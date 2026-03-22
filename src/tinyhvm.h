@@ -112,7 +112,14 @@ typedef u64 Term;
 #define UOP_SHRINK    21  // = slice
 #define UOP_PAD       22
 
-#define UOP_COUNT     23
+// CNN (need custom gradient rules in thvm_grad):
+#define UOP_IM2COL    23  // im2col: x[B,C,H,W] → col[n_patches, patch_size]
+#define UOP_COL2IM    24  // col2im: col[n_patches, patch_size] → x[B,C,H,W]
+#define UOP_MAXPOOL   25  // maxpool2d: x[B,C,H,W] → out[B,C,OH,OW]
+#define UOP_NCHW2NHWC 26  // layout transpose
+#define UOP_NHWC2NCHW 27  // layout transpose
+
+#define UOP_COUNT     28
 
 // ============================================================
 // NUM encoding

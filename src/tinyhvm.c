@@ -267,9 +267,10 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             heap_set(ctx, loc, a);
 
             int is_binary = (uop >= UOP_ADD && uop <= UOP_SUB) || uop == UOP_MM;
+            int is_cnn_input = (uop >= UOP_IM2COL && uop <= UOP_NHWC2NCHW);
             int is_reduce = (uop == UOP_SUM || uop == UOP_RMAX);
             Term b = term_era();
-            if (is_binary || is_movement) {
+            if (is_binary || is_movement || is_cnn_input) {
                 b = thvm_reduce(ctx, heap_read(ctx, loc + 1));
                 heap_set(ctx, loc + 1, b);
             }
@@ -346,6 +347,15 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             u32 b_id = is_binary ? (u32)term_val(b) : 0;
             TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
 
+            // CNN-specific ops: a=input, b=params tensor (contains Conv2dParams or LayoutParams)
+            int is_cnn_op = (uop >= UOP_IM2COL && uop <= UOP_NHWC2NCHW);
+            if (is_cnn_op) {
+                // b holds conv params as raw bytes
+                assert(term_tag(b) == TAG_TEN);
+                b_id = (u32)term_val(b);
+                mb = &ctx->tensors[b_id];
+            }
+
             // Determine output shape
             u32 out_shape[MAX_DIM];
             u32 out_ndim;
@@ -358,6 +368,43 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 out_shape[0] = ma->view.shape.dims[0];
                 out_shape[1] = mb->view.shape.dims[1];
                 out_ndim = 2;
+            } else if (is_cnn_op) {
+                // Read Conv2dParams from params tensor buffer
+                // (Layout ops use B,C,H,W from shape directly)
+                if (uop == UOP_IM2COL) {
+                    // Output: [n_patches, patch_size]
+                    // Read params: {B,Cin,H,W,KH,KW,OH,OW,patch_size,n_patches}
+                    u32 params[10];
+                    ctx->backend->buf_read(mb->buf_id, params, sizeof(params));
+                    out_shape[0] = params[9]; // n_patches
+                    out_shape[1] = params[8]; // patch_size
+                    out_ndim = 2;
+                } else if (uop == UOP_COL2IM) {
+                    // Output: [B,Cin,H,W]
+                    u32 params[10];
+                    ctx->backend->buf_read(mb->buf_id, params, sizeof(params));
+                    out_shape[0] = params[0]; // B
+                    out_shape[1] = params[1]; // Cin
+                    out_shape[2] = params[2]; // H
+                    out_shape[3] = params[3]; // W
+                    out_ndim = 4;
+                } else if (uop == UOP_MAXPOOL) {
+                    // Output: [B,C,OH,OW] where OH=H/2, OW=W/2
+                    assert(ma->view.shape.rank == 4);
+                    out_shape[0] = ma->view.shape.dims[0]; // B
+                    out_shape[1] = ma->view.shape.dims[1]; // C
+                    out_shape[2] = ma->view.shape.dims[2] / 2; // OH
+                    out_shape[3] = ma->view.shape.dims[3] / 2; // OW
+                    out_ndim = 4;
+                } else if (uop == UOP_NCHW2NHWC || uop == UOP_NHWC2NCHW) {
+                    // Same total elements, just reordered
+                    u32 n = ma->view.numel;
+                    out_shape[0] = n;
+                    out_ndim = 1;
+                } else {
+                    assert(0 && "unknown CNN UOp");
+                    out_ndim = 0;
+                }
             } else if (is_reduce) {
                 // Reduce: collapse last dim to 1
                 out_ndim = ma->view.shape.rank;
@@ -392,6 +439,13 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 u32 M = ma->view.shape.dims[0], K = ma->view.shape.dims[1], N = mb->view.shape.dims[1];
                 ctx->backend->op_mm(md->buf_id, ma->buf_id, &ma->view,
                                 mb->buf_id, &mb->view, M, K, N);
+            } else if (is_cnn_op) {
+                // CNN ops dispatched via backend kernel pipelines
+                // These are currently handled in layers.c via dispatch_1d
+                // For now, store the dst_id and let layers.c fill the buffer
+                // TODO: move dispatch into backend vtable
+                // Mark as needing external dispatch
+                md->host_ptr = (void*)(uintptr_t)1; // sentinel: "dispatch me"
             } else if (is_reduce) {
                 u32 reduce_dim = ma->view.shape.dims[ma->view.shape.rank - 1];
                 ctx->backend->op_reduce(uop, md->buf_id, md->view.numel,
@@ -944,6 +998,54 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
                     grad_graph_accum(ctx, gm, a_id,
                         thvm_permute(ctx, grad, inv_axes, rank));
                 }
+                break;
+            }
+            // === CNN op DUP rules ===
+            case UOP_IM2COL: {
+                // DUP through im2col = col2im (they are inverses)
+                // Gradient of im2col(x, params) w.r.t. x is col2im(grad, params)
+                if (ma->requires_grad) {
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_COL2IM, grad,
+                                term_ten(b_id, DTYPE_U32)));
+                }
+                break;
+            }
+
+            case UOP_COL2IM: {
+                // DUP through col2im = im2col (they are inverses)
+                if (ma->requires_grad) {
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_IM2COL, grad,
+                                term_ten(b_id, DTYPE_U32)));
+                }
+                break;
+            }
+
+            case UOP_NCHW2NHWC: {
+                // DUP through NCHW→NHWC = NHWC→NCHW (inverse layout)
+                if (ma->requires_grad) {
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_NHWC2NCHW, grad,
+                                term_ten(b_id, DTYPE_U32)));
+                }
+                break;
+            }
+
+            case UOP_NHWC2NCHW: {
+                // DUP through NHWC→NCHW = NCHW→NHWC (inverse layout)
+                if (ma->requires_grad) {
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_NCHW2NHWC, grad,
+                                term_ten(b_id, DTYPE_U32)));
+                }
+                break;
+            }
+
+            case UOP_MAXPOOL: {
+                // DUP through maxpool = scatter grad to argmax positions
+                // This needs the argmax mask from forward — stored in b_id
+                // For now, skip (maxpool backward is handled separately)
                 break;
             }
 

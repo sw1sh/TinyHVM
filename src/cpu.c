@@ -66,6 +66,7 @@ static void cpu_op_unary(u32 uop, u32 dst, const View *dv,
             case UOP_RELU: pd[i] = val > 0.0f ? val : 0.0f; break;
             case UOP_EXP:  pd[i] = __builtin_expf(val); break;
             case UOP_LOG:  pd[i] = __builtin_logf(val); break;
+            case UOP_SQRT: pd[i] = __builtin_sqrtf(val); break;
             default:       pd[i] = val; break;
         }
     }

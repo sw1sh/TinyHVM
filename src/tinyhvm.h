@@ -88,30 +88,31 @@ typedef u64 Term;
 #define UOP_LOG     5
 #define UOP_RELU    6
 #define UOP_CAST    7   // dtype cast
+#define UOP_SQRT    8   // square root
 
 // Elementwise (binary):
-#define UOP_ADD     8
-#define UOP_MUL     9
-#define UOP_DIV    10
-#define UOP_MAX    11
-#define UOP_CMP    12   // compare (returns 0/1)
-#define UOP_SUB    13   // subtract (for gradient descent)
+#define UOP_ADD     9
+#define UOP_MUL    10
+#define UOP_DIV    11
+#define UOP_MAX    12
+#define UOP_CMP    13   // compare (returns 0/1)
+#define UOP_SUB    14   // subtract (for gradient descent)
 
 // Reduce:
-#define UOP_SUM    14   // reduce sum over axis
-#define UOP_RMAX   15   // reduce max over axis
+#define UOP_SUM    15   // reduce sum over axis
+#define UOP_RMAX   16   // reduce max over axis
 
 // Matmul (special — dispatches to BLAS/MPS):
-#define UOP_MM     16   // matrix multiply
+#define UOP_MM     17   // matrix multiply
 
 // Movement (metadata-only, stride manipulation):
-#define UOP_RESHAPE   17
-#define UOP_PERMUTE   18
-#define UOP_EXPAND    19  // = broadcast
-#define UOP_SHRINK    20  // = slice
-#define UOP_PAD       21
+#define UOP_RESHAPE   18
+#define UOP_PERMUTE   19
+#define UOP_EXPAND    20  // = broadcast
+#define UOP_SHRINK    21  // = slice
+#define UOP_PAD       22
 
-#define UOP_COUNT     22
+#define UOP_COUNT     23
 
 // ============================================================
 // NUM encoding

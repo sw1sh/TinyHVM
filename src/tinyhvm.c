@@ -469,7 +469,7 @@ static const char *tag_names[] = {
 
 static const char *uop_names[] = {
     "load", "store", "copy",
-    "neg", "exp", "log", "relu", "cast",
+    "neg", "exp", "log", "relu", "cast", "sqrt",
     "add", "mul", "div", "max", "cmp", "sub",
     "sum", "rmax",
     "mm",
@@ -838,6 +838,83 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
                         thvm_op(ctx, UOP_MUL, grad,
                                 term_ten(mask_id, ma->dtype)));
                 }
+                break;
+            }
+
+            case UOP_NEG: {
+                // ∂(-a)/∂a = -grad
+                if (ma->requires_grad)
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_NEG, grad, term_era()));
+                break;
+            }
+
+            case UOP_EXP: {
+                // ∂exp(a)/∂a = exp(a) * grad  (output = exp(a))
+                if (ma->requires_grad)
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_MUL, grad,
+                                term_ten((u32)i, e->dtype)));
+                break;
+            }
+
+            case UOP_LOG: {
+                // ∂log(a)/∂a = grad / a
+                if (ma->requires_grad)
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_DIV, grad,
+                                term_ten(a_id, ma->dtype)));
+                break;
+            }
+
+            case UOP_SQRT: {
+                // ∂sqrt(a)/∂a = grad / (2 * sqrt(a))
+                if (ma->requires_grad) {
+                    f32 two_val = 2.0f;
+                    Term two_t = thvm_tensor(ctx, &two_val, SHAPE(1));
+                    Term denom = thvm_op(ctx, UOP_MUL,
+                                    two_t, term_ten((u32)i, e->dtype));
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_DIV, grad, denom));
+                }
+                break;
+            }
+
+            case UOP_DIV: {
+                if (!mb) break;
+                // ∂(a/b)/∂a = grad / b
+                if (ma->requires_grad)
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_DIV, grad,
+                                term_ten(b_id, mb->dtype)));
+                // ∂(a/b)/∂b = -grad * a / b²
+                if (mb->requires_grad) {
+                    Term neg_grad = thvm_op(ctx, UOP_NEG, grad, term_era());
+                    Term num = thvm_op(ctx, UOP_MUL, neg_grad,
+                                       term_ten(a_id, ma->dtype));
+                    Term b_sq = thvm_op(ctx, UOP_MUL,
+                                        term_ten(b_id, mb->dtype),
+                                        term_ten(b_id, mb->dtype));
+                    grad_graph_accum(ctx, gm, b_id,
+                        thvm_op(ctx, UOP_DIV, num, b_sq));
+                }
+                break;
+            }
+
+            case UOP_SUM: {
+                // ∂sum(a)/∂a = broadcast grad to original shape
+                if (ma->requires_grad) {
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_expand(ctx,
+                            thvm_reshape(ctx, grad, e->view.shape),
+                            ma->view.shape));
+                }
+                break;
+            }
+
+            case UOP_RMAX: {
+                // ∂max(a)/∂a = grad * (a == max)
+                // Skip for now — rarely needed directly in backprop
                 break;
             }
 

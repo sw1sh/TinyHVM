@@ -1,30 +1,32 @@
 CC      = clang
-CFLAGS  = -O2 -Wall -Wextra -Wpedantic -std=c11
-LDFLAGS =
+CFLAGS  = -O2 -Wall -Wextra -std=c11
+FRAMEWORKS_CPU   = -framework Accelerate
+FRAMEWORKS_METAL = -framework Metal -framework MetalPerformanceShaders \
+                   -framework Foundation -framework Accelerate
 
-SRC     = src/tinyhvm.c
-HDR     = src/tinyhvm.h
+# Build shaders.metallib from shaders.metal
+shaders.metallib: src/shaders.metal
+	xcrun -sdk macosx metal -c src/shaders.metal -o /tmp/shaders.air
+	xcrun -sdk macosx metallib /tmp/shaders.air -o shaders.metallib
 
-# CPU backend uses Accelerate for BLAS
-cpu: $(SRC) $(HDR) src/gpu_cpu.c
-	$(CC) $(CFLAGS) -DBACKEND_CPU -framework Accelerate \
-		-o tinyhvm src/main.c src/gpu_cpu.c $(LDFLAGS)
+# Tests — CPU backend (header-only include)
+test: test/test_term.c src/tinyhvm.c src/tinyhvm.h src/gpu_cpu.c
+	$(CC) $(CFLAGS) $(FRAMEWORKS_CPU) -o test_term test/test_term.c && ./test_term
 
-# Metal backend (macOS)
-metal: $(SRC) $(HDR) src/gpu_metal.m
-	$(CC) $(CFLAGS) -DBACKEND_METAL \
-		-framework Metal -framework MetalPerformanceShaders -framework Foundation \
-		-o tinyhvm src/main.c src/gpu_metal.m $(LDFLAGS)
+# Tests — Metal backend parity
+test_metal: shaders.metallib test/test_metal.c src/tinyhvm.c src/tinyhvm.h src/gpu_metal.m
+	$(CC) $(CFLAGS) $(FRAMEWORKS_METAL) -o test_metal test/test_metal.c src/gpu_metal.m && ./test_metal
 
-# Tests
-test_term: test/test_term.c $(SRC) $(HDR)
-	$(CC) $(CFLAGS) -o test_term test/test_term.c
-	./test_term
+# Training — CPU
+test_train: test/test_train.c src/tinyhvm.c src/tinyhvm.h src/gpu_cpu.c
+	$(CC) $(CFLAGS) $(FRAMEWORKS_CPU) -o test_train test/test_train.c && ./test_train
 
-test: test_term
+# Training — Metal
+test_train_metal: shaders.metallib test/test_train_metal.c src/tinyhvm.c src/tinyhvm.h src/gpu_metal.m
+	$(CC) $(CFLAGS) $(FRAMEWORKS_METAL) -o test_train_metal test/test_train_metal.c src/gpu_metal.m && ./test_train_metal
 
 clean:
-	rm -f tinyhvm tinyhvm_cpu test_term test_reduce test_basic
+	rm -f test_term test_metal test_train test_train_metal shaders.metallib /tmp/shaders.air
 	rm -rf *.dSYM
 
-.PHONY: cpu metal test test_term clean
+.PHONY: test test_metal test_train test_train_metal clean

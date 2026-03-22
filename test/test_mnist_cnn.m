@@ -174,12 +174,17 @@ int main(void) {
         adam_add_param(&opt, i, param_ids[i], param_sizes[i]);
 
     // ========== Training loop ==========
-    u32 BS = 64;  // batch size (beautiful_mnist uses 512, we use smaller for speed)
-    u32 n_steps = 70;  // same as beautiful_mnist
+    u32 BS = 128;
+    u32 n_steps = 1000;
+    f32 lr_max = 0.001f, lr_min = 0.0001f;
 
     printf("  Training %u steps, BS=%u...\n\n", n_steps, BS);
 
     for (u32 step = 0; step < n_steps; step++) {
+        // Cosine LR schedule
+        f32 progress = (f32)step / (f32)n_steps;
+        opt.lr = lr_min + 0.5f * (lr_max - lr_min) * (1.0f + cosf(3.14159f * progress));
+
         clock_t t0 = clock();
 
         // Random batch
@@ -321,8 +326,8 @@ int main(void) {
         clock_t t1 = clock();
         f32 ms = 1000.0f * (f32)(t1 - t0) / (f32)CLOCKS_PER_SEC;
 
-        if (step % 10 == 0 || step == n_steps - 1) {
-            printf("  step %2u/%u  loss=%.4f  (%.0fms)\n", step, n_steps, ce.loss, ms);
+        if (step % 50 == 0 || step == n_steps - 1) {
+            printf("  step %3u/%u  loss=%.4f  lr=%.5f  (%.0fms)\n", step, n_steps, ce.loss, opt.lr, ms);
         }
 
         // Reset ephemeral tensors
@@ -392,8 +397,8 @@ int main(void) {
     f32 test_acc = 100.0f * (f32)test_correct / (f32)(test_batches * test_bs);
     printf("\n  Test accuracy: %.1f%% (%u/%u)\n", test_acc, test_correct, test_batches * test_bs);
 
-    int pass = test_acc > 95.0f;  // tinygrad targets 99%, we'll accept 95% initially
-    printf("\n  %s: CNN test accuracy %s 95%%\n", pass ? "PASS" : "FAIL",
+    int pass = test_acc > 99.0f;
+    printf("\n  %s: CNN test accuracy %s 99%%\n", pass ? "PASS" : "FAIL",
            pass ? ">" : "<");
 
     // Cleanup

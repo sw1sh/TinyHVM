@@ -82,8 +82,85 @@ static View view_create(Shape s) {
 static View view_permute(View v, const u32 *axes) {
     View r = v;
     for (u32 i = 0; i < v.shape.rank; i++) {
-        r.shape.dims[i]   = v.shape.dims[axes[i]];
+        r.shape.dims[i] = v.shape.dims[axes[i]];
         r.strides[i] = v.strides[axes[i]];
+    }
+    r.contiguous = 0;
+    return r;
+}
+
+// Reshape: validate numel, recompute strides (row-major)
+static View view_reshape(View v, Shape new_shape) {
+    u32 new_numel = 1;
+    for (u32 i = 0; i < new_shape.rank; i++) new_numel *= new_shape.dims[i];
+    assert(new_numel == v.numel && "reshape: numel mismatch");
+    View r = {0};
+    r.shape = new_shape;
+    r.numel = new_numel;
+    r.offset = v.offset;
+    // New row-major strides
+    for (u32 i = 0; i < new_shape.rank; i++) {
+        i32 st = 1;
+        for (u32 j = i + 1; j < new_shape.rank; j++) st *= (i32)new_shape.dims[j];
+        r.strides[i] = st;
+    }
+    r.contiguous = v.contiguous;
+    return r;
+}
+
+// Expand: set stride=0 for broadcast dimensions (dim must be 1 → n)
+static View view_expand(View v, Shape new_shape) {
+    assert(v.shape.rank == new_shape.rank);
+    View r = v;
+    r.numel = 1;
+    for (u32 i = 0; i < new_shape.rank; i++) {
+        if (v.shape.dims[i] == 1 && new_shape.dims[i] > 1) {
+            r.strides[i] = 0;  // broadcast!
+        } else {
+            assert(v.shape.dims[i] == new_shape.dims[i]);
+        }
+        r.shape.dims[i] = new_shape.dims[i];
+        r.numel *= new_shape.dims[i];
+    }
+    r.contiguous = 0;
+    return r;
+}
+
+// Shrink: slice — adjust offset and shape
+static View view_shrink(View v, const u32 *starts, const u32 *ends) {
+    View r = v;
+    r.numel = 1;
+    for (u32 i = 0; i < v.shape.rank; i++) {
+        r.offset += (i32)starts[i] * v.strides[i];
+        r.shape.dims[i] = ends[i] - starts[i];
+        r.numel *= r.shape.dims[i];
+    }
+    r.contiguous = 0;
+    return r;
+}
+
+// Pad: extend shape, adjust offset (data starts at offset with original strides)
+// Padding requires physical copy to a bigger buffer, so this is NOT free.
+// However we can handle it at dispatch time.
+static View view_pad(View v, const u32 *pad_before, const u32 *pad_after) {
+    View r = v;
+    r.numel = 1;
+    for (u32 i = 0; i < v.shape.rank; i++) {
+        r.shape.dims[i] = v.shape.dims[i] + pad_before[i] + pad_after[i];
+        r.numel *= r.shape.dims[i];
+    }
+    r.contiguous = 0;
+    return r;
+}
+
+// Stride: modify strides for pooling window extraction
+static View view_stride(View v, const u32 *strides_mult) {
+    View r = v;
+    r.numel = 1;
+    for (u32 i = 0; i < v.shape.rank; i++) {
+        r.shape.dims[i] = (v.shape.dims[i] + strides_mult[i] - 1) / strides_mult[i];
+        r.strides[i] = v.strides[i] * (i32)strides_mult[i];
+        r.numel *= r.shape.dims[i];
     }
     r.contiguous = 0;
     return r;
@@ -153,6 +230,21 @@ static u32 tensor_create(TinyHVM *ctx, Shape s, u32 dtype) {
     return id;
 }
 
+// Create a tensor that shares another's buffer but has a different View
+// No GPU allocation — just metadata.
+static u32 tensor_view_of(TinyHVM *ctx, u32 src_id, View new_view) {
+    assert(ctx->tensor_count < MAX_TENSORS);
+    u32 id = ctx->tensor_count++;
+    TensorMeta *m = &ctx->tensors[id];
+    TensorMeta *ms = &ctx->tensors[src_id];
+    memset(m, 0, sizeof(*m));
+    m->dtype = ms->dtype;
+    m->refcount = 1;
+    m->buf_id = ms->buf_id;    // SHARE the buffer
+    m->view = new_view;
+    return id;
+}
+
 
 
 // ============================================================
@@ -167,6 +259,9 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             u32 uop = term_ext(t);
             u64 loc = term_val(t);
 
+            // Movement ops: modify View, share buffer
+            int is_movement = (uop >= UOP_RESHAPE && uop <= UOP_PAD);
+
             // Reduce arguments
             Term a = thvm_reduce(ctx, heap_read(ctx, loc));
             heap_set(ctx, loc, a);
@@ -174,18 +269,81 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             int is_binary = (uop >= UOP_ADD && uop <= UOP_SUB) || uop == UOP_MM;
             int is_reduce = (uop == UOP_SUM || uop == UOP_RMAX);
             Term b = term_era();
-            if (is_binary) {
+            if (is_binary || is_movement) {
                 b = thvm_reduce(ctx, heap_read(ctx, loc + 1));
                 heap_set(ctx, loc + 1, b);
             }
 
             if (term_tag(a) != TAG_TEN) return t;
             if (is_binary && term_tag(b) != TAG_TEN) return t;
-            if (!ctx->backend) return t;
 
             u32 a_id = (u32)term_val(a);
-            u32 b_id = is_binary ? (u32)term_val(b) : 0;
             TensorMeta *ma = &ctx->tensors[a_id];
+
+            // Movement ops: create view, share buffer, no compute
+            if (is_movement) {
+                // b encodes the new shape/args as a tensor with shape data
+                u32 b_id = 0;
+                if (term_tag(b) == TAG_TEN) b_id = (u32)term_val(b);
+                View new_view;
+                switch (uop) {
+                    case UOP_RESHAPE: {
+                        // b is a 1D tensor whose elements are the new dims
+                        assert(b_id);
+                        TensorMeta *mb = &ctx->tensors[b_id];
+                        Shape ns = {.rank = mb->view.numel};
+                        f32 *dims = malloc(ns.rank * sizeof(f32));
+                        ctx->backend->buf_read(mb->buf_id, dims, ns.rank * sizeof(f32));
+                        for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
+                        free(dims);
+                        new_view = view_reshape(ma->view, ns);
+                        break;
+                    }
+                    case UOP_EXPAND: {
+                        assert(b_id);
+                        TensorMeta *mb = &ctx->tensors[b_id];
+                        Shape ns = {.rank = mb->view.numel};
+                        f32 *dims = malloc(ns.rank * sizeof(f32));
+                        ctx->backend->buf_read(mb->buf_id, dims, ns.rank * sizeof(f32));
+                        for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
+                        free(dims);
+                        new_view = view_expand(ma->view, ns);
+                        break;
+                    }
+                    case UOP_PERMUTE: {
+                        assert(b_id);
+                        TensorMeta *mb = &ctx->tensors[b_id];
+                        u32 rank = mb->view.numel;
+                        f32 *axes_f = malloc(rank * sizeof(f32));
+                        ctx->backend->buf_read(mb->buf_id, axes_f, rank * sizeof(f32));
+                        u32 axes[MAX_DIM];
+                        for (u32 i = 0; i < rank; i++) axes[i] = (u32)axes_f[i];
+                        free(axes_f);
+                        new_view = view_permute(ma->view, axes);
+                        break;
+                    }
+                    default:
+                        // PAD, SHRINK need physical copy — fall through to compute
+                        // For now, assert
+                        assert(0 && "pad/shrink not yet implemented in reduce");
+                        new_view = ma->view;
+                }
+                u32 dst_id = tensor_view_of(ctx, a_id, new_view);
+                // Record provenance
+                if (ctx->recording && ma->requires_grad) {
+                    TensorMeta *md = &ctx->tensors[dst_id];
+                    md->requires_grad = 1;
+                    md->creator_op = uop;
+                    md->src_ids[0] = a_id;
+                    md->src_ids[1] = b_id;
+                }
+                ctx->itrs++;
+                return term_ten(dst_id, ma->dtype);
+            }
+
+            if (!ctx->backend) return t;
+
+            u32 b_id = is_binary ? (u32)term_val(b) : 0;
             TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
 
             // Determine output shape
@@ -426,6 +584,28 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
     return term_top(uop, loc);
 }
 
+// Movement ops: encode shape as a 1D f32 tensor, build lazy TOP
+Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
+    f32 dims[MAX_DIM];
+    for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (f32)new_shape.dims[i];
+    Term shape_t = thvm_tensor(ctx, dims, SHAPE(new_shape.rank));
+    return thvm_op(ctx, UOP_RESHAPE, t, shape_t);
+}
+
+Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
+    f32 dims[MAX_DIM];
+    for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (f32)new_shape.dims[i];
+    Term shape_t = thvm_tensor(ctx, dims, SHAPE(new_shape.rank));
+    return thvm_op(ctx, UOP_EXPAND, t, shape_t);
+}
+
+Term thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank) {
+    f32 axes_f[MAX_DIM];
+    for (u32 i = 0; i < rank; i++) axes_f[i] = (f32)axes[i];
+    Term axes_t = thvm_tensor(ctx, axes_f, SHAPE(rank));
+    return thvm_op(ctx, UOP_PERMUTE, t, axes_t);
+}
+
 void thvm_realize(TinyHVM *ctx, Term t) {
     thvm_reduce(ctx, t);
 }
@@ -657,6 +837,50 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
                     grad_graph_accum(ctx, gm, a_id,
                         thvm_op(ctx, UOP_MUL, grad,
                                 term_ten(mask_id, ma->dtype)));
+                }
+                break;
+            }
+
+            // === Movement op DUP rules (inverse movement) ===
+            case UOP_RESHAPE: {
+                // DUP through reshape = reshape grad back to original shape
+                if (ma->requires_grad) {
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_reshape(ctx, grad, ma->view.shape));
+                }
+                break;
+            }
+
+            case UOP_EXPAND: {
+                // DUP through expand = sum along expanded axes
+                // (expand broadcasts dims that were 1; backward sums them back)
+                if (ma->requires_grad) {
+                    // For now, use tensor_reduce_sum_to to handle shape reduction
+                    // This is eagerly computed, but correct
+                    Term g_reduced = thvm_reduce(ctx, grad);
+                    if (term_tag(g_reduced) == TAG_TEN) {
+                        u32 g_id = (u32)term_val(g_reduced);
+                        u32 reduced = tensor_reduce_sum_to(ctx, g_id, ma->view.shape);
+                        grad_graph_accum(ctx, gm, a_id, term_ten(reduced, ma->dtype));
+                    }
+                }
+                break;
+            }
+
+            case UOP_PERMUTE: {
+                // DUP through permute = permute with inverse axes
+                if (ma->requires_grad && b_id) {
+                    TensorMeta *mb_p = &ctx->tensors[b_id];
+                    u32 rank = mb_p->view.numel;
+                    f32 *axes_f = malloc(rank * sizeof(f32));
+                    ctx->backend->buf_read(mb_p->buf_id, axes_f, rank * sizeof(f32));
+                    // Compute inverse permutation
+                    u32 inv_axes[MAX_DIM];
+                    for (u32 j = 0; j < rank; j++)
+                        inv_axes[(u32)axes_f[j]] = j;
+                    free(axes_f);
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_permute(ctx, grad, inv_axes, rank));
                 }
                 break;
             }

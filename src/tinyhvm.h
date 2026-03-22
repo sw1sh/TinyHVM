@@ -256,6 +256,11 @@ Term     thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b);
 void     thvm_realize(TinyHVM *ctx, Term t);
 f32     *thvm_to_host(TinyHVM *ctx, Term t);
 
+// Movement ops (lazy — modify View, share buffer)
+Term     thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape);
+Term     thvm_expand(TinyHVM *ctx, Term t, Shape new_shape);
+Term     thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank);
+
 // Print
 void     thvm_print_term(TinyHVM *ctx, Term t);
 

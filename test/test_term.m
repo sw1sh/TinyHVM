@@ -1,7 +1,11 @@
-// test_term.c — TinyHVM test suite v2 (includes autograd tests)
+// test_term.m — TinyHVM test suite
+// Change DEVICE to "metal" to run all tests on GPU.
 
 #include "../src/tinyhvm.c"
 #include "../src/gpu_cpu.c"
+#include "../src/gpu_metal.m"
+
+#define DEVICE "cpu"
 
 #include <stdio.h>
 #include <math.h>
@@ -113,7 +117,7 @@ static void test_op2_reduce(void) {
 
 static void test_matmul_identity(void) {
     printf("test_matmul_identity:\n");
-    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
     f32 x_d[] = {1,2,3,4}; u32 s[] = {2,2};
     f32 i_d[] = {1,0,0,1};
     Term x = thvm_tensor(ctx, x_d, shape_of(s, 2));
@@ -130,7 +134,7 @@ static void test_matmul_identity(void) {
 
 static void test_relu(void) {
     printf("test_relu:\n");
-    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
     f32 d[] = {-1, 2, -3, 4}; u32 s[] = {1, 4};
     Term t = thvm_tensor(ctx, d, shape_of(s, 2));
     Term r = thvm_reduce(ctx, thvm_op(ctx, UOP_RELU, t, term_era()));
@@ -146,7 +150,7 @@ static void test_relu(void) {
 
 static void test_broadcast_add(void) {
     printf("test_broadcast_add:\n");
-    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
     // a = [[1,2,3],[4,5,6]] (2x3)
     f32 a_d[] = {1,2,3,4,5,6}; u32 sa[] = {2, 3};
@@ -172,7 +176,7 @@ static void test_broadcast_add(void) {
 
 static void test_broadcast_column(void) {
     printf("test_broadcast_column:\n");
-    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
     // a = [[1,2],[3,4]] (2x2)
     f32 a_d[] = {1,2,3,4}; u32 sa[] = {2, 2};
@@ -198,7 +202,7 @@ static void test_broadcast_column(void) {
 
 static void test_full_forward(void) {
     printf("test_full_forward (relu(mm(x,w)+b) with broadcast):\n");
-    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
     f32 x_d[] = {1,2,3,4,5,6}; u32 xs[] = {2,3};
     f32 w_d[] = {0.1f,-0.2f, 0.3f,0.4f, -0.5f,0.6f}; u32 ws[] = {3,2};
@@ -230,7 +234,7 @@ static void test_full_forward(void) {
 
 static void test_grad_x2(void) {
     printf("test_grad_x2 (d(x^2)/dx = 2x at x=3):\n");
-    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
     f32 x_d[] = {3.0f}; u32 xs[] = {1, 1};
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
@@ -254,7 +258,7 @@ static void test_grad_x2(void) {
 
 static void test_grad_add(void) {
     printf("test_grad_add (d(a+b)/da = 1):\n");
-    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
     f32 a_d[] = {2.0f}; u32 s[] = {1, 1};
     f32 b_d[] = {5.0f};
@@ -281,7 +285,7 @@ static void test_grad_add(void) {
 
 static void test_grad_relu(void) {
     printf("test_grad_relu:\n");
-    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
     f32 x_d[] = {-2.0f, 3.0f, -1.0f, 4.0f}; u32 xs[] = {1, 4};
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
@@ -308,7 +312,7 @@ static void test_grad_relu(void) {
 
 static void test_grad_mm(void) {
     printf("test_grad_mm (matmul gradient):\n");
-    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
     f32 a_d[] = {1,2,3,4}; u32 s[] = {2, 2};
     f32 b_d[] = {5,6,7,8};
@@ -349,7 +353,7 @@ static void test_grad_mm(void) {
 
 static void test_grad_of_grad(void) {
     printf("test_grad_of_grad (d²(x³)/dx² = 6x at x=2 => 12):\n");
-    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
     f32 x_d[] = {2.0f}; u32 xs[] = {1, 1};
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));

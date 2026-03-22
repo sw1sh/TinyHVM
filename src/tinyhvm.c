@@ -377,6 +377,21 @@ void thvm_print_term(TinyHVM *ctx, Term t) {
 // api.c — High-level tensor API
 // ============================================================
 
+// Device registry — both backends are always linked in.
+extern GpuBackend gpu_cpu_backend;
+#ifdef __APPLE__
+extern GpuBackend gpu_metal_backend;
+#endif
+
+GpuBackend *thvm_device(const char *name) {
+    #ifdef __APPLE__
+    if (strcmp(name, "metal") == 0 || strcmp(name, "gpu") == 0)
+        return &gpu_metal_backend;
+    #endif
+    (void)name;
+    return &gpu_cpu_backend;
+}
+
 TinyHVM *thvm_init(GpuBackend *gpu) {
     TinyHVM *ctx = calloc(1, sizeof(TinyHVM));
     ctx->heap = calloc(HEAP_CAP, sizeof(Term));

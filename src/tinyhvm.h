@@ -241,6 +241,7 @@ static inline Term heap_read(TinyHVM *ctx, u64 loc);
 static inline void heap_set(TinyHVM *ctx, u64 loc, Term t);
 
 // Context
+GpuBackend *thvm_device(const char *name);  // "cpu", "metal"
 TinyHVM *thvm_init(GpuBackend *gpu);
 void     thvm_free(TinyHVM *ctx);
 

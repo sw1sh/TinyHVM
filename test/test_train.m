@@ -3,7 +3,14 @@
 // Trains on 4 XOR examples, converges to loss < 0.05
 
 #include "../src/tinyhvm.c"
-#include "../src/gpu_cpu.c"
+
+#ifdef USE_METAL
+  extern GpuBackend gpu_metal_backend;
+  #define BACKEND gpu_metal_backend
+#else
+  #include "../src/gpu_cpu.c"
+  #define BACKEND BACKEND
+#endif
 
 #include <stdio.h>
 #include <math.h>
@@ -37,7 +44,7 @@ static void sgd_update(TinyHVM *ctx, Term param, Term grad_term, f32 lr) {
 
 int main(void) {
     printf("=== XOR Training (thvm_grad) ===\n\n");
-    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
     // XOR data: 4 examples × 2 inputs
     f32 x_data[] = {0,0, 0,1, 1,0, 1,1};  // [4,2]

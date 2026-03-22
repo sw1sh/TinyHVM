@@ -241,10 +241,24 @@ int main(void) {
 
     printf("  Training %u steps, BS=%u...\n\n", n_steps, BS);
 
+    // Profiling accumulators (nanoseconds)
+    #include <mach/mach_time.h>
+    mach_timebase_info_data_t tbi;
+    mach_timebase_info(&tbi);
+    #define NS(t) ((t) * tbi.numer / tbi.denom)
+
+    u64 prof_batch = 0, prof_fwd = 0, prof_loss = 0;
+    u64 prof_bwd_linear = 0, prof_bwd_pool_bn = 0, prof_bwd_conv = 0;
+    u64 prof_adam = 0, prof_reset = 0;
+
+    #define PROF_START() u64 _ps = mach_absolute_time()
+    #define PROF_ACC(acc) do { acc += mach_absolute_time() - _ps; _ps = mach_absolute_time(); } while(0)
+
     for (u32 step = 0; step < n_steps; step++) {
         f32 progress = (f32)step / (f32)n_steps;
         opt.lr = lr_min + 0.5f * (lr_max - lr_min) * (1.0f + cosf(3.14159f * progress));
         clock_t t0 = clock();
+        PROF_START();
 
         // Random batch
         f32 *batch_x = malloc(BS * 784 * sizeof(f32));
@@ -255,6 +269,7 @@ int main(void) {
             batch_y[i] = train_labels[idx];
         }
         u32 x = tensor_from(ctx, batch_x, (Shape){.dims={BS,1,28,28}, .rank=4});
+        PROF_ACC(prof_batch);
 
         // Start batch — all compute dispatches accumulate until flush
         ctx->backend->begin_batch();
@@ -264,9 +279,11 @@ int main(void) {
             conv3_w, conv3_b, conv4_w, conv4_b,
             bn2_gamma, bn2_beta, bn2_rmean, bn2_rvar,
             fc_w, fc_b, 1);
+        PROF_ACC(prof_fwd);
 
         // Loss
         CEResult ce = cross_entropy(ctx, term_ten(fc.logits, DTYPE_F32), batch_y, BS, 10);
+        PROF_ACC(prof_loss);
 
         // Backward
         Term d_logits = cross_entropy_backward(ctx, &ce, batch_y);
@@ -286,6 +303,7 @@ int main(void) {
         ctx->tensors[d_flat].view.strides[1] = 9;
         ctx->tensors[d_flat].view.strides[2] = 3;
         ctx->tensors[d_flat].view.strides[3] = 1;
+        PROF_ACC(prof_bwd_linear);
 
         // MaxPool2 backward
         u32 d_mp2 = maxpool2d_backward(ctx, d_flat, &fc.mp2);
@@ -293,6 +311,8 @@ int main(void) {
         BNGrads bng2 = batchnorm_backward(ctx, d_mp2, &fc.bn2c, bn2_gamma);
         grad_ids[10] = bng2.d_gamma;
         grad_ids[11] = bng2.d_beta;
+        PROF_ACC(prof_bwd_pool_bn);
+
         // ReLU4
         u32 d_r4 = relu_backward(ctx, bng2.d_input, fc.cc4.out_id, BS*64*6*6);
         // Conv4
@@ -323,9 +343,11 @@ int main(void) {
         ConvGrads cg1 = conv2d_backward(ctx, d_r1, &fc.cc1, conv1_w);
         grad_ids[0] = cg1.d_weight;
         grad_ids[1] = cg1.d_bias;
+        PROF_ACC(prof_bwd_conv);
 
         // Adam step
         adam_step(ctx, &opt, grad_ids);
+        PROF_ACC(prof_adam);
 
         // Flush all pending compute before reset
         ctx->backend->end_batch();
@@ -335,8 +357,24 @@ int main(void) {
             printf("  step %3u/%u  loss=%.4f  lr=%.5f  (%.0fms)\n", step, n_steps, ce.loss, opt.lr, ms);
 
         thvm_reset(ctx, n_weights);
+        PROF_ACC(prof_reset);
+
         free(batch_x); free(batch_y);
     }
+
+    // Print profiling breakdown
+    f32 steps_f = (f32)n_steps;
+    printf("\n  === Profile (avg per step) ===\n");
+    printf("  batch_prep: %6.1f ms\n", (f32)NS(prof_batch) / 1e6f / steps_f);
+    printf("  forward:    %6.1f ms\n", (f32)NS(prof_fwd) / 1e6f / steps_f);
+    printf("  loss:       %6.1f ms\n", (f32)NS(prof_loss) / 1e6f / steps_f);
+    printf("  bwd_linear: %6.1f ms\n", (f32)NS(prof_bwd_linear) / 1e6f / steps_f);
+    printf("  bwd_bn+mp:  %6.1f ms\n", (f32)NS(prof_bwd_pool_bn) / 1e6f / steps_f);
+    printf("  bwd_conv:   %6.1f ms\n", (f32)NS(prof_bwd_conv) / 1e6f / steps_f);
+    printf("  adam:       %6.1f ms\n", (f32)NS(prof_adam) / 1e6f / steps_f);
+    printf("  reset:      %6.1f ms\n", (f32)NS(prof_reset) / 1e6f / steps_f);
+    f32 total = (f32)NS(prof_batch + prof_fwd + prof_loss + prof_bwd_linear + prof_bwd_pool_bn + prof_bwd_conv + prof_adam + prof_reset) / 1e6f / steps_f;
+    printf("  TOTAL:      %6.1f ms\n", total);
 
     // ========== Test accuracy ==========
     printf("\n  Evaluating test set...\n");

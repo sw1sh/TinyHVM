@@ -389,6 +389,7 @@ static ConvResult conv2d(TinyHVM *ctx, u32 x_id, u32 w_id, u32 b_id,
 
 // Conv2d backward (im2col-based)
 typedef struct { u32 d_weight, d_bias, d_input; } ConvGrads;
+typedef struct { u32 M, N; } TransposeParams;  // must match Metal struct
 
 static ConvGrads conv2d_backward(TinyHVM *ctx, u32 d_out_id, ConvResult *cr, u32 w_id) {
     u32 B=cr->B, Cin=cr->Cin, Cout=cr->Cout;
@@ -414,15 +415,12 @@ static ConvGrads conv2d_backward(TinyHVM *ctx, u32 d_out_id, ConvResult *cr, u32
     u32 col_buf = ctx->tensors[cr->col_id].buf_id;
     u32 col_t_buf = ctx->backend->buf_alloc(n_patches * patch_size * sizeof(f32));
     {
-        // CPU transpose of col matrix (can be large)
-        f32 *col_data = malloc(n_patches * patch_size * sizeof(f32));
-        f32 *col_t = malloc(n_patches * patch_size * sizeof(f32));
-        ctx->backend->buf_read(col_buf, col_data, n_patches * patch_size * sizeof(f32));
-        for (u32 i = 0; i < n_patches; i++)
-            for (u32 j = 0; j < patch_size; j++)
-                col_t[j * n_patches + i] = col_data[i * patch_size + j];
-        ctx->backend->buf_write(col_t_buf, col_t, n_patches * patch_size * sizeof(f32));
-        free(col_data); free(col_t);
+        // Device-side transpose: [n_patches, patch_size] → [patch_size, n_patches]
+        TransposeParams tp = {n_patches, patch_size};
+        id<MTLBuffer> t_bufs[] = { metal_pool.bufs[col_t_buf], metal_pool.bufs[col_buf] };
+        const void *t_params[] = { &tp };
+        u64 t_psizes[] = { sizeof(TransposeParams) };
+        dispatch_1d(pipe_matrix_transpose, t_bufs, 2, t_params, t_psizes, 1, n_patches * patch_size);
     }
 
     u32 dw_buf = ctx->backend->buf_alloc(patch_size * Cout * sizeof(f32));
@@ -435,14 +433,12 @@ static ConvGrads conv2d_backward(TinyHVM *ctx, u32 d_out_id, ConvResult *cr, u32
     // Transpose dw: [patch_size, Cout] → [Cout, patch_size] → reshape [Cout,Cin,KH,KW]
     u32 dw_t_buf = ctx->backend->buf_alloc(Cout * patch_size * sizeof(f32));
     {
-        f32 *dw_data = malloc(patch_size * Cout * sizeof(f32));
-        f32 *dw_t = malloc(Cout * patch_size * sizeof(f32));
-        ctx->backend->buf_read(dw_buf, dw_data, patch_size * Cout * sizeof(f32));
-        for (u32 i = 0; i < patch_size; i++)
-            for (u32 j = 0; j < Cout; j++)
-                dw_t[j * patch_size + i] = dw_data[i * Cout + j];
-        ctx->backend->buf_write(dw_t_buf, dw_t, Cout * patch_size * sizeof(f32));
-        free(dw_data); free(dw_t);
+        // Device-side transpose: [patch_size, Cout] → [Cout, patch_size]
+        TransposeParams tp = {patch_size, Cout};
+        id<MTLBuffer> t_bufs[] = { metal_pool.bufs[dw_t_buf], metal_pool.bufs[dw_buf] };
+        const void *t_params[] = { &tp };
+        u64 t_psizes[] = { sizeof(TransposeParams) };
+        dispatch_1d(pipe_matrix_transpose, t_bufs, 2, t_params, t_psizes, 1, patch_size * Cout);
     }
     u32 d_weight = ctx->tensor_count++;
     ctx->tensors[d_weight] = (TensorMeta){
@@ -623,9 +619,7 @@ static BNGrads batchnorm_backward(TinyHVM *ctx, u32 d_out_id, BNResult *bn, u32 
 // ReLU backward
 // ============================================================
 
-typedef struct {
-    u32 M, N;
-} TransposeParams;
+
 
 static u32 relu_backward(TinyHVM *ctx, u32 d_out_id, u32 x_id, u32 n) {
     u32 dx_buf = ctx->backend->buf_alloc(n * sizeof(f32));

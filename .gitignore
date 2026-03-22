@@ -30,3 +30,4 @@ test_metal
 shaders.metallib
 data/
 test_mnist
+test_mnist_cnn

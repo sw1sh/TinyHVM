@@ -55,11 +55,11 @@ static void test_num_encoding(void) {
 static void test_view_create(void) {
     printf("test_view_create:\n");
     u32 shape[] = {2, 3, 4};
-    View v = view_create(shape, 3);
-    ASSERT_EQ(v.ndim, 3, "ndim");
-    ASSERT_EQ(v.shape[0], 2, "shape[0]");
-    ASSERT_EQ(v.shape[1], 3, "shape[1]");
-    ASSERT_EQ(v.shape[2], 4, "shape[2]");
+    View v = view_create(shape_of(shape, 3));
+    ASSERT_EQ(v.shape.rank, 3, "ndim");
+    ASSERT_EQ(v.shape.dims[0], 2, "shape[0]");
+    ASSERT_EQ(v.shape.dims[1], 3, "shape[1]");
+    ASSERT_EQ(v.shape.dims[2], 4, "shape[2]");
     ASSERT_EQ(v.strides[0], 12, "stride[0] = 3*4");
     ASSERT_EQ(v.strides[1], 4, "stride[1] = 4");
     ASSERT_EQ(v.strides[2], 1, "stride[2] = 1");
@@ -70,8 +70,8 @@ static void test_view_create(void) {
 static void test_view_broadcast(void) {
     printf("test_view_broadcast:\n");
     u32 sa[] = {2, 3}, sb[] = {1, 3};
-    View a = view_create(sa, 2);
-    View b = view_create(sb, 2);
+    View a = view_create(shape_of(sa, 2));
+    View b = view_create(shape_of(sb, 2));
     View oa, ob;
     u32 out_shape[MAX_DIM], out_ndim;
     int ok = view_broadcast(&a, &b, &oa, &ob, out_shape, &out_ndim);
@@ -86,11 +86,11 @@ static void test_view_broadcast(void) {
 static void test_view_permute(void) {
     printf("test_view_permute:\n");
     u32 shape[] = {2, 3};
-    View v = view_create(shape, 2);
+    View v = view_create(shape_of(shape, 2));
     u32 axes[] = {1, 0};
     View p = view_permute(v, axes);
-    ASSERT_EQ(p.shape[0], 3, "permuted shape[0]");
-    ASSERT_EQ(p.shape[1], 2, "permuted shape[1]");
+    ASSERT_EQ(p.shape.dims[0], 3, "permuted shape[0]");
+    ASSERT_EQ(p.shape.dims[1], 2, "permuted shape[1]");
     ASSERT_EQ(p.strides[0], 1, "permuted stride[0]");
     ASSERT_EQ(p.strides[1], 3, "permuted stride[1]");
     ASSERT_EQ(p.contiguous, 0, "not contiguous");
@@ -116,8 +116,8 @@ static void test_matmul_identity(void) {
     TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
     f32 x_d[] = {1,2,3,4}; u32 s[] = {2,2};
     f32 i_d[] = {1,0,0,1};
-    Term x = thvm_tensor(ctx, x_d, s, 2);
-    Term w = thvm_tensor(ctx, i_d, s, 2);
+    Term x = thvm_tensor(ctx, x_d, shape_of(s, 2));
+    Term w = thvm_tensor(ctx, i_d, shape_of(s, 2));
     Term r = thvm_reduce(ctx, thvm_op(ctx, UOP_MM, x, w));
     f32 *out = thvm_to_host(ctx, r);
     ASSERT(out != NULL, "mm returns data");
@@ -132,7 +132,7 @@ static void test_relu(void) {
     printf("test_relu:\n");
     TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
     f32 d[] = {-1, 2, -3, 4}; u32 s[] = {1, 4};
-    Term t = thvm_tensor(ctx, d, s, 2);
+    Term t = thvm_tensor(ctx, d, shape_of(s, 2));
     Term r = thvm_reduce(ctx, thvm_op(ctx, UOP_RELU, t, term_era()));
     f32 *out = thvm_to_host(ctx, r);
     ASSERT_NEAR(out[0], 0, 1e-5f, "relu(-1)=0");
@@ -150,11 +150,11 @@ static void test_broadcast_add(void) {
 
     // a = [[1,2,3],[4,5,6]] (2x3)
     f32 a_d[] = {1,2,3,4,5,6}; u32 sa[] = {2, 3};
-    Term a = thvm_tensor(ctx, a_d, sa, 2);
+    Term a = thvm_tensor(ctx, a_d, shape_of(sa, 2));
 
     // b = [10, 20, 30] (1x3) — broadcast to (2x3)
     f32 b_d[] = {10, 20, 30}; u32 sb[] = {1, 3};
-    Term b = thvm_tensor(ctx, b_d, sb, 2);
+    Term b = thvm_tensor(ctx, b_d, shape_of(sb, 2));
 
     Term r = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD, a, b));
     f32 *out = thvm_to_host(ctx, r);
@@ -176,11 +176,11 @@ static void test_broadcast_column(void) {
 
     // a = [[1,2],[3,4]] (2x2)
     f32 a_d[] = {1,2,3,4}; u32 sa[] = {2, 2};
-    Term a = thvm_tensor(ctx, a_d, sa, 2);
+    Term a = thvm_tensor(ctx, a_d, shape_of(sa, 2));
 
     // b = [[10],[20]] (2x1) — broadcast to (2x2)
     f32 b_d[] = {10, 20}; u32 sb[] = {2, 1};
-    Term b = thvm_tensor(ctx, b_d, sb, 2);
+    Term b = thvm_tensor(ctx, b_d, shape_of(sb, 2));
 
     Term r = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD, a, b));
     f32 *out = thvm_to_host(ctx, r);
@@ -204,9 +204,9 @@ static void test_full_forward(void) {
     f32 w_d[] = {0.1f,-0.2f, 0.3f,0.4f, -0.5f,0.6f}; u32 ws[] = {3,2};
     f32 b_d[] = {-0.1f, 0.2f}; u32 bs[] = {1,2};  // broadcast!
 
-    Term x = thvm_tensor(ctx, x_d, xs, 2);
-    Term w = thvm_tensor(ctx, w_d, ws, 2);
-    Term b = thvm_tensor(ctx, b_d, bs, 2);
+    Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
+    Term w = thvm_tensor(ctx, w_d, shape_of(ws, 2));
+    Term b = thvm_tensor(ctx, b_d, shape_of(bs, 2));
 
     Term z = thvm_op(ctx, UOP_RELU,
                 thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, x, w), b),
@@ -233,7 +233,7 @@ static void test_grad_x2(void) {
     TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
 
     f32 x_d[] = {3.0f}; u32 xs[] = {1, 1};
-    Term x = thvm_tensor(ctx, x_d, xs, 2);
+    Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx, x);
 
     thvm_clear_tape(ctx);
@@ -258,8 +258,8 @@ static void test_grad_add(void) {
 
     f32 a_d[] = {2.0f}; u32 s[] = {1, 1};
     f32 b_d[] = {5.0f};
-    Term a = thvm_tensor(ctx, a_d, s, 2);
-    Term b = thvm_tensor(ctx, b_d, s, 2);
+    Term a = thvm_tensor(ctx, a_d, shape_of(s, 2));
+    Term b = thvm_tensor(ctx, b_d, shape_of(s, 2));
     thvm_set_requires_grad(ctx, a);
     thvm_set_requires_grad(ctx, b);
 
@@ -284,7 +284,7 @@ static void test_grad_relu(void) {
     TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
 
     f32 x_d[] = {-2.0f, 3.0f, -1.0f, 4.0f}; u32 xs[] = {1, 4};
-    Term x = thvm_tensor(ctx, x_d, xs, 2);
+    Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx, x);
 
     thvm_clear_tape(ctx);
@@ -312,8 +312,8 @@ static void test_grad_mm(void) {
 
     f32 a_d[] = {1,2,3,4}; u32 s[] = {2, 2};
     f32 b_d[] = {5,6,7,8};
-    Term a = thvm_tensor(ctx, a_d, s, 2);
-    Term b = thvm_tensor(ctx, b_d, s, 2);
+    Term a = thvm_tensor(ctx, a_d, shape_of(s, 2));
+    Term b = thvm_tensor(ctx, b_d, shape_of(s, 2));
     thvm_set_requires_grad(ctx, a);
     thvm_set_requires_grad(ctx, b);
 
@@ -352,7 +352,7 @@ static void test_grad_of_grad(void) {
     TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
 
     f32 x_d[] = {2.0f}; u32 xs[] = {1, 1};
-    Term x = thvm_tensor(ctx, x_d, xs, 2);
+    Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx, x);
 
     // Forward: x^3 — tape accumulates

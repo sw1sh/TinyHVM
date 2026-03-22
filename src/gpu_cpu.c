@@ -40,9 +40,9 @@ static void cpu_buf_read(u32 id, void *o, u64 b)        { memcpy(o, cpu_pool.buf
 static inline u32 strided_index(u32 flat, const View *v) {
     u32 idx = (u32)v->offset;
     u32 rem = flat;
-    for (i32 d = (i32)v->ndim - 1; d >= 0; d--) {
-        u32 coord = rem % v->shape[d];
-        rem /= v->shape[d];
+    for (i32 d = (i32)v->shape.rank - 1; d >= 0; d--) {
+        u32 coord = rem % v->shape.dims[d];
+        rem /= v->shape.dims[d];
         idx += coord * (u32)v->strides[d];
     }
     return idx;

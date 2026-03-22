@@ -141,11 +141,26 @@ typedef u64 Term;
 #define MAX_TENSORS 4096
 #define MAX_TAPE 4096
 
+// Shape: dims + rank bundled together
+typedef struct {
+    u32 dims[MAX_DIM];
+    u32 rank;
+} Shape;
+
+// Convenience: SHAPE(2,3) → (Shape){.dims={2,3}, .rank=2}
+#define SHAPE(...) ((Shape){.dims={__VA_ARGS__}, \
+    .rank=sizeof((u32[]){__VA_ARGS__})/sizeof(u32)})
+
+static inline Shape shape_of(const u32 *dims, u32 rank) {
+    Shape s = {.rank = rank};
+    for (u32 i = 0; i < rank; i++) s.dims[i] = dims[i];
+    return s;
+}
+
 // View: shape + strides + offset (tinygrad-inspired)
 // Movement ops modify this without touching GPU buffers.
 typedef struct {
-    u32 ndim;
-    u32 shape[MAX_DIM];
+    Shape shape;
     i32 strides[MAX_DIM];   // can be 0 (broadcast) or negative (flip)
     i32 offset;             // starting element in buffer
     u32 numel;              // product of shape (logical element count)
@@ -233,7 +248,7 @@ void     thvm_free(TinyHVM *ctx);
 Term     thvm_reduce(TinyHVM *ctx, Term t);
 
 // Tensor API
-Term     thvm_tensor(TinyHVM *ctx, const f32 *data, const u32 *shape, u32 ndim);
+Term     thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s);
 Term     thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b);
 void     thvm_realize(TinyHVM *ctx, Term t);
 f32     *thvm_to_host(TinyHVM *ctx, Term t);

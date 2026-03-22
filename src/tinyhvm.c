@@ -61,19 +61,18 @@ static inline void heap_set(TinyHVM *ctx, u64 l, Term t) { ctx->heap[l] = t; }
 // view.c — View helpers (shape/stride arithmetic)
 // ============================================================
 
-static View view_create(const u32 *shape, u32 ndim) {
+static View view_create(Shape s) {
     View v = {0};
-    v.ndim = ndim;
+    v.shape = s;
     v.numel = 1;
-    for (u32 i = 0; i < ndim; i++) {
-        v.shape[i] = shape[i];
-        v.numel *= shape[i];
+    for (u32 i = 0; i < s.rank; i++) {
+        v.numel *= s.dims[i];
     }
     // Row-major strides
-    for (u32 i = 0; i < ndim; i++) {
-        i32 s = 1;
-        for (u32 j = i + 1; j < ndim; j++) s *= (i32)shape[j];
-        v.strides[i] = s;
+    for (u32 i = 0; i < s.rank; i++) {
+        i32 st = 1;
+        for (u32 j = i + 1; j < s.rank; j++) st *= (i32)s.dims[j];
+        v.strides[i] = st;
     }
     v.offset = 0;
     v.contiguous = 1;
@@ -82,8 +81,8 @@ static View view_create(const u32 *shape, u32 ndim) {
 
 static View view_permute(View v, const u32 *axes) {
     View r = v;
-    for (u32 i = 0; i < v.ndim; i++) {
-        r.shape[i]   = v.shape[axes[i]];
+    for (u32 i = 0; i < v.shape.rank; i++) {
+        r.shape.dims[i]   = v.shape.dims[axes[i]];
         r.strides[i] = v.strides[axes[i]];
     }
     r.contiguous = 0;
@@ -94,12 +93,12 @@ static View view_expand(View v, const u32 *new_shape) {
     // Broadcast: where shape[i]==1 and new_shape[i]>1, set stride=0
     View r = v;
     r.numel = 1;
-    for (u32 i = 0; i < v.ndim; i++) {
-        if (v.shape[i] == 1 && new_shape[i] > 1) {
-            r.shape[i] = new_shape[i];
+    for (u32 i = 0; i < v.shape.rank; i++) {
+        if (v.shape.dims[i] == 1 && new_shape[i] > 1) {
+            r.shape.dims[i] = new_shape[i];
             r.strides[i] = 0;
         }
-        r.numel *= r.shape[i];
+        r.numel *= r.shape.dims[i];
     }
     r.contiguous = 0;
     return r;
@@ -108,17 +107,17 @@ static View view_expand(View v, const u32 *new_shape) {
 // Broadcast two views to a common shape. Returns 1 on success.
 static int view_broadcast(const View *a, const View *b, View *out_a, View *out_b, u32 *out_shape, u32 *out_ndim) {
     // Align from the right, pad with 1s on the left
-    u32 ndim = a->ndim > b->ndim ? a->ndim : b->ndim;
+    u32 ndim = a->shape.rank > b->shape.rank ? a->shape.rank : b->shape.rank;
     *out_ndim = ndim;
 
     // Build padded shapes (right-aligned)
     u32 sa[MAX_DIM] = {0}, sb[MAX_DIM] = {0};
     i32 sta[MAX_DIM] = {0}, stb[MAX_DIM] = {0};
-    u32 off_a = ndim - a->ndim, off_b = ndim - b->ndim;
+    u32 off_a = ndim - a->shape.rank, off_b = ndim - b->shape.rank;
 
     for (u32 i = 0; i < ndim; i++) {
-        sa[i] = (i >= off_a) ? a->shape[i - off_a] : 1;
-        sb[i] = (i >= off_b) ? b->shape[i - off_b] : 1;
+        sa[i] = (i >= off_a) ? a->shape.dims[i - off_a] : 1;
+        sb[i] = (i >= off_b) ? b->shape.dims[i - off_b] : 1;
         sta[i] = (i >= off_a) ? a->strides[i - off_a] : 0;
         stb[i] = (i >= off_b) ? b->strides[i - off_b] : 0;
     }
@@ -136,12 +135,12 @@ static int view_broadcast(const View *a, const View *b, View *out_a, View *out_b
     // Build broadcast views (stride=0 where expanded)
     *out_a = (View){0};
     *out_b = (View){0};
-    out_a->ndim = out_b->ndim = ndim;
+    out_a->shape.rank = out_b->shape.rank = ndim;
     out_a->numel = out_b->numel = numel;
     out_a->offset = a->offset;
     out_b->offset = b->offset;
     for (u32 i = 0; i < ndim; i++) {
-        out_a->shape[i] = out_b->shape[i] = out_shape[i];
+        out_a->shape.dims[i] = out_b->shape.dims[i] = out_shape[i];
         out_a->strides[i] = (sa[i] == 1 && out_shape[i] > 1) ? 0 : sta[i];
         out_b->strides[i] = (sb[i] == 1 && out_shape[i] > 1) ? 0 : stb[i];
     }
@@ -152,14 +151,14 @@ static int view_broadcast(const View *a, const View *b, View *out_a, View *out_b
 // tensor.c — Tensor metadata registry
 // ============================================================
 
-static u32 tensor_create(TinyHVM *ctx, const u32 *shape, u32 ndim, u32 dtype) {
-    assert(ndim <= MAX_DIM && ctx->tensor_count < MAX_TENSORS);
+static u32 tensor_create(TinyHVM *ctx, Shape s, u32 dtype) {
+    assert(s.rank <= MAX_DIM && ctx->tensor_count < MAX_TENSORS);
     u32 id = ctx->tensor_count++;
     TensorMeta *m = &ctx->tensors[id];
     memset(m, 0, sizeof(*m));
     m->dtype = dtype;
     m->refcount = 1;
-    m->view = view_create(shape, ndim);
+    m->view = view_create(s);
 
     if (ctx->gpu) {
         m->buf_id = ctx->gpu->buf_alloc((u64)m->view.numel * 4);
@@ -221,10 +220,10 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
 
             if (uop == UOP_MM) {
                 // matmul: [M,K] x [K,N] → [M,N]
-                assert(ma->view.ndim == 2 && mb->view.ndim == 2);
-                assert(ma->view.shape[1] == mb->view.shape[0]);
-                out_shape[0] = ma->view.shape[0];
-                out_shape[1] = mb->view.shape[1];
+                assert(ma->view.shape.rank == 2 && mb->view.shape.rank == 2);
+                assert(ma->view.shape.dims[1] == mb->view.shape.dims[0]);
+                out_shape[0] = ma->view.shape.dims[0];
+                out_shape[1] = mb->view.shape.dims[1];
                 out_ndim = 2;
             } else if (is_binary) {
                 // Binary: broadcast shapes
@@ -232,11 +231,11 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 assert(ok && "shape broadcast failed");
             } else {
                 // Unary: output = input shape
-                out_ndim = ma->view.ndim;
-                for (u32 i = 0; i < out_ndim; i++) out_shape[i] = ma->view.shape[i];
+                out_ndim = ma->view.shape.rank;
+                for (u32 i = 0; i < out_ndim; i++) out_shape[i] = ma->view.shape.dims[i];
             }
 
-            u32 dst_id = tensor_create(ctx, out_shape, out_ndim, ma->dtype);
+            u32 dst_id = tensor_create(ctx, shape_of(out_shape, out_ndim), ma->dtype);
             TensorMeta *md = &ctx->tensors[dst_id];
 
             // Record to tape if any input requires grad
@@ -257,7 +256,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
 
             // Dispatch
             if (uop == UOP_MM) {
-                u32 M = ma->view.shape[0], K = ma->view.shape[1], N = mb->view.shape[1];
+                u32 M = ma->view.shape.dims[0], K = ma->view.shape.dims[1], N = mb->view.shape.dims[1];
                 ctx->gpu->op_mm(md->buf_id, ma->buf_id, &ma->view,
                                 mb->buf_id, &mb->view, M, K, N);
             } else if (is_binary) {
@@ -357,7 +356,7 @@ void thvm_print_term(TinyHVM *ctx, Term t) {
             if (ctx && tid < ctx->tensor_count) {
                 View *v = &ctx->tensors[tid].view;
                 printf(" [");
-                for (u32 i = 0; i < v->ndim; i++) printf("%s%u", i?",":"", v->shape[i]);
+                for (u32 i = 0; i < v->shape.rank; i++) printf("%s%u", i?",":"", v->shape.dims[i]);
                 printf("]");
             }
             printf(")");
@@ -396,8 +395,8 @@ void thvm_free(TinyHVM *ctx) {
     free(ctx);
 }
 
-Term thvm_tensor(TinyHVM *ctx, const f32 *data, const u32 *shape, u32 ndim) {
-    u32 id = tensor_create(ctx, shape, ndim, DTYPE_F32);
+Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {
+    u32 id = tensor_create(ctx, s, DTYPE_F32);
     TensorMeta *m = &ctx->tensors[id];
     if (ctx->gpu && data) {
         ctx->gpu->buf_write(m->buf_id, data, (u64)m->view.numel * 4);
@@ -431,8 +430,8 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t) {
 // ============================================================
 
 // Create a tensor filled with a constant
-static u32 tensor_fill(TinyHVM *ctx, const u32 *shape, u32 ndim, f32 val) {
-    u32 id = tensor_create(ctx, shape, ndim, DTYPE_F32);
+static u32 tensor_fill(TinyHVM *ctx, Shape s, f32 val) {
+    u32 id = tensor_create(ctx, s, DTYPE_F32);
     TensorMeta *m = &ctx->tensors[id];
     u32 n = m->view.numel;
     f32 *tmp = malloc(n * sizeof(f32));
@@ -445,10 +444,10 @@ static u32 tensor_fill(TinyHVM *ctx, const u32 *shape, u32 ndim, f32 val) {
 // Physical 2D transpose: create a new buffer with swapped layout
 static u32 tensor_transpose_2d(TinyHVM *ctx, u32 src_id) {
     TensorMeta *ms = &ctx->tensors[src_id];
-    assert(ms->view.ndim == 2);
-    u32 M = ms->view.shape[0], N = ms->view.shape[1];
+    assert(ms->view.shape.rank == 2);
+    u32 M = ms->view.shape.dims[0], N = ms->view.shape.dims[1];
     u32 t_shape[] = {N, M};
-    u32 tid = tensor_create(ctx, t_shape, 2, ms->dtype);
+    u32 tid = tensor_create(ctx, shape_of(t_shape, 2), ms->dtype);
 
     // Read src, transpose, write dst
     u32 n = M * N;
@@ -465,22 +464,22 @@ static u32 tensor_transpose_2d(TinyHVM *ctx, u32 src_id) {
 }
 
 // Reduce-sum a tensor to target shape (for gradient accumulation after broadcast)
-static u32 tensor_reduce_sum_to(TinyHVM *ctx, u32 grad_id, const u32 *target_shape, u32 target_ndim) {
+static u32 tensor_reduce_sum_to(TinyHVM *ctx, u32 grad_id, Shape target) {
     TensorMeta *mg = &ctx->tensors[grad_id];
 
     // Check if shapes already match
-    if (mg->view.ndim == target_ndim) {
+    if (mg->view.shape.rank == target.rank) {
         int same = 1;
-        for (u32 i = 0; i < target_ndim; i++)
-            if (mg->view.shape[i] != target_shape[i]) same = 0;
+        for (u32 i = 0; i < target.rank; i++)
+            if (mg->view.shape.dims[i] != target.dims[i]) same = 0;
         if (same) return grad_id;
     }
 
     // Sum-reduce along broadcast dimensions
     u32 n_out = 1;
-    for (u32 i = 0; i < target_ndim; i++) n_out *= target_shape[i];
+    for (u32 i = 0; i < target.rank; i++) n_out *= target.dims[i];
 
-    u32 out_id = tensor_fill(ctx, target_shape, target_ndim, 0.0f);
+    u32 out_id = tensor_fill(ctx, target, 0.0f);
     u32 n_grad = mg->view.numel;
 
     f32 *g_data = malloc(n_grad * sizeof(f32));
@@ -491,15 +490,15 @@ static u32 tensor_reduce_sum_to(TinyHVM *ctx, u32 grad_id, const u32 *target_sha
     for (u32 i = 0; i < n_grad; i++) {
         u32 out_idx = 0, rem = i, out_stride = 1;
         // Right-align target shape within grad shape
-        u32 off = mg->view.ndim - target_ndim;
-        for (i32 d = (i32)mg->view.ndim - 1; d >= 0; d--) {
-            u32 coord = rem % mg->view.shape[d];
-            rem /= mg->view.shape[d];
+        u32 off = mg->view.shape.rank - target.rank;
+        for (i32 d = (i32)mg->view.shape.rank - 1; d >= 0; d--) {
+            u32 coord = rem % mg->view.shape.dims[d];
+            rem /= mg->view.shape.dims[d];
             if ((u32)d >= off) {
                 u32 td = (u32)d - off;
-                u32 tc = (target_shape[td] == 1) ? 0 : coord;
+                u32 tc = (target.dims[td] == 1) ? 0 : coord;
                 out_idx += tc * out_stride;
-                out_stride *= target_shape[td];
+                out_stride *= target.dims[td];
             }
         }
         o_data[out_idx] += g_data[i];
@@ -564,7 +563,7 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
 
     // Seed: ∂y/∂y = 1 (ones with same shape as y)
     TensorMeta *my = &ctx->tensors[y_id];
-    u32 ones_id = tensor_fill(ctx, my->view.shape, my->view.ndim, 1.0f);
+    u32 ones_id = tensor_fill(ctx, my->view.shape, 1.0f);
     gm[y_id] = term_ten(ones_id, my->dtype);
 
     // Walk tape backward, build lazy gradient graph
@@ -629,8 +628,8 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
                 // ∂relu(a)/∂a = (a > 0) ? 1 : 0
                 // mask is computed eagerly (not differentiable)
                 if (ma->requires_grad) {
-                    u32 zero_id = tensor_fill(ctx, ma->view.shape, ma->view.ndim, 0.0f);
-                    u32 mask_id = tensor_create(ctx, ma->view.shape, ma->view.ndim, ma->dtype);
+                    u32 zero_id = tensor_fill(ctx, ma->view.shape, 0.0f);
+                    u32 mask_id = tensor_create(ctx, ma->view.shape, ma->dtype);
                     View mv, zv; u32 os[MAX_DIM], on;
                     view_broadcast(&ma->view, &ctx->tensors[zero_id].view, &mv, &zv, os, &on);
                     ctx->gpu->op_binary(UOP_CMP, ctx->tensors[mask_id].buf_id,

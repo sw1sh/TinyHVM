@@ -234,7 +234,44 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
 
 static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
                          u32 M, u32 K, u32 N) {
-    (void)av; (void)bv;
+    // Materialize non-contiguous inputs to contiguous temp buffers for MPS
+    id<MTLBuffer> buf_a = metal_pool.bufs[a];
+    id<MTLBuffer> buf_b = metal_pool.bufs[b];
+    id<MTLBuffer> tmp_a = nil, tmp_b = nil;
+
+    if (!av->contiguous) {
+        u32 n = M * K;
+        tmp_a = [mtl_dev newBufferWithLength:n * sizeof(float) options:MTLResourceStorageModeShared];
+        float *src = (float *)buf_a.contents;
+        float *dst_ptr = (float *)tmp_a.contents;
+        for (u32 i = 0; i < n; i++) {
+            u32 idx = (u32)av->offset, rem = i;
+            for (i32 d = (i32)av->shape.rank - 1; d >= 0; d--) {
+                u32 coord = rem % av->shape.dims[d];
+                rem /= av->shape.dims[d];
+                idx += coord * (u32)av->strides[d];
+            }
+            dst_ptr[i] = src[idx];
+        }
+        buf_a = tmp_a;
+    }
+
+    if (!bv->contiguous) {
+        u32 n = K * N;
+        tmp_b = [mtl_dev newBufferWithLength:n * sizeof(float) options:MTLResourceStorageModeShared];
+        float *src = (float *)buf_b.contents;
+        float *dst_ptr = (float *)tmp_b.contents;
+        for (u32 i = 0; i < n; i++) {
+            u32 idx = (u32)bv->offset, rem = i;
+            for (i32 d = (i32)bv->shape.rank - 1; d >= 0; d--) {
+                u32 coord = rem % bv->shape.dims[d];
+                rem /= bv->shape.dims[d];
+                idx += coord * (u32)bv->strides[d];
+            }
+            dst_ptr[i] = src[idx];
+        }
+        buf_b = tmp_b;
+    }
 
     // MPS path: float matmul
     MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
@@ -247,8 +284,8 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
         matrixDescriptorWithRows:M columns:N rowBytes:N*sizeof(float)
         dataType:MPSDataTypeFloat32];
 
-    MPSMatrix *matA = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[a] descriptor:descA];
-    MPSMatrix *matB = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[b] descriptor:descB];
+    MPSMatrix *matA = [[MPSMatrix alloc] initWithBuffer:buf_a descriptor:descA];
+    MPSMatrix *matB = [[MPSMatrix alloc] initWithBuffer:buf_b descriptor:descB];
     MPSMatrix *matC = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[dst] descriptor:descC];
 
     MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]

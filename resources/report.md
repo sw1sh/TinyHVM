@@ -318,28 +318,30 @@ Define custom interaction rules for fusion:
 
 ### Phase 1: Core Runtime ✅
 
-Completed. TinyHVM is a standalone C library (~2000 LoC) with:
+Completed. TinyHVM is a standalone C library (~4700 LoC) with:
 
 - **Interaction calculus core**: 64-bit term encoding (SUB:1 | TAG:7 | EXT:18 | VAL:38), bump-allocated heap, weak normal form reduction engine
 - **Tensor abstraction**: `Shape` struct (variable rank up to 8D), `View` with strides/offset (tinygrad-inspired ShapeTracker), dtype-aware with `dtype_size()` helper
-- **Backend interface**: `Backend` vtable with `init/shutdown/buf_alloc/buf_free/buf_write/buf_read/op_unary/op_binary/op_mm`. Runtime selection via `thvm_device("cpu"|"metal")`
+- **Backend interface**: `Backend` vtable with `init/shutdown/buf_alloc/buf_free/buf_write/buf_read/op_unary/op_binary/op_mm` + CNN dispatch ops + profiling. Runtime selection via `thvm_device("cpu"|"metal")`
 - **CPU backend** (`cpu.c`): Accelerate/vDSP matmul, strided elementwise ops
-- **Metal backend** (`metal.m`): 11 compute shaders + MPS matmul, `StorageModeShared` for zero-copy on Apple Silicon
-- **Operations**: neg, exp, log, relu (unary); add, mul, sub, div, max, cmp (binary); matmul (MPS/Accelerate)
+- **Metal backend** (`metal.m`): Compute shaders + MPS matmul, `StorageModeShared` for zero-copy on Apple Silicon, command buffer batching
+- **23 UOps** (aligned with [tinyspec](https://github.com/tinygrad/tinyspec)): movement (reshape/permute/expand/shrink/pad), elementwise (neg/exp/log/relu/sqrt/cast + add/mul/div/sub/max/cmp), reduce (sum/rmax), matmul
 - **Broadcasting**: Full numpy-style shape broadcasting with stride manipulation
 - **Tests**: 93/93 unit tests passing on both CPU and Metal
 
 ```
-src/tinyhvm.h      271 lines  — types, constants, API
-src/tinyhvm.c      650 lines  — reduction engine, views, autograd, API
-src/cpu.c      135 lines  — CPU backend (Accelerate)
-src/metal.m    277 lines  — Metal backend (MPS + compute shaders)
-src/shaders.metal  163 lines  — 11 Metal compute kernels
+src/tinyhvm.h      409 lines  — types, constants, API, profiling, Layer abstraction
+src/tinyhvm.c     1586 lines  — reduction engine, views, autograd, UOp compositions
+src/cpu.c          219 lines  — CPU backend (Accelerate)
+src/metal.m        608 lines  — Metal backend (MPS + compute shaders + profiling)
+src/layers.c       572 lines  — CNN layers (direct Metal dispatch), Layer sequential
+src/shaders.metal  475 lines  — Metal compute kernels
 test/test_term.m   409 lines  — 93 unit tests
 test/test_train.m  144 lines  — XOR training end-to-end
+test/beautiful_mnist.m  281 lines — CNN MNIST training (96.2% accuracy)
 ```
 
-### Phase 2: Autograd & Training 🔧 (in progress)
+### Phase 2: Autograd & Training ✅
 
 Completed:
 - **Graph-level gradient** (`thvm_grad`): JAX-style — returns a lazy Term that, when reduced, computes ∂y/∂x. Supports `grad(grad(f))` via composable lazy graph construction
@@ -347,10 +349,11 @@ Completed:
 - **Gradient rules**: add, sub, mul, matmul (with transpose), relu (with mask)
 - **SGD training**: XOR 2-layer MLP converges in 7 epochs
 - **Engineering study**: Read ggml and tinygrad source, documented patterns in `engineering_reference.md`
-
-Remaining:
-- **MNIST demo**: Requires softmax, reduce_sum (per-axis), log, cross-entropy loss
-- **Command buffer batching**: Accumulate ops in one Metal command buffer per `thvm_reduce()` call (currently per-op roundtrip)
+- **CNN training (beautiful_mnist)**: Conv2d + BatchNorm + MaxPool + Linear layers via direct Metal dispatch. Loss 2.92→0.11, 96.2% test accuracy, ~46ms/step
+- **Device-agnostic profiling**: `ThvmProfile`, `thvm_prof_tick/record`, `THVM_PROFILE=1` for tinygrad-style kernel breakdown
+- **Layer abstraction**: Tagged union `Layer` (Conv2d/BN/MaxPool/Flatten/Linear/Fn) + `thvm_sequential`
+- **Eval helpers**: `thvm_argmax`, `thvm_eval_accuracy`
+- **Command buffer batching**: `begin_batch`/`end_batch` in backend vtable
 
 ### Phase 3: Kernel Fusion (planned)
 1. Graph-level `backend.graph_compute(cgraph)` interface (ggml pattern)

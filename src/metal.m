@@ -443,59 +443,100 @@ static void metal_pool_reset(u32 keep) {
 }
 
 // ============================================================
-// CNN op dispatch (im2col, col2im, maxpool, layout transpose)
+// CNN backend ops — device-agnostic interface for layers.c
 // ============================================================
-// Conv2dParams, LayoutParams, Pool2dParams defined in tinyhvm.h
 
-static void metal_op_cnn(u32 uop, u32 dst, u32 src, u32 params_buf) {
-    u64 t0 = thvm_prof_tick();
-    switch (uop) {
-        case UOP_IM2COL: {
-            Conv2dParams cp;
-            metal_buf_read(params_buf, &cp, sizeof(cp));
-            u32 numel = cp.n_patches * cp.patch_size;
-            id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
-            const void *params[] = { &cp };
-            u64 psizes[] = { sizeof(Conv2dParams) };
-            dispatch_1d(pipe_im2col, bufs, 2, params, psizes, 1, numel);
-            break;
-        }
-        case UOP_COL2IM: {
-            Conv2dParams cp;
-            metal_buf_read(params_buf, &cp, sizeof(cp));
-            u32 numel = cp.B * cp.Cin * cp.H * cp.W;
-            id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
-            const void *params[] = { &cp };
-            u64 psizes[] = { sizeof(Conv2dParams) };
-            dispatch_1d(pipe_col2im, bufs, 2, params, psizes, 1, numel);
-            break;
-        }
-        case UOP_NCHW2NHWC: {
-            LayoutParams lp;
-            metal_buf_read(params_buf, &lp, sizeof(lp));
-            u32 numel = lp.B * lp.C * lp.H * lp.W;
-            id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
-            const void *params[] = { &lp };
-            u64 psizes[] = { sizeof(LayoutParams) };
-            dispatch_1d(pipe_nchw_to_nhwc, bufs, 2, params, psizes, 1, numel);
-            break;
-        }
-        case UOP_NHWC2NCHW: {
-            LayoutParams lp;
-            metal_buf_read(params_buf, &lp, sizeof(lp));
-            u32 numel = lp.B * lp.C * lp.H * lp.W;
-            id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
-            const void *params[] = { &lp };
-            u64 psizes[] = { sizeof(LayoutParams) };
-            dispatch_1d(pipe_nhwc_to_nchw, bufs, 2, params, psizes, 1, numel);
-            break;
-        }
-        case UOP_MAXPOOL: {
-            break;
-        }
-        default: break;
-    }
-    thvm_prof_record(uop, t0);
+static void metal_op_im2col(u32 dst, u32 src, Conv2dParams p) {
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+    const void *params[] = { &p };
+    u64 psizes[] = { sizeof(Conv2dParams) };
+    dispatch_1d(pipe_im2col, bufs, 2, params, psizes, 1, p.n_patches * p.patch_size);
+}
+
+static void metal_op_col2im(u32 dst, u32 src, Conv2dParams p) {
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+    const void *params[] = { &p };
+    u64 psizes[] = { sizeof(Conv2dParams) };
+    dispatch_1d(pipe_col2im, bufs, 2, params, psizes, 1, p.B * p.Cin * p.H * p.W);
+}
+
+static void metal_op_nhwc_to_nchw(u32 dst, u32 src, u32 B, u32 C, u32 H, u32 W) {
+    LayoutParams lp = {B, C, H, W};
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+    const void *params[] = { &lp };
+    u64 psizes[] = { sizeof(LayoutParams) };
+    dispatch_1d(pipe_nhwc_to_nchw, bufs, 2, params, psizes, 1, B * C * H * W);
+}
+
+static void metal_op_nchw_to_nhwc(u32 dst, u32 src, u32 B, u32 C, u32 H, u32 W) {
+    LayoutParams lp = {B, C, H, W};
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+    const void *params[] = { &lp };
+    u64 psizes[] = { sizeof(LayoutParams) };
+    dispatch_1d(pipe_nchw_to_nhwc, bufs, 2, params, psizes, 1, B * C * H * W);
+}
+
+static void metal_op_bias_add(u32 buf, u32 bias, u32 C, u32 n) {
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[buf], metal_pool.bufs[bias] };
+    const void *params[] = { &C };
+    u64 psizes[] = { sizeof(u32) };
+    dispatch_1d(pipe_bias_add, bufs, 2, params, psizes, 1, n);
+}
+
+static void metal_op_col_sum(u32 dst, u32 src, u32 N, u32 C) {
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+    const void *params[] = { &N, &C };
+    u64 psizes[] = { sizeof(u32), sizeof(u32) };
+    dispatch_1d(pipe_col_sum, bufs, 2, params, psizes, 2, C);
+}
+
+static void metal_op_transpose(u32 dst, u32 src, u32 M, u32 N) {
+    typedef struct { u32 M, N; } TP;
+    TP tp = {M, N};
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+    const void *params[] = { &tp };
+    u64 psizes[] = { sizeof(TP) };
+    dispatch_1d(pipe_matrix_transpose, bufs, 2, params, psizes, 1, M * N);
+}
+
+static void metal_op_maxpool_fwd(u32 out, u32 mask, u32 src, u32 B, u32 C, u32 H, u32 W) {
+    u32 OH = H / 2, OW = W / 2;
+    LayoutParams lp = {B, C, H, W};
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[out], metal_pool.bufs[mask], metal_pool.bufs[src] };
+    const void *params[] = { &lp };
+    u64 psizes[] = { sizeof(LayoutParams) };
+    dispatch_1d(pipe_maxpool2d_fwd, bufs, 3, params, psizes, 1, B * C * OH * OW);
+}
+
+static void metal_op_maxpool_bwd(u32 dx, u32 dout, u32 mask, u32 B, u32 C, u32 H, u32 W) {
+    u32 OH = H / 2, OW = W / 2;
+    LayoutParams lp = {B, C, H, W};
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dx], metal_pool.bufs[dout], metal_pool.bufs[mask] };
+    const void *params[] = { &lp };
+    u64 psizes[] = { sizeof(LayoutParams) };
+    dispatch_1d(pipe_maxpool2d_bwd, bufs, 3, params, psizes, 1, B * C * OH * OW);
+}
+
+static void metal_op_relu_bwd(u32 dx, u32 dout, u32 x, u32 n) {
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dx], metal_pool.bufs[dout], metal_pool.bufs[x] };
+    dispatch_1d(pipe_relu_bwd, bufs, 3, NULL, NULL, 0, n);
+}
+
+static void metal_op_zero_fill(u32 buf, u32 n) {
+    id<MTLBuffer> bufs_[] = { metal_pool.bufs[buf] };
+    dispatch_1d(pipe_zero_fill, bufs_, 1, NULL, NULL, 0, n);
+}
+
+static void metal_op_adam_step(u32 param, u32 grad, u32 m, u32 v,
+                                f32 lr, f32 beta1, f32 beta2, f32 eps,
+                                f32 bc1, f32 bc2, u32 n) {
+    typedef struct { f32 lr, beta1, beta2, eps, bc1, bc2; } AP;
+    AP ap = {lr, beta1, beta2, eps, bc1, bc2};
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[param], metal_pool.bufs[grad],
+                              metal_pool.bufs[m], metal_pool.bufs[v] };
+    const void *params[] = { &ap };
+    u64 psizes[] = { sizeof(AP) };
+    dispatch_1d(pipe_adam_step, bufs, 4, params, psizes, 1, n);
 }
 
 // ============================================================
@@ -546,10 +587,22 @@ Backend metal_backend = {
     .op_binary = metal_op_binary,
     .op_mm     = metal_op_mm,
     .op_reduce = metal_op_reduce,
-    .op_cnn    = metal_op_cnn,
+    .op_im2col = metal_op_im2col,
+    .op_col2im = metal_op_col2im,
+    .op_nhwc_to_nchw = metal_op_nhwc_to_nchw,
+    .op_nchw_to_nhwc = metal_op_nchw_to_nhwc,
+    .op_bias_add = metal_op_bias_add,
+    .op_col_sum  = metal_op_col_sum,
+    .op_transpose = metal_op_transpose,
+    .op_maxpool_fwd = metal_op_maxpool_fwd,
+    .op_maxpool_bwd = metal_op_maxpool_bwd,
+    .op_relu_bwd = metal_op_relu_bwd,
+    .op_zero_fill = metal_op_zero_fill,
+    .op_adam_step = metal_op_adam_step,
     .pool_reset = metal_pool_reset,
     .begin_batch = metal_begin_batch,
     .end_batch   = metal_end_batch,
     .profile_report = metal_profile_report,
     .profile_reset  = metal_profile_reset,
 };
+

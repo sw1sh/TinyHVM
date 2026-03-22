@@ -114,21 +114,13 @@ typedef u64 Term;
 #define UOP_SHRINK    21  // = slice
 #define UOP_PAD       22
 
-// CNN (need custom gradient rules in thvm_grad):
-#define UOP_IM2COL    23  // im2col: x[B,C,H,W] → col[n_patches, patch_size]
-#define UOP_COL2IM    24  // col2im: col[n_patches, patch_size] → x[B,C,H,W]
-#define UOP_MAXPOOL   25  // maxpool2d: x[B,C,H,W] → out[B,C,OH,OW]
-#define UOP_NCHW2NHWC 26  // layout transpose
-#define UOP_NHWC2NCHW 27  // layout transpose
-
-#define UOP_COUNT     28
+#define UOP_COUNT     23
 
 // UOp name table (device-agnostic)
 static const char *uop_names[] = {
     "LOAD","STORE","CONST","CAST","NEG","RELU","EXP","LOG","SQRT","RECIP",
     "ADD","MUL","MAX","CMP","SUB","SUM","RMAX","MM",
-    "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD",
-    "IM2COL","COL2IM","MAXPOOL","NCHW2NHWC","NHWC2NCHW"
+    "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD"
 };
 
 // ============================================================
@@ -173,7 +165,7 @@ static inline void thvm_prof_record(u32 uop, u64 t0) {
     }
 }
 
-// CNN op parameter structs (must match Metal shader structs)
+// Conv2d parameter structs (used by layers.c internal kernels)
 typedef struct { u32 B, Cin, H, W, KH, KW, OH, OW, patch_size, n_patches; } Conv2dParams;
 typedef struct { u32 B, C, H, W; } LayoutParams;
 typedef struct { u32 B, C, H, W, OH, OW; } Pool2dParams;
@@ -273,9 +265,22 @@ typedef struct {
     // dst shape = src shape with last dim collapsed to 1
     void  (*op_reduce)(u32 uop, u32 dst, u32 dst_numel,
                        u32 src, u32 src_numel, u32 reduce_dim);
-    // CNN ops: im2col, col2im, maxpool, layout transpose
-    // params_buf contains Conv2dParams or LayoutParams as raw u32s
-    void  (*op_cnn)(u32 uop, u32 dst, u32 src, u32 params_buf);
+
+    // CNN ops — used by layers.c, device-agnostic
+    void  (*op_im2col)(u32 dst, u32 src, Conv2dParams p);
+    void  (*op_col2im)(u32 dst, u32 src, Conv2dParams p);
+    void  (*op_nhwc_to_nchw)(u32 dst, u32 src, u32 B, u32 C, u32 H, u32 W);
+    void  (*op_nchw_to_nhwc)(u32 dst, u32 src, u32 B, u32 C, u32 H, u32 W);
+    void  (*op_bias_add)(u32 buf, u32 bias, u32 C, u32 n);
+    void  (*op_col_sum)(u32 dst, u32 src, u32 N, u32 C);
+    void  (*op_transpose)(u32 dst, u32 src, u32 M, u32 N);
+    void  (*op_maxpool_fwd)(u32 out, u32 mask, u32 src, u32 B, u32 C, u32 H, u32 W);
+    void  (*op_maxpool_bwd)(u32 dx, u32 dout, u32 mask, u32 B, u32 C, u32 H, u32 W);
+    void  (*op_relu_bwd)(u32 dx, u32 dout, u32 x, u32 n);
+    void  (*op_zero_fill)(u32 buf, u32 n);
+    void  (*op_adam_step)(u32 param, u32 grad, u32 m, u32 v,
+                          f32 lr, f32 beta1, f32 beta2, f32 eps, f32 bc1, f32 bc2, u32 n);
+
     // Pool management: reset buffer pool to `keep` entries
     void  (*pool_reset)(u32 keep);
     // Command buffer batching: accumulate GPU work without sync
@@ -390,12 +395,15 @@ Term     thvm_grad(TinyHVM *ctx, Term y, Term x);
 void     thvm_backward(TinyHVM *ctx, Term loss,
                        Term *params, Term *grads, u32 n_params);
 
-// Conv2d as UOp composition (autograd-compatible)
-// Builds: im2col → MM → bias_add → layout_transpose as lazy TOP nodes
-// Conv params passed as a tensor — create with thvm_conv2d_params()
-Term     thvm_conv2d_params(TinyHVM *ctx, u32 B, u32 Cin, u32 H, u32 W,
-                            u32 KH, u32 KW);
-Term     thvm_conv2d_forward(TinyHVM *ctx, Term x, Term w, Term bias,
-                             Term conv_params);
+// Movement ops
+Term     thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim);
+Term     thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim);
+
+// Tinygrad-style UOp compositions
+Term     thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
+                   u32 n_spatial);
+Term     thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
+                     u32 groups, const u32 *stride_, const u32 *padding_);
+Term     thvm_maxpool2d(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_);
 
 #endif // TINYHVM_H

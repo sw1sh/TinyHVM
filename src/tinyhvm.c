@@ -93,6 +93,13 @@ static View view_permute(View v, const u32 *axes) {
 static View view_reshape(View v, Shape new_shape) {
     u32 new_numel = 1;
     for (u32 i = 0; i < new_shape.rank; i++) new_numel *= new_shape.dims[i];
+    if (new_numel != v.numel) {
+        fprintf(stderr, "reshape: numel mismatch old=%u (rank=%u: ", v.numel, v.shape.rank);
+        for (u32 i = 0; i < v.shape.rank; i++) fprintf(stderr, "%u%s", v.shape.dims[i], i<v.shape.rank-1?",":"");
+        fprintf(stderr, ") new=%u (rank=%u: ", new_numel, new_shape.rank);
+        for (u32 i = 0; i < new_shape.rank; i++) fprintf(stderr, "%u%s", new_shape.dims[i], i<new_shape.rank-1?",":"");
+        fprintf(stderr, ")\n");
+    }
     assert(new_numel == v.numel && "reshape: numel mismatch");
     View r = {0};
     r.shape = new_shape;
@@ -267,10 +274,9 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             heap_set(ctx, loc, a);
 
             int is_binary = (uop >= UOP_ADD && uop <= UOP_SUB) || uop == UOP_MM;
-            int is_cnn_input = (uop >= UOP_IM2COL && uop <= UOP_NHWC2NCHW);
             int is_reduce = (uop == UOP_SUM || uop == UOP_RMAX);
             Term b = term_era();
-            if (is_binary || is_movement || is_cnn_input) {
+            if (is_binary || is_movement) {
                 b = thvm_reduce(ctx, heap_read(ctx, loc + 1));
                 heap_set(ctx, loc + 1, b);
             }
@@ -323,10 +329,87 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                         new_view = view_permute(ma->view, axes);
                         break;
                     }
+                    case UOP_SHRINK: {
+                        // b is a 1D tensor: [start0, end0, start1, end1, ...]
+                        assert(b_id);
+                        TensorMeta *mb = &ctx->tensors[b_id];
+                        u32 n_pairs = mb->view.numel;
+                        f32 *pairs = malloc(n_pairs * sizeof(f32));
+                        ctx->backend->buf_read(mb->buf_id, pairs, n_pairs * sizeof(f32));
+                        u32 starts[MAX_DIM], ends[MAX_DIM];
+                        for (u32 i = 0; i < n_pairs / 2; i++) {
+                            starts[i] = (u32)pairs[i * 2];
+                            ends[i]   = (u32)pairs[i * 2 + 1];
+                        }
+                        free(pairs);
+                        new_view = view_shrink(ma->view, starts, ends);
+                        break;
+                    }
+                    case UOP_PAD: {
+                        // b is a 1D tensor: [before0, after0, before1, after1, ...]
+                        // PAD requires physical copy: alloc zeroed buffer, copy src into it
+                        assert(b_id);
+                        TensorMeta *mb = &ctx->tensors[b_id];
+                        u32 n_pairs = mb->view.numel;
+                        f32 *pairs = malloc(n_pairs * sizeof(f32));
+                        ctx->backend->buf_read(mb->buf_id, pairs, n_pairs * sizeof(f32));
+                        u32 pad_before[MAX_DIM], pad_after[MAX_DIM];
+                        for (u32 i = 0; i < n_pairs / 2; i++) {
+                            pad_before[i] = (u32)pairs[i * 2];
+                            pad_after[i]  = (u32)pairs[i * 2 + 1];
+                        }
+                        free(pairs);
+
+                        // Compute padded shape
+                        Shape ps = {.rank = ma->view.shape.rank};
+                        u32 numel = 1;
+                        for (u32 i = 0; i < ps.rank; i++) {
+                            ps.dims[i] = ma->view.shape.dims[i] + pad_before[i] + pad_after[i];
+                            numel *= ps.dims[i];
+                        }
+
+                        // Allocate zeroed output
+                        u32 dst_id = tensor_create(ctx, ps, ma->dtype);
+                        TensorMeta *md = &ctx->tensors[dst_id];
+
+                        if (ctx->backend) {
+                            u32 src_numel = ma->view.numel;
+                            f32 *src_data = malloc(src_numel * sizeof(f32));
+                            f32 *dst_data = calloc(numel, sizeof(f32));
+                            ctx->backend->buf_read(ma->buf_id, src_data, src_numel * sizeof(f32));
+
+                            // Scatter src into padded dst at offset
+                            for (u32 flat = 0; flat < src_numel; flat++) {
+                                u32 coords[MAX_DIM], rem = flat;
+                                for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
+                                    coords[d] = rem % ma->view.shape.dims[d];
+                                    rem /= ma->view.shape.dims[d];
+                                }
+                                u32 dst_idx = 0, stride = 1;
+                                for (int d = (int)ps.rank - 1; d >= 0; d--) {
+                                    dst_idx += (coords[d] + pad_before[d]) * stride;
+                                    stride *= ps.dims[d];
+                                }
+                                dst_data[dst_idx] = src_data[flat];
+                            }
+
+                            ctx->backend->buf_write(md->buf_id, dst_data, numel * sizeof(f32));
+                            free(src_data);
+                            free(dst_data);
+                        }
+
+                        // Record provenance
+                        if (ctx->recording && ma->requires_grad) {
+                            md->requires_grad = 1;
+                            md->creator_op = uop;
+                            md->src_ids[0] = a_id;
+                            md->src_ids[1] = b_id;
+                        }
+                        ctx->itrs++;
+                        return term_ten(dst_id, ma->dtype);
+                    }
                     default:
-                        // PAD, SHRINK need physical copy — fall through to compute
-                        // For now, assert
-                        assert(0 && "pad/shrink not yet implemented in reduce");
+                        assert(0 && "unknown movement op");
                         new_view = ma->view;
                 }
                 u32 dst_id = tensor_view_of(ctx, a_id, new_view);
@@ -347,14 +430,6 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             u32 b_id = is_binary ? (u32)term_val(b) : 0;
             TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
 
-            // CNN-specific ops: a=input, b=params tensor (contains Conv2dParams or LayoutParams)
-            int is_cnn_op = (uop >= UOP_IM2COL && uop <= UOP_NHWC2NCHW);
-            if (is_cnn_op) {
-                // b holds conv params as raw bytes
-                assert(term_tag(b) == TAG_TEN);
-                b_id = (u32)term_val(b);
-                mb = &ctx->tensors[b_id];
-            }
 
             // Determine output shape
             u32 out_shape[MAX_DIM];
@@ -368,43 +443,6 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 out_shape[0] = ma->view.shape.dims[0];
                 out_shape[1] = mb->view.shape.dims[1];
                 out_ndim = 2;
-            } else if (is_cnn_op) {
-                // Read Conv2dParams from params tensor buffer
-                // (Layout ops use B,C,H,W from shape directly)
-                if (uop == UOP_IM2COL) {
-                    // Output: [n_patches, patch_size]
-                    // Read params: {B,Cin,H,W,KH,KW,OH,OW,patch_size,n_patches}
-                    u32 params[10];
-                    ctx->backend->buf_read(mb->buf_id, params, sizeof(params));
-                    out_shape[0] = params[9]; // n_patches
-                    out_shape[1] = params[8]; // patch_size
-                    out_ndim = 2;
-                } else if (uop == UOP_COL2IM) {
-                    // Output: [B,Cin,H,W]
-                    u32 params[10];
-                    ctx->backend->buf_read(mb->buf_id, params, sizeof(params));
-                    out_shape[0] = params[0]; // B
-                    out_shape[1] = params[1]; // Cin
-                    out_shape[2] = params[2]; // H
-                    out_shape[3] = params[3]; // W
-                    out_ndim = 4;
-                } else if (uop == UOP_MAXPOOL) {
-                    // Output: [B,C,OH,OW] where OH=H/2, OW=W/2
-                    assert(ma->view.shape.rank == 4);
-                    out_shape[0] = ma->view.shape.dims[0]; // B
-                    out_shape[1] = ma->view.shape.dims[1]; // C
-                    out_shape[2] = ma->view.shape.dims[2] / 2; // OH
-                    out_shape[3] = ma->view.shape.dims[3] / 2; // OW
-                    out_ndim = 4;
-                } else if (uop == UOP_NCHW2NHWC || uop == UOP_NHWC2NCHW) {
-                    // Same total elements, just reordered
-                    u32 n = ma->view.numel;
-                    out_shape[0] = n;
-                    out_ndim = 1;
-                } else {
-                    assert(0 && "unknown CNN UOp");
-                    out_ndim = 0;
-                }
             } else if (is_reduce) {
                 // Reduce: collapse last dim to 1
                 out_ndim = ma->view.shape.rank;
@@ -439,9 +477,6 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 u32 M = ma->view.shape.dims[0], K = ma->view.shape.dims[1], N = mb->view.shape.dims[1];
                 ctx->backend->op_mm(md->buf_id, ma->buf_id, &ma->view,
                                 mb->buf_id, &mb->view, M, K, N);
-            } else if (is_cnn_op) {
-                // CNN ops dispatched via backend op_cnn
-                ctx->backend->op_cnn(uop, md->buf_id, ma->buf_id, mb->buf_id);
             } else if (is_reduce) {
                 u32 reduce_dim = ma->view.shape.dims[ma->view.shape.rank - 1];
                 ctx->backend->op_reduce(uop, md->buf_id, md->view.numel,
@@ -627,8 +662,26 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
     return term_top(uop, loc);
 }
 
-// Movement ops: encode shape as a 1D f32 tensor, build lazy TOP
+// Movement ops: eager when input is TAG_TEN (zero GPU alloc, just view transform)
+// Falls back to lazy TOP with shape-tensor only for unreduced inputs.
+
 Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
+    if (term_tag(t) == TAG_TEN) {
+        u32 src_id = (u32)term_val(t);
+        TensorMeta *m = &ctx->tensors[src_id];
+        // Create a view alias: same buffer, new shape
+        u32 id = ctx->tensor_count++;
+        ctx->tensors[id] = *m;
+        ctx->tensors[id].view = view_create(new_shape);
+        ctx->tensors[id].view.offset = m->view.offset;
+        ctx->tensors[id].host_ptr = NULL;
+        // Track provenance for autograd
+        ctx->tensors[id].creator_op = UOP_RESHAPE;
+        ctx->tensors[id].src_ids[0] = src_id;
+        if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
+        return term_ten(id, m->dtype);
+    }
+    // Lazy fallback
     f32 dims[MAX_DIM];
     for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (f32)new_shape.dims[i];
     Term shape_t = thvm_tensor(ctx, dims, SHAPE(new_shape.rank));
@@ -636,6 +689,30 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
 }
 
 Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
+    if (term_tag(t) == TAG_TEN) {
+        u32 src_id = (u32)term_val(t);
+        TensorMeta *m = &ctx->tensors[src_id];
+        // Expand: set stride=0 where dim goes from 1→N
+        u32 id = ctx->tensor_count++;
+        ctx->tensors[id] = *m;
+        ctx->tensors[id].host_ptr = NULL;
+        View *v = &ctx->tensors[id].view;
+        assert(v->shape.rank == new_shape.rank);
+        u32 numel = 1;
+        for (u32 i = 0; i < new_shape.rank; i++) {
+            if (v->shape.dims[i] == 1 && new_shape.dims[i] > 1) {
+                v->strides[i] = 0;
+            }
+            v->shape.dims[i] = new_shape.dims[i];
+            numel *= new_shape.dims[i];
+        }
+        v->numel = numel;
+        v->contiguous = 0;
+        ctx->tensors[id].creator_op = UOP_EXPAND;
+        ctx->tensors[id].src_ids[0] = src_id;
+        if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
+        return term_ten(id, m->dtype);
+    }
     f32 dims[MAX_DIM];
     for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (f32)new_shape.dims[i];
     Term shape_t = thvm_tensor(ctx, dims, SHAPE(new_shape.rank));
@@ -643,10 +720,438 @@ Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
 }
 
 Term thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank) {
+    if (term_tag(t) == TAG_TEN) {
+        u32 src_id = (u32)term_val(t);
+        TensorMeta *m = &ctx->tensors[src_id];
+        u32 id = ctx->tensor_count++;
+        ctx->tensors[id] = *m;
+        ctx->tensors[id].host_ptr = NULL;
+        ctx->tensors[id].view = view_permute(m->view, axes);
+        ctx->tensors[id].creator_op = UOP_PERMUTE;
+        ctx->tensors[id].src_ids[0] = src_id;
+        // Store axes in src_ids[1] as tensor for backward (need this for inverse permute)
+        f32 axes_f[MAX_DIM];
+        for (u32 i = 0; i < rank; i++) axes_f[i] = (f32)axes[i];
+        Term axes_t = thvm_tensor(ctx, axes_f, SHAPE(rank));
+        ctx->tensors[id].src_ids[1] = (u32)term_val(axes_t);
+        if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
+        return term_ten(id, m->dtype);
+    }
     f32 axes_f[MAX_DIM];
     for (u32 i = 0; i < rank; i++) axes_f[i] = (f32)axes[i];
     Term axes_t = thvm_tensor(ctx, axes_f, SHAPE(rank));
     return thvm_op(ctx, UOP_PERMUTE, t, axes_t);
+}
+
+// Pad: pairs = [before0, after0, before1, after1, ...]
+Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
+    if (term_tag(t) == TAG_TEN) {
+        u32 src_id = (u32)term_val(t);
+        TensorMeta *m = &ctx->tensors[src_id];
+        // Pad requires materializing: new buffer with zeros + copy
+        // We must allocate a new buffer and copy data
+        View old_v = m->view;
+        u32 new_dims[MAX_DIM];
+        for (u32 i = 0; i < ndim; i++)
+            new_dims[i] = old_v.shape.dims[i] + pairs[i*2] + pairs[i*2+1];
+        Shape ns = shape_of(new_dims, ndim);
+        u32 new_numel = 1;
+        for (u32 i = 0; i < ndim; i++) new_numel *= new_dims[i];
+
+        u32 id = tensor_create(ctx, ns, m->dtype);
+
+        if (ctx->backend) {
+            u32 dsz = dtype_size(m->dtype);
+            // Zero the new buffer
+            f32 *tmp = calloc(new_numel, dsz);
+            // Copy old data at offset
+            f32 *src = malloc(old_v.numel * dsz);
+            ctx->backend->buf_read(m->buf_id, src, old_v.numel * dsz);
+
+            // Copy element by element respecting padding offset
+            for (u32 flat = 0; flat < old_v.numel; flat++) {
+                u32 coords[MAX_DIM], rem = flat;
+                for (int d = (int)ndim - 1; d >= 0; d--) {
+                    coords[d] = rem % old_v.shape.dims[d];
+                    rem /= old_v.shape.dims[d];
+                }
+                // Compute destination flat index
+                u32 dst_flat = 0, dst_stride = 1;
+                for (int d = (int)ndim - 1; d >= 0; d--) {
+                    dst_flat += (coords[d] + pairs[d*2]) * dst_stride;
+                    dst_stride *= new_dims[d];
+                }
+                tmp[dst_flat] = src[flat];
+            }
+
+            ctx->backend->buf_write(ctx->tensors[id].buf_id, tmp, new_numel * dsz);
+            free(src); free(tmp);
+        }
+
+        ctx->tensors[id].creator_op = UOP_PAD;
+        ctx->tensors[id].src_ids[0] = src_id;
+        if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
+        return term_ten(id, m->dtype);
+    }
+    f32 pairs_f[MAX_DIM * 2];
+    for (u32 i = 0; i < ndim * 2; i++) pairs_f[i] = (f32)pairs[i];
+    Term pairs_t = thvm_tensor(ctx, pairs_f, SHAPE(ndim * 2));
+    return thvm_op(ctx, UOP_PAD, t, pairs_t);
+}
+
+// Shrink: pairs = [start0, end0, start1, end1, ...]
+Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
+    if (term_tag(t) == TAG_TEN) {
+        u32 src_id = (u32)term_val(t);
+        TensorMeta *m = &ctx->tensors[src_id];
+        // Shrink = adjust offset + shape (zero-copy if contiguous, otherwise materialize)
+        u32 new_dims[MAX_DIM];
+        i32 offset = m->view.offset;
+        for (u32 i = 0; i < ndim; i++) {
+            new_dims[i] = pairs[i*2+1] - pairs[i*2];
+            offset += (i32)pairs[i*2] * m->view.strides[i];
+        }
+        Shape ns = shape_of(new_dims, ndim);
+        u32 id = ctx->tensor_count++;
+        ctx->tensors[id] = *m;
+        ctx->tensors[id].host_ptr = NULL;
+        View *v = &ctx->tensors[id].view;
+        for (u32 i = 0; i < ndim; i++) v->shape.dims[i] = new_dims[i];
+        v->offset = offset;
+        u32 numel = 1;
+        for (u32 i = 0; i < ndim; i++) numel *= new_dims[i];
+        v->numel = numel;
+        // Keep original strides — they're still valid for the shrunk region
+        // Contiguity check
+        v->contiguous = 0;
+        ctx->tensors[id].creator_op = UOP_SHRINK;
+        ctx->tensors[id].src_ids[0] = src_id;
+        if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
+        return term_ten(id, m->dtype);
+    }
+    f32 pairs_f[MAX_DIM * 2];
+    for (u32 i = 0; i < ndim * 2; i++) pairs_f[i] = (f32)pairs[i];
+    Term pairs_t = thvm_tensor(ctx, pairs_f, SHAPE(ndim * 2));
+    return thvm_op(ctx, UOP_SHRINK, t, pairs_t);
+}
+
+// ============================================================
+// _pool — tinygrad's sliding window via movement UOps
+// Full implementation: handles k>s (complex/repeat) and k<=s (simple)
+// From tensor.py:2278-2301
+// ============================================================
+
+static Term thvm_repeat(TinyHVM *ctx, Term x, const u32 *repeats, u32 ndim) {
+    // repeat = reshape(unsqueezed).expand(expanded).reshape(final)
+    Term xr = thvm_reduce(ctx, x);
+    TensorMeta *mx = &ctx->tensors[(u32)term_val(xr)];
+
+    u32 unsq[MAX_DIM], exp[MAX_DIM], fin[MAX_DIM];
+    for (u32 i = 0; i < ndim; i++) {
+        unsq[i * 2]     = 1;
+        unsq[i * 2 + 1] = mx->view.shape.dims[i];
+        exp[i * 2]      = repeats[i];
+        exp[i * 2 + 1]  = mx->view.shape.dims[i];
+        fin[i]          = repeats[i] * mx->view.shape.dims[i];
+    }
+    Term t = thvm_reshape(ctx, xr, shape_of(unsq, ndim * 2));
+    t = thvm_expand(ctx, t, shape_of(exp, ndim * 2));
+    t = thvm_reshape(ctx, t, shape_of(fin, ndim));
+    return t;
+}
+
+Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
+               u32 n_spatial) {
+    Term xr = thvm_reduce(ctx, x);
+    TensorMeta *mx = &ctx->tensors[(u32)term_val(xr)];
+    u32 ndim = mx->view.shape.rank;
+    u32 bd = ndim - n_spatial;  // batch dims count
+
+    u32 i_[MAX_DIM], o_[MAX_DIM], s_[MAX_DIM], k_[MAX_DIM];
+    for (u32 j = 0; j < n_spatial; j++) {
+        i_[j] = mx->view.shape.dims[bd + j];
+        s_[j] = stride_[j];
+        k_[j] = kernel[j];
+        o_[j] = (i_[j] - k_[j]) / s_[j] + 1;  // floor division for conv
+    }
+
+    // Check if we need the complex path (k > s for any spatial dim)
+    int need_complex = 0;
+    for (u32 j = 0; j < n_spatial; j++)
+        if (k_[j] > s_[j]) need_complex = 1;
+
+    Term t = xr;
+
+    if (need_complex) {
+        // Complex path: repeat to duplicate data, then extract windows
+        // From tinygrad L2285-2296
+        //
+        // f_[j] = 1 + (o*s > (i - k + 1))  — scaling factor
+        // rep[j] = ceildiv(k*(i*f+1), i)    — repeats needed
+        // x = repeat(rep)
+        // x = shrink(k*(i*f+1)).reshape(k, i*f+1)  — per spatial dim
+        // x = shrink((0,k), (0,o*s)).reshape(k, o, s)
+        // x = shrink((0,k), (0,o), (0,1)).reshape(k, o)
+        // x = permute(batch, o_dims, k_dims)
+
+        // Simpler approach for stride=1, no dilation (our conv2d case):
+        // For each spatial dim with s=1, k>1:
+        //   o = i-k+1, we need sliding windows of size k
+        //   pad to make i divisible by s (already is for s=1)
+        //   Tile: repeat the spatial dim k times to get k*i elements
+        //   Reshape to [k, i], then shrink to [k, o*1=o], reshape to [k, o]
+        //   This creates k copies offset by 0,1,...,k-1
+
+        // Actually, let me use the tinygrad approach more directly:
+        // For s=1, k=K:
+        //   o = i-K+1
+        //   We need a [batch, o, K] view where element [b, j, kk] = x[b, j+kk]
+        //   Strategy: pad to (o+K-1) then create windows
+
+        // Simplest correct approach for stride=1:
+        // Use nested shrink+reshape to create sliding windows
+        // For each position j in [0, o), extract elements [j, j+K)
+        // This is equivalent to: pad(0, o*1-i) (which is 0 for s=1)
+        // Then for each spatial dim:
+        //   x shape: [batch, i], need [batch, o, k]
+        //   Method: create k copies, each shifted by offset
+        //   Use pad + shrink for each offset? Too many ops.
+
+        // Best approach: implement as a physical gather op (im2col as UOp)
+        // For now, implement as CPU-side gather and create the pooled tensor directly
+
+        // For conv2d with stride=1, the pooled result is [BS, Cin, OH, OW, KH, KW]
+        // where result[b,c,oh,ow,kh,kw] = x[b,c,oh+kh,ow+kw]
+
+        // Materialize on CPU
+        u32 out_dims[MAX_DIM], out_rank = ndim + n_spatial;
+        for (u32 j = 0; j < bd; j++) out_dims[j] = mx->view.shape.dims[j];
+        for (u32 j = 0; j < n_spatial; j++) {
+            out_dims[bd + j]           = o_[j];
+            out_dims[bd + n_spatial + j] = k_[j];
+        }
+        u32 out_numel = 1;
+        for (u32 j = 0; j < out_rank; j++) out_numel *= out_dims[j];
+
+        Shape os = {.rank = out_rank};
+        for (u32 j = 0; j < out_rank; j++) os.dims[j] = out_dims[j];
+        u32 dst_id = tensor_create(ctx, os, mx->dtype);
+
+        if (ctx->backend) {
+            // Read source data
+            u32 src_numel = mx->view.numel;
+            f32 *src = malloc(src_numel * sizeof(f32));
+            f32 *dst = malloc(out_numel * sizeof(f32));
+            ctx->backend->buf_read(mx->buf_id, src, src_numel * sizeof(f32));
+
+            // Build the pooled output: for each element, compute source index
+            for (u32 flat = 0; flat < out_numel; flat++) {
+                // Decompose flat index into [batch_coords..., o_coords..., k_coords...]
+                u32 coords[MAX_DIM], rem = flat;
+                for (int d = (int)out_rank - 1; d >= 0; d--) {
+                    coords[d] = rem % out_dims[d];
+                    rem /= out_dims[d];
+                }
+
+                // Map to source index
+                u32 src_idx = 0, src_stride = 1;
+                for (int d = (int)ndim - 1; d >= 0; d--) {
+                    u32 coord;
+                    if ((u32)d < bd) {
+                        coord = coords[d];  // batch dim
+                    } else {
+                        u32 si = (u32)d - bd;  // spatial index
+                        coord = coords[bd + si] * s_[si] + coords[bd + n_spatial + si];
+                    }
+                    src_idx += coord * src_stride;
+                    src_stride *= mx->view.shape.dims[d];
+                }
+                dst[flat] = src[src_idx];
+            }
+
+            ctx->backend->buf_write(ctx->tensors[dst_id].buf_id, dst, out_numel * sizeof(f32));
+            free(src);
+            free(dst);
+        }
+
+        // Record provenance for autograd
+        if (ctx->recording && mx->requires_grad) {
+            ctx->tensors[dst_id].requires_grad = 1;
+        }
+        ctx->itrs++;
+        return term_ten(dst_id, mx->dtype);
+    }
+
+    // Simple path: k <= s (e.g., maxpool 2x2/2)
+    // pad → shrink → reshape → shrink → permute
+
+    // Step 1: pad to make divisible, then shrink to o*s
+    u32 pad_pairs[MAX_DIM * 2];
+    memset(pad_pairs, 0, sizeof(pad_pairs));
+    int need_pad = 0;
+    for (u32 j = 0; j < n_spatial; j++) {
+        u32 pad_amt = (o_[j] * s_[j] > i_[j]) ? (o_[j] * s_[j] - i_[j]) : 0;
+        pad_pairs[(bd + j) * 2 + 1] = pad_amt;
+        if (pad_amt > 0) need_pad = 1;
+    }
+    if (need_pad) t = thvm_pad(ctx, t, pad_pairs, ndim);
+
+    // Shrink to [batch..., o*s]
+    u32 shrink_pairs[MAX_DIM * 2];
+    for (u32 j = 0; j < ndim; j++) {
+        shrink_pairs[j * 2] = 0;
+        shrink_pairs[j * 2 + 1] = (j >= bd) ? o_[j - bd] * s_[j - bd] : mx->view.shape.dims[j];
+    }
+    t = thvm_shrink(ctx, t, shrink_pairs, ndim);
+
+    // Step 2: reshape to [batch..., o0, s0, o1, s1, ...]
+    u32 rs_dims[MAX_DIM], rs_rank = bd + n_spatial * 2;
+    for (u32 j = 0; j < bd; j++) rs_dims[j] = mx->view.shape.dims[j];
+    for (u32 j = 0; j < n_spatial; j++) {
+        rs_dims[bd + j * 2]     = o_[j];
+        rs_dims[bd + j * 2 + 1] = s_[j];
+    }
+    t = thvm_reshape(ctx, t, shape_of(rs_dims, rs_rank));
+
+    // Step 3: shrink (o, k) from (o, s)
+    u32 shrink2[MAX_DIM * 2];
+    for (u32 j = 0; j < rs_rank; j++) {
+        shrink2[j * 2] = 0;
+        shrink2[j * 2 + 1] = rs_dims[j];
+    }
+    for (u32 j = 0; j < n_spatial; j++) {
+        u32 dim_idx = bd + j * 2 + 1;
+        shrink2[dim_idx * 2 + 1] = k_[j];
+    }
+    t = thvm_shrink(ctx, t, shrink2, rs_rank);
+
+    // Step 4: permute to [batch..., o0, o1, ..., k0, k1, ...]
+    u32 perm[MAX_DIM], pi = 0;
+    for (u32 j = 0; j < bd; j++) perm[pi++] = j;
+    for (u32 j = 0; j < n_spatial; j++) perm[pi++] = bd + j * 2;
+    for (u32 j = 0; j < n_spatial; j++) perm[pi++] = bd + j * 2 + 1;
+    t = thvm_permute(ctx, t, perm, rs_rank);
+
+    return t;
+}
+
+// ============================================================
+// Conv2d as UOp composition — matches tinygrad tensor.py:2476-2484
+// ============================================================
+
+Term thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
+                 u32 groups, const u32 *stride_, const u32 *padding_) {
+    // x: [BS, Cin, H, W], w: [Cout, Cin/groups, KH, KW], bias: [Cout] or NULL
+    Term xr = thvm_reduce(ctx, x);
+    Term wr = thvm_reduce(ctx, w);
+    TensorMeta *mx = &ctx->tensors[(u32)term_val(xr)];
+    TensorMeta *mw = &ctx->tensors[(u32)term_val(wr)];
+
+    u32 bs = mx->view.shape.dims[0];
+    u32 cin = mx->view.shape.dims[1];
+    u32 cout = mw->view.shape.dims[0];
+    u32 cin_g = mw->view.shape.dims[1];  // cin/groups
+    u32 KH = mw->view.shape.dims[2];
+    u32 KW = mw->view.shape.dims[3];
+    (void)cin_g;
+    assert(groups * cin_g == cin);
+
+    // Step 1: pad input
+    u32 pad_pairs[MAX_DIM * 2] = {0};
+    pad_pairs[2*2] = padding_[0]; pad_pairs[2*2+1] = padding_[1];  // H before/after
+    pad_pairs[3*2] = padding_[2]; pad_pairs[3*2+1] = padding_[3];  // W before/after
+    Term padded = xr;
+    if (padding_[0] || padding_[1] || padding_[2] || padding_[3]) {
+        padded = thvm_pad(ctx, xr, pad_pairs, 4);
+    }
+
+    // Step 2: _pool to create sliding windows
+    u32 k[] = {KH, KW};
+    u32 s[] = {stride_[0], stride_[1]};
+    Term pooled = thvm_pool(ctx, padded, k, s, 2);
+    // pooled: [BS, Cin, OY, OX, KH, KW]
+
+    // Get output spatial dims
+    Term pr = thvm_reduce(ctx, pooled);
+    TensorMeta *mp = &ctx->tensors[(u32)term_val(pr)];
+    u32 oy = mp->view.shape.dims[2];
+    u32 ox = mp->view.shape.dims[3];
+
+    u32 rcout = cout / groups;
+
+    // Step 3: reshape + expand + permute for broadcasting
+    // pooled: [BS, groups, cin_g, 1, OY, OX, KH, KW]
+    Term x_rs = thvm_reshape(ctx, pr,
+        shape_of((u32[]){bs, groups, cin_g, 1, oy, ox, KH, KW}, 8));
+    // expand to: [BS, groups, cin_g, rcout, OY, OX, KH, KW]
+    Term x_exp = thvm_expand(ctx, x_rs,
+        shape_of((u32[]){bs, groups, cin_g, rcout, oy, ox, KH, KW}, 8));
+    // permute to: [BS, groups, rcout, OY, OX, cin_g, KH, KW]
+    u32 conv_perm[] = {0, 1, 3, 4, 5, 2, 6, 7};
+    Term x_perm = thvm_permute(ctx, x_exp, conv_perm, 8);
+
+    // Step 4: reshape weight to [1, groups, rcout, 1, 1, cin_g, KH, KW]
+    Term w_rs = thvm_reshape(ctx, wr,
+        shape_of((u32[]){1, groups, rcout, 1, 1, cin_g, KH, KW}, 8));
+
+    // Step 5: multiply + sum over (cin_g, KH, KW) = last 3 dims
+    Term prod = thvm_op(ctx, UOP_MUL, x_perm, w_rs);
+
+    // Sum reduces last dim to 1 (keeps rank). Reshape to drop trailing 1.
+    // prod: [BS, groups, rcout, OY, OX, cin_g, KH, KW]
+    Term s1 = thvm_op(ctx, UOP_SUM, prod, term_era());
+    // → [BS, groups, rcout, OY, OX, cin_g, KH, 1], squeeze:
+    s1 = thvm_reshape(ctx, s1, shape_of((u32[]){bs, groups, rcout, oy, ox, cin_g, KH}, 7));
+
+    Term s2 = thvm_op(ctx, UOP_SUM, s1, term_era());
+    // → [BS, groups, rcout, OY, OX, cin_g, 1], squeeze:
+    s2 = thvm_reshape(ctx, s2, shape_of((u32[]){bs, groups, rcout, oy, ox, cin_g}, 6));
+
+    Term s3 = thvm_op(ctx, UOP_SUM, s2, term_era());
+    // → [BS, groups, rcout, OY, OX, 1], squeeze:
+    s3 = thvm_reshape(ctx, s3, shape_of((u32[]){bs, groups, rcout, oy, ox}, 5));
+
+    // Reshape to [BS, Cout, OY, OX]
+    Term out = thvm_reshape(ctx, s3, shape_of((u32[]){bs, cout, oy, ox}, 4));
+
+    // Add bias
+    if (term_tag(bias) != TAG_ERA) {
+        Term b_rs = thvm_reshape(ctx, bias, shape_of((u32[]){1, cout, 1, 1}, 4));
+        out = thvm_op(ctx, UOP_ADD, out, b_rs);
+    }
+
+    return out;
+}
+
+// ============================================================
+// MaxPool2d as UOp composition — tinygrad tensor.py:2404-2405
+// ============================================================
+
+Term thvm_maxpool2d(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_) {
+    // pooled = _pool(x, kernel, stride)
+    // return pooled.max(kernel_axes)
+    u32 k[] = {kernel[0], kernel[1]};
+    u32 s[] = {stride_[0], stride_[1]};
+    Term pooled = thvm_pool(ctx, x, k, s, 2);
+    // pooled shape: [BS, C, OY, OX, KH, KW]
+    // reduce max over last 2 dims (KH, KW), squeezing between
+
+    // Get pool dims
+    Term pr = thvm_reduce(ctx, pooled);
+    TensorMeta *mp = &ctx->tensors[(u32)term_val(pr)];
+    u32 bs = mp->view.shape.dims[0];
+    u32 c  = mp->view.shape.dims[1];
+    u32 oy = mp->view.shape.dims[2];
+    u32 ox = mp->view.shape.dims[3];
+    u32 kh = mp->view.shape.dims[4];
+
+    Term r1 = thvm_op(ctx, UOP_RMAX, pr, term_era());
+    // → [BS, C, OY, OX, KH, 1], squeeze:
+    r1 = thvm_reshape(ctx, r1, shape_of((u32[]){bs, c, oy, ox, kh}, 5));
+
+    Term r2 = thvm_op(ctx, UOP_RMAX, r1, term_era());
+    // → [BS, C, OY, OX, 1], squeeze:
+    return thvm_reshape(ctx, r2, shape_of((u32[]){bs, c, oy, ox}, 4));
 }
 
 void thvm_realize(TinyHVM *ctx, Term t) {
@@ -989,54 +1494,6 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
                 }
                 break;
             }
-            // === CNN op DUP rules ===
-            case UOP_IM2COL: {
-                // DUP through im2col = col2im (they are inverses)
-                // Gradient of im2col(x, params) w.r.t. x is col2im(grad, params)
-                if (ma->requires_grad) {
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_COL2IM, grad,
-                                term_ten(b_id, DTYPE_U32)));
-                }
-                break;
-            }
-
-            case UOP_COL2IM: {
-                // DUP through col2im = im2col (they are inverses)
-                if (ma->requires_grad) {
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_IM2COL, grad,
-                                term_ten(b_id, DTYPE_U32)));
-                }
-                break;
-            }
-
-            case UOP_NCHW2NHWC: {
-                // DUP through NCHW→NHWC = NHWC→NCHW (inverse layout)
-                if (ma->requires_grad) {
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_NHWC2NCHW, grad,
-                                term_ten(b_id, DTYPE_U32)));
-                }
-                break;
-            }
-
-            case UOP_NHWC2NCHW: {
-                // DUP through NHWC→NCHW = NCHW→NHWC (inverse layout)
-                if (ma->requires_grad) {
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_NCHW2NHWC, grad,
-                                term_ten(b_id, DTYPE_U32)));
-                }
-                break;
-            }
-
-            case UOP_MAXPOOL: {
-                // DUP through maxpool = scatter grad to argmax positions
-                // This needs the argmax mask from forward — stored in b_id
-                // For now, skip (maxpool backward is handled separately)
-                break;
-            }
 
             default:
                 break;
@@ -1057,72 +1514,6 @@ void thvm_backward(TinyHVM *ctx, Term loss,
     for (u32 i = 0; i < n_params; i++) {
         grads[i] = thvm_grad(ctx, loss, params[i]);
     }
-}
-
-// ============================================================
-// conv2d_graph.c — Conv2d as UOp composition (autograd-visible)
-// ============================================================
-
-Term thvm_conv2d_params(TinyHVM *ctx, u32 B, u32 Cin, u32 H, u32 W,
-                        u32 KH, u32 KW) {
-    u32 OH = H - KH + 1, OW = W - KW + 1;
-    u32 patch_size = Cin * KH * KW;
-    u32 n_patches = B * OH * OW;
-    Conv2dParams cp = {B, Cin, H, W, KH, KW, OH, OW, patch_size, n_patches};
-
-    // Store as u32 tensor (not f32) — it's opaque params
-    u32 id = ctx->tensor_count++;
-    u32 buf = ctx->backend->buf_alloc(sizeof(Conv2dParams));
-    ctx->tensors[id] = (TensorMeta){
-        .buf_id = buf,
-        .dtype = DTYPE_U32,
-        .view = view_create(SHAPE(sizeof(Conv2dParams) / sizeof(u32))),
-    };
-    ctx->backend->buf_write(buf, &cp, sizeof(Conv2dParams));
-    return term_ten(id, DTYPE_U32);
-}
-
-Term thvm_conv2d_forward(TinyHVM *ctx, Term x, Term w, Term bias,
-                         Term conv_params) {
-    // Reduce conv_params to get Conv2dParams from buffer
-    conv_params = thvm_reduce(ctx, conv_params);
-    assert(term_tag(conv_params) == TAG_TEN);
-    u32 cp_id = (u32)term_val(conv_params);
-    Conv2dParams cp;
-    ctx->backend->buf_read(ctx->tensors[cp_id].buf_id, &cp, sizeof(Conv2dParams));
-
-    u32 Cout = 0;
-    {
-        // Infer Cout from weight shape: w is [Cout, Cin*KH*KW]
-        Term w_r = thvm_reduce(ctx, w);
-        assert(term_tag(w_r) == TAG_TEN);
-        Cout = ctx->tensors[(u32)term_val(w_r)].view.shape.dims[0];
-    }
-
-    // Step 1: im2col(x) → col [n_patches, patch_size]
-    Term col = thvm_op(ctx, UOP_IM2COL, x, conv_params);
-
-    // Step 2: Transpose weights: w[Cout, patch_size] → w_t[patch_size, Cout]
-    u32 perm_axes[] = {1, 0};
-    Term w_t = thvm_permute(ctx, w, perm_axes, 2);
-
-    // Step 3: col[n_patches, patch_size] @ w_t[patch_size, Cout] → out[n_patches, Cout]
-    Term out = thvm_op(ctx, UOP_MM, col, w_t);
-
-    // Step 4: Add bias (broadcast: bias[1, Cout] + out[n_patches, Cout])
-    Term biased = thvm_op(ctx, UOP_ADD, out, bias);
-
-    // Step 5: Layout transpose NHWC→NCHW
-    // out is [B*OH*OW, Cout] = [n_patches, Cout], conceptually NHWC
-    // Need to reshape to [B, OH, OW, Cout] then transpose to [B, Cout, OH, OW]
-    Term reshaped = thvm_reshape(ctx, biased,
-        SHAPE(cp.B, cp.OH, cp.OW, Cout));
-
-    // Permute [B, OH, OW, Cout] → [B, Cout, OH, OW]
-    u32 nchw_axes[] = {0, 3, 1, 2};
-    Term nchw = thvm_permute(ctx, reshaped, nchw_axes, 4);
-
-    return nchw;
 }
 
 // ============================================================

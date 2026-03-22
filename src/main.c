@@ -1,5 +1,4 @@
 // main.c — TinyHVM CLI entry point
-// For now, just runs the forward pass test inline.
 
 #include "tinyhvm.c"
 #include "gpu_cpu.c"
@@ -7,13 +6,12 @@
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
-    printf("TinyHVM v0.1\n");
+    printf("TinyHVM v0.2\n");
     printf("heap: %llu terms (%llu MB)\n",
            (unsigned long long)HEAP_CAP,
            (unsigned long long)(HEAP_CAP * 8 / (1024 * 1024)));
-    printf("tags: %d, uops: %d\n", TAG_COUNT, UOP_COUNT);
+    printf("tags: %d, uops: %d\n\n", TAG_COUNT, UOP_COUNT);
 
-    // Quick smoke test: relu(matmul(x, w) + b)
     TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
 
     // x = [[1, 2, 3], [4, 5, 6]]  (2x3)
@@ -26,44 +24,39 @@ int main(int argc, char **argv) {
     u32 w_shape[] = {3, 2};
     Term w = thvm_tensor(ctx, w_data, w_shape, 2);
 
-    // b = [-0.1, 0.2]  (2,) — will need broadcast, for now use (1x2)
-    // Actually for simplicity, expand b to (2x2) matching output
-    f32 b_data[] = {-0.1f, 0.2f, -0.1f, 0.2f};
-    u32 b_shape[] = {2, 2};
+    // b = [-0.1, 0.2]  (1x2) — will be broadcast to (2x2)!
+    f32 b_data[] = {-0.1f, 0.2f};
+    u32 b_shape[] = {1, 2};
     Term b = thvm_tensor(ctx, b_data, b_shape, 2);
 
-    // z = relu(matmul(x, w) + b)
+    // z = relu(matmul(x, w) + b)  — b is auto-broadcast!
     Term xw  = thvm_op(ctx, UOP_MM, x, w);
     Term xwb = thvm_op(ctx, UOP_ADD, xw, b);
     Term z   = thvm_op(ctx, UOP_RELU, xwb, term_era());
 
-    printf("\nBefore reduction:\n  z = ");
+    printf("Before reduction:\n  z = ");
     thvm_print_term(ctx, z);
     printf("\n");
 
-    // Realize
     Term result = thvm_reduce(ctx, z);
     printf("\nAfter reduction:\n  z = ");
     thvm_print_term(ctx, result);
     printf("\n");
 
-    // Read back
     f32 *out = thvm_to_host(ctx, result);
     if (out) {
         u32 id = (u32)term_val(result);
-        TensorMeta *m = &ctx->tensors[id];
-        printf("\nResult [%u x %u]:\n", m->shape[0], m->shape[1]);
-        for (u32 i = 0; i < m->shape[0]; i++) {
+        View *v = &ctx->tensors[id].view;
+        printf("\nResult [%u x %u]:\n", v->shape[0], v->shape[1]);
+        for (u32 i = 0; i < v->shape[0]; i++) {
             printf("  [");
-            for (u32 j = 0; j < m->shape[1]; j++) {
-                printf(" %.4f", out[i * m->shape[1] + j]);
-            }
+            for (u32 j = 0; j < v->shape[1]; j++)
+                printf(" %.4f", out[i * v->shape[1] + j]);
             printf(" ]\n");
         }
     }
 
     printf("\nInteractions: %llu\n", (unsigned long long)ctx->itrs);
-
     thvm_free(ctx);
     return 0;
 }

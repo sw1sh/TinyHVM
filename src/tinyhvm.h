@@ -66,8 +66,8 @@ typedef u64 Term;
 #define TAG_OP2  9   // Binary operation: Op2(opr, x, y)
 
 // Tensor (new):
-#define TAG_TEN  10  // Tensor handle: VAL = buf_id, EXT = dtype
-#define TAG_TOP  11  // Tensor op node (lazy): EXT = opcode
+#define TAG_TEN  10  // Tensor handle: VAL = tensor_id, EXT = dtype
+#define TAG_TOP  11  // Tensor op node (lazy): EXT = uop code
 #define TAG_CTR  12  // Constructor (for multi-arg nodes)
 
 #define TAG_COUNT 13
@@ -76,13 +76,11 @@ typedef u64 Term;
 // UOps — Minimal tensor operations (tinygrad-inspired)
 // ============================================================
 // Stored in EXT field of TAG_TOP nodes.
-// Like tinygrad UOps, these are the atomic operations that
-// the scheduler/reducer will fuse and dispatch.
 
-// Movement (no compute):
+// Movement (no compute, metadata only):
 #define UOP_LOAD    0   // Load tensor from host
 #define UOP_STORE   1   // Store tensor to host
-#define UOP_COPY    2   // Copy buffer
+#define UOP_COPY    2   // Physical copy (resolve strides)
 
 // Elementwise (unary):
 #define UOP_NEG     3
@@ -97,15 +95,23 @@ typedef u64 Term;
 #define UOP_DIV    10
 #define UOP_MAX    11
 #define UOP_CMP    12   // compare (returns 0/1)
+#define UOP_SUB    13   // subtract (for gradient descent)
 
 // Reduce:
-#define UOP_SUM    13   // reduce sum over axis
-#define UOP_RMAX   14   // reduce max over axis
+#define UOP_SUM    14   // reduce sum over axis
+#define UOP_RMAX   15   // reduce max over axis
 
 // Matmul (special — dispatches to BLAS/MPS):
-#define UOP_MM     15   // matrix multiply
+#define UOP_MM     16   // matrix multiply
 
-#define UOP_COUNT  16
+// Movement (metadata-only, stride manipulation):
+#define UOP_RESHAPE   17
+#define UOP_PERMUTE   18
+#define UOP_EXPAND    19  // = broadcast
+#define UOP_SHRINK    20  // = slice
+#define UOP_PAD       21
+
+#define UOP_COUNT     22
 
 // ============================================================
 // NUM encoding
@@ -133,16 +139,39 @@ typedef u64 Term;
 
 #define MAX_DIM 8
 #define MAX_TENSORS 4096
+#define MAX_TAPE 4096
 
+// View: shape + strides + offset (tinygrad-inspired)
+// Movement ops modify this without touching GPU buffers.
 typedef struct {
-    u32 buf_id;
-    u32 dtype;
     u32 ndim;
     u32 shape[MAX_DIM];
-    u32 numel;       // total elements (product of shape)
-    u32 refcount;
-    void *host_ptr;  // optional host shadow
+    i32 strides[MAX_DIM];   // can be 0 (broadcast) or negative (flip)
+    i32 offset;             // starting element in buffer
+    u32 numel;              // product of shape (logical element count)
+    u8  contiguous;         // 1 if standard row-major, no offset
+} View;
+
+typedef struct {
+    u32  buf_id;        // GPU buffer ID
+    u32  dtype;
+    u32  refcount;
+    View view;          // shape/stride/offset metadata
+    void *host_ptr;     // optional host shadow for readback
+
+    // Autograd provenance
+    u8   requires_grad;
+    u32  grad_id;       // tensor_id of accumulated gradient (0 = none)
+    u32  creator_op;    // UOP that created this tensor (for backward)
+    u32  src_ids[2];    // input tensor IDs (for backward rules)
 } TensorMeta;
+
+// Autograd tape entry (records forward ops for backward pass)
+typedef struct {
+    u32 uop;
+    u32 out_id;
+    u32 src_ids[2];
+} TapeEntry;
 
 // ============================================================
 // GPU Backend Interface
@@ -155,12 +184,13 @@ typedef struct {
     void  (*buf_free)(u32 id);
     void  (*buf_write)(u32 id, const void *data, u64 bytes);
     void  (*buf_read)(u32 id, void *out, u64 bytes);
-    // Ops — dst buffer pre-allocated by caller
-    void  (*op_add)(u32 dst, u32 a, u32 b, u32 n);
-    void  (*op_mul)(u32 dst, u32 a, u32 b, u32 n);
-    void  (*op_relu)(u32 dst, u32 src, u32 n);
-    void  (*op_neg)(u32 dst, u32 src, u32 n);
-    void  (*op_mm)(u32 dst, u32 a, u32 b, u32 M, u32 K, u32 N);
+    // Strided ops — full View info for broadcasting/transpose
+    void  (*op_unary)(u32 uop, u32 dst, const View *dv,
+                      u32 src, const View *sv);
+    void  (*op_binary)(u32 uop, u32 dst, const View *dv,
+                       u32 a, const View *av, u32 b, const View *bv);
+    void  (*op_mm)(u32 dst, u32 a, const View *av, u32 b, const View *bv,
+                   u32 M, u32 K, u32 N);
 } GpuBackend;
 
 // ============================================================
@@ -173,7 +203,12 @@ typedef struct {
     TensorMeta  tensors[MAX_TENSORS];
     u32         tensor_count;
     GpuBackend *gpu;
-    u64         itrs;  // interaction count
+    u64         itrs;       // interaction count
+
+    // Autograd
+    TapeEntry   tape[MAX_TAPE];
+    u32         tape_len;
+    u8          recording;  // 1 if taping forward ops
 } TinyHVM;
 
 // ============================================================

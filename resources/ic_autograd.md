@@ -1,218 +1,126 @@
 # IC-Native Autograd: Differentiation as Duplication
 
-How interaction nets naturally compute gradients, and why this is the right foundation for TinyHVM's backward pass.
+How interaction nets compute gradients, and why TinyHVM uses this instead of a tape.
 
-## Origin
+## Where This Comes From
 
-This is **not** a new idea — the theoretical connection between **duplication** and **differentiation** is a known result from **Differential Linear Logic** (DiLL), introduced by Thomas Ehrhard and Laurent Regnier in 2003.
+The connection between duplication and differentiation isn't something we invented. It comes from **Differential Linear Logic** by Thomas Ehrhard and Laurent Regnier (2003). The short version: in linear logic, you can't copy things for free — every copy is an explicit DUP. Ehrhard showed that this DUP operation corresponds exactly to taking a derivative. The math checks out and it's been studied for 20+ years.
 
-**Key papers:**
-- Ehrhard & Regnier, "The differential lambda-calculus" (2003) — [doi:10.1016/S0304-3975(03)00392-X](https://doi.org/10.1016/S0304-3975(03)00392-X)
-- Ehrhard & Regnier, "Differential interaction nets" (2006) — extends interaction nets with differentiation
-- Ehrhard, "An introduction to differential linear logic: proof-nets, models and antiderivatives" (2017)
+What nobody's done is build a tensor runtime around it. That's what TinyHVM is.
 
-**What's new in TinyHVM:** applying this theory to *tensor computation* and building an actual runtime that uses it. Nobody has done this before. The theory says DUP≈derivative; we're engineering it into a working ML system.
-
----
-
-## The Idea in One Sentence
-
-> In linear logic, a function's **derivative** is its **linear approximation** — and in interaction nets, the **DUP node** extracts exactly the linear part of a computation.
+**Papers:**
+- Ehrhard & Regnier, "The differential lambda-calculus" (2003)
+- Ehrhard & Regnier, "Differential interaction nets" (2006)
+- Lafont, "Interaction combinators" (1997) — the foundation HVM builds on
 
 ---
 
-## Background: Linear Logic and Duplication
+## The Core Idea
 
-In **linear logic** (Girard, 1987), every resource must be used **exactly once** — no implicit copying or discarding. To use something twice, you must explicitly **duplicate** it with the `!` (bang/exponential) modality.
+A function's derivative tells you: if I wiggle the input, how does the output wiggle? In interaction nets, the way you "use an input twice" is by duplicating it with a DUP node. The DUP has to pass through every operation the input touches. As it passes through each op, the DUP-op interaction rule naturally computes the chain rule.
 
-Interaction nets implement linear logic. In HVM/TinyHVM:
-- **Variables are affine** — used at most once
-- **DUP nodes** explicitly copy terms
-- **ERA nodes** explicitly discard terms
-
-This means: **every non-linear use is visible in the graph as a DUP node**.
+So: backward pass = DUP propagating through the forward graph.
 
 ---
 
-## The Connection: DUP = ∂/∂x
+## Quick Recap: What Are TOP Nodes?
 
-Consider a function `f(x) = x * x`. In normal math, the derivative is `f'(x) = 2x`.
-
-Now look at what happens when we **duplicate** the input in an interaction net:
-
-```
-                       ┌──→ a ──→ [MUL] ──→ y
-           x ──→ [DUP]─┤
-                       └──→ b ──→ [MUL] ──→ y
-```
-
-The DUP creates two copies of `x`. Each copy flows into one argument of MUL. The **interaction** between DUP and MUL must handle the fact that `x` is used twice.
-
-In differential linear logic, the DUP-over-a-function interaction produces TWO things:
-1. The **original function applied normally** (the forward pass)
-2. The **derivative with respect to the duplicated variable** (the backward pass)
-
-This isn't metaphorical — it's a provable structural property of the calculus.
-
----
-
-## How It Works Mechanically in TinyHVM
-
-### Setup: TAG_TOP nodes are tensor operations
-
-`TOP` = **T**ensor **OP**eration. When you write:
-```c
-Term z = thvm_op(ctx, UOP_MM, x, w);  // lazy matmul
-```
-
-This creates a `TAG_TOP` node in the heap:
-```
-HEAP[loc]   = x   (first arg)
-HEAP[loc+1] = w   (second arg)
-Term z = TOP(uop=UOP_MM, loc)
-```
-
-It doesn't compute anything yet — it's a lazy graph node.
-
-### Forward pass (Phase 1 — what we built)
-
-When we reduce `z`, the reducer sees `TAG_TOP`, evaluates args to `TAG_TEN` (realized tensors), dispatches to GPU:
-```
-TOP(MM, loc) + [x:TEN, w:TEN] → dispatch gpu->op_mm → result:TEN
-```
-
-### Backward pass (Phase 2 — the new part)
-
-Now suppose we want gradients. We **DUP** the computation:
+`TOP` = **T**ensor **OP**eration. These are lazy computation nodes. When you write:
 
 ```c
-// Build: loss = sum(relu(mm(x, w) + b))
-Term z   = thvm_op(ctx, UOP_MM, x, w);
-Term zb  = thvm_op(ctx, UOP_ADD, z, b);
-Term a   = thvm_op(ctx, UOP_RELU, zb, term_era());
-Term loss = thvm_op(ctx, UOP_SUM, a, term_era());
+Term z = thvm_op(ctx, UOP_MM, x, w);
 ```
 
-To get gradients, we **duplicate** the loss through the graph. The DUP propagates backward through each TOP node, and each TOP node has a **DUP-TOP interaction rule** that produces the gradient:
+Nothing executes yet. You get a `TAG_TOP` node sitting in the heap saying "I'm a matmul waiting to happen." The arguments `x` and `w` are stored in `HEAP[loc]` and `HEAP[loc+1]`.
 
-### DUP-TOP Interaction Rules
-
-When a DUP meets a TOP node during reduction, it doesn't just copy the TOP — it **splits into forward + backward**:
-
-#### Rule 1: DUP-ADD
-
-```
-DUP ─── ADD(a, b) ──→ (forward: ADD(a, b), backward: (grad_a, grad_b))
-```
-
-Addition distributes: `∂(a+b)/∂a = 1, ∂(a+b)/∂b = 1`.
-So the DUP just **copies the incoming gradient** to both branches:
-
-```
-         ┌──→ grad_a = grad    (copy)
-grad ───DUP
-         └──→ grad_b = grad    (copy)
-```
-
-#### Rule 2: DUP-MUL
-
-```
-∂(a*b)/∂a = b,  ∂(a*b)/∂b = a
-```
-
-The DUP-MUL interaction produces:
-```
-         ┌──→ grad_a = MUL(grad, b)    (grad × other_input)
-grad ───DUP
-         └──→ grad_b = MUL(grad, a)    (grad × other_input)
-```
-
-The DUP needs access to the *saved forward inputs* — this is why we record them.
-
-#### Rule 3: DUP-MM (Matmul)
-
-```
-z = MM(A, B)  where A:[M,K], B:[K,N], z:[M,N]
-∂z/∂A = MM(grad, Bᵀ)     [M,N] × [N,K] → [M,K]
-∂z/∂B = MM(Aᵀ, grad)     [K,M] × [M,N] → [K,N]
-```
-
-The DUP-MM interaction produces:
-```
-          ┌──→ grad_A = MM(grad, TRANSPOSE(B))
-grad ────DUP
-          └──→ grad_B = MM(TRANSPOSE(A), grad)
-```
-
-This creates **new TOP nodes** for the backward matmuls — they're just more lazy graph nodes that get reduced the same way.
-
-#### Rule 4: DUP-RELU
-
-```
-∂relu(a)/∂a = (a > 0) ? 1 : 0
-```
-
-DUP-RELU produces:
-```
-grad ──→ grad_a = MUL(grad, CMP_GT(a, 0))    (masked passthrough)
-```
-
-Again, needs saved forward input `a`.
+Reduction evaluates these lazily — when the reducer hits a TOP whose inputs are realized tensors (TAG_TEN), it dispatches to the GPU backend.
 
 ---
 
-## Why This Is Better Than Tape-Based Autograd
+## How DUP Produces Gradients
 
-| Aspect | Tape (PyTorch) | IC-Native (TinyHVM) |
-|--------|---------------|---------------------|
-| **Data structure** | Separate tape list | Same graph |
-| **Forward/backward** | Two separate phases | Single reduction |
-| **Memory** | Stores all intermediates | Optimal sharing via DUP |
-| **Parallelism** | Sequential backward | All independent gradients reduce in parallel |
-| **Higher-order derivs** | Manual tape-of-tape | Just DUP again (DUP-DUP = second derivative) |
+Say we have `z = mm(A, B)` and we want `∂z/∂A` and `∂z/∂B`. We inject a DUP node after `z`:
 
-The IC approach means:
-- **No separate backward pass** — gradients are produced as natural byproducts of DUP interactions
-- **Optimal sharing** — if two losses share a sub-computation, DUP-SUP annihilation avoids redundant gradient computation
-- **Higher-order gradients for free** — DUP a DUP = second derivative, via the same rules
+```
+A ──→ [MM] ──→ z ──→ [DUP] ──→ z_fwd  (use the value)
+B ──↗                    └──→ z_grad (get the gradient)
+```
+
+The DUP propagates backward into the MM node. The DUP-MM interaction rule says:
+
+```
+∂z/∂A = MM(grad, Bᵀ)
+∂z/∂B = MM(Aᵀ, grad)
+```
+
+These are just two more MM operations — new TOP nodes that get reduced by the same forward machinery. There's no special "backward kernel." Backward is just more forward.
+
+### All the Rules
+
+**DUP-ADD**: `z = a + b`
+- `∂z/∂a = grad` (just copy)
+- `∂z/∂b = grad` (just copy)
+
+DUP through add = copy the gradient to both branches. Trivial.
+
+**DUP-MUL**: `z = a * b`
+- `∂z/∂a = grad * b`
+- `∂z/∂b = grad * a`
+
+DUP through mul = multiply grad by the other input. Needs saved forward values.
+
+**DUP-MM**: `z = mm(A[M,K], B[K,N])`
+- `∂z/∂A = mm(grad[M,N], Bᵀ[N,K])` → `[M,K]` ✓
+- `∂z/∂B = mm(Aᵀ[K,M], grad[M,N])` → `[K,N]` ✓
+
+DUP through matmul = two matmuls with transposes. Shapes work out.
+
+**DUP-RELU**: `z = relu(a)`
+- `∂z/∂a = grad * (a > 0 ? 1 : 0)`
+
+DUP through relu = mask the gradient where input was negative.
+
+**DUP-SUM**: `z = sum(a)`
+- `∂z/∂a = broadcast(grad, shape_of_a)`
+
+DUP through sum = broadcast the scalar gradient back to the original shape.
 
 ---
 
-## Practical Implementation in TinyHVM
+## Why Not Just Use a Tape?
 
-For Phase 2, we implement this as a **hybrid**:
+| | Tape (PyTorch-style) | IC-native (TinyHVM) |
+|---|---|---|
+| Data structure | Separate ops list | Same graph |
+| Forward/backward | Two phases | One reduction |
+| Shared subexpressions | Recomputed or manually cached | DUP-SUP annihilation handles it |
+| Higher-order gradients | Tape of tapes (tricky) | Just DUP the DUP |
+| Parallelism | Backward is sequential | Independent gradients reduce in parallel |
 
-1. **Forward pass**: reduce TOP nodes as before (dispatch to GPU)
-2. **Recording**: each TOP reduction saves its inputs in the TensorMeta (needed for backward rules)
-3. **Backward trigger**: `thvm_backward(ctx, loss)` injects a DUP at the loss, then reduces
-4. **DUP-TOP rules**: implemented as new cases in the reducer
+The IC approach doesn't need a separate backward pass. The gradients fall out of the same graph reduction. And if two losses share computation, DUP-SUP annihilation avoids recomputing shared parts — you get optimal sharing for free.
+
+---
+
+## What We'll Build in Phase 2
+
+Practically, the reducer gets new cases:
 
 ```c
-case TAG_DP0:  // or TAG_DP1
-case TAG_DUP: {
-    // DUP meets a TOP → apply gradient rule
-    Term inner = thvm_reduce(ctx, ...);
-    if (term_tag(inner) == TAG_TOP) {
-        u32 uop = term_ext(inner);
-        // Apply the DUP-TOP interaction rule for this uop
-        switch (uop) {
-            case UOP_ADD: /* copy grad to both branches */ break;
-            case UOP_MM:  /* mm(grad, Bt), mm(At, grad) */ break;
-            case UOP_RELU: /* mul(grad, cmp(a, 0)) */     break;
-        }
-    }
-}
+// In thvm_reduce, when DUP meets a realized TOP:
+// 1. Look up what forward op produced this tensor
+// 2. Apply the corresponding gradient rule
+// 3. Return new TOP nodes (lazy backward ops)
 ```
 
-The beauty: backward ops are just **more TOP nodes**. They get reduced by the same forward-pass machinery. There's no separate "backward kernel" — `mm` backward is just two more `mm` forward passes (with transposes).
+Each tensor that needs gradients stores its "provenance" — which op and which inputs created it. When DUP reaches it, the provenance tells us which gradient rule to fire.
+
+The backward ops (`mm(grad, Bᵀ)` etc.) are just normal TOP nodes. They reduce via the same GPU dispatch. Simple.
 
 ---
 
 ## References
 
-1. Ehrhard, T. & Regnier, L. (2003). "The differential lambda-calculus." *Theoretical Computer Science*, 309(1-3), 1-41.
-2. Ehrhard, T. & Regnier, L. (2006). "Differential interaction nets." *Theoretical Computer Science*, 364(2), 166-195.
-3. Girard, J.-Y. (1987). "Linear logic." *Theoretical Computer Science*, 50(1), 1-101.
-4. Lafont, Y. (1997). "Interaction combinators." *Information and Computation*, 137(1), 69-101.
-5. Mazza, D. (2017). "Linear logic and computation: a new point of view." — Survey connecting differential LL to computation.
-6. Taelin, V. (2024). "The Interaction Calculus." — HVM4 specification (gist `903f20e0`).
+1. Ehrhard & Regnier (2003). "The differential lambda-calculus." *TCS* 309(1-3), 1-41.
+2. Ehrhard & Regnier (2006). "Differential interaction nets." *TCS* 364(2), 166-195.
+3. Girard (1987). "Linear logic." *TCS* 50(1), 1-101.
+4. Lafont (1997). "Interaction combinators." *Information and Computation* 137(1), 69-101.

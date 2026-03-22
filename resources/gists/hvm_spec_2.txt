@@ -1,0 +1,291 @@
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+  const char* input;
+  size_t index;
+} Parser;
+
+static Parser parser_new(const char* input) {
+  Parser p = {
+    .input = input,
+    .index = 0
+  };
+  return p;
+}
+
+static bool is_ascii_space(char c) {
+  return (unsigned char)c <= 0x7F && isspace((unsigned char)c);
+}
+
+static void skip_trivia(Parser* p) {
+  while (true) {
+    // Skip whitespace
+    while (p->input[p->index] && is_ascii_space(p->input[p->index])) {
+      p->index++;
+    }
+    
+    // Skip line comments
+    if (p->input[p->index] == '/' && p->input[p->index + 1] == '/') {
+      p->index += 2;
+      while (p->input[p->index] && p->input[p->index] != '\n') {
+        p->index++;
+      }
+      continue;
+    }
+    
+    break;
+  }
+}
+
+static bool starts_with(const Parser* p, const char* lit) {
+  return strncmp(p->input + p->index, lit, strlen(lit)) == 0;
+}
+
+static void error(Parser* p, const char* expected) {
+  fprintf(stderr, "PARSE_ERROR at position %zu\n", p->index);
+  fprintf(stderr, "Expected: %s\n", expected);
+  fprintf(stderr, "Detected: ");
+  if (p->input[p->index] == '\0') {
+    fprintf(stderr, "end of input\n");
+  } else if (p->input[p->index] == '\n') {
+    fprintf(stderr, "newline\n");
+  } else {
+    fprintf(stderr, "'%c'\n", p->input[p->index]);
+  }
+}
+
+static bool is_name_char(unsigned char c) {
+  return isalnum(c) || c == '_' || c == '$';
+}
+
+static bool parse_name(Parser* p, char** out) {
+  skip_trivia(p);
+  size_t start = p->index;
+  
+  while (p->input[p->index]) {
+    unsigned char c = (unsigned char)p->input[p->index];
+    if (c < 0x80 && is_name_char(c)) {
+      p->index++;
+    } else {
+      break;
+    }
+  }
+  
+  if (p->index == start) {
+    error(p, "name");
+    return false;
+  }
+  
+  size_t len = p->index - start;
+  *out = malloc(len + 1);
+  memcpy(*out, p->input + start, len);
+  (*out)[len] = '\0';
+  return true;
+}
+
+static bool consume(Parser* p, const char* lit) {
+  skip_trivia(p);
+  size_t n = strlen(lit);
+  if (strncmp(p->input + p->index, lit, n) == 0) {
+    p->index += n;
+    return true;
+  }
+  error(p, lit);
+  return false;
+}
+
+static bool is_eof(Parser* p) {
+  skip_trivia(p);
+  return p->input[p->index] == '\0';
+}
+
+/* ------------------------------ AST nodes ------------------------------- */
+
+typedef enum {
+  TERM_LAM,
+  TERM_APP,
+  TERM_VAR
+} TermTag;
+
+typedef struct Term {
+  TermTag tag;
+  union {
+    struct {
+      char* name;
+      struct Term* body;
+    } lam;
+    struct {
+      struct Term* func;
+      struct Term* arg;
+    } app;
+    struct {
+      char* name;
+    } var;
+  };
+} Term;
+
+static Term* term_new_var(char* name) {
+  Term* t = calloc(1, sizeof(Term));
+  t->tag = TERM_VAR;
+  t->var.name = name;
+  return t;
+}
+
+static Term* term_new_lam(char* name, Term* body) {
+  Term* t = calloc(1, sizeof(Term));
+  t->tag = TERM_LAM;
+  t->lam.name = name;
+  t->lam.body = body;
+  return t;
+}
+
+static Term* term_new_app(Term* func, Term* arg) {
+  Term* t = calloc(1, sizeof(Term));
+  t->tag = TERM_APP;
+  t->app.func = func;
+  t->app.arg = arg;
+  return t;
+}
+
+static void term_free(Term* t) {
+  if (!t) return;
+  switch (t->tag) {
+    case TERM_LAM:
+      free(t->lam.name);
+      term_free(t->lam.body);
+      break;
+    case TERM_APP:
+      term_free(t->app.func);
+      term_free(t->app.arg);
+      break;
+    case TERM_VAR:
+      free(t->var.name);
+      break;
+  }
+  free(t);
+}
+
+static void term_print(const Term* t) {
+  switch (t->tag) {
+    case TERM_LAM:
+      printf("λ%s.", t->lam.name);
+      term_print(t->lam.body);
+      break;
+    case TERM_APP:
+      putchar('(');
+      term_print(t->app.func);
+      putchar(' ');
+      term_print(t->app.arg);
+      putchar(')');
+      break;
+    case TERM_VAR:
+      fputs(t->var.name, stdout);
+      break;
+  }
+}
+
+/* ------------------------------ Grammar --------------------------------- */
+
+static bool parse_term(Parser* p, Term** out);
+
+static bool parse_lam(Parser* p, Term** out) {
+  if (!consume(p, "λ")) {
+    return false;
+  }
+  
+  char* name = NULL;
+  if (!parse_name(p, &name)) {
+    return false;
+  }
+  
+  if (!consume(p, ".")) {
+    free(name);
+    return false;
+  }
+  
+  Term* body = NULL;
+  if (!parse_term(p, &body)) {
+    free(name);
+    return false;
+  }
+  
+  *out = term_new_lam(name, body);
+  return true;
+}
+
+static bool parse_app(Parser* p, Term** out) {
+  if (!consume(p, "(")) {
+    return false;
+  }
+  
+  Term* func = NULL;
+  if (!parse_term(p, &func)) {
+    return false;
+  }
+  
+  Term* arg = NULL;
+  if (!parse_term(p, &arg)) {
+    term_free(func);
+    return false;
+  }
+  
+  if (!consume(p, ")")) {
+    term_free(func);
+    term_free(arg);
+    return false;
+  }
+  
+  *out = term_new_app(func, arg);
+  return true;
+}
+
+static bool parse_var(Parser* p, Term** out) {
+  char* name = NULL;
+  if (!parse_name(p, &name)) {
+    return false;
+  }
+  
+  *out = term_new_var(name);
+  return true;
+}
+
+static bool parse_term(Parser* p, Term** out) {
+  skip_trivia(p);
+  
+  if (starts_with(p, "λ")) {
+    return parse_lam(p, out);
+  }
+  
+  if (starts_with(p, "(")) {
+    return parse_app(p, out);
+  }
+  
+  return parse_var(p, out);
+}
+
+/* -------------------------------- main ---------------------------------- */
+
+int main(void) {
+  const char* code = "λf.λx.(f (f x))";
+  
+  Parser p = parser_new(code);
+  Term* term = NULL;
+  
+  bool ok = parse_term(&p, &term) && is_eof(&p);
+  
+  if (!ok) {
+    return 1;
+  }
+  
+  term_print(term);
+  putchar('\n');
+  
+  term_free(term);
+  
+  return 0;
+}

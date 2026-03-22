@@ -1,0 +1,294 @@
+# ./HVM.hs #
+
+# HVM
+
+HVM is functional language and prover based on the Interaction Calculus.
+
+It is a pure functional runtime like Haskell's GHC, with some peculiarities:
+- Variables are affine, meaning they can only occur, at most, once.
+- To copy values, linear thunks are used, where 2 vars refer to the same value.
+- Accessing a thunk triggers an incremental, layer-by-layer copy of the value.
+- Lambdas can also be cloned incrementally by linear thunks.
+- As a side-effect, lambda-bound vars can escape (occur outside of the body).
+
+While odd, this setup is very performant. HVM is implemented in pure C.
+
+## Language
+
+Terms are core expressions, defined by the grammar:
+
+```
+Term ::=
+  # Variables
+  | VAR ::= Nick
+  | DP0 ::= Nick "₀"
+  | DP1 ::= Nick "₁"
+  # Lambdas
+  | ALL ::= "∀" Term "." Term
+  | LAM ::= "λ" Nick "." Term
+  | APP ::= "(" Term " " Term ")"
+  # Superpositions
+  | ERA ::= "*"
+  | SUP ::= "&" Label "{" Term "," Term "}"
+  # Empty
+  | EMP ::= "⊥"
+  # Unit
+  | UNI ::= "⊤"
+  | NUL ::= "()"
+  # Booleans
+  | BIT ::= "𝔹"
+  | BT0 ::= "#0"
+  | BT1 ::= "#1"
+  # Naturals
+  | NAT ::= "ℕ"
+  | ZER ::= "0n"
+  | SUC ::= "1n" "+" Term
+  # Lists
+  | LST ::= Term "[]"
+  | NIL ::= "[]"
+  | CON ::= Term "<>" Term
+  # Pairs
+  | SIG ::= "Σ" Term "." Term
+  | TUP ::= "#(" Term "," Term ")"
+  # Function
+  | REF ::= "@" Nick
+```
+
+Labels are 3-Letter nicks.
+
+Letters are one of 64 characters:
+
+```
+Letter ∈ _abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789$
+```
+
+Thunks are shared values stored on the heap, written as:
+
+```
+Thunk ::= "!" "&" Label Nick "=" Term
+```
+
+Functions are defined by the following grammar:
+
+```
+Function ::=
+  | FUN ::= "@" Nick ":" Term "=" Body
+
+Body ::=
+  | ABS ::= "λ" Nick "." Body
+  | EFQ ::= "λ" "{" "}"
+  | USE ::= "λ" "{" "()" ":" Body ";" "}"
+  | BIF ::= "λ" "{" "#0" ":" Body ";" "#1" ":" Body ";" "}"
+  | SWI ::= "λ" "{" "0n" ":" Body ";" "1n" "+" ":" Body ";" "}"
+  | MAT ::= "λ" "{" "[]" ":" Body ";" "<>" ":" Body ";" "}"
+  | GET ::= "λ" "{" "#(,)" ":" Body ";" "}"
+  | RET ::= Term
+```
+  
+## Evaluation
+
+```
+wnf : Term → Term
+wnf (f x) = app f x
+wnf k₀    = dp0 (lab k₀) k₀
+wnf k₁    = dp1 (lab k₁) k₁
+wnf @F    = ref F -- TODO: will define later
+wnf x     = x
+
+app : Term → Term → Term
+app (wnf → λx.f)    (wnf → v) = x ← v ; f
+app (wnf → &L{x,y}) (wnf → v) = !&L V = v ; &L{(x V₀),(y V₁)}
+app (wnf → f)       (wnf → v) = (f v)
+
+dp0 : Label → Term → Term
+dp0 L k₀@(wnf → λx.f)    = x ← &L{x0,x1} ; !&L F = f ; k₀ ← λx1.F₁ ; λx0.F₀
+dp0 L k₀@(wnf → (f x))   = !&L F = f ; !&L X = x ; k₀ ← (F₁ X₁) ; (F₀ X₀)
+dp0 L k₀@(wnf → &L{x,y}) = k₀ ← y ; x
+dp0 L k₀@(wnf → &M{x,y}) = !&L X = &M{x0,x1} ; !&L Y = &M{y0,y1} ; k₀ ← &M{X₁,Y₁} ; &M{X₀,Y₀}
+dp0 L k₀@(wnf → ())      = k₀ ← () ; ()
+dp0 L k₀@(wnf → #0)      = k₀ ← #0 ; #0
+dp0 L k₀@(wnf → #1)      = k₀ ← #1 ; #1
+dp0 L k₀@(wnf → 0n)      = k₀ ← 0n ; 0n
+dp0 L k₀@(wnf → 1n+x)    = !&L X = x ; k₀ ← 1n+X₁ ; 1n+X₀
+dp0 L k₀@(wnf → [])      = k₀ ← [] ; []
+dp0 L k₀@(wnf → x<>y)    = !&L X = x ; !&L Y = y ; k₀ ← X₁<>Y₁ ; X₀<>Y₀
+dp0 L k₀@(wnf → #(x,y))  = !&L X = x ; !&L Y = y ; k₀ ← #(X₁,Y₁) ; #(X₀,Y₀)
+dp0 L k₀@(wnf → x)       = k₀ ← x ; x
+
+dp1 : Label → Term → Term
+dp1 L k₁@(wnf → λx.f)    = x ← &L{x0,x1} ; !&L F = f ; k₁ ← λx0.F₀ ; λx1.F₁
+dp1 L k₁@(wnf → (f x))   = !&L F = f ; !&L X = x ; k₁ ← (F₀ X₀) ; (F₁ X₁)
+dp1 L k₁@(wnf → &M{x,y}) = !&L X = &M{x0,x1} ; !&L Y = &M{y0,y1} ; k₁ ← &M{X₀,Y₀} ; &M{X₁,Y₁}
+dp1 L k₁@(wnf → ())      = k₁ ← () ; ()
+dp1 L k₁@(wnf → #0)      = k₁ ← #0 ; #0
+dp1 L k₁@(wnf → #1)      = k₁ ← #1 ; #1
+dp1 L k₁@(wnf → 0n)      = k₁ ← 0n ; 0n
+dp1 L k₁@(wnf → 1n+x)    = !&L X = x ; k₁ ← 1n+X₀ ; 1n+X₁
+dp1 L k₁@(wnf → [])      = k₁ ← [] ; []
+dp1 L k₁@(wnf → x<>y)    = !&L X = x ; !&L Y = y ; k₁ ← X₀<>Y₀ ; X₁<>Y₁
+dp1 L k₁@(wnf → #(x,y))  = !&L X = x ; !&L Y = y ; k₁ ← #(X₀,Y₀) ; #(X₁,Y₁)
+dp1 L k₁@(wnf → x)       = k₁ ← x ; x
+```
+
+Where:
+- `x ← v ; f` means substitute `x` by `v`, then do `f`.
+- `!&L V = v` means allocate a thunk, 'V', then do `f`.
+- The returned value is the last.
+
+Note that, in dp0 rules, we generate two parts, corresponding to both copies of
+the shared value. We then return one part, effectivelly replacing the DP0 by it,
+and we replace the thunk by the other part, allowing the DP1 to grab it later.
+The same occurs in dp1 rules, except the other way around.
+
+Also note that, in some rules, we refer to variables (like x0, x1) and thunks
+(like F) before creating them. That's correct, since HVM has scaping scopes.
+
+## Memory
+
+The global memory (heap) is an array of Term and Body pointers.
+
+### Letters and Nicks
+
+Letters are encoded using 6 bits. Nicks are sequences of 3 letters:
+
+```
+__x
+```
+
+Is represented as:
+
+```
+0b000000_000000_011000
+```
+
+### Term
+
+Term pointers are represented in memory as a 64-bit union:
+
+```
+TERM ::= SUB (1-bit) & TAG (5-bit) & LAB (18-bit) & VAL (40-bit)
+```
+
+Where:
+- SUB = is-subst bit
+- TAG = term variant
+- LAB = nick or label
+- VAL = node address
+
+```
+main =
+  !&L F = f
+  λf. λx. (F₀ (F₁ x))
+```
+
+Can be represented as:
+
+```
+HEAP ::=
+| IDX → TAG LAB VAL - notes
+| 0x0 → LAM f   0x1 - 1st lam: `λf._`  (root of main is always on index 0)
+| 0x1 → LAM x   0x2 - 2nd lam: `λx._`  (on body of 1st lam)
+| 0x2 → APP _   0x4 - 1st app: `(_ _)` (on body of 2nd lam)
+| 0x3 → VAR f   0x0 - var use: `F = f` (on a global thunk)
+| 0x4 → DP0 L   0x3 - lft cpy: `F₀`    (on 1st slot of 1st app)
+| 0x5 → APP _   0x6 - 2nd app: `(_ _)` (on 2nd slot of 1st app)
+| 0x6 → DP1 L   0x3 - rgt cpy: `F₁`    (on 1st slot of 2nd app)
+| 0x7 → VAR x   0x1 - var use: `x`     (on 2nd slot of 2nd app)
+```
+
+The heap forms a tree of terms, starting from the root term (at index 0), and
+recursing down to its children, towards leaves. Terms like APP point to a Node,
+which is a heap slice with its child terms in consecutive slots. So, on index
+0x5, we have an APP pointing to index 0x6; that means index 0x6 and 0x7 are its
+function and argument, respectively. The only exceptions to this tree structure
+are vars: VAR points to their parent lambdas, and DP0 and DP1 point to a thunk.
+
+A thunk is nothing but a slot of the heap that isn't pointed to by a single
+parent node; instead, it is pointed to by two variables: DP0 and DP1. As such,
+the term it stores is "shared" by them. In this example, the index 3 is a thunk,
+which stores the 'f' var, aliased as 'F', and pointed to by both DP's.
+
+### SUB
+SUB marks a value written in-place for substitution. Writers set a cell to
+SUB(v) (same TAG/LAB/VAL with the SUB bit set); the first consumer clears SUB
+into its own cell and zeroes the source.
+
+- Beta (λ): writer is the β-step and writes SUB(v) to the binder cell — i.e.,
+  the cell that currently stores the lambda term (the function slot in an
+  app-λ). The body is returned. Later, the bound VAR consumes from that binder
+  cell (reads SUB(w), clears it to 0, and returns w).
+- DP (thunk): writer is the active DP (replaces k with one half and writes the
+  other half into the thunk slot at the source index); consumer is the twin DP
+  (if thunk holds SUB(w), writes w at k and sets thunk := 0).
+
+ 
+
+### Body
+
+Body pointers are represented in memory as a 64-bit union:
+
+```
+BODY ::= zero (1-bit) & TAG (5-bit) & zero (18-bit) & VAL (40-bit)
+```
+
+They follow the same structure as Terms, and share the same heap space.
+
+### Functions
+
+Functions are stored in a global 'Book' array, which has 262144 entries. Each
+entry stores two indices, pointing to the root of the function's type and body,
+respectively, on the heap.
+
+```
+@F : ∀ℕ. λx. ℕ = λ{
+  0n: 0n ;
+  1n+: λp. 1n + 1n + (@F p) ;
+}
+```
+
+Can be represented as:
+
+```
+BOOK ::=
+| ... => ...
+| __F => (0x1,0x5)
+| ... => ...
+```
+
+This means the indices 0x1 and 0x2 of the heap are a tuple storing the type and
+body for the function named '__F':
+
+```
+HEAP ::=
+| IDX → TAG LAB VAL - notes
+| 0x0 → _   _   _   - reserved for root of main
+| 0x1 → ALL _   0x2 - 1st all: `∀ℕ._`           (root of F's type)
+| 0x2 → NAT _   0x0 - 1st nat: `ℕ`              (on type of 1st all)
+| 0x3 → LAM x   0x4 - 1st lam: `λx._`           (on body of 1st all)
+| 0x4 → NAT _   0x0 - 2nd nat: `ℕ`              (on body of 1st lam)
+| 0x5 → SWI _   0x6 - 1st swi: `λ{0n:_;1n+:_;}` (root of F's body)
+| 0x6 → ZER _   0x0 - 1st zer: `0n`             (on zero case of 1st swi)
+| 0x7 → ABS p   0x8 - 2nd lam: `λp._`           (on succ case of 1st swi)
+| 0x8 → SUC _   0x9 - 1st suc: `1n+_`           (on body of 2nd lam)
+| 0x9 → SUC _   0xA - 2nd suc: `1n+_`           (on body of 1st suc)
+| 0xA → APP _   0xB - 1st app: `(_ _)`          (on body of 2nd suc)
+| 0xB → REF F   0x0 - 1st ref: `@F`             (on 1st slot of 1st app)
+| 0xC → VAR p   0x7 - var use: `p`              (on 2nd slot of 1st app)
+```
+
+## Notes
+
+- Body and Term are stored in the same heap space.
+- VARs point to their binding lambdas (LAM or ABS).
+- DP0 and DP1 point to the thunk (i.e., the shared value).
+- To save space, DP0 and DP1 store the thunk's label.
+- SWI, MAT and GET don't bind fields.
+  - Wrong: `λ{0n:0n;1n+p:p;}`.
+  - Right: `λ{0n:0n;1n+:λp.p;}`.
+- Quantifiers and dependent pairs don't bind names.
+  - Wrong: `∀x:A.B`.
+  - Right: `∀A.λx.B`. 
+- Terms are parsed in two phases: base and suff.
+  - Suff: the "<>" and "[]" operators.
+  - Base: everything else.
+  This makes the syntax unambiguous.

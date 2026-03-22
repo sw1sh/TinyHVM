@@ -1,0 +1,27 @@
+# TinyHVM build artifacts
+*.o
+*.dSYM/
+tinyhvm
+tinyhvm_cpu
+test_term
+test_reduce
+test_basic
+
+# OS
+.DS_Store
+
+# AG / Antigravity
+.gemini/
+.agent/
+.agents/
+
+# Temp / scratch
+/tmp/
+*.tmp
+*.swp
+*~
+
+# Symlinked reference repos (not tracked)
+/HVM
+/HVM4
+/tinygrad

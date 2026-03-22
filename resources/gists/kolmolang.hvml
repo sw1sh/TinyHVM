@@ -1,0 +1,199 @@
+import Prelude.hvml
+
+// Types
+// -----
+
+// Type ::= ⊥ | [Type]
+// - ⊥         = ⊥   = the Empty type
+// - [⊥]       = ⊤   = the Unit type
+// - [[⊥]]     = ℕ   = the Nat type
+// - [[[⊥]]]   = ℕ*  = the List type
+// - [[[[⊥]]]] = ℕ** = the Grid type
+data Type {
+  #Emp
+  #Vec{ele}
+}
+
+// Core ::=
+// | LAM λ<bod>
+// | MAT ?<nil><con>
+// | PUT +<idx><nxt>
+// | EMI ^<idx><nxt>
+// | NEW $<nxt>
+// | ERA -<nxt>
+// | DUP &<nxt>
+// | RET .
+// | CAL @<fid><nxt>
+data Core {
+  #Lam{bod} // λx. S.push(x); <bod>
+  #Mat{nil con} // match pop() { []:<nil> (x,xs): S.push(xs); S.push(x); <cons> }
+  #Put{idx nxt} // S[-idx] = S.pop(); <nxt>
+  #Emi{idx nxt} // R[-idx] = S.pop(); <nxt>
+  #New{nxt} // S.push([]); <nxt>
+  #Era{nxt} // S.pop(); <nxt>
+  #Dup{nxt} // x = S.pop(); S.push(x); S.push(x); <nxt>
+  #Ret{} // return S;
+  #Cal{fid ari ret nxt} // S.append(F[fid]()); <nxt>
+}
+
+// Utils
+// -----
+
+@nat = λn ~ n {
+  0: []
+  p: #Cons{[] (@nat p)}
+}
+
+@u32 = λxs
+  @len(xs)
+
+@insert_at(i v xs) = ~ i !v !xs {
+  0: !&0{x xs}=xs &0{#Cons{v x} xs}
+  i: !&0{x xs}=xs &0{x @insert_at(i v xs)}
+}
+
+@copy_at(i xs) = ~ i !xs {
+  0: !&0{x xs}=xs !&{x0 x1}=x &0{&0{x0 xs} x1}
+  i: !&0{x xs}=xs !&0{xs xk}=@copy_at(i xs) &0{&0{x xs} xk}
+}
+
+@apply(n xs fn) = ~ n !xs !fn {
+  0: &0{xs fn}
+  p: !&0{x xs}=xs !&0{xs fn}=@apply(p xs fn) &0{xs (fn x)}
+}
+
+@get(n rs fn) = ~ n !rs !fn {
+  0: fn
+  p: !&0{r rs}=rs @get(p rs (fn r)) 
+}
+
+@append(n xs ys) = ~ n !xs !ys {
+  0: ys
+  p: !&0{x xs}=xs &0{x @append(p xs ys)}
+}
+
+// Instructions
+// ------------
+
+// Pushes an external argument to the local stack
+@lam(len ctx lib bod) = λx
+  @comp((+ len 1) &0{x ctx} lib bod)
+
+// Pattern-matches on the top stack element
+@mat(len ctx lib nil con) =
+  ! &0{x ctx} = ctx
+  ~ x !len !ctx !lib {
+    #Nil: @comp((- len 1) ctx lib nil)
+    #Cons{x xs}: @comp((+ len 1) &0{x &0{xs ctx}} lib con)
+  }
+
+// Pushes a value into the nth element of the stack
+@put(len ctx lib idx nxt) =
+  ! &0{x ctx} = ctx
+  @comp((- len 1) @insert_at(idx x ctx) lib nxt)
+
+// Emits a value into the nth slot of the return list
+@emi(len ctx lib idx nxt) =
+  ! &0{x ctx} = ctx
+  @insert_at(idx x @comp((- len 1) ctx lib nxt))
+
+// Pushes an empty element to the stack
+@new(len ctx lib nxt) =
+  @comp((+ len 1) &0{[] ctx} lib nxt)
+
+// Drops the top element of the stack
+@era(len ctx lib nxt) =
+  ! &0{x ctx} = ctx
+  @comp((- len 1) ctx lib nxt)
+
+// Clones the top element of the stack
+@dup(len ctx lib nxt) =
+  ! &0{x ctx} = ctx
+  ! & {x0 x1} = x
+  @comp((+ len 1) &0{x0 &0{x1 ctx}} lib nxt)
+
+// Return empty elements
+@ret(len ctx lib) =
+  ctx
+
+// Calls itself recursively
+@cal(len ctx lib fid ari ret nxt) =
+  !& {ar0 ar1} = ari
+  !&0{lib fun} = @copy_at(fid lib)
+  !&0{ctx got} = @apply(ar0 ctx fun)
+  !& {le0 le1} = (- len ar1)
+  @comp((+ le0 ret) @append(le1 ctx got) lib nxt)
+
+// Compilation
+// -----------
+
+@comp(len ctx lib tm) = ~ tm !len !ctx !lib {
+  #Lam{bod}: @lam(len ctx lib bod)
+  #Mat{nil con}: @mat(len ctx lib nil con)
+  #Put{idx nxt}: @put(len ctx lib idx nxt)
+  #Emi{idx nxt}: @emi(len ctx lib idx nxt)
+  #New{nxt}: @new(len ctx lib nxt)
+  #Era{nxt}: @era(len ctx lib nxt)
+  #Dup{nxt}: @dup(len ctx lib nxt)
+  #Ret{}: @ret(len ctx lib)
+  #Cal{fid ari ret nxt}: @cal(len ctx lib fid ari ret nxt)
+}
+
+@make(term lib) = λf @comp(0 * &0{f lib} term)
+
+// Tests
+// -----
+
+// Core ::= λ<bod> | ?<nil><con> | +<nxt> | ^<nxt> | $<nxt> | *<nxt> | &<nxt> | . | @F<nxt>
+
+// mul2 : (ℕ) → (ℕ)
+// mul2 = λ?$.$^0^0@0.
+@t_mul2 = #Lam{#Mat{
+  #New{#Ret{}}
+  #New{#Emi{0 #Emi{0 #Cal{0 1 1 #Ret{}}}}}}}
+@f_mul2 = @fix(λf @comp(0 * &0{f *} @t_mul2))
+
+// half : (ℕ) → (ℕ)
+// half = λ?$.-?$.^0@0.
+@t_half = #Lam{#Mat{
+  #New{#Ret{}}
+  #Era{#Mat{
+    #New{#Ret{}}
+    #Emi{0 #Cal{0 1 1 #Ret{}}}}}}}
+@f_half = @fix(λf @comp(0 * &0{f *} @t_half))
+
+// Decreases all values by 1, counts the number of 0's.
+// decs : ([ℕ]) → ([ℕ],ℕ)
+// decs = λ?$$.?$^0@012.-^1@012.
+@t_decs = #Lam{#Mat{
+  #New{#New{#Ret{}}}
+  #Mat{#New{#Emi{0 #Cal{0 1 2 #Ret{}}}}
+       #Era{#Emi{1 #Cal{0 1 2 #Ret{}}}}}}}
+@f_decs = @fix(λf @comp(0 * &0{f *} @t_decs))
+
+// Converts a list to a histogram.
+// xs2h : ([ℕ]) → ([ℕ])
+// xs2h = λ?$.+0@012^0@111.
+@t_xs2h = #Lam{#Mat{
+  #New{#Ret{}}
+  #Put{0 #Cal{0 1 2 #Emi{0 #Cal{1 1 1 #Ret{}}}}}}}
+@f_xs2h = @fix(λf @comp(0 * &0{@f_decs &0{f *}} @t_xs2h))
+
+// Converts a histogram to a list.
+// h2xs : ([ℕ],ℕ) → [ℕ]
+// h2xs = λ?λ-$.?λ$+0@021.-+0λ&^0@021.
+@t_h2xs = #Lam{#Mat{
+  #Lam{#Era{#New{#Ret{}}}}
+  #Mat{
+    #Lam{#New{#Put{0 #Cal{0 2 1 #Ret{}}}}}
+    #Era{#Put{0 #Lam{#Dup{#Emi{0 #Cal{0 2 1 #Ret{}}}}}}}}}}
+@f_h2xs = @fix(λf @comp(0 * &0{f *} @t_h2xs))
+
+// sort : ([ℕ]) → ([ℕ])
+// sort = λ@011$@121.
+@t_sort = #Lam{#Cal{0 1 1 #New{ #Cal{1 2 1 #Ret{}}}}}}
+@f_sort = @fix(λf @comp(0 * &0{@f_xs2h &0{@f_h2xs &0{f *}}} @t_sort))
+
+// Sorting Algorithm in ~150 bits
+@list = @map(@nat [3 0 2 1 5 1])
+@main = @map(@u32 (@f_sort @list))

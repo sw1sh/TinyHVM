@@ -172,6 +172,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             heap_set(ctx, loc, a);
 
             int is_binary = (uop >= UOP_ADD && uop <= UOP_SUB) || uop == UOP_MM;
+            int is_reduce = (uop == UOP_SUM || uop == UOP_RMAX);
             Term b = term_era();
             if (is_binary) {
                 b = thvm_reduce(ctx, heap_read(ctx, loc + 1));
@@ -199,6 +200,11 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 out_shape[0] = ma->view.shape.dims[0];
                 out_shape[1] = mb->view.shape.dims[1];
                 out_ndim = 2;
+            } else if (is_reduce) {
+                // Reduce: collapse last dim to 1
+                out_ndim = ma->view.shape.rank;
+                for (u32 i = 0; i < out_ndim; i++) out_shape[i] = ma->view.shape.dims[i];
+                out_shape[out_ndim - 1] = 1;
             } else if (is_binary) {
                 // Binary: broadcast shapes
                 int ok = view_broadcast(&ma->view, &mb->view, &av_bc, &bv_bc, out_shape, &out_ndim);
@@ -228,6 +234,10 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 u32 M = ma->view.shape.dims[0], K = ma->view.shape.dims[1], N = mb->view.shape.dims[1];
                 ctx->backend->op_mm(md->buf_id, ma->buf_id, &ma->view,
                                 mb->buf_id, &mb->view, M, K, N);
+            } else if (is_reduce) {
+                u32 reduce_dim = ma->view.shape.dims[ma->view.shape.rank - 1];
+                ctx->backend->op_reduce(uop, md->buf_id, md->view.numel,
+                                        ma->buf_id, ma->view.numel, reduce_dim);
             } else if (is_binary) {
                 ctx->backend->op_binary(uop, md->buf_id, &md->view,
                                     ma->buf_id, &av_bc,
@@ -384,6 +394,20 @@ void thvm_free(TinyHVM *ctx) {
     }
     free(ctx->heap);
     free(ctx);
+}
+
+void thvm_reset(TinyHVM *ctx, u32 keep) {
+    // Free ephemeral tensors (above `keep`), reset heap
+    // Weight tensors [0..keep) are preserved
+    for (u32 i = keep; i < ctx->tensor_count; i++) {
+        if (ctx->tensors[i].host_ptr) free(ctx->tensors[i].host_ptr);
+        memset(&ctx->tensors[i], 0, sizeof(TensorMeta));
+    }
+    // Reset backend buffer pool (frees GPU/CPU buffers above keep)
+    if (ctx->backend && ctx->backend->pool_reset)
+        ctx->backend->pool_reset(keep);
+    ctx->tensor_count = keep;
+    ctx->heap_pos = 1;  // reset heap (keep weight terms as raw IDs)
 }
 
 Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {

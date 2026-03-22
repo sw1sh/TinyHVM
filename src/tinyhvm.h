@@ -187,7 +187,7 @@ typedef struct {
 
 
 // ============================================================
-// GPU Backend Interface
+// Backend Interface
 // ============================================================
 
 typedef struct {
@@ -204,6 +204,12 @@ typedef struct {
                        u32 a, const View *av, u32 b, const View *bv);
     void  (*op_mm)(u32 dst, u32 a, const View *av, u32 b, const View *bv,
                    u32 M, u32 K, u32 N);
+    // Reduce op: reduce src along last axis into dst
+    // dst shape = src shape with last dim collapsed to 1
+    void  (*op_reduce)(u32 uop, u32 dst, u32 dst_numel,
+                       u32 src, u32 src_numel, u32 reduce_dim);
+    // Pool management: reset buffer pool to `keep` entries
+    void  (*pool_reset)(u32 keep);
 } Backend;
 
 // ============================================================
@@ -239,6 +245,7 @@ static inline void heap_set(TinyHVM *ctx, u64 loc, Term t);
 Backend *thvm_device(const char *name);  // "cpu", "metal"
 TinyHVM *thvm_init(Backend *backend);
 void     thvm_free(TinyHVM *ctx);
+void     thvm_reset(TinyHVM *ctx, u32 keep);  // free tensors above `keep`, reset heap
 
 // Reduction
 Term     thvm_reduce(TinyHVM *ctx, Term t);

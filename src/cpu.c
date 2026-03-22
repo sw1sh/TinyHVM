@@ -122,6 +122,39 @@ static void cpu_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
 #endif
 }
 
+// ============================================================
+// Reduce op (sum/max along last axis)
+// src is [outer × reduce_dim], dst is [outer]
+// ============================================================
+
+static void cpu_op_reduce(u32 uop, u32 dst, u32 dst_numel,
+                           u32 src, u32 src_numel, u32 reduce_dim) {
+    (void)src_numel;
+    f32 *pd = cpu_pool.bufs[dst];
+    f32 *ps = cpu_pool.bufs[src];
+    u32 outer = dst_numel;
+
+    for (u32 o = 0; o < outer; o++) {
+        f32 acc = (uop == UOP_RMAX) ? -1e30f : 0.0f;
+        for (u32 r = 0; r < reduce_dim; r++) {
+            f32 v = ps[o * reduce_dim + r];
+            if (uop == UOP_SUM)       acc += v;
+            else if (uop == UOP_RMAX) acc = v > acc ? v : acc;
+        }
+        pd[o] = acc;
+    }
+}
+
+static void cpu_pool_reset(u32 keep) {
+    // Free buffers above `keep` (keep is number of *tensors*, buf IDs start at 1)
+    u32 buf_keep = keep + 1;  // tensor 0 → buf 1, tensor N-1 → buf N
+    for (u32 i = buf_keep; i < cpu_pool.count; i++) {
+        free(cpu_pool.bufs[i]);
+        cpu_pool.bufs[i] = NULL;
+    }
+    cpu_pool.count = buf_keep;
+}
+
 Backend cpu_backend = {
     .init      = cpu_init,
     .shutdown  = cpu_shutdown,
@@ -132,4 +165,6 @@ Backend cpu_backend = {
     .op_unary  = cpu_op_unary,
     .op_binary = cpu_op_binary,
     .op_mm     = cpu_op_mm,
+    .op_reduce = cpu_op_reduce,
+    .pool_reset = cpu_pool_reset,
 };

@@ -3,9 +3,9 @@
 // Trains on 4 XOR examples, converges to loss < 0.05
 
 #include "../src/tinyhvm.c"
-#include "../src/gpu_cpu.c"
+#include "../src/cpu.c"
 #ifdef __APPLE__
-  #include "../src/gpu_metal.m"
+  #include "../src/metal.m"
 #endif
 
 #ifndef DEVICE

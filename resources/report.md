@@ -323,8 +323,8 @@ Completed. TinyHVM is a standalone C library (~2000 LoC) with:
 - **Interaction calculus core**: 64-bit term encoding (SUB:1 | TAG:7 | EXT:18 | VAL:38), bump-allocated heap, weak normal form reduction engine
 - **Tensor abstraction**: `Shape` struct (variable rank up to 8D), `View` with strides/offset (tinygrad-inspired ShapeTracker), dtype-aware with `dtype_size()` helper
 - **Backend interface**: `Backend` vtable with `init/shutdown/buf_alloc/buf_free/buf_write/buf_read/op_unary/op_binary/op_mm`. Runtime selection via `thvm_device("cpu"|"metal")`
-- **CPU backend** (`gpu_cpu.c`): Accelerate/vDSP matmul, strided elementwise ops
-- **Metal backend** (`gpu_metal.m`): 11 compute shaders + MPS matmul, `StorageModeShared` for zero-copy on Apple Silicon
+- **CPU backend** (`cpu.c`): Accelerate/vDSP matmul, strided elementwise ops
+- **Metal backend** (`metal.m`): 11 compute shaders + MPS matmul, `StorageModeShared` for zero-copy on Apple Silicon
 - **Operations**: neg, exp, log, relu (unary); add, mul, sub, div, max, cmp (binary); matmul (MPS/Accelerate)
 - **Broadcasting**: Full numpy-style shape broadcasting with stride manipulation
 - **Tests**: 93/93 unit tests passing on both CPU and Metal
@@ -332,8 +332,8 @@ Completed. TinyHVM is a standalone C library (~2000 LoC) with:
 ```
 src/tinyhvm.h      271 lines  — types, constants, API
 src/tinyhvm.c      650 lines  — reduction engine, views, autograd, API
-src/gpu_cpu.c      135 lines  — CPU backend (Accelerate)
-src/gpu_metal.m    277 lines  — Metal backend (MPS + compute shaders)
+src/cpu.c      135 lines  — CPU backend (Accelerate)
+src/metal.m    277 lines  — Metal backend (MPS + compute shaders)
 src/shaders.metal  163 lines  — 11 Metal compute kernels
 test/test_term.m   409 lines  — 93 unit tests
 test/test_train.m  144 lines  — XOR training end-to-end

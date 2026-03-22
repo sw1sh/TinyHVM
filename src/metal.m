@@ -1,4 +1,4 @@
-// gpu_metal.m — Metal GPU backend for TinyHVM
+// metal.m — Metal backend for TinyHVM
 // Pre-built compute shaders + MPS matmul.
 // Matches Backend vtable exactly.
 
@@ -22,6 +22,7 @@ static id<MTLLibrary>      mtl_lib;
 static id<MTLComputePipelineState> pipe_neg, pipe_relu, pipe_exp, pipe_log;
 static id<MTLComputePipelineState> pipe_add, pipe_mul, pipe_sub, pipe_div, pipe_max, pipe_cmp;
 static id<MTLComputePipelineState> pipe_mm;
+static id<MTLComputePipelineState> pipe_reduce_sum, pipe_reduce_max;
 
 // Buffer pool
 static struct {
@@ -111,6 +112,8 @@ static int metal_init(void) {
     pipe_max  = make_pipe(@"binary_max");
     pipe_cmp  = make_pipe(@"binary_cmp");
     pipe_mm   = make_pipe(@"matmul_f32");
+    pipe_reduce_sum = make_pipe(@"reduce_sum");
+    pipe_reduce_max = make_pipe(@"reduce_max");
 
     memset(&metal_pool, 0, sizeof(metal_pool));
     metal_pool.count = 1;  // 0 reserved
@@ -260,6 +263,35 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
 }
 
 // ============================================================
+// Reduce op dispatch
+// ============================================================
+
+static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
+                             u32 src, u32 src_numel, u32 reduce_dim) {
+    (void)src_numel;
+    id<MTLComputePipelineState> pipe = nil;
+    switch (uop) {
+        case UOP_SUM:  pipe = pipe_reduce_sum; break;
+        case UOP_RMAX: pipe = pipe_reduce_max; break;
+        default: return;
+    }
+
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+    const void *params[] = { &reduce_dim };
+    u64 psizes[] = { sizeof(u32) };
+    dispatch_1d(pipe, bufs, 2, params, psizes, 1, dst_numel);
+}
+
+static void metal_pool_reset(u32 keep) {
+    u32 buf_keep = keep + 1;
+    for (u32 i = buf_keep; i < metal_pool.count; i++) {
+        metal_pool.bufs[i] = nil;
+        metal_pool.sizes[i] = 0;
+    }
+    metal_pool.count = buf_keep;
+}
+
+// ============================================================
 // Export
 // ============================================================
 
@@ -273,4 +305,6 @@ Backend metal_backend = {
     .op_unary  = metal_op_unary,
     .op_binary = metal_op_binary,
     .op_mm     = metal_op_mm,
+    .op_reduce = metal_op_reduce,
+    .pool_reset = metal_pool_reset,
 };

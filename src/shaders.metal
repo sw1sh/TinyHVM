@@ -161,3 +161,30 @@ kernel void matmul_f32(device float *C [[buffer(0)]],
         sum += A[row * K + k] * B[k * N + col];
     C[row * N + col] = sum;
 }
+
+// ============================================================
+// Reduce ops — one thread per output element
+// src is [outer × reduce_dim], dst is [outer]
+// ============================================================
+
+kernel void reduce_sum(device float *dst [[buffer(0)]],
+                       device const float *src [[buffer(1)]],
+                       constant uint &reduce_dim [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    float acc = 0.0f;
+    uint base = i * reduce_dim;
+    for (uint r = 0; r < reduce_dim; r++)
+        acc += src[base + r];
+    dst[i] = acc;
+}
+
+kernel void reduce_max(device float *dst [[buffer(0)]],
+                       device const float *src [[buffer(1)]],
+                       constant uint &reduce_dim [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    float acc = -1e30f;
+    uint base = i * reduce_dim;
+    for (uint r = 0; r < reduce_dim; r++)
+        acc = max(acc, src[base + r]);
+    dst[i] = acc;
+}

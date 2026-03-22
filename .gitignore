@@ -28,3 +28,5 @@ test_basic
 test_train
 test_metal
 shaders.metallib
+data/
+test_mnist

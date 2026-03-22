@@ -153,17 +153,16 @@ typedef struct {
 } View;
 
 typedef struct {
-    u32  buf_id;        // GPU buffer ID
-    u32  dtype;
-    u32  refcount;
-    View view;          // shape/stride/offset metadata
-    void *host_ptr;     // optional host shadow for readback
+    u32         buf_id;     // GPU buffer handle
+    u32         dtype;
+    u32         refcount;
+    View        view;
+    void       *host_ptr;   // cached host copy
 
     // Autograd provenance
-    u8   requires_grad;
-    u32  grad_id;       // tensor_id of accumulated gradient (0 = none)
-    u32  creator_op;    // UOP that created this tensor (for backward)
-    u32  src_ids[2];    // input tensor IDs (for backward rules)
+    u8          requires_grad;
+    u32         creator_op; // UOP that created this tensor
+    u32         src_ids[2]; // input tensor ids (for backward rules)
 } TensorMeta;
 
 // Autograd tape entry (records forward ops for backward pass)
@@ -241,5 +240,16 @@ f32     *thvm_to_host(TinyHVM *ctx, Term t);
 
 // Print
 void     thvm_print_term(TinyHVM *ctx, Term t);
+
+// Autograd
+void     thvm_set_requires_grad(TinyHVM *ctx, Term t);
+void     thvm_start_recording(TinyHVM *ctx);
+void     thvm_stop_recording(TinyHVM *ctx);
+void     thvm_clear_tape(TinyHVM *ctx);
+
+// Graph-level gradient (JAX-style)
+// Returns a lazy Term — when reduced, computes ∂y/∂x.
+// Gradient ops go through thvm_op → get taped → grad(grad(f)) works.
+Term     thvm_grad(TinyHVM *ctx, Term y, Term x);
 
 #endif // TINYHVM_H

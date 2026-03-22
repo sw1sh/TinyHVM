@@ -519,55 +519,60 @@ void thvm_set_requires_grad(TinyHVM *ctx, Term t) {
 
 void thvm_start_recording(TinyHVM *ctx) {
     ctx->recording = 1;
-    ctx->tape_len = 0;
 }
 
 void thvm_stop_recording(TinyHVM *ctx) {
     ctx->recording = 0;
 }
 
-// Accumulate grad into tensor's grad buffer
-static void grad_accumulate(TinyHVM *ctx, u32 tensor_id, u32 grad_id) {
-    TensorMeta *m = &ctx->tensors[tensor_id];
+void thvm_clear_tape(TinyHVM *ctx) {
+    ctx->tape_len = 0;
+}
 
-    // Reduce grad to match tensor shape if broadcast happened
-    grad_id = tensor_reduce_sum_to(ctx, grad_id, m->view.shape, m->view.ndim);
-    TensorMeta *mg = &ctx->tensors[grad_id];
+// ============================================================
+// grad.c — Graph-level gradient (JAX-style)
+// ============================================================
+//
+// thvm_grad(ctx, y, x) returns a lazy Term.
+// When reduced, it computes ∂y/∂x.
+// Because gradient ops are built with thvm_op(), they go through
+// thvm_reduce → TAG_TOP dispatch → get taped if recording is on.
+// This means grad(grad(f)) works: reduce the first gradient with
+// recording on, then call thvm_grad again on the result.
 
-    if (m->grad_id == 0) {
-        // First gradient — just assign
-        m->grad_id = grad_id;
+// Accumulate gradient: grad_map[id] += new_grad (lazy ADD)
+static void grad_graph_accum(TinyHVM *ctx, Term *grad_map, u32 id, Term new_grad) {
+    if (!ctx->tensors[id].requires_grad) return;
+    if (term_tag(grad_map[id]) == TAG_ERA) {
+        grad_map[id] = new_grad;
     } else {
-        // Accumulate: existing_grad += new_grad
-        TensorMeta *mold = &ctx->tensors[m->grad_id];
-        View gv_bc, ov_bc;
-        u32 out_shape[MAX_DIM], out_ndim;
-        view_broadcast(&mold->view, &mg->view, &ov_bc, &gv_bc, out_shape, &out_ndim);
-        u32 acc_id = tensor_create(ctx, out_shape, out_ndim, m->dtype);
-        TensorMeta *macc = &ctx->tensors[acc_id];
-        ctx->gpu->op_binary(UOP_ADD, macc->buf_id, &macc->view,
-                            mold->buf_id, &ov_bc, mg->buf_id, &gv_bc);
-        m->grad_id = acc_id;
+        grad_map[id] = thvm_op(ctx, UOP_ADD, grad_map[id], new_grad);
     }
 }
 
-void thvm_backward(TinyHVM *ctx, Term loss) {
-    loss = thvm_reduce(ctx, loss);
-    assert(term_tag(loss) == TAG_TEN);
-    u32 loss_id = (u32)term_val(loss);
+Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
+    // Reduce y so we have tensor IDs and a tape
+    y = thvm_reduce(ctx, y);
+    assert(term_tag(y) == TAG_TEN && term_tag(x) == TAG_TEN);
+    u32 y_id = (u32)term_val(y);
+    u32 x_id = (u32)term_val(x);
 
-    // Seed: d(loss)/d(loss) = 1
-    TensorMeta *ml = &ctx->tensors[loss_id];
-    u32 ones_id = tensor_fill(ctx, ml->view.shape, ml->view.ndim, 1.0f);
-    ml->grad_id = ones_id;
+    // Gradient map: tensor_id → gradient Term (ERA = no gradient yet)
+    u32 tc = ctx->tensor_count;
+    Term *gm = malloc(tc * sizeof(Term));
+    for (u32 i = 0; i < tc; i++) gm[i] = term_era();
 
-    // Walk tape in reverse
+    // Seed: ∂y/∂y = 1 (ones with same shape as y)
+    TensorMeta *my = &ctx->tensors[y_id];
+    u32 ones_id = tensor_fill(ctx, my->view.shape, my->view.ndim, 1.0f);
+    gm[y_id] = term_ten(ones_id, my->dtype);
+
+    // Walk tape backward, build lazy gradient graph
     for (i32 i = (i32)ctx->tape_len - 1; i >= 0; i--) {
         TapeEntry *e = &ctx->tape[i];
-        TensorMeta *mout = &ctx->tensors[e->out_id];
-        if (mout->grad_id == 0) continue;  // no gradient flowing here
+        Term grad = gm[e->out_id];
+        if (term_tag(grad) == TAG_ERA) continue;
 
-        u32 grad_id = mout->grad_id;
         u32 a_id = e->src_ids[0];
         u32 b_id = e->src_ids[1];
         int is_binary = (e->uop >= UOP_ADD && e->uop <= UOP_SUB) || e->uop == UOP_MM;
@@ -575,156 +580,77 @@ void thvm_backward(TinyHVM *ctx, Term loss) {
         TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
 
         switch (e->uop) {
-            case UOP_ADD: {
-                // d(a+b)/da = 1, d(a+b)/db = 1 → pass grad through
-                if (ma->requires_grad) grad_accumulate(ctx, a_id, grad_id);
-                if (mb && mb->requires_grad) grad_accumulate(ctx, b_id, grad_id);
+            case UOP_ADD:
+                // ∂(a+b)/∂a = 1 → pass grad through
+                grad_graph_accum(ctx, gm, a_id, grad);
+                if (mb) grad_graph_accum(ctx, gm, b_id, grad);
                 break;
-            }
-            case UOP_SUB: {
-                // d(a-b)/da = 1, d(a-b)/db = -1
-                if (ma->requires_grad) grad_accumulate(ctx, a_id, grad_id);
-                if (mb && mb->requires_grad) {
-                    // neg(grad)
-                    u32 neg_id = tensor_create(ctx, ctx->tensors[grad_id].view.shape,
-                                               ctx->tensors[grad_id].view.ndim, ma->dtype);
-                    ctx->gpu->op_unary(UOP_NEG, ctx->tensors[neg_id].buf_id, &ctx->tensors[neg_id].view,
-                                       ctx->tensors[grad_id].buf_id, &ctx->tensors[grad_id].view);
-                    grad_accumulate(ctx, b_id, neg_id);
-                }
+
+            case UOP_SUB:
+                // ∂(a-b)/∂a = 1, ∂(a-b)/∂b = -1
+                grad_graph_accum(ctx, gm, a_id, grad);
+                if (mb && mb->requires_grad)
+                    grad_graph_accum(ctx, gm, b_id,
+                        thvm_op(ctx, UOP_NEG, grad, term_era()));
                 break;
-            }
-            case UOP_MUL: {
-                // d(a*b)/da = b, d(a*b)/db = a → grad*b, grad*a
-                TensorMeta *mg = &ctx->tensors[grad_id];
-                if (ma->requires_grad) {
-                    // grad_a = grad * b
-                    View gv, bv; u32 os[MAX_DIM], on;
-                    view_broadcast(&mg->view, &mb->view, &gv, &bv, os, &on);
-                    u32 ga_id = tensor_create(ctx, os, on, ma->dtype);
-                    ctx->gpu->op_binary(UOP_MUL, ctx->tensors[ga_id].buf_id, &ctx->tensors[ga_id].view,
-                                        mg->buf_id, &gv, mb->buf_id, &bv);
-                    grad_accumulate(ctx, a_id, ga_id);
-                }
-                if (mb && mb->requires_grad) {
-                    // grad_b = grad * a
-                    View gv, av; u32 os[MAX_DIM], on;
-                    view_broadcast(&mg->view, &ma->view, &gv, &av, os, &on);
-                    u32 gb_id = tensor_create(ctx, os, on, ma->dtype);
-                    ctx->gpu->op_binary(UOP_MUL, ctx->tensors[gb_id].buf_id, &ctx->tensors[gb_id].view,
-                                        mg->buf_id, &gv, ma->buf_id, &av);
-                    grad_accumulate(ctx, b_id, gb_id);
-                }
+
+            case UOP_MUL:
+                // ∂(a*b)/∂a = b, ∂(a*b)/∂b = a
+                if (ma->requires_grad)
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_MUL, grad,
+                                term_ten(b_id, mb->dtype)));
+                if (mb && mb->requires_grad)
+                    grad_graph_accum(ctx, gm, b_id,
+                        thvm_op(ctx, UOP_MUL, grad,
+                                term_ten(a_id, ma->dtype)));
                 break;
-            }
+
             case UOP_MM: {
                 // z = mm(A[M,K], B[K,N])
-                // dz/dA = mm(grad[M,N], B^T[N,K])
-                // dz/dB = mm(A^T[K,M], grad[M,N])
-                TensorMeta *mg = &ctx->tensors[grad_id];
+                // ∂z/∂A = mm(grad, Bᵀ)
+                // ∂z/∂B = mm(Aᵀ, grad)
                 if (ma->requires_grad) {
                     u32 bt_id = tensor_transpose_2d(ctx, b_id);
-                    u32 M = mg->view.shape[0], N2 = mg->view.shape[1];
-                    u32 K = ctx->tensors[bt_id].view.shape[1];
-                    u32 ga_shape[] = {M, K};
-                    u32 ga_id = tensor_create(ctx, ga_shape, 2, ma->dtype);
-                    ctx->gpu->op_mm(ctx->tensors[ga_id].buf_id,
-                                    mg->buf_id, &mg->view,
-                                    ctx->tensors[bt_id].buf_id, &ctx->tensors[bt_id].view,
-                                    M, N2, K);
-                    grad_accumulate(ctx, a_id, ga_id);
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_MM, grad,
+                                term_ten(bt_id, mb->dtype)));
                 }
                 if (mb && mb->requires_grad) {
                     u32 at_id = tensor_transpose_2d(ctx, a_id);
-                    u32 K = ctx->tensors[at_id].view.shape[0];
-                    u32 M2 = ctx->tensors[at_id].view.shape[1];
-                    u32 N = mg->view.shape[1];
-                    u32 gb_shape[] = {K, N};
-                    u32 gb_id = tensor_create(ctx, gb_shape, 2, ma->dtype);
-                    ctx->gpu->op_mm(ctx->tensors[gb_id].buf_id,
-                                    ctx->tensors[at_id].buf_id, &ctx->tensors[at_id].view,
-                                    mg->buf_id, &mg->view,
-                                    K, M2, N);
-                    grad_accumulate(ctx, b_id, gb_id);
+                    grad_graph_accum(ctx, gm, b_id,
+                        thvm_op(ctx, UOP_MM,
+                                term_ten(at_id, ma->dtype), grad));
                 }
                 break;
             }
+
             case UOP_RELU: {
-                // d(relu(a))/da = (a > 0) ? 1 : 0  →  grad * (a > 0)
+                // ∂relu(a)/∂a = (a > 0) ? 1 : 0
+                // mask is computed eagerly (not differentiable)
                 if (ma->requires_grad) {
-                    TensorMeta *mg = &ctx->tensors[grad_id];
-                    // Create zero tensor for comparison
                     u32 zero_id = tensor_fill(ctx, ma->view.shape, ma->view.ndim, 0.0f);
-                    // mask = (a > 0)
                     u32 mask_id = tensor_create(ctx, ma->view.shape, ma->view.ndim, ma->dtype);
                     View mv, zv; u32 os[MAX_DIM], on;
                     view_broadcast(&ma->view, &ctx->tensors[zero_id].view, &mv, &zv, os, &on);
-                    ctx->gpu->op_binary(UOP_CMP, ctx->tensors[mask_id].buf_id, &ctx->tensors[mask_id].view,
-                                        ma->buf_id, &mv, ctx->tensors[zero_id].buf_id, &zv);
-                    // grad_a = grad * mask
-                    View gv, mkv; u32 os2[MAX_DIM], on2;
-                    view_broadcast(&mg->view, &ctx->tensors[mask_id].view, &gv, &mkv, os2, &on2);
-                    u32 ga_id = tensor_create(ctx, os2, on2, ma->dtype);
-                    ctx->gpu->op_binary(UOP_MUL, ctx->tensors[ga_id].buf_id, &ctx->tensors[ga_id].view,
-                                        mg->buf_id, &gv, ctx->tensors[mask_id].buf_id, &mkv);
-                    grad_accumulate(ctx, a_id, ga_id);
+                    ctx->gpu->op_binary(UOP_CMP, ctx->tensors[mask_id].buf_id,
+                                        &ctx->tensors[mask_id].view,
+                                        ma->buf_id, &mv,
+                                        ctx->tensors[zero_id].buf_id, &zv);
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_MUL, grad,
+                                term_ten(mask_id, ma->dtype)));
                 }
                 break;
             }
+
             default:
-                // Unknown op — skip (gradient doesn't flow through)
                 break;
         }
     }
+
+    Term result = gm[x_id];
+    free(gm);
+    return result;  // lazy — reduce to get the value
 }
 
-void thvm_zero_grad(TinyHVM *ctx) {
-    for (u32 i = 0; i < ctx->tensor_count; i++) {
-        ctx->tensors[i].grad_id = 0;
-    }
-    ctx->tape_len = 0;
-}
-
-f32 *thvm_get_grad(TinyHVM *ctx, Term t) {
-    if (term_tag(t) != TAG_TEN) return NULL;
-    u32 id = (u32)term_val(t);
-    TensorMeta *m = &ctx->tensors[id];
-    if (m->grad_id == 0) return NULL;
-    TensorMeta *mg = &ctx->tensors[m->grad_id];
-    if (!mg->host_ptr) mg->host_ptr = malloc((size_t)mg->view.numel * sizeof(f32));
-    if (ctx->gpu) ctx->gpu->buf_read(mg->buf_id, mg->host_ptr, (u64)mg->view.numel * 4);
-    return (f32 *)mg->host_ptr;
-}
-
-// SGD update: param -= lr * grad
-void thvm_param_update(TinyHVM *ctx, Term *params, u32 n, f32 lr) {
-    for (u32 i = 0; i < n; i++) {
-        if (term_tag(params[i]) != TAG_TEN) continue;
-        u32 pid = (u32)term_val(params[i]);
-        TensorMeta *mp = &ctx->tensors[pid];
-        if (mp->grad_id == 0) continue;
-        TensorMeta *mg = &ctx->tensors[mp->grad_id];
-
-        // scaled_grad = lr * grad
-        u32 lr_id = tensor_fill(ctx, mg->view.shape, mg->view.ndim, lr);
-        u32 scaled_id = tensor_create(ctx, mg->view.shape, mg->view.ndim, mp->dtype);
-        View lv, gv; u32 os[MAX_DIM], on;
-        view_broadcast(&ctx->tensors[lr_id].view, &mg->view, &lv, &gv, os, &on);
-        ctx->gpu->op_binary(UOP_MUL, ctx->tensors[scaled_id].buf_id, &ctx->tensors[scaled_id].view,
-                            ctx->tensors[lr_id].buf_id, &lv, mg->buf_id, &gv);
-
-        // param -= scaled_grad
-        u32 new_id = tensor_create(ctx, mp->view.shape, mp->view.ndim, mp->dtype);
-        View pv, sv; u32 os2[MAX_DIM], on2;
-        view_broadcast(&mp->view, &ctx->tensors[scaled_id].view, &pv, &sv, os2, &on2);
-        ctx->gpu->op_binary(UOP_SUB, ctx->tensors[new_id].buf_id, &ctx->tensors[new_id].view,
-                            mp->buf_id, &pv, ctx->tensors[scaled_id].buf_id, &sv);
-
-        // Copy back to original buffer
-        u64 bytes = (u64)mp->view.numel * 4;
-        void *tmp = malloc(bytes);
-        ctx->gpu->buf_read(ctx->tensors[new_id].buf_id, tmp, bytes);
-        ctx->gpu->buf_write(mp->buf_id, tmp, bytes);
-        free(tmp);
-    }
-}

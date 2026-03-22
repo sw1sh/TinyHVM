@@ -226,33 +226,28 @@ static void test_full_forward(void) {
     thvm_free(ctx);
 }
 
-// ---- Autograd ----
+// ---- Autograd (graph-level only) ----
 
-static void test_grad_mul(void) {
-    printf("test_grad_mul (d(x*x)/dx at x=3 => 6):\n");
+static void test_grad_x2(void) {
+    printf("test_grad_x2 (d(x^2)/dx = 2x at x=3):\n");
     TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
 
-    // x = [[3.0]]  (scalar as 1x1)
     f32 x_d[] = {3.0f}; u32 xs[] = {1, 1};
     Term x = thvm_tensor(ctx, x_d, xs, 2);
     thvm_set_requires_grad(ctx, x);
 
-    // Forward: y = x * x
+    thvm_clear_tape(ctx);
     thvm_start_recording(ctx);
-    Term y = thvm_op(ctx, UOP_MUL, x, x);
-    Term result = thvm_reduce(ctx, y);
+    Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_MUL, x, x));
     thvm_stop_recording(ctx);
 
-    // Check forward value: 3*3 = 9
-    f32 *fwd = thvm_to_host(ctx, result);
+    f32 *fwd = thvm_to_host(ctx, yr);
     ASSERT_NEAR(fwd[0], 9.0f, 1e-5f, "3*3 = 9");
 
-    // Backward
-    thvm_backward(ctx, result);
-    f32 *grad = thvm_get_grad(ctx, x);
-    ASSERT(grad != NULL, "grad exists");
-    // d(x*x)/dx = 2x = 6
-    ASSERT_NEAR(grad[0], 6.0f, 1e-5f, "d(x^2)/dx = 2x = 6");
+    Term dy = thvm_grad(ctx, yr, x);
+    f32 *g = thvm_to_host(ctx, dy);
+    ASSERT(g != NULL, "grad exists");
+    ASSERT_NEAR(g[0], 6.0f, 1e-5f, "d(x^2)/dx = 2x = 6");
 
     thvm_free(ctx);
 }
@@ -268,17 +263,16 @@ static void test_grad_add(void) {
     thvm_set_requires_grad(ctx, a);
     thvm_set_requires_grad(ctx, b);
 
+    thvm_clear_tape(ctx);
     thvm_start_recording(ctx);
-    Term y = thvm_op(ctx, UOP_ADD, a, b);
-    Term result = thvm_reduce(ctx, y);
+    Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD, a, b));
     thvm_stop_recording(ctx);
 
-    f32 *fwd = thvm_to_host(ctx, result);
+    f32 *fwd = thvm_to_host(ctx, yr);
     ASSERT_NEAR(fwd[0], 7.0f, 1e-5f, "2+5 = 7");
 
-    thvm_backward(ctx, result);
-    f32 *ga = thvm_get_grad(ctx, a);
-    f32 *gb = thvm_get_grad(ctx, b);
+    f32 *ga = thvm_to_host(ctx, thvm_grad(ctx, yr, a));
+    f32 *gb = thvm_to_host(ctx, thvm_grad(ctx, yr, b));
     ASSERT_NEAR(ga[0], 1.0f, 1e-5f, "d(a+b)/da = 1");
     ASSERT_NEAR(gb[0], 1.0f, 1e-5f, "d(a+b)/db = 1");
 
@@ -293,24 +287,21 @@ static void test_grad_relu(void) {
     Term x = thvm_tensor(ctx, x_d, xs, 2);
     thvm_set_requires_grad(ctx, x);
 
+    thvm_clear_tape(ctx);
     thvm_start_recording(ctx);
-    Term y = thvm_op(ctx, UOP_RELU, x, term_era());
-    Term result = thvm_reduce(ctx, y);
+    Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_RELU, x, term_era()));
     thvm_stop_recording(ctx);
 
-    // relu([-2,3,-1,4]) = [0,3,0,4]
-    f32 *fwd = thvm_to_host(ctx, result);
+    f32 *fwd = thvm_to_host(ctx, yr);
     ASSERT_NEAR(fwd[0], 0.0f, 1e-5f, "relu(-2)=0");
     ASSERT_NEAR(fwd[1], 3.0f, 1e-5f, "relu(3)=3");
 
-    thvm_backward(ctx, result);
-    f32 *grad = thvm_get_grad(ctx, x);
-    ASSERT(grad != NULL, "relu grad exists");
-    // d(relu)/dx = 0 where x<0, 1 where x>0
-    ASSERT_NEAR(grad[0], 0.0f, 1e-5f, "relu grad(-2)=0");
-    ASSERT_NEAR(grad[1], 1.0f, 1e-5f, "relu grad(3)=1");
-    ASSERT_NEAR(grad[2], 0.0f, 1e-5f, "relu grad(-1)=0");
-    ASSERT_NEAR(grad[3], 1.0f, 1e-5f, "relu grad(4)=1");
+    f32 *g = thvm_to_host(ctx, thvm_grad(ctx, yr, x));
+    ASSERT(g != NULL, "relu grad exists");
+    ASSERT_NEAR(g[0], 0.0f, 1e-5f, "relu grad(-2)=0");
+    ASSERT_NEAR(g[1], 1.0f, 1e-5f, "relu grad(3)=1");
+    ASSERT_NEAR(g[2], 0.0f, 1e-5f, "relu grad(-1)=0");
+    ASSERT_NEAR(g[3], 1.0f, 1e-5f, "relu grad(4)=1");
 
     thvm_free(ctx);
 }
@@ -319,7 +310,6 @@ static void test_grad_mm(void) {
     printf("test_grad_mm (matmul gradient):\n");
     TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
 
-    // A = [[1,2],[3,4]] (2x2), B = [[5,6],[7,8]] (2x2)
     f32 a_d[] = {1,2,3,4}; u32 s[] = {2, 2};
     f32 b_d[] = {5,6,7,8};
     Term a = thvm_tensor(ctx, a_d, s, 2);
@@ -327,30 +317,27 @@ static void test_grad_mm(void) {
     thvm_set_requires_grad(ctx, a);
     thvm_set_requires_grad(ctx, b);
 
+    thvm_clear_tape(ctx);
     thvm_start_recording(ctx);
-    Term y = thvm_op(ctx, UOP_MM, a, b);
-    Term result = thvm_reduce(ctx, y);
+    Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_MM, a, b));
     thvm_stop_recording(ctx);
 
-    // mm = [[1*5+2*7, 1*6+2*8],[3*5+4*7, 3*6+4*8]] = [[19,22],[43,50]]
-    f32 *fwd = thvm_to_host(ctx, result);
+    f32 *fwd = thvm_to_host(ctx, yr);
     ASSERT_NEAR(fwd[0], 19.0f, 1e-4f, "mm[0,0]=19");
     ASSERT_NEAR(fwd[1], 22.0f, 1e-4f, "mm[0,1]=22");
     ASSERT_NEAR(fwd[2], 43.0f, 1e-4f, "mm[1,0]=43");
     ASSERT_NEAR(fwd[3], 50.0f, 1e-4f, "mm[1,1]=50");
 
-    thvm_backward(ctx, result);
-
-    // grad_A = grad . B^T = [[1,1],[1,1]] . [[5,7],[6,8]] = [[11,15],[11,15]]
-    f32 *ga = thvm_get_grad(ctx, a);
+    // grad_A = ones . B^T = [[11,15],[11,15]]
+    f32 *ga = thvm_to_host(ctx, thvm_grad(ctx, yr, a));
     ASSERT(ga != NULL, "mm grad_a exists");
     ASSERT_NEAR(ga[0], 11.0f, 1e-4f, "grad_A[0,0]=11");
     ASSERT_NEAR(ga[1], 15.0f, 1e-4f, "grad_A[0,1]=15");
     ASSERT_NEAR(ga[2], 11.0f, 1e-4f, "grad_A[1,0]=11");
     ASSERT_NEAR(ga[3], 15.0f, 1e-4f, "grad_A[1,1]=15");
 
-    // grad_B = A^T . grad = [[1,3],[2,4]] . [[1,1],[1,1]] = [[4,4],[6,6]]
-    f32 *gb = thvm_get_grad(ctx, b);
+    // grad_B = A^T . ones = [[4,4],[6,6]]
+    f32 *gb = thvm_to_host(ctx, thvm_grad(ctx, yr, b));
     ASSERT(gb != NULL, "mm grad_b exists");
     ASSERT_NEAR(gb[0], 4.0f, 1e-4f, "grad_B[0,0]=4");
     ASSERT_NEAR(gb[1], 4.0f, 1e-4f, "grad_B[0,1]=4");
@@ -360,8 +347,45 @@ static void test_grad_mm(void) {
     thvm_free(ctx);
 }
 
+static void test_grad_of_grad(void) {
+    printf("test_grad_of_grad (d²(x³)/dx² = 6x at x=2 => 12):\n");
+    TinyHVM *ctx = thvm_init(&gpu_cpu_backend);
+
+    f32 x_d[] = {2.0f}; u32 xs[] = {1, 1};
+    Term x = thvm_tensor(ctx, x_d, xs, 2);
+    thvm_set_requires_grad(ctx, x);
+
+    // Forward: x^3 — tape accumulates
+    thvm_clear_tape(ctx);
+    thvm_start_recording(ctx);
+    Term t1 = thvm_op(ctx, UOP_MUL, x, x);
+    Term y  = thvm_op(ctx, UOP_MUL, t1, x);
+    Term yr = thvm_reduce(ctx, y);
+    // DON'T stop recording — tape accumulates into grad reduction
+
+    f32 *fwd = thvm_to_host(ctx, yr);
+    ASSERT_NEAR(fwd[0], 8.0f, 1e-4f, "x^3 = 8");
+
+    // First grad: dy/dx (lazy) — reduce it while recording
+    Term dy_dx = thvm_grad(ctx, yr, x);
+    Term dy_val = thvm_reduce(ctx, dy_dx);  // grad ops get taped
+    thvm_stop_recording(ctx);
+
+    f32 *g1 = thvm_to_host(ctx, dy_val);
+    ASSERT(g1 != NULL, "first grad exists");
+    ASSERT_NEAR(g1[0], 12.0f, 1e-4f, "d(x^3)/dx = 3x^2 = 12");
+
+    // Second grad: d²y/dx² — walks FULL tape (forward + grad ops)
+    Term d2y = thvm_grad(ctx, dy_val, x);
+    f32 *g2 = thvm_to_host(ctx, d2y);
+    ASSERT(g2 != NULL, "second grad exists");
+    ASSERT_NEAR(g2[0], 12.0f, 1e-4f, "d²(x³)/dx² = 6x = 12");
+
+    thvm_free(ctx);
+}
+
 int main(void) {
-    printf("=== TinyHVM Test Suite v2 ===\n\n");
+    printf("=== TinyHVM Test Suite v3 ===\n\n");
 
     test_term_packing();
     test_num_encoding();
@@ -374,10 +398,11 @@ int main(void) {
     test_broadcast_add();
     test_broadcast_column();
     test_full_forward();
-    test_grad_mul();
+    test_grad_x2();
     test_grad_add();
     test_grad_relu();
     test_grad_mm();
+    test_grad_of_grad();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);

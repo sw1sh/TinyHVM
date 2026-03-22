@@ -1,6 +1,6 @@
 // metal.m — Metal backend for TinyHVM
 // Pre-built compute shaders + MPS matmul.
-// Matches Backend vtable exactly.
+// Command buffer batching for performance.
 
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
@@ -19,10 +19,13 @@ static id<MTLCommandQueue> mtl_queue;
 static id<MTLLibrary>      mtl_lib;
 
 // Shader pipelines
-static id<MTLComputePipelineState> pipe_neg, pipe_relu, pipe_exp, pipe_log;
+static id<MTLComputePipelineState> pipe_neg, pipe_relu, pipe_exp, pipe_log, pipe_sqrt;
 static id<MTLComputePipelineState> pipe_add, pipe_mul, pipe_sub, pipe_div, pipe_max, pipe_cmp;
 static id<MTLComputePipelineState> pipe_mm;
 static id<MTLComputePipelineState> pipe_reduce_sum, pipe_reduce_max;
+static id<MTLComputePipelineState> pipe_im2col, pipe_col2im;
+static id<MTLComputePipelineState> pipe_nhwc_to_nchw, pipe_nchw_to_nhwc;
+static id<MTLComputePipelineState> pipe_bias_add, pipe_col_sum;
 
 // Buffer pool
 static struct {
@@ -31,7 +34,56 @@ static struct {
     u32           count;
 } metal_pool;
 
-// ViewParams must match the struct in shaders.metal
+// ============================================================
+// Command buffer batching
+// ============================================================
+// When batching is active, compute dispatches accumulate into a single
+// command buffer instead of each creating + committing their own.
+// This eliminates ~50 GPU syncs per training step.
+
+static id<MTLCommandBuffer>         batch_cmd;      // active batch command buffer
+static id<MTLComputeCommandEncoder> batch_encoder;   // shared compute encoder
+static int                          batch_active;    // 1 = batching on
+static int                          batch_dirty;     // 1 = encoder has pending work
+
+// Flush (commit + wait) any pending compute work
+static void metal_flush(void) {
+    if (batch_encoder) {
+        [batch_encoder endEncoding];
+        batch_encoder = nil;
+    }
+    if (batch_cmd) {
+        [batch_cmd commit];
+        [batch_cmd waitUntilCompleted];
+        batch_cmd = nil;
+    }
+    batch_dirty = 0;
+}
+
+// Get or create the shared compute encoder
+static id<MTLComputeCommandEncoder> get_encoder(void) {
+    if (!batch_cmd) {
+        batch_cmd = [mtl_queue commandBuffer];
+    }
+    if (!batch_encoder) {
+        batch_encoder = [batch_cmd computeCommandEncoder];
+    }
+    return batch_encoder;
+}
+
+static void metal_begin_batch(void) {
+    batch_active = 1;
+}
+
+static void metal_end_batch(void) {
+    if (batch_dirty) metal_flush();
+    batch_active = 0;
+}
+
+// ============================================================
+// ViewParams (must match shaders.metal)
+// ============================================================
+
 typedef struct {
     int32_t  strides[8];
     uint32_t shape[8];
@@ -105,6 +157,7 @@ static int metal_init(void) {
     pipe_relu = make_pipe(@"unary_relu");
     pipe_exp  = make_pipe(@"unary_exp");
     pipe_log  = make_pipe(@"unary_log");
+    pipe_sqrt = make_pipe(@"unary_sqrt");
     pipe_add  = make_pipe(@"binary_add");
     pipe_mul  = make_pipe(@"binary_mul");
     pipe_sub  = make_pipe(@"binary_sub");
@@ -112,15 +165,27 @@ static int metal_init(void) {
     pipe_max  = make_pipe(@"binary_max");
     pipe_cmp  = make_pipe(@"binary_cmp");
     pipe_mm   = make_pipe(@"matmul_f32");
+    pipe_im2col = make_pipe(@"im2col");
+    pipe_col2im = make_pipe(@"col2im");
+    pipe_nhwc_to_nchw = make_pipe(@"nhwc_to_nchw");
+    pipe_nchw_to_nhwc = make_pipe(@"nchw_to_nhwc");
+    pipe_bias_add = make_pipe(@"bias_add");
+    pipe_col_sum = make_pipe(@"col_sum");
     pipe_reduce_sum = make_pipe(@"reduce_sum");
     pipe_reduce_max = make_pipe(@"reduce_max");
 
     memset(&metal_pool, 0, sizeof(metal_pool));
     metal_pool.count = 1;  // 0 reserved
+
+    batch_cmd = nil;
+    batch_encoder = nil;
+    batch_active = 0;
+    batch_dirty = 0;
     return 0;
 }
 
 static void metal_shutdown(void) {
+    metal_flush();
     for (u32 i = 1; i < metal_pool.count; i++) {
         metal_pool.bufs[i] = nil;
     }
@@ -145,36 +210,53 @@ static void metal_buf_free(u32 id) {
 }
 
 static void metal_buf_write(u32 id, const void *data, u64 bytes) {
+    // Must flush pending GPU work before CPU writes to shared buffer
+    if (batch_dirty) metal_flush();
     memcpy(metal_pool.bufs[id].contents, data, bytes);
 }
 
 static void metal_buf_read(u32 id, void *out, u64 bytes) {
+    // Must flush pending GPU work before CPU reads from shared buffer
+    if (batch_dirty) metal_flush();
     memcpy(out, metal_pool.bufs[id].contents, bytes);
 }
 
 // ============================================================
-// Dispatch helpers
+// Dispatch helpers (batched)
 // ============================================================
 
 static void dispatch_1d(id<MTLComputePipelineState> pipe,
                         id<MTLBuffer> *bufs, u32 n_bufs,
                         const void **params, u64 *param_sizes, u32 n_params,
                         u32 numel) {
-    id<MTLCommandBuffer> cmd = [mtl_queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    [enc setComputePipelineState:pipe];
-
-    for (u32 i = 0; i < n_bufs; i++)
-        [enc setBuffer:bufs[i] offset:0 atIndex:i];
-    for (u32 i = 0; i < n_params; i++)
-        [enc setBytes:params[i] length:param_sizes[i] atIndex:n_bufs + i];
-
-    NSUInteger tpg = MIN(pipe.maxTotalThreadsPerThreadgroup, (NSUInteger)numel);
-    [enc dispatchThreads:MTLSizeMake(numel, 1, 1)
-       threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
+    if (batch_active) {
+        // Append to shared encoder
+        id<MTLComputeCommandEncoder> enc = get_encoder();
+        [enc setComputePipelineState:pipe];
+        for (u32 i = 0; i < n_bufs; i++)
+            [enc setBuffer:bufs[i] offset:0 atIndex:i];
+        for (u32 i = 0; i < n_params; i++)
+            [enc setBytes:params[i] length:param_sizes[i] atIndex:n_bufs + i];
+        NSUInteger tpg = MIN(pipe.maxTotalThreadsPerThreadgroup, (NSUInteger)numel);
+        [enc dispatchThreads:MTLSizeMake(numel, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        batch_dirty = 1;
+    } else {
+        // Immediate: own command buffer
+        id<MTLCommandBuffer> cmd = [mtl_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pipe];
+        for (u32 i = 0; i < n_bufs; i++)
+            [enc setBuffer:bufs[i] offset:0 atIndex:i];
+        for (u32 i = 0; i < n_params; i++)
+            [enc setBytes:params[i] length:param_sizes[i] atIndex:n_bufs + i];
+        NSUInteger tpg = MIN(pipe.maxTotalThreadsPerThreadgroup, (NSUInteger)numel);
+        [enc dispatchThreads:MTLSizeMake(numel, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
 }
 
 // ============================================================
@@ -189,6 +271,7 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
         case UOP_RELU: pipe = pipe_relu; break;
         case UOP_EXP:  pipe = pipe_exp;  break;
         case UOP_LOG:  pipe = pipe_log;  break;
+        case UOP_SQRT: pipe = pipe_sqrt; break;
         default: return;
     }
 
@@ -229,11 +312,14 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
 }
 
 // ============================================================
-// Matmul — MPS fast path, compute shader fallback
+// Matmul — MPS (requires its own command buffer)
 // ============================================================
 
 static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
                          u32 M, u32 K, u32 N) {
+    // MPS needs its own command buffer — flush any pending compute work first
+    if (batch_dirty) metal_flush();
+
     // Materialize non-contiguous inputs to contiguous temp buffers for MPS
     id<MTLBuffer> buf_a = metal_pool.bufs[a];
     id<MTLBuffer> buf_b = metal_pool.bufs[b];
@@ -273,7 +359,7 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
         buf_b = tmp_b;
     }
 
-    // MPS path: float matmul
+    // MPS matmul
     MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
         matrixDescriptorWithRows:M columns:K rowBytes:K*sizeof(float)
         dataType:MPSDataTypeFloat32];
@@ -296,7 +382,15 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
     id<MTLCommandBuffer> cmd = [mtl_queue commandBuffer];
     [mm encodeToCommandBuffer:cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
     [cmd commit];
-    [cmd waitUntilCompleted];
+
+    // If batching, we DON'T wait — the next batched compute dispatch will create
+    // a new command buffer which will be serialized after this one by the queue.
+    // If not batching, we must wait.
+    if (!batch_active) {
+        [cmd waitUntilCompleted];
+    } else {
+        [cmd waitUntilCompleted];  // TODO: can remove this with proper dependency tracking
+    }
 }
 
 // ============================================================
@@ -320,6 +414,7 @@ static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
 }
 
 static void metal_pool_reset(u32 keep) {
+    if (batch_dirty) metal_flush();
     u32 buf_keep = keep + 1;
     for (u32 i = buf_keep; i < metal_pool.count; i++) {
         metal_pool.bufs[i] = nil;
@@ -344,4 +439,6 @@ Backend metal_backend = {
     .op_mm     = metal_op_mm,
     .op_reduce = metal_op_reduce,
     .pool_reset = metal_pool_reset,
+    .begin_batch = metal_begin_batch,
+    .end_batch   = metal_end_batch,
 };

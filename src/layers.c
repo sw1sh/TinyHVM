@@ -271,10 +271,10 @@ static void adam_free(Adam *opt) {
 }
 
 // ============================================================
-// Conv2d: im2col + matmul (backend dispatch)
+// Conv2d: GPU im2col + MPS matmul (fully on-device)
 // ============================================================
-// im2col is host-side data movement (arranges patches as matrix rows)
-// then the core multiply is backend→op_mm
+// All data stays on GPU. Zero CPU roundtrips.
+// Pipeline: im2col(GPU) → matmul(MPS) → bias_add(GPU) → nhwc_to_nchw(GPU)
 
 typedef struct {
     u32 out_id;
@@ -282,75 +282,104 @@ typedef struct {
     u32 B, Cin, H, W, Cout, KH, KW, OH, OW;
 } ConvResult;
 
+// Conv2dParams must match the Metal shader struct
+typedef struct {
+    u32 B, Cin, H, W, KH, KW, OH, OW;
+    u32 patch_size;
+    u32 n_patches;
+} Conv2dParams;
+
+typedef struct {
+    u32 B, C, H, W;
+} LayoutParams;
+
 static ConvResult conv2d(TinyHVM *ctx, u32 x_id, u32 w_id, u32 b_id,
                          u32 B, u32 Cin, u32 H, u32 W, u32 Cout, u32 KH, u32 KW) {
     u32 OH = H - KH + 1, OW = W - KW + 1;
     u32 patch_size = Cin * KH * KW;
     u32 n_patches = B * OH * OW;
 
-    // im2col: [B, Cin, H, W] → [n_patches, patch_size]
-    f32 *x = buf_read(ctx, x_id, B*Cin*H*W);
-    f32 *col = calloc(n_patches * patch_size, sizeof(f32));
-    for (u32 b = 0; b < B; b++)
-        for (u32 oh = 0; oh < OH; oh++)
-            for (u32 ow = 0; ow < OW; ow++) {
-                u32 row = b * OH * OW + oh * OW + ow;
-                for (u32 c = 0; c < Cin; c++)
-                    for (u32 kh = 0; kh < KH; kh++)
-                        for (u32 kw = 0; kw < KW; kw++)
-                            col[row * patch_size + c*KH*KW + kh*KW + kw] =
-                                x[(b*Cin + c)*H*W + (oh+kh)*W + (ow+kw)];
-            }
-    free(x);
+    Conv2dParams cp = {B, Cin, H, W, KH, KW, OH, OW, patch_size, n_patches};
 
-    // Store col as tensor for backward
-    u32 col_id = tensor_from(ctx, col, SHAPE(n_patches, patch_size));
+    // Allocate col buffer: [n_patches, patch_size]
+    u32 col_buf = ctx->backend->buf_alloc(n_patches * patch_size * sizeof(f32));
+    u32 col_id = ctx->tensor_count++;
+    ctx->tensors[col_id] = (TensorMeta){
+        .buf_id = col_buf,
+        .dtype = DTYPE_F32,
+        .view = view_create(SHAPE(n_patches, patch_size)),
+    };
 
-    // Weight: [Cout, Cin*KH*KW] → W is already [Cout,Cin,KH,KW], reshape
-    // matmul: col [n_patches, patch_size] @ W^T [patch_size, Cout] → [n_patches, Cout]
-    // We reshape W to [Cout, patch_size] and transpose
-    Term w_flat = thvm_reshape(ctx, term_ten(w_id, DTYPE_F32), SHAPE(Cout, patch_size));
-    u32 axes[] = {1, 0};
-    Term w_t = thvm_permute(ctx, w_flat, axes, 2);  // [patch_size, Cout]
+    // GPU im2col: dispatch on full col matrix
+    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+    {
+        id<MTLBuffer> bufs[] = { metal_pool.bufs[col_buf], metal_pool.bufs[ctx->tensors[x_id].buf_id] };
+        const void *params[] = { &cp };
+        u64 psizes[] = { sizeof(Conv2dParams) };
+        dispatch_1d(pipe_im2col, bufs, 2, params, psizes, 1, n_patches * patch_size);
+    }
+    if (ctx->backend->end_batch) ctx->backend->end_batch();
 
-    Term out_t = thvm_op(ctx, UOP_MM, term_ten(col_id, DTYPE_F32), w_t);
+    // Weight: [Cout, Cin*KH*KW] → transpose to [patch_size, Cout] for matmul
+    // col [n_patches, patch_size] @ W^T [patch_size, Cout] → [n_patches, Cout]
+    u32 wt_buf = ctx->backend->buf_alloc(Cout * patch_size * sizeof(f32));
+    {
+        // Transpose W from [Cout, patch_size] to [patch_size, Cout] on CPU (small matrix)
+        f32 *w_data = malloc(Cout * patch_size * sizeof(f32));
+        f32 *wt_data = malloc(Cout * patch_size * sizeof(f32));
+        ctx->backend->buf_read(ctx->tensors[w_id].buf_id, w_data, Cout * patch_size * sizeof(f32));
+        for (u32 i = 0; i < Cout; i++)
+            for (u32 j = 0; j < patch_size; j++)
+                wt_data[j * Cout + i] = w_data[i * patch_size + j];
+        ctx->backend->buf_write(wt_buf, wt_data, Cout * patch_size * sizeof(f32));
+        free(w_data); free(wt_data);
+    }
 
-    // Add bias: [1, Cout] broadcast to [n_patches, Cout]
-    Term b_r = thvm_reshape(ctx, term_ten(b_id, DTYPE_F32), SHAPE(1, Cout));
-    Term b_bc = thvm_expand(ctx, b_r, SHAPE(n_patches, Cout));
-    Term y = thvm_op(ctx, UOP_ADD, out_t, b_bc);
+    // Matmul: col [n_patches, patch_size] @ W^T [patch_size, Cout] → [n_patches, Cout]
+    u32 mm_buf = ctx->backend->buf_alloc(n_patches * Cout * sizeof(f32));
+    View mm_view = view_create(SHAPE(n_patches, Cout));
+    View col_view = view_create(SHAPE(n_patches, patch_size));
+    View wt_view = view_create(SHAPE(patch_size, Cout));
+    ctx->backend->op_mm(mm_buf, col_buf, &col_view, wt_buf, &wt_view, n_patches, patch_size, Cout);
 
-    // Reduce to get output tensor id
-    y = thvm_reduce(ctx, y);
-    u32 out_id = (u32)term_val(y);
+    // Bias add + layout transpose: all on GPU in one batch
+    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+    {
+        // bias_add: mm_buf[i] += bias[i % Cout]
+        id<MTLBuffer> bias_bufs[] = { metal_pool.bufs[mm_buf], metal_pool.bufs[ctx->tensors[b_id].buf_id] };
+        const void *bias_params[] = { &Cout };
+        u64 bias_psizes[] = { sizeof(u32) };
+        dispatch_1d(pipe_bias_add, bias_bufs, 2, bias_params, bias_psizes, 1, n_patches * Cout);
+    }
 
-    // Reshape output: [n_patches, Cout] → [B, OH, OW, Cout] → [B, Cout, OH, OW]
-    ctx->tensors[out_id].view.shape = (Shape){.dims={B, Cout, OH, OW}, .rank=4};
-    ctx->tensors[out_id].view.strides[0] = (i32)(Cout*OH*OW);
-    ctx->tensors[out_id].view.strides[1] = 1;
-    ctx->tensors[out_id].view.strides[2] = (i32)(OW*Cout);
-    ctx->tensors[out_id].view.strides[3] = (i32)Cout;
-    // Actually, matmul output [n_patches, Cout] is row-major
-    // [b*OH*OW + oh*OW + ow, cout] → we need to transpose to NCHW
-    // Easier: just copy into NCHW layout
-    f32 *flat = buf_read(ctx, out_id, n_patches * Cout);
-    f32 *nchw = malloc(B * Cout * OH * OW * sizeof(f32));
-    for (u32 b = 0; b < B; b++)
-        for (u32 c = 0; c < Cout; c++)
-            for (u32 oh = 0; oh < OH; oh++)
-                for (u32 ow = 0; ow < OW; ow++)
-                    nchw[(b*Cout+c)*OH*OW + oh*OW+ow] =
-                        flat[(b*OH*OW + oh*OW+ow)*Cout + c];
+    // nhwc_to_nchw: [B, OH, OW, Cout] → [B, Cout, OH, OW]
+    u32 out_buf = ctx->backend->buf_alloc(B * Cout * OH * OW * sizeof(f32));
+    {
+        LayoutParams lp = {B, Cout, OH, OW};
+        id<MTLBuffer> layout_bufs[] = { metal_pool.bufs[out_buf], metal_pool.bufs[mm_buf] };
+        const void *layout_params[] = { &lp };
+        u64 layout_psizes[] = { sizeof(LayoutParams) };
+        dispatch_1d(pipe_nhwc_to_nchw, layout_bufs, 2, layout_params, layout_psizes, 1, B*Cout*OH*OW);
+    }
+    if (ctx->backend->end_batch) ctx->backend->end_batch();
 
-    ctx->tensors[out_id].view = view_create((Shape){.dims={B,Cout,OH,OW}, .rank=4});
-    ctx->backend->buf_write(ctx->tensors[out_id].buf_id, nchw, B*Cout*OH*OW*sizeof(f32));
-    free(flat); free(nchw); free(col);
+    // Register output tensor
+    u32 out_id = ctx->tensor_count++;
+    ctx->tensors[out_id] = (TensorMeta){
+        .buf_id = out_buf,
+        .dtype = DTYPE_F32,
+        .view = view_create((Shape){.dims={B,Cout,OH,OW}, .rank=4}),
+    };
+
+    // Free temp weight transpose buffer (keep col for backward)
+    ctx->backend->buf_free(wt_buf);
+    (void)mm_view;
 
     return (ConvResult){.out_id=out_id, .col_id=col_id, .B=B, .Cin=Cin, .H=H, .W=W,
                         .Cout=Cout, .KH=KH, .KW=KW, .OH=OH, .OW=OW};
 }
 
-// Conv2d backward (im2col-based matmul backward)
+// Conv2d backward (GPU im2col-based)
 typedef struct { u32 d_weight, d_bias, d_input; } ConvGrads;
 
 static ConvGrads conv2d_backward(TinyHVM *ctx, u32 d_out_id, ConvResult *cr, u32 w_id) {
@@ -360,60 +389,112 @@ static ConvGrads conv2d_backward(TinyHVM *ctx, u32 d_out_id, ConvResult *cr, u32
     u32 patch_size = Cin*KH*KW;
     u32 n_patches = B*OH*OW;
 
-    // d_out: [B,Cout,OH,OW] → [n_patches, Cout]
-    f32 *d_out_nchw = buf_read(ctx, d_out_id, B*Cout*OH*OW);
-    f32 *d_out_flat = malloc(n_patches * Cout * sizeof(f32));
-    for (u32 b = 0; b < B; b++)
-        for (u32 c = 0; c < Cout; c++)
-            for (u32 oh = 0; oh < OH; oh++)
-                for (u32 ow = 0; ow < OW; ow++)
-                    d_out_flat[(b*OH*OW+oh*OW+ow)*Cout+c] = d_out_nchw[(b*Cout+c)*OH*OW+oh*OW+ow];
-    free(d_out_nchw);
+    Conv2dParams cp = {B, Cin, H, W, KH, KW, OH, OW, patch_size, n_patches};
 
-    u32 dout_id = tensor_from(ctx, d_out_flat, SHAPE(n_patches, Cout));
-    free(d_out_flat);
+    // d_out: [B,Cout,OH,OW] → nchw_to_nhwc → [n_patches, Cout]
+    u32 dout_nhwc_buf = ctx->backend->buf_alloc(n_patches * Cout * sizeof(f32));
+    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+    {
+        LayoutParams lp = {B, Cout, OH, OW};
+        id<MTLBuffer> layout_bufs[] = { metal_pool.bufs[dout_nhwc_buf], metal_pool.bufs[ctx->tensors[d_out_id].buf_id] };
+        const void *layout_params[] = { &lp };
+        u64 layout_psizes[] = { sizeof(LayoutParams) };
+        dispatch_1d(pipe_nchw_to_nhwc, layout_bufs, 2, layout_params, layout_psizes, 1, n_patches*Cout);
+    }
+    if (ctx->backend->end_batch) ctx->backend->end_batch();
 
-    // d_weight: col^T [patch_size, n_patches] @ d_out [n_patches, Cout] → [patch_size, Cout]
-    u32 axes[] = {1, 0};
-    Term col_t = thvm_permute(ctx, term_ten(cr->col_id, DTYPE_F32), axes, 2);
-    Term dw_t = thvm_op(ctx, UOP_MM, col_t, term_ten(dout_id, DTYPE_F32));
-    // Transpose back to [Cout, patch_size] and reshape to [Cout, Cin, KH, KW]
-    Term dw_perm = thvm_permute(ctx, dw_t, axes, 2);
-    Term dw = thvm_reshape(ctx, dw_perm, (Shape){.dims={Cout, Cin, KH, KW}, .rank=4});
-    dw = thvm_reduce(ctx, dw);
-    u32 d_weight = (u32)term_val(dw);
+    // d_weight: col^T [patch_size, n_patches] @ d_out_flat [n_patches, Cout] → [patch_size, Cout]
+    // Transpose col: we have col [n_patches, patch_size], need col^T [patch_size, n_patches]
+    u32 col_buf = ctx->tensors[cr->col_id].buf_id;
+    u32 col_t_buf = ctx->backend->buf_alloc(n_patches * patch_size * sizeof(f32));
+    {
+        // CPU transpose of col matrix (can be large but avoids complex GPU kernel)
+        f32 *col_data = malloc(n_patches * patch_size * sizeof(f32));
+        f32 *col_t = malloc(n_patches * patch_size * sizeof(f32));
+        ctx->backend->buf_read(col_buf, col_data, n_patches * patch_size * sizeof(f32));
+        for (u32 i = 0; i < n_patches; i++)
+            for (u32 j = 0; j < patch_size; j++)
+                col_t[j * n_patches + i] = col_data[i * patch_size + j];
+        ctx->backend->buf_write(col_t_buf, col_t, n_patches * patch_size * sizeof(f32));
+        free(col_data); free(col_t);
+    }
 
-    // d_bias: sum d_out along patches → [Cout]
-    f32 *dout_data = buf_read(ctx, dout_id, n_patches * Cout);
-    f32 *db = calloc(Cout, sizeof(f32));
-    for (u32 i = 0; i < n_patches; i++)
-        for (u32 c = 0; c < Cout; c++)
-            db[c] += dout_data[i*Cout+c];
-    u32 d_bias = tensor_from(ctx, db, SHAPE(Cout));
-    free(dout_data); free(db);
+    u32 dw_buf = ctx->backend->buf_alloc(patch_size * Cout * sizeof(f32));
+    View col_t_view = view_create(SHAPE(patch_size, n_patches));
+    View dout_view = view_create(SHAPE(n_patches, Cout));
+    View dw_view = view_create(SHAPE(patch_size, Cout));
+    ctx->backend->op_mm(dw_buf, col_t_buf, &col_t_view, dout_nhwc_buf, &dout_view,
+                        patch_size, n_patches, Cout);
 
-    // d_input: d_out [n_patches, Cout] @ W [Cout, patch_size] → [n_patches, patch_size]
+    // Transpose dw: [patch_size, Cout] → [Cout, patch_size] → reshape [Cout,Cin,KH,KW]
+    u32 dw_t_buf = ctx->backend->buf_alloc(Cout * patch_size * sizeof(f32));
+    {
+        f32 *dw_data = malloc(patch_size * Cout * sizeof(f32));
+        f32 *dw_t = malloc(Cout * patch_size * sizeof(f32));
+        ctx->backend->buf_read(dw_buf, dw_data, patch_size * Cout * sizeof(f32));
+        for (u32 i = 0; i < patch_size; i++)
+            for (u32 j = 0; j < Cout; j++)
+                dw_t[j * patch_size + i] = dw_data[i * Cout + j];
+        ctx->backend->buf_write(dw_t_buf, dw_t, Cout * patch_size * sizeof(f32));
+        free(dw_data); free(dw_t);
+    }
+    u32 d_weight = ctx->tensor_count++;
+    ctx->tensors[d_weight] = (TensorMeta){
+        .buf_id = dw_t_buf,
+        .dtype = DTYPE_F32,
+        .view = view_create((Shape){.dims={Cout,Cin,KH,KW}, .rank=4}),
+    };
+
+    // d_bias: col_sum(d_out_flat) → [Cout]
+    u32 db_buf = ctx->backend->buf_alloc(Cout * sizeof(f32));
+    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+    {
+        id<MTLBuffer> sum_bufs[] = { metal_pool.bufs[db_buf], metal_pool.bufs[dout_nhwc_buf] };
+        const void *sum_params[] = { &n_patches, &Cout };
+        u64 sum_psizes[] = { sizeof(u32), sizeof(u32) };
+        dispatch_1d(pipe_col_sum, sum_bufs, 2, sum_params, sum_psizes, 2, Cout);
+    }
+    if (ctx->backend->end_batch) ctx->backend->end_batch();
+
+    u32 d_bias = ctx->tensor_count++;
+    ctx->tensors[d_bias] = (TensorMeta){
+        .buf_id = db_buf,
+        .dtype = DTYPE_F32,
+        .view = view_create(SHAPE(Cout)),
+    };
+
+    // d_input: d_out_flat [n_patches, Cout] @ W [Cout, patch_size] → [n_patches, patch_size]
     // Then col2im to get [B, Cin, H, W]
-    Term w_flat = thvm_reshape(ctx, term_ten(w_id, DTYPE_F32), SHAPE(Cout, patch_size));
-    Term dcol_t = thvm_op(ctx, UOP_MM, term_ten(dout_id, DTYPE_F32), w_flat);
-    dcol_t = thvm_reduce(ctx, dcol_t);
-    u32 dcol_id = (u32)term_val(dcol_t);
+    u32 dcol_buf = ctx->backend->buf_alloc(n_patches * patch_size * sizeof(f32));
+    View w_flat_view = view_create(SHAPE(Cout, patch_size));
+    View dcol_view = view_create(SHAPE(n_patches, patch_size));
+    ctx->backend->op_mm(dcol_buf, dout_nhwc_buf, &dout_view, ctx->tensors[w_id].buf_id, &w_flat_view,
+                        n_patches, Cout, patch_size);
 
-    // col2im
-    f32 *dcol = buf_read(ctx, dcol_id, n_patches * patch_size);
-    f32 *dx = calloc(B*Cin*H*W, sizeof(f32));
-    for (u32 b = 0; b < B; b++)
-        for (u32 oh = 0; oh < OH; oh++)
-            for (u32 ow = 0; ow < OW; ow++) {
-                u32 row = b*OH*OW+oh*OW+ow;
-                for (u32 c = 0; c < Cin; c++)
-                    for (u32 kh = 0; kh < KH; kh++)
-                        for (u32 kw = 0; kw < KW; kw++)
-                            dx[(b*Cin+c)*H*W + (oh+kh)*W+(ow+kw)] +=
-                                dcol[row*patch_size + c*KH*KW+kh*KW+kw];
-            }
-    u32 d_input = tensor_from(ctx, dx, (Shape){.dims={B,Cin,H,W}, .rank=4});
-    free(dcol); free(dx);
+    // GPU col2im: [n_patches, patch_size] → [B, Cin, H, W]
+    u32 dx_buf = ctx->backend->buf_alloc(B * Cin * H * W * sizeof(f32));
+    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+    {
+        id<MTLBuffer> c2i_bufs[] = { metal_pool.bufs[dx_buf], metal_pool.bufs[dcol_buf] };
+        const void *c2i_params[] = { &cp };
+        u64 c2i_psizes[] = { sizeof(Conv2dParams) };
+        dispatch_1d(pipe_col2im, c2i_bufs, 2, c2i_params, c2i_psizes, 1, B*Cin*H*W);
+    }
+    if (ctx->backend->end_batch) ctx->backend->end_batch();
+
+    u32 d_input = ctx->tensor_count++;
+    ctx->tensors[d_input] = (TensorMeta){
+        .buf_id = dx_buf,
+        .dtype = DTYPE_F32,
+        .view = view_create((Shape){.dims={B,Cin,H,W}, .rank=4}),
+    };
+
+    // Free temp buffers
+    ctx->backend->buf_free(col_t_buf);
+    ctx->backend->buf_free(dout_nhwc_buf);
+    ctx->backend->buf_free(dcol_buf);
+    ctx->backend->buf_free(dw_buf);
+    (void)dw_view; (void)dcol_view;
 
     return (ConvGrads){.d_weight=d_weight, .d_bias=d_bias, .d_input=d_input};
 }

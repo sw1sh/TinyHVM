@@ -211,6 +211,9 @@ typedef struct {
                        u32 src, u32 src_numel, u32 reduce_dim);
     // Pool management: reset buffer pool to `keep` entries
     void  (*pool_reset)(u32 keep);
+    // Command buffer batching: accumulate GPU work without sync
+    void  (*begin_batch)(void);
+    void  (*end_batch)(void);
 } Backend;
 
 // ============================================================

@@ -200,4 +200,6 @@ Backend cpu_backend = {
     .op_mm     = cpu_op_mm,
     .op_reduce = cpu_op_reduce,
     .pool_reset = cpu_pool_reset,
+    .begin_batch = NULL,  // CPU: no batching needed
+    .end_batch   = NULL,
 };

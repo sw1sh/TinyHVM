@@ -31,3 +31,4 @@ shaders.metallib
 data/
 test_mnist
 test_mnist_cnn
+beautiful_mnist

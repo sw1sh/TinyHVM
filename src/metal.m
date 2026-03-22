@@ -129,6 +129,7 @@ static id<MTLComputePipelineState> make_pipe(NSString *name) {
 // ============================================================
 
 static int metal_init(void) {
+    thvm_prof_init();
     mtl_dev = MTLCreateSystemDefaultDevice();
     if (!mtl_dev) return -1;
     mtl_queue = [mtl_dev newCommandQueue];
@@ -275,6 +276,7 @@ static void dispatch_1d(id<MTLComputePipelineState> pipe,
 
 static void metal_op_unary(u32 uop, u32 dst, const View *dv,
                             u32 src, const View *sv) {
+    u64 t0 = thvm_prof_tick();
     id<MTLComputePipelineState> pipe = nil;
     switch (uop) {
         case UOP_NEG:  pipe = pipe_neg;  break;
@@ -292,6 +294,7 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
     const void *params[] = { &dvp, &svp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams) };
     dispatch_1d(pipe, bufs, 2, params, psizes, 2, dv->numel);
+    thvm_prof_record(uop, t0);
 }
 
 // ============================================================
@@ -300,6 +303,7 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
 
 static void metal_op_binary(u32 uop, u32 dst, const View *dv,
                              u32 a, const View *av, u32 b, const View *bv) {
+    u64 t0 = thvm_prof_tick();
     id<MTLComputePipelineState> pipe = nil;
     switch (uop) {
         case UOP_ADD: pipe = pipe_add; break;
@@ -319,6 +323,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
     const void *params[] = { &dvp, &avp, &bvp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams), sizeof(ViewParams) };
     dispatch_1d(pipe, bufs, 3, params, psizes, 3, dv->numel);
+    thvm_prof_record(uop, t0);
 }
 
 // ============================================================
@@ -327,6 +332,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
 
 static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
                          u32 M, u32 K, u32 N) {
+    u64 t0 = thvm_prof_tick();
     // MPS needs its own command buffer — flush any pending compute work first
     if (batch_dirty) metal_flush();
 
@@ -401,6 +407,7 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
     } else {
         [cmd waitUntilCompleted];  // TODO: can remove this with proper dependency tracking
     }
+    thvm_prof_record(UOP_MM, t0);
 }
 
 // ============================================================
@@ -409,6 +416,7 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
 
 static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
                              u32 src, u32 src_numel, u32 reduce_dim) {
+    u64 t0 = thvm_prof_tick();
     (void)src_numel;
     id<MTLComputePipelineState> pipe = nil;
     switch (uop) {
@@ -421,6 +429,7 @@ static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
     const void *params[] = { &reduce_dim };
     u64 psizes[] = { sizeof(u32) };
     dispatch_1d(pipe, bufs, 2, params, psizes, 1, dst_numel);
+    thvm_prof_record(uop, t0);
 }
 
 static void metal_pool_reset(u32 keep) {
@@ -439,6 +448,7 @@ static void metal_pool_reset(u32 keep) {
 // Conv2dParams, LayoutParams, Pool2dParams defined in tinyhvm.h
 
 static void metal_op_cnn(u32 uop, u32 dst, u32 src, u32 params_buf) {
+    u64 t0 = thvm_prof_tick();
     switch (uop) {
         case UOP_IM2COL: {
             Conv2dParams cp;
@@ -481,11 +491,44 @@ static void metal_op_cnn(u32 uop, u32 dst, u32 src, u32 params_buf) {
             break;
         }
         case UOP_MAXPOOL: {
-            // Maxpool needs extra output (argmax mask) — handled by layers.c for now
             break;
         }
         default: break;
     }
+    thvm_prof_record(uop, t0);
+}
+
+// ============================================================
+// Graph-level profile report (tinygrad-style kernel breakdown)
+// ============================================================
+
+static void metal_profile_report(void) {
+    if (!thvm_prof_global.enabled) return;
+    u64 total_ns = 0;
+    u32 total_cnt = 0;
+    printf("\n  ╔══════════════════════════════════════════╗\n");
+    printf("  ║  Kernel Profile (THVM_PROFILE=1)         ║\n");
+    printf("  ╠══════════════════════════════════════════╣\n");
+    printf("  ║  %-10s %6s %8s %8s      ║\n", "Kernel", "Count", "Total", "Avg");
+    printf("  ╠══════════════════════════════════════════╣\n");
+    for (u32 i = 0; i < UOP_COUNT; i++) {
+        if (thvm_prof_global.dispatch_cnt[i] == 0) continue;
+        f32 total_ms = (f32)thvm_prof_global.dispatch_ns[i] / 1e6f;
+        f32 avg_us = (f32)thvm_prof_global.dispatch_ns[i] / (f32)thvm_prof_global.dispatch_cnt[i] / 1e3f;
+        printf("  ║  %-10s %6u %6.1fms %6.0fμs      ║\n",
+               uop_names[i], thvm_prof_global.dispatch_cnt[i], total_ms, avg_us);
+        total_ns += thvm_prof_global.dispatch_ns[i];
+        total_cnt += thvm_prof_global.dispatch_cnt[i];
+    }
+    printf("  ╠══════════════════════════════════════════╣\n");
+    printf("  ║  %-10s %6u %6.1fms              ║\n",
+           "TOTAL", total_cnt, (f32)total_ns / 1e6f);
+    printf("  ╚══════════════════════════════════════════╝\n");
+}
+
+static void metal_profile_reset(void) {
+    memset(thvm_prof_global.dispatch_ns, 0, sizeof(thvm_prof_global.dispatch_ns));
+    memset(thvm_prof_global.dispatch_cnt, 0, sizeof(thvm_prof_global.dispatch_cnt));
 }
 
 // ============================================================
@@ -507,4 +550,6 @@ Backend metal_backend = {
     .pool_reset = metal_pool_reset,
     .begin_batch = metal_begin_batch,
     .end_batch   = metal_end_batch,
+    .profile_report = metal_profile_report,
+    .profile_reset  = metal_profile_reset,
 };

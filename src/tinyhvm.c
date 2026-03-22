@@ -517,14 +517,7 @@ static const char *tag_names[] = {
     "NUM", "REF", "OP2", "TEN", "TOP", "CTR"
 };
 
-static const char *uop_names[] = {
-    "load", "store", "copy",
-    "neg", "exp", "log", "relu", "cast", "sqrt",
-    "add", "mul", "div", "max", "cmp", "sub",
-    "sum", "rmax",
-    "mm",
-    "reshape", "permute", "expand", "shrink", "pad"
-};
+// uop_names now in tinyhvm.h
 
 void thvm_print_term(TinyHVM *ctx, Term t) {
     u32 tag = term_tag(t);
@@ -1130,4 +1123,73 @@ Term thvm_conv2d_forward(TinyHVM *ctx, Term x, Term w, Term bias,
     Term nchw = thvm_permute(ctx, reshaped, nchw_axes, 4);
 
     return nchw;
+}
+
+// ============================================================
+// Profiling — dispatch to backend
+// ============================================================
+
+void thvm_profile_report(TinyHVM *ctx) {
+    if (ctx->backend && ctx->backend->profile_report)
+        ctx->backend->profile_report();
+}
+
+void thvm_profile_reset(TinyHVM *ctx) {
+    if (ctx->backend && ctx->backend->profile_reset)
+        ctx->backend->profile_reset();
+}
+
+
+// ============================================================
+// Eval helpers — argmax + accuracy
+// ============================================================
+
+Term thvm_argmax(TinyHVM *ctx, Term x, u32 rows, u32 cols) {
+    // Read logits to host, compute argmax per row
+    x = thvm_reduce(ctx, x);
+    f32 *data = thvm_to_host(ctx, x);
+
+    u32 *preds = malloc(rows * sizeof(u32));
+    for (u32 i = 0; i < rows; i++) {
+        u32 best = 0;
+        f32 mv = data[i * cols];
+        for (u32 j = 1; j < cols; j++) {
+            if (data[i * cols + j] > mv) {
+                mv = data[i * cols + j];
+                best = j;
+            }
+        }
+        preds[i] = best;
+    }
+
+    // Store as u32 tensor
+    u32 id = ctx->tensor_count++;
+    u32 buf = ctx->backend->buf_alloc(rows * sizeof(u32));
+    ctx->tensors[id] = (TensorMeta){
+        .buf_id = buf, .dtype = DTYPE_U32,
+        .view = view_create(SHAPE(rows)),
+    };
+    ctx->backend->buf_write(buf, preds, rows * sizeof(u32));
+    free(preds);
+    return term_ten(id, DTYPE_U32);
+}
+
+f32 thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
+                       u32 n_samples, u32 n_classes) {
+    logits = thvm_reduce(ctx, logits);
+    f32 *data = thvm_to_host(ctx, logits);
+
+    u32 correct = 0;
+    for (u32 i = 0; i < n_samples; i++) {
+        u32 best = 0;
+        f32 mv = data[i * n_classes];
+        for (u32 j = 1; j < n_classes; j++) {
+            if (data[i * n_classes + j] > mv) {
+                mv = data[i * n_classes + j];
+                best = j;
+            }
+        }
+        if (best == labels[i]) correct++;
+    }
+    return 100.0f * (f32)correct / (f32)n_samples;
 }

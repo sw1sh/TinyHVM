@@ -5,6 +5,8 @@
 #define TINYHVM_H
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stddef.h>
 
 // ============================================================
@@ -121,6 +123,56 @@ typedef u64 Term;
 
 #define UOP_COUNT     28
 
+// UOp name table (device-agnostic)
+static const char *uop_names[] = {
+    "LOAD","STORE","CONST","CAST","NEG","RELU","EXP","LOG","SQRT","RECIP",
+    "ADD","MUL","MAX","CMP","SUB","SUM","RMAX","MM",
+    "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD",
+    "IM2COL","COL2IM","MAXPOOL","NCHW2NHWC","NHWC2NCHW"
+};
+
+// ============================================================
+// Device-agnostic profiling (enabled by THVM_PROFILE env)
+// ============================================================
+
+#include <time.h>
+
+typedef struct {
+    u64 dispatch_ns[UOP_COUNT];
+    u32 dispatch_cnt[UOP_COUNT];
+    int enabled;
+} ThvmProfile;
+
+// Global profile state
+static ThvmProfile thvm_prof_global;
+
+static inline void thvm_prof_init(void) {
+    thvm_prof_global.enabled = getenv("THVM_PROFILE") != NULL;
+    memset(thvm_prof_global.dispatch_ns, 0, sizeof(thvm_prof_global.dispatch_ns));
+    memset(thvm_prof_global.dispatch_cnt, 0, sizeof(thvm_prof_global.dispatch_cnt));
+}
+
+// Portable nanosecond timer
+static inline u64 thvm_prof_tick(void) {
+    if (!thvm_prof_global.enabled) return 0;
+#ifdef __APPLE__
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
+#endif
+}
+
+static inline void thvm_prof_record(u32 uop, u64 t0) {
+    if (!thvm_prof_global.enabled || t0 == 0) return;
+    u64 ns = thvm_prof_tick() - t0;
+    if (uop < UOP_COUNT) {
+        thvm_prof_global.dispatch_ns[uop] += ns;
+        thvm_prof_global.dispatch_cnt[uop]++;
+    }
+}
+
 // CNN op parameter structs (must match Metal shader structs)
 typedef struct { u32 B, Cin, H, W, KH, KW, OH, OW, patch_size, n_patches; } Conv2dParams;
 typedef struct { u32 B, C, H, W; } LayoutParams;
@@ -229,6 +281,9 @@ typedef struct {
     // Command buffer batching: accumulate GPU work without sync
     void  (*begin_batch)(void);
     void  (*end_batch)(void);
+    // Profiling: kernel-level timing (like tinygrad's GlobalCounters)
+    void  (*profile_report)(void);
+    void  (*profile_reset)(void);
 } Backend;
 
 // ============================================================
@@ -287,6 +342,43 @@ void     thvm_print_term(TinyHVM *ctx, Term t);
 void     thvm_set_requires_grad(TinyHVM *ctx, Term t);
 void     thvm_start_recording(TinyHVM *ctx);
 void     thvm_stop_recording(TinyHVM *ctx);
+
+// Profiling (dispatches to backend->profile_report/reset)
+void     thvm_profile_report(TinyHVM *ctx);
+void     thvm_profile_reset(TinyHVM *ctx);
+
+// ============================================================
+// Layer abstraction — sequential composition
+// ============================================================
+
+typedef enum {
+    LAYER_CONV2D, LAYER_BN, LAYER_MAXPOOL,
+    LAYER_FLATTEN, LAYER_LINEAR, LAYER_FN
+} LayerType;
+
+typedef Term (*LayerFn)(TinyHVM *ctx, Term x);
+
+typedef struct {
+    LayerType type;
+    union {
+        struct { Term w, b; u32 ci, co, k; }    conv;
+        struct { Term gamma, beta, rmean, rvar; u32 c; } bn;
+        struct { u32 ks; }                       pool;
+        struct { u32 from_dim; }                  flat;
+        struct { Term w, b; u32 in_f, out_f; }   lin;
+        LayerFn fn;
+    };
+} Layer;
+
+// Build model as layer list, run with thvm_sequential
+Term     thvm_sequential(TinyHVM *ctx, Term x, Layer *layers, u32 n,
+                         u32 BS, int training);
+
+// Eval: argmax along last axis, returns u32 tensor of predictions
+Term     thvm_argmax(TinyHVM *ctx, Term x, u32 rows, u32 cols);
+// Eval accuracy: (argmax(logits) == labels).mean() * 100
+f32      thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
+                            u32 n_samples, u32 n_classes);
 
 // Graph-level gradient (JAX-style)
 // Returns a lazy Term — when reduced, computes ∂y/∂x.

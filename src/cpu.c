@@ -203,4 +203,6 @@ Backend cpu_backend = {
     .pool_reset = cpu_pool_reset,
     .begin_batch = NULL,  // CPU: no batching needed
     .end_batch   = NULL,
+    .profile_report = NULL,
+    .profile_reset  = NULL,
 };

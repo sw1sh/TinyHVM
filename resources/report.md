@@ -316,28 +316,52 @@ Define custom interaction rules for fusion:
 
 ## 6. Implementation Roadmap
 
-### Phase 1: Proof of Concept
-1. Implement `Tensor` as an HVM4 constructor type
-2. Create FFI bridge to a single GPU backend (Metal or CUDA)
-3. Implement basic ops: add, mul, matmul, relu via FFI primitives
-4. Demonstrate: `z = relu(matmul(x, w) + b)` as an HVM4 program
-5. Verify correctness against tinygrad output
+### Phase 1: Core Runtime ✅
 
-### Phase 2: Autograd
-1. Implement backward pass as HVM4 graph duplication + reversal
-2. Leverage DUP/SUP for gradient flow
-3. Demonstrate training a simple network (MNIST)
+Completed. TinyHVM is a standalone C library (~2000 LoC) with:
 
-### Phase 3: Kernel Fusion
-1. Define interaction rules for fusing elementwise chains
-2. Implement a fusion-aware scheduler using HVM4 reduction
-3. Benchmark against tinygrad's native scheduler
+- **Interaction calculus core**: 64-bit term encoding (SUB:1 | TAG:7 | EXT:18 | VAL:38), bump-allocated heap, weak normal form reduction engine
+- **Tensor abstraction**: `Shape` struct (variable rank up to 8D), `View` with strides/offset (tinygrad-inspired ShapeTracker), dtype-aware with `dtype_size()` helper
+- **Backend interface**: `Backend` vtable with `init/shutdown/buf_alloc/buf_free/buf_write/buf_read/op_unary/op_binary/op_mm`. Runtime selection via `thvm_device("cpu"|"metal")`
+- **CPU backend** (`gpu_cpu.c`): Accelerate/vDSP matmul, strided elementwise ops
+- **Metal backend** (`gpu_metal.m`): 11 compute shaders + MPS matmul, `StorageModeShared` for zero-copy on Apple Silicon
+- **Operations**: neg, exp, log, relu (unary); add, mul, sub, div, max, cmp (binary); matmul (MPS/Accelerate)
+- **Broadcasting**: Full numpy-style shape broadcasting with stride manipulation
+- **Tests**: 93/93 unit tests passing on both CPU and Metal
 
-### Phase 4: Full Framework
-1. Port tinygrad's full op set to HVM4 FFI primitives
-2. Implement ShapeTracker as HVM4 constructors
-3. Build Python bindings (compile Python → HVM4 via Bend or custom frontend)
-4. Multi-backend support via FFI (Metal, CUDA, OpenCL)
+```
+src/tinyhvm.h      271 lines  — types, constants, API
+src/tinyhvm.c      650 lines  — reduction engine, views, autograd, API
+src/gpu_cpu.c      135 lines  — CPU backend (Accelerate)
+src/gpu_metal.m    277 lines  — Metal backend (MPS + compute shaders)
+src/shaders.metal  163 lines  — 11 Metal compute kernels
+test/test_term.m   409 lines  — 93 unit tests
+test/test_train.m  144 lines  — XOR training end-to-end
+```
+
+### Phase 2: Autograd & Training 🔧 (in progress)
+
+Completed:
+- **Graph-level gradient** (`thvm_grad`): JAX-style — returns a lazy Term that, when reduced, computes ∂y/∂x. Supports `grad(grad(f))` via composable lazy graph construction
+- **Provenance tracking**: `TensorMeta.creator_op` + `src_ids[]` — no separate tape needed
+- **Gradient rules**: add, sub, mul, matmul (with transpose), relu (with mask)
+- **SGD training**: XOR 2-layer MLP converges in 7 epochs
+- **Engineering study**: Read ggml and tinygrad source, documented patterns in `engineering_reference.md`
+
+Remaining:
+- **MNIST demo**: Requires softmax, reduce_sum (per-axis), log, cross-entropy loss
+- **Command buffer batching**: Accumulate ops in one Metal command buffer per `thvm_reduce()` call (currently per-op roundtrip)
+
+### Phase 3: Kernel Fusion (planned)
+1. Graph-level `backend.graph_compute(cgraph)` interface (ggml pattern)
+2. Metal function constants for generic unary/binary kernels
+3. Fusion-aware scheduling via interaction net rewriting
+
+### Phase 4: Full Framework (planned)
+1. Quantization support (f16 at minimum)
+2. Static memory allocation (pre-compute buffer sizes from graph)
+3. Multi-backend support (CUDA via same Backend interface)
+4. Python or higher-level bindings
 
 ---
 

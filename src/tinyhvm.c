@@ -636,30 +636,16 @@ static u32 tensor_fill(TinyHVM *ctx, Shape s, f32 val) {
     return id;
 }
 
-// Physical 2D transpose: create a new buffer with swapped layout
+// Transpose 2D: just swap axes via permute (zero-copy, stride swap)
 static u32 tensor_transpose_2d(TinyHVM *ctx, u32 src_id) {
-    TensorMeta *ms = &ctx->tensors[src_id];
-    assert(ms->view.shape.rank == 2);
-    u32 M = ms->view.shape.dims[0], N = ms->view.shape.dims[1];
-    u32 t_shape[] = {N, M};
-    u32 tid = tensor_create(ctx, shape_of(t_shape, 2), ms->dtype);
-
-    // Read src, transpose, write dst
-    u32 n = M * N;
-    u32 dsz = dtype_size(ms->dtype);
-    f32 *src = malloc(n * dsz);
-    f32 *dst = malloc(n * dsz);
-    if (ctx->backend) ctx->backend->buf_read(ms->buf_id, src, n * dsz);
-    for (u32 i = 0; i < M; i++)
-        for (u32 j = 0; j < N; j++)
-            dst[j * M + i] = src[i * N + j];
-    if (ctx->backend) ctx->backend->buf_write(ctx->tensors[tid].buf_id, dst, n * dsz);
-    free(src);
-    free(dst);
-    return tid;
+    u32 axes[] = {1, 0};
+    Term t = thvm_permute(ctx, term_ten(src_id, ctx->tensors[src_id].dtype), axes, 2);
+    t = thvm_reduce(ctx, t);
+    return (u32)term_val(t);
 }
 
 // Reduce-sum a tensor to target shape (for gradient accumulation after broadcast)
+// Uses UOP_SUM iteratively along broadcast dimensions
 static u32 tensor_reduce_sum_to(TinyHVM *ctx, u32 grad_id, Shape target) {
     TensorMeta *mg = &ctx->tensors[grad_id];
 
@@ -671,23 +657,22 @@ static u32 tensor_reduce_sum_to(TinyHVM *ctx, u32 grad_id, Shape target) {
         if (same) return grad_id;
     }
 
-    // Sum-reduce along broadcast dimensions
+    // Reduce along each broadcast dimension using UOP_SUM
+    // For now, fall back to host-side for complex shape mismatches
+    // (full UOp reduce-along-axis needs axis parameter in UOP_SUM)
     u32 n_out = 1;
     for (u32 i = 0; i < target.rank; i++) n_out *= target.dims[i];
 
     u32 out_id = tensor_fill(ctx, target, 0.0f);
     u32 n_grad = mg->view.numel;
-
     u32 dsz = dtype_size(mg->dtype);
     f32 *g_data = malloc(n_grad * dsz);
     f32 *o_data = calloc(n_out, dsz);
     if (ctx->backend) ctx->backend->buf_read(mg->buf_id, g_data, n_grad * dsz);
 
-    // Map each grad element to its target element via modular indexing
+    u32 off = mg->view.shape.rank - target.rank;
     for (u32 i = 0; i < n_grad; i++) {
         u32 out_idx = 0, rem = i, out_stride = 1;
-        // Right-align target shape within grad shape
-        u32 off = mg->view.shape.rank - target.rank;
         for (i32 d = (i32)mg->view.shape.rank - 1; d >= 0; d--) {
             u32 coord = rem % mg->view.shape.dims[d];
             rem /= mg->view.shape.dims[d];

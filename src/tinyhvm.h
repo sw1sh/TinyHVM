@@ -137,9 +137,13 @@ typedef u64 Term;
 #define DTYPE_U32  3
 #define DTYPE_COUNT 4
 
+static inline u32 dtype_size(u32 dtype) {
+    static const u32 sizes[] = {4, 2, 4, 4};
+    return (dtype < DTYPE_COUNT) ? sizes[dtype] : 4;
+}
+
 #define MAX_DIM 8
 #define MAX_TENSORS 4096
-#define MAX_TAPE 4096
 
 // Shape: dims + rank bundled together
 typedef struct {
@@ -180,12 +184,7 @@ typedef struct {
     u32         src_ids[2]; // input tensor ids (for backward rules)
 } TensorMeta;
 
-// Autograd tape entry (records forward ops for backward pass)
-typedef struct {
-    u32 uop;
-    u32 out_id;
-    u32 src_ids[2];
-} TapeEntry;
+
 
 // ============================================================
 // GPU Backend Interface
@@ -205,7 +204,7 @@ typedef struct {
                        u32 a, const View *av, u32 b, const View *bv);
     void  (*op_mm)(u32 dst, u32 a, const View *av, u32 b, const View *bv,
                    u32 M, u32 K, u32 N);
-} GpuBackend;
+} Backend;
 
 // ============================================================
 // Context
@@ -216,13 +215,9 @@ typedef struct {
     u64         heap_pos;
     TensorMeta  tensors[MAX_TENSORS];
     u32         tensor_count;
-    GpuBackend *gpu;
+    Backend *backend;
     u64         itrs;       // interaction count
-
-    // Autograd
-    TapeEntry   tape[MAX_TAPE];
-    u32         tape_len;
-    u8          recording;  // 1 if taping forward ops
+    u8          recording;  // 1 if recording forward ops for grad
 } TinyHVM;
 
 // ============================================================
@@ -241,8 +236,8 @@ static inline Term heap_read(TinyHVM *ctx, u64 loc);
 static inline void heap_set(TinyHVM *ctx, u64 loc, Term t);
 
 // Context
-GpuBackend *thvm_device(const char *name);  // "cpu", "metal"
-TinyHVM *thvm_init(GpuBackend *gpu);
+Backend *thvm_device(const char *name);  // "cpu", "metal"
+TinyHVM *thvm_init(Backend *backend);
 void     thvm_free(TinyHVM *ctx);
 
 // Reduction
@@ -261,7 +256,6 @@ void     thvm_print_term(TinyHVM *ctx, Term t);
 void     thvm_set_requires_grad(TinyHVM *ctx, Term t);
 void     thvm_start_recording(TinyHVM *ctx);
 void     thvm_stop_recording(TinyHVM *ctx);
-void     thvm_clear_tape(TinyHVM *ctx);
 
 // Graph-level gradient (JAX-style)
 // Returns a lazy Term — when reduced, computes ∂y/∂x.

@@ -25,3 +25,6 @@ test_basic
 /HVM
 /HVM4
 /tinygrad
+test_train
+test_metal
+shaders.metallib

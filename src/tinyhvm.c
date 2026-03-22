@@ -89,20 +89,7 @@ static View view_permute(View v, const u32 *axes) {
     return r;
 }
 
-static View view_expand(View v, const u32 *new_shape) {
-    // Broadcast: where shape[i]==1 and new_shape[i]>1, set stride=0
-    View r = v;
-    r.numel = 1;
-    for (u32 i = 0; i < v.shape.rank; i++) {
-        if (v.shape.dims[i] == 1 && new_shape[i] > 1) {
-            r.shape.dims[i] = new_shape[i];
-            r.strides[i] = 0;
-        }
-        r.numel *= r.shape.dims[i];
-    }
-    r.contiguous = 0;
-    return r;
-}
+
 
 // Broadcast two views to a common shape. Returns 1 on success.
 static int view_broadcast(const View *a, const View *b, View *out_a, View *out_b, u32 *out_shape, u32 *out_ndim) {
@@ -160,26 +147,13 @@ static u32 tensor_create(TinyHVM *ctx, Shape s, u32 dtype) {
     m->refcount = 1;
     m->view = view_create(s);
 
-    if (ctx->gpu) {
-        m->buf_id = ctx->gpu->buf_alloc((u64)m->view.numel * 4);
+    if (ctx->backend) {
+        m->buf_id = ctx->backend->buf_alloc((u64)m->view.numel * dtype_size(dtype));
     }
     return id;
 }
 
-// Create a tensor that shares a buffer (for views/broadcasts)
-static u32 tensor_view(TinyHVM *ctx, u32 src_id, View v) {
-    assert(ctx->tensor_count < MAX_TENSORS);
-    u32 id = ctx->tensor_count++;
-    TensorMeta *m = &ctx->tensors[id];
-    memset(m, 0, sizeof(*m));
-    m->buf_id = ctx->tensors[src_id].buf_id;
-    m->dtype  = ctx->tensors[src_id].dtype;
-    m->refcount = 1;
-    m->view = v;
-    // bump refcount on original buffer's source
-    ctx->tensors[src_id].refcount++;
-    return id;
-}
+
 
 // ============================================================
 // reduce.c — WNF reduction engine
@@ -206,7 +180,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
 
             if (term_tag(a) != TAG_TEN) return t;
             if (is_binary && term_tag(b) != TAG_TEN) return t;
-            if (!ctx->gpu) return t;
+            if (!ctx->backend) return t;
 
             u32 a_id = (u32)term_val(a);
             u32 b_id = is_binary ? (u32)term_val(b) : 0;
@@ -238,15 +212,10 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             u32 dst_id = tensor_create(ctx, shape_of(out_shape, out_ndim), ma->dtype);
             TensorMeta *md = &ctx->tensors[dst_id];
 
-            // Record to tape if any input requires grad
+            // Record provenance for autograd
             if (ctx->recording) {
                 int needs = ma->requires_grad || (mb && mb->requires_grad);
-                if (needs && ctx->tape_len < MAX_TAPE) {
-                    TapeEntry *e = &ctx->tape[ctx->tape_len++];
-                    e->uop = uop;
-                    e->out_id = dst_id;
-                    e->src_ids[0] = a_id;
-                    e->src_ids[1] = b_id;
+                if (needs) {
                     md->requires_grad = 1;
                     md->creator_op = uop;
                     md->src_ids[0] = a_id;
@@ -257,14 +226,14 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             // Dispatch
             if (uop == UOP_MM) {
                 u32 M = ma->view.shape.dims[0], K = ma->view.shape.dims[1], N = mb->view.shape.dims[1];
-                ctx->gpu->op_mm(md->buf_id, ma->buf_id, &ma->view,
+                ctx->backend->op_mm(md->buf_id, ma->buf_id, &ma->view,
                                 mb->buf_id, &mb->view, M, K, N);
             } else if (is_binary) {
-                ctx->gpu->op_binary(uop, md->buf_id, &md->view,
+                ctx->backend->op_binary(uop, md->buf_id, &md->view,
                                     ma->buf_id, &av_bc,
                                     ctx->tensors[b_id].buf_id, &bv_bc);
             } else {
-                ctx->gpu->op_unary(uop, md->buf_id, &md->view,
+                ctx->backend->op_unary(uop, md->buf_id, &md->view,
                                    ma->buf_id, &ma->view);
             }
 
@@ -378,31 +347,38 @@ void thvm_print_term(TinyHVM *ctx, Term t) {
 // ============================================================
 
 // Device registry — both backends are always linked in.
-extern GpuBackend gpu_cpu_backend;
+extern Backend cpu_backend;
 #ifdef __APPLE__
-extern GpuBackend gpu_metal_backend;
+extern Backend metal_backend;
 #endif
 
-GpuBackend *thvm_device(const char *name) {
+Backend *thvm_device(const char *name) {
     #ifdef __APPLE__
     if (strcmp(name, "metal") == 0 || strcmp(name, "gpu") == 0)
-        return &gpu_metal_backend;
+        return &metal_backend;
     #endif
     (void)name;
-    return &gpu_cpu_backend;
+    return &cpu_backend;
 }
 
-TinyHVM *thvm_init(GpuBackend *gpu) {
+TinyHVM *thvm_init(Backend *backend) {
     TinyHVM *ctx = calloc(1, sizeof(TinyHVM));
     ctx->heap = calloc(HEAP_CAP, sizeof(Term));
     ctx->heap_pos = 1;
-    ctx->gpu = gpu;
-    if (gpu && gpu->init) gpu->init();
+    ctx->backend = backend;
+    if (backend && backend->init) backend->init();
     return ctx;
 }
 
 void thvm_free(TinyHVM *ctx) {
-    if (ctx->gpu && ctx->gpu->shutdown) ctx->gpu->shutdown();
+    // Free GPU buffers first
+    if (ctx->backend) {
+        for (u32 i = 0; i < ctx->tensor_count; i++) {
+            if (ctx->tensors[i].buf_id)
+                ctx->backend->buf_free(ctx->tensors[i].buf_id);
+        }
+    }
+    if (ctx->backend && ctx->backend->shutdown) ctx->backend->shutdown();
     for (u32 i = 0; i < ctx->tensor_count; i++) {
         if (ctx->tensors[i].host_ptr) free(ctx->tensors[i].host_ptr);
     }
@@ -413,8 +389,8 @@ void thvm_free(TinyHVM *ctx) {
 Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {
     u32 id = tensor_create(ctx, s, DTYPE_F32);
     TensorMeta *m = &ctx->tensors[id];
-    if (ctx->gpu && data) {
-        ctx->gpu->buf_write(m->buf_id, data, (u64)m->view.numel * 4);
+    if (ctx->backend && data) {
+        ctx->backend->buf_write(m->buf_id, data, (u64)m->view.numel * dtype_size(m->dtype));
     }
     return term_ten(id, DTYPE_F32);
 }
@@ -435,8 +411,8 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t) {
     if (term_tag(t) != TAG_TEN) return NULL;
     u32 id = (u32)term_val(t);
     TensorMeta *m = &ctx->tensors[id];
-    if (!m->host_ptr) m->host_ptr = malloc((size_t)m->view.numel * sizeof(f32));
-    if (ctx->gpu) ctx->gpu->buf_read(m->buf_id, m->host_ptr, (u64)m->view.numel * 4);
+    if (!m->host_ptr) m->host_ptr = malloc((size_t)m->view.numel * dtype_size(m->dtype));
+    if (ctx->backend) ctx->backend->buf_read(m->buf_id, m->host_ptr, (u64)m->view.numel * dtype_size(m->dtype));
     return (f32 *)m->host_ptr;
 }
 
@@ -451,7 +427,7 @@ static u32 tensor_fill(TinyHVM *ctx, Shape s, f32 val) {
     u32 n = m->view.numel;
     f32 *tmp = malloc(n * sizeof(f32));
     for (u32 i = 0; i < n; i++) tmp[i] = val;
-    if (ctx->gpu) ctx->gpu->buf_write(m->buf_id, tmp, (u64)n * 4);
+    if (ctx->backend) ctx->backend->buf_write(m->buf_id, tmp, (u64)n * dtype_size(DTYPE_F32));
     free(tmp);
     return id;
 }
@@ -466,13 +442,14 @@ static u32 tensor_transpose_2d(TinyHVM *ctx, u32 src_id) {
 
     // Read src, transpose, write dst
     u32 n = M * N;
-    f32 *src = malloc(n * sizeof(f32));
-    f32 *dst = malloc(n * sizeof(f32));
-    if (ctx->gpu) ctx->gpu->buf_read(ms->buf_id, src, n * 4);
+    u32 dsz = dtype_size(ms->dtype);
+    f32 *src = malloc(n * dsz);
+    f32 *dst = malloc(n * dsz);
+    if (ctx->backend) ctx->backend->buf_read(ms->buf_id, src, n * dsz);
     for (u32 i = 0; i < M; i++)
         for (u32 j = 0; j < N; j++)
             dst[j * M + i] = src[i * N + j];
-    if (ctx->gpu) ctx->gpu->buf_write(ctx->tensors[tid].buf_id, dst, n * 4);
+    if (ctx->backend) ctx->backend->buf_write(ctx->tensors[tid].buf_id, dst, n * dsz);
     free(src);
     free(dst);
     return tid;
@@ -497,9 +474,10 @@ static u32 tensor_reduce_sum_to(TinyHVM *ctx, u32 grad_id, Shape target) {
     u32 out_id = tensor_fill(ctx, target, 0.0f);
     u32 n_grad = mg->view.numel;
 
-    f32 *g_data = malloc(n_grad * sizeof(f32));
-    f32 *o_data = calloc(n_out, sizeof(f32));
-    if (ctx->gpu) ctx->gpu->buf_read(mg->buf_id, g_data, n_grad * 4);
+    u32 dsz = dtype_size(mg->dtype);
+    f32 *g_data = malloc(n_grad * dsz);
+    f32 *o_data = calloc(n_out, dsz);
+    if (ctx->backend) ctx->backend->buf_read(mg->buf_id, g_data, n_grad * dsz);
 
     // Map each grad element to its target element via modular indexing
     for (u32 i = 0; i < n_grad; i++) {
@@ -519,7 +497,7 @@ static u32 tensor_reduce_sum_to(TinyHVM *ctx, u32 grad_id, Shape target) {
         o_data[out_idx] += g_data[i];
     }
 
-    if (ctx->gpu) ctx->gpu->buf_write(ctx->tensors[out_id].buf_id, o_data, n_out * 4);
+    if (ctx->backend) ctx->backend->buf_write(ctx->tensors[out_id].buf_id, o_data, n_out * dsz);
     free(g_data);
     free(o_data);
     return out_id;
@@ -539,9 +517,7 @@ void thvm_stop_recording(TinyHVM *ctx) {
     ctx->recording = 0;
 }
 
-void thvm_clear_tape(TinyHVM *ctx) {
-    ctx->tape_len = 0;
-}
+
 
 // ============================================================
 // grad.c — Graph-level gradient (JAX-style)
@@ -581,19 +557,21 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
     u32 ones_id = tensor_fill(ctx, my->view.shape, 1.0f);
     gm[y_id] = term_ten(ones_id, my->dtype);
 
-    // Walk tape backward, build lazy gradient graph
-    for (i32 i = (i32)ctx->tape_len - 1; i >= 0; i--) {
-        TapeEntry *e = &ctx->tape[i];
-        Term grad = gm[e->out_id];
+    // Walk tensors backward (provenance stored in TensorMeta)
+    for (i32 i = (i32)tc - 1; i >= 0; i--) {
+        TensorMeta *e = &ctx->tensors[i];
+        if (!e->creator_op && i != 0) continue; // not a computed tensor
+        Term grad = gm[i];
         if (term_tag(grad) == TAG_ERA) continue;
 
+        u32 uop = e->creator_op;
         u32 a_id = e->src_ids[0];
         u32 b_id = e->src_ids[1];
-        int is_binary = (e->uop >= UOP_ADD && e->uop <= UOP_SUB) || e->uop == UOP_MM;
+        int is_binary = (uop >= UOP_ADD && uop <= UOP_SUB) || uop == UOP_MM;
         TensorMeta *ma = &ctx->tensors[a_id];
         TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
 
-        switch (e->uop) {
+        switch (uop) {
             case UOP_ADD:
                 // ∂(a+b)/∂a = 1 → pass grad through
                 grad_graph_accum(ctx, gm, a_id, grad);
@@ -621,6 +599,7 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
                 break;
 
             case UOP_MM: {
+                if (!mb) break;
                 // z = mm(A[M,K], B[K,N])
                 // ∂z/∂A = mm(grad, Bᵀ)
                 // ∂z/∂B = mm(Aᵀ, grad)
@@ -647,7 +626,7 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
                     u32 mask_id = tensor_create(ctx, ma->view.shape, ma->dtype);
                     View mv, zv; u32 os[MAX_DIM], on;
                     view_broadcast(&ma->view, &ctx->tensors[zero_id].view, &mv, &zv, os, &on);
-                    ctx->gpu->op_binary(UOP_CMP, ctx->tensors[mask_id].buf_id,
+                    ctx->backend->op_binary(UOP_CMP, ctx->tensors[mask_id].buf_id,
                                         &ctx->tensors[mask_id].view,
                                         ma->buf_id, &mv,
                                         ctx->tensors[zero_id].buf_id, &zv);

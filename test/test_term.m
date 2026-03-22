@@ -240,7 +240,6 @@ static void test_grad_x2(void) {
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx, x);
 
-    thvm_clear_tape(ctx);
     thvm_start_recording(ctx);
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_MUL, x, x));
     thvm_stop_recording(ctx);
@@ -267,7 +266,6 @@ static void test_grad_add(void) {
     thvm_set_requires_grad(ctx, a);
     thvm_set_requires_grad(ctx, b);
 
-    thvm_clear_tape(ctx);
     thvm_start_recording(ctx);
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD, a, b));
     thvm_stop_recording(ctx);
@@ -291,7 +289,6 @@ static void test_grad_relu(void) {
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx, x);
 
-    thvm_clear_tape(ctx);
     thvm_start_recording(ctx);
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_RELU, x, term_era()));
     thvm_stop_recording(ctx);
@@ -321,7 +318,6 @@ static void test_grad_mm(void) {
     thvm_set_requires_grad(ctx, a);
     thvm_set_requires_grad(ctx, b);
 
-    thvm_clear_tape(ctx);
     thvm_start_recording(ctx);
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_MM, a, b));
     thvm_stop_recording(ctx);
@@ -360,7 +356,6 @@ static void test_grad_of_grad(void) {
     thvm_set_requires_grad(ctx, x);
 
     // Forward: x^3 — tape accumulates
-    thvm_clear_tape(ctx);
     thvm_start_recording(ctx);
     Term t1 = thvm_op(ctx, UOP_MUL, x, x);
     Term y  = thvm_op(ctx, UOP_MUL, t1, x);

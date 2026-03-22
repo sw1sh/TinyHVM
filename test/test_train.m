@@ -3,13 +3,13 @@
 // Trains on 4 XOR examples, converges to loss < 0.05
 
 #include "../src/tinyhvm.c"
+#include "../src/gpu_cpu.c"
+#ifdef __APPLE__
+  #include "../src/gpu_metal.m"
+#endif
 
-#ifdef USE_METAL
-  extern GpuBackend gpu_metal_backend;
-  #define BACKEND gpu_metal_backend
-#else
-  #include "../src/gpu_cpu.c"
-  #define BACKEND BACKEND
+#ifndef DEVICE
+  #define DEVICE "cpu"
 #endif
 
 #include <stdio.h>
@@ -29,15 +29,16 @@ static void sgd_update(TinyHVM *ctx, Term param, Term grad_term, f32 lr) {
 
     // Read param and grad, do param -= lr * grad on CPU
     u32 n = mp->view.numel;
-    f32 *p_data = malloc(n * sizeof(f32));
-    f32 *g_data = malloc(n * sizeof(f32));
-    ctx->gpu->buf_read(mp->buf_id, p_data, n * 4);
-    ctx->gpu->buf_read(mg->buf_id, g_data, n * 4);
+    u32 dsz = dtype_size(mp->dtype);
+    f32 *p_data = malloc(n * dsz);
+    f32 *g_data = malloc(n * dsz);
+    ctx->backend->buf_read(mp->buf_id, p_data, n * dsz);
+    ctx->backend->buf_read(mg->buf_id, g_data, n * dsz);
 
     for (u32 i = 0; i < n; i++)
         p_data[i] -= lr * g_data[i];
 
-    ctx->gpu->buf_write(mp->buf_id, p_data, n * 4);
+    ctx->backend->buf_write(mp->buf_id, p_data, n * dsz);
     free(p_data);
     free(g_data);
 }
@@ -76,7 +77,6 @@ int main(void) {
 
     for (int epoch = 0; epoch < 5000; epoch++) {
         // Forward: h = relu(X·W1 + B1), out = h·W2 + B2
-        thvm_clear_tape(ctx);
         thvm_start_recording(ctx);
 
         Term z1 = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1), B1);
@@ -123,7 +123,6 @@ int main(void) {
 
     // Final predictions
     printf("\n  Final predictions:\n");
-    thvm_clear_tape(ctx);
     Term z1 = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1), B1);
     Term h  = thvm_op(ctx, UOP_RELU, z1, term_era());
     Term out = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2), B2);

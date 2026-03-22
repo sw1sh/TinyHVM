@@ -122,7 +122,7 @@ static void cpu_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
 #endif
 }
 
-GpuBackend gpu_cpu_backend = {
+Backend cpu_backend = {
     .init      = cpu_init,
     .shutdown  = cpu_shutdown,
     .buf_alloc = cpu_buf_alloc,

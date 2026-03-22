@@ -1,6 +1,6 @@
 // gpu_metal.m — Metal GPU backend for TinyHVM
 // Pre-built compute shaders + MPS matmul.
-// Matches GpuBackend vtable exactly.
+// Matches Backend vtable exactly.
 
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
@@ -263,7 +263,7 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
 // Export
 // ============================================================
 
-GpuBackend gpu_metal_backend = {
+Backend metal_backend = {
     .init      = metal_init,
     .shutdown  = metal_shutdown,
     .buf_alloc = metal_buf_alloc,

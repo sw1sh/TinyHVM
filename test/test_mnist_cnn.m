@@ -256,7 +256,8 @@ int main(void) {
         }
         u32 x = tensor_from(ctx, batch_x, (Shape){.dims={BS,1,28,28}, .rank=4});
 
-        // Forward
+        // Start batch — all compute dispatches accumulate until flush
+        ctx->backend->begin_batch();
         ForwardCache fc = forward_pass(ctx, x, BS,
             conv1_w, conv1_b, conv2_w, conv2_b,
             bn1_gamma, bn1_beta, bn1_rmean, bn1_rvar,
@@ -325,6 +326,9 @@ int main(void) {
 
         // Adam step
         adam_step(ctx, &opt, grad_ids);
+
+        // Flush all pending compute before reset
+        ctx->backend->end_batch();
 
         f32 ms = 1000.0f * (f32)(clock() - t0) / (f32)CLOCKS_PER_SEC;
         if (step % 10 == 0 || step == n_steps - 1)

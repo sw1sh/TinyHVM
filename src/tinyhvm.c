@@ -1055,3 +1055,79 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
     return result;  // lazy — reduce to get the value
 }
 
+// ============================================================
+// backward.c — Multi-parameter backward pass
+// ============================================================
+
+void thvm_backward(TinyHVM *ctx, Term loss,
+                   Term *params, Term *grads, u32 n_params) {
+    for (u32 i = 0; i < n_params; i++) {
+        grads[i] = thvm_grad(ctx, loss, params[i]);
+    }
+}
+
+// ============================================================
+// conv2d_graph.c — Conv2d as UOp composition (autograd-visible)
+// ============================================================
+
+Term thvm_conv2d_params(TinyHVM *ctx, u32 B, u32 Cin, u32 H, u32 W,
+                        u32 KH, u32 KW) {
+    u32 OH = H - KH + 1, OW = W - KW + 1;
+    u32 patch_size = Cin * KH * KW;
+    u32 n_patches = B * OH * OW;
+    Conv2dParams cp = {B, Cin, H, W, KH, KW, OH, OW, patch_size, n_patches};
+
+    // Store as u32 tensor (not f32) — it's opaque params
+    u32 id = ctx->tensor_count++;
+    u32 buf = ctx->backend->buf_alloc(sizeof(Conv2dParams));
+    ctx->tensors[id] = (TensorMeta){
+        .buf_id = buf,
+        .dtype = DTYPE_U32,
+        .view = view_create(SHAPE(sizeof(Conv2dParams) / sizeof(u32))),
+    };
+    ctx->backend->buf_write(buf, &cp, sizeof(Conv2dParams));
+    return term_ten(id, DTYPE_U32);
+}
+
+Term thvm_conv2d_forward(TinyHVM *ctx, Term x, Term w, Term bias,
+                         Term conv_params) {
+    // Reduce conv_params to get Conv2dParams from buffer
+    conv_params = thvm_reduce(ctx, conv_params);
+    assert(term_tag(conv_params) == TAG_TEN);
+    u32 cp_id = (u32)term_val(conv_params);
+    Conv2dParams cp;
+    ctx->backend->buf_read(ctx->tensors[cp_id].buf_id, &cp, sizeof(Conv2dParams));
+
+    u32 Cout = 0;
+    {
+        // Infer Cout from weight shape: w is [Cout, Cin*KH*KW]
+        Term w_r = thvm_reduce(ctx, w);
+        assert(term_tag(w_r) == TAG_TEN);
+        Cout = ctx->tensors[(u32)term_val(w_r)].view.shape.dims[0];
+    }
+
+    // Step 1: im2col(x) → col [n_patches, patch_size]
+    Term col = thvm_op(ctx, UOP_IM2COL, x, conv_params);
+
+    // Step 2: Transpose weights: w[Cout, patch_size] → w_t[patch_size, Cout]
+    u32 perm_axes[] = {1, 0};
+    Term w_t = thvm_permute(ctx, w, perm_axes, 2);
+
+    // Step 3: col[n_patches, patch_size] @ w_t[patch_size, Cout] → out[n_patches, Cout]
+    Term out = thvm_op(ctx, UOP_MM, col, w_t);
+
+    // Step 4: Add bias (broadcast: bias[1, Cout] + out[n_patches, Cout])
+    Term biased = thvm_op(ctx, UOP_ADD, out, bias);
+
+    // Step 5: Layout transpose NHWC→NCHW
+    // out is [B*OH*OW, Cout] = [n_patches, Cout], conceptually NHWC
+    // Need to reshape to [B, OH, OW, Cout] then transpose to [B, Cout, OH, OW]
+    Term reshaped = thvm_reshape(ctx, biased,
+        SHAPE(cp.B, cp.OH, cp.OW, Cout));
+
+    // Permute [B, OH, OW, Cout] → [B, Cout, OH, OW]
+    u32 nchw_axes[] = {0, 3, 1, 2};
+    Term nchw = thvm_permute(ctx, reshaped, nchw_axes, 4);
+
+    return nchw;
+}

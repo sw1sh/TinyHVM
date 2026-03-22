@@ -293,4 +293,17 @@ void     thvm_stop_recording(TinyHVM *ctx);
 // Gradient ops go through thvm_op → get taped → grad(grad(f)) works.
 Term     thvm_grad(TinyHVM *ctx, Term y, Term x);
 
+// Backward: compute gradients for multiple parameters at once
+// Stores results in grads[] (lazy Terms — reduce to get values)
+void     thvm_backward(TinyHVM *ctx, Term loss,
+                       Term *params, Term *grads, u32 n_params);
+
+// Conv2d as UOp composition (autograd-compatible)
+// Builds: im2col → MM → bias_add → layout_transpose as lazy TOP nodes
+// Conv params passed as a tensor — create with thvm_conv2d_params()
+Term     thvm_conv2d_params(TinyHVM *ctx, u32 B, u32 Cin, u32 H, u32 W,
+                            u32 KH, u32 KW);
+Term     thvm_conv2d_forward(TinyHVM *ctx, Term x, Term w, Term bias,
+                             Term conv_params);
+
 #endif // TINYHVM_H

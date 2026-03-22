@@ -209,17 +209,23 @@ static BNResult batchnorm(TinyHVM *ctx, u32 x_id,
 // Adam optimizer
 // ============================================================
 
+// AdamParams must match the Metal struct
+typedef struct {
+    f32 lr, beta1, beta2, eps;
+    f32 bc1, bc2;
+} AdamGPUParams;
+
 typedef struct {
     f32 lr, beta1, beta2, eps;
     u32 t;   // timestep
     u32 n_params;
     u32 *param_ids;
     u32 *param_sizes;
-    f32 **m;  // first moment
-    f32 **v;  // second moment
+    u32 *m_bufs;  // GPU buffer IDs for first moment
+    u32 *v_bufs;  // GPU buffer IDs for second moment
 } Adam;
 
-static Adam adam_init(f32 lr, u32 n_params) {
+static Adam adam_init(TinyHVM *ctx, f32 lr, u32 n_params) {
     Adam opt = {0};
     opt.lr = lr;
     opt.beta1 = 0.9f;
@@ -229,45 +235,53 @@ static Adam adam_init(f32 lr, u32 n_params) {
     opt.n_params = n_params;
     opt.param_ids = calloc(n_params, sizeof(u32));
     opt.param_sizes = calloc(n_params, sizeof(u32));
-    opt.m = calloc(n_params, sizeof(f32*));
-    opt.v = calloc(n_params, sizeof(f32*));
+    opt.m_bufs = calloc(n_params, sizeof(u32));
+    opt.v_bufs = calloc(n_params, sizeof(u32));
+    (void)ctx;
     return opt;
 }
 
-static void adam_add_param(Adam *opt, u32 idx, u32 param_id, u32 size) {
+static void adam_add_param(TinyHVM *ctx, Adam *opt, u32 idx, u32 param_id, u32 size) {
     opt->param_ids[idx] = param_id;
     opt->param_sizes[idx] = size;
-    opt->m[idx] = calloc(size, sizeof(f32));
-    opt->v[idx] = calloc(size, sizeof(f32));
+    // Allocate m/v as proper tensors (zero-initialized) so they survive pool_reset
+    f32 *zeros = calloc(size, sizeof(f32));
+    opt->m_bufs[idx] = tensor_from(ctx, zeros, SHAPE(size));
+    opt->v_bufs[idx] = tensor_from(ctx, zeros, SHAPE(size));
+    free(zeros);
 }
 
 static void adam_step(TinyHVM *ctx, Adam *opt, u32 *grad_ids) {
     opt->t++;
-    f32 bc1 = 1.0f - powf(opt->beta1, (f32)opt->t);
-    f32 bc2 = 1.0f - powf(opt->beta2, (f32)opt->t);
+    AdamGPUParams p = {
+        .lr = opt->lr,
+        .beta1 = opt->beta1,
+        .beta2 = opt->beta2,
+        .eps = opt->eps,
+        .bc1 = 1.0f - powf(opt->beta1, (f32)opt->t),
+        .bc2 = 1.0f - powf(opt->beta2, (f32)opt->t),
+    };
 
-    for (u32 p = 0; p < opt->n_params; p++) {
-        u32 pid = opt->param_ids[p];
-        u32 sz = opt->param_sizes[p];
-        f32 *param = buf_read(ctx, pid, sz);
-        f32 *grad = buf_read(ctx, grad_ids[p], sz);
-
-        for (u32 i = 0; i < sz; i++) {
-            opt->m[p][i] = opt->beta1*opt->m[p][i] + (1-opt->beta1)*grad[i];
-            opt->v[p][i] = opt->beta2*opt->v[p][i] + (1-opt->beta2)*grad[i]*grad[i];
-            f32 m_hat = opt->m[p][i] / bc1;
-            f32 v_hat = opt->v[p][i] / bc2;
-            param[i] -= opt->lr * m_hat / (sqrtf(v_hat) + opt->eps);
-        }
-
-        ctx->backend->buf_write(ctx->tensors[pid].buf_id, param, sz*sizeof(f32));
-        free(param); free(grad);
+    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+    for (u32 i = 0; i < opt->n_params; i++) {
+        u32 pid = opt->param_ids[i];
+        u32 sz = opt->param_sizes[i];
+        id<MTLBuffer> bufs[] = {
+            metal_pool.bufs[ctx->tensors[pid].buf_id],      // param
+            metal_pool.bufs[ctx->tensors[grad_ids[i]].buf_id], // grad
+            metal_pool.bufs[ctx->tensors[opt->m_bufs[i]].buf_id],  // m
+            metal_pool.bufs[ctx->tensors[opt->v_bufs[i]].buf_id],  // v
+        };
+        const void *params[] = { &p };
+        u64 psizes[] = { sizeof(AdamGPUParams) };
+        dispatch_1d(pipe_adam_step, bufs, 4, params, psizes, 1, sz);
     }
+    if (ctx->backend->end_batch) ctx->backend->end_batch();
 }
 
 static void adam_free(Adam *opt) {
-    for (u32 i = 0; i < opt->n_params; i++) { free(opt->m[i]); free(opt->v[i]); }
-    free(opt->param_ids); free(opt->param_sizes); free(opt->m); free(opt->v);
+    free(opt->param_ids); free(opt->param_sizes);
+    free(opt->m_bufs); free(opt->v_bufs);
 }
 
 // ============================================================
@@ -505,53 +519,69 @@ static ConvGrads conv2d_backward(TinyHVM *ctx, u32 d_out_id, ConvResult *cr, u32
 
 typedef struct {
     u32 out_id;
-    u8 *mask;  // argmax indices for backward
+    u32 mask_buf;  // GPU byte buffer for argmax mask
     u32 B, C, H, W;
 } PoolResult;
 
 static PoolResult maxpool2d(TinyHVM *ctx, u32 x_id, u32 B, u32 C, u32 H, u32 W) {
     u32 OH = H/2, OW = W/2;
-    f32 *x = buf_read(ctx, x_id, B*C*H*W);
-    f32 *out = malloc(B*C*OH*OW * sizeof(f32));
-    u8  *mask = malloc(B*C*OH*OW);
+    u32 out_numel = B*C*OH*OW;
 
-    for (u32 b = 0; b < B; b++)
-        for (u32 c = 0; c < C; c++)
-            for (u32 oh = 0; oh < OH; oh++)
-                for (u32 ow = 0; ow < OW; ow++) {
-                    u32 base = (b*C+c)*H*W;
-                    u32 h0 = oh*2, w0 = ow*2;
-                    f32 vals[4] = { x[base+h0*W+w0], x[base+h0*W+w0+1],
-                                    x[base+(h0+1)*W+w0], x[base+(h0+1)*W+w0+1] };
-                    u8 mi = 0;
-                    for (u8 k = 1; k < 4; k++) if (vals[k] > vals[mi]) mi = k;
-                    u32 oidx = (b*C+c)*OH*OW + oh*OW+ow;
-                    out[oidx] = vals[mi];
-                    mask[oidx] = mi;
-                }
+    u32 out_buf = ctx->backend->buf_alloc(out_numel * sizeof(f32));
+    u32 mask_buf = ctx->backend->buf_alloc(out_numel);  // u8 per element
 
-    u32 out_id = tensor_from(ctx, out, (Shape){.dims={B,C,OH,OW}, .rank=4});
-    free(x); free(out);
-    return (PoolResult){.out_id=out_id, .mask=mask, .B=B, .C=C, .H=H, .W=W};
+    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+    {
+        LayoutParams lp = {B, C, H, W};
+        id<MTLBuffer> bufs[] = { metal_pool.bufs[out_buf], metal_pool.bufs[mask_buf],
+                                  metal_pool.bufs[ctx->tensors[x_id].buf_id] };
+        const void *params[] = { &lp };
+        u64 psizes[] = { sizeof(LayoutParams) };
+        dispatch_1d(pipe_maxpool2d_fwd, bufs, 3, params, psizes, 1, out_numel);
+    }
+    if (ctx->backend->end_batch) ctx->backend->end_batch();
+
+    u32 out_id = ctx->tensor_count++;
+    ctx->tensors[out_id] = (TensorMeta){
+        .buf_id = out_buf,
+        .dtype = DTYPE_F32,
+        .view = view_create((Shape){.dims={B,C,OH,OW}, .rank=4}),
+    };
+
+    return (PoolResult){.out_id=out_id, .mask_buf=mask_buf, .B=B, .C=C, .H=H, .W=W};
 }
 
 static u32 maxpool2d_backward(TinyHVM *ctx, u32 d_out_id, PoolResult *pr) {
     u32 B=pr->B, C=pr->C, H=pr->H, W=pr->W, OH=H/2, OW=W/2;
-    f32 *dout = buf_read(ctx, d_out_id, B*C*OH*OW);
-    f32 *dx = calloc(B*C*H*W, sizeof(f32));
+    u32 out_numel = B*C*OH*OW;
+    u32 in_numel = B*C*H*W;
 
-    for (u32 b = 0; b < B; b++)
-        for (u32 c = 0; c < C; c++)
-            for (u32 oh = 0; oh < OH; oh++)
-                for (u32 ow = 0; ow < OW; ow++) {
-                    u32 oidx = (b*C+c)*OH*OW + oh*OW+ow;
-                    u8 mi = pr->mask[oidx];
-                    u32 h0 = oh*2 + mi/2, w0 = ow*2 + mi%2;
-                    dx[(b*C+c)*H*W + h0*W+w0] = dout[oidx];
-                }
+    u32 dx_buf = ctx->backend->buf_alloc(in_numel * sizeof(f32));
 
-    u32 dx_id = tensor_from(ctx, dx, (Shape){.dims={B,C,H,W}, .rank=4});
-    free(dout); free(dx); free(pr->mask);
+    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+    {
+        // Zero the output first
+        id<MTLBuffer> z_bufs[] = { metal_pool.bufs[dx_buf] };
+        dispatch_1d(pipe_zero_fill, z_bufs, 1, NULL, NULL, 0, in_numel);
+
+        // Scatter gradient
+        LayoutParams lp = {B, C, H, W};
+        id<MTLBuffer> bufs[] = { metal_pool.bufs[dx_buf],
+                                  metal_pool.bufs[ctx->tensors[d_out_id].buf_id],
+                                  metal_pool.bufs[pr->mask_buf] };
+        const void *params[] = { &lp };
+        u64 psizes[] = { sizeof(LayoutParams) };
+        dispatch_1d(pipe_maxpool2d_bwd, bufs, 3, params, psizes, 1, out_numel);
+    }
+    if (ctx->backend->end_batch) ctx->backend->end_batch();
+
+    u32 dx_id = ctx->tensor_count++;
+    ctx->tensors[dx_id] = (TensorMeta){
+        .buf_id = dx_buf,
+        .dtype = DTYPE_F32,
+        .view = view_create((Shape){.dims={B,C,H,W}, .rank=4}),
+    };
+
     return dx_id;
 }
 
@@ -606,17 +636,31 @@ static BNGrads batchnorm_backward(TinyHVM *ctx, u32 d_out_id, BNResult *bn, u32 
 }
 
 // ============================================================
-// ReLU backward
+// ReLU backward (GPU)
 // ============================================================
 
+typedef struct {
+    u32 M, N;
+} TransposeParams;
+
 static u32 relu_backward(TinyHVM *ctx, u32 d_out_id, u32 x_id, u32 n) {
-    f32 *dout = buf_read(ctx, d_out_id, n);
-    f32 *x = buf_read(ctx, x_id, n);
-    f32 *dx = malloc(n * sizeof(f32));
-    for (u32 i = 0; i < n; i++)
-        dx[i] = x[i] > 0.0f ? dout[i] : 0.0f;
-    u32 dx_id = tensor_from(ctx, dx, ctx->tensors[d_out_id].view.shape);
-    free(dout); free(x); free(dx);
+    u32 dx_buf = ctx->backend->buf_alloc(n * sizeof(f32));
+
+    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+    {
+        id<MTLBuffer> bufs[] = { metal_pool.bufs[dx_buf],
+                                  metal_pool.bufs[ctx->tensors[d_out_id].buf_id],
+                                  metal_pool.bufs[ctx->tensors[x_id].buf_id] };
+        dispatch_1d(pipe_relu_bwd, bufs, 3, NULL, NULL, 0, n);
+    }
+    if (ctx->backend->end_batch) ctx->backend->end_batch();
+
+    u32 dx_id = ctx->tensor_count++;
+    ctx->tensors[dx_id] = (TensorMeta){
+        .buf_id = dx_buf,
+        .dtype = DTYPE_F32,
+        .view = ctx->tensors[d_out_id].view,
+    };
     return dx_id;
 }
 
@@ -626,35 +670,82 @@ static u32 relu_backward(TinyHVM *ctx, u32 d_out_id, u32 x_id, u32 n) {
 
 typedef struct { u32 d_weight, d_bias, d_input; } LinearGrads;
 
+// Helper: GPU matrix transpose using Metal kernel
+static u32 gpu_transpose_2d(TinyHVM *ctx, u32 src_id, u32 M, u32 N) {
+    u32 dst_buf = ctx->backend->buf_alloc(M * N * sizeof(f32));
+    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+    {
+        TransposeParams tp = {M, N};
+        id<MTLBuffer> bufs[] = { metal_pool.bufs[dst_buf],
+                                  metal_pool.bufs[ctx->tensors[src_id].buf_id] };
+        const void *params[] = { &tp };
+        u64 psizes[] = { sizeof(TransposeParams) };
+        dispatch_1d(pipe_matrix_transpose, bufs, 2, params, psizes, 1, M * N);
+    }
+    if (ctx->backend->end_batch) ctx->backend->end_batch();
+
+    u32 dst_id = ctx->tensor_count++;
+    ctx->tensors[dst_id] = (TensorMeta){
+        .buf_id = dst_buf,
+        .dtype = DTYPE_F32,
+        .view = view_create(SHAPE(N, M)),
+    };
+    return dst_id;
+}
+
+// Helper: GPU column sum using Metal kernel
+static u32 gpu_col_sum(TinyHVM *ctx, u32 src_id, u32 N, u32 C) {
+    u32 dst_buf = ctx->backend->buf_alloc(C * sizeof(f32));
+    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+    {
+        id<MTLBuffer> bufs[] = { metal_pool.bufs[dst_buf],
+                                  metal_pool.bufs[ctx->tensors[src_id].buf_id] };
+        const void *params[] = { &N, &C };
+        u64 psizes[] = { sizeof(u32), sizeof(u32) };
+        dispatch_1d(pipe_col_sum, bufs, 2, params, psizes, 2, C);
+    }
+    if (ctx->backend->end_batch) ctx->backend->end_batch();
+
+    u32 dst_id = ctx->tensor_count++;
+    ctx->tensors[dst_id] = (TensorMeta){
+        .buf_id = dst_buf,
+        .dtype = DTYPE_F32,
+        .view = view_create(SHAPE(C)),
+    };
+    return dst_id;
+}
+
 static LinearGrads linear_backward(TinyHVM *ctx, u32 d_out_id, u32 x_id, u32 w_id,
                                     u32 B, u32 in_f, u32 out_f) {
-    // d_input = d_out @ W^T → [B, in]  but W is [in, out]
-    // so d_input = d_out [B, out] @ W^T [out, in]
-    u32 axes[] = {1, 0};
-    Term w_t = thvm_permute(ctx, term_ten(w_id, DTYPE_F32), axes, 2);
+    // d_input = d_out [B, out] @ W^T [out, in] → [B, in]
+    u32 wt_id = gpu_transpose_2d(ctx, w_id, in_f, out_f);
+    View dout_view = view_create(SHAPE(B, out_f));
+    View wt_view = view_create(SHAPE(out_f, in_f));
+    u32 di_buf = ctx->backend->buf_alloc(B * in_f * sizeof(f32));
+    ctx->backend->op_mm(di_buf, ctx->tensors[d_out_id].buf_id, &dout_view,
+                        ctx->tensors[wt_id].buf_id, &wt_view, B, out_f, in_f);
+    u32 d_input = ctx->tensor_count++;
+    ctx->tensors[d_input] = (TensorMeta){
+        .buf_id = di_buf,
+        .dtype = DTYPE_F32,
+        .view = view_create(SHAPE(B, in_f)),
+    };
 
-    // Need physical transpose for matmul (currently requires contiguous)
-    // Use tensor_transpose_2d for now
-    u32 wt_id = tensor_transpose_2d(ctx, w_id);
-    Term di_t = thvm_op(ctx, UOP_MM, term_ten(d_out_id, DTYPE_F32), term_ten(wt_id, DTYPE_F32));
-    di_t = thvm_reduce(ctx, di_t);
-    u32 d_input = (u32)term_val(di_t);
+    // d_weight = x^T [in, B] @ d_out [B, out] → [in, out]
+    u32 xt_id = gpu_transpose_2d(ctx, x_id, B, in_f);
+    View xt_view = view_create(SHAPE(in_f, B));
+    u32 dw_buf = ctx->backend->buf_alloc(in_f * out_f * sizeof(f32));
+    ctx->backend->op_mm(dw_buf, ctx->tensors[xt_id].buf_id, &xt_view,
+                        ctx->tensors[d_out_id].buf_id, &dout_view, in_f, B, out_f);
+    u32 d_weight = ctx->tensor_count++;
+    ctx->tensors[d_weight] = (TensorMeta){
+        .buf_id = dw_buf,
+        .dtype = DTYPE_F32,
+        .view = view_create(SHAPE(in_f, out_f)),
+    };
 
-    // d_weight = x^T @ d_out → [in, out]
-    u32 xt_id = tensor_transpose_2d(ctx, x_id);
-    Term dw_t = thvm_op(ctx, UOP_MM, term_ten(xt_id, DTYPE_F32), term_ten(d_out_id, DTYPE_F32));
-    dw_t = thvm_reduce(ctx, dw_t);
-    u32 d_weight = (u32)term_val(dw_t);
+    // d_bias = col_sum(d_out) → [out]
+    u32 d_bias = gpu_col_sum(ctx, d_out_id, B, out_f);
 
-    // d_bias = sum(d_out, axis=0) → [out]
-    f32 *dout = buf_read(ctx, d_out_id, B*out_f);
-    f32 *db = calloc(out_f, sizeof(f32));
-    for (u32 i = 0; i < B; i++)
-        for (u32 j = 0; j < out_f; j++)
-            db[j] += dout[i*out_f+j];
-    u32 d_bias = tensor_from(ctx, db, SHAPE(out_f));
-    free(dout); free(db);
-
-    (void)in_f; (void)w_t;
     return (LinearGrads){.d_weight=d_weight, .d_bias=d_bias, .d_input=d_input};
 }

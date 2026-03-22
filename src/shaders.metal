@@ -347,3 +347,129 @@ kernel void col_sum(device float *dst [[buffer(0)]],
         sum += src[i * C + gid];
     dst[gid] = sum;
 }
+
+// ============================================================
+// Adam optimizer step (per-element)
+// param[i] -= lr * m_hat / (sqrt(v_hat) + eps)
+// ============================================================
+
+struct AdamParams {
+    float lr, beta1, beta2, eps;
+    float bc1, bc2;  // bias correction: 1 - beta^t
+};
+
+kernel void adam_step(device float *param [[buffer(0)]],
+                      device const float *grad [[buffer(1)]],
+                      device float *m [[buffer(2)]],
+                      device float *v [[buffer(3)]],
+                      constant AdamParams &p [[buffer(4)]],
+                      uint gid [[thread_position_in_grid]]) {
+    float g = grad[gid];
+    float mi = p.beta1 * m[gid] + (1.0f - p.beta1) * g;
+    float vi = p.beta2 * v[gid] + (1.0f - p.beta2) * g * g;
+    m[gid] = mi;
+    v[gid] = vi;
+    float m_hat = mi / p.bc1;
+    float v_hat = vi / p.bc2;
+    param[gid] -= p.lr * m_hat / (sqrt(v_hat) + p.eps);
+}
+
+// ============================================================
+// MaxPool2d 2x2 stride 2 — forward with argmax mask
+// Thread per output element
+// ============================================================
+
+kernel void maxpool2d_fwd(device float *out [[buffer(0)]],
+                          device uchar *mask [[buffer(1)]],
+                          device const float *x [[buffer(2)]],
+                          constant LayoutParams &p [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
+    uint OH = p.H / 2, OW = p.W / 2;
+    uint total = p.B * p.C * OH * OW;
+    if (gid >= total) return;
+
+    uint b = gid / (p.C * OH * OW);
+    uint rem = gid % (p.C * OH * OW);
+    uint c = rem / (OH * OW);
+    rem = rem % (OH * OW);
+    uint oh = rem / OW;
+    uint ow = rem % OW;
+
+    uint base = (b * p.C + c) * p.H * p.W;
+    uint h0 = oh * 2, w0 = ow * 2;
+    float v0 = x[base + h0 * p.W + w0];
+    float v1 = x[base + h0 * p.W + w0 + 1];
+    float v2 = x[base + (h0+1) * p.W + w0];
+    float v3 = x[base + (h0+1) * p.W + w0 + 1];
+
+    uchar mi = 0;
+    float mx = v0;
+    if (v1 > mx) { mx = v1; mi = 1; }
+    if (v2 > mx) { mx = v2; mi = 2; }
+    if (v3 > mx) { mx = v3; mi = 3; }
+
+    out[gid] = mx;
+    mask[gid] = mi;
+}
+
+// MaxPool2d backward: scatter gradient using mask
+kernel void maxpool2d_bwd(device float *dx [[buffer(0)]],
+                          device const float *dout [[buffer(1)]],
+                          device const uchar *mask [[buffer(2)]],
+                          constant LayoutParams &p [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
+    uint OH = p.H / 2, OW = p.W / 2;
+    uint total = p.B * p.C * OH * OW;
+    if (gid >= total) return;
+
+    uint b = gid / (p.C * OH * OW);
+    uint rem = gid % (p.C * OH * OW);
+    uint c = rem / (OH * OW);
+    rem = rem % (OH * OW);
+    uint oh = rem / OW;
+    uint ow = rem % OW;
+
+    uchar mi = mask[gid];
+    uint h0 = oh * 2 + mi / 2;
+    uint w0 = ow * 2 + mi % 2;
+    // Note: dx must be zeroed first
+    dx[(b * p.C + c) * p.H * p.W + h0 * p.W + w0] = dout[gid];
+}
+
+// ============================================================
+// ReLU backward: dx = x > 0 ? dout : 0
+// ============================================================
+
+kernel void relu_bwd(device float *dx [[buffer(0)]],
+                     device const float *dout [[buffer(1)]],
+                     device const float *x [[buffer(2)]],
+                     uint gid [[thread_position_in_grid]]) {
+    dx[gid] = x[gid] > 0.0f ? dout[gid] : 0.0f;
+}
+
+// ============================================================
+// Matrix transpose: [M, N] → [N, M]
+// ============================================================
+
+struct TransposeParams {
+    uint M, N;
+};
+
+kernel void matrix_transpose(device float *dst [[buffer(0)]],
+                              device const float *src [[buffer(1)]],
+                              constant TransposeParams &p [[buffer(2)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.M * p.N) return;
+    uint i = gid / p.N;
+    uint j = gid % p.N;
+    dst[j * p.M + i] = src[gid];
+}
+
+// ============================================================
+// Zero fill
+// ============================================================
+
+kernel void zero_fill(device float *dst [[buffer(0)]],
+                      uint gid [[thread_position_in_grid]]) {
+    dst[gid] = 0.0f;
+}

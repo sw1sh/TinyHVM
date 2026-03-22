@@ -218,11 +218,9 @@ int main(void) {
     u32 fc_b = tensor_from(ctx, fcb, SHAPE(10));
     free(fcw); free(fcb);
 
-    u32 n_weights = ctx->tensor_count;
-
     // ========== Adam optimizer ==========
     #define N_PARAMS 14
-    Adam opt = adam_init(0.001f, N_PARAMS);
+    Adam opt = adam_init(ctx, 0.001f, N_PARAMS);
     u32 param_ids[] = {conv1_w, conv1_b, conv2_w, conv2_b, bn1_gamma, bn1_beta,
                        conv3_w, conv3_b, conv4_w, conv4_b, bn2_gamma, bn2_beta,
                        fc_w, fc_b};
@@ -230,7 +228,11 @@ int main(void) {
                          64*32*3*3, 64, 64*64*3*3, 64, 64, 64,
                          576*10, 10};
     for (u32 i = 0; i < N_PARAMS; i++)
-        adam_add_param(&opt, i, param_ids[i], param_sizes[i]);
+        adam_add_param(ctx, &opt, i, param_ids[i], param_sizes[i]);
+
+    // IMPORTANT: n_weights must be set AFTER adam_add_param allocates
+    // GPU m/v buffers, so they survive thvm_reset(n_weights)
+    u32 n_weights = ctx->tensor_count;
 
     // ========== Training loop ==========
     u32 BS = 128;

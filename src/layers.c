@@ -294,16 +294,7 @@ typedef struct {
     u32 B, Cin, H, W, Cout, KH, KW, OH, OW;
 } ConvResult;
 
-// Conv2dParams must match the Metal shader struct
-typedef struct {
-    u32 B, Cin, H, W, KH, KW, OH, OW;
-    u32 patch_size;
-    u32 n_patches;
-} Conv2dParams;
-
-typedef struct {
-    u32 B, C, H, W;
-} LayoutParams;
+// Conv2dParams, LayoutParams defined in tinyhvm.h
 
 static ConvResult conv2d(TinyHVM *ctx, u32 x_id, u32 w_id, u32 b_id,
                          u32 B, u32 Cin, u32 H, u32 W, u32 Cout, u32 KH, u32 KW) {

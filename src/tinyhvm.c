@@ -440,12 +440,8 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 ctx->backend->op_mm(md->buf_id, ma->buf_id, &ma->view,
                                 mb->buf_id, &mb->view, M, K, N);
             } else if (is_cnn_op) {
-                // CNN ops dispatched via backend kernel pipelines
-                // These are currently handled in layers.c via dispatch_1d
-                // For now, store the dst_id and let layers.c fill the buffer
-                // TODO: move dispatch into backend vtable
-                // Mark as needing external dispatch
-                md->host_ptr = (void*)(uintptr_t)1; // sentinel: "dispatch me"
+                // CNN ops dispatched via backend op_cnn
+                ctx->backend->op_cnn(uop, md->buf_id, ma->buf_id, mb->buf_id);
             } else if (is_reduce) {
                 u32 reduce_dim = ma->view.shape.dims[ma->view.shape.rank - 1];
                 ctx->backend->op_reduce(uop, md->buf_id, md->view.numel,

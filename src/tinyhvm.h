@@ -121,6 +121,11 @@ typedef u64 Term;
 
 #define UOP_COUNT     28
 
+// CNN op parameter structs (must match Metal shader structs)
+typedef struct { u32 B, Cin, H, W, KH, KW, OH, OW, patch_size, n_patches; } Conv2dParams;
+typedef struct { u32 B, C, H, W; } LayoutParams;
+typedef struct { u32 B, C, H, W, OH, OW; } Pool2dParams;
+
 // ============================================================
 // NUM encoding
 // ============================================================
@@ -216,6 +221,9 @@ typedef struct {
     // dst shape = src shape with last dim collapsed to 1
     void  (*op_reduce)(u32 uop, u32 dst, u32 dst_numel,
                        u32 src, u32 src_numel, u32 reduce_dim);
+    // CNN ops: im2col, col2im, maxpool, layout transpose
+    // params_buf contains Conv2dParams or LayoutParams as raw u32s
+    void  (*op_cnn)(u32 uop, u32 dst, u32 src, u32 params_buf);
     // Pool management: reset buffer pool to `keep` entries
     void  (*pool_reset)(u32 keep);
     // Command buffer batching: accumulate GPU work without sync

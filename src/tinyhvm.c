@@ -1512,6 +1512,7 @@ Term thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
     u32 KW = mw->view.shape.dims[3];
     (void)cin_g;
     assert(groups * cin_g == cin);
+    assert(groups == 1);  // grouped conv via matmul needs separate handling
 
     // Step 1: pad input
     u32 pad_pairs[MAX_DIM * 2] = {0};
@@ -1528,49 +1529,35 @@ Term thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
     Term pooled = thvm_pool(ctx, padded, k, s, 2);
     // pooled: [BS, Cin, OY, OX, KH, KW]
 
-    // Get output spatial dims
     Term pr = thvm_reduce(ctx, pooled);
     TensorMeta *mp = &ctx->tensors[(u32)term_val(pr)];
     u32 oy = mp->view.shape.dims[2];
     u32 ox = mp->view.shape.dims[3];
 
-    u32 rcout = cout / groups;
+    // Step 3: im2col + matmul approach
+    // Reshape pooled: [BS, Cin, OY, OX, KH, KW]
+    //   → permute to [BS, OY, OX, Cin, KH, KW]
+    //   → reshape to [BS*OY*OX, Cin*KH*KW]   (im2col columns)
+    u32 perm_col[] = {0, 2, 3, 1, 4, 5};
+    Term x_perm = thvm_permute(ctx, pr, perm_col, 6);
+    Term x_col = thvm_reshape(ctx, x_perm,
+        shape_of((u32[]){bs * oy * ox, cin * KH * KW}, 2));
 
-    // Step 3: reshape + expand + permute for broadcasting
-    // pooled: [BS, groups, cin_g, 1, OY, OX, KH, KW]
-    Term x_rs = thvm_reshape(ctx, pr,
-        shape_of((u32[]){bs, groups, cin_g, 1, oy, ox, KH, KW}, 8));
-    // expand to: [BS, groups, cin_g, rcout, OY, OX, KH, KW]
-    Term x_exp = thvm_expand(ctx, x_rs,
-        shape_of((u32[]){bs, groups, cin_g, rcout, oy, ox, KH, KW}, 8));
-    // permute to: [BS, groups, rcout, OY, OX, cin_g, KH, KW]
-    u32 conv_perm[] = {0, 1, 3, 4, 5, 2, 6, 7};
-    Term x_perm = thvm_permute(ctx, x_exp, conv_perm, 8);
+    // Reshape weight: [Cout, Cin, KH, KW] → [Cout, Cin*KH*KW] → transpose
+    Term w_flat = thvm_reshape(ctx, wr,
+        shape_of((u32[]){cout, cin * KH * KW}, 2));
+    // permute to [Cin*KH*KW, Cout] for x_col @ w_T
+    u32 perm_w[] = {1, 0};
+    Term w_T = thvm_permute(ctx, w_flat, perm_w, 2);
 
-    // Step 4: reshape weight to [1, groups, rcout, 1, 1, cin_g, KH, KW]
-    Term w_rs = thvm_reshape(ctx, wr,
-        shape_of((u32[]){1, groups, rcout, 1, 1, cin_g, KH, KW}, 8));
+    // Matmul: [BS*OY*OX, Cin*KH*KW] @ [Cin*KH*KW, Cout] → [BS*OY*OX, Cout]
+    Term mm_out = thvm_op(ctx, UOP_MM, x_col, w_T);
 
-    // Step 5: multiply + sum over (cin_g, KH, KW) = last 3 dims
-    // Guard: only SUM when dim > 1, else the "last non-1 dim" heuristic
-    // would reduce the wrong axis (e.g. when cin_g=1 for first conv).
-    Term prod = thvm_op(ctx, UOP_MUL, x_perm, w_rs);
-
-    // SUM over KW (dim 7), then squeeze
-    // prod: [BS, groups, rcout, OY, OX, cin_g, KH, KW]
-    Term s1 = (KW > 1) ? thvm_op(ctx, UOP_SUM, prod, term_era()) : prod;
-    s1 = thvm_reshape(ctx, s1, shape_of((u32[]){bs, groups, rcout, oy, ox, cin_g, KH}, 7));
-
-    // SUM over KH (dim 6), then squeeze
-    Term s2 = (KH > 1) ? thvm_op(ctx, UOP_SUM, s1, term_era()) : s1;
-    s2 = thvm_reshape(ctx, s2, shape_of((u32[]){bs, groups, rcout, oy, ox, cin_g}, 6));
-
-    // SUM over cin_g (dim 5), then squeeze
-    Term s3 = (cin_g > 1) ? thvm_op(ctx, UOP_SUM, s2, term_era()) : s2;
-    s3 = thvm_reshape(ctx, s3, shape_of((u32[]){bs, groups, rcout, oy, ox}, 5));
-
-    // Reshape to [BS, Cout, OY, OX]
-    Term out = thvm_reshape(ctx, s3, shape_of((u32[]){bs, cout, oy, ox}, 4));
+    // Reshape: [BS*OY*OX, Cout] → [BS, OY, OX, Cout] → permute [BS, Cout, OY, OX]
+    Term out_4d = thvm_reshape(ctx, mm_out,
+        shape_of((u32[]){bs, oy, ox, cout}, 4));
+    u32 perm_nchw[] = {0, 3, 1, 2};
+    Term out = thvm_permute(ctx, out_4d, perm_nchw, 4);
 
     // Add bias
     if (term_tag(bias) != TAG_ERA) {

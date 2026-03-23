@@ -244,7 +244,9 @@ int main(void) {
       } // @autoreleasepool
     }
 
-    // Eval
+    // Eval (skip when profiling with interaction limit)
+    f32 acc = 0;
+    if (!max_itrs) {
     printf("\n  Evaluating test set...\n");
     Term test_data = thvm_tensor(ctx, data.test_images,
         (Shape){.dims={data.n_test, 1, 28, 28}, .rank=4});
@@ -255,17 +257,20 @@ int main(void) {
         Term x = thvm_shrink(ctx, test_data,
             (u32[]){b*tbs, (b+1)*tbs, 0, 1, 0, 28, 0, 28}, 4);
         Term logits = thvm_sequential(ctx, x, model, N_LAYERS, tbs, 0);
-        f32 acc = thvm_eval_accuracy(ctx, logits, &data.test_labels[b*tbs], tbs, 10);
-        correct += (u32)(acc * (f32)tbs / 100.0f);
+        f32 batch_acc = thvm_eval_accuracy(ctx, logits, &data.test_labels[b*tbs], tbs, 10);
+        correct += (u32)(batch_acc * (f32)tbs / 100.0f);
         thvm_reset(ctx, eval_keep);
     }
-    f32 acc = 100.0f * (f32)correct / (f32)(tb * tbs);
+    acc = 100.0f * (f32)correct / (f32)(tb * tbs);
     printf("\n  Test accuracy: %.1f%% (%u/%u)\n", acc, correct, tb * tbs);
     printf("\n  %s: CNN test accuracy %s 90%%\n", acc > 90 ? "PASS" : "FAIL",
            acc > 90 ? ">" : "<");
+    } else {
+        printf("\n  (eval skipped — profiling mode)\n");
+    }
 
     adam_free(&opt);
     mnist_free(&data);
     thvm_free(ctx);
-    return acc > 90 ? 0 : 1;
+    return max_itrs ? 0 : (acc > 90 ? 0 : 1);
 }

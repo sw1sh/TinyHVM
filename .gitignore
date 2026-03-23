@@ -33,3 +33,4 @@ test_mnist
 test_mnist_cnn
 beautiful_mnist
 tinyspec/
+beautiful_mnist_debug

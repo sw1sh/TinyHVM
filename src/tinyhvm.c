@@ -272,9 +272,10 @@ extern void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
                                  u32 a_buf, const View *av,
                                  u32 b_buf, const View *bv,
                                  const View *ov,
-                                 u32 reduce_dim,
-                                 u32 reduce_stride_a,
-                                 u32 reduce_stride_b);
+                                 u32 n_reduce,
+                                 const u32 *reduce_dims,
+                                 const u32 *reduce_strides_a,
+                                 const u32 *reduce_strides_b);
 extern Backend metal_backend;
 #endif
 
@@ -557,8 +558,8 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
 
             // === FUSED MUL+SUM: pattern match SUM(MUL(a, b)) ===
             // Avoids materializing the huge MUL intermediate buffer.
-            // Instead, fuses into a single kernel: for each output element,
-            // iterate over reduce_dim, accumulating a[i]*b[i].
+            // Skip when recording autograd: backward needs separate MUL/SUM records
+            // to compute correct gradients through both operands.
             if (uop == UOP_SUM) {
                 Term child = heap_read(ctx, loc);
                 if (term_tag(child) == TAG_TOP && term_ext(child) == UOP_MUL) {
@@ -578,27 +579,50 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                         int ok = view_broadcast(&ma->view, &mb->view, &av_bc, &bv_bc,
                                                 out_shape, &out_ndim);
                         if (ok) {
-                            // Find reduce axis: last non-1 dim in broadcast shape
-                            int reduce_axis = -1;
-                            for (int i = (int)out_ndim - 1; i >= 0; i--) {
-                                if (out_shape[i] > 1) { reduce_axis = i; break; }
+                            // Determine reduce axes: explicit (from thvm_sum_axes) or last-non-1
+                            u32 n_reduce = 0;
+                            u32 reduce_axes[MAX_DIM];
+                            Term sum_arg = heap_read(ctx, loc + 1);
+                            if (term_tag(sum_arg) == TAG_TOP || term_tag(sum_arg) == TAG_TEN) {
+                                // Explicit axes from thvm_sum_axes
+                                Term axes_t = thvm_reduce(ctx, sum_arg);
+                                if (term_tag(axes_t) == TAG_TEN) {
+                                    u32 ax_id = (u32)term_val(axes_t);
+                                    TensorMeta *max = &ctx->tensors[ax_id];
+                                    n_reduce = max->view.numel;
+                                    f32 *axes_f = malloc(n_reduce * sizeof(f32));
+                                    ctx->backend->buf_read(max->buf_id, axes_f, n_reduce * sizeof(f32));
+                                    for (u32 i = 0; i < n_reduce; i++) reduce_axes[i] = (u32)axes_f[i];
+                                    free(axes_f);
+                                }
+                            } else {
+                                // Old behavior: last non-1 dim
+                                for (int i = (int)out_ndim - 1; i >= 0; i--) {
+                                    if (out_shape[i] > 1) { reduce_axes[0] = (u32)i; n_reduce = 1; break; }
+                                }
                             }
-                            if (reduce_axis >= 0) {
-                                u32 reduce_dim = out_shape[reduce_axis];
-                                // Output shape: broadcast shape with reduce axis = 1
+                            if (n_reduce > 0) {
+                                // Build reduce dim sizes and strides arrays
+                                u32 reduce_dims[MAX_DIM];
+                                u32 reduce_strides_a[MAX_DIM], reduce_strides_b[MAX_DIM];
+                                u32 reduce_numel = 1;
+                                for (u32 i = 0; i < n_reduce; i++) {
+                                    u32 ax = reduce_axes[i];
+                                    reduce_dims[i] = out_shape[ax];
+                                    reduce_strides_a[i] = (u32)av_bc.strides[ax];
+                                    reduce_strides_b[i] = (u32)bv_bc.strides[ax];
+                                    reduce_numel *= out_shape[ax];
+                                }
+
+                                // Output shape: broadcast with reduce axes = 1
                                 u32 dst_shape[MAX_DIM];
                                 for (u32 i = 0; i < out_ndim; i++) dst_shape[i] = out_shape[i];
-                                dst_shape[reduce_axis] = 1;
+                                for (u32 i = 0; i < n_reduce; i++) dst_shape[reduce_axes[i]] = 1;
                                 Shape dst_s = shape_of(dst_shape, out_ndim);
                                 u32 dst_numel = 1;
                                 for (u32 i = 0; i < out_ndim; i++) dst_numel *= dst_shape[i];
 
-                                // Create output view (contiguous, no reduce axis)
                                 View ov = view_create(dst_s);
-
-                                // Compute reduce strides in a and b
-                                u32 rs_a = (u32)av_bc.strides[reduce_axis];
-                                u32 rs_b = (u32)bv_bc.strides[reduce_axis];
 
                                 // Create output tensor
                                 u32 dst_id = tensor_create(ctx, dst_s, ma->dtype);
@@ -615,37 +639,50 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                                     }
                                 }
 
-                                // Dispatch
+                                // Dispatch: Metal or CPU fallback
                                 if (ctx->backend == &metal_backend) {
                                     metal_mul_reduce_sum(
                                         md->buf_id, dst_numel,
                                         ma->buf_id, &av_bc,
                                         mb->buf_id, &bv_bc,
-                                        &ov, reduce_dim, rs_a, rs_b);
+                                        &ov, n_reduce,
+                                        reduce_dims, reduce_strides_a, reduce_strides_b);
                                 } else {
-                                    // CPU fallback: strided mul+sum
-                                    f32 *a_ptr = malloc(ma->view.numel * sizeof(f32));
-                                    f32 *b_ptr = malloc(mb->view.numel * sizeof(f32));
-                                    ctx->backend->buf_read(ma->buf_id, a_ptr, ma->view.numel * sizeof(f32));
-                                    ctx->backend->buf_read(mb->buf_id, b_ptr, mb->view.numel * sizeof(f32));
+                                    // Compute actual buffer footprint (stride-0 broadcasts)
+                                    u32 a_buf = ma->view.offset + 1, b_buf = mb->view.offset + 1;
+                                    for (u32 d = 0; d < ma->view.shape.rank; d++)
+                                        if (ma->view.strides[d] > 0)
+                                            a_buf += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
+                                    for (u32 d = 0; d < mb->view.shape.rank; d++)
+                                        if (mb->view.strides[d] > 0)
+                                            b_buf += (mb->view.shape.dims[d]-1) * (u32)mb->view.strides[d];
+
+                                    f32 *a_ptr = malloc(a_buf * sizeof(f32));
+                                    f32 *b_ptr = malloc(b_buf * sizeof(f32));
+                                    ctx->backend->buf_read(ma->buf_id, a_ptr, a_buf * sizeof(f32));
+                                    ctx->backend->buf_read(mb->buf_id, b_ptr, b_buf * sizeof(f32));
                                     f32 *dst_ptr = calloc(dst_numel, sizeof(f32));
                                     for (u32 o = 0; o < dst_numel; o++) {
-                                        // Compute N-d coords from flat output
                                         u32 coords[MAX_DIM], rem = o;
                                         for (int d = (int)ov.shape.rank - 1; d >= 0; d--) {
                                             coords[d] = rem % ov.shape.dims[d];
                                             rem /= ov.shape.dims[d];
                                         }
-                                        // Base indices
                                         u32 ba = (u32)av_bc.offset, bb = (u32)bv_bc.offset;
                                         for (u32 d = 0; d < ov.shape.rank; d++) {
                                             ba += coords[d] * (u32)av_bc.strides[d];
                                             bb += coords[d] * (u32)bv_bc.strides[d];
                                         }
-                                        // Accumulate
                                         f32 acc = 0.0f;
-                                        for (u32 r = 0; r < reduce_dim; r++) {
-                                            acc += a_ptr[ba + r * rs_a] * b_ptr[bb + r * rs_b];
+                                        for (u32 r = 0; r < reduce_numel; r++) {
+                                            u32 off_a = 0, off_b = 0, rr = r;
+                                            for (u32 ri = 0; ri < n_reduce; ri++) {
+                                                u32 rc = rr % reduce_dims[ri];
+                                                rr /= reduce_dims[ri];
+                                                off_a += rc * reduce_strides_a[ri];
+                                                off_b += rc * reduce_strides_b[ri];
+                                            }
+                                            acc += a_ptr[ba + off_a] * b_ptr[bb + off_b];
                                         }
                                         dst_ptr[o] = acc;
                                     }
@@ -1087,6 +1124,16 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
     return term_top(uop, loc);
 }
 
+// Multi-axis SUM: reduces along specified axes in one pass.
+// Matches tinygrad's .sum(axis=[...]) — the axes tensor is stored as the
+// second heap slot, just like reshape stores shape.
+Term thvm_sum_axes(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes) {
+    f32 axes_f[MAX_DIM];
+    for (u32 i = 0; i < n_axes; i++) axes_f[i] = (f32)axes[i];
+    Term axes_t = thvm_tensor(ctx, axes_f, SHAPE(n_axes));
+    return thvm_op(ctx, UOP_SUM, x, axes_t);
+}
+
 // Movement ops: eager when input is TAG_TEN (zero GPU alloc, just view transform)
 // Falls back to lazy TOP with shape-tensor only for unreduced inputs.
 
@@ -1512,7 +1559,6 @@ Term thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
     u32 KW = mw->view.shape.dims[3];
     (void)cin_g;
     assert(groups * cin_g == cin);
-    assert(groups == 1);  // grouped conv via matmul needs separate handling
 
     // Step 1: pad input
     u32 pad_pairs[MAX_DIM * 2] = {0};
@@ -1529,35 +1575,36 @@ Term thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
     Term pooled = thvm_pool(ctx, padded, k, s, 2);
     // pooled: [BS, Cin, OY, OX, KH, KW]
 
+    // Get output spatial dims
     Term pr = thvm_reduce(ctx, pooled);
     TensorMeta *mp = &ctx->tensors[(u32)term_val(pr)];
     u32 oy = mp->view.shape.dims[2];
     u32 ox = mp->view.shape.dims[3];
 
-    // Step 3: im2col + matmul approach
-    // Reshape pooled: [BS, Cin, OY, OX, KH, KW]
-    //   → permute to [BS, OY, OX, Cin, KH, KW]
-    //   → reshape to [BS*OY*OX, Cin*KH*KW]   (im2col columns)
-    u32 perm_col[] = {0, 2, 3, 1, 4, 5};
-    Term x_perm = thvm_permute(ctx, pr, perm_col, 6);
-    Term x_col = thvm_reshape(ctx, x_perm,
-        shape_of((u32[]){bs * oy * ox, cin * KH * KW}, 2));
+    u32 rcout = cout / groups;
 
-    // Reshape weight: [Cout, Cin, KH, KW] → [Cout, Cin*KH*KW] → transpose
-    Term w_flat = thvm_reshape(ctx, wr,
-        shape_of((u32[]){cout, cin * KH * KW}, 2));
-    // permute to [Cin*KH*KW, Cout] for x_col @ w_T
-    u32 perm_w[] = {1, 0};
-    Term w_T = thvm_permute(ctx, w_flat, perm_w, 2);
+    // Step 3: reshape + expand + permute for broadcasting
+    // pooled: [BS, groups, cin_g, 1, OY, OX, KH, KW]
+    Term x_rs = thvm_reshape(ctx, pr,
+        shape_of((u32[]){bs, groups, cin_g, 1, oy, ox, KH, KW}, 8));
+    // expand to: [BS, groups, cin_g, rcout, OY, OX, KH, KW]
+    Term x_exp = thvm_expand(ctx, x_rs,
+        shape_of((u32[]){bs, groups, cin_g, rcout, oy, ox, KH, KW}, 8));
+    // permute to: [BS, groups, rcout, OY, OX, cin_g, KH, KW]
+    u32 conv_perm[] = {0, 1, 3, 4, 5, 2, 6, 7};
+    Term x_perm = thvm_permute(ctx, x_exp, conv_perm, 8);
 
-    // Matmul: [BS*OY*OX, Cin*KH*KW] @ [Cin*KH*KW, Cout] → [BS*OY*OX, Cout]
-    Term mm_out = thvm_op(ctx, UOP_MM, x_col, w_T);
+    // Step 4: reshape weight to [1, groups, rcout, 1, 1, cin_g, KH, KW]
+    Term w_rs = thvm_reshape(ctx, wr,
+        shape_of((u32[]){1, groups, rcout, 1, 1, cin_g, KH, KW}, 8));
 
-    // Reshape: [BS*OY*OX, Cout] → [BS, OY, OX, Cout] → permute [BS, Cout, OY, OX]
-    Term out_4d = thvm_reshape(ctx, mm_out,
-        shape_of((u32[]){bs, oy, ox, cout}, 4));
-    u32 perm_nchw[] = {0, 3, 1, 2};
-    Term out = thvm_permute(ctx, out_4d, perm_nchw, 4);
+    // prod: [BS, groups, rcout, OY, OX, cin_g, KH, KW]
+    Term prod = thvm_op(ctx, UOP_MUL, x_perm, w_rs);
+    // Fused multi-axis SUM(MUL) — reduce axes 5,6,7 (cin_g, KH, KW)
+    u32 reduce_axes[] = {5, 6, 7};
+    Term summed = thvm_sum_axes(ctx, prod, reduce_axes, 3);
+    // → [BS, groups, rcout, OY, OX, 1, 1, 1]
+    Term out = thvm_reshape(ctx, summed, shape_of((u32[]){bs, cout, oy, ox}, 4));
 
     // Add bias
     if (term_tag(bias) != TAG_ERA) {
@@ -1690,41 +1737,52 @@ static u32 tensor_reduce_sum_to(TinyHVM *ctx, u32 grad_id, Shape target) {
         if (same) return grad_id;
     }
 
-    u32 n_out = 1;
-    for (u32 i = 0; i < target.rank; i++) n_out *= target.dims[i];
-
-    u32 out_id = tensor_fill(ctx, target, 0.0f);
-    u32 n_grad = mg->view.numel;
-    u32 dsz = dtype_size(mg->dtype);
-
-    // Read grad values via strided access (handles expanded views)
-    f32 *g_data = (f32 *)thvm_to_host(ctx, term_ten(grad_id, mg->dtype));
-    // thvm_to_host may have modified the tensor's host_ptr, copy it
-    f32 *g_copy = malloc(n_grad * dsz);
-    memcpy(g_copy, g_data, n_grad * dsz);
-
-    f32 *o_data = calloc(n_out, dsz);
-
-    u32 off = mg->view.shape.rank - target.rank;
-    for (u32 i = 0; i < n_grad; i++) {
-        u32 out_idx = 0, rem = i, out_stride = 1;
-        for (i32 d = (i32)mg->view.shape.rank - 1; d >= 0; d--) {
-            u32 coord = rem % mg->view.shape.dims[d];
-            rem /= mg->view.shape.dims[d];
-            if ((u32)d >= off) {
-                u32 td = (u32)d - off;
-                u32 tc = (target.dims[td] == 1) ? 0 : coord;
-                out_idx += tc * out_stride;
-                out_stride *= target.dims[td];
+    // If same rank, use thvm_sum_axes on dims where grad.shape[d] != target.shape[d]
+    if (mg->view.shape.rank == target.rank) {
+        u32 reduce_axes[MAX_DIM];
+        u32 n_reduce = 0;
+        for (u32 d = 0; d < target.rank; d++) {
+            if (mg->view.shape.dims[d] != target.dims[d]) {
+                reduce_axes[n_reduce++] = d;
             }
         }
-        o_data[out_idx] += g_copy[i];
+        if (n_reduce > 0) {
+            Term g = term_ten(grad_id, mg->dtype);
+            Term summed = thvm_sum_axes(ctx, g, reduce_axes, n_reduce);
+            summed = thvm_reduce(ctx, summed);
+            // Reshape to target (sum_axes produces 1 on reduced dims)
+            Term result = thvm_reshape(ctx, summed, target);
+            result = thvm_reduce(ctx, result);
+            return (u32)term_val(result);
+        }
     }
 
-    if (ctx->backend) ctx->backend->buf_write(ctx->tensors[out_id].buf_id, o_data, n_out * dsz);
-    free(g_copy);
-    free(o_data);
-    return out_id;
+    // Different ranks: grad has more leading dims than target
+    // Sum over leading dims, then reduce broadcast dims
+    if (mg->view.shape.rank > target.rank) {
+        u32 n_leading = mg->view.shape.rank - target.rank;
+        u32 reduce_axes[MAX_DIM];
+        u32 n_reduce = 0;
+        // Sum over all leading dims
+        for (u32 d = 0; d < n_leading; d++)
+            reduce_axes[n_reduce++] = d;
+        // Also sum over trailing dims where shapes differ
+        for (u32 d = 0; d < target.rank; d++) {
+            if (mg->view.shape.dims[n_leading + d] != target.dims[d])
+                reduce_axes[n_reduce++] = n_leading + d;
+        }
+        Term g = term_ten(grad_id, mg->dtype);
+        Term summed = thvm_sum_axes(ctx, g, reduce_axes, n_reduce);
+        summed = thvm_reduce(ctx, summed);
+        Term result = thvm_reshape(ctx, summed, target);
+        result = thvm_reduce(ctx, result);
+        return (u32)term_val(result);
+    }
+
+    // Fallback: reshape directly (should not normally reach here)
+    Term result = thvm_reshape(ctx, term_ten(grad_id, mg->dtype), target);
+    result = thvm_reduce(ctx, result);
+    return (u32)term_val(result);
 }
 
 void thvm_set_requires_grad(TinyHVM *ctx, Term t) {
@@ -1754,6 +1812,7 @@ void thvm_stop_recording(TinyHVM *ctx) {
 // This means grad(grad(f)) works: reduce the first gradient with
 // recording on, then call thvm_grad again on the result.
 
+
 // Accumulate gradient: grad_map[id] += new_grad (lazy ADD)
 static void grad_graph_accum(TinyHVM *ctx, Term *grad_map, u32 id, Term new_grad) {
     if (!ctx->tensors[id].requires_grad) return;
@@ -1764,23 +1823,21 @@ static void grad_graph_accum(TinyHVM *ctx, Term *grad_map, u32 id, Term new_grad
     }
 }
 
-Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
-    // Reduce y so we have tensor IDs and a tape
-    y = thvm_reduce(ctx, y);
-    assert(term_tag(y) == TAG_TEN && term_tag(x) == TAG_TEN);
-    u32 y_id = (u32)term_val(y);
-    u32 x_id = (u32)term_val(x);
-
-    // Gradient map: tensor_id → gradient Term (ERA = no gradient yet)
+// Internal: build the full gradient map from loss → all tensors
+// Returns malloc'd array of Terms (caller must free)
+static Term *_build_grad_map(TinyHVM *ctx, u32 y_id) {
     u32 tc = ctx->tensor_count;
     Term *gm = malloc(tc * sizeof(Term));
     for (u32 i = 0; i < tc; i++) gm[i] = term_era();
 
-    // Seed: ∂y/∂y = 1 (ones with same shape as y)
     TensorMeta *my = &ctx->tensors[y_id];
     u32 ones_id = tensor_fill(ctx, my->view.shape, 1.0f);
     gm[y_id] = term_ten(ones_id, my->dtype);
+    return gm;
+}
 
+// Internal: run backward traversal, populating gradient map
+static void _run_backward(TinyHVM *ctx, Term *gm, u32 tc) {
     // Walk tensors backward (provenance stored in TensorMeta)
     for (i32 i = (i32)tc - 1; i >= 0; i--) {
         TensorMeta *e = &ctx->tensors[i];
@@ -1853,17 +1910,47 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
                 break;
             }
 
-            case UOP_MUL:
-                // ∂(a*b)/∂a = b, ∂(a*b)/∂b = a
-                if (ma->requires_grad)
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_MUL, grad,
-                                term_ten(b_id, mb->dtype)));
-                if (mb && mb->requires_grad)
-                    grad_graph_accum(ctx, gm, b_id,
-                        thvm_op(ctx, UOP_MUL, grad,
-                                term_ten(a_id, ma->dtype)));
+            case UOP_MUL: {
+                // ∂(a*b)/∂a = grad*b, ∂(a*b)/∂b = grad*a
+                // Keep lazy — reducer will fuse if followed by SUM
+                if (ma->requires_grad) {
+                    Term ga = thvm_op(ctx, UOP_MUL, grad,
+                                      term_ten(b_id, mb->dtype));
+                    // Reduce broadcast dims if needed
+                    if (ma->view.numel != e->view.numel) {
+                        u32 reduce_axes[MAX_DIM];
+                        u32 n_reduce = 0;
+                        for (u32 d = 0; d < e->view.shape.rank; d++) {
+                            if (e->view.shape.dims[d] != ma->view.shape.dims[d])
+                                reduce_axes[n_reduce++] = d;
+                        }
+                        if (n_reduce > 0) {
+                            ga = thvm_sum_axes(ctx, ga, reduce_axes, n_reduce);
+                            ga = thvm_reshape(ctx, ga, ma->view.shape);
+                        }
+                    }
+                    grad_graph_accum(ctx, gm, a_id, ga);
+                }
+                if (mb && mb->requires_grad) {
+                    Term gb = thvm_op(ctx, UOP_MUL, grad,
+                                      term_ten(a_id, ma->dtype));
+                    // Reduce broadcast dims if needed
+                    if (mb->view.numel != e->view.numel) {
+                        u32 reduce_axes[MAX_DIM];
+                        u32 n_reduce = 0;
+                        for (u32 d = 0; d < e->view.shape.rank; d++) {
+                            if (e->view.shape.dims[d] != mb->view.shape.dims[d])
+                                reduce_axes[n_reduce++] = d;
+                        }
+                        if (n_reduce > 0) {
+                            gb = thvm_sum_axes(ctx, gb, reduce_axes, n_reduce);
+                            gb = thvm_reshape(ctx, gb, mb->view.shape);
+                        }
+                    }
+                    grad_graph_accum(ctx, gm, b_id, gb);
+                }
                 break;
+            }
 
             case UOP_MM: {
                 if (!mb) break;
@@ -1964,11 +2051,108 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
                 break;
             }
 
+            case UOP_MAX: {
+                // ∂max(a,b)/∂a = (a >= b) * grad  →  (output == a) * grad
+                // ∂max(a,b)/∂b = (a < b) * grad   →  (output != a) * grad
+                if (!mb) break;
+                if (ma->requires_grad || mb->requires_grad) {
+                    // Use output==a to build mask (avoids reading broadcast b)
+                    u32 n = e->view.numel;
+                    f32 *out_data = (f32 *)thvm_to_host(ctx, term_ten((u32)i, e->dtype));
+                    f32 *a_data = (f32 *)thvm_to_host(ctx, term_ten(a_id, ma->dtype));
+                    f32 *mask = malloc(n * sizeof(f32));
+                    for (u32 j = 0; j < n; j++)
+                        mask[j] = (out_data[j] == a_data[j]) ? 1.0f : 0.0f;
+                    Term mask_t = thvm_tensor(ctx, mask, e->view.shape);
+
+                    if (ma->requires_grad) {
+                        Term ga = thvm_op(ctx, UOP_MUL, grad, mask_t);
+                        ga = thvm_reduce(ctx, ga);
+                        u32 ga_id = (u32)term_val(ga);
+                        if (ctx->tensors[ga_id].view.numel != ma->view.numel) {
+                            ga_id = tensor_reduce_sum_to(ctx, ga_id, ma->view.shape);
+                            ga = term_ten(ga_id, ma->dtype);
+                        }
+                        grad_graph_accum(ctx, gm, a_id, ga);
+                    }
+                    if (mb->requires_grad) {
+                        // Invert mask for b
+                        for (u32 j = 0; j < n; j++) mask[j] = 1.0f - mask[j];
+                        Term inv_mask_t = thvm_tensor(ctx, mask, e->view.shape);
+                        Term gb = thvm_op(ctx, UOP_MUL, grad, inv_mask_t);
+                        gb = thvm_reduce(ctx, gb);
+                        u32 gb_id = (u32)term_val(gb);
+                        if (ctx->tensors[gb_id].view.numel != mb->view.numel) {
+                            gb_id = tensor_reduce_sum_to(ctx, gb_id, mb->view.shape);
+                            gb = term_ten(gb_id, mb->dtype);
+                        }
+                        grad_graph_accum(ctx, gm, b_id, gb);
+                    }
+                    free(mask);
+                }
+                break;
+            }
+
             case UOP_SUM: {
-                // ∂sum(a)/∂a = broadcast grad to original shape
-                if (ma->requires_grad) {
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_expand(ctx, grad, ma->view.shape));
+                if (b_id) {
+                    // Fused SUM(MUL): ∂sum(a*b)/∂a = expand(grad)*b reduced to a.shape
+                    //                 ∂sum(a*b)/∂b = expand(grad)*a reduced to b.shape
+                    // Keep everything LAZY so MUL+SUM can be fused during reduce
+                    TensorMeta *mb = &ctx->tensors[b_id];
+                    // Expand grad to a's shape (broadcast shape of the MUL)
+                    Term grad_exp = thvm_expand(ctx, grad, ma->view.shape);
+                    if (ma->requires_grad) {
+                        // ga = expand(grad) * b — keep lazy, will be reduced later
+                        Term ga = thvm_op(ctx, UOP_MUL, grad_exp,
+                                          term_ten(b_id, mb->dtype));
+                        // Reduce broadcast dims lazily using thvm_sum_axes
+                        if (ma->view.numel != e->view.numel) {
+                            // Find which dims of the MUL output need summing to reach a.shape
+                            u32 reduce_axes[MAX_DIM];
+                            u32 n_reduce = 0;
+                            for (u32 d = 0; d < ma->view.shape.rank; d++) {
+                                if (ma->view.shape.dims[d] != mb->view.shape.dims[d] &&
+                                    mb->view.shape.dims[d] > 1) {
+                                    // This dim was broadcast from a, need to sum
+                                    // Actually: a.shape[d] might be 1 (the broadcast source)
+                                }
+                                // Sum dims where grad_exp.shape[d] > a.shape[d]
+                                // But grad_exp = expand(grad, a.shape) so it matches a.shape
+                                // The MUL(grad_exp, b) has shape = broadcast(a.shape, b.shape)
+                                // We need to reduce to a.shape
+                            }
+                            // MUL(grad_exp, b) shape = broadcast(a.shape, b.shape) = a.shape
+                            // since a.shape >= b.shape (a is the big expanded input)
+                            // So ga already has a.shape — no reduction needed for a
+                        }
+                        grad_graph_accum(ctx, gm, a_id, ga);
+                    }
+                    if (mb->requires_grad) {
+                        // gb = expand(grad) * a — keep lazy
+                        Term gb = thvm_op(ctx, UOP_MUL, grad_exp,
+                                          term_ten(a_id, ma->dtype));
+                        // gb has shape = a.shape, need to reduce to b.shape
+                        // Find dims where a.shape[d] != b.shape[d]
+                        u32 reduce_axes[MAX_DIM];
+                        u32 n_reduce = 0;
+                        for (u32 d = 0; d < ma->view.shape.rank; d++) {
+                            if (ma->view.shape.dims[d] != mb->view.shape.dims[d]) {
+                                reduce_axes[n_reduce++] = d;
+                            }
+                        }
+                        if (n_reduce > 0) {
+                            // SUM(MUL(grad_exp, a)) over broadcast dims — will be FUSED
+                            gb = thvm_sum_axes(ctx, gb, reduce_axes, n_reduce);
+                            gb = thvm_reshape(ctx, gb, mb->view.shape);
+                        }
+                        grad_graph_accum(ctx, gm, b_id, gb);
+                    }
+                } else {
+                    // Plain SUM: ∂sum(a)/∂a = broadcast grad to original shape
+                    if (ma->requires_grad) {
+                        grad_graph_accum(ctx, gm, a_id,
+                            thvm_expand(ctx, grad, ma->view.shape));
+                    }
                 }
                 break;
             }
@@ -2150,13 +2334,41 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
                 break;
         }
     }
-
-    Term result = gm[x_id];
-    free(gm);
-    return result;  // lazy — reduce to get the value
 }
 
-// thvm_backward removed — use thvm_grad(ctx, loss, param) per parameter instead.
+Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
+    y = thvm_reduce(ctx, y);
+    assert(term_tag(y) == TAG_TEN && term_tag(x) == TAG_TEN);
+    u32 y_id = (u32)term_val(y);
+    u32 x_id = (u32)term_val(x);
+    u32 tc = ctx->tensor_count;
+    Term *gm = _build_grad_map(ctx, y_id);
+    _run_backward(ctx, gm, tc);
+    Term result = gm[x_id];
+    free(gm);
+    return result;
+}
+
+// Single-pass backward: compute ALL param gradients in one traversal
+// This avoids N separate thvm_grad calls which would each re-traverse the full graph
+void thvm_backward(TinyHVM *ctx, Term loss, Term *params, Term *grads, u32 n_params) {
+    loss = thvm_reduce(ctx, loss);
+    assert(term_tag(loss) == TAG_TEN);
+    u32 y_id = (u32)term_val(loss);
+    u32 tc = ctx->tensor_count;
+    Term *gm = _build_grad_map(ctx, y_id);
+    _run_backward(ctx, gm, tc);
+    // Extract gradients for all requested params
+    for (u32 p = 0; p < n_params; p++) {
+        if (term_tag(params[p]) == TAG_TEN) {
+            u32 pid = (u32)term_val(params[p]);
+            grads[p] = (pid < tc) ? gm[pid] : term_era();
+        } else {
+            grads[p] = term_era();
+        }
+    }
+    free(gm);
+}
 // Each gradient is a lazy IC term that reduces through the standard engine.
 
 

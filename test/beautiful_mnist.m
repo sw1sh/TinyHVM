@@ -197,14 +197,18 @@ int main(void) {
 
         // Loss — cross-entropy (pure UOp composition, fully differentiable)
         Term loss = cross_entropy_loss(ctx, logits, by, BS, 10);
-        thvm_stop_recording(ctx);
 
         // Flush GPU work before CPU reads loss value
         if (ctx->backend->end_batch) ctx->backend->end_batch();
 
         // Read loss value for printing
-        f32 *loss_host = thvm_to_host(ctx, thvm_reduce(ctx, loss));
+        Term loss_reduced = thvm_reduce(ctx, loss);
+        f32 *loss_host = thvm_to_host(ctx, loss_reduced);
         f32 loss_val = loss_host[0];
+
+        // Stop recording AFTER loss is reduced — all forward ops now have creator_op
+        // Backward runs with recording OFF so gradient ops can use SUM(MUL) fusion
+        thvm_stop_recording(ctx);
 
         // === BACKWARD PHASE ===
         thvm_prof_phase(PHASE_BACKWARD);
@@ -212,14 +216,15 @@ int main(void) {
         // Re-batch for gradient computation + adam
         if (ctx->backend->begin_batch) ctx->backend->begin_batch();
 
-        // Backward — IC autograd: compute each param gradient via thvm_grad
-        // Each gradient is a lazy IC term, reduced through standard engine
-        Term loss_reduced = thvm_reduce(ctx, loss);
+        // Single-pass backward: compute ALL param gradients in one traversal
+        Term grad_terms[n_params];
+        thvm_backward(ctx, loss_reduced, params, grad_terms, n_params);
         u32 grad_ids[n_params];
         for (u32 i = 0; i < n_params; i++) {
-            Term g = thvm_reduce(ctx, thvm_grad(ctx, loss_reduced, params[i]));
+            Term g = thvm_reduce(ctx, grad_terms[i]);
             grad_ids[i] = (term_tag(g) == TAG_TEN) ? (u32)term_val(g) : 0;
         }
+
 
         // === ADAM PHASE ===
         thvm_prof_phase(PHASE_ADAM);

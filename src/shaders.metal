@@ -476,17 +476,15 @@ kernel void zero_fill(device float *dst [[buffer(0)]],
 
 // ============================================================
 // Fused MUL + SUM — avoids materializing the full MUL intermediate.
-// Thread per output element. For each output element, iterates over
-// reduce_dim, multiplying a[strided] * b[strided] and accumulating.
-//
-// The reduce axis is the last non-1 dim of the broadcast shape.
-// dst_numel = broadcast_numel / reduce_dim.
+// Thread per output element. Supports multi-axis reduction.
 // ============================================================
 
 struct MulReduceParams {
-    uint reduce_dim;      // size of the dim being reduced
-    uint reduce_stride_a; // stride of reduce axis in a
-    uint reduce_stride_b; // stride of reduce axis in b
+    uint n_reduce;           // number of reduce axes
+    uint reduce_numel;       // product of all reduce dims
+    uint reduce_dims[8];     // size of each reduce axis
+    uint reduce_strides_a[8]; // stride in a for each reduce axis
+    uint reduce_strides_b[8]; // stride in b for each reduce axis
 };
 
 kernel void mul_reduce_sum(device float *dst [[buffer(0)]],
@@ -515,11 +513,17 @@ kernel void mul_reduce_sum(device float *dst [[buffer(0)]],
         base_b += coords[d] * uint(bv.strides[d]);
     }
 
-    // Accumulate over reduce axis
+    // Accumulate over all reduce axes
     float acc = 0.0f;
-    for (uint r = 0; r < rp.reduce_dim; r++) {
-        acc += a[base_a + r * rp.reduce_stride_a] *
-               b[base_b + r * rp.reduce_stride_b];
+    for (uint r = 0; r < rp.reduce_numel; r++) {
+        uint off_a = 0, off_b = 0, rr = r;
+        for (uint ri = 0; ri < rp.n_reduce; ri++) {
+            uint rc = rr % rp.reduce_dims[ri];
+            rr /= rp.reduce_dims[ri];
+            off_a += rc * rp.reduce_strides_a[ri];
+            off_b += rc * rp.reduce_strides_b[ri];
+        }
+        acc += a[base_a + off_a] * b[base_b + off_b];
     }
     dst[i] = acc;
 }

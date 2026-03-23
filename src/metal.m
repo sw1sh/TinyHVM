@@ -208,17 +208,52 @@ static void metal_shutdown(void) {
     memset(&metal_pool, 0, sizeof(metal_pool));
 }
 
+// Buffer pool free-list: reuse freed buffers instead of allocating new ones
+#define MAX_FREE_BUFS 512
+static struct {
+    id<MTLBuffer> buf;
+    u64           size;
+} free_list[MAX_FREE_BUFS];
+static u32 free_count = 0;
+
 static u32 metal_buf_alloc(u64 bytes) {
+    bytes = MAX(bytes, 4);
     u32 id = metal_pool.count++;
     assert(id < MAX_BUFS);
-    metal_pool.bufs[id] = [mtl_dev newBufferWithLength:MAX(bytes, 4)
-                                               options:MTLResourceStorageModeShared];
-    metal_pool.sizes[id] = bytes;
+
+    // Try to reuse a freed buffer of matching size (exact or up to 2x)
+    u32 best_idx = UINT32_MAX;
+    u64 best_size = UINT64_MAX;
+    for (u32 i = 0; i < free_count; i++) {
+        u64 sz = free_list[i].size;
+        if (sz >= bytes && sz <= bytes * 2 && sz < best_size) {
+            best_idx = i;
+            best_size = sz;
+        }
+    }
+    if (best_idx != UINT32_MAX) {
+        // Reuse from free-list
+        metal_pool.bufs[id] = free_list[best_idx].buf;
+        metal_pool.sizes[id] = free_list[best_idx].size;
+        // Remove from free-list (swap with last)
+        free_list[best_idx] = free_list[--free_count];
+    } else {
+        // Allocate new Metal buffer
+        metal_pool.bufs[id] = [mtl_dev newBufferWithLength:bytes
+                                                   options:MTLResourceStorageModeShared];
+        metal_pool.sizes[id] = bytes;
+    }
     thvm_prof_buf_alloc(bytes);
     return id;
 }
 
 static void metal_buf_free(u32 id) {
+    if (metal_pool.bufs[id] && free_count < MAX_FREE_BUFS) {
+        // Return to free-list for reuse
+        free_list[free_count].buf = metal_pool.bufs[id];
+        free_list[free_count].size = metal_pool.sizes[id];
+        free_count++;
+    }
     metal_pool.bufs[id] = nil;
     metal_pool.sizes[id] = 0;
 }
@@ -447,23 +482,34 @@ static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
 // ============================================================
 
 typedef struct {
-    uint32_t reduce_dim;
-    uint32_t reduce_stride_a;
-    uint32_t reduce_stride_b;
+    uint32_t n_reduce;
+    uint32_t reduce_numel;
+    uint32_t reduce_dims[8];
+    uint32_t reduce_strides_a[8];
+    uint32_t reduce_strides_b[8];
 } MulReduceParams;
 
 void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
                           u32 a_buf, const View *av,
                           u32 b_buf, const View *bv,
                           const View *ov,
-                          u32 reduce_dim,
-                          u32 reduce_stride_a,
-                          u32 reduce_stride_b) {
+                          u32 n_reduce,
+                          const u32 *reduce_dims,
+                          const u32 *reduce_strides_a,
+                          const u32 *reduce_strides_b) {
     u64 t0 = thvm_prof_tick();
     ViewParams avp = view_to_params(av);
     ViewParams bvp = view_to_params(bv);
     ViewParams ovp = view_to_params(ov);
-    MulReduceParams rp = {reduce_dim, reduce_stride_a, reduce_stride_b};
+    MulReduceParams rp = {0};
+    rp.n_reduce = n_reduce;
+    rp.reduce_numel = 1;
+    for (u32 i = 0; i < n_reduce; i++) {
+        rp.reduce_dims[i] = reduce_dims[i];
+        rp.reduce_strides_a[i] = reduce_strides_a[i];
+        rp.reduce_strides_b[i] = reduce_strides_b[i];
+        rp.reduce_numel *= reduce_dims[i];
+    }
 
     id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a_buf], metal_pool.bufs[b_buf] };
     const void *params[] = { &avp, &bvp, &ovp, &rp };
@@ -477,6 +523,12 @@ static void metal_pool_reset(u32 keep) {
     u32 buf_keep = keep + 1;
     for (u32 i = buf_keep; i < metal_pool.count; i++) {
         thvm_prof_buf_free(metal_pool.sizes[i]);
+        // Move to free-list for reuse instead of releasing
+        if (metal_pool.bufs[i] && free_count < MAX_FREE_BUFS) {
+            free_list[free_count].buf = metal_pool.bufs[i];
+            free_list[free_count].size = metal_pool.sizes[i];
+            free_count++;
+        }
         metal_pool.bufs[i] = nil;
         metal_pool.sizes[i] = 0;
     }

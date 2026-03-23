@@ -718,11 +718,9 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                                                        ms, mb_p->view.shape);
                                 MEMO_RETURN((REACHES(aid,x_id) ? (REACHES(bid,x_id) ? GRAD_ADD(GRAD3(at,da,x),GRAD3(bt,db,x)) : GRAD3(at,da,x)) : (REACHES(bid,x_id) ? GRAD3(bt,db,x) : term_era())));
                             } else {
-                                u32 os[MAX_DIM];
-                                for (u32 d = 0; d < ma->view.shape.rank; d++) os[d] = 1;
-                                Term g = thvm_expand(ctx,
-                                    thvm_reshape(ctx, gy, shape_of(os, ma->view.shape.rank)),
-                                    ma->view.shape);
+                                // gy has keepdims shape (reduced dims = 1); expand to input shape.
+                                Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
+                                Term g = thvm_expand(ctx, gy_r, ma->view.shape);
                                 MEMO_RETURN(GRAD3(at, g, x));
                             }
                         }
@@ -1245,18 +1243,37 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                     u8 is_ra[MAX_DIM] = {0};
                     for (u32 i = 0; i < n_explicit; i++) is_ra[explicit_axes[i]] = 1;
 
-                    // Read input data
+                    // Read input data — use strided indexing (handles expand/broadcast views)
+                    u32 buf_numel = ma->view.numel;
+                    f32 *raw = NULL;
+                    {
+                        // Read the backing buffer (may be smaller if stride=0 broadcast)
+                        u64 buf_sz = ctx->backend == &metal_backend
+                            ? (u64)buf_numel * sizeof(f32) : 0;
+                        // Use enough bytes to cover the backing buffer
+                        u32 max_buf_idx = (u32)ma->view.offset;
+                        for (u32 d = 0; d < ma->view.shape.rank; d++)
+                            if (ma->view.strides[d] > 0)
+                                max_buf_idx += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
+                        raw = malloc((max_buf_idx+1) * sizeof(f32));
+                        if (ctx->backend->end_batch) ctx->backend->end_batch();
+                        ctx->backend->buf_read(ma->buf_id, raw, (u64)(max_buf_idx+1)*sizeof(f32));
+                        if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+                        (void)buf_sz;
+                    }
                     f32 *in_data = malloc(in_numel * sizeof(f32));
-                    if (ctx->backend->end_batch) ctx->backend->end_batch();
-                    ctx->backend->buf_read(ma->buf_id, in_data, in_numel * sizeof(f32));
-                    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+                    for (u32 flat = 0; flat < in_numel; flat++) {
+                        // Compute strided physical index using view strides
+                        u32 coords[MAX_DIM], rem = flat, phys = (u32)ma->view.offset;
+                        for (int d = (int)rank - 1; d >= 0; d--) {
+                            coords[d] = rem % ma->view.shape.dims[d];
+                            rem /= ma->view.shape.dims[d];
+                            phys += coords[d] * (u32)(ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
+                        }
+                        in_data[flat] = raw[phys];
+                    }
+                    free(raw);
                     f32 *out_data = calloc(out_numel, sizeof(f32));
-
-                    // Build input strides (row-major)
-                    u32 in_strides[MAX_DIM];
-                    in_strides[rank-1] = 1;
-                    for (int d = (int)rank - 2; d >= 0; d--)
-                        in_strides[d] = in_strides[d+1] * ma->view.shape.dims[d+1];
 
                     // Build output strides (row-major, with 1s on reduce axes)
                     u32 out_strides[MAX_DIM];
@@ -1266,13 +1283,11 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
 
                     // Iterate over all input elements, accumulate to output
                     for (u32 flat = 0; flat < in_numel; flat++) {
-                        // Compute input coords from flat index
                         u32 coords[MAX_DIM], rem = flat;
                         for (int d = (int)rank - 1; d >= 0; d--) {
                             coords[d] = rem % ma->view.shape.dims[d];
                             rem /= ma->view.shape.dims[d];
                         }
-                        // Compute output flat index (reduce axes → coord 0)
                         u32 out_flat = 0;
                         for (u32 d = 0; d < rank; d++) {
                             u32 c = is_ra[d] ? 0 : coords[d];
@@ -1280,7 +1295,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                         }
                         if (uop == UOP_SUM) {
                             out_data[out_flat] += in_data[flat];
-                        } else { // UOP_RMAX
+                        } else {
                             if (in_data[flat] > out_data[out_flat])
                                 out_data[out_flat] = in_data[flat];
                         }
@@ -1289,6 +1304,33 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                     free(in_data); free(out_data);
                 } else {
                     // Single-axis reduce: last non-1 dim
+                    // Materialize non-contiguous input first (e.g. expand strides=0)
+                    u32 src_numel = ma->view.numel;
+                    f32 *mat_src = NULL;
+                    u32 use_buf = ma->buf_id;
+                    if (!ma->view.contiguous) {
+                        u32 max_buf_idx = (u32)ma->view.offset;
+                        for (u32 d = 0; d < ma->view.shape.rank; d++)
+                            if (ma->view.strides[d] > 0)
+                                max_buf_idx += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
+                        f32 *raw = malloc((max_buf_idx+1) * sizeof(f32));
+                        if (ctx->backend->end_batch) ctx->backend->end_batch();
+                        ctx->backend->buf_read(ma->buf_id, raw, (u64)(max_buf_idx+1)*sizeof(f32));
+                        if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+                        mat_src = malloc(src_numel * sizeof(f32));
+                        for (u32 flat = 0; flat < src_numel; flat++) {
+                            u32 rem = flat, phys = (u32)ma->view.offset;
+                            for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
+                                u32 c = rem % ma->view.shape.dims[d]; rem /= ma->view.shape.dims[d];
+                                phys += c * (u32)(ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
+                            }
+                            mat_src[flat] = raw[phys];
+                        }
+                        free(raw);
+                        use_buf = ctx->backend->buf_alloc(src_numel * sizeof(f32));
+                        ctx->backend->buf_write(use_buf, mat_src, src_numel * sizeof(f32));
+                        free(mat_src);
+                    }
                     u32 reduce_dim = 1;
                     int ra = -1;
                     for (int i = (int)ma->view.shape.rank - 1; i >= 0; i--) {
@@ -1302,7 +1344,8 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                             reduce_dim *= ma->view.shape.dims[i];
                     }
                     ctx->backend->op_reduce(uop, md->buf_id, md->view.numel,
-                                            ma->buf_id, ma->view.numel, reduce_dim);
+                                            use_buf, src_numel, reduce_dim);
+                    if (use_buf != ma->buf_id) ctx->backend->buf_free(use_buf);
                 }
             } else if (is_binary) {
                 ctx->backend->op_binary(uop, md->buf_id, &md->view,

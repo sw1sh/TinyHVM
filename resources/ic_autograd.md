@@ -4,86 +4,88 @@ How interaction nets compute gradients, and why TinyHVM uses this instead of a t
 
 ## Where This Comes From
 
-The connection between duplication and differentiation isn't something we invented. It comes from **Differential Linear Logic** by Thomas Ehrhard and Laurent Regnier (2003). The short version: in linear logic, you can't copy things for free — every copy is an explicit DUP. Ehrhard showed that this DUP operation corresponds exactly to taking a derivative. The math checks out and it's been studied for 20+ years.
-
-What nobody's done is build a tensor runtime around it. That's what TinyHVM is.
+The connection between duplication and differentiation comes from **Differential Linear Logic**
+by Ehrhard and Regnier (2003). In linear logic every copy is an explicit DUP, and that DUP
+operation corresponds exactly to taking a derivative. TinyHVM builds a tensor runtime around this.
 
 **Papers:**
 - Ehrhard & Regnier, "The differential lambda-calculus" (2003)
 - Ehrhard & Regnier, "Differential interaction nets" (2006)
-- Lafont, "Interaction combinators" (1997) — the foundation HVM builds on
+- Lafont, "Interaction combinators" (1997) — foundation HVM builds on
 
 ---
 
 ## The Core Idea
 
-A function's derivative tells you: if I wiggle the input, how does the output wiggle? In interaction nets, the way you "use an input twice" is by duplicating it with a DUP node. The DUP has to pass through every operation the input touches. As it passes through each op, the DUP-op interaction rule naturally computes the chain rule.
+Backward pass = DUP node propagating through the forward graph.
 
-So: backward pass = DUP propagating through the forward graph.
+Each TOP node in the graph stores **provenance** — which UOp produced it and which source tensor
+IDs fed into it (`creator_op`, `src_ids[0]`, `src_ids[1]`). `thvm_grad(ctx, y, x)` creates a
+lazy `UOP_GRAD` term. When reduced, the GRAD handler reads `y`'s provenance and applies the
+corresponding gradient rule, recursing until it hits `x` (base case: return `gy`).
 
----
-
-## Quick Recap: What Are TOP Nodes?
-
-`TOP` = **T**ensor **OP**eration. These are lazy computation nodes. When you write:
-
-```c
-Term z = thvm_op(ctx, UOP_MM, x, w);
-```
-
-Nothing executes yet. You get a `TAG_TOP` node sitting in the heap saying "I'm a matmul waiting to happen." The arguments `x` and `w` are stored in `HEAP[loc]` and `HEAP[loc+1]`.
-
-Reduction evaluates these lazily — when the reducer hits a TOP whose inputs are realized tensors (TAG_TEN), it dispatches to the GPU backend.
+No tape, no backward loop — gradients are just more lazy TOP nodes that reduce through the same
+forward engine.
 
 ---
 
-## How DUP Produces Gradients
+## Gradient Rules (DUP-Op Interactions)
 
-Say we have `z = mm(A, B)` and we want `∂z/∂A` and `∂z/∂B`. We inject a DUP node after `z`:
+| Op | Forward | Grad w.r.t. a | Grad w.r.t. b |
+|---|---|---|---|
+| ADD | `z = a + b` | `gy` | `gy` |
+| SUB | `z = a - b` | `gy` | `-gy` |
+| MUL | `z = a * b` | `gy * b` | `gy * a` |
+| DIV | `z = a / b` | `gy / b` | `-gy * a / b²` |
+| MM  | `z = mm(A,B)` | `mm(gy, Bᵀ)` | `mm(Aᵀ, gy)` |
+| RELU | `z = relu(a)` | `gy * (a > 0)` | — |
+| EXP | `z = exp(a)` | `gy * z` | — |
+| LOG | `z = log(a)` | `gy / a` | — |
+| SUM | `z = sum(a)` | `expand(gy, a.shape)` | — |
+| EXPAND | `z = expand(a, shape)` | `sum_to_shape(gy, z.shape, a.shape)` | — |
 
-```
-A ──→ [MM] ──→ z ──→ [DUP] ──→ z_fwd  (use the value)
-B ──↗                    └──→ z_grad (get the gradient)
-```
+**SUM backward invariant**: `gy` always has the **keepdims shape** — reduced axes are set to
+1 rather than removed. So `expand(gy, input.shape)` is a direct broadcast, no reshape needed.
+The old code incorrectly reshaped `gy` to all-ones before expanding, which failed when `gy`
+was already a non-scalar keepdims shape from an outer SUM.
 
-The DUP propagates backward into the MM node. The DUP-MM interaction rule says:
+---
 
-```
-∂z/∂A = MM(grad, Bᵀ)
-∂z/∂B = MM(Aᵀ, grad)
-```
+## Gradient Seed Shape
 
-These are just two more MM operations — new TOP nodes that get reduced by the same forward machinery. There's no special "backward kernel." Backward is just more forward.
+`thvm_grad(ctx, y, x)` seeds with `ones` shaped to match `y`. Previously the seed was always
+a scalar `[1]` regardless of `y`'s shape. This caused `test_grad_mm` to abort: the MM backward
+computes `mm(gy, Bᵀ)` which requires `gy` to be rank-2.
 
-### All the Rules
+**Current behavior**: seed = `tensor_fill(ctx, y.shape, 1.0f)`.
 
-**DUP-ADD**: `z = a + b`
-- `∂z/∂a = grad` (just copy)
-- `∂z/∂b = grad` (just copy)
+---
 
-DUP through add = copy the gradient to both branches. Trivial.
+## Fusion and Autograd Interaction
 
-**DUP-MUL**: `z = a * b`
-- `∂z/∂a = grad * b`
-- `∂z/∂b = grad * a`
+The fused `SUM(MUL(a, b))` kernel is a performance optimization that skips materializing the
+intermediate MUL result. **This fusion is only safe when no MUL input requires a gradient.**
 
-DUP through mul = multiply grad by the other input. Needs saved forward values.
+Gate: `if (!ma->requires_grad && !mb->requires_grad) { /* fuse */ }`
 
-**DUP-MM**: `z = mm(A[M,K], B[K,N])`
-- `∂z/∂A = mm(grad[M,N], Bᵀ[N,K])` → `[M,K]` ✓
-- `∂z/∂B = mm(Aᵀ[K,M], grad[M,N])` → `[K,N]` ✓
+When either MUL input requires grad, the MUL node must materialize separately. The GRAD handler
+for SUM needs to recurse through MUL to apply the chain rule; if MUL was fused away, the SUM's
+`src_ids[0]` would point to the MUL's input (e.g. `diff`) instead of its output (`sq = diff²`),
+causing the MUL backward to be skipped and losing the `2*diff` factor.
 
-DUP through matmul = two matmuls with transposes. Shapes work out.
+The `recording` flag is NOT the correct gate. Two tensors can both be on a gradient path
+(`requires_grad = 1`) even when `recording = 0` (e.g., during backward itself). `requires_grad`
+is the always-correct signal.
 
-**DUP-RELU**: `z = relu(a)`
-- `∂z/∂a = grad * (a > 0 ? 1 : 0)`
+---
 
-DUP through relu = mask the gradient where input was negative.
+## Strided Reduce Correctness
 
-**DUP-SUM**: `z = sum(a)`
-- `∂z/∂a = broadcast(grad, shape_of_a)`
-
-DUP through sum = broadcast the scalar gradient back to the original shape.
+`thvm_sum_axes` passes through the SUM reducer which reads the source buffer. If the source is
+a non-contiguous **expand view** (stride=0 in broadcast dims), a flat `buf_read` reads the
+wrong data — the backing buffer may be 1 element while the view claims N. Fix: both the
+multi-axis and single-axis reduce paths now materialize non-contiguous inputs using view strides
+before accumulating.
 
 ---
 
@@ -93,28 +95,8 @@ DUP through sum = broadcast the scalar gradient back to the original shape.
 |---|---|---|
 | Data structure | Separate ops list | Same graph |
 | Forward/backward | Two phases | One reduction |
-| Shared subexpressions | Recomputed or manually cached | DUP-SUP annihilation handles it |
-| Higher-order gradients | Tape of tapes (tricky) | Just DUP the DUP |
-| Parallelism | Backward is sequential | Independent gradients reduce in parallel |
-
-The IC approach doesn't need a separate backward pass. The gradients fall out of the same graph reduction. And if two losses share computation, DUP-SUP annihilation avoids recomputing shared parts — you get optimal sharing for free.
-
----
-
-## What We'll Build in Phase 2
-
-Practically, the reducer gets new cases:
-
-```c
-// In thvm_reduce, when DUP meets a realized TOP:
-// 1. Look up what forward op produced this tensor
-// 2. Apply the corresponding gradient rule
-// 3. Return new TOP nodes (lazy backward ops)
-```
-
-Each tensor that needs gradients stores its "provenance" — which op and which inputs created it. When DUP reaches it, the provenance tells us which gradient rule to fire.
-
-The backward ops (`mm(grad, Bᵀ)` etc.) are just normal TOP nodes. They reduce via the same GPU dispatch. Simple.
+| Higher-order gradients | Tape of tapes (tricky) | Just GRAD the GRAD node |
+| Implementation size | Separate backward engine | ~200 lines of GRAD handler |
 
 ---
 

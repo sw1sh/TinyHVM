@@ -594,7 +594,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                             u32 _cop = _m->creator_op; \
                             int _bin = (_cop==UOP_ADD||_cop==UOP_SUB||_cop==UOP_MUL|| \
                                         _cop==UOP_DIV||_cop==UOP_MAX||_cop==UOP_MM|| \
-                                        _cop==UOP_CMP||_cop==UOP_SUM); \
+                                        _cop==UOP_CMP||_cop==UOP_SUM||_cop==UOP_FUSING); \
                             if (_sp<254) { _stk[_sp++]=_m->src_ids[0]; \
                             if (_bin && _sp<254) _stk[_sp++]=_m->src_ids[1]; } \
                         } \
@@ -700,30 +700,40 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                                                    my->view.shape, mb_p->view.shape);
                             MEMO_RETURN((REACHES(aid,x_id) ? (REACHES(bid,x_id) ? GRAD_ADD(GRAD3(at,da,x),GRAD3(bt,db,x)) : GRAD3(at,da,x)) : (REACHES(bid,x_id) ? GRAD3(bt,db,x) : term_era())));
                         }
-                        case UOP_SUM: {
-                            // Distinguish fused SUM·MUL (b = MUL operand, rank>1) from plain SUM
-                            int is_fused = mb_p && mb_p->view.shape.rank > 1;
-                            if (is_fused) {
-                                Shape ms = ma->view.shape;
-                                for (u32 d = 0; d < ms.rank; d++)
-                                    if (mb_p->view.shape.dims[d] > ms.dims[d])
-                                        ms.dims[d] = mb_p->view.shape.dims[d];
-                                u32 os[MAX_DIM];
-                                for (u32 d = 0; d < ms.rank; d++) os[d] = 1;
-                                Term gbc = thvm_expand(ctx,
-                                    thvm_reshape(ctx, gy, shape_of(os, ms.rank)), ms);
-                                Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gbc, bt),
-                                                       ms, ma->view.shape);
-                                Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gbc, at),
-                                                       ms, mb_p->view.shape);
-                                MEMO_RETURN((REACHES(aid,x_id) ? (REACHES(bid,x_id) ? GRAD_ADD(GRAD3(at,da,x),GRAD3(bt,db,x)) : GRAD3(at,da,x)) : (REACHES(bid,x_id) ? GRAD3(bt,db,x) : term_era())));
-                            } else {
-                                // gy has keepdims shape (reduced dims = 1); expand to input shape.
-                                Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
-                                Term g = thvm_expand(ctx, gy_r, ma->view.shape);
-                                MEMO_RETURN(GRAD3(at, g, x));
-                            }
+                        case UOP_FUSING: {
+                            // src_ids[0/1] = tensor ids of the two MUL inputs (a, b)
+                            u32 fa_id = ctx->tensors[y_id].src_ids[0];
+                            u32 fb_id = ctx->tensors[y_id].src_ids[1];
+                            Term fa = term_ten(fa_id, ctx->tensors[fa_id].dtype);
+                            Term fb = term_ten(fb_id, ctx->tensors[fb_id].dtype);
+                            TensorMeta *ma2 = &ctx->tensors[fa_id];
+                            TensorMeta *mb2 = &ctx->tensors[fb_id];
+                            // Broadcast shape of MUL inputs
+                            Shape ms = ma2->view.shape;
+                            for (u32 d = 0; d < ms.rank; d++)
+                                if (mb2->view.shape.dims[d] > ms.dims[d])
+                                    ms.dims[d] = mb2->view.shape.dims[d];
+                            // gy has the fused SUM output's keepdims shape.
+                            // Expand directly to ms — no reshape needed.
+                            Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
+                            Term gbc  = thvm_expand(ctx, gy_r, ms);
+                            Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gbc, fb),
+                                                   ms, ma2->view.shape);
+                            Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gbc, fa),
+                                                   ms, mb2->view.shape);
+                            MEMO_RETURN((REACHES(fa_id,x_id)
+                                ? (REACHES(fb_id,x_id)
+                                    ? GRAD_ADD(GRAD3(fa,da,x), GRAD3(fb,db,x))
+                                    : GRAD3(fa,da,x))
+                                : (REACHES(fb_id,x_id) ? GRAD3(fb,db,x) : term_era())));
                         }
+                        case UOP_SUM: {
+                            // Plain SUM (no fused MUL). gy has keepdims shape; expand to input shape.
+                            Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
+                            Term g = thvm_expand(ctx, gy_r, ma->view.shape);
+                            MEMO_RETURN(GRAD3(at, g, x));
+                        }
+
                         case UOP_RMAX: {
                             Term max_bc = thvm_expand(ctx,
                                 thvm_reshape(ctx, y, my->view.shape), ma->view.shape);
@@ -844,13 +854,9 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                         u32 mb_id = (u32)term_val(mb_t);
                         TensorMeta *ma = &ctx->tensors[ma_id];
                         TensorMeta *mb = &ctx->tensors[mb_id];
-                        // Fuse only when no input is on a gradient path.
-                        // When either input requires_grad, skip fusion: the is_fused GRAD
-                        // handler expects gy to have a scalar/seed shape, but nested SUMs pass
-                        // arbitrary keepdims shapes (e.g. [16,1]) causing reshape failures.
-                        // TODO: add UOP_FUSED_SUM_MUL that records its reduce axes so the
-                        //       GRAD handler can expand gy correctly regardless of gy's shape.
-                        if (!ma->requires_grad && !mb->requires_grad) {
+                        // Always fuse — GRAD will walk back through the original subnet.
+                        // The fused output gets creator_op=UOP_FUSING and the SUM's
+                        // heap loc in src_ids so the GRAD handler can re-read a and b.
                         View av_bc, bv_bc;
                         u32 out_shape[MAX_DIM];
                         u32 out_ndim;
@@ -906,7 +912,15 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                                 u32 dst_id = tensor_create(ctx, dst_s, ma->dtype);
                                 TensorMeta *md = &ctx->tensors[dst_id];
 
-                                // No provenance needed — inputs have no requires_grad
+                                // Record FUSING provenance: store the SUM heap loc so the
+                                // GRAD handler can walk back through the unfused subnet.
+                                // loc split across two u32 src_ids (heap fits in 38-bit VAL).
+                                if (ctx->recording) {
+                                    md->requires_grad = ma->requires_grad || mb->requires_grad;
+                                    md->creator_op = UOP_FUSING;
+                                    md->src_ids[0] = ma_id;  // MUL input a
+                                    md->src_ids[1] = mb_id;  // MUL input b
+                                }
 
                                 // Dispatch: Metal or CPU fallback
                                 if (ctx->backend == &metal_backend) {
@@ -962,7 +976,6 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                                 MEMO_RETURN(term_ten(dst_id, ma->dtype));
                             }
                         } // if (ok)
-                        } // !requires_grad
                     }
                 }
             }

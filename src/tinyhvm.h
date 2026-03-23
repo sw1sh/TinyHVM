@@ -114,7 +114,11 @@ typedef u64 Term;
 #define UOP_SHRINK    21  // = slice
 #define UOP_PAD       22
 
-#define UOP_COUNT     23
+// Fusion: wraps any fused subgraph. Realized tensor carries the original subnet
+// heap root in src_ids, so GRAD can walk back through the unfused lazy graph.
+#define UOP_FUSING    23
+
+#define UOP_COUNT     24
 
 // Internal ops — not part of tinyspec, only used for autograd provenance
 #define UOP_POOL_GATHER 100  // sliding window gather (im2col equivalent)

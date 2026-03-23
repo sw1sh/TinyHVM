@@ -1103,7 +1103,7 @@ Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
             new_dims[i] = pairs[i*2+1] - pairs[i*2];
             offset += (i32)pairs[i*2] * m->view.strides[i];
         }
-        Shape ns = shape_of(new_dims, ndim);
+        // ns not needed — dims set directly on the view below
         u32 id = ctx->tensor_count++;
         ctx->tensors[id] = *m;
         ctx->tensors[id].host_ptr = NULL;

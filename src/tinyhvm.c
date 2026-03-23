@@ -263,6 +263,14 @@ static u32 tensor_view_of(TinyHVM *ctx, u32 src_id, View new_view) {
 // See resources/ic_fusion.md for design.
 // FUSING node absorbs fuseable ops pairwise, emits one fused dispatch.
 
+// Forward declaration: Metal GPU dispatch for fused kernels (metal.m)
+#ifdef __APPLE__
+extern void metal_dispatch_fused(u32 out_buf, u32 *input_bufs, u32 n_inputs,
+                                  u32 *ops, u32 n_ops, int has_reduce,
+                                  u32 out_numel, u32 reduce_dim, u32 total_numel);
+extern Backend metal_backend;
+#endif
+
 #define MAX_FUSE_OPS 16
 #define MAX_FUSE_INPUTS 4
 
@@ -352,37 +360,19 @@ static int try_fuse(TinyHVM *ctx, Term t, FuseState *fs) {
     return fs->n_ops >= 2; // fuse only if >1 op absorbed
 }
 
-// Execute fused op chain on CPU without intermediate buffers.
+// Execute fused op chain without intermediate buffers.
 // ops[] is outermost-first: e.g. [SUM, MUL, RELU]
-// means: SUM(MUL(input_a, input_b) where input_a = RELU(primary_input))
-static Term dispatch_fused_cpu(TinyHVM *ctx, FuseState *fs) {
-    // Primary input is input_ids[0], secondary inputs are [1..n_inputs-1]
+// Routes to Metal GPU dispatch when available.
+static Term dispatch_fused(TinyHVM *ctx, FuseState *fs) {
     u32 primary_id = fs->input_ids[0];
     TensorMeta *mp = &ctx->tensors[primary_id];
     u32 n_primary = mp->view.numel;
 
-    // Read primary input to host
-    f32 *primary = (f32 *)thvm_to_host(ctx, term_ten(primary_id, mp->dtype));
-    f32 *primary_copy = malloc(n_primary * sizeof(f32));
-    memcpy(primary_copy, primary, n_primary * sizeof(f32));
-
-    // Read secondary inputs
-    f32 *secondary[MAX_FUSE_INPUTS - 1] = {0};
-    for (u32 i = 1; i < fs->n_inputs; i++) {
-        u32 sid = fs->input_ids[i];
-        TensorMeta *ms = &ctx->tensors[sid];
-        f32 *s = (f32 *)thvm_to_host(ctx, term_ten(sid, ms->dtype));
-        secondary[i-1] = malloc(ms->view.numel * sizeof(f32));
-        memcpy(secondary[i-1], s, ms->view.numel * sizeof(f32));
-    }
-
-    // Determine output shape
-    // If has_reduce: reduce collapses the primary input
+    // Determine output shape and reduce_dim
     u32 out_numel;
     Shape out_shape;
     u32 reduce_dim = 1;
     if (fs->has_reduce) {
-        // Find the reduce dim (innermost non-1 dim)
         out_shape = mp->view.shape;
         for (int d = (int)out_shape.rank - 1; d >= 0; d--) {
             if (out_shape.dims[d] > 1) {
@@ -398,8 +388,44 @@ static Term dispatch_fused_cpu(TinyHVM *ctx, FuseState *fs) {
         out_numel = n_primary;
     }
 
-    // Allocate output
+    // Allocate output tensor
     u32 out_id = tensor_create(ctx, out_shape, DTYPE_F32);
+
+#ifdef __APPLE__
+    // === METAL GPU PATH ===
+    if (ctx->backend == &metal_backend) {
+        // Get buffer IDs for the inputs
+        u32 input_bufs[MAX_FUSE_INPUTS];
+        for (u32 i = 0; i < fs->n_inputs; i++)
+            input_bufs[i] = ctx->tensors[fs->input_ids[i]].buf_id;
+
+        metal_dispatch_fused(
+            ctx->tensors[out_id].buf_id,
+            input_bufs, fs->n_inputs,
+            fs->ops, fs->n_ops, fs->has_reduce,
+            out_numel, reduce_dim, n_primary);
+
+        ctx->itrs++;
+        return term_ten(out_id, DTYPE_F32);
+    }
+#endif
+
+    // === CPU FALLBACK PATH ===
+    // Read primary input to host
+    f32 *primary = (f32 *)thvm_to_host(ctx, term_ten(primary_id, mp->dtype));
+    f32 *primary_copy = malloc(n_primary * sizeof(f32));
+    memcpy(primary_copy, primary, n_primary * sizeof(f32));
+
+    // Read secondary inputs
+    f32 *secondary[MAX_FUSE_INPUTS - 1] = {0};
+    for (u32 i = 1; i < fs->n_inputs; i++) {
+        u32 sid = fs->input_ids[i];
+        TensorMeta *ms = &ctx->tensors[sid];
+        f32 *s = (f32 *)thvm_to_host(ctx, term_ten(sid, ms->dtype));
+        secondary[i-1] = malloc(ms->view.numel * sizeof(f32));
+        memcpy(secondary[i-1], s, ms->view.numel * sizeof(f32));
+    }
+    // Output already allocated above
     f32 *output = malloc(out_numel * sizeof(f32));
 
     // Execute fused loop
@@ -518,7 +544,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             if ((uop == UOP_SUM || uop == UOP_RMAX) && !ctx->recording && getenv("THVM_FUSE")) {
                 FuseState fs = {0};
                 if (try_fuse(ctx, t, &fs) && fs.n_ops >= 2) {
-                    return dispatch_fused_cpu(ctx, &fs);
+                    return dispatch_fused(ctx, &fs);
                 }
             }
 

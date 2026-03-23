@@ -108,10 +108,13 @@ sharing the same `buf_id` with a modified `View` — no data copy.
 
 ## 5. Autograd
 
-### Recording
+### Recording (transitional)
 
-`ctx->recording = 1` during the forward pass. When a realized tensor is created
-while recording, its `creator_op` and `src_ids` are set for the GRAD handler.
+`ctx->recording = 1` gates provenance writes (`creator_op`, `src_ids`). This is
+a transitional mechanism — in the pure inet model provenance is always written
+(cost is negligible when `requires_grad` propagation prunes the write).
+
+See `resources/ic_pure_inet.md` §Phase 1 for the plan to remove this flag.
 
 ### GRAD node
 
@@ -240,6 +243,8 @@ are handled correctly.
 | `src/metal.m` | Metal backend: GPU kernels, `metal_mul_reduce_sum` |
 | `src/shaders.metal` | MSL compute shaders |
 | `src/layers.c` | Conv2d, maxpool, sequential model helpers |
+| `resources/ic_arch.md` | This document |
+| `resources/ic_pure_inet.md` | Pure inet training model & PoC implementation plan |
 | `resources/ic_autograd.md` | Autograd design notes |
 | `resources/ic_fusion.md` | Fusion design and FUSING roadmap |
 
@@ -249,7 +254,7 @@ are handled correctly.
 
 ```
 thvm_init(backend)           → allocate heap, tensor table, memo
-thvm_start_recording(ctx)    → ctx->recording = 1
+thvm_start_recording(ctx)    → ctx->recording = 1  [transitional — see ic_pure_inet.md]
 [ build lazy graph with thvm_op, thvm_reshape, ... ]
 thvm_stop_recording(ctx)     → ctx->recording = 0
 thvm_reduce / thvm_realize   → collapses lazy graph, fills buffers
@@ -260,3 +265,25 @@ thvm_reset(ctx, n_weights)   → free all tensors above n_weights, clear heap/me
 
 `thvm_reset` is the training-loop boundary — it frees activation buffers while
 keeping weight tensors intact.
+
+> **Note**: This lifecycle is the current imperative-shell model. The target
+> architecture (see `resources/ic_pure_inet.md`) eliminates `recording`,
+> `thvm_reset`, and the C training loop in favour of a single closed inet term
+> that reduces to the trained weights.
+
+---
+
+## 10. Roadmap: Pure Inet Training
+
+The training loop expressed as a single inet reduction is the natural end state of
+this architecture. Four implementation phases are planned:
+
+| Phase | Change | Status |
+|-------|--------|--------|
+| 0 | One training step as single `thvm_reduce` call | Achievable today |
+| 1 | Remove `recording` flag — always-on provenance | Near-term |
+| 2 | `TAG_LAM` / `TAG_APP` / `TAG_REF` interaction rules | Medium-term |
+| 3 | `UOP_ITE`, `UOP_LOAD` — conditionals and lazy data | Medium-term |
+| 4 | Full recursive training loop as one inet term | Target |
+
+See `resources/ic_pure_inet.md` for full design and implementation plan.

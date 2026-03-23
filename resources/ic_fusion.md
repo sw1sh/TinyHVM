@@ -64,28 +64,47 @@ if (!ma->requires_grad && !mb->requires_grad) { /* fuse */ }
 carry `requires_grad = 1`. Two tensors on a gradient path can be encountered while
 `recording = 0` (during backward reduction itself).
 
-## Future: General Fusion via FUSING Nodes
+## General Fusion via FUSING Nodes
 
-The current fused path is a special case for `SUM(MUL)`. The full vision is an IC-native
-FUSING accumulator node that absorbs fuseable ops one at a time:
+The current `SUM(MUL)` fast path is ad-hoc. The general mechanism is a `UOP_FUSING` node that:
+
+1. **Wraps any matched subgraph** without destroying it — the original TAG_TOP subnet stays in the heap
+2. **Dispatches one fused kernel** using the realized inputs
+3. **Delegates GRAD transparently** to the original unfused subnet
 
 ```
-Step 0: SUM(unreduced_child) → create FUSING{reduce=SUM}
-Step 1: FUSING{SUM} ⊳ MUL(a, b) → absorb → FUSING{SUM,MUL}(a, b)
-Step 2: FUSING{SUM,MUL} ⊳ RELU(x) → absorb → FUSING{SUM,MUL,RELU}(x)
-Step 3: FUSING{SUM,MUL,RELU} ⊳ LOAD(buf) → boundary → emit one kernel
+Forward:
+  FUSING(orig_subgraph) → realized tensor (one kernel, no intermediates)
+
+Backward:
+  GRAD(FUSING(orig), gy, x)  →  GRAD(orig, gy, x)
 ```
 
-Interaction rules:
+The GRAD handler for `UOP_FUSING` is one line: reconstruct the original term from `src_ids[0]` (the heap loc of the original TAG_TOP root) and fire GRAD on it. The original subnet is fully intact — no special per-op backward cases, no provenance hacks, no `!requires_grad` guards.
+
+```c
+case UOP_FUSING: {
+    // src_ids[0] = heap loc of original unfused TAG_TOP root
+    // (e.g. SUM_loc, which still points to MUL(a,b) in the heap)
+    Term orig = term_new(TAG_TOP, ctx->tensors[y_id].orig_uop,
+                         (u64)ctx->tensors[y_id].src_ids[0]);
+    MEMO_RETURN(GRAD3(orig, gy, x));
+}
+```
+
+### Interaction rules for fusion
+
+`try_fuse()` walks the lazy graph pairwise. Each `⊳` is a single IC interaction:
+
 ```
 FUSING ⊳ ELEMENTWISE(args...)  → absorb, new children = args
 FUSING ⊳ MOVEMENT(arg)        → absorb as index transform
-FUSING ⊳ REDUCE(arg)          → STOP (two reduces = two kernels)
-FUSING ⊳ LOAD/materialized    → STOP, emit fused kernel
-FUSING ⊳ requires_grad input  → STOP (autograd boundary)
+FUSING ⊳ REDUCE(arg)          → if first reduce: absorb; else STOP (two reduces = two kernels)
+FUSING ⊳ LOAD/realized        → STOP, emit fused kernel
 ```
 
-The last rule is the same gate as today: fusion terminates at any input that needs a gradient.
+No `requires_grad` gate at all — since backward just walks the original graph.
+
 
 ## Memory Impact
 

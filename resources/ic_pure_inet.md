@@ -284,9 +284,10 @@ Term program = thvm_app(ctx,
 ## Invariants of the Pure Inet Model
 
 1. **Single reduction**: `thvm_reduce(program)` is called once. `TAG_REF`
-   unfolding is one interaction rule — the REF node is replaced by a fresh clone
-   of its body sub-inet in-place; ordinary reduction continues on the resulting
-   net. It is not C recursion.
+   unfolding is one interaction rule — the REF node's principal port is replaced
+   by the body's root port; its auxiliary ports are linked to the body's free
+   ports. Pure port rewiring, no copying. If the body has fan-out, DUP/SUP
+   interactions handle sharing lazily when those ports are consumed.
 2. **No explicit backward pass**: `GRAD(y, gy, x)` is just a lazy TOP node built
    alongside the forward graph. It reduces on demand when the result is needed.
 3. **No recording flag**: provenance is written whenever `requires_grad` is true.

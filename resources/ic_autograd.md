@@ -22,7 +22,9 @@ Backward pass = DUP node propagating through the forward graph.
 Each TOP node in the graph stores **provenance** — which UOp produced it and which source tensor
 IDs fed into it (`creator_op`, `src_ids[0]`, `src_ids[1]`). `thvm_grad(ctx, y, x)` creates a
 lazy `UOP_GRAD` term. When reduced, the GRAD handler reads `y`'s provenance and applies the
-corresponding gradient rule, recursing until it hits `x` (base case: return `gy`).
+corresponding gradient rule — which emits new `UOP_GRAD` terms as lazy TAG_TOP nodes.
+Those nodes reduce through the same GRAD handler, working backward until the base case
+(`y == x`) is reached and `gy` is returned.
 
 No tape, no backward loop — gradients are just more lazy TOP nodes that reduce through the same
 forward engine.
@@ -73,9 +75,12 @@ for SUM needs to recurse through MUL to apply the chain rule; if MUL was fused a
 `src_ids[0]` would point to the MUL's input (e.g. `diff`) instead of its output (`sq = diff²`),
 causing the MUL backward to be skipped and losing the `2*diff` factor.
 
-The `recording` flag is NOT the correct gate. Two tensors can both be on a gradient path
-(`requires_grad = 1`) even when `recording = 0` (e.g., during backward itself). `requires_grad`
-is the always-correct signal.
+The `recording` flag still exists — it gates **provenance writes** at tensor creation
+(`if (ctx->recording) { md->creator_op = ...; }`). What was removed is using `recording`
+as the **fusion gate**. Previously the fused `SUM(MUL)` path had `goto skip_fused_mul_sum`
+when `ctx->recording` — replaced with `!ma->requires_grad && !mb->requires_grad`. Two tensors
+can be on a gradient path (`requires_grad = 1`) even when `recording = 0` (e.g. during
+backward itself), so `requires_grad` is the correct fusion gate.
 
 ---
 

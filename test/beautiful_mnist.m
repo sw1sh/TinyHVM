@@ -136,24 +136,45 @@ int main(void) {
         thvm_set_requires_grad(ctx, params[i]);
     printf("  %u trainable parameters extracted\n", n_params);
 
+    // Load entire training set as a source Term BEFORE adam init
+    // so train_data is preserved by thvm_reset
+    u32 BS = 128;
+    Term train_data = thvm_tensor(ctx, data.train_images,
+        (Shape){.dims={data.n_train, 1, 28, 28}, .rank=4});
+
     Adam opt = adam_init(ctx, 0.001f, n_params);
     for (u32 i = 0; i < n_params; i++)
         adam_add_param(ctx, &opt, i, (u32)term_val(params[i]), param_sizes[i]);
 
-    // Load entire training set as a source Term (one-time host→device transfer)
-    u32 BS = 128;
-    Term train_data = thvm_tensor(ctx, data.train_images,
-        (Shape){.dims={data.n_train, 1, 28, 28}, .rank=4});
-    u32 n_weights = ctx->tensor_count;  // AFTER data + adam state
+    u32 n_weights = ctx->tensor_count;  // AFTER data + adam state = all persistent tensors
     u32 n_batches = data.n_train / BS;
     u32 n_steps = 70;
     f32 lr_max = 0.001f, lr_min = 0.0001f;
     printf("  Training %u steps, BS=%u...\n\n", n_steps, BS);
 
+    // Interaction count limit (for profiling): THVM_MAX_ITRS env
+    u64 max_itrs = 0;
+    { const char *mi = getenv("THVM_MAX_ITRS");
+      if (mi) max_itrs = (u64)atoll(mi); }
+    if (max_itrs) printf("  ⚡ Interaction limit: %llu\n", (unsigned long long)max_itrs);
+
     for (u32 step = 0; step < n_steps; step++) {
+        if (max_itrs && ctx->itrs >= max_itrs) {
+            printf("\n  ⚡ Hit interaction limit (%llu itrs) at step %u\n",
+                   (unsigned long long)ctx->itrs, step);
+            break;
+        }
+
+        // Per-step profile reset
+        if (ctx->backend && ctx->backend->profile_reset)
+            ctx->backend->profile_reset();
+
         f32 progress = (f32)step / (f32)n_steps;
         opt.lr = lr_min + 0.5f * (lr_max - lr_min) * (1.0f + cosf(3.14159f * progress));
         clock_t t0 = clock();
+
+        // === FORWARD PHASE ===
+        thvm_prof_phase(PHASE_FORWARD);
 
         // Batch via thvm_shrink — source UOp, no memcpy
         u32 bi = step % n_batches;
@@ -177,24 +198,35 @@ int main(void) {
         f32 *loss_host = thvm_to_host(ctx, thvm_reduce(ctx, loss));
         f32 loss_val = loss_host[0];
 
-        // Backward — IC autograd, directly on the scalar loss
-        Term grads[n_params];
-        thvm_backward(ctx, thvm_reduce(ctx, loss), params, grads, n_params);
+        // === BACKWARD PHASE ===
+        thvm_prof_phase(PHASE_BACKWARD);
 
-        // Reduce all gradients and apply Adam
+        // Backward — IC autograd: compute each param gradient via thvm_grad
+        // Each gradient is a lazy IC term, reduced through standard engine
+        Term loss_reduced = thvm_reduce(ctx, loss);
         u32 grad_ids[n_params];
         for (u32 i = 0; i < n_params; i++) {
-            Term g = thvm_reduce(ctx, grads[i]);
+            Term g = thvm_reduce(ctx, thvm_grad(ctx, loss_reduced, params[i]));
             grad_ids[i] = (term_tag(g) == TAG_TEN) ? (u32)term_val(g) : 0;
         }
+
+        // === ADAM PHASE ===
+        thvm_prof_phase(PHASE_ADAM);
         adam_step(ctx, &opt, grad_ids);
 
         f32 ms = 1000.0f * (f32)(clock() - t0) / (f32)CLOCKS_PER_SEC;
-        if (step % 10 == 0 || step == n_steps - 1)
-            printf("  step %3u/%u  loss=%.4f  lr=%.5f  (%.0fms)\n",
-                   step, n_steps, loss_val, opt.lr, ms);
+        printf("  step %3u/%u  loss=%.4f  lr=%.5f  (%.0fms)  tensors=%u  itrs=%llu\n",
+               step, n_steps, loss_val, opt.lr, ms, ctx->tensor_count,
+               (unsigned long long)ctx->itrs);
 
+        // === RESET PHASE ===
+        thvm_prof_phase(PHASE_RESET);
         thvm_reset(ctx, n_weights);
+        thvm_prof_phase_end();
+
+        // Per-step profile report
+        if (ctx->backend && ctx->backend->profile_report)
+            ctx->backend->profile_report();
     }
 
     // Eval

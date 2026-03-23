@@ -132,9 +132,53 @@ static const char *uop_names[] = {
 
 #include <time.h>
 
+// Extended UOp range to cover POOL_GATHER
+#define PROF_UOP_MAX 128
+
+// Phase IDs for step-level tracking
+#define PHASE_FORWARD   0
+#define PHASE_BACKWARD  1
+#define PHASE_ADAM      2
+#define PHASE_RESET     3
+#define PHASE_OTHER     4
+#define PHASE_COUNT     5
+
+static const char *phase_names[] = {"forward", "backward", "adam", "reset", "other"};
+
 typedef struct {
-    u64 dispatch_ns[UOP_COUNT];
-    u32 dispatch_cnt[UOP_COUNT];
+    // Per-UOp dispatch stats (compute ops)
+    u64 uop_ns[PROF_UOP_MAX];       // total nanoseconds per UOp
+    u32 uop_cnt[PROF_UOP_MAX];      // dispatch count per UOp
+
+    // Per-UOp tensor creation stats
+    u32 uop_tensors[PROF_UOP_MAX];  // tensors created per UOp type
+
+    // Memory tracking
+    u64 buf_bytes_alloc;             // total bytes allocated this step
+    u32 buf_alloc_cnt;               // number of buf_alloc calls
+    u64 buf_bytes_peak;              // peak cumulative bytes (lifetime)
+    u64 buf_bytes_current;           // current live bytes
+
+    // Tensor watermarks
+    u32 tensor_peak;                 // peak tensor_count reached
+    u32 tensor_created;              // total tensors created this step
+    u32 tensor_freed;                // tensors freed by reset
+
+    // Heap usage
+    u64 heap_peak;                   // peak heap_pos reached
+    u64 heap_at_reset;               // heap_pos before reset
+
+    // Phase timing
+    u64 phase_ns[PHASE_COUNT];
+    u64 phase_start;
+    u32 current_phase;
+
+    // CPU-side data transfer
+    u64 cpu_read_bytes;              // bytes read from GPU to CPU (buf_read)
+    u32 cpu_read_cnt;
+    u64 cpu_write_bytes;             // bytes written from CPU to GPU (buf_write)
+    u32 cpu_write_cnt;
+
     int enabled;
 } ThvmProfile;
 
@@ -143,8 +187,28 @@ static ThvmProfile thvm_prof_global;
 
 static inline void thvm_prof_init(void) {
     thvm_prof_global.enabled = getenv("THVM_PROFILE") != NULL;
-    memset(thvm_prof_global.dispatch_ns, 0, sizeof(thvm_prof_global.dispatch_ns));
-    memset(thvm_prof_global.dispatch_cnt, 0, sizeof(thvm_prof_global.dispatch_cnt));
+    memset(&thvm_prof_global, 0, sizeof(thvm_prof_global));
+    thvm_prof_global.enabled = getenv("THVM_PROFILE") != NULL;
+}
+
+// Reset per-step counters (keep cumulative ones like buf_bytes_current)
+static inline void thvm_prof_step_reset(void) {
+    if (!thvm_prof_global.enabled) return;
+    memset(thvm_prof_global.uop_ns, 0, sizeof(thvm_prof_global.uop_ns));
+    memset(thvm_prof_global.uop_cnt, 0, sizeof(thvm_prof_global.uop_cnt));
+    memset(thvm_prof_global.uop_tensors, 0, sizeof(thvm_prof_global.uop_tensors));
+    thvm_prof_global.buf_bytes_alloc = 0;
+    thvm_prof_global.buf_alloc_cnt = 0;
+    thvm_prof_global.tensor_created = 0;
+    thvm_prof_global.tensor_freed = 0;
+    thvm_prof_global.tensor_peak = 0;
+    thvm_prof_global.heap_peak = 0;
+    thvm_prof_global.heap_at_reset = 0;
+    memset(thvm_prof_global.phase_ns, 0, sizeof(thvm_prof_global.phase_ns));
+    thvm_prof_global.cpu_read_bytes = 0;
+    thvm_prof_global.cpu_read_cnt = 0;
+    thvm_prof_global.cpu_write_bytes = 0;
+    thvm_prof_global.cpu_write_cnt = 0;
 }
 
 // Portable nanosecond timer
@@ -162,10 +226,71 @@ static inline u64 thvm_prof_tick(void) {
 static inline void thvm_prof_record(u32 uop, u64 t0) {
     if (!thvm_prof_global.enabled || t0 == 0) return;
     u64 ns = thvm_prof_tick() - t0;
-    if (uop < UOP_COUNT) {
-        thvm_prof_global.dispatch_ns[uop] += ns;
-        thvm_prof_global.dispatch_cnt[uop]++;
+    if (uop < PROF_UOP_MAX) {
+        thvm_prof_global.uop_ns[uop] += ns;
+        thvm_prof_global.uop_cnt[uop]++;
     }
+}
+
+static inline void thvm_prof_tensor_created(u32 uop_hint) {
+    if (!thvm_prof_global.enabled) return;
+    thvm_prof_global.tensor_created++;
+    if (uop_hint < PROF_UOP_MAX)
+        thvm_prof_global.uop_tensors[uop_hint]++;
+}
+
+static inline void thvm_prof_buf_alloc(u64 bytes) {
+    if (!thvm_prof_global.enabled) return;
+    thvm_prof_global.buf_bytes_alloc += bytes;
+    thvm_prof_global.buf_alloc_cnt++;
+    thvm_prof_global.buf_bytes_current += bytes;
+    if (thvm_prof_global.buf_bytes_current > thvm_prof_global.buf_bytes_peak)
+        thvm_prof_global.buf_bytes_peak = thvm_prof_global.buf_bytes_current;
+}
+
+static inline void thvm_prof_buf_free(u64 bytes) {
+    if (!thvm_prof_global.enabled) return;
+    if (thvm_prof_global.buf_bytes_current >= bytes)
+        thvm_prof_global.buf_bytes_current -= bytes;
+}
+
+static inline void thvm_prof_buf_read(u64 bytes) {
+    if (!thvm_prof_global.enabled) return;
+    thvm_prof_global.cpu_read_bytes += bytes;
+    thvm_prof_global.cpu_read_cnt++;
+}
+
+static inline void thvm_prof_buf_write(u64 bytes) {
+    if (!thvm_prof_global.enabled) return;
+    thvm_prof_global.cpu_write_bytes += bytes;
+    thvm_prof_global.cpu_write_cnt++;
+}
+
+static inline void thvm_prof_phase(u32 phase) {
+    if (!thvm_prof_global.enabled) return;
+    u64 now = thvm_prof_tick();
+    if (thvm_prof_global.phase_start) {
+        u32 prev = thvm_prof_global.current_phase;
+        thvm_prof_global.phase_ns[prev] += now - thvm_prof_global.phase_start;
+    }
+    thvm_prof_global.current_phase = phase;
+    thvm_prof_global.phase_start = now;
+}
+
+static inline void thvm_prof_phase_end(void) {
+    if (!thvm_prof_global.enabled || !thvm_prof_global.phase_start) return;
+    u64 now = thvm_prof_tick();
+    u32 prev = thvm_prof_global.current_phase;
+    thvm_prof_global.phase_ns[prev] += now - thvm_prof_global.phase_start;
+    thvm_prof_global.phase_start = 0;
+}
+
+static inline void thvm_prof_update_watermarks(u32 tensor_count, u64 heap_pos) {
+    if (!thvm_prof_global.enabled) return;
+    if (tensor_count > thvm_prof_global.tensor_peak)
+        thvm_prof_global.tensor_peak = tensor_count;
+    if (heap_pos > thvm_prof_global.heap_peak)
+        thvm_prof_global.heap_peak = heap_pos;
 }
 
 // Conv2d parameter structs (used by layers.c internal kernels)
@@ -203,7 +328,7 @@ static inline u32 dtype_size(u32 dtype) {
 }
 
 #define MAX_DIM 8
-#define MAX_TENSORS 4096
+#define MAX_TENSORS 16384
 
 // Shape: dims + rank bundled together
 typedef struct {
@@ -393,10 +518,7 @@ f32      thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
 // Gradient ops go through thvm_op → get taped → grad(grad(f)) works.
 Term     thvm_grad(TinyHVM *ctx, Term y, Term x);
 
-// Backward: compute gradients for multiple parameters at once
-// Stores results in grads[] (lazy Terms — reduce to get values)
-void     thvm_backward(TinyHVM *ctx, Term loss,
-                       Term *params, Term *grads, u32 n_params);
+// Backward removed — use thvm_grad(ctx, loss, param) per parameter instead
 
 // Movement ops
 Term     thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim);

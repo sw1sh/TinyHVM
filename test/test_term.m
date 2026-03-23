@@ -355,26 +355,22 @@ static void test_grad_of_grad(void) {
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx, x);
 
-    // Forward: x^3 — tape accumulates
     thvm_start_recording(ctx);
     Term t1 = thvm_op(ctx, UOP_MUL, x, x);
     Term y  = thvm_op(ctx, UOP_MUL, t1, x);
     Term yr = thvm_reduce(ctx, y);
-    // DON'T stop recording — tape accumulates into grad reduction
 
     f32 *fwd = thvm_to_host(ctx, yr);
     ASSERT_NEAR(fwd[0], 8.0f, 1e-4f, "x^3 = 8");
 
-    // First grad: dy/dx (lazy) — reduce it while recording
     Term dy_dx = thvm_grad(ctx, yr, x);
-    Term dy_val = thvm_reduce(ctx, dy_dx);  // grad ops get taped
+    Term dy_val = thvm_reduce(ctx, dy_dx);
     thvm_stop_recording(ctx);
 
     f32 *g1 = thvm_to_host(ctx, dy_val);
     ASSERT(g1 != NULL, "first grad exists");
     ASSERT_NEAR(g1[0], 12.0f, 1e-4f, "d(x^3)/dx = 3x^2 = 12");
 
-    // Second grad: d²y/dx² — walks FULL tape (forward + grad ops)
     Term d2y = thvm_grad(ctx, dy_val, x);
     f32 *g2 = thvm_to_host(ctx, d2y);
     ASSERT(g2 != NULL, "second grad exists");
@@ -383,8 +379,229 @@ static void test_grad_of_grad(void) {
     thvm_free(ctx);
 }
 
+static void test_grad_sum(void) {
+    printf("test_grad_sum (d(sum(x))/dx = ones):\n");
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+
+    f32 x_d[] = {1,2,3,4,5,6}; u32 xs[] = {2, 3};
+    Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
+    thvm_set_requires_grad(ctx, x);
+
+    thvm_start_recording(ctx);
+    Term s1 = thvm_op(ctx, UOP_SUM, x, term_era());       // [2,1]
+    Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_SUM, s1, term_era()));  // [1,1]
+    thvm_stop_recording(ctx);
+
+    f32 *fwd = thvm_to_host(ctx, yr);
+    printf("  sum_val = %.4f (expected 21)\n", fwd[0]);
+    ASSERT_NEAR(fwd[0], 21.0f, 1e-4f, "sum(1..6)=21");
+
+    Term grad_term = thvm_grad(ctx, yr, x);
+    grad_term = thvm_reduce(ctx, grad_term);
+    u32 gid = (u32)term_val(grad_term);
+    TensorMeta *gm = &ctx->tensors[gid];
+    printf("  grad tensor %u shape=[%u,%u] strides=[%d,%d] contiguous=%d buf=%u\n",
+           gid, gm->view.shape.dims[0], gm->view.shape.dims[1],
+           gm->view.strides[0], gm->view.strides[1], gm->view.contiguous, gm->buf_id);
+    f32 *g = thvm_to_host(ctx, grad_term);
+    ASSERT(g != NULL, "sum grad exists");
+    printf("  grad = [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]\n", g[0],g[1],g[2],g[3],g[4],g[5]);
+    for (int i = 0; i < 6; i++)
+        ASSERT_NEAR(g[i], 1.0f, 1e-4f, "d(sum)/dx_i = 1");
+
+    printf("  tensors=%u itrs=%llu\n", ctx->tensor_count, (unsigned long long)ctx->itrs);
+    thvm_free(ctx);
+}
+
+static void test_grad_exp_log(void) {
+    printf("test_grad_exp_log (d(exp(x))/dx = exp(x), d(log(x))/dx = 1/x):\n");
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+
+    f32 x_d[] = {1.0f, 2.0f}; u32 xs[] = {1, 2};
+    Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
+    thvm_set_requires_grad(ctx, x);
+
+    // exp
+    thvm_start_recording(ctx);
+    Term yr1 = thvm_reduce(ctx, thvm_op(ctx, UOP_EXP, x, term_era()));
+    thvm_stop_recording(ctx);
+
+    f32 *ge = thvm_to_host(ctx, thvm_grad(ctx, yr1, x));
+    ASSERT_NEAR(ge[0], expf(1.0f), 1e-4f, "d(exp(1))/dx = e");
+    ASSERT_NEAR(ge[1], expf(2.0f), 1e-3f, "d(exp(2))/dx = e^2");
+
+    // log — fresh ctx to reset tape
+    TinyHVM *ctx2 = thvm_init(thvm_device(DEVICE));
+    f32 x2_d[] = {2.0f, 4.0f};
+    Term x2 = thvm_tensor(ctx2, x2_d, shape_of(xs, 2));
+    thvm_set_requires_grad(ctx2, x2);
+
+    thvm_start_recording(ctx2);
+    Term yr2 = thvm_reduce(ctx2, thvm_op(ctx2, UOP_LOG, x2, term_era()));
+    thvm_stop_recording(ctx2);
+
+    f32 *gl = thvm_to_host(ctx2, thvm_grad(ctx2, yr2, x2));
+    ASSERT_NEAR(gl[0], 0.5f, 1e-4f, "d(log(2))/dx = 0.5");
+    ASSERT_NEAR(gl[1], 0.25f, 1e-4f, "d(log(4))/dx = 0.25");
+
+    printf("  tensors=%u/%u itrs=%llu/%llu\n",
+           ctx->tensor_count, ctx2->tensor_count,
+           (unsigned long long)ctx->itrs, (unsigned long long)ctx2->itrs);
+    thvm_free(ctx);
+    thvm_free(ctx2);
+}
+
+static void test_grad_div(void) {
+    printf("test_grad_div (d(a/b)/da = 1/b, d(a/b)/db = -a/b^2):\n");
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+
+    f32 a_d[] = {6.0f}; u32 s[] = {1, 1};
+    f32 b_d[] = {3.0f};
+    Term a = thvm_tensor(ctx, a_d, shape_of(s, 2));
+    Term b = thvm_tensor(ctx, b_d, shape_of(s, 2));
+    thvm_set_requires_grad(ctx, a);
+    thvm_set_requires_grad(ctx, b);
+
+    thvm_start_recording(ctx);
+    Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_DIV, a, b));
+    thvm_stop_recording(ctx);
+
+    f32 *fwd = thvm_to_host(ctx, yr);
+    ASSERT_NEAR(fwd[0], 2.0f, 1e-4f, "6/3=2");
+
+    f32 *ga = thvm_to_host(ctx, thvm_grad(ctx, yr, a));
+    ASSERT_NEAR(ga[0], 1.0f/3.0f, 1e-4f, "d(a/b)/da = 1/3");
+
+    f32 *gb = thvm_to_host(ctx, thvm_grad(ctx, yr, b));
+    ASSERT_NEAR(gb[0], -6.0f/9.0f, 1e-4f, "d(a/b)/db = -6/9");
+
+    printf("  tensors=%u itrs=%llu\n", ctx->tensor_count, (unsigned long long)ctx->itrs);
+    thvm_free(ctx);
+}
+
+static void test_grad_broadcast_expand(void) {
+    printf("test_grad_broadcast_expand (gradient through expand+add):\n");
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+
+    // x:[2,3], b:[1,3] broadcast-added
+    f32 x_d[] = {1,2,3,4,5,6}; u32 xs[] = {2, 3};
+    f32 b_d[] = {10,20,30}; u32 bs[] = {1, 3};
+    Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
+    Term b = thvm_tensor(ctx, b_d, shape_of(bs, 2));
+    thvm_set_requires_grad(ctx, x);
+    thvm_set_requires_grad(ctx, b);
+
+    thvm_start_recording(ctx);
+    // sum(x + broadcast(b)) — loss is scalar
+    Term added = thvm_op(ctx, UOP_ADD, x, b);  // broadcasts b from [1,3] to [2,3]
+    Term s1 = thvm_op(ctx, UOP_SUM, added, term_era());
+    Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_SUM, s1, term_era()));
+    thvm_stop_recording(ctx);
+
+    f32 *fwd = thvm_to_host(ctx, yr);
+    printf("  sum_val = %.4f (expected 141)\n", fwd[0]);
+    ASSERT_NEAR(fwd[0], 141.0f, 1e-3f, "sum(x+b)=1+2+3+4+5+6+2*(10+20+30)=141");
+
+    // d(sum(x+b))/dx = ones [2,3]
+    f32 *gx = thvm_to_host(ctx, thvm_grad(ctx, yr, x));
+    ASSERT(gx != NULL, "expand grad_x exists");
+    for (int i = 0; i < 6; i++)
+        ASSERT_NEAR(gx[i], 1.0f, 1e-4f, "grad_x = 1");
+
+    // d(sum(x+b))/db = [2,2,2] (summed over batch dim)
+    f32 *gb = thvm_to_host(ctx, thvm_grad(ctx, yr, b));
+    ASSERT(gb != NULL, "expand grad_b exists");
+    printf("  grad_b = [%.3f, %.3f, %.3f]\n", gb[0], gb[1], gb[2]);
+    ASSERT_NEAR(gb[0], 2.0f, 1e-4f, "grad_b[0]=2");
+    ASSERT_NEAR(gb[1], 2.0f, 1e-4f, "grad_b[1]=2");
+    ASSERT_NEAR(gb[2], 2.0f, 1e-4f, "grad_b[2]=2");
+
+    printf("  tensors=%u itrs=%llu\n", ctx->tensor_count, (unsigned long long)ctx->itrs);
+    thvm_free(ctx);
+}
+
+static void test_grad_chain(void) {
+    printf("test_grad_chain (relu(mm(x,W)+b) → sum, full chain rule):\n");
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+
+    f32 x_d[] = {1,2,3,4}; u32 xs[] = {2, 2};
+    f32 w_d[] = {0.5f, -0.5f, 0.5f, -0.5f}; u32 ws[] = {2, 2};
+    f32 b_d[] = {0.1f, -0.1f}; u32 bs_[] = {1, 2};
+    Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
+    Term w = thvm_tensor(ctx, w_d, shape_of(ws, 2));
+    Term b = thvm_tensor(ctx, b_d, shape_of(bs_, 2));
+    thvm_set_requires_grad(ctx, w);
+    thvm_set_requires_grad(ctx, b);
+
+    thvm_start_recording(ctx);
+    Term mm = thvm_op(ctx, UOP_MM, x, w);
+    Term added = thvm_op(ctx, UOP_ADD, mm, b);
+    Term act = thvm_op(ctx, UOP_RELU, added, term_era());
+    Term s1 = thvm_op(ctx, UOP_SUM, act, term_era());
+    Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_SUM, s1, term_era()));
+    thvm_stop_recording(ctx);
+
+    f32 *fwd = thvm_to_host(ctx, yr);
+    printf("  chain_fwd = %.4f\n", fwd[0]);
+    ASSERT(fwd[0] > 0, "chain forward > 0");
+
+    f32 *gw = thvm_to_host(ctx, thvm_grad(ctx, yr, w));
+    ASSERT(gw != NULL, "chain grad_w exists");
+    printf("  grad_w = [%.3f, %.3f, %.3f, %.3f]\n", gw[0], gw[1], gw[2], gw[3]);
+
+    f32 *gb = thvm_to_host(ctx, thvm_grad(ctx, yr, b));
+    ASSERT(gb != NULL, "chain grad_b exists");
+    printf("  grad_b = [%.3f, %.3f]\n", gb[0], gb[1]);
+
+    printf("  tensors=%u itrs=%llu\n", ctx->tensor_count, (unsigned long long)ctx->itrs);
+    thvm_free(ctx);
+}
+
+static void test_grad_softmax_loss(void) {
+    printf("test_grad_softmax_loss (log(softmax(x)) gradient):\n");
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+
+    // Simple 1-sample, 3-class logits
+    f32 x_d[] = {2.0f, 1.0f, 0.1f}; u32 xs[] = {1, 3};
+    Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
+    thvm_set_requires_grad(ctx, x);
+
+    thvm_start_recording(ctx);
+    // softmax: exp(x) / sum(exp(x))
+    Term ex = thvm_op(ctx, UOP_EXP, x, term_era());
+    Term ex_sum = thvm_op(ctx, UOP_SUM, ex, term_era());  // [1,1]
+    Term ex_sum_bc = thvm_expand(ctx, ex_sum, shape_of((u32[]){1,3}, 2));
+    Term sm = thvm_op(ctx, UOP_DIV, ex, ex_sum_bc);
+    // -log(softmax[0]) = cross-entropy for class 0
+    Term log_sm = thvm_op(ctx, UOP_LOG, sm, term_era());
+    Term neg = thvm_op(ctx, UOP_NEG, log_sm, term_era());
+    // Pick class 0: shrink to [1,1]
+    Term loss = thvm_shrink(ctx, neg, (u32[]){0, 1, 0, 1}, 2);
+    Term yr = thvm_reduce(ctx, loss);
+    thvm_stop_recording(ctx);
+
+    f32 *fwd = thvm_to_host(ctx, yr);
+    printf("  loss = %.4f\n", fwd[0]);
+
+    f32 *gx = thvm_to_host(ctx, thvm_grad(ctx, yr, x));
+    ASSERT(gx != NULL, "softmax grad exists");
+    printf("  grad = [%.4f, %.4f, %.4f]\n", gx[0], gx[1], gx[2]);
+    // For CE loss targeting class 0: grad[0] = softmax[0] - 1, grad[i>0] = softmax[i]
+    f32 e0 = expf(2.0f), e1 = expf(1.0f), e2 = expf(0.1f);
+    f32 esum = e0 + e1 + e2;
+    f32 expected_g0 = e0/esum - 1.0f;  // softmax[0] - 1
+    f32 expected_g1 = e1/esum;          // softmax[1]
+    f32 expected_g2 = e2/esum;          // softmax[2]
+    ASSERT_NEAR(gx[0], expected_g0, 1e-3f, "CE grad[0] = p0 - 1");
+    ASSERT_NEAR(gx[1], expected_g1, 1e-3f, "CE grad[1] = p1");
+    ASSERT_NEAR(gx[2], expected_g2, 1e-3f, "CE grad[2] = p2");
+
+    printf("  tensors=%u itrs=%llu\n", ctx->tensor_count, (unsigned long long)ctx->itrs);
+    thvm_free(ctx);
+}
+
 int main(void) {
-    printf("=== TinyHVM Test Suite v3 ===\n\n");
+    printf("=== TinyHVM Test Suite v4 ===\n\n");
 
     test_term_packing();
     test_num_encoding();
@@ -403,7 +620,24 @@ int main(void) {
     test_grad_mm();
     test_grad_of_grad();
 
+    // New chain-rule / MNIST-relevant tests
+    test_grad_sum();
+    test_grad_exp_log();
+    test_grad_div();
+    test_grad_broadcast_expand();
+    test_grad_chain();
+    test_grad_softmax_loss();
+
     printf("\n=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);
+
+    // Profile report (if THVM_PROFILE=1)
+    if (thvm_prof_global.enabled) {
+        printf("\n  Final profiling state:\n");
+        printf("  buf_bytes_peak: %.1f MB\n",
+               (f32)thvm_prof_global.buf_bytes_peak / (1024.0f * 1024.0f));
+    }
+
     return tests_failed > 0 ? 1 : 0;
 }
+

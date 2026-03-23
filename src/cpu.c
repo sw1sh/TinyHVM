@@ -17,7 +17,7 @@
 // Buffer pool: ID → pointer
 // ============================================================
 
-#define MAX_BUFS 8192
+#define MAX_BUFS 16384
 
 static struct {
     void *bufs[MAX_BUFS];

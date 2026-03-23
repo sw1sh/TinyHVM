@@ -12,7 +12,7 @@
 // Metal state
 // ============================================================
 
-#define MAX_BUFS 8192
+#define MAX_BUFS 16384
 
 static id<MTLDevice>       mtl_dev;
 static id<MTLCommandQueue> mtl_queue;
@@ -212,6 +212,7 @@ static u32 metal_buf_alloc(u64 bytes) {
     metal_pool.bufs[id] = [mtl_dev newBufferWithLength:MAX(bytes, 4)
                                                options:MTLResourceStorageModeShared];
     metal_pool.sizes[id] = bytes;
+    thvm_prof_buf_alloc(bytes);
     return id;
 }
 
@@ -224,12 +225,14 @@ static void metal_buf_write(u32 id, const void *data, u64 bytes) {
     // Must flush pending GPU work before CPU writes to shared buffer
     if (batch_dirty) metal_flush();
     memcpy(metal_pool.bufs[id].contents, data, bytes);
+    thvm_prof_buf_write(bytes);
 }
 
 static void metal_buf_read(u32 id, void *out, u64 bytes) {
     // Must flush pending GPU work before CPU reads from shared buffer
     if (batch_dirty) metal_flush();
     memcpy(out, metal_pool.bufs[id].contents, bytes);
+    thvm_prof_buf_read(bytes);
 }
 
 // ============================================================
@@ -436,6 +439,7 @@ static void metal_pool_reset(u32 keep) {
     if (batch_dirty) metal_flush();
     u32 buf_keep = keep + 1;
     for (u32 i = buf_keep; i < metal_pool.count; i++) {
+        thvm_prof_buf_free(metal_pool.sizes[i]);
         metal_pool.bufs[i] = nil;
         metal_pool.sizes[i] = 0;
     }
@@ -545,31 +549,95 @@ static void metal_op_adam_step(u32 param, u32 grad, u32 m, u32 v,
 
 static void metal_profile_report(void) {
     if (!thvm_prof_global.enabled) return;
-    u64 total_ns = 0;
-    u32 total_cnt = 0;
-    printf("\n  ╔══════════════════════════════════════════╗\n");
-    printf("  ║  Kernel Profile (THVM_PROFILE=1)         ║\n");
-    printf("  ╠══════════════════════════════════════════╣\n");
-    printf("  ║  %-10s %6s %8s %8s      ║\n", "Kernel", "Count", "Total", "Avg");
-    printf("  ╠══════════════════════════════════════════╣\n");
-    for (u32 i = 0; i < UOP_COUNT; i++) {
-        if (thvm_prof_global.dispatch_cnt[i] == 0) continue;
-        f32 total_ms = (f32)thvm_prof_global.dispatch_ns[i] / 1e6f;
-        f32 avg_us = (f32)thvm_prof_global.dispatch_ns[i] / (f32)thvm_prof_global.dispatch_cnt[i] / 1e3f;
-        printf("  ║  %-10s %6u %6.1fms %6.0fμs      ║\n",
-               uop_names[i], thvm_prof_global.dispatch_cnt[i], total_ms, avg_us);
-        total_ns += thvm_prof_global.dispatch_ns[i];
-        total_cnt += thvm_prof_global.dispatch_cnt[i];
+    thvm_prof_phase_end();
+
+    printf("\n  ╔═══════════════════════════════════════════════════════════╗\n");
+    printf("  ║            TinyHVM Step Profile (THVM_PROFILE=1)         ║\n");
+    printf("  ╠═══════════════════════════════════════════════════════════╣\n");
+
+    // Phase timing
+    printf("  ║  Phase Timing:                                           ║\n");
+    u64 total_phase_ns = 0;
+    for (u32 i = 0; i < PHASE_COUNT; i++) total_phase_ns += thvm_prof_global.phase_ns[i];
+    for (u32 i = 0; i < PHASE_COUNT; i++) {
+        if (thvm_prof_global.phase_ns[i] == 0) continue;
+        f32 ms = (f32)thvm_prof_global.phase_ns[i] / 1e6f;
+        f32 pct = total_phase_ns ? 100.0f * (f32)thvm_prof_global.phase_ns[i] / (f32)total_phase_ns : 0;
+        printf("  ║    %-10s %8.1fms  (%5.1f%%)                        ║\n",
+               phase_names[i], ms, pct);
     }
-    printf("  ╠══════════════════════════════════════════╣\n");
-    printf("  ║  %-10s %6u %6.1fms              ║\n",
-           "TOTAL", total_cnt, (f32)total_ns / 1e6f);
-    printf("  ╚══════════════════════════════════════════╝\n");
+    printf("  ║    %-10s %8.1fms                                  ║\n",
+           "TOTAL", (f32)total_phase_ns / 1e6f);
+
+    // UOp dispatch breakdown
+    printf("  ╠═══════════════════════════════════════════════════════════╣\n");
+    printf("  ║  UOp Dispatch:                                           ║\n");
+    printf("  ║  %-10s %6s %8s %8s %6s                  ║\n",
+           "Op", "Count", "Total", "Avg", "Tens");
+    printf("  ╠═══════════════════════════════════════════════════════════╣\n");
+    u64 total_uop_ns = 0;
+    u32 total_uop_cnt = 0;
+    u32 total_uop_tens = 0;
+    const char *ext_uop_names[] = {
+        [UOP_POOL_GATHER] = "POOL_G"
+    };
+    for (u32 i = 0; i < PROF_UOP_MAX; i++) {
+        if (thvm_prof_global.uop_cnt[i] == 0 && thvm_prof_global.uop_tensors[i] == 0) continue;
+        const char *name = "?";
+        if (i < UOP_COUNT && i < sizeof(uop_names)/sizeof(uop_names[0])) name = uop_names[i];
+        else if (i == UOP_POOL_GATHER) name = "POOL_G";
+        f32 total_ms = (f32)thvm_prof_global.uop_ns[i] / 1e6f;
+        f32 avg_us = thvm_prof_global.uop_cnt[i] ?
+            (f32)thvm_prof_global.uop_ns[i] / (f32)thvm_prof_global.uop_cnt[i] / 1e3f : 0;
+        printf("  ║  %-10s %6u %6.1fms %6.0fμs %6u                  ║\n",
+               name, thvm_prof_global.uop_cnt[i], total_ms, avg_us,
+               thvm_prof_global.uop_tensors[i]);
+        total_uop_ns += thvm_prof_global.uop_ns[i];
+        total_uop_cnt += thvm_prof_global.uop_cnt[i];
+        total_uop_tens += thvm_prof_global.uop_tensors[i];
+    }
+    printf("  ║  %-10s %6u %6.1fms          %6u                  ║\n",
+           "TOTAL", total_uop_cnt, (f32)total_uop_ns / 1e6f, total_uop_tens);
+
+    // Memory
+    printf("  ╠═══════════════════════════════════════════════════════════╣\n");
+    printf("  ║  Memory:                                                 ║\n");
+    printf("  ║    buf_alloc:  %6u calls, %8.1f MB this step        ║\n",
+           thvm_prof_global.buf_alloc_cnt,
+           (f32)thvm_prof_global.buf_bytes_alloc / (1024.0f * 1024.0f));
+    printf("  ║    live bufs:  %8.1f MB current, %8.1f MB peak      ║\n",
+           (f32)thvm_prof_global.buf_bytes_current / (1024.0f * 1024.0f),
+           (f32)thvm_prof_global.buf_bytes_peak / (1024.0f * 1024.0f));
+
+    // Tensors
+    printf("  ║  Tensors:                                                ║\n");
+    printf("  ║    created: %5u   freed: %5u   peak: %5u             ║\n",
+           thvm_prof_global.tensor_created,
+           thvm_prof_global.tensor_freed,
+           thvm_prof_global.tensor_peak);
+
+    // Heap
+    printf("  ║  Heap:                                                   ║\n");
+    printf("  ║    peak: %8llu words (%5.1f MB)   at_reset: %8llu   ║\n",
+           (unsigned long long)thvm_prof_global.heap_peak,
+           (f32)thvm_prof_global.heap_peak * 8.0f / (1024.0f * 1024.0f),
+           (unsigned long long)thvm_prof_global.heap_at_reset);
+
+    // CPU↔GPU transfers
+    printf("  ║  CPU↔GPU:                                                ║\n");
+    printf("  ║    read:  %6u calls, %8.1f MB                      ║\n",
+           thvm_prof_global.cpu_read_cnt,
+           (f32)thvm_prof_global.cpu_read_bytes / (1024.0f * 1024.0f));
+    printf("  ║    write: %6u calls, %8.1f MB                      ║\n",
+           thvm_prof_global.cpu_write_cnt,
+           (f32)thvm_prof_global.cpu_write_bytes / (1024.0f * 1024.0f));
+
+    printf("  ╚═══════════════════════════════════════════════════════════╝\n");
+    (void)ext_uop_names;
 }
 
 static void metal_profile_reset(void) {
-    memset(thvm_prof_global.dispatch_ns, 0, sizeof(thvm_prof_global.dispatch_ns));
-    memset(thvm_prof_global.dispatch_cnt, 0, sizeof(thvm_prof_global.dispatch_cnt));
+    thvm_prof_step_reset();
 }
 
 // ============================================================

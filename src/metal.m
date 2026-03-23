@@ -23,6 +23,7 @@ static id<MTLComputePipelineState> pipe_neg, pipe_relu, pipe_exp, pipe_log, pipe
 static id<MTLComputePipelineState> pipe_add, pipe_mul, pipe_sub, pipe_div, pipe_max, pipe_cmp;
 static id<MTLComputePipelineState> pipe_mm;
 static id<MTLComputePipelineState> pipe_reduce_sum, pipe_reduce_max;
+static id<MTLComputePipelineState> pipe_mul_reduce_sum;
 static id<MTLComputePipelineState> pipe_im2col, pipe_col2im;
 static id<MTLComputePipelineState> pipe_nhwc_to_nchw, pipe_nchw_to_nhwc;
 static id<MTLComputePipelineState> pipe_bias_add, pipe_col_sum;
@@ -184,6 +185,7 @@ static int metal_init(void) {
     pipe_zero_fill = make_pipe(@"zero_fill");
     pipe_reduce_sum = make_pipe(@"reduce_sum");
     pipe_reduce_max = make_pipe(@"reduce_max");
+    pipe_mul_reduce_sum = make_pipe(@"mul_reduce_sum");
 
     memset(&metal_pool, 0, sizeof(metal_pool));
     metal_pool.count = 1;  // 0 reserved
@@ -410,6 +412,11 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
     } else {
         [cmd waitUntilCompleted];  // TODO: can remove this with proper dependency tracking
     }
+
+    // Release temporary contiguous copies (prevents GPU memory leak)
+    tmp_a = nil;
+    tmp_b = nil;
+
     thvm_prof_record(UOP_MM, t0);
 }
 
@@ -433,6 +440,36 @@ static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
     u64 psizes[] = { sizeof(u32) };
     dispatch_1d(pipe, bufs, 2, params, psizes, 1, dst_numel);
     thvm_prof_record(uop, t0);
+}
+
+// ============================================================
+// Fused MUL+SUM — called from thvm_reduce pattern match
+// ============================================================
+
+typedef struct {
+    uint32_t reduce_dim;
+    uint32_t reduce_stride_a;
+    uint32_t reduce_stride_b;
+} MulReduceParams;
+
+void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
+                          u32 a_buf, const View *av,
+                          u32 b_buf, const View *bv,
+                          const View *ov,
+                          u32 reduce_dim,
+                          u32 reduce_stride_a,
+                          u32 reduce_stride_b) {
+    u64 t0 = thvm_prof_tick();
+    ViewParams avp = view_to_params(av);
+    ViewParams bvp = view_to_params(bv);
+    ViewParams ovp = view_to_params(ov);
+    MulReduceParams rp = {reduce_dim, reduce_stride_a, reduce_stride_b};
+
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a_buf], metal_pool.bufs[b_buf] };
+    const void *params[] = { &avp, &bvp, &ovp, &rp };
+    u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams), sizeof(ViewParams), sizeof(MulReduceParams) };
+    dispatch_1d(pipe_mul_reduce_sum, bufs, 3, params, psizes, 4, dst_numel);
+    thvm_prof_record(UOP_SUM, t0);
 }
 
 static void metal_pool_reset(u32 keep) {

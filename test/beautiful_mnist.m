@@ -159,6 +159,7 @@ int main(void) {
     if (max_itrs) printf("  ⚡ Interaction limit: %llu\n", (unsigned long long)max_itrs);
 
     for (u32 step = 0; step < n_steps; step++) {
+      @autoreleasepool {
         if (max_itrs && ctx->itrs >= max_itrs) {
             printf("\n  ⚡ Hit interaction limit (%llu itrs) at step %u\n",
                    (unsigned long long)ctx->itrs, step);
@@ -175,6 +176,10 @@ int main(void) {
 
         // === FORWARD PHASE ===
         thvm_prof_phase(PHASE_FORWARD);
+
+        // Begin GPU command buffer batching — all dispatches until end_batch
+        // go into one command buffer (eliminates ~50 GPU syncs per step)
+        if (ctx->backend->begin_batch) ctx->backend->begin_batch();
 
         // Batch via thvm_shrink — source UOp, no memcpy
         u32 bi = step % n_batches;
@@ -194,12 +199,18 @@ int main(void) {
         Term loss = cross_entropy_loss(ctx, logits, by, BS, 10);
         thvm_stop_recording(ctx);
 
+        // Flush GPU work before CPU reads loss value
+        if (ctx->backend->end_batch) ctx->backend->end_batch();
+
         // Read loss value for printing
         f32 *loss_host = thvm_to_host(ctx, thvm_reduce(ctx, loss));
         f32 loss_val = loss_host[0];
 
         // === BACKWARD PHASE ===
         thvm_prof_phase(PHASE_BACKWARD);
+
+        // Re-batch for gradient computation + adam
+        if (ctx->backend->begin_batch) ctx->backend->begin_batch();
 
         // Backward — IC autograd: compute each param gradient via thvm_grad
         // Each gradient is a lazy IC term, reduced through standard engine
@@ -214,6 +225,9 @@ int main(void) {
         thvm_prof_phase(PHASE_ADAM);
         adam_step(ctx, &opt, grad_ids);
 
+        // Flush all GPU work
+        if (ctx->backend->end_batch) ctx->backend->end_batch();
+
         f32 ms = 1000.0f * (f32)(clock() - t0) / (f32)CLOCKS_PER_SEC;
         printf("  step %3u/%u  loss=%.4f  lr=%.5f  (%.0fms)  tensors=%u  itrs=%llu\n",
                step, n_steps, loss_val, opt.lr, ms, ctx->tensor_count,
@@ -227,12 +241,15 @@ int main(void) {
         // Per-step profile report
         if (ctx->backend && ctx->backend->profile_report)
             ctx->backend->profile_report();
+      } // @autoreleasepool
     }
 
     // Eval
     printf("\n  Evaluating test set...\n");
     Term test_data = thvm_tensor(ctx, data.test_images,
         (Shape){.dims={data.n_test, 1, 28, 28}, .rank=4});
+    // Watermark: preserve test_data across reset calls
+    u32 eval_keep = ctx->tensor_count;
     u32 correct = 0, tbs = 64, tb = data.n_test / tbs;
     for (u32 b = 0; b < tb; b++) {
         Term x = thvm_shrink(ctx, test_data,
@@ -240,7 +257,7 @@ int main(void) {
         Term logits = thvm_sequential(ctx, x, model, N_LAYERS, tbs, 0);
         f32 acc = thvm_eval_accuracy(ctx, logits, &data.test_labels[b*tbs], tbs, 10);
         correct += (u32)(acc * (f32)tbs / 100.0f);
-        thvm_reset(ctx, n_weights);
+        thvm_reset(ctx, eval_keep);
     }
     f32 acc = 100.0f * (f32)correct / (f32)(tb * tbs);
     printf("\n  Test accuracy: %.1f%% (%u/%u)\n", acc, correct, tb * tbs);

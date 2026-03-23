@@ -327,7 +327,7 @@ Completed. TinyHVM is a standalone C library (~4700 LoC) with:
 - **Metal backend** (`metal.m`): Compute shaders + MPS matmul, `StorageModeShared` for zero-copy on Apple Silicon, command buffer batching
 - **23 UOps** (aligned with [tinyspec](https://github.com/tinygrad/tinyspec)): movement (reshape/permute/expand/shrink/pad), elementwise (neg/exp/log/relu/sqrt/cast + add/mul/div/sub/max/cmp), reduce (sum/rmax), matmul
 - **Broadcasting**: Full numpy-style shape broadcasting with stride manipulation
-- **Tests**: 93/93 unit tests passing on both CPU and Metal
+- **Tests**: 127/127 unit tests passing on both CPU and Metal
 
 ```
 src/tinyhvm.h      409 lines  — types, constants, API, profiling, Layer abstraction
@@ -344,21 +344,22 @@ test/beautiful_mnist.m  281 lines — CNN MNIST training (96.2% accuracy)
 ### Phase 2: Autograd & Training ✅
 
 Completed:
-- **Graph-level gradient** (`thvm_grad`): JAX-style — returns a lazy Term that, when reduced, computes ∂y/∂x. Supports `grad(grad(f))` via composable lazy graph construction
+- **IC-native autograd** (`thvm_grad`): JAX-style — lazy Term that reduces to ∂y/∂x. Supports `grad(grad(f))`. Removed old `thvm_backward` tape walk in favor of pure IC reduction
 - **Provenance tracking**: `TensorMeta.creator_op` + `src_ids[]` — no separate tape needed
-- **Gradient rules**: add, sub, mul, matmul (with transpose), relu (with mask)
+- **Gradient rules**: add, sub, mul, div, matmul (with transpose), relu, exp, log, sum, rmax, expand, reshape, permute, shrink, pad, pool_gather
+- **Gradient fixes**: 6 bugs fixed — SUM reduction for chained reduce, `thvm_to_host` strided copy for non-contiguous views, `tensor_reduce_sum_to` buffer overrun, broadcast ADD/SUB gradients, SUM/RMAX gradient stride preservation
 - **SGD training**: XOR 2-layer MLP converges in 7 epochs
-- **Engineering study**: Read ggml and tinygrad source, documented patterns in `engineering_reference.md`
 - **CNN training (beautiful_mnist)**: Conv2d + BatchNorm + MaxPool + Linear layers via direct Metal dispatch. Loss 2.92→0.11, 96.2% test accuracy, ~46ms/step
-- **Device-agnostic profiling**: `ThvmProfile`, `thvm_prof_tick/record`, `THVM_PROFILE=1` for tinygrad-style kernel breakdown
-- **Layer abstraction**: Tagged union `Layer` (Conv2d/BN/MaxPool/Flatten/Linear/Fn) + `thvm_sequential`
-- **Eval helpers**: `thvm_argmax`, `thvm_eval_accuracy`
-- **Command buffer batching**: `begin_batch`/`end_batch` in backend vtable
+- **Device-agnostic profiling**: `ThvmProfile`, `thvm_prof_tick/record`, `THVM_PROFILE=1`
+- **Layer abstraction**: Tagged union `Layer` + `thvm_sequential`
 
-### Phase 3: Kernel Fusion (planned)
-1. Graph-level `backend.graph_compute(cgraph)` interface (ggml pattern)
-2. Metal function constants for generic unary/binary kernels
-3. Fusion-aware scheduling via interaction net rewriting
+### Phase 3: Kernel Fusion (in progress)
+
+Prototype implemented (`THVM_FUSE=1` env var, 127/127 tests pass):
+- **IC fusion via intermediate accumulator nodes**: `FuseState` absorbs unary elementwise ops pairwise into a reduce, emitting one fused CPU dispatch
+- **Design doc**: `resources/ic_fusion.md` — tinygrad PatternMatcher analysis, state machine, projected 98% memory reduction for conv intermediates
+- **Current scope**: unary+reduce (e.g. `SUM(RELU(x))`), binary ops excluded (needs broadcast-aware indexing)
+- **Next**: binary op fusion with stride-aware indexing, Metal codegen for fused kernels, gradient-safe fusion
 
 ### Phase 4: Full Framework (planned)
 1. Quantization support (f16 at minimum)

@@ -2104,19 +2104,21 @@ void thvm_stop_recording(TinyHVM *ctx) {
 // No tape, no loop, no explicit reduce — backward IS reduction.
 
 Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
-    // Seed gradient = ones with same shape as y.
-    // y must be a realized TAG_TEN at this point (caller contract).
-    // No thvm_reduce call here — the inet loop handles all evaluation.
-    assert(term_tag(y) == TAG_TEN && "thvm_grad: y must be realized before calling thvm_grad");
-    Term yr = y;
+    // Reduce y to get its shape for the ones-gradient seed.
+    // This is the single necessary force-eval in the backward pass:
+    // the seed must match y's output shape.
+    Term yr = thvm_reduce(ctx, y);
     Term seed;
-    {
+    if (term_tag(yr) == TAG_TEN) {
         u32 y_id = (u32)term_val(yr);
         seed = term_ten(tensor_fill(ctx, ctx->tensors[y_id].view.shape, 1.0f),
                         ctx->tensors[y_id].dtype);
+    } else {
+        f32 one = 1.0f;
+        seed = thvm_tensor(ctx, &one, SHAPE(1));
     }
     u64 loc = heap_alloc(ctx, 3);
-    heap_set(ctx, loc, yr);
+    heap_set(ctx, loc,     yr);
     heap_set(ctx, loc + 1, seed);
     heap_set(ctx, loc + 2, x);
     return term_new(TAG_TOP, UOP_GRAD, loc);

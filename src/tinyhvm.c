@@ -833,8 +833,6 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
 
             // === FUSED MUL+SUM: pattern match SUM(MUL(a, b)) ===
             // Avoids materializing the huge MUL intermediate buffer.
-            // Skip if any MUL input requires_grad: backward must traverse through
-            // the MUL node separately, so we can't collapse it into the SUM.
             if (uop == UOP_SUM) {
                 Term child = heap_read(ctx, loc);
                 if (term_tag(child) == TAG_TOP && term_ext(child) == UOP_MUL) {
@@ -846,10 +844,13 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                         u32 mb_id = (u32)term_val(mb_t);
                         TensorMeta *ma = &ctx->tensors[ma_id];
                         TensorMeta *mb = &ctx->tensors[mb_id];
-                        // Only fuse when no input is on a gradient path
+                        // Fuse only when no input is on a gradient path.
+                        // When either input requires_grad, skip fusion: the is_fused GRAD
+                        // handler expects gy to have a scalar/seed shape, but nested SUMs pass
+                        // arbitrary keepdims shapes (e.g. [16,1]) causing reshape failures.
+                        // TODO: add UOP_FUSED_SUM_MUL that records its reduce axes so the
+                        //       GRAD handler can expand gy correctly regardless of gy's shape.
                         if (!ma->requires_grad && !mb->requires_grad) {
-
-                        // Compute broadcast shapes
                         View av_bc, bv_bc;
                         u32 out_shape[MAX_DIM];
                         u32 out_ndim;
@@ -960,8 +961,8 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                                 ctx->itrs++;
                                 MEMO_RETURN(term_ten(dst_id, ma->dtype));
                             }
-                        }
-                        } // end !requires_grad
+                        } // if (ok)
+                        } // !requires_grad
                     }
                 }
             }

@@ -34,3 +34,7 @@ test_mnist_cnn
 beautiful_mnist
 tinyspec/
 beautiful_mnist_debug
+test_mlp_grad
+test_mlp_cpu
+test_grad_check
+test_low_lr

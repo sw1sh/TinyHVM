@@ -218,12 +218,37 @@ int main(void) {
 
         // Single-pass backward: compute ALL param gradients in one traversal
         Term grad_terms[n_params];
+        clock_t tb0 = clock();
         thvm_backward(ctx, loss_reduced, params, grad_terms, n_params);
+        clock_t tb1 = clock();
         u32 grad_ids[n_params];
         for (u32 i = 0; i < n_params; i++) {
             Term g = thvm_reduce(ctx, grad_terms[i]);
             grad_ids[i] = (term_tag(g) == TAG_TEN) ? (u32)term_val(g) : 0;
         }
+        clock_t tb2 = clock();
+        if (step < 2) {
+            printf("  backward: graph=%.0fms reduce=%.0fms\n",
+                1000.0*(tb1-tb0)/(double)CLOCKS_PER_SEC,
+                1000.0*(tb2-tb1)/(double)CLOCKS_PER_SEC);
+            // Debug: check gradient health
+            int n_era = 0, n_ten = 0;
+            for (u32 i = 0; i < n_params; i++) {
+                if (term_tag(grad_terms[i]) == TAG_ERA) n_era++;
+                else n_ten++;
+            }
+            printf("  grads: %d TAG_TEN, %d TAG_ERA\n", n_ten, n_era);
+            if (grad_ids[0]) {
+                f32 gd[32]; u32 gn = ctx->tensors[grad_ids[0]].view.numel;
+                if (gn > 32) gn = 32;
+                ctx->backend->buf_read(ctx->tensors[grad_ids[0]].buf_id, gd, gn*sizeof(f32));
+                f32 gnorm = 0; for (u32 j=0;j<gn;j++) gnorm += gd[j]*gd[j];
+                printf("  grad[0] norm=%.6f first=%.6f\n", sqrtf(gnorm), gd[0]);
+            } else {
+                printf("  grad[0] = NO GRADIENT\n");
+            }
+        }
+
 
 
         // === ADAM PHASE ===

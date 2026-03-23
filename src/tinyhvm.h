@@ -118,6 +118,7 @@ typedef u64 Term;
 
 // Internal ops — not part of tinyspec, only used for autograd provenance
 #define UOP_POOL_GATHER 100  // sliding window gather (im2col equivalent)
+#define UOP_GRAD        101  // IC gradient: DUP-op interaction in the reducer
 
 // UOp name table (device-agnostic)
 static const char *uop_names[] = {
@@ -431,6 +432,9 @@ typedef struct {
     Backend *backend;
     u64         itrs;       // interaction count
     u8          recording;  // 1 if recording forward ops for grad
+    // DUP-SUP memo: cache reduced TAG_TOP results by heap location
+    Term       *reduce_memo;   // array[MAX_HEAP], 0 = not cached
+    u64         reduce_memo_size;
 } TinyHVM;
 
 // ============================================================

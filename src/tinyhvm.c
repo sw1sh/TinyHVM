@@ -538,7 +538,32 @@ static Term dispatch_fused(TinyHVM *ctx, FuseState *fs) {
 // reduce.c — WNF reduction engine
 // ============================================================
 
+// Forward declarations for UOP_GRAD handler
+static u32 tensor_fill(TinyHVM *ctx, Shape s, f32 val);
+static u32 tensor_transpose_2d(TinyHVM *ctx, u32 src_id);
+static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target);
+
 Term thvm_reduce(TinyHVM *ctx, Term t) {
+    // DUP-SUP annihilation: cache TAG_TOP reductions by heap location.
+    // Shared sub-expressions (e.g., K² copies of same grad in col2im)
+    // are reduced once and cached.
+    u64 memo_loc = 0;  // set for TAG_TOP to enable caching
+    if (term_tag(t) == TAG_TOP) {
+        memo_loc = term_val(t);
+        if (memo_loc < ctx->reduce_memo_size && ctx->reduce_memo[memo_loc] != 0) {
+            return ctx->reduce_memo[memo_loc];  // cached
+        }
+    }
+    // Macro: cache result for TAG_TOP before returning.
+    // Loop until WNF: if the result is still a TAG_TOP (pending interaction), keep reducing.
+    #define MEMO_RETURN(result) do { \
+        Term _r = (result); \
+        while (term_tag(_r) == TAG_TOP) _r = thvm_reduce(ctx, _r); \
+        if (memo_loc && memo_loc < ctx->reduce_memo_size) \
+            ctx->reduce_memo[memo_loc] = _r; \
+        return _r; \
+    } while(0)
+
     u32 tag = term_tag(t);
 
     switch (tag) {
@@ -546,20 +571,272 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             u32 uop = term_ext(t);
             u64 loc = term_val(t);
 
+            // === UOP_GRAD: DUP-op interaction (IC-native backward) ===
+            // GRAD(y, grad_y, x) = "given ∂L/∂y = grad_y, compute ∂L/∂x"
+            // No reduce — everything lazy. The chain rule produces new TOP nodes.
+            if (uop == UOP_GRAD) {
+                Term y  = heap_read(ctx, loc);
+                Term gy = heap_read(ctx, loc + 1);
+                Term x  = heap_read(ctx, loc + 2);
+
+                // Reachability check: does x_id appear in the provenance subtree of y_id?
+                // BFS over provenance — prunes dead branches in binary ops.
+                #define REACHES(y_id_, x_id_) ({ \
+                    int _found = ((y_id_) == (x_id_)); \
+                    if (!_found && ctx->tensors[y_id_].creator_op) { \
+                        u32 _stk[256], _sp=0; \
+                        _stk[_sp++] = (y_id_); \
+                        while (_sp && !_found) { \
+                            u32 _n = _stk[--_sp]; \
+                            if (_n == (x_id_)) { _found=1; break; } \
+                            TensorMeta *_m = &ctx->tensors[_n]; \
+                            if (!_m->creator_op) continue; \
+                            u32 _cop = _m->creator_op; \
+                            int _bin = (_cop==UOP_ADD||_cop==UOP_SUB||_cop==UOP_MUL|| \
+                                        _cop==UOP_DIV||_cop==UOP_MAX||_cop==UOP_MM|| \
+                                        _cop==UOP_CMP||_cop==UOP_SUM); \
+                            if (_sp<254) { _stk[_sp++]=_m->src_ids[0]; \
+                            if (_bin && _sp<254) _stk[_sp++]=_m->src_ids[1]; } \
+                        } \
+                    } \
+                    _found; })
+
+
+                if (term_tag(y) == TAG_TEN) {
+                    u32 y_id = (u32)term_val(y);
+                    u32 x_id = (term_tag(x) == TAG_TEN) ? (u32)term_val(x) : ~0u;
+
+                    // Base case: y == x → return grad_y
+                    if (term_tag(x) == TAG_TEN && (u32)term_val(x) == y_id)
+                        MEMO_RETURN(thvm_reduce(ctx, gy));
+
+                    TensorMeta *my = &ctx->tensors[y_id];
+
+                    // Leaf (no provenance, not x) → ERA (no gradient path)
+                    if (!my->creator_op) {
+                        MEMO_RETURN(term_era());
+                    }
+
+                    // DUP-op interaction via provenance
+                    u32 cop = my->creator_op;
+                    u32 aid = my->src_ids[0], bid = my->src_ids[1];
+                    TensorMeta *ma = &ctx->tensors[aid];
+                    Term at = term_ten(aid, ma->dtype);
+
+                    int is_bin = (cop==UOP_ADD||cop==UOP_SUB||cop==UOP_MUL||
+                                  cop==UOP_DIV||cop==UOP_MAX||cop==UOP_MM||cop==UOP_CMP);
+                    TensorMeta *mb_p = is_bin ? &ctx->tensors[bid] : NULL;
+                    Term bt = is_bin ? term_ten(bid, mb_p->dtype) : term_era();
+
+                    // Helper macro: create recursive GRAD term (3 heap slots)
+                    #define GRAD3(y_,gy_,x_) ({ \
+                        u64 _l = heap_alloc(ctx, 3); \
+                        heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
+                        term_new(TAG_TOP, UOP_GRAD, _l); })
+                    // Combine two gradient branches — skip ERA (no-path) operands
+                    #define GRAD_ADD(ga, gb) ({ \
+                        Term _ga = (ga), _gb = (gb); \
+                        term_tag(_ga)==TAG_ERA ? _gb : \
+                        term_tag(_gb)==TAG_ERA ? _ga : \
+                        thvm_op(ctx, UOP_ADD, _ga, _gb); })
+
+                    switch (cop) {
+                        case UOP_ADD: {
+                            Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
+                            Term db = sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape);
+                            MEMO_RETURN((REACHES(aid,x_id) ? (REACHES(bid,x_id) ? GRAD_ADD(GRAD3(at,da,x),GRAD3(bt,db,x)) : GRAD3(at,da,x)) : (REACHES(bid,x_id) ? GRAD3(bt,db,x) : term_era())));
+                        }
+                        case UOP_SUB: {
+                            Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
+                            Term neg = thvm_op(ctx, UOP_NEG,
+                                sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape), term_era());
+                            MEMO_RETURN((REACHES(aid,x_id) ? (REACHES(bid,x_id) ? GRAD_ADD(GRAD3(at,da,x),GRAD3(bt,neg,x)) : GRAD3(at,da,x)) : (REACHES(bid,x_id) ? GRAD3(bt,neg,x) : term_era())));
+                        }
+                        case UOP_MUL: {
+                            Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt),
+                                                   my->view.shape, ma->view.shape);
+                            Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at),
+                                                   my->view.shape, mb_p->view.shape);
+                            MEMO_RETURN((REACHES(aid,x_id) ? (REACHES(bid,x_id) ? GRAD_ADD(GRAD3(at,da,x),GRAD3(bt,db,x)) : GRAD3(at,da,x)) : (REACHES(bid,x_id) ? GRAD3(bt,db,x) : term_era())));
+                        }
+                        case UOP_MM: {
+                            u32 bt_id = tensor_transpose_2d(ctx, bid);
+                            u32 at_id = tensor_transpose_2d(ctx, aid);
+                            Term da = thvm_op(ctx, UOP_MM, gy, term_ten(bt_id, mb_p->dtype));
+                            Term db = thvm_op(ctx, UOP_MM, term_ten(at_id, ma->dtype), gy);
+                            MEMO_RETURN((REACHES(aid,x_id) ? (REACHES(bid,x_id) ? GRAD_ADD(GRAD3(at,da,x),GRAD3(bt,db,x)) : GRAD3(at,da,x)) : (REACHES(bid,x_id) ? GRAD3(bt,db,x) : term_era())));
+                        }
+                        case UOP_RELU: {
+                            f32 z = 0.0f;
+                            Term mask = thvm_op(ctx, UOP_CMP, at, thvm_tensor(ctx, &z, SHAPE(1)));
+                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, mask), x));
+                        }
+                        case UOP_NEG:
+                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_NEG, gy, term_era()), x));
+                        case UOP_EXP:
+                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, y), x));
+                        case UOP_LOG:
+                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, at), x));
+                        case UOP_SQRT: {
+                            f32 two = 2.0f;
+                            Term denom = thvm_op(ctx, UOP_MUL, thvm_tensor(ctx, &two, SHAPE(1)), y);
+                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, denom), x));
+                        }
+                        case UOP_DIV: {
+                            Term da = thvm_op(ctx, UOP_DIV, gy, bt);
+                            Term ng = thvm_op(ctx, UOP_NEG, gy, term_era());
+                            Term db = thvm_op(ctx, UOP_DIV,
+                                thvm_op(ctx, UOP_MUL, ng, at),
+                                thvm_op(ctx, UOP_MUL, bt, bt));
+                            MEMO_RETURN((REACHES(aid,x_id) ? (REACHES(bid,x_id) ? GRAD_ADD(GRAD3(at,da,x),GRAD3(bt,db,x)) : GRAD3(at,da,x)) : (REACHES(bid,x_id) ? GRAD3(bt,db,x) : term_era())));
+                        }
+                        case UOP_MAX: {
+                            Term mask = thvm_op(ctx, UOP_CMP, y, at);
+                            Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, mask),
+                                                   my->view.shape, ma->view.shape);
+                            f32 one = 1.0f;
+                            Term inv = thvm_op(ctx, UOP_SUB, thvm_tensor(ctx, &one, SHAPE(1)), mask);
+                            Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, inv),
+                                                   my->view.shape, mb_p->view.shape);
+                            MEMO_RETURN((REACHES(aid,x_id) ? (REACHES(bid,x_id) ? GRAD_ADD(GRAD3(at,da,x),GRAD3(bt,db,x)) : GRAD3(at,da,x)) : (REACHES(bid,x_id) ? GRAD3(bt,db,x) : term_era())));
+                        }
+                        case UOP_SUM: {
+                            // Distinguish fused SUM·MUL (b = MUL operand, rank>1) from plain SUM
+                            int is_fused = mb_p && mb_p->view.shape.rank > 1;
+                            if (is_fused) {
+                                Shape ms = ma->view.shape;
+                                for (u32 d = 0; d < ms.rank; d++)
+                                    if (mb_p->view.shape.dims[d] > ms.dims[d])
+                                        ms.dims[d] = mb_p->view.shape.dims[d];
+                                u32 os[MAX_DIM];
+                                for (u32 d = 0; d < ms.rank; d++) os[d] = 1;
+                                Term gbc = thvm_expand(ctx,
+                                    thvm_reshape(ctx, gy, shape_of(os, ms.rank)), ms);
+                                Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gbc, bt),
+                                                       ms, ma->view.shape);
+                                Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gbc, at),
+                                                       ms, mb_p->view.shape);
+                                MEMO_RETURN((REACHES(aid,x_id) ? (REACHES(bid,x_id) ? GRAD_ADD(GRAD3(at,da,x),GRAD3(bt,db,x)) : GRAD3(at,da,x)) : (REACHES(bid,x_id) ? GRAD3(bt,db,x) : term_era())));
+                            } else {
+                                u32 os[MAX_DIM];
+                                for (u32 d = 0; d < ma->view.shape.rank; d++) os[d] = 1;
+                                Term g = thvm_expand(ctx,
+                                    thvm_reshape(ctx, gy, shape_of(os, ma->view.shape.rank)),
+                                    ma->view.shape);
+                                MEMO_RETURN(GRAD3(at, g, x));
+                            }
+                        }
+                        case UOP_RMAX: {
+                            Term max_bc = thvm_expand(ctx,
+                                thvm_reshape(ctx, y, my->view.shape), ma->view.shape);
+                            Term mask = thvm_op(ctx, UOP_CMP, at, max_bc);
+                            Term gbc = thvm_expand(ctx, gy, ma->view.shape);
+                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_MUL, gbc, mask), x));
+                        }
+                        case UOP_RESHAPE:
+                            MEMO_RETURN(GRAD3(at, thvm_reshape(ctx, gy, ma->view.shape), x));
+                        case UOP_EXPAND:
+                            MEMO_RETURN(GRAD3(at,
+                                sum_to_shape(ctx, gy, my->view.shape, ma->view.shape), x));
+                        case UOP_PERMUTE: {
+                            u32 rank = ctx->tensors[bid].view.numel;
+                            f32 *af = malloc(rank * sizeof(f32));
+                            ctx->backend->buf_read(ctx->tensors[bid].buf_id, af, rank*sizeof(f32));
+                            u32 inv[MAX_DIM];
+                            for (u32 j = 0; j < rank; j++) inv[(u32)af[j]] = j;
+                            free(af);
+                            MEMO_RETURN(GRAD3(at, thvm_permute(ctx, gy, inv, rank), x));
+                        }
+                        case UOP_PAD: {
+                            TensorMeta *mp = &ctx->tensors[bid];
+                            u32 nd = mp->view.numel / 2;
+                            f32 *pf = malloc(mp->view.numel * sizeof(f32));
+                            ctx->backend->buf_read(mp->buf_id, pf, mp->view.numel*sizeof(f32));
+                            u32 sp[MAX_DIM*2];
+                            for (u32 j=0;j<nd;j++){sp[j*2]=(u32)pf[j*2];sp[j*2+1]=(u32)pf[j*2]+ma->view.shape.dims[j];}
+                            free(pf);
+                            MEMO_RETURN(GRAD3(at, thvm_shrink(ctx, gy, sp, nd), x));
+                        }
+                        case UOP_SHRINK: {
+                            TensorMeta *ms2 = &ctx->tensors[bid];
+                            u32 nd = ms2->view.numel / 2;
+                            f32 *sf = malloc(ms2->view.numel * sizeof(f32));
+                            ctx->backend->buf_read(ms2->buf_id, sf, ms2->view.numel*sizeof(f32));
+                            u32 pp[MAX_DIM*2];
+                            for (u32 j=0;j<nd;j++){pp[j*2]=(u32)sf[j*2];pp[j*2+1]=ma->view.shape.dims[j]-(u32)sf[j*2+1];}
+                            free(sf);
+                            MEMO_RETURN(GRAD3(at, thvm_pad(ctx, gy, pp, nd), x));
+                        }
+                        case UOP_POOL_GATHER: {
+                            TensorMeta *mp = &ctx->tensors[bid];
+                            u32 plen = mp->view.numel;
+                            f32 *pf = malloc(plen * sizeof(f32));
+                            ctx->backend->buf_read(mp->buf_id, pf, plen*sizeof(f32));
+                            u32 ns=(u32)pf[0], pk[2],ps[2],pi[2],po[2],pbd;
+                            for (u32 j=0;j<ns;j++){pk[j]=(u32)pf[1+j];ps[j]=(u32)pf[1+ns+j];pi[j]=(u32)pf[1+2*ns+j];po[j]=(u32)pf[1+3*ns+j];}
+                            pbd=(u32)pf[1+4*ns]; free(pf);
+                            assert(ns==2);
+                            if (ps[0]==pk[0]&&ps[1]==pk[1]) {
+                                u32 pa[MAX_DIM];
+                                for(u32 j=0;j<pbd;j++)pa[j]=j;
+                                pa[pbd]=pbd;pa[pbd+1]=pbd+2;pa[pbd+2]=pbd+1;pa[pbd+3]=pbd+3;
+                                MEMO_RETURN(GRAD3(at,
+                                    thvm_reshape(ctx,thvm_permute(ctx,gy,pa,pbd+4),ma->view.shape),x));
+                            } else {
+                                u32 bd[MAX_DIM]; for(u32 j=0;j<pbd;j++)bd[j]=ma->view.shape.dims[j];
+                                Term dx=term_era();
+                                for(u32 kh=0;kh<pk[0];kh++) for(u32 kw=0;kw<pk[1];kw++){
+                                    u32 sh[MAX_DIM*2];
+                                    for(u32 j=0;j<pbd;j++){sh[j*2]=0;sh[j*2+1]=bd[j];}
+                                    sh[pbd*2]=0;sh[pbd*2+1]=po[0];sh[(pbd+1)*2]=0;sh[(pbd+1)*2+1]=po[1];
+                                    sh[(pbd+2)*2]=kh;sh[(pbd+2)*2+1]=kh+1;sh[(pbd+3)*2]=kw;sh[(pbd+3)*2+1]=kw+1;
+                                    Term sl=thvm_shrink(ctx,gy,sh,pbd+4);
+                                    u32 rd[MAX_DIM],rr=pbd+2; for(u32 j=0;j<pbd;j++)rd[j]=bd[j];
+                                    rd[pbd]=po[0];rd[pbd+1]=po[1];
+                                    Term s2=thvm_reshape(ctx,sl,shape_of(rd,rr));
+                                    assert(ps[0]==1&&ps[1]==1);
+                                    u32 pp2[MAX_DIM*2]; for(u32 j=0;j<pbd;j++){pp2[j*2]=0;pp2[j*2+1]=0;}
+                                    pp2[pbd*2]=kh;pp2[pbd*2+1]=pi[0]-po[0]-kh;
+                                    pp2[(pbd+1)*2]=kw;pp2[(pbd+1)*2+1]=pi[1]-po[1]-kw;
+                                    Term pd=thvm_pad(ctx,s2,pp2,rr);
+                                    dx=(term_tag(dx)==TAG_ERA)?pd:thvm_op(ctx,UOP_ADD,dx,pd);
+                                }
+                                MEMO_RETURN(GRAD3(at, dx, x));
+                            }
+                        }
+                        default: {
+                            // Unknown op → zero
+                            u32 zid = tensor_fill(ctx, my->view.shape, 0.0f);
+                            MEMO_RETURN(term_ten(zid, my->dtype));
+                        }
+                    }
+                    #undef GRAD3
+                    #undef GRAD_ADD
+                    #undef REACHES
+                }
+                // y is not TAG_TEN (still lazy or ERA) → reduce y first, then retry
+                if (term_tag(y) == TAG_TOP) {
+                    Term yr = thvm_reduce(ctx, y);
+                    heap_set(ctx, loc, yr);
+                    return thvm_reduce(ctx, t); // retry with reduced y
+                }
+                MEMO_RETURN(term_era());
+            }
+
             // === IC FUSION: try to absorb elementwise chain into reduce ===
             // Opt-in via THVM_FUSE=1 env var (prototype)
             // Skip during gradient recording — gradient graphs are complex
             if ((uop == UOP_SUM || uop == UOP_RMAX) && !ctx->recording && getenv("THVM_FUSE")) {
                 FuseState fs = {0};
                 if (try_fuse(ctx, t, &fs) && fs.n_ops >= 2) {
-                    return dispatch_fused(ctx, &fs);
+                    MEMO_RETURN(dispatch_fused(ctx, &fs));
                 }
             }
 
             // === FUSED MUL+SUM: pattern match SUM(MUL(a, b)) ===
             // Avoids materializing the huge MUL intermediate buffer.
-            // Skip when recording autograd: backward needs separate MUL/SUM records
-            // to compute correct gradients through both operands.
+            // Skip if any MUL input requires_grad: backward must traverse through
+            // the MUL node separately, so we can't collapse it into the SUM.
             if (uop == UOP_SUM) {
                 Term child = heap_read(ctx, loc);
                 if (term_tag(child) == TAG_TOP && term_ext(child) == UOP_MUL) {
@@ -571,6 +848,8 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                         u32 mb_id = (u32)term_val(mb_t);
                         TensorMeta *ma = &ctx->tensors[ma_id];
                         TensorMeta *mb = &ctx->tensors[mb_id];
+                        // Only fuse when no input is on a gradient path
+                        if (!ma->requires_grad && !mb->requires_grad) {
 
                         // Compute broadcast shapes
                         View av_bc, bv_bc;
@@ -628,16 +907,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                                 u32 dst_id = tensor_create(ctx, dst_s, ma->dtype);
                                 TensorMeta *md = &ctx->tensors[dst_id];
 
-                                // Record provenance for autograd
-                                if (ctx->recording) {
-                                    int needs = ma->requires_grad || mb->requires_grad;
-                                    if (needs) {
-                                        md->requires_grad = 1;
-                                        md->creator_op = UOP_SUM;
-                                        md->src_ids[0] = ma_id;
-                                        md->src_ids[1] = mb_id;
-                                    }
-                                }
+                                // No provenance needed — inputs have no requires_grad
 
                                 // Dispatch: Metal or CPU fallback
                                 if (ctx->backend == &metal_backend) {
@@ -690,9 +960,10 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                                     free(a_ptr); free(b_ptr); free(dst_ptr);
                                 }
                                 ctx->itrs++;
-                                return term_ten(dst_id, ma->dtype);
+                                MEMO_RETURN(term_ten(dst_id, ma->dtype));
                             }
                         }
+                        } // end !requires_grad
                     }
                 }
             }
@@ -837,7 +1108,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                             md->src_ids[1] = b_id;
                         }
                         ctx->itrs++;
-                        return term_ten(dst_id, ma->dtype);
+                        MEMO_RETURN(term_ten(dst_id, ma->dtype));
                     }
                     default:
                         assert(0 && "unknown movement op");
@@ -853,7 +1124,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                     md->src_ids[1] = b_id;
                 }
                 ctx->itrs++;
-                return term_ten(dst_id, ma->dtype);
+                MEMO_RETURN(term_ten(dst_id, ma->dtype));
             }
 
             if (!ctx->backend) return t;
@@ -875,23 +1146,48 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 out_shape[1] = mb->view.shape.dims[1];
                 out_ndim = 2;
             } else if (is_reduce) {
-                // Reduce: find the innermost non-1 dim to collapse
+                // Reduce: check if explicit axes are provided (from thvm_sum_axes)
                 out_ndim = ma->view.shape.rank;
                 for (u32 i = 0; i < out_ndim; i++) out_shape[i] = ma->view.shape.dims[i];
-                // Find the reduce axis: last dim with size > 1
-                int reduce_axis = -1;
-                for (int i = (int)out_ndim - 1; i >= 0; i--) {
-                    if (out_shape[i] > 1) { reduce_axis = i; break; }
-                }
-                if (reduce_axis >= 0) {
-                    out_shape[reduce_axis] = 1;
+
+                Term sum_arg = heap_read(ctx, loc + 1);
+                if (term_tag(sum_arg) == TAG_TOP || term_tag(sum_arg) == TAG_TEN) {
+                    // Explicit axes from thvm_sum_axes
+                    Term axes_t = thvm_reduce(ctx, sum_arg);
+                    if (term_tag(axes_t) == TAG_TEN) {
+                        u32 ax_id = (u32)term_val(axes_t);
+                        TensorMeta *max_t = &ctx->tensors[ax_id];
+                        u32 n_axes = max_t->view.numel;
+                        f32 *axes_f = malloc(n_axes * sizeof(f32));
+                        ctx->backend->buf_read(max_t->buf_id, axes_f, n_axes * sizeof(f32));
+                        for (u32 i = 0; i < n_axes; i++) {
+                            u32 ax = (u32)axes_f[i];
+                            out_shape[ax] = 1;
+                        }
+                        free(axes_f);
+                    }
                 } else {
-                    // All dims are 1 — nothing to reduce, output = input
-                    out_shape[out_ndim - 1] = 1;
+                    // Old behavior: last non-1 dim
+                    int reduce_axis = -1;
+                    for (int i = (int)out_ndim - 1; i >= 0; i--) {
+                        if (out_shape[i] > 1) { reduce_axis = i; break; }
+                    }
+                    if (reduce_axis >= 0) {
+                        out_shape[reduce_axis] = 1;
+                    } else {
+                        out_shape[out_ndim - 1] = 1;
+                    }
                 }
             } else if (is_binary) {
                 // Binary: broadcast shapes
                 int ok = view_broadcast(&ma->view, &mb->view, &av_bc, &bv_bc, out_shape, &out_ndim);
+                if (!ok) {
+                    printf("broadcast fail: uop=%u a=[", uop);
+                    for (u32 d=0;d<ma->view.shape.rank;d++) printf("%u,",ma->view.shape.dims[d]);
+                    printf("] b=[");
+                    for (u32 d=0;d<mb->view.shape.rank;d++) printf("%u,",mb->view.shape.dims[d]);
+                    printf("]\n");
+                }
                 assert(ok && "shape broadcast failed");
             } else {
                 // Unary: output = input shape
@@ -919,23 +1215,95 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 ctx->backend->op_mm(md->buf_id, ma->buf_id, &ma->view,
                                 mb->buf_id, &mb->view, M, K, N);
             } else if (is_reduce) {
-                // reduce_dim = product of dims from reduce_axis to end
-                // The kernel sees flat [outer × reduce_dim]
-                u32 reduce_dim = 1;
-                int ra = -1;
-                for (int i = (int)ma->view.shape.rank - 1; i >= 0; i--) {
-                    reduce_dim *= ma->view.shape.dims[i];
-                    if (ma->view.shape.dims[i] > 1 && ra < 0) ra = i;
-                    if (ra >= 0 && i <= ra) break;
+                // Check if explicit axes are provided
+                Term sum_arg2 = heap_read(ctx, loc + 1);
+                int has_explicit_axes = (term_tag(sum_arg2) == TAG_TOP || term_tag(sum_arg2) == TAG_TEN);
+                u32 n_explicit = 0;
+                u32 explicit_axes[MAX_DIM];
+
+                if (has_explicit_axes) {
+                    Term axes_t2 = thvm_reduce(ctx, sum_arg2);
+                    if (term_tag(axes_t2) == TAG_TEN) {
+                        u32 ax_id = (u32)term_val(axes_t2);
+                        TensorMeta *axt = &ctx->tensors[ax_id];
+                        n_explicit = axt->view.numel;
+                        f32 *af = malloc(n_explicit * sizeof(f32));
+                        ctx->backend->buf_read(axt->buf_id, af, n_explicit * sizeof(f32));
+                        for (u32 i = 0; i < n_explicit; i++) explicit_axes[i] = (u32)af[i];
+                        free(af);
+                    }
                 }
-                // If we found a non-1 dim, reduce_dim is the product from that dim to end
-                if (ra >= 0) {
-                    reduce_dim = 1;
-                    for (u32 i = (u32)ra; i < ma->view.shape.rank; i++)
+
+                if (n_explicit > 0) {
+                    // Multi-axis reduce: use CPU strided iteration for correctness.
+                    // The generic op_reduce kernel only handles contiguous trailing dims.
+                    // For arbitrary axis combinations, we iterate with strides.
+                    u32 rank = ma->view.shape.rank;
+                    u32 in_numel = ma->view.numel;
+                    u32 out_numel = md->view.numel;
+
+                    u8 is_ra[MAX_DIM] = {0};
+                    for (u32 i = 0; i < n_explicit; i++) is_ra[explicit_axes[i]] = 1;
+
+                    // Read input data
+                    f32 *in_data = malloc(in_numel * sizeof(f32));
+                    if (ctx->backend->end_batch) ctx->backend->end_batch();
+                    ctx->backend->buf_read(ma->buf_id, in_data, in_numel * sizeof(f32));
+                    if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+                    f32 *out_data = calloc(out_numel, sizeof(f32));
+
+                    // Build input strides (row-major)
+                    u32 in_strides[MAX_DIM];
+                    in_strides[rank-1] = 1;
+                    for (int d = (int)rank - 2; d >= 0; d--)
+                        in_strides[d] = in_strides[d+1] * ma->view.shape.dims[d+1];
+
+                    // Build output strides (row-major, with 1s on reduce axes)
+                    u32 out_strides[MAX_DIM];
+                    out_strides[rank-1] = 1;
+                    for (int d = (int)rank - 2; d >= 0; d--)
+                        out_strides[d] = out_strides[d+1] * out_shape[d+1];
+
+                    // Iterate over all input elements, accumulate to output
+                    for (u32 flat = 0; flat < in_numel; flat++) {
+                        // Compute input coords from flat index
+                        u32 coords[MAX_DIM], rem = flat;
+                        for (int d = (int)rank - 1; d >= 0; d--) {
+                            coords[d] = rem % ma->view.shape.dims[d];
+                            rem /= ma->view.shape.dims[d];
+                        }
+                        // Compute output flat index (reduce axes → coord 0)
+                        u32 out_flat = 0;
+                        for (u32 d = 0; d < rank; d++) {
+                            u32 c = is_ra[d] ? 0 : coords[d];
+                            out_flat += c * out_strides[d];
+                        }
+                        if (uop == UOP_SUM) {
+                            out_data[out_flat] += in_data[flat];
+                        } else { // UOP_RMAX
+                            if (in_data[flat] > out_data[out_flat])
+                                out_data[out_flat] = in_data[flat];
+                        }
+                    }
+                    ctx->backend->buf_write(md->buf_id, out_data, out_numel * sizeof(f32));
+                    free(in_data); free(out_data);
+                } else {
+                    // Single-axis reduce: last non-1 dim
+                    u32 reduce_dim = 1;
+                    int ra = -1;
+                    for (int i = (int)ma->view.shape.rank - 1; i >= 0; i--) {
                         reduce_dim *= ma->view.shape.dims[i];
+                        if (ma->view.shape.dims[i] > 1 && ra < 0) ra = i;
+                        if (ra >= 0 && i <= ra) break;
+                    }
+                    if (ra >= 0) {
+                        reduce_dim = 1;
+                        for (u32 i = (u32)ra; i < ma->view.shape.rank; i++)
+                            reduce_dim *= ma->view.shape.dims[i];
+                    }
+                    ctx->backend->op_reduce(uop, md->buf_id, md->view.numel,
+                                            ma->buf_id, ma->view.numel, reduce_dim);
                 }
-                ctx->backend->op_reduce(uop, md->buf_id, md->view.numel,
-                                        ma->buf_id, ma->view.numel, reduce_dim);
             } else if (is_binary) {
                 ctx->backend->op_binary(uop, md->buf_id, &md->view,
                                     ma->buf_id, &av_bc,
@@ -946,7 +1314,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             }
 
             ctx->itrs++;
-            return term_ten(dst_id, ma->dtype);
+            MEMO_RETURN(term_ten(dst_id, ma->dtype));
         }
 
         case TAG_APP: {
@@ -1067,6 +1435,9 @@ TinyHVM *thvm_init(Backend *backend) {
     ctx->heap = calloc(HEAP_CAP, sizeof(Term));
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();  // sentinel: prevent TAG_APP(0) self-loop
+    // DUP-SUP memo: same size as heap, 0 = not cached
+    ctx->reduce_memo = calloc(HEAP_CAP, sizeof(Term));
+    ctx->reduce_memo_size = HEAP_CAP;
     ctx->backend = backend;
     if (backend && backend->init) backend->init();
     return ctx;
@@ -1085,6 +1456,7 @@ void thvm_free(TinyHVM *ctx) {
         if (ctx->tensors[i].host_ptr) free(ctx->tensors[i].host_ptr);
     }
     free(ctx->heap);
+    free(ctx->reduce_memo);
     free(ctx);
 }
 
@@ -1106,6 +1478,8 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
     ctx->tensor_count = keep;
     ctx->heap_pos = 1;  // reset heap (keep weight terms as raw IDs)
     ctx->heap[0] = term_era();  // sentinel
+    // Clear DUP-SUP memo
+    memset(ctx->reduce_memo, 0, ctx->reduce_memo_size * sizeof(Term));
 }
 
 Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {
@@ -1724,65 +2098,59 @@ static u32 tensor_transpose_2d(TinyHVM *ctx, u32 src_id) {
     return (u32)term_val(t);
 }
 
-// Reduce-sum a tensor to target shape (for gradient accumulation after broadcast)
-// Uses UOP_SUM iteratively along broadcast dimensions
-static u32 tensor_reduce_sum_to(TinyHVM *ctx, u32 grad_id, Shape target) {
-    TensorMeta *mg = &ctx->tensors[grad_id];
 
+
+// Sum-to-shape: reduce broadcast dimensions to match target shape.
+// Returns lazy Term (TAG_TOP). No thvm_reduce calls.
+static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target) {
     // Check if shapes already match
-    if (mg->view.shape.rank == target.rank) {
+    if (src_shape.rank == target.rank) {
         int same = 1;
         for (u32 i = 0; i < target.rank; i++)
-            if (mg->view.shape.dims[i] != target.dims[i]) same = 0;
-        if (same) return grad_id;
+            if (src_shape.dims[i] != target.dims[i]) same = 0;
+        if (same) return grad;
     }
 
-    // If same rank, use thvm_sum_axes on dims where grad.shape[d] != target.shape[d]
-    if (mg->view.shape.rank == target.rank) {
-        u32 reduce_axes[MAX_DIM];
-        u32 n_reduce = 0;
+    u32 reduce_axes[MAX_DIM];
+    u32 n_reduce = 0;
+
+    if (src_shape.rank == target.rank) {
+        // Same rank: sum over axes where src is larger than target
         for (u32 d = 0; d < target.rank; d++) {
-            if (mg->view.shape.dims[d] != target.dims[d]) {
+            if (src_shape.dims[d] != target.dims[d])
                 reduce_axes[n_reduce++] = d;
-            }
         }
-        if (n_reduce > 0) {
-            Term g = term_ten(grad_id, mg->dtype);
-            Term summed = thvm_sum_axes(ctx, g, reduce_axes, n_reduce);
-            summed = thvm_reduce(ctx, summed);
-            // Reshape to target (sum_axes produces 1 on reduced dims)
-            Term result = thvm_reshape(ctx, summed, target);
-            result = thvm_reduce(ctx, result);
-            return (u32)term_val(result);
-        }
-    }
-
-    // Different ranks: grad has more leading dims than target
-    // Sum over leading dims, then reduce broadcast dims
-    if (mg->view.shape.rank > target.rank) {
-        u32 n_leading = mg->view.shape.rank - target.rank;
-        u32 reduce_axes[MAX_DIM];
-        u32 n_reduce = 0;
-        // Sum over all leading dims
+    } else if (src_shape.rank > target.rank) {
+        // src has more dims: sum leading dims first
+        u32 n_leading = src_shape.rank - target.rank;
         for (u32 d = 0; d < n_leading; d++)
             reduce_axes[n_reduce++] = d;
-        // Also sum over trailing dims where shapes differ
         for (u32 d = 0; d < target.rank; d++) {
-            if (mg->view.shape.dims[n_leading + d] != target.dims[d])
+            if (src_shape.dims[n_leading + d] != target.dims[d])
                 reduce_axes[n_reduce++] = n_leading + d;
         }
-        Term g = term_ten(grad_id, mg->dtype);
-        Term summed = thvm_sum_axes(ctx, g, reduce_axes, n_reduce);
-        summed = thvm_reduce(ctx, summed);
-        Term result = thvm_reshape(ctx, summed, target);
-        result = thvm_reduce(ctx, result);
-        return (u32)term_val(result);
+    } else {
+        // src.rank < target.rank: src was broadcast from a scalar/reduced form
+        // This happens when gy is a keepdims-reduced shape like [1,1] but
+        // the target has more dims. Just reshape src to target if numel matches or is 1.
+        // Generally this shouldn't happen in correct backward — but handle gracefully.
+        printf("sum_to_shape: src.rank=%u < target.rank=%u src=[", src_shape.rank, target.rank);
+        for (u32 d=0;d<src_shape.rank;d++) printf("%u,",src_shape.dims[d]);
+        printf("] target=[");
+        for (u32 d=0;d<target.rank;d++) printf("%u,",target.dims[d]);
+        printf("]\n");
+        // Reshape grad to target shape (broadcast; assumes numel(src) == 1 or numel matches)
+        if (target.rank > 0) {
+            grad = thvm_reshape(ctx, grad, target);
+        }
+        return grad;
     }
 
-    // Fallback: reshape directly (should not normally reach here)
-    Term result = thvm_reshape(ctx, term_ten(grad_id, mg->dtype), target);
-    result = thvm_reduce(ctx, result);
-    return (u32)term_val(result);
+    if (n_reduce > 0) {
+        grad = thvm_sum_axes(ctx, grad, reduce_axes, n_reduce);
+        grad = thvm_reshape(ctx, grad, target);
+    }
+    return grad;
 }
 
 void thvm_set_requires_grad(TinyHVM *ctx, Term t) {
@@ -1802,574 +2170,39 @@ void thvm_stop_recording(TinyHVM *ctx) {
 
 
 // ============================================================
-// grad.c — Graph-level gradient (JAX-style)
+// grad.c — IC-native autograd (DUP-op interactions in the reducer)
 // ============================================================
 //
-// thvm_grad(ctx, y, x) returns a lazy Term.
-// When reduced, it computes ∂y/∂x.
-// Because gradient ops are built with thvm_op(), they go through
-// thvm_reduce → TAG_TOP dispatch → get taped if recording is on.
-// This means grad(grad(f)) works: reduce the first gradient with
-// recording on, then call thvm_grad again on the result.
-
-
-// Accumulate gradient: grad_map[id] += new_grad (lazy ADD)
-static void grad_graph_accum(TinyHVM *ctx, Term *grad_map, u32 id, Term new_grad) {
-    if (!ctx->tensors[id].requires_grad) return;
-    if (term_tag(grad_map[id]) == TAG_ERA) {
-        grad_map[id] = new_grad;
-    } else {
-        grad_map[id] = thvm_op(ctx, UOP_ADD, grad_map[id], new_grad);
-    }
-}
-
-// Internal: build the full gradient map from loss → all tensors
-// Returns malloc'd array of Terms (caller must free)
-static Term *_build_grad_map(TinyHVM *ctx, u32 y_id) {
-    u32 tc = ctx->tensor_count;
-    Term *gm = malloc(tc * sizeof(Term));
-    for (u32 i = 0; i < tc; i++) gm[i] = term_era();
-
-    TensorMeta *my = &ctx->tensors[y_id];
-    u32 ones_id = tensor_fill(ctx, my->view.shape, 1.0f);
-    gm[y_id] = term_ten(ones_id, my->dtype);
-    return gm;
-}
-
-// Internal: run backward traversal, populating gradient map
-static void _run_backward(TinyHVM *ctx, Term *gm, u32 tc) {
-    // Walk tensors backward (provenance stored in TensorMeta)
-    for (i32 i = (i32)tc - 1; i >= 0; i--) {
-        TensorMeta *e = &ctx->tensors[i];
-        if (!e->creator_op && i != 0) continue; // not a computed tensor
-        Term grad = gm[i];
-        if (term_tag(grad) == TAG_ERA) continue;
-
-        u32 uop = e->creator_op;
-        u32 a_id = e->src_ids[0];
-        u32 b_id = e->src_ids[1];
-        int is_binary = (uop >= UOP_ADD && uop <= UOP_SUB) || uop == UOP_MM;
-        TensorMeta *ma = &ctx->tensors[a_id];
-        TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
-
-        switch (uop) {
-            case UOP_ADD: {
-                // ∂(a+b)/∂a = 1 → pass grad through, reduce if broadcast
-                Term gr = thvm_reduce(ctx, grad);
-                if (ma->requires_grad) {
-                    Term ga = gr;
-                    if (term_tag(gr) == TAG_TEN) {
-                        u32 g_id = (u32)term_val(gr);
-                        if (ctx->tensors[g_id].view.numel != ma->view.numel) {
-                            u32 r_id = tensor_reduce_sum_to(ctx, g_id, ma->view.shape);
-                            ga = term_ten(r_id, ma->dtype);
-                        }
-                    }
-                    grad_graph_accum(ctx, gm, a_id, ga);
-                }
-                if (mb && mb->requires_grad) {
-                    Term gb = gr;
-                    if (term_tag(gr) == TAG_TEN) {
-                        u32 g_id = (u32)term_val(gr);
-                        if (ctx->tensors[g_id].view.numel != mb->view.numel) {
-                            u32 r_id = tensor_reduce_sum_to(ctx, g_id, mb->view.shape);
-                            gb = term_ten(r_id, mb->dtype);
-                        }
-                    }
-                    grad_graph_accum(ctx, gm, b_id, gb);
-                }
-                break;
-            }
-
-            case UOP_SUB: {
-                // ∂(a-b)/∂a = 1, ∂(a-b)/∂b = -1
-                Term gr = thvm_reduce(ctx, grad);
-                if (ma->requires_grad) {
-                    Term ga = gr;
-                    if (term_tag(gr) == TAG_TEN) {
-                        u32 g_id = (u32)term_val(gr);
-                        if (ctx->tensors[g_id].view.numel != ma->view.numel) {
-                            u32 r_id = tensor_reduce_sum_to(ctx, g_id, ma->view.shape);
-                            ga = term_ten(r_id, ma->dtype);
-                        }
-                    }
-                    grad_graph_accum(ctx, gm, a_id, ga);
-                }
-                if (mb && mb->requires_grad) {
-                    Term neg_grad = thvm_op(ctx, UOP_NEG, gr, term_era());
-                    Term ngr = thvm_reduce(ctx, neg_grad);
-                    if (term_tag(ngr) == TAG_TEN) {
-                        u32 g_id = (u32)term_val(ngr);
-                        if (ctx->tensors[g_id].view.numel != mb->view.numel) {
-                            u32 r_id = tensor_reduce_sum_to(ctx, g_id, mb->view.shape);
-                            ngr = term_ten(r_id, mb->dtype);
-                        }
-                    }
-                    grad_graph_accum(ctx, gm, b_id, ngr);
-                }
-                break;
-            }
-
-            case UOP_MUL: {
-                // ∂(a*b)/∂a = grad*b, ∂(a*b)/∂b = grad*a
-                // Keep lazy — reducer will fuse if followed by SUM
-                if (ma->requires_grad) {
-                    Term ga = thvm_op(ctx, UOP_MUL, grad,
-                                      term_ten(b_id, mb->dtype));
-                    // Reduce broadcast dims if needed
-                    if (ma->view.numel != e->view.numel) {
-                        u32 reduce_axes[MAX_DIM];
-                        u32 n_reduce = 0;
-                        for (u32 d = 0; d < e->view.shape.rank; d++) {
-                            if (e->view.shape.dims[d] != ma->view.shape.dims[d])
-                                reduce_axes[n_reduce++] = d;
-                        }
-                        if (n_reduce > 0) {
-                            ga = thvm_sum_axes(ctx, ga, reduce_axes, n_reduce);
-                            ga = thvm_reshape(ctx, ga, ma->view.shape);
-                        }
-                    }
-                    grad_graph_accum(ctx, gm, a_id, ga);
-                }
-                if (mb && mb->requires_grad) {
-                    Term gb = thvm_op(ctx, UOP_MUL, grad,
-                                      term_ten(a_id, ma->dtype));
-                    // Reduce broadcast dims if needed
-                    if (mb->view.numel != e->view.numel) {
-                        u32 reduce_axes[MAX_DIM];
-                        u32 n_reduce = 0;
-                        for (u32 d = 0; d < e->view.shape.rank; d++) {
-                            if (e->view.shape.dims[d] != mb->view.shape.dims[d])
-                                reduce_axes[n_reduce++] = d;
-                        }
-                        if (n_reduce > 0) {
-                            gb = thvm_sum_axes(ctx, gb, reduce_axes, n_reduce);
-                            gb = thvm_reshape(ctx, gb, mb->view.shape);
-                        }
-                    }
-                    grad_graph_accum(ctx, gm, b_id, gb);
-                }
-                break;
-            }
-
-            case UOP_MM: {
-                if (!mb) break;
-                // z = mm(A[M,K], B[K,N])
-                // ∂z/∂A = mm(grad, Bᵀ)
-                // ∂z/∂B = mm(Aᵀ, grad)
-                if (ma->requires_grad) {
-                    u32 bt_id = tensor_transpose_2d(ctx, b_id);
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_MM, grad,
-                                term_ten(bt_id, mb->dtype)));
-                }
-                if (mb && mb->requires_grad) {
-                    u32 at_id = tensor_transpose_2d(ctx, a_id);
-                    grad_graph_accum(ctx, gm, b_id,
-                        thvm_op(ctx, UOP_MM,
-                                term_ten(at_id, ma->dtype), grad));
-                }
-                break;
-            }
-
-            case UOP_RELU: {
-                // ∂relu(a)/∂a = (a > 0) ? 1 : 0
-                // mask is computed eagerly (not differentiable)
-                if (ma->requires_grad) {
-                    u32 zero_id = tensor_fill(ctx, ma->view.shape, 0.0f);
-                    u32 mask_id = tensor_create(ctx, ma->view.shape, ma->dtype);
-                    View mv, zv; u32 os[MAX_DIM], on;
-                    view_broadcast(&ma->view, &ctx->tensors[zero_id].view, &mv, &zv, os, &on);
-                    ctx->backend->op_binary(UOP_CMP, ctx->tensors[mask_id].buf_id,
-                                        &ctx->tensors[mask_id].view,
-                                        ma->buf_id, &mv,
-                                        ctx->tensors[zero_id].buf_id, &zv);
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_MUL, grad,
-                                term_ten(mask_id, ma->dtype)));
-                }
-                break;
-            }
-
-            case UOP_NEG: {
-                // ∂(-a)/∂a = -grad
-                if (ma->requires_grad)
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_NEG, grad, term_era()));
-                break;
-            }
-
-            case UOP_EXP: {
-                // ∂exp(a)/∂a = exp(a) * grad  (output = exp(a))
-                if (ma->requires_grad)
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_MUL, grad,
-                                term_ten((u32)i, e->dtype)));
-                break;
-            }
-
-            case UOP_LOG: {
-                // ∂log(a)/∂a = grad / a
-                if (ma->requires_grad)
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_DIV, grad,
-                                term_ten(a_id, ma->dtype)));
-                break;
-            }
-
-            case UOP_SQRT: {
-                // ∂sqrt(a)/∂a = grad / (2 * sqrt(a))
-                if (ma->requires_grad) {
-                    f32 two_val = 2.0f;
-                    Term two_t = thvm_tensor(ctx, &two_val, SHAPE(1));
-                    Term denom = thvm_op(ctx, UOP_MUL,
-                                    two_t, term_ten((u32)i, e->dtype));
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_DIV, grad, denom));
-                }
-                break;
-            }
-
-            case UOP_DIV: {
-                if (!mb) break;
-                // ∂(a/b)/∂a = grad / b
-                if (ma->requires_grad)
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_DIV, grad,
-                                term_ten(b_id, mb->dtype)));
-                // ∂(a/b)/∂b = -grad * a / b²
-                if (mb->requires_grad) {
-                    Term neg_grad = thvm_op(ctx, UOP_NEG, grad, term_era());
-                    Term num = thvm_op(ctx, UOP_MUL, neg_grad,
-                                       term_ten(a_id, ma->dtype));
-                    Term b_sq = thvm_op(ctx, UOP_MUL,
-                                        term_ten(b_id, mb->dtype),
-                                        term_ten(b_id, mb->dtype));
-                    grad_graph_accum(ctx, gm, b_id,
-                        thvm_op(ctx, UOP_DIV, num, b_sq));
-                }
-                break;
-            }
-
-            case UOP_MAX: {
-                // ∂max(a,b)/∂a = (a >= b) * grad  →  (output == a) * grad
-                // ∂max(a,b)/∂b = (a < b) * grad   →  (output != a) * grad
-                if (!mb) break;
-                if (ma->requires_grad || mb->requires_grad) {
-                    // Use output==a to build mask (avoids reading broadcast b)
-                    u32 n = e->view.numel;
-                    f32 *out_data = (f32 *)thvm_to_host(ctx, term_ten((u32)i, e->dtype));
-                    f32 *a_data = (f32 *)thvm_to_host(ctx, term_ten(a_id, ma->dtype));
-                    f32 *mask = malloc(n * sizeof(f32));
-                    for (u32 j = 0; j < n; j++)
-                        mask[j] = (out_data[j] == a_data[j]) ? 1.0f : 0.0f;
-                    Term mask_t = thvm_tensor(ctx, mask, e->view.shape);
-
-                    if (ma->requires_grad) {
-                        Term ga = thvm_op(ctx, UOP_MUL, grad, mask_t);
-                        ga = thvm_reduce(ctx, ga);
-                        u32 ga_id = (u32)term_val(ga);
-                        if (ctx->tensors[ga_id].view.numel != ma->view.numel) {
-                            ga_id = tensor_reduce_sum_to(ctx, ga_id, ma->view.shape);
-                            ga = term_ten(ga_id, ma->dtype);
-                        }
-                        grad_graph_accum(ctx, gm, a_id, ga);
-                    }
-                    if (mb->requires_grad) {
-                        // Invert mask for b
-                        for (u32 j = 0; j < n; j++) mask[j] = 1.0f - mask[j];
-                        Term inv_mask_t = thvm_tensor(ctx, mask, e->view.shape);
-                        Term gb = thvm_op(ctx, UOP_MUL, grad, inv_mask_t);
-                        gb = thvm_reduce(ctx, gb);
-                        u32 gb_id = (u32)term_val(gb);
-                        if (ctx->tensors[gb_id].view.numel != mb->view.numel) {
-                            gb_id = tensor_reduce_sum_to(ctx, gb_id, mb->view.shape);
-                            gb = term_ten(gb_id, mb->dtype);
-                        }
-                        grad_graph_accum(ctx, gm, b_id, gb);
-                    }
-                    free(mask);
-                }
-                break;
-            }
-
-            case UOP_SUM: {
-                if (b_id) {
-                    // Fused SUM(MUL): ∂sum(a*b)/∂a = expand(grad)*b reduced to a.shape
-                    //                 ∂sum(a*b)/∂b = expand(grad)*a reduced to b.shape
-                    // Keep everything LAZY so MUL+SUM can be fused during reduce
-                    TensorMeta *mb = &ctx->tensors[b_id];
-                    // Expand grad to a's shape (broadcast shape of the MUL)
-                    Term grad_exp = thvm_expand(ctx, grad, ma->view.shape);
-                    if (ma->requires_grad) {
-                        // ga = expand(grad) * b — keep lazy, will be reduced later
-                        Term ga = thvm_op(ctx, UOP_MUL, grad_exp,
-                                          term_ten(b_id, mb->dtype));
-                        // Reduce broadcast dims lazily using thvm_sum_axes
-                        if (ma->view.numel != e->view.numel) {
-                            // Find which dims of the MUL output need summing to reach a.shape
-                            u32 reduce_axes[MAX_DIM];
-                            u32 n_reduce = 0;
-                            for (u32 d = 0; d < ma->view.shape.rank; d++) {
-                                if (ma->view.shape.dims[d] != mb->view.shape.dims[d] &&
-                                    mb->view.shape.dims[d] > 1) {
-                                    // This dim was broadcast from a, need to sum
-                                    // Actually: a.shape[d] might be 1 (the broadcast source)
-                                }
-                                // Sum dims where grad_exp.shape[d] > a.shape[d]
-                                // But grad_exp = expand(grad, a.shape) so it matches a.shape
-                                // The MUL(grad_exp, b) has shape = broadcast(a.shape, b.shape)
-                                // We need to reduce to a.shape
-                            }
-                            // MUL(grad_exp, b) shape = broadcast(a.shape, b.shape) = a.shape
-                            // since a.shape >= b.shape (a is the big expanded input)
-                            // So ga already has a.shape — no reduction needed for a
-                        }
-                        grad_graph_accum(ctx, gm, a_id, ga);
-                    }
-                    if (mb->requires_grad) {
-                        // gb = expand(grad) * a — keep lazy
-                        Term gb = thvm_op(ctx, UOP_MUL, grad_exp,
-                                          term_ten(a_id, ma->dtype));
-                        // gb has shape = a.shape, need to reduce to b.shape
-                        // Find dims where a.shape[d] != b.shape[d]
-                        u32 reduce_axes[MAX_DIM];
-                        u32 n_reduce = 0;
-                        for (u32 d = 0; d < ma->view.shape.rank; d++) {
-                            if (ma->view.shape.dims[d] != mb->view.shape.dims[d]) {
-                                reduce_axes[n_reduce++] = d;
-                            }
-                        }
-                        if (n_reduce > 0) {
-                            // SUM(MUL(grad_exp, a)) over broadcast dims — will be FUSED
-                            gb = thvm_sum_axes(ctx, gb, reduce_axes, n_reduce);
-                            gb = thvm_reshape(ctx, gb, mb->view.shape);
-                        }
-                        grad_graph_accum(ctx, gm, b_id, gb);
-                    }
-                } else {
-                    // Plain SUM: ∂sum(a)/∂a = broadcast grad to original shape
-                    if (ma->requires_grad) {
-                        grad_graph_accum(ctx, gm, a_id,
-                            thvm_expand(ctx, grad, ma->view.shape));
-                    }
-                }
-                break;
-            }
-
-            case UOP_RMAX: {
-                // ∂max(a)/∂a = grad * (a == max_value)
-                // max_value is the output (tensor i), broadcast back to input shape
-                if (ma->requires_grad) {
-                    // Expand max result back to input shape, compare to get mask
-                    Term max_bc = thvm_expand(ctx,
-                        thvm_reshape(ctx, term_ten((u32)i, e->dtype), e->view.shape),
-                        ma->view.shape);
-                    // mask = (a == max)
-                    Term mask = thvm_op(ctx, UOP_CMP, term_ten(a_id, ma->dtype), max_bc);
-                    // grad * mask, broadcast grad to input shape
-                    Term grad_bc = thvm_expand(ctx, grad, ma->view.shape);
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_op(ctx, UOP_MUL, grad_bc, mask));
-                }
-                break;
-            }
-
-            case UOP_PAD: {
-                // ∂pad(a)/∂a = shrink(grad) — remove the padded regions
-                if (ma->requires_grad && b_id) {
-                    TensorMeta *mb_pad = &ctx->tensors[b_id];
-                    u32 ndim_p = mb_pad->view.numel / 2;
-                    f32 *pf = malloc(mb_pad->view.numel * sizeof(f32));
-                    ctx->backend->buf_read(mb_pad->buf_id, pf, mb_pad->view.numel * sizeof(f32));
-                    // Shrink pairs: start=pad_before, end=pad_before+original_dim
-                    u32 shrink_p[MAX_DIM * 2];
-                    for (u32 j = 0; j < ndim_p; j++) {
-                        u32 pad_before = (u32)pf[j * 2];
-                        shrink_p[j * 2]     = pad_before;
-                        shrink_p[j * 2 + 1] = pad_before + ma->view.shape.dims[j];
-                    }
-                    free(pf);
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_shrink(ctx, grad, shrink_p, ndim_p));
-                }
-                break;
-            }
-
-            case UOP_SHRINK: {
-                // ∂shrink(a)/∂a = pad(grad) — pad with zeros to restore original shape
-                if (ma->requires_grad && b_id) {
-                    TensorMeta *mb_sh = &ctx->tensors[b_id];
-                    u32 ndim_s = mb_sh->view.numel / 2;
-                    f32 *sf = malloc(mb_sh->view.numel * sizeof(f32));
-                    ctx->backend->buf_read(mb_sh->buf_id, sf, mb_sh->view.numel * sizeof(f32));
-                    // Pad pairs: before=shrink_start, after=original_dim-shrink_end
-                    u32 pad_p[MAX_DIM * 2];
-                    for (u32 j = 0; j < ndim_s; j++) {
-                        u32 s_start = (u32)sf[j * 2];
-                        u32 s_end   = (u32)sf[j * 2 + 1];
-                        pad_p[j * 2]     = s_start;
-                        pad_p[j * 2 + 1] = ma->view.shape.dims[j] - s_end;
-                    }
-                    free(sf);
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_pad(ctx, grad, pad_p, ndim_s));
-                }
-                break;
-            }
-
-            // === Movement op DUP rules (inverse movement) ===
-            case UOP_RESHAPE: {
-                // DUP through reshape = reshape grad back to original shape
-                if (ma->requires_grad) {
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_reshape(ctx, grad, ma->view.shape));
-                }
-                break;
-            }
-
-            case UOP_EXPAND: {
-                // DUP through expand = sum along expanded axes
-                // (expand broadcasts dims that were 1; backward sums them back)
-                if (ma->requires_grad) {
-                    // For now, use tensor_reduce_sum_to to handle shape reduction
-                    // This is eagerly computed, but correct
-                    Term g_reduced = thvm_reduce(ctx, grad);
-                    if (term_tag(g_reduced) == TAG_TEN) {
-                        u32 g_id = (u32)term_val(g_reduced);
-                        u32 reduced = tensor_reduce_sum_to(ctx, g_id, ma->view.shape);
-                        grad_graph_accum(ctx, gm, a_id, term_ten(reduced, ma->dtype));
-                    }
-                }
-                break;
-            }
-
-            case UOP_PERMUTE: {
-                // DUP through permute = permute with inverse axes
-                if (ma->requires_grad && b_id) {
-                    TensorMeta *mb_p = &ctx->tensors[b_id];
-                    u32 rank = mb_p->view.numel;
-                    f32 *axes_f = malloc(rank * sizeof(f32));
-                    ctx->backend->buf_read(mb_p->buf_id, axes_f, rank * sizeof(f32));
-                    // Compute inverse permutation
-                    u32 inv_axes[MAX_DIM];
-                    for (u32 j = 0; j < rank; j++)
-                        inv_axes[(u32)axes_f[j]] = j;
-                    free(axes_f);
-                    grad_graph_accum(ctx, gm, a_id,
-                        thvm_permute(ctx, grad, inv_axes, rank));
-                }
-                break;
-            }
-
-            case UOP_POOL_GATHER: {
-                // ∂pool_gather(a)/∂a = scatter-add (col2im equivalent)
-                // Forward gathered: out[batch, o0, o1, k0, k1] = in[batch, o0*s0+k0, o1*s1+k1]
-                // Backward: scatter-add gradient back to input shape
-                if (ma->requires_grad && b_id) {
-                    TensorMeta *mb_pg = &ctx->tensors[b_id];
-                    u32 plen = mb_pg->view.numel;
-                    f32 *pf = malloc(plen * sizeof(f32));
-                    ctx->backend->buf_read(mb_pg->buf_id, pf, plen * sizeof(f32));
-                    u32 ns = (u32)pf[0];  // n_spatial
-                    u32 pk[2], ps[2], pi[2], po[2], pbd;
-                    for (u32 j = 0; j < ns; j++) {
-                        pk[j] = (u32)pf[1 + j];
-                        ps[j] = (u32)pf[1 + ns + j];
-                        pi[j] = (u32)pf[1 + 2*ns + j];
-                        po[j] = (u32)pf[1 + 3*ns + j];
-                    }
-                    pbd = (u32)pf[1 + 4*ns];
-                    free(pf);
-
-                    // Materialize gradient and scatter-add back
-                    Term g_r = thvm_reduce(ctx, grad);
-                    u32 g_id = (u32)term_val(g_r);
-                    u32 g_numel = ctx->tensors[g_id].view.numel;
-                    u32 in_numel = ma->view.numel;
-                    f32 *g_data = malloc(g_numel * sizeof(f32));
-                    f32 *dx = calloc(in_numel, sizeof(f32));
-                    ctx->backend->buf_read(ctx->tensors[g_id].buf_id, g_data, g_numel * sizeof(f32));
-
-                    u32 ndim_out = ma->view.shape.rank + ns;
-                    u32 od[MAX_DIM];
-                    for (u32 j = 0; j < pbd; j++) od[j] = ma->view.shape.dims[j];
-                    for (u32 j = 0; j < ns; j++) {
-                        od[pbd + j]      = po[j];
-                        od[pbd + ns + j] = pk[j];
-                    }
-
-                    for (u32 flat = 0; flat < g_numel; flat++) {
-                        u32 coords[MAX_DIM], rem = flat;
-                        for (int d = (int)ndim_out - 1; d >= 0; d--) {
-                            coords[d] = rem % od[d];
-                            rem /= od[d];
-                        }
-                        // Map back to source index
-                        u32 src_idx = 0, src_stride = 1;
-                        u32 ndim_in = ma->view.shape.rank;
-                        for (int d = (int)ndim_in - 1; d >= 0; d--) {
-                            u32 coord;
-                            if ((u32)d < pbd) {
-                                coord = coords[d];
-                            } else {
-                                u32 si = (u32)d - pbd;
-                                coord = coords[pbd + si] * ps[si] + coords[pbd + ns + si];
-                            }
-                            src_idx += coord * src_stride;
-                            src_stride *= ma->view.shape.dims[d];
-                        }
-                        dx[src_idx] += g_data[flat];
-                    }
-
-                    u32 dx_id = tensor_fill(ctx, ma->view.shape, 0.0f);
-                    ctx->backend->buf_write(ctx->tensors[dx_id].buf_id, dx, in_numel * sizeof(f32));
-                    free(g_data); free(dx);
-                    grad_graph_accum(ctx, gm, a_id, term_ten(dx_id, ma->dtype));
-                }
-                break;
-            }
-
-            default:
-                break;
-        }
-    }
-}
+// Backward is NOT a separate phase — it's reduction of UOP_GRAD terms.
+// thvm_grad(ctx, y, x) creates a lazy GRAD term (3 heap slots: y, grad_y, x).
+// The reducer handles UOP_GRAD by applying DUP-op rules via provenance.
+// No tape, no loop, no explicit reduce — backward IS reduction.
 
 Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
-    y = thvm_reduce(ctx, y);
-    assert(term_tag(y) == TAG_TEN && term_tag(x) == TAG_TEN);
-    u32 y_id = (u32)term_val(y);
-    u32 x_id = (u32)term_val(x);
-    u32 tc = ctx->tensor_count;
-    Term *gm = _build_grad_map(ctx, y_id);
-    _run_backward(ctx, gm, tc);
-    Term result = gm[x_id];
-    free(gm);
-    return result;
+    // Seed gradient = ones with same shape as y
+    Term yr = (term_tag(y) == TAG_TEN) ? y : thvm_reduce(ctx, y);
+    Term seed;
+    if (term_tag(yr) == TAG_TEN) {
+        u32 y_id = (u32)term_val(yr);
+        seed = term_ten(tensor_fill(ctx, ctx->tensors[y_id].view.shape, 1.0f),
+                        ctx->tensors[y_id].dtype);
+    } else {
+        f32 one = 1.0f;
+        seed = thvm_tensor(ctx, &one, SHAPE(1)); // fallback
+    }
+    u64 loc = heap_alloc(ctx, 3);
+    heap_set(ctx, loc, yr);
+    heap_set(ctx, loc + 1, seed);
+    heap_set(ctx, loc + 2, x);
+    return term_new(TAG_TOP, UOP_GRAD, loc);
 }
 
-// Single-pass backward: compute ALL param gradients in one traversal
-// This avoids N separate thvm_grad calls which would each re-traverse the full graph
 void thvm_backward(TinyHVM *ctx, Term loss, Term *params, Term *grads, u32 n_params) {
-    loss = thvm_reduce(ctx, loss);
-    assert(term_tag(loss) == TAG_TEN);
-    u32 y_id = (u32)term_val(loss);
-    u32 tc = ctx->tensor_count;
-    Term *gm = _build_grad_map(ctx, y_id);
-    _run_backward(ctx, gm, tc);
-    // Extract gradients for all requested params
-    for (u32 p = 0; p < n_params; p++) {
-        if (term_tag(params[p]) == TAG_TEN) {
-            u32 pid = (u32)term_val(params[p]);
-            grads[p] = (pid < tc) ? gm[pid] : term_era();
-        } else {
-            grads[p] = term_era();
-        }
-    }
-    free(gm);
+    // DUP: create independent gradient terms for each param
+    // Each grads[p] is a lazy UOP_GRAD — reduce it to compute ∂loss/∂params[p]
+    for (u32 p = 0; p < n_params; p++)
+        grads[p] = thvm_grad(ctx, loss, params[p]);
 }
-// Each gradient is a lazy IC term that reduces through the standard engine.
 
 
 

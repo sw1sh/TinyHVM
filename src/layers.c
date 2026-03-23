@@ -39,45 +39,38 @@ static Term softmax(TinyHVM *ctx, Term logits, u32 B, u32 C) {
 }
 
 // ============================================================
-// Cross-entropy loss
+// Cross-entropy loss (pure UOp composition)
+// loss = -mean(sum(one_hot * log(softmax(logits))))
 // ============================================================
 
-typedef struct {
-    f32  loss;
-    f32 *probs;
-    u32  B, C;
-} CEResult;
+static Term cross_entropy_loss(TinyHVM *ctx, Term logits, u8 *labels, u32 B, u32 C) {
+    // softmax (already UOp-based)
+    Term probs = softmax(ctx, logits, B, C);
 
-static CEResult cross_entropy(TinyHVM *ctx, Term logits, u8 *labels, u32 B, u32 C) {
-    Term sm = softmax(ctx, logits, B, C);
-    f32 *probs = thvm_to_host(ctx, sm);
+    // clamp for numerical stability: max(probs, 1e-7)
+    f32 eps = 1e-7f;
+    Term eps_t = thvm_expand(ctx, thvm_tensor(ctx, &eps, SHAPE(1, 1)), SHAPE(B, C));
+    Term clamped = thvm_op(ctx, UOP_MAX, probs, eps_t);
 
-    f32 loss = 0.0f;
-    f32 *probs_copy = malloc(B * C * sizeof(f32));
-    memcpy(probs_copy, probs, B * C * sizeof(f32));
-    for (u32 i = 0; i < B; i++) {
-        f32 p = probs_copy[i * C + labels[i]];
-        if (p < 1e-7f) p = 1e-7f;
-        loss -= logf(p);
-    }
-    loss /= (f32)B;
-    return (CEResult){.loss = loss, .probs = probs_copy, .B = B, .C = C};
-}
+    // log(softmax)
+    Term log_probs = thvm_op(ctx, UOP_LOG, clamped, term_era());
 
-static Term cross_entropy_backward(TinyHVM *ctx, CEResult *ce, u8 *labels) {
-    u32 B = ce->B, C = ce->C;
-    f32 *grad = malloc(B * C * sizeof(f32));
-    memcpy(grad, ce->probs, B * C * sizeof(f32));
-    for (u32 i = 0; i < B; i++)
-        grad[i * C + labels[i]] -= 1.0f;
+    // one-hot labels: [B, C] with 1.0 at correct class
+    f32 *oh = calloc(B * C, sizeof(f32));
+    for (u32 i = 0; i < B; i++) oh[i * C + labels[i]] = 1.0f;
+    Term one_hot = thvm_tensor(ctx, oh, SHAPE(B, C));
+    free(oh);
+
+    // -sum(one_hot * log_probs) / B
+    Term masked = thvm_op(ctx, UOP_MUL, one_hot, log_probs);
+    // Sum over classes (last dim), then sum over batch
+    Term sum_c = thvm_op(ctx, UOP_SUM, masked, term_era());  // [B, 1]
+    Term sum_b = thvm_op(ctx, UOP_SUM, sum_c, term_era());  // [1, 1]
+    Term neg = thvm_op(ctx, UOP_NEG, sum_b, term_era());
+
     f32 inv_B = 1.0f / (f32)B;
-    for (u32 i = 0; i < B * C; i++)
-        grad[i] *= inv_B;
-
-    Term t = thvm_tensor(ctx, grad, SHAPE(B, C));
-    free(grad);
-    free(ce->probs);
-    return t;
+    Term scale = thvm_tensor(ctx, &inv_B, SHAPE(1, 1));
+    return thvm_op(ctx, UOP_MUL, neg, scale);  // scalar loss
 }
 
 // ============================================================
@@ -95,18 +88,48 @@ typedef struct {
 static ConvResult conv2d(TinyHVM *ctx, u32 x_id, u32 w_id, u32 b_id,
                          u32 B, u32 Cin, u32 H, u32 W, u32 Cout, u32 KH, u32 KW) {
     u32 OH = H - KH + 1, OW = W - KW + 1;
+    u32 patch_size = Cin * KH * KW;
+    u32 n_patches = B * OH * OW;
+    Conv2dParams cp = {B, Cin, H, W, KH, KW, OH, OW, patch_size, n_patches};
 
-    // thvm_conv2d: pad → _pool → reshape → expand → permute → mul → sum → add bias
-    u32 padding[] = {0, 0, 0, 0};
-    u32 stride[] = {1, 1};
-    Term x_t = term_ten(x_id, DTYPE_F32);
-    Term w_t = term_ten(w_id, DTYPE_F32);
-    Term b_t = term_ten(b_id, DTYPE_F32);
+    // Direct Metal dispatch: im2col → matmul → bias_add → nhwc_to_nchw
+    u32 col_buf = ctx->backend->buf_alloc(n_patches * patch_size * sizeof(f32));
+    ctx->backend->op_im2col(col_buf, ctx->tensors[x_id].buf_id, cp);
 
-    Term out = thvm_conv2d(ctx, x_t, w_t, b_t, 1, stride, padding);
-    Term out_r = thvm_reduce(ctx, out);
+    // matmul: col[n_patches, patch_size] @ W^T → [n_patches, Cout]
+    u32 out_nhwc = ctx->backend->buf_alloc(n_patches * Cout * sizeof(f32));
+    {
+        View col_view = view_create(SHAPE(n_patches, patch_size));
+        View w_view = view_create(SHAPE(Cout, patch_size));  // W is [Cout, Cin*KH*KW]
+        // Need W transposed: [patch_size, Cout]
+        u32 wt_buf = ctx->backend->buf_alloc(patch_size * Cout * sizeof(f32));
+        ctx->backend->op_transpose(wt_buf, ctx->tensors[w_id].buf_id, Cout, patch_size);
+        View wt_view = view_create(SHAPE(patch_size, Cout));
+        ctx->backend->op_mm(out_nhwc, col_buf, &col_view, wt_buf, &wt_view,
+                           n_patches, patch_size, Cout);
+    }
 
-    return (ConvResult){.out_id=(u32)term_val(out_r), .x_id=x_id, .col_id=0,
+    // bias_add
+    ctx->backend->op_bias_add(out_nhwc, ctx->tensors[b_id].buf_id, Cout, n_patches);
+
+    // nhwc_to_nchw: [B,OH,OW,Cout] → [B,Cout,OH,OW]
+    u32 out_buf = ctx->backend->buf_alloc(n_patches * Cout * sizeof(f32));
+    ctx->backend->op_nhwc_to_nchw(out_buf, out_nhwc, B, Cout, OH, OW);
+
+    u32 out_id = ctx->tensor_count++;
+    ctx->tensors[out_id] = (TensorMeta){
+        .buf_id = out_buf, .dtype = DTYPE_F32,
+        .view = view_create((Shape){.dims={B,Cout,OH,OW}, .rank=4}),
+    };
+
+    // Store col_id for backward
+    u32 col_id = ctx->tensor_count++;
+    ctx->tensors[col_id] = (TensorMeta){
+        .buf_id = col_buf, .dtype = DTYPE_F32,
+        .view = view_create(SHAPE(n_patches, patch_size)),
+    };
+
+    return (ConvResult){.out_id=out_id, .x_id=x_id, .col_id=col_id,
                         .B=B, .Cin=Cin, .H=H, .W=W,
                         .Cout=Cout, .KH=KH, .KW=KW, .OH=OH, .OW=OW};
 }
@@ -194,23 +217,21 @@ typedef struct {
 } PoolResult;
 
 static PoolResult maxpool2d(TinyHVM *ctx, u32 x_id, u32 B, u32 C, u32 H, u32 W) {
-    // Use thvm_maxpool2d: pool → rmax (pure UOp composition)
-    u32 kernel[] = {2, 2}, stride[] = {2, 2};
-    Term x_t = term_ten(x_id, DTYPE_F32);
-    Term out = thvm_maxpool2d(ctx, x_t, kernel, stride);
-    Term out_r = thvm_reduce(ctx, out);
-
     u32 OH = H / 2, OW = W / 2;
     u32 out_n = B * C * OH * OW;
 
-    // Also compute mask via backend for backward pass
+    // Single direct Metal dispatch: maxpool_fwd produces output + argmax mask
+    u32 out_buf = ctx->backend->buf_alloc(out_n * sizeof(f32));
     u32 mask_buf = ctx->backend->buf_alloc(out_n * sizeof(u8));
-    u32 out_buf2 = ctx->backend->buf_alloc(out_n * sizeof(f32));
-    ctx->backend->op_maxpool_fwd(out_buf2, mask_buf, ctx->tensors[x_id].buf_id, B, C, H, W);
-    // We use the thvm result as the forward output (correct by UOp definition)
-    // but store the mask for backward
+    ctx->backend->op_maxpool_fwd(out_buf, mask_buf, ctx->tensors[x_id].buf_id, B, C, H, W);
 
-    return (PoolResult){.out_id=(u32)term_val(out_r), .mask_buf=mask_buf, .x_id=x_id,
+    u32 out_id = ctx->tensor_count++;
+    ctx->tensors[out_id] = (TensorMeta){
+        .buf_id = out_buf, .dtype = DTYPE_F32,
+        .view = view_create((Shape){.dims={B,C,OH,OW}, .rank=4}),
+    };
+
+    return (PoolResult){.out_id=out_id, .mask_buf=mask_buf, .x_id=x_id,
                         .B=B, .C=C, .H=H, .W=W};
 }
 
@@ -252,8 +273,6 @@ static Term linear(TinyHVM *ctx, Term x, Term w, Term b, u32 B, u32 in_f, u32 ou
 
 typedef struct {
     u32  out_id;
-    f32 *x_hat;
-    f32 *inv_std;
     u32  B, C, H, W;
 } BNResult;
 
@@ -261,63 +280,90 @@ static BNResult batchnorm(TinyHVM *ctx, u32 x_id,
                            u32 gamma_id, u32 beta_id,
                            u32 rmean_id, u32 rvar_id,
                            u32 B, u32 C, u32 H, u32 W, int training) {
-    u32 spatial = H * W;
-    u32 n = B * C * spatial;
-    f32 *x = buf_read(ctx, x_id, n);
-    f32 *gamma = buf_read(ctx, gamma_id, C);
-    f32 *beta = buf_read(ctx, beta_id, C);
-    f32 *rm = buf_read(ctx, rmean_id, C);
-    f32 *rv = buf_read(ctx, rvar_id, C);
-
     f32 eps = 1e-5f, momentum = 0.1f;
-    f32 *mean = calloc(C, sizeof(f32));
-    f32 *var = calloc(C, sizeof(f32));
-    f32 *inv_std = malloc(C * sizeof(f32));
-    f32 *x_hat = malloc(n * sizeof(f32));
-    f32 *out = malloc(n * sizeof(f32));
+    u32 count = B * H * W;
+
+    Term x = term_ten(x_id, DTYPE_F32);
+    Term mean_t, var_t;
 
     if (training) {
-        u32 count = B * spatial;
-        for (u32 b = 0; b < B; b++)
-            for (u32 c = 0; c < C; c++)
-                for (u32 s = 0; s < spatial; s++)
-                    mean[c] += x[(b*C+c)*spatial+s];
-        for (u32 c = 0; c < C; c++) mean[c] /= (f32)count;
+        // Compute mean per channel via UOps:
+        // x:[B,C,H,W] → permute to [C,B,H,W] → reshape to [C, B*H*W]
+        // → SUM → [C,1] → reshape [C] → DIV by count
+        Term x_perm = thvm_permute(ctx, x, (u32[]){1,0,2,3}, 4);
+        Term x_flat = thvm_reshape(ctx, x_perm, SHAPE(C, count));
+        Term x_sum = thvm_op(ctx, UOP_SUM, x_flat, term_era());
+        // x_sum: [C, 1]
+        Term x_sum_sq = thvm_reshape(ctx, x_sum, SHAPE(C));
+        f32 inv_count = 1.0f / (f32)count;
+        Term inv_n = thvm_tensor(ctx, &inv_count, SHAPE(1));
+        Term inv_n_bc = thvm_expand(ctx, inv_n, SHAPE(C));
+        mean_t = thvm_op(ctx, UOP_MUL, x_sum_sq, inv_n_bc);
+        // mean_t: [C]
 
-        for (u32 b = 0; b < B; b++)
-            for (u32 c = 0; c < C; c++)
-                for (u32 s = 0; s < spatial; s++) {
-                    f32 d = x[(b*C+c)*spatial+s] - mean[c];
-                    var[c] += d * d;
-                }
-        for (u32 c = 0; c < C; c++) var[c] /= (f32)count;
+        // Compute variance: var = sum((x - mean)^2) / count
+        // Broadcast mean to [B,C,H,W]
+        Term mean_4d = thvm_expand(ctx,
+            thvm_reshape(ctx, mean_t, SHAPE(1, C, 1, 1)),
+            (Shape){.dims={B,C,H,W}, .rank=4});
+        Term diff = thvm_op(ctx, UOP_SUB, x, mean_4d);
+        Term diff2 = thvm_op(ctx, UOP_MUL, diff, diff);
+        // Sum diff2 per channel
+        Term d2_perm = thvm_permute(ctx, diff2, (u32[]){1,0,2,3}, 4);
+        Term d2_flat = thvm_reshape(ctx, d2_perm, SHAPE(C, count));
+        Term d2_sum = thvm_op(ctx, UOP_SUM, d2_flat, term_era());
+        Term d2_sum_sq = thvm_reshape(ctx, d2_sum, SHAPE(C));
+        var_t = thvm_op(ctx, UOP_MUL, d2_sum_sq, inv_n_bc);
+        // var_t: [C]
 
+        // Update running stats (CPU-side, not in gradient graph)
+        f32 *mean_host = thvm_to_host(ctx, thvm_reduce(ctx, mean_t));
+        f32 *var_host = thvm_to_host(ctx, thvm_reduce(ctx, var_t));
+        f32 *rm = malloc(C * sizeof(f32)), *rv = malloc(C * sizeof(f32));
+        ctx->backend->buf_read(ctx->tensors[rmean_id].buf_id, rm, C*sizeof(f32));
+        ctx->backend->buf_read(ctx->tensors[rvar_id].buf_id, rv, C*sizeof(f32));
+        f32 bessel = (f32)count / (f32)(count - 1);
         for (u32 c = 0; c < C; c++) {
-            rm[c] = (1-momentum)*rm[c] + momentum*mean[c];
-            rv[c] = (1-momentum)*rv[c] + momentum*var[c]*((f32)count/(f32)(count-1));
+            rm[c] = (1-momentum)*rm[c] + momentum*mean_host[c];
+            rv[c] = (1-momentum)*rv[c] + momentum*var_host[c]*bessel;
         }
         ctx->backend->buf_write(ctx->tensors[rmean_id].buf_id, rm, C*sizeof(f32));
         ctx->backend->buf_write(ctx->tensors[rvar_id].buf_id, rv, C*sizeof(f32));
+        free(rm); free(rv);
     } else {
-        memcpy(mean, rm, C*sizeof(f32));
-        memcpy(var, rv, C*sizeof(f32));
+        mean_t = term_ten(rmean_id, DTYPE_F32);
+        var_t = term_ten(rvar_id, DTYPE_F32);
     }
 
-    for (u32 c = 0; c < C; c++)
-        inv_std[c] = 1.0f / sqrtf(var[c] + eps);
+    // Normalize: x_hat = (x - mean) / sqrt(var + eps)
+    Term mean_bc = thvm_expand(ctx,
+        thvm_reshape(ctx, mean_t, SHAPE(1, C, 1, 1)),
+        (Shape){.dims={B,C,H,W}, .rank=4});
+    Term centered = thvm_op(ctx, UOP_SUB, x, mean_bc);
 
-    for (u32 b = 0; b < B; b++)
-        for (u32 c = 0; c < C; c++)
-            for (u32 s = 0; s < spatial; s++) {
-                u32 idx = (b*C+c)*spatial+s;
-                x_hat[idx] = (x[idx] - mean[c]) * inv_std[c];
-                out[idx] = x_hat[idx] * gamma[c] + beta[c];
-            }
+    f32 eps_f = eps;
+    Term eps_t = thvm_tensor(ctx, &eps_f, SHAPE(1));
+    Term eps_bc = thvm_expand(ctx, eps_t, SHAPE(C));
+    Term var_eps = thvm_op(ctx, UOP_ADD, var_t, eps_bc);
+    Term std = thvm_op(ctx, UOP_SQRT, var_eps, term_era());
+    Term inv_std = thvm_expand(ctx,
+        thvm_reshape(ctx, std, SHAPE(1, C, 1, 1)),
+        (Shape){.dims={B,C,H,W}, .rank=4});
+    Term x_hat = thvm_op(ctx, UOP_DIV, centered, inv_std);
 
-    u32 out_id = tensor_from(ctx, out, (Shape){.dims={B,C,H,W}, .rank=4});
-    free(x); free(gamma); free(beta); free(rm); free(rv);
-    free(mean); free(var); free(out);
-    return (BNResult){.out_id = out_id, .x_hat = x_hat, .inv_std = inv_std, .B=B, .C=C, .H=H, .W=W};
+    // Scale: out = x_hat * gamma + beta
+    Term gamma_bc = thvm_expand(ctx,
+        thvm_reshape(ctx, term_ten(gamma_id, DTYPE_F32), SHAPE(1, C, 1, 1)),
+        (Shape){.dims={B,C,H,W}, .rank=4});
+    Term beta_bc = thvm_expand(ctx,
+        thvm_reshape(ctx, term_ten(beta_id, DTYPE_F32), SHAPE(1, C, 1, 1)),
+        (Shape){.dims={B,C,H,W}, .rank=4});
+    Term out = thvm_op(ctx, UOP_ADD,
+                       thvm_op(ctx, UOP_MUL, x_hat, gamma_bc),
+                       beta_bc);
+
+    Term out_r = thvm_reduce(ctx, out);
+    return (BNResult){.out_id=(u32)term_val(out_r), .B=B, .C=C, .H=H, .W=W};
 }
 
 // ============================================================
@@ -451,55 +497,7 @@ static LinearGrads linear_backward(TinyHVM *ctx, u32 d_out_id, u32 x_id, u32 w_i
     return (LinearGrads){.d_weight=d_weight, .d_bias=d_bias, .d_input=d_input};
 }
 
-// BatchNorm backward (host-side)
-typedef struct { u32 d_input, d_gamma, d_beta; } BNGrads;
-
-static BNGrads batchnorm_backward(TinyHVM *ctx, u32 d_out_id, BNResult *bn, u32 gamma_id) {
-    u32 B=bn->B, C=bn->C, H=bn->H, W=bn->W, spatial=H*W;
-    u32 n = B*C*spatial, count = B*spatial;
-
-    f32 *dout = buf_read(ctx, d_out_id, n);
-    f32 *gamma = buf_read(ctx, gamma_id, C);
-
-    f32 *d_gamma = calloc(C, sizeof(f32));
-    f32 *d_beta = calloc(C, sizeof(f32));
-    f32 *dx = malloc(n * sizeof(f32));
-
-    for (u32 b = 0; b < B; b++)
-        for (u32 c = 0; c < C; c++)
-            for (u32 s = 0; s < spatial; s++) {
-                u32 idx = (b*C+c)*spatial+s;
-                d_gamma[c] += dout[idx] * bn->x_hat[idx];
-                d_beta[c] += dout[idx];
-            }
-
-    for (u32 c = 0; c < C; c++) {
-        f32 mean_dy = 0, mean_xhat_dy = 0;
-        for (u32 b = 0; b < B; b++)
-            for (u32 s = 0; s < spatial; s++) {
-                u32 idx = (b*C+c)*spatial+s;
-                mean_dy += dout[idx];
-                mean_xhat_dy += dout[idx] * bn->x_hat[idx];
-            }
-        mean_dy /= (f32)count;
-        mean_xhat_dy /= (f32)count;
-
-        for (u32 b = 0; b < B; b++)
-            for (u32 s = 0; s < spatial; s++) {
-                u32 idx = (b*C+c)*spatial+s;
-                dx[idx] = gamma[c] * bn->inv_std[c] *
-                    (dout[idx] - mean_dy - bn->x_hat[idx]*mean_xhat_dy);
-            }
-    }
-
-    u32 dx_id = tensor_from(ctx, dx, (Shape){.dims={B,C,H,W}, .rank=4});
-    u32 dg_id = tensor_from(ctx, d_gamma, SHAPE(C));
-    u32 db_id = tensor_from(ctx, d_beta, SHAPE(C));
-    free(dout); free(gamma); free(dx); free(d_gamma); free(d_beta);
-    free(bn->x_hat); free(bn->inv_std);
-
-    return (BNGrads){.d_input=dx_id, .d_gamma=dg_id, .d_beta=db_id};
-}
+// batchnorm_backward removed — autograd handles BN gradients via UOp composition
 
 // ============================================================
 // Sequential composition
@@ -511,16 +509,11 @@ Term thvm_sequential(TinyHVM *ctx, Term x, Layer *layers, u32 n,
         Layer *l = &layers[i];
         switch (l->type) {
             case LAYER_CONV2D: {
-                Term xr = thvm_reduce(ctx, x);
-                TensorMeta *mx = &ctx->tensors[(u32)term_val(xr)];
-                u32 Cin = mx->view.shape.dims[1];
-                u32 H   = mx->view.shape.dims[2];
-                u32 W   = mx->view.shape.dims[3];
-                ConvResult cr = conv2d(ctx, (u32)term_val(xr),
-                    (u32)term_val(thvm_reduce(ctx, l->conv.w)),
-                    (u32)term_val(thvm_reduce(ctx, l->conv.b)),
-                    BS, Cin, H, W, l->conv.co, l->conv.k, l->conv.k);
-                x = term_ten(cr.out_id, DTYPE_F32);
+                // Pure UOp composition: thvm_conv2d
+                u32 padding[] = {0, 0, 0, 0};
+                u32 stride[] = {1, 1};
+                x = thvm_conv2d(ctx, x, l->conv.w, l->conv.b,
+                                1, stride, padding);
                 break;
             }
             case LAYER_BN: {
@@ -539,28 +532,22 @@ Term thvm_sequential(TinyHVM *ctx, Term x, Layer *layers, u32 n,
                 break;
             }
             case LAYER_MAXPOOL: {
-                Term xr = thvm_reduce(ctx, x);
-                TensorMeta *mx = &ctx->tensors[(u32)term_val(xr)];
-                u32 C = mx->view.shape.dims[1];
-                u32 H = mx->view.shape.dims[2];
-                u32 W = mx->view.shape.dims[3];
-                PoolResult pr = maxpool2d(ctx, (u32)term_val(xr), BS, C, H, W);
-                x = term_ten(pr.out_id, DTYPE_F32);
+                // Pure UOp composition: thvm_maxpool2d
+                u32 kernel[] = {l->pool.ks, l->pool.ks};
+                u32 stride[] = {l->pool.ks, l->pool.ks};
+                x = thvm_maxpool2d(ctx, x, kernel, stride);
                 break;
             }
             case LAYER_FLATTEN: {
                 Term xr = thvm_reduce(ctx, x);
                 TensorMeta *mx = &ctx->tensors[(u32)term_val(xr)];
                 u32 numel = mx->view.numel / BS;
-                mx->view = view_create(SHAPE(BS, numel));
-                x = xr;
+                x = thvm_reshape(ctx, xr, SHAPE(BS, numel));
                 break;
             }
             case LAYER_LINEAR: {
-                Term xr = thvm_reduce(ctx, x);
-                Term lo = linear(ctx, xr, l->lin.w, l->lin.b,
-                    BS, l->lin.in_f, l->lin.out_f);
-                x = thvm_reduce(ctx, lo);
+                x = linear(ctx, x, l->lin.w, l->lin.b,
+                           BS, l->lin.in_f, l->lin.out_f);
                 break;
             }
             case LAYER_FN:

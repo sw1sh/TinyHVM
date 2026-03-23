@@ -116,6 +116,9 @@ typedef u64 Term;
 
 #define UOP_COUNT     23
 
+// Internal ops — not part of tinyspec, only used for autograd provenance
+#define UOP_POOL_GATHER 100  // sliding window gather (im2col equivalent)
+
 // UOp name table (device-agnostic)
 static const char *uop_names[] = {
     "LOAD","STORE","CONST","CAST","NEG","RELU","EXP","LOG","SQRT","RECIP",

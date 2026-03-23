@@ -611,6 +611,7 @@ TinyHVM *thvm_init(Backend *backend) {
     TinyHVM *ctx = calloc(1, sizeof(TinyHVM));
     ctx->heap = calloc(HEAP_CAP, sizeof(Term));
     ctx->heap_pos = 1;
+    ctx->heap[0] = term_era();  // sentinel: prevent TAG_APP(0) self-loop
     ctx->backend = backend;
     if (backend && backend->init) backend->init();
     return ctx;
@@ -644,6 +645,7 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
         ctx->backend->pool_reset(keep);
     ctx->tensor_count = keep;
     ctx->heap_pos = 1;  // reset heap (keep weight terms as raw IDs)
+    ctx->heap[0] = term_era();  // sentinel
 }
 
 Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {
@@ -790,6 +792,11 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
 
         ctx->tensors[id].creator_op = UOP_PAD;
         ctx->tensors[id].src_ids[0] = src_id;
+        // Store pairs as tensor for backward
+        f32 pairs_f[MAX_DIM * 2];
+        for (u32 i2 = 0; i2 < ndim * 2; i2++) pairs_f[i2] = (f32)pairs[i2];
+        Term pt = thvm_tensor(ctx, pairs_f, SHAPE(ndim * 2));
+        ctx->tensors[id].src_ids[1] = (u32)term_val(pt);
         if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
@@ -826,6 +833,11 @@ Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         v->contiguous = 0;
         ctx->tensors[id].creator_op = UOP_SHRINK;
         ctx->tensors[id].src_ids[0] = src_id;
+        // Store pairs as tensor for backward
+        f32 shrink_f[MAX_DIM * 2];
+        for (u32 i2 = 0; i2 < ndim * 2; i2++) shrink_f[i2] = (f32)pairs[i2];
+        Term st = thvm_tensor(ctx, shrink_f, SHAPE(ndim * 2));
+        ctx->tensors[id].src_ids[1] = (u32)term_val(st);
         if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
@@ -883,53 +895,63 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
     Term t = xr;
 
     if (need_complex) {
-        // Complex path: repeat to duplicate data, then extract windows
-        // From tinygrad L2285-2296
+        // Differentiable path using only traceable UOps:
+        // For each spatial dim j with k > s:
+        //   Create k_j shifted copies via shrink, each of size o_j
+        //   Stack along new kernel dimension
         //
-        // f_[j] = 1 + (o*s > (i - k + 1))  — scaling factor
-        // rep[j] = ceildiv(k*(i*f+1), i)    — repeats needed
-        // x = repeat(rep)
-        // x = shrink(k*(i*f+1)).reshape(k, i*f+1)  — per spatial dim
-        // x = shrink((0,k), (0,o*s)).reshape(k, o, s)
-        // x = shrink((0,k), (0,o), (0,1)).reshape(k, o)
-        // x = permute(batch, o_dims, k_dims)
+        // For conv2d (s=1): x[b,c, oh+kh, ow+kw] for each (kh,kw)
+        // = shrink x along spatial dims to [oh+kh : oh+kh + 1] for each kernel pos
+        //
+        // Strategy: process one spatial dim at a time.
+        // For dim j: reshape to (..., i_j) then for each k in 0..k_j-1,
+        //   shrink to [k, k+o_j) to get shifted copy of size o_j
+        //   pad to full size i_j with zeros, accumulate via reshape
+        // Finally reshape to (..., o_j, k_j)
+        //
+        // Simpler: for 2D conv (the common case), create the full [BS, Cin, OH, OW, KH, KW]
+        // tensor by iterating over kernel positions and writing shrunk slices.
+        // Each shrink IS differentiable (has gradient rule now).
 
-        // Simpler approach for stride=1, no dilation (our conv2d case):
-        // For each spatial dim with s=1, k>1:
-        //   o = i-k+1, we need sliding windows of size k
-        //   pad to make i divisible by s (already is for s=1)
-        //   Tile: repeat the spatial dim k times to get k*i elements
-        //   Reshape to [k, i], then shrink to [k, o*1=o], reshape to [k, o]
-        //   This creates k copies offset by 0,1,...,k-1
+        // For 2D spatial: iterate over (kh, kw), shrink input for each position
+        assert(n_spatial == 2);  // 2D pooling for now
+        u32 bs_dims[MAX_DIM];
+        for (u32 j = 0; j < bd; j++) bs_dims[j] = mx->view.shape.dims[j];
 
-        // Actually, let me use the tinygrad approach more directly:
-        // For s=1, k=K:
-        //   o = i-K+1
-        //   We need a [batch, o, K] view where element [b, j, kk] = x[b, j+kk]
-        //   Strategy: pad to (o+K-1) then create windows
+        // We need: result[batch, o0, o1, k0, k1] = x[batch, o0*s0+k0, o1*s1+k1]
+        // Build by creating k0*k1 shrunk slices and concatenating
 
-        // Simplest correct approach for stride=1:
-        // Use nested shrink+reshape to create sliding windows
-        // For each position j in [0, o), extract elements [j, j+K)
-        // This is equivalent to: pad(0, o*1-i) (which is 0 for s=1)
-        // Then for each spatial dim:
-        //   x shape: [batch, i], need [batch, o, k]
-        //   Method: create k copies, each shifted by offset
-        //   Use pad + shrink for each offset? Too many ops.
-
-        // Best approach: implement as a physical gather op (im2col as UOp)
-        // For now, implement as CPU-side gather and create the pooled tensor directly
-
-        // For conv2d with stride=1, the pooled result is [BS, Cin, OH, OW, KH, KW]
-        // where result[b,c,oh,ow,kh,kw] = x[b,c,oh+kh,ow+kw]
-
-        // Materialize on CPU
+        // Output shape: [batch_dims..., o0, o1, k0, k1]
         u32 out_dims[MAX_DIM], out_rank = ndim + n_spatial;
         for (u32 j = 0; j < bd; j++) out_dims[j] = mx->view.shape.dims[j];
         for (u32 j = 0; j < n_spatial; j++) {
-            out_dims[bd + j]           = o_[j];
+            out_dims[bd + j]             = o_[j];
             out_dims[bd + n_spatial + j] = k_[j];
         }
+
+        // For each kernel position (kh, kw), produce a shrunk view of x
+        // with shape [batch, o0, o1] and place it at position [kh, kw]
+        // in the kernel dimensions.
+        //
+        // In the output tensor [batch, o0, o1, k0, k1]:
+        //   element [b, oh, ow, kh, kw] = x[b, oh*s0+kh, ow*s1+kw]
+        //
+        // We create this by doing k0*k1 shrink ops and summing into the right spot.
+        // Each shrink produces [batch, o0, o1].
+        // Reshape to [batch, o0, o1, 1, 1], pad to [batch, o0, o1, k0, k1] at (kh,kw).
+
+        // Actually simplest: build entire output on CPU using shrink results.
+        // Each shrink IS a traceable UOp. Read shrunk data, write to output position.
+
+        // Even simpler and fully lazy: build the output as a sum of padded shrinks.
+        // For each (kh,kw): shrink → reshape to [batch,o0,o1,1,1] → pad to place at (kh,kw)
+        // Then sum all k0*k1 terms. But that's really wasteful in memory.
+
+        // Most practical: CPU gather but WITH proper provenance tracking.
+        // Store source tensor + params, implement scatter-add backward.
+
+        // Since we can't avoid materialization for overlapping windows without
+        // a dedicated unfolding UOp, materialize on CPU but record provenance.
         u32 out_numel = 1;
         for (u32 j = 0; j < out_rank; j++) out_numel *= out_dims[j];
 
@@ -938,29 +960,24 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
         u32 dst_id = tensor_create(ctx, os, mx->dtype);
 
         if (ctx->backend) {
-            // Read source data
             u32 src_numel = mx->view.numel;
             f32 *src = malloc(src_numel * sizeof(f32));
             f32 *dst = malloc(out_numel * sizeof(f32));
             ctx->backend->buf_read(mx->buf_id, src, src_numel * sizeof(f32));
 
-            // Build the pooled output: for each element, compute source index
             for (u32 flat = 0; flat < out_numel; flat++) {
-                // Decompose flat index into [batch_coords..., o_coords..., k_coords...]
                 u32 coords[MAX_DIM], rem = flat;
                 for (int d = (int)out_rank - 1; d >= 0; d--) {
                     coords[d] = rem % out_dims[d];
                     rem /= out_dims[d];
                 }
-
-                // Map to source index
                 u32 src_idx = 0, src_stride = 1;
                 for (int d = (int)ndim - 1; d >= 0; d--) {
                     u32 coord;
                     if ((u32)d < bd) {
-                        coord = coords[d];  // batch dim
+                        coord = coords[d];
                     } else {
-                        u32 si = (u32)d - bd;  // spatial index
+                        u32 si = (u32)d - bd;
                         coord = coords[bd + si] * s_[si] + coords[bd + n_spatial + si];
                     }
                     src_idx += coord * src_stride;
@@ -974,7 +991,24 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
             free(dst);
         }
 
-        // Record provenance for autograd
+        // Record provenance: custom POOL op for autograd
+        // Store source id + pool params (n_spatial, kernel, stride, input spatial dims)
+        ctx->tensors[dst_id].creator_op = UOP_POOL_GATHER;
+        ctx->tensors[dst_id].src_ids[0] = (u32)term_val(xr);
+        // Store pool params: [n_spatial, k0, k1, s0, s1, i0, i1, o0, o1, bd]
+        f32 params[MAX_DIM * 2];  // needs 1 + 4*n_spatial + 1 entries
+        params[0] = (f32)n_spatial;
+        for (u32 j = 0; j < n_spatial; j++) {
+            params[1 + j]               = (f32)k_[j];
+            params[1 + n_spatial + j]    = (f32)s_[j];
+            params[1 + 2*n_spatial + j]  = (f32)i_[j];
+            params[1 + 3*n_spatial + j]  = (f32)o_[j];
+        }
+        params[1 + 4*n_spatial] = (f32)bd;
+        u32 plen = 2 + 4*n_spatial;
+        Term pt = thvm_tensor(ctx, params, SHAPE(plen));
+        ctx->tensors[dst_id].src_ids[1] = (u32)term_val(pt);
+
         if (ctx->recording && mx->requires_grad) {
             ctx->tensors[dst_id].requires_grad = 1;
         }
@@ -1446,8 +1480,65 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
             }
 
             case UOP_RMAX: {
-                // ∂max(a)/∂a = grad * (a == max)
-                // Skip for now — rarely needed directly in backprop
+                // ∂max(a)/∂a = grad * (a == max_value)
+                // max_value is the output (tensor i), broadcast back to input shape
+                if (ma->requires_grad) {
+                    // Expand max result back to input shape, compare to get mask
+                    Term max_bc = thvm_expand(ctx,
+                        thvm_reshape(ctx, term_ten((u32)i, e->dtype), e->view.shape),
+                        ma->view.shape);
+                    // mask = (a == max)
+                    Term mask = thvm_op(ctx, UOP_CMP, term_ten(a_id, ma->dtype), max_bc);
+                    // grad * mask, broadcast grad to input shape
+                    Term grad_bc = thvm_expand(ctx,
+                        thvm_reshape(ctx, grad, e->view.shape),
+                        ma->view.shape);
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_op(ctx, UOP_MUL, grad_bc, mask));
+                }
+                break;
+            }
+
+            case UOP_PAD: {
+                // ∂pad(a)/∂a = shrink(grad) — remove the padded regions
+                if (ma->requires_grad && b_id) {
+                    TensorMeta *mb_pad = &ctx->tensors[b_id];
+                    u32 ndim_p = mb_pad->view.numel / 2;
+                    f32 *pf = malloc(mb_pad->view.numel * sizeof(f32));
+                    ctx->backend->buf_read(mb_pad->buf_id, pf, mb_pad->view.numel * sizeof(f32));
+                    // Shrink pairs: start=pad_before, end=pad_before+original_dim
+                    u32 shrink_p[MAX_DIM * 2];
+                    for (u32 j = 0; j < ndim_p; j++) {
+                        u32 pad_before = (u32)pf[j * 2];
+                        shrink_p[j * 2]     = pad_before;
+                        shrink_p[j * 2 + 1] = pad_before + ma->view.shape.dims[j];
+                    }
+                    free(pf);
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_shrink(ctx, grad, shrink_p, ndim_p));
+                }
+                break;
+            }
+
+            case UOP_SHRINK: {
+                // ∂shrink(a)/∂a = pad(grad) — pad with zeros to restore original shape
+                if (ma->requires_grad && b_id) {
+                    TensorMeta *mb_sh = &ctx->tensors[b_id];
+                    u32 ndim_s = mb_sh->view.numel / 2;
+                    f32 *sf = malloc(mb_sh->view.numel * sizeof(f32));
+                    ctx->backend->buf_read(mb_sh->buf_id, sf, mb_sh->view.numel * sizeof(f32));
+                    // Pad pairs: before=shrink_start, after=original_dim-shrink_end
+                    u32 pad_p[MAX_DIM * 2];
+                    for (u32 j = 0; j < ndim_s; j++) {
+                        u32 s_start = (u32)sf[j * 2];
+                        u32 s_end   = (u32)sf[j * 2 + 1];
+                        pad_p[j * 2]     = s_start;
+                        pad_p[j * 2 + 1] = ma->view.shape.dims[j] - s_end;
+                    }
+                    free(sf);
+                    grad_graph_accum(ctx, gm, a_id,
+                        thvm_pad(ctx, grad, pad_p, ndim_s));
+                }
                 break;
             }
 
@@ -1491,6 +1582,74 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
                     free(axes_f);
                     grad_graph_accum(ctx, gm, a_id,
                         thvm_permute(ctx, grad, inv_axes, rank));
+                }
+                break;
+            }
+
+            case UOP_POOL_GATHER: {
+                // ∂pool_gather(a)/∂a = scatter-add (col2im equivalent)
+                // Forward gathered: out[batch, o0, o1, k0, k1] = in[batch, o0*s0+k0, o1*s1+k1]
+                // Backward: scatter-add gradient back to input shape
+                if (ma->requires_grad && b_id) {
+                    TensorMeta *mb_pg = &ctx->tensors[b_id];
+                    u32 plen = mb_pg->view.numel;
+                    f32 *pf = malloc(plen * sizeof(f32));
+                    ctx->backend->buf_read(mb_pg->buf_id, pf, plen * sizeof(f32));
+                    u32 ns = (u32)pf[0];  // n_spatial
+                    u32 pk[2], ps[2], pi[2], po[2], pbd;
+                    for (u32 j = 0; j < ns; j++) {
+                        pk[j] = (u32)pf[1 + j];
+                        ps[j] = (u32)pf[1 + ns + j];
+                        pi[j] = (u32)pf[1 + 2*ns + j];
+                        po[j] = (u32)pf[1 + 3*ns + j];
+                    }
+                    pbd = (u32)pf[1 + 4*ns];
+                    free(pf);
+
+                    // Materialize gradient and scatter-add back
+                    Term g_r = thvm_reduce(ctx, grad);
+                    u32 g_id = (u32)term_val(g_r);
+                    u32 g_numel = ctx->tensors[g_id].view.numel;
+                    u32 in_numel = ma->view.numel;
+                    f32 *g_data = malloc(g_numel * sizeof(f32));
+                    f32 *dx = calloc(in_numel, sizeof(f32));
+                    ctx->backend->buf_read(ctx->tensors[g_id].buf_id, g_data, g_numel * sizeof(f32));
+
+                    u32 ndim_out = ma->view.shape.rank + ns;
+                    u32 od[MAX_DIM];
+                    for (u32 j = 0; j < pbd; j++) od[j] = ma->view.shape.dims[j];
+                    for (u32 j = 0; j < ns; j++) {
+                        od[pbd + j]      = po[j];
+                        od[pbd + ns + j] = pk[j];
+                    }
+
+                    for (u32 flat = 0; flat < g_numel; flat++) {
+                        u32 coords[MAX_DIM], rem = flat;
+                        for (int d = (int)ndim_out - 1; d >= 0; d--) {
+                            coords[d] = rem % od[d];
+                            rem /= od[d];
+                        }
+                        // Map back to source index
+                        u32 src_idx = 0, src_stride = 1;
+                        u32 ndim_in = ma->view.shape.rank;
+                        for (int d = (int)ndim_in - 1; d >= 0; d--) {
+                            u32 coord;
+                            if ((u32)d < pbd) {
+                                coord = coords[d];
+                            } else {
+                                u32 si = (u32)d - pbd;
+                                coord = coords[pbd + si] * ps[si] + coords[pbd + ns + si];
+                            }
+                            src_idx += coord * src_stride;
+                            src_stride *= ma->view.shape.dims[d];
+                        }
+                        dx[src_idx] += g_data[flat];
+                    }
+
+                    u32 dx_id = tensor_fill(ctx, ma->view.shape, 0.0f);
+                    ctx->backend->buf_write(ctx->tensors[dx_id].buf_id, dx, in_numel * sizeof(f32));
+                    free(g_data); free(dx);
+                    grad_graph_accum(ctx, gm, a_id, term_ten(dx_id, ma->dtype));
                 }
                 break;
             }

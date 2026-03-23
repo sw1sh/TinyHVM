@@ -701,31 +701,37 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                             MEMO_RETURN((REACHES(aid,x_id) ? (REACHES(bid,x_id) ? GRAD_ADD(GRAD3(at,da,x),GRAD3(bt,db,x)) : GRAD3(at,da,x)) : (REACHES(bid,x_id) ? GRAD3(bt,db,x) : term_era())));
                         }
                         case UOP_FUSING: {
-                            // src_ids[0/1] = tensor ids of the two MUL inputs (a, b)
-                            u32 fa_id = ctx->tensors[y_id].src_ids[0];
-                            u32 fb_id = ctx->tensors[y_id].src_ids[1];
-                            Term fa = term_ten(fa_id, ctx->tensors[fa_id].dtype);
-                            Term fb = term_ten(fb_id, ctx->tensors[fb_id].dtype);
-                            TensorMeta *ma2 = &ctx->tensors[fa_id];
-                            TensorMeta *mb2 = &ctx->tensors[fb_id];
-                            // Broadcast shape of MUL inputs
-                            Shape ms = ma2->view.shape;
-                            for (u32 d = 0; d < ms.rank; d++)
-                                if (mb2->view.shape.dims[d] > ms.dims[d])
-                                    ms.dims[d] = mb2->view.shape.dims[d];
-                            // gy has the fused SUM output's keepdims shape.
-                            // Expand directly to ms — no reshape needed.
-                            Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
-                            Term gbc  = thvm_expand(ctx, gy_r, ms);
-                            Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gbc, fb),
-                                                   ms, ma2->view.shape);
-                            Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gbc, fa),
-                                                   ms, mb2->view.shape);
-                            MEMO_RETURN((REACHES(fa_id,x_id)
-                                ? (REACHES(fb_id,x_id)
-                                    ? GRAD_ADD(GRAD3(fa,da,x), GRAD3(fb,db,x))
-                                    : GRAD3(fa,da,x))
-                                : (REACHES(fb_id,x_id) ? GRAD3(fb,db,x) : term_era())));
+                            // General FUSING backward: re-reduce the original unfused subnet
+                            // with provenance recording, then GRAD through the result.
+                            //
+                            // fusing_loc = heap loc of the original TAG_TOP subnet root
+                            // fusing_uop = UOP of that root (e.g. UOP_SUM)
+                            // src_ids    = leaf tensor ids of the subnet (for REACHES traversal)
+                            //
+                            // By temporarily clearing reduce_memo[fusing_loc] we bypass the
+                            // forward memo cache, so thvm_reduce runs the full unfused path and
+                            // records proper provenance. We then restore the FUSING memo so
+                            // future forward reductions still get the fast fused result.
+                            u64 orig_loc = ctx->tensors[y_id].fusing_loc;
+                            u32 orig_uop = ctx->tensors[y_id].fusing_uop;
+
+                            Term saved_fusing = ctx->reduce_memo[orig_loc];
+                            u8   saved_rec    = ctx->recording;
+                            u8   saved_nf     = ctx->no_fuse;
+
+                            ctx->reduce_memo[orig_loc] = 0; // clear so fresh reduction runs
+                            ctx->recording = 1;             // record provenance on unfused path
+                            ctx->no_fuse   = 1;             // prevent re-fusing the same pattern
+
+                            Term orig = term_new(TAG_TOP, orig_uop, orig_loc);
+                            Term unfused = thvm_reduce(ctx, orig); // fully unfused, with provenance
+
+                            ctx->reduce_memo[orig_loc] = saved_fusing; // restore FUSING fast path
+                            ctx->recording = saved_rec;
+                            ctx->no_fuse   = saved_nf;
+
+                            // GRAD through the unfused result — works for any subnet topology
+                            MEMO_RETURN(GRAD3(unfused, gy, x));
                         }
                         case UOP_SUM: {
                             // Plain SUM (no fused MUL). gy has keepdims shape; expand to input shape.
@@ -843,7 +849,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
 
             // === FUSED MUL+SUM: pattern match SUM(MUL(a, b)) ===
             // Avoids materializing the huge MUL intermediate buffer.
-            if (uop == UOP_SUM) {
+            if (uop == UOP_SUM && !ctx->no_fuse) {
                 Term child = heap_read(ctx, loc);
                 if (term_tag(child) == TAG_TOP && term_ext(child) == UOP_MUL) {
                     u64 mul_loc = term_val(child);
@@ -918,8 +924,10 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                                 if (ctx->recording) {
                                     md->requires_grad = ma->requires_grad || mb->requires_grad;
                                     md->creator_op = UOP_FUSING;
-                                    md->src_ids[0] = ma_id;  // MUL input a
-                                    md->src_ids[1] = mb_id;  // MUL input b
+                                    md->src_ids[0] = ma_id;  // MUL input a (for REACHES)
+                                    md->src_ids[1] = mb_id;  // MUL input b (for REACHES)
+                                    md->fusing_loc = loc;    // heap loc of SUM TAG_TOP
+                                    md->fusing_uop = UOP_SUM; // outermost fused op
                                 }
 
                                 // Dispatch: Metal or CPU fallback

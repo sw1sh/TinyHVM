@@ -371,7 +371,11 @@ typedef struct {
     // Autograd provenance
     u8          requires_grad;
     u32         creator_op; // UOP that created this tensor
-    u32         src_ids[2]; // input tensor ids (for backward rules)
+    u32         src_ids[2]; // input tensor ids (for backward rules + REACHES traversal)
+
+    // Fusion metadata (only when creator_op == UOP_FUSING)
+    u64         fusing_loc; // heap loc of the original subnet root TAG_TOP
+    u32         fusing_uop; // UOP of the subnet root (e.g. UOP_SUM)
 } TensorMeta;
 
 
@@ -436,6 +440,7 @@ typedef struct {
     Backend *backend;
     u64         itrs;       // interaction count
     u8          recording;  // 1 if recording forward ops for grad
+    u8          no_fuse;    // 1 to skip fusion (used during GRAD subnet re-reduction)
     // DUP-SUP memo: cache reduced TAG_TOP results by heap location
     Term       *reduce_memo;   // array[MAX_HEAP], 0 = not cached
     u64         reduce_memo_size;

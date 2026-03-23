@@ -211,13 +211,28 @@ case TAG_REF:
 
 ---
 
-### Phase 3 — UOP_ITE and UOP_LOAD
+### Phase 3 — `UOP_ASSIGN`, `UOP_ITE`, `UOP_LOAD`
 
-**UOP_ITE**:
+**`UOP_ASSIGN`** (in-place weight update):
+```c
+case UOP_ASSIGN: {
+    Term dst = heap_read(ctx, loc);
+    Term src = thvm_reduce(ctx, heap_read(ctx, loc + 1));
+    // dst must be TAG_TEN; blit src buffer into dst buffer
+    u32 dst_id = (u32)term_val(dst);
+    u32 src_id = (u32)term_val(src);
+    // in-place copy on the backend (single GPU memcpy or CPU memcpy)
+    ctx->backend->buf_copy(ctx->tensors[dst_id].buf_id,
+                           ctx->tensors[src_id].buf_id,
+                           ctx->tensors[dst_id].view.numel * sizeof(f32));
+    MEMO_RETURN(dst);   // returns same TAG_TEN, same buf_id
+}
+```
+
+**`UOP_ITE`**:
 ```c
 case UOP_ITE: {
     Term cond = thvm_reduce(ctx, heap_read(ctx, loc));
-    // cond should be TAG_NUM
     if (term_as_u32(cond) != 0)
         MEMO_RETURN(thvm_reduce(ctx, heap_read(ctx, loc + 1)));
     else
@@ -225,7 +240,7 @@ case UOP_ITE: {
 }
 ```
 
-**UOP_LOAD**:
+**`UOP_LOAD`**:
 ```c
 case UOP_LOAD: {
     Term src = heap_read(ctx, loc);     // data source (pointer to f32 array + shape)
@@ -268,14 +283,47 @@ Term program = thvm_app(ctx,
 
 ## Invariants of the Pure Inet Model
 
-1. **Single reduction**: `thvm_reduce(program)` is called once. It may internally
-   call `thvm_reduce` recursively (REF unfolding), but from the caller's perspective
-   it is one call.
+1. **Single reduction**: `thvm_reduce(program)` is called once. `TAG_REF`
+   unfolding is one interaction rule — the REF node is replaced by a fresh clone
+   of its body sub-inet in-place; ordinary reduction continues on the resulting
+   net. It is not C recursion.
 2. **No explicit backward pass**: `GRAD(y, gy, x)` is just a lazy TOP node built
    alongside the forward graph. It reduces on demand when the result is needed.
 3. **No recording flag**: provenance is written whenever `requires_grad` is true.
-4. **Weights persist via sharing**: W and b appear in both numerator and denominator
-   of the `GRAD` node. The DUP-SUP mechanism (TAG_SUP / TAG_DP) ensures they are
-   reduced once and shared correctly.
-5. **Erasure frees activations**: intermediate tensors (H, loss, etc.) are erased
-   by TAG_ERA propagation when the lambda that produced them closes.
+4. **Weight mutation via `UOP_ASSIGN`**: purely functional `W' = W - lr*dW`
+   produces a new tensor and erases the old `W` buffer — correct but wastes a
+   GPU allocation each step. `UOP_ASSIGN(dst, src)` reduces `src`, blits it into
+   `dst`'s existing `buf_id`, and returns the same `TAG_TEN(dst_id)`. From the
+   inet's perspective the node reduces to the same term; under the hood the
+   buffer is updated in-place. This is the only controlled side effect.
+   (Analogue: tinygrad's `UOP_STORE` / `Tensor.assign()`.)
+5. **Erasure frees activations**: intermediate tensors (`H`, `loss`, etc.) are
+   erased by `TAG_ERA` propagation when the lambda that produced them closes.
+
+---
+
+## §6 Side Effects: `UOP_ASSIGN`
+
+The **only** controlled side effect in the pure inet is buffer mutation during
+the optimizer step.
+
+```
+UOP_ASSIGN(dst_term, src_term)
+  → reduce src_term to TAG_TEN(src_id)
+  → blit src buffer into dst buffer  (GPU memcpy, no new allocation)
+  → return dst_term unchanged          (same TAG_TEN, same buf_id)
+```
+
+Training loop with `ASSIGN`:
+
+```
+let dW  = GRAD(loss, W)
+let W'  = ASSIGN(W, W - lr * dW)   // in-place; W' is same node as W
+let db  = GRAD(loss, b)
+let b'  = ASSIGN(b, b - lr * db)
+self(W', b', data', n-1)
+```
+
+`UOP_ASSIGN` is a **performance annotation**, not a correctness requirement. The
+fully pure version (new buffers each step) is also valid and simpler to implement
+first in the PoC.

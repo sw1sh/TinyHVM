@@ -116,9 +116,12 @@ typedef u64 Term;
 
 // Fusion: wraps any fused subgraph. Realized tensor carries the original subnet
 // heap root in src_ids, so GRAD can walk back through the unfused lazy graph.
-#define UOP_FUSING    23
+#define UOP_FUSING    23  // fused kernel (SUM(MUL) etc); see ic_fusion.md
+#define UOP_ASSIGN    24  // in-place weight update: blit src buf into dst buf
+#define UOP_ITE       25  // conditional: ITE(cond, then, else)
+#define UOP_LOAD_BATCH 26 // lazy batch load: LOAD(data_ptr_term, idx_term)
 
-#define UOP_COUNT     24
+#define UOP_COUNT     27
 
 // Internal ops — not part of tinyspec, only used for autograd provenance
 #define UOP_POOL_GATHER 100  // sliding window gather (im2col equivalent)
@@ -439,11 +442,13 @@ typedef struct {
     u32         tensor_count;
     Backend *backend;
     u64         itrs;       // interaction count
-    u8          recording;  // 1 if recording forward ops for grad
     u8          no_fuse;    // 1 to skip fusion (used during GRAD subnet re-reduction)
     // DUP-SUP memo: cache reduced TAG_TOP results by heap location
     Term       *reduce_memo;   // array[MAX_HEAP], 0 = not cached
     u64         reduce_memo_size;
+    // Named definitions for TAG_REF (global def table)
+    Term        defs[256];   // defs[name] = heap loc or TAG_TOP term
+    u32         def_count;
 } TinyHVM;
 
 // ============================================================
@@ -486,8 +491,20 @@ void     thvm_print_term(TinyHVM *ctx, Term t);
 
 // Autograd
 void     thvm_set_requires_grad(TinyHVM *ctx, Term t);
-void     thvm_start_recording(TinyHVM *ctx);
-void     thvm_stop_recording(TinyHVM *ctx);
+void     thvm_start_recording(TinyHVM *ctx);  // no-op — provenance always-on
+void     thvm_stop_recording(TinyHVM *ctx);   // no-op — provenance always-on
+
+// Lambda / inet combinators
+Term     thvm_lam(TinyHVM *ctx, Term *var_out, Term body);   // allocate LAM node
+Term     thvm_app(TinyHVM *ctx, Term fun, Term arg);         // allocate APP node
+u32      thvm_define(TinyHVM *ctx, Term body);               // register def, return name id
+Term     thvm_ref(TinyHVM *ctx, u32 name);                   // TAG_REF(name)
+Term     thvm_sup(TinyHVM *ctx, Term a, Term b);             // TAG_SUP(a, b)
+
+// Inet ops
+Term     thvm_ite(TinyHVM *ctx, Term cond, Term then_t, Term else_t);
+Term     thvm_load(TinyHVM *ctx, const f32 *data, u32 numel_per_item, Shape item_shape, Term idx);
+Term     thvm_assign(TinyHVM *ctx, Term dst, Term src);      // in-place weight update
 
 // Profiling (dispatches to backend->profile_report/reset)
 void     thvm_profile_report(TinyHVM *ctx);

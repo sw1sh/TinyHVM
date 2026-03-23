@@ -286,28 +286,29 @@ static u32 tensor_fill(TinyHVM *ctx, Shape s, f32 val);
 static u32 tensor_transpose_2d(TinyHVM *ctx, u32 src_id);
 static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target);
 
-Term thvm_reduce(TinyHVM *ctx, Term t) {
-    // DUP-SUP annihilation: cache TAG_TOP reductions by heap location.
-    // Shared sub-expressions (e.g., K² copies of same grad in col2im)
-    // are reduced once and cached.
+// thvm_interact: fire ONE interaction rule for term t.
+// Returns the resulting term (may itself be un-reduced).
+// Does NOT loop. thvm_reduce is the outer active-pair loop.
+static Term thvm_interact(TinyHVM *ctx, Term t) {
     u64 memo_loc = 0;  // set for TAG_TOP to enable caching
     if (term_tag(t) == TAG_TOP) {
         memo_loc = term_val(t);
         if (memo_loc < ctx->reduce_memo_size && ctx->reduce_memo[memo_loc] != 0) {
-            return ctx->reduce_memo[memo_loc];  // cached
+            return ctx->reduce_memo[memo_loc];  // already cached — no interaction needed
         }
     }
-    // Macro: cache result for TAG_TOP before returning.
-    // Loop until WNF: if the result is still a TAG_TOP (pending interaction), keep reducing.
+    // Macro: cache the result for TAG_TOP terms.
     #define MEMO_RETURN(result) do { \
         Term _r = (result); \
-        while (term_tag(_r) == TAG_TOP) _r = thvm_reduce(ctx, _r); \
+        while (term_tag(_r) == TAG_TOP) _r = thvm_interact(ctx, _r); \
         if (memo_loc && memo_loc < ctx->reduce_memo_size) \
             ctx->reduce_memo[memo_loc] = _r; \
         return _r; \
     } while(0)
 
-    u32 tag = term_tag(t);
+    u32 tag;
+inet_step:
+    tag = term_tag(t);
 
     switch (tag) {
         case TAG_TOP: {
@@ -459,18 +460,15 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                             u32 orig_uop = ctx->tensors[y_id].fusing_uop;
 
                             Term saved_fusing = ctx->reduce_memo[orig_loc];
-                            u8   saved_rec    = ctx->recording;
                             u8   saved_nf     = ctx->no_fuse;
 
                             ctx->reduce_memo[orig_loc] = 0; // clear so fresh reduction runs
-                            ctx->recording = 1;             // record provenance on unfused path
                             ctx->no_fuse   = 1;             // prevent re-fusing the same pattern
 
                             Term orig = term_new(TAG_TOP, orig_uop, orig_loc);
                             Term unfused = thvm_reduce(ctx, orig); // fully unfused, with provenance
 
                             ctx->reduce_memo[orig_loc] = saved_fusing; // restore FUSING fast path
-                            ctx->recording = saved_rec;
                             ctx->no_fuse   = saved_nf;
 
                             // GRAD through the unfused result — works for any subnet topology
@@ -580,6 +578,58 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 MEMO_RETURN(term_era());
             }
 
+            // === Phase 3 inet ops ===
+
+            if (uop == UOP_ASSIGN) {
+                // UOP_ASSIGN(dst, src) — reduce src, blit into dst's buffer in-place
+                Term dst_t = heap_read(ctx, loc);
+                Term src_t = thvm_reduce(ctx, heap_read(ctx, loc + 1));
+                Term dst_r = thvm_reduce(ctx, dst_t);
+                if (term_tag(dst_r) == TAG_TEN && term_tag(src_t) == TAG_TEN) {
+                    u32 dst_id = (u32)term_val(dst_r);
+                    u32 src_id = (u32)term_val(src_t);
+                    TensorMeta *md = &ctx->tensors[dst_id];
+                    TensorMeta *ms = &ctx->tensors[src_id];
+                    u64 nbytes = (u64)md->view.numel * sizeof(f32);
+                    f32 *dst_host = (f32 *)thvm_to_host(ctx, dst_r);
+                    f32 *src_host = (f32 *)thvm_to_host(ctx, src_t);
+                    memcpy(dst_host, src_host, nbytes);
+                    if (ctx->backend)
+                        ctx->backend->buf_write(md->buf_id, dst_host, nbytes);
+                    (void)ms;
+                    ctx->itrs++;
+                    MEMO_RETURN(dst_r); // same TAG_TEN, same buf_id, mutated value
+                }
+                MEMO_RETURN(term_era());
+            }
+
+            if (uop == UOP_ITE) {
+                // UOP_ITE(cond, then, else) — branches on TAG_NUM condition
+                // heap[loc]={cond, then}, heap[loc+2]=else (allocate 3 slots)
+                Term cond = thvm_reduce(ctx, heap_read(ctx, loc));
+                if (term_tag(cond) != TAG_NUM) MEMO_RETURN(term_era());
+                u32 cv = term_as_u32(cond);
+                ctx->itrs++;
+                MEMO_RETURN(thvm_reduce(ctx, heap_read(ctx, loc + (cv ? 1 : 2))));
+            }
+
+            if (uop == UOP_LOAD_BATCH) {
+                // UOP_LOAD_BATCH(data_term, idx_term)
+                // data_term = TAG_NUM containing a pointer to a LoadBatchCtx struct
+                Term data_t = heap_read(ctx, loc);
+                Term idx_t  = thvm_reduce(ctx, heap_read(ctx, loc + 1));
+                if (term_tag(data_t) != TAG_NUM || term_tag(idx_t) != TAG_NUM)
+                    MEMO_RETURN(term_era());
+                // Decode: data_t stores an index into a side-channel registry
+                // (see thvm_load below). For now use as raw pointer packed in u32.
+                typedef struct { const f32 *data; u32 numel; Shape shape; } LoadBatchCtx;
+                LoadBatchCtx *lbc = (LoadBatchCtx *)(uintptr_t)term_as_u32(data_t);
+                u32 idx = term_as_u32(idx_t);
+                const f32 *batch = lbc->data + (u64)idx * lbc->numel;
+                ctx->itrs++;
+                MEMO_RETURN(thvm_tensor(ctx, batch, lbc->shape));
+            }
+
             // === FUSED MUL+SUM: pattern match SUM(MUL(a, b)) ===
             // Avoids materializing the huge MUL intermediate buffer.
             if (uop == UOP_SUM && !ctx->no_fuse) {
@@ -654,8 +704,8 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                                 // Record FUSING provenance: store the SUM heap loc so the
                                 // GRAD handler can walk back through the unfused subnet.
                                 // loc split across two u32 src_ids (heap fits in 38-bit VAL).
-                                if (ctx->recording) {
-                                    md->requires_grad = ma->requires_grad || mb->requires_grad;
+                                if (ma->requires_grad || mb->requires_grad) {
+                                    md->requires_grad = 1;
                                     md->creator_op = UOP_FUSING;
                                     md->src_ids[0] = ma_id;  // MUL input a (for REACHES)
                                     md->src_ids[1] = mb_id;  // MUL input b (for REACHES)
@@ -854,7 +904,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                         }
 
                         // Record provenance
-                        if (ctx->recording && ma->requires_grad) {
+                        if (ma->requires_grad) {
                             md->requires_grad = 1;
                             md->creator_op = uop;
                             md->src_ids[0] = a_id;
@@ -869,7 +919,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 }
                 u32 dst_id = tensor_view_of(ctx, a_id, new_view);
                 // Record provenance
-                if (ctx->recording && ma->requires_grad) {
+                if (ma->requires_grad) {
                     TensorMeta *md = &ctx->tensors[dst_id];
                     md->requires_grad = 1;
                     md->creator_op = uop;
@@ -952,7 +1002,7 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             TensorMeta *md = &ctx->tensors[dst_id];
 
             // Record provenance for autograd
-            if (ctx->recording) {
+            {
                 int needs = ma->requires_grad || (mb && mb->requires_grad);
                 if (needs) {
                     md->requires_grad = 1;
@@ -1115,20 +1165,68 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
             MEMO_RETURN(term_ten(dst_id, ma->dtype));
         }
 
+        // TAG_APP: beta reduction — APP(LAM(x, body), arg) → body[x ← arg]
+        // Rule fires as an active pair: APP + LAM → relink ports, continue loop.
         case TAG_APP: {
             u64 loc = term_val(t);
-            Term fun = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term fun = thvm_reduce(ctx, heap_read(ctx, loc));  // reduce fun (not tail)
             heap_set(ctx, loc, fun);
             if (term_tag(fun) == TAG_LAM) {
                 u64 lam_loc = term_val(fun);
                 Term arg = heap_read(ctx, loc + 1);
-                heap_set(ctx, lam_loc, arg);
-                Term body = heap_read(ctx, lam_loc + 1);
+                heap_set(ctx, lam_loc, arg);      // link: write arg at var slot
                 ctx->itrs++;
-                return thvm_reduce(ctx, body);
+                t = heap_read(ctx, lam_loc + 1);  // body is the next term to reduce
+                goto inet_step;                   // loop — no recursive call
             }
             return t;
         }
+
+        // TAG_LAM: lambda abstraction — returned as-is until applied
+        case TAG_LAM:
+            return t;
+
+        // TAG_REF: port-link — link body into the net, continue loop.
+        // REF interacts with its environment by relinking its port to the body's root.
+        // No recursive call — the active-pair loop handles the continuation.
+        case TAG_REF: {
+            u32 name = (u32)term_ext(t);
+            assert(name < ctx->def_count);
+            ctx->itrs++;
+            t = ctx->defs[name];  // link: t becomes the body root
+            goto inet_step;       // loop — no recursive call
+        }
+
+        // TAG_SUP: superposition — returned as-is until projected by DP0/DP1
+        case TAG_SUP:
+            return t;
+
+        // TAG_DP0/DP1: superposition projection — active pair with SUP.
+        // Fire the rule: link to the chosen branch, continue loop.
+        case TAG_DP0: {
+            u64 loc = term_val(t);
+            Term sup = thvm_reduce(ctx, heap_read(ctx, loc));  // reduce the sup (not tail)
+            if (term_tag(sup) == TAG_SUP) {
+                ctx->itrs++;
+                t = heap_read(ctx, term_val(sup));  // link to left branch
+                goto inet_step;
+            }
+            heap_set(ctx, loc, sup);
+            return t;
+        }
+
+        case TAG_DP1: {
+            u64 loc = term_val(t);
+            Term sup = thvm_reduce(ctx, heap_read(ctx, loc));
+            if (term_tag(sup) == TAG_SUP) {
+                ctx->itrs++;
+                t = heap_read(ctx, term_val(sup) + 1);  // link to right branch
+                goto inet_step;
+            }
+            heap_set(ctx, loc, sup);
+            return t;
+        }
+
 
         case TAG_OP2: {
             u64 loc = term_val(t);
@@ -1161,6 +1259,20 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
 
         default:
             return t;
+    }
+}
+
+// ============================================================
+// thvm_reduce: outer active-pair loop
+// Calls thvm_interact repeatedly until the term reaches WNF.
+// Handles memo caching for TAG_TOP shared subexpressions.
+// ============================================================
+
+Term thvm_reduce(TinyHVM *ctx, Term t) {
+    while (1) {
+        Term next = thvm_interact(ctx, t);
+        if (next == t) return t;  // WNF — interact returned t unchanged
+        t = next;
     }
 }
 
@@ -1322,7 +1434,7 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
         // Track provenance for autograd
         ctx->tensors[id].creator_op = UOP_RESHAPE;
         ctx->tensors[id].src_ids[0] = src_id;
-        if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
+        if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
     // Lazy fallback
@@ -1354,7 +1466,7 @@ Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
         v->contiguous = 0;
         ctx->tensors[id].creator_op = UOP_EXPAND;
         ctx->tensors[id].src_ids[0] = src_id;
-        if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
+        if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
     f32 dims[MAX_DIM];
@@ -1378,7 +1490,7 @@ Term thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank) {
         for (u32 i = 0; i < rank; i++) axes_f[i] = (f32)axes[i];
         Term axes_t = thvm_tensor(ctx, axes_f, SHAPE(rank));
         ctx->tensors[id].src_ids[1] = (u32)term_val(axes_t);
-        if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
+        if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
     f32 axes_f[MAX_DIM];
@@ -1439,7 +1551,7 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         for (u32 i2 = 0; i2 < ndim * 2; i2++) pairs_f[i2] = (f32)pairs[i2];
         Term pt = thvm_tensor(ctx, pairs_f, SHAPE(ndim * 2));
         ctx->tensors[id].src_ids[1] = (u32)term_val(pt);
-        if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
+        if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
     f32 pairs_f[MAX_DIM * 2];
@@ -1480,7 +1592,7 @@ Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         for (u32 i2 = 0; i2 < ndim * 2; i2++) shrink_f[i2] = (f32)pairs[i2];
         Term st = thvm_tensor(ctx, shrink_f, SHAPE(ndim * 2));
         ctx->tensors[id].src_ids[1] = (u32)term_val(st);
-        if (ctx->recording && m->requires_grad) ctx->tensors[id].requires_grad = 1;
+        if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
     f32 pairs_f[MAX_DIM * 2];
@@ -1651,7 +1763,7 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
         Term pt = thvm_tensor(ctx, params, SHAPE(plen));
         ctx->tensors[dst_id].src_ids[1] = (u32)term_val(pt);
 
-        if (ctx->recording && mx->requires_grad) {
+        if (mx->requires_grad) {
             ctx->tensors[dst_id].requires_grad = 1;
         }
         ctx->itrs++;
@@ -1744,14 +1856,15 @@ Term thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
     // Step 2: _pool to create sliding windows
     u32 k[] = {KH, KW};
     u32 s[] = {stride_[0], stride_[1]};
+    // Compute output spatial dims algebraically — no thvm_reduce needed.
+    // input after padding: H + pad[0]+pad[1], W + pad[2]+pad[3]
+    u32 IH = mx->view.shape.dims[2] + padding_[0] + padding_[1];
+    u32 IW = mx->view.shape.dims[3] + padding_[2] + padding_[3];
+    u32 oy = (IH - KH) / stride_[0] + 1;
+    u32 ox = (IW - KW) / stride_[1] + 1;
     Term pooled = thvm_pool(ctx, padded, k, s, 2);
     // pooled: [BS, Cin, OY, OX, KH, KW]
-
-    // Get output spatial dims
-    Term pr = thvm_reduce(ctx, pooled);
-    TensorMeta *mp = &ctx->tensors[(u32)term_val(pr)];
-    u32 oy = mp->view.shape.dims[2];
-    u32 ox = mp->view.shape.dims[3];
+    Term pr = pooled;  // lazy — shape is now known algebraically
 
     u32 rcout = cout / groups;
 
@@ -1800,21 +1913,27 @@ Term thvm_maxpool2d(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_)
     // pooled shape: [BS, C, OY, OX, KH, KW]
     // reduce max over last 2 dims (KH, KW), squeezing between
 
-    // Get pool dims
-    Term pr = thvm_reduce(ctx, pooled);
+    // Compute pool output dims algebraically — no thvm_reduce needed.
+    // x must be a TAG_TEN (caller contract: x is realized input).
+    Term pr = x;  // pass through — shape read from input
+    if (term_tag(x) != TAG_TEN) pr = thvm_reduce(ctx, x);  // ensure realized
     TensorMeta *mp = &ctx->tensors[(u32)term_val(pr)];
     u32 bs = mp->view.shape.dims[0];
     u32 c  = mp->view.shape.dims[1];
-    u32 oy = mp->view.shape.dims[2];
-    u32 ox = mp->view.shape.dims[3];
-    u32 kh = mp->view.shape.dims[4];
+    u32 IH = mp->view.shape.dims[2];
+    u32 IW = mp->view.shape.dims[3];
+    u32 kh = kernel[0], kw2 = kernel[1];
+    u32 oy = (IH - kh) / stride_[0] + 1;
+    u32 ox = (IW - kw2) / stride_[1] + 1;
+    Term pool_t = thvm_pool(ctx, pr, k, s, 2);
 
-    Term r1 = thvm_op(ctx, UOP_RMAX, pr, term_era());
+    Term r1 = thvm_op(ctx, UOP_RMAX, pool_t, term_era());
     // → [BS, C, OY, OX, KH, 1], squeeze:
     r1 = thvm_reshape(ctx, r1, shape_of((u32[]){bs, c, oy, ox, kh}, 5));
 
     Term r2 = thvm_op(ctx, UOP_RMAX, r1, term_era());
     // → [BS, C, OY, OX, 1], squeeze:
+    (void)kw2;
     return thvm_reshape(ctx, r2, shape_of((u32[]){bs, c, oy, ox}, 4));
 }
 
@@ -1958,11 +2077,11 @@ void thvm_set_requires_grad(TinyHVM *ctx, Term t) {
 }
 
 void thvm_start_recording(TinyHVM *ctx) {
-    ctx->recording = 1;
+    (void)ctx; // recording always-on; stub kept for API compat
 }
 
 void thvm_stop_recording(TinyHVM *ctx) {
-    ctx->recording = 0;
+    (void)ctx; // recording always-on; stub kept for API compat
 }
 
 
@@ -1977,16 +2096,16 @@ void thvm_stop_recording(TinyHVM *ctx) {
 // No tape, no loop, no explicit reduce — backward IS reduction.
 
 Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
-    // Seed gradient = ones with same shape as y
-    Term yr = (term_tag(y) == TAG_TEN) ? y : thvm_reduce(ctx, y);
+    // Seed gradient = ones with same shape as y.
+    // y must be a realized TAG_TEN at this point (caller contract).
+    // No thvm_reduce call here — the inet loop handles all evaluation.
+    assert(term_tag(y) == TAG_TEN && "thvm_grad: y must be realized before calling thvm_grad");
+    Term yr = y;
     Term seed;
-    if (term_tag(yr) == TAG_TEN) {
+    {
         u32 y_id = (u32)term_val(yr);
         seed = term_ten(tensor_fill(ctx, ctx->tensors[y_id].view.shape, 1.0f),
                         ctx->tensors[y_id].dtype);
-    } else {
-        f32 one = 1.0f;
-        seed = thvm_tensor(ctx, &one, SHAPE(1)); // fallback
     }
     u64 loc = heap_alloc(ctx, 3);
     heap_set(ctx, loc, yr);
@@ -2027,8 +2146,10 @@ void thvm_profile_reset(TinyHVM *ctx) {
 // ============================================================
 
 Term thvm_argmax(TinyHVM *ctx, Term x, u32 rows, u32 cols) {
-    // Read logits to host, compute argmax per row
-    x = thvm_reduce(ctx, x);
+    // Force-evaluation point: argmax needs the actual data on host.
+    // This is intentional — thvm_argmax is an eval helper, not a lazy builder.
+    // Callers should call thvm_realize(ctx, x) before this if preferred.
+    if (term_tag(x) != TAG_TEN) x = thvm_reduce(ctx, x);
     f32 *data = thvm_to_host(ctx, x);
 
     u32 *preds = malloc(rows * sizeof(u32));
@@ -2074,4 +2195,83 @@ f32 thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
         if (best == labels[i]) correct++;
     }
     return 100.0f * (f32)correct / (f32)n_samples;
+}
+
+
+// ============================================================
+// inet.c — Interaction combinator API (Phase 2+3)
+// ============================================================
+
+// TAG_LAM: λx.body  where heap[loc]=var_placeholder, heap[loc+1]=body
+// Returns a LAM term. *var_out is a TAG_VAR pointing to the var slot.
+Term thvm_lam(TinyHVM *ctx, Term *var_out, Term body) {
+    u64 loc = heap_alloc(ctx, 2);
+    Term var = term_new(TAG_VAR, 0, loc);
+    heap_set(ctx, loc,     term_set_sub(var));  // sub flag: unbound
+    heap_set(ctx, loc + 1, body);
+    if (var_out) *var_out = var;
+    return term_new(TAG_LAM, 0, loc);
+}
+
+// TAG_APP: (fun arg)
+Term thvm_app(TinyHVM *ctx, Term fun, Term arg) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     fun);
+    heap_set(ctx, loc + 1, arg);
+    return term_new(TAG_APP, 0, loc);
+}
+
+// TAG_SUP: {a, b} superposition
+Term thvm_sup(TinyHVM *ctx, Term a, Term b) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     a);
+    heap_set(ctx, loc + 1, b);
+    return term_new(TAG_SUP, 0, loc);
+}
+
+// Register a global definition; returns its name id for TAG_REF.
+u32 thvm_define(TinyHVM *ctx, Term body) {
+    assert(ctx->def_count < 256);
+    u32 name = ctx->def_count++;
+    ctx->defs[name] = body;
+    return name;
+}
+
+// TAG_REF: reference to named def `name`
+Term thvm_ref(TinyHVM *ctx, u32 name) {
+    return term_new(TAG_REF, name, 0);
+}
+
+// UOP_ITE: ITE(cond, then_t, else_t) — 3-slot heap node
+Term thvm_ite(TinyHVM *ctx, Term cond, Term then_t, Term else_t) {
+    u64 loc = heap_alloc(ctx, 3);
+    heap_set(ctx, loc,     cond);
+    heap_set(ctx, loc + 1, then_t);
+    heap_set(ctx, loc + 2, else_t);
+    return term_new(TAG_TOP, UOP_ITE, loc);
+}
+
+// UOP_LOAD_BATCH: lazy batch materializer
+// Wraps a LoadBatchCtx pointer (passed as TAG_NUM) with an idx term.
+// NOTE: lbc must remain alive for the lifetime of the program term.
+typedef struct { const f32 *data; u32 numel; Shape shape; } ThvmLoadBatchCtx;
+
+Term thvm_load(TinyHVM *ctx, const f32 *data, u32 numel_per_item,
+               Shape item_shape, Term idx) {
+    ThvmLoadBatchCtx *lbc = (ThvmLoadBatchCtx *)malloc(sizeof(ThvmLoadBatchCtx));
+    lbc->data  = data;
+    lbc->numel = numel_per_item;
+    lbc->shape = item_shape;
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     term_num_u32((u32)(uintptr_t)lbc));
+    heap_set(ctx, loc + 1, idx);
+    return term_new(TAG_TOP, UOP_LOAD_BATCH, loc);
+}
+
+// UOP_ASSIGN: in-place weight update
+Term thvm_assign(TinyHVM *ctx, Term dst, Term src) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     dst);
+    heap_set(ctx, loc + 1, src);
+    return term_new(TAG_TOP, UOP_ASSIGN, loc);
 }

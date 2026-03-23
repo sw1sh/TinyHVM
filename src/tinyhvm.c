@@ -1263,15 +1263,23 @@ inet_step:
 }
 
 // ============================================================
-// thvm_reduce: outer active-pair loop
-// Calls thvm_interact repeatedly until the term reaches WNF.
-// Handles memo caching for TAG_TOP shared subexpressions.
+// thvm_reduce: single-chain normal-order reduction trampoline.
+//
+// Calls thvm_interact(t) and follows the result until WNF.
+// This is sequential "normal order" reduction from the root —
+// NOT a full active-pair queue reducer.
+//
+// A true concurrent inet reducer would maintain a pairs[] queue,
+// scan the heap for all active pairs (nodes meeting at principal ports),
+// and process them in any order (or in parallel). Here we only follow
+// a single chain from the root, which is correct for TinyHVM's
+// tree-shaped tensor computation graph but doesn't exploit parallelism.
 // ============================================================
 
 Term thvm_reduce(TinyHVM *ctx, Term t) {
     while (1) {
         Term next = thvm_interact(ctx, t);
-        if (next == t) return t;  // WNF — interact returned t unchanged
+        if (next == t) return t;  // WNF — no rule fired, t is in normal form
         t = next;
     }
 }
@@ -2146,10 +2154,9 @@ void thvm_profile_reset(TinyHVM *ctx) {
 // ============================================================
 
 Term thvm_argmax(TinyHVM *ctx, Term x, u32 rows, u32 cols) {
-    // Force-evaluation point: argmax needs the actual data on host.
-    // This is intentional — thvm_argmax is an eval helper, not a lazy builder.
-    // Callers should call thvm_realize(ctx, x) before this if preferred.
-    if (term_tag(x) != TAG_TEN) x = thvm_reduce(ctx, x);
+    // Force-evaluation point: argmax reads actual data. thvm_reduce is idempotent
+    // on TAG_TEN (returns immediately via WNF check), so unconditional call is fine.
+    x = thvm_reduce(ctx, x);
     f32 *data = thvm_to_host(ctx, x);
 
     u32 *preds = malloc(rows * sizeof(u32));

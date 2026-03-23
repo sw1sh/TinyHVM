@@ -266,8 +266,15 @@ static u32 tensor_view_of(TinyHVM *ctx, u32 src_id, View new_view) {
 // Forward declaration: Metal GPU dispatch for fused kernels (metal.m)
 #ifdef __APPLE__
 extern void metal_dispatch_fused(u32 out_buf, u32 *input_bufs, u32 n_inputs,
-                                  u32 *ops, u32 n_ops, int has_reduce,
-                                  u32 out_numel, u32 reduce_dim, u32 total_numel);
+                                 u32 *ops, u32 n_ops, int has_reduce,
+                                 u32 out_numel, u32 reduce_dim, u32 total_numel);
+extern void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
+                                 u32 a_buf, const View *av,
+                                 u32 b_buf, const View *bv,
+                                 const View *ov,
+                                 u32 reduce_dim,
+                                 u32 reduce_stride_a,
+                                 u32 reduce_stride_b);
 extern Backend metal_backend;
 #endif
 
@@ -545,6 +552,111 @@ Term thvm_reduce(TinyHVM *ctx, Term t) {
                 FuseState fs = {0};
                 if (try_fuse(ctx, t, &fs) && fs.n_ops >= 2) {
                     return dispatch_fused(ctx, &fs);
+                }
+            }
+
+            // === FUSED MUL+SUM: pattern match SUM(MUL(a, b)) ===
+            // Avoids materializing the huge MUL intermediate buffer.
+            // Instead, fuses into a single kernel: for each output element,
+            // iterate over reduce_dim, accumulating a[i]*b[i].
+            if (uop == UOP_SUM) {
+                Term child = heap_read(ctx, loc);
+                if (term_tag(child) == TAG_TOP && term_ext(child) == UOP_MUL) {
+                    u64 mul_loc = term_val(child);
+                    Term ma_t = thvm_reduce(ctx, heap_read(ctx, mul_loc));
+                    Term mb_t = thvm_reduce(ctx, heap_read(ctx, mul_loc + 1));
+                    if (term_tag(ma_t) == TAG_TEN && term_tag(mb_t) == TAG_TEN) {
+                        u32 ma_id = (u32)term_val(ma_t);
+                        u32 mb_id = (u32)term_val(mb_t);
+                        TensorMeta *ma = &ctx->tensors[ma_id];
+                        TensorMeta *mb = &ctx->tensors[mb_id];
+
+                        // Compute broadcast shapes
+                        View av_bc, bv_bc;
+                        u32 out_shape[MAX_DIM];
+                        u32 out_ndim;
+                        int ok = view_broadcast(&ma->view, &mb->view, &av_bc, &bv_bc,
+                                                out_shape, &out_ndim);
+                        if (ok) {
+                            // Find reduce axis: last non-1 dim in broadcast shape
+                            int reduce_axis = -1;
+                            for (int i = (int)out_ndim - 1; i >= 0; i--) {
+                                if (out_shape[i] > 1) { reduce_axis = i; break; }
+                            }
+                            if (reduce_axis >= 0) {
+                                u32 reduce_dim = out_shape[reduce_axis];
+                                // Output shape: broadcast shape with reduce axis = 1
+                                u32 dst_shape[MAX_DIM];
+                                for (u32 i = 0; i < out_ndim; i++) dst_shape[i] = out_shape[i];
+                                dst_shape[reduce_axis] = 1;
+                                Shape dst_s = shape_of(dst_shape, out_ndim);
+                                u32 dst_numel = 1;
+                                for (u32 i = 0; i < out_ndim; i++) dst_numel *= dst_shape[i];
+
+                                // Create output view (contiguous, no reduce axis)
+                                View ov = view_create(dst_s);
+
+                                // Compute reduce strides in a and b
+                                u32 rs_a = (u32)av_bc.strides[reduce_axis];
+                                u32 rs_b = (u32)bv_bc.strides[reduce_axis];
+
+                                // Create output tensor
+                                u32 dst_id = tensor_create(ctx, dst_s, ma->dtype);
+                                TensorMeta *md = &ctx->tensors[dst_id];
+
+                                // Record provenance for autograd
+                                if (ctx->recording) {
+                                    int needs = ma->requires_grad || mb->requires_grad;
+                                    if (needs) {
+                                        md->requires_grad = 1;
+                                        md->creator_op = UOP_SUM;
+                                        md->src_ids[0] = ma_id;
+                                        md->src_ids[1] = mb_id;
+                                    }
+                                }
+
+                                // Dispatch
+                                if (ctx->backend == &metal_backend) {
+                                    metal_mul_reduce_sum(
+                                        md->buf_id, dst_numel,
+                                        ma->buf_id, &av_bc,
+                                        mb->buf_id, &bv_bc,
+                                        &ov, reduce_dim, rs_a, rs_b);
+                                } else {
+                                    // CPU fallback: strided mul+sum
+                                    f32 *a_ptr = malloc(ma->view.numel * sizeof(f32));
+                                    f32 *b_ptr = malloc(mb->view.numel * sizeof(f32));
+                                    ctx->backend->buf_read(ma->buf_id, a_ptr, ma->view.numel * sizeof(f32));
+                                    ctx->backend->buf_read(mb->buf_id, b_ptr, mb->view.numel * sizeof(f32));
+                                    f32 *dst_ptr = calloc(dst_numel, sizeof(f32));
+                                    for (u32 o = 0; o < dst_numel; o++) {
+                                        // Compute N-d coords from flat output
+                                        u32 coords[MAX_DIM], rem = o;
+                                        for (int d = (int)ov.shape.rank - 1; d >= 0; d--) {
+                                            coords[d] = rem % ov.shape.dims[d];
+                                            rem /= ov.shape.dims[d];
+                                        }
+                                        // Base indices
+                                        u32 ba = (u32)av_bc.offset, bb = (u32)bv_bc.offset;
+                                        for (u32 d = 0; d < ov.shape.rank; d++) {
+                                            ba += coords[d] * (u32)av_bc.strides[d];
+                                            bb += coords[d] * (u32)bv_bc.strides[d];
+                                        }
+                                        // Accumulate
+                                        f32 acc = 0.0f;
+                                        for (u32 r = 0; r < reduce_dim; r++) {
+                                            acc += a_ptr[ba + r * rs_a] * b_ptr[bb + r * rs_b];
+                                        }
+                                        dst_ptr[o] = acc;
+                                    }
+                                    ctx->backend->buf_write(md->buf_id, dst_ptr, dst_numel * sizeof(f32));
+                                    free(a_ptr); free(b_ptr); free(dst_ptr);
+                                }
+                                ctx->itrs++;
+                                return term_ten(dst_id, ma->dtype);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1440,20 +1552,21 @@ Term thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
         shape_of((u32[]){1, groups, rcout, 1, 1, cin_g, KH, KW}, 8));
 
     // Step 5: multiply + sum over (cin_g, KH, KW) = last 3 dims
+    // Guard: only SUM when dim > 1, else the "last non-1 dim" heuristic
+    // would reduce the wrong axis (e.g. when cin_g=1 for first conv).
     Term prod = thvm_op(ctx, UOP_MUL, x_perm, w_rs);
 
-    // Sum reduces last dim to 1 (keeps rank). Reshape to drop trailing 1.
+    // SUM over KW (dim 7), then squeeze
     // prod: [BS, groups, rcout, OY, OX, cin_g, KH, KW]
-    Term s1 = thvm_op(ctx, UOP_SUM, prod, term_era());
-    // → [BS, groups, rcout, OY, OX, cin_g, KH, 1], squeeze:
+    Term s1 = (KW > 1) ? thvm_op(ctx, UOP_SUM, prod, term_era()) : prod;
     s1 = thvm_reshape(ctx, s1, shape_of((u32[]){bs, groups, rcout, oy, ox, cin_g, KH}, 7));
 
-    Term s2 = thvm_op(ctx, UOP_SUM, s1, term_era());
-    // → [BS, groups, rcout, OY, OX, cin_g, 1], squeeze:
+    // SUM over KH (dim 6), then squeeze
+    Term s2 = (KH > 1) ? thvm_op(ctx, UOP_SUM, s1, term_era()) : s1;
     s2 = thvm_reshape(ctx, s2, shape_of((u32[]){bs, groups, rcout, oy, ox, cin_g}, 6));
 
-    Term s3 = thvm_op(ctx, UOP_SUM, s2, term_era());
-    // → [BS, groups, rcout, OY, OX, 1], squeeze:
+    // SUM over cin_g (dim 5), then squeeze
+    Term s3 = (cin_g > 1) ? thvm_op(ctx, UOP_SUM, s2, term_era()) : s2;
     s3 = thvm_reshape(ctx, s3, shape_of((u32[]){bs, groups, rcout, oy, ox}, 5));
 
     // Reshape to [BS, Cout, OY, OX]

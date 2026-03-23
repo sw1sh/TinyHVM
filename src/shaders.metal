@@ -473,3 +473,53 @@ kernel void zero_fill(device float *dst [[buffer(0)]],
                       uint gid [[thread_position_in_grid]]) {
     dst[gid] = 0.0f;
 }
+
+// ============================================================
+// Fused MUL + SUM — avoids materializing the full MUL intermediate.
+// Thread per output element. For each output element, iterates over
+// reduce_dim, multiplying a[strided] * b[strided] and accumulating.
+//
+// The reduce axis is the last non-1 dim of the broadcast shape.
+// dst_numel = broadcast_numel / reduce_dim.
+// ============================================================
+
+struct MulReduceParams {
+    uint reduce_dim;      // size of the dim being reduced
+    uint reduce_stride_a; // stride of reduce axis in a
+    uint reduce_stride_b; // stride of reduce axis in b
+};
+
+kernel void mul_reduce_sum(device float *dst [[buffer(0)]],
+                           device const float *a [[buffer(1)]],
+                           device const float *b [[buffer(2)]],
+                           constant ViewParams &av [[buffer(3)]],
+                           constant ViewParams &bv [[buffer(4)]],
+                           constant ViewParams &ov [[buffer(5)]],
+                           constant MulReduceParams &rp [[buffer(6)]],
+                           uint i [[thread_position_in_grid]]) {
+    if (i >= ov.numel) return;
+
+    // Compute N-d coordinates from flat output index using output shape
+    uint coords[8];
+    uint rem = i;
+    for (int d = int(ov.rank) - 1; d >= 0; d--) {
+        coords[d] = rem % ov.shape[d];
+        rem /= ov.shape[d];
+    }
+
+    // Compute base indices into a and b for these coordinates
+    uint base_a = uint(av.offset);
+    uint base_b = uint(bv.offset);
+    for (uint d = 0; d < ov.rank; d++) {
+        base_a += coords[d] * uint(av.strides[d]);
+        base_b += coords[d] * uint(bv.strides[d]);
+    }
+
+    // Accumulate over reduce axis
+    float acc = 0.0f;
+    for (uint r = 0; r < rp.reduce_dim; r++) {
+        acc += a[base_a + r * rp.reduce_stride_a] *
+               b[base_b + r * rp.reduce_stride_b];
+    }
+    dst[i] = acc;
+}

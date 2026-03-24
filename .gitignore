@@ -46,3 +46,5 @@ test_term_pre
 test_term_dbg
 test_train_dbg
 test_term_dbg
+test_mnist_cpu
+test_mnist_metal

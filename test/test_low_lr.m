@@ -45,7 +45,7 @@ int main() {
     printf("=== MLP Gradient Test (4→8→2, batch=%u) ===\n", BS);
 
     for (u32 step = 0; step < 50; step++) {
-        thvm_start_recording(ctx);
+
         Term x = thvm_tensor(ctx, x_data, shape_of((u32[]){BS, IN}, 2));
         Term target = thvm_tensor(ctx, target_data, shape_of((u32[]){BS, OUT}, 2));
 
@@ -67,7 +67,7 @@ int main() {
         loss = thvm_reduce(ctx, loss);
         f32 *lv = thvm_to_host(ctx, loss);
 
-        thvm_stop_recording(ctx);
+
 
         if (step == 0) first_loss = lv[0];
         last_loss = lv[0];

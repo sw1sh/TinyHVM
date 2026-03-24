@@ -170,7 +170,7 @@ int main(void) {
             Term Y = thvm_tensor(ctx, &train_onehot[offset * 10],  SHAPE(batch_size, 10));
 
             // Forward: h = relu(X·W1 + B1), out = h·W2 + B2
-            thvm_start_recording(ctx);
+
 
             Term z1  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1), B1);
             Term h   = thvm_op(ctx, UOP_RELU, z1, term_era());
@@ -181,7 +181,7 @@ int main(void) {
             Term sq   = thvm_op(ctx, UOP_MUL, diff, diff);
             Term loss_term = thvm_reduce(ctx, sq);
 
-            thvm_stop_recording(ctx);
+
 
             // Compute loss
             f32 *loss_data = thvm_to_host(ctx, loss_term);

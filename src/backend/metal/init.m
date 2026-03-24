@@ -1,7 +1,7 @@
 // metal/init.m — Metal state declarations + init/shutdown
 // All shared state is declared here. Sub-files contain function bodies only.
 
-#define MAX_BUFS 16384
+#define MAX_BUFS 524288
 
 // Device state
 static id<MTLDevice>       mtl_dev;

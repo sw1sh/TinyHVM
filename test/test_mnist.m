@@ -1,95 +1,86 @@
-// test_mnist.m — MNIST training as recursive inet
-// Same pattern as test_train.m (XOR): entire training chunk is ONE lazy
-// term, ONE thvm_reduce() call, no C training loop within a chunk.
+// test_mnist.m — MNIST training (MLP or CNN)
 //
-// Each chunk of 50 steps is a recursive inet program:
-//   train = λcounter. IFZ(counter, ERA, λm. forward→loss→grad→assign→recurse)
-// Batch slicing via dynamic SHRINK: pairs tensor computed from counter.
+// Usage:
+//   ./test_mnist              # MLP, one-program inet, no C loop
+//   ./test_mnist mlp          # same
+//   ./test_mnist cnn          # CNN with IC autograd + Adam
+//
+// MLP: 784→128→10, ReLU, cross-entropy, SGD.
+//   Entire epoch is ONE recursive inet program, ONE thvm_reduce().
+//
+// CNN: Conv(1,32,5)→ReLU→Conv(32,32,5)→ReLU→BN→MaxPool
+//    → Conv(32,64,3)→ReLU→Conv(64,64,3)→ReLU→BN→MaxPool
+//    → Flatten→Linear(576,10). Adam, cosine LR.
 
 #include "../src/tinyhvm.c"
 #include "../src/backend/cpu/_.c"
 #ifdef __APPLE__
   #include "../src/backend/metal/_.m"
 #endif
+#include "../src/nn/_.c"
+#include "../src/nn/datasets.c"
 #include "train_helpers.h"
 
 #ifndef DEVICE
-  #define DEVICE "cpu"
+  #define DEVICE "metal"
 #endif
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
-
-// ============================================================
-// MNIST IDX file loader
-// ============================================================
-
-static u32 read_u32_be(FILE *f) {
-    u8 buf[4];
-    fread(buf, 1, 4, f);
-    return ((u32)buf[0] << 24) | ((u32)buf[1] << 16) |
-           ((u32)buf[2] << 8)  |  (u32)buf[3];
-}
-
-static f32 *load_images(const char *path, u32 *n) {
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "Cannot open %s\n", path); exit(1); }
-    read_u32_be(f); *n = read_u32_be(f);
-    u32 rows = read_u32_be(f), cols = read_u32_be(f);
-    u32 pixels = rows * cols;
-    u8 *raw = malloc(*n * pixels);
-    fread(raw, 1, *n * pixels, f); fclose(f);
-    f32 *data = malloc(*n * pixels * sizeof(f32));
-    for (u32 i = 0; i < *n * pixels; i++) data[i] = raw[i] / 255.0f;
-    free(raw);
-    return data;
-}
-
-static f32 *load_labels_onehot(const char *path, u32 *n, u8 **raw_out) {
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "Cannot open %s\n", path); exit(1); }
-    read_u32_be(f); *n = read_u32_be(f);
-    *raw_out = malloc(*n);
-    fread(*raw_out, 1, *n, f); fclose(f);
-    f32 *onehot = calloc(*n * 10, sizeof(f32));
-    for (u32 i = 0; i < *n; i++) onehot[i * 10 + (*raw_out)[i]] = 1.0f;
-    return onehot;
-}
+#include <time.h>
 
 static void xavier_init(f32 *data, u32 fan_in, u32 fan_out, u32 n) {
-    f32 scale = sqrtf(6.0f / (f32)(fan_in + fan_out));
+    f32 scale = sqrtf(2.0f / (f32)(fan_in + fan_out));
     for (u32 i = 0; i < n; i++)
-        data[i] = ((f32)rand() / (f32)RAND_MAX * 2.0f - 1.0f) * scale;
+        data[i] = scale * ((f32)rand() / (f32)RAND_MAX * 2.0f - 1.0f);
+}
+
+static Term make_weight(TinyHVM *ctx, Shape s, u32 fan_in, u32 fan_out) {
+    u32 n = 1;
+    for (u32 i = 0; i < s.rank; i++) n *= s.dims[i];
+    f32 *data = malloc(n * sizeof(f32));
+    xavier_init(data, fan_in, fan_out, n);
+    Term t = thvm_tensor(ctx, data, s);
+    free(data);
+    return t;
+}
+
+static Term make_zeros(TinyHVM *ctx, u32 n) {
+    f32 *z = calloc(n, sizeof(f32));
+    Term t = thvm_tensor(ctx, z, SHAPE(n));
+    free(z);
+    return t;
+}
+
+static Term make_ones(TinyHVM *ctx, u32 n) {
+    f32 *o = malloc(n * sizeof(f32));
+    for (u32 i = 0; i < n; i++) o[i] = 1.0f;
+    Term t = thvm_tensor(ctx, o, SHAPE(n));
+    free(o);
+    return t;
+}
+
+static Term relu_fn(TinyHVM *ctx, Term x) {
+    return thvm_op(ctx, UOP_RELU, x, term_era());
 }
 
 // ============================================================
-// Main
+// MLP: one recursive inet program, one reduce
 // ============================================================
 
-int main(void) {
-    printf("=== MNIST — recursive inet training (%s) ===\n\n", DEVICE);
-    srand(42);
+static int run_mlp(MNISTData *data) {
+    printf("=== MNIST MLP — recursive inet (%s) ===\n", DEVICE);
+    printf("  No C loop. ONE program, ONE reduce.\n\n");
 
-    // Load data
-    u32 n_train, n_test;
-    u8 *train_raw, *test_raw;
-    f32 *train_images = load_images("data/train-images-idx3-ubyte", &n_train);
-    f32 *train_onehot = load_labels_onehot("data/train-labels-idx1-ubyte", &n_train, &train_raw);
-    f32 *test_images  = load_images("data/t10k-images-idx3-ubyte", &n_test);
-    f32 *test_onehot  = load_labels_onehot("data/t10k-labels-idx1-ubyte", &n_test, &test_raw);
-    (void)test_onehot;
-    printf("  Train: %u, Test: %u\n\n", n_train, n_test);
-
-    u32 BS = 64, H = 128;
-    u32 n_batches = n_train / BS;
-    u32 n_epochs = 10;
+    u32 BS = 128, H = 128;
+    u32 n_batches = data->n_train / BS;
     f32 lr_val = 0.1f;
 
     TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
-    // Weights: 784 → H → 10
+    // Weights
     f32 *w1d = malloc(784 * H * sizeof(f32)); xavier_init(w1d, 784, H, 784 * H);
     f32 *b1d = calloc(H, sizeof(f32));
     f32 *w2d = malloc(H * 10 * sizeof(f32));  xavier_init(w2d, H, 10, H * 10);
@@ -105,90 +96,229 @@ int main(void) {
     thvm_set_requires_grad(ctx, B2);
     free(w1d); free(b1d); free(w2d); free(b2d);
 
-    // Entire training set as persistent tensors
-    Term X_all = thvm_tensor(ctx, train_images, SHAPE(n_train, 784));
-    Term Y_all = thvm_tensor(ctx, train_onehot, SHAPE(n_train, 10));
+    Term X_all = thvm_tensor(ctx, data->train_images, SHAPE(data->n_train, 784));
+    Term Y_all;
+    { // one-hot labels
+        f32 *oh = calloc(data->n_train * 10, sizeof(f32));
+        for (u32 i = 0; i < data->n_train; i++) oh[i * 10 + data->train_labels[i]] = 1.0f;
+        Y_all = thvm_tensor(ctx, oh, SHAPE(data->n_train, 10));
+        free(oh);
+    }
 
-    // Persistent constants
     Term LR = thvm_tensor(ctx, &lr_val, SHAPE(1));
-    f32 inv_n = 1.0f / (f32)(BS * 10);
+    f32 inv_n = 1.0f / (f32)BS;
     Term INV_N = thvm_tensor(ctx, &inv_n, SHAPE(1));
     f32 bs_f = (f32)BS;
     Term BS_ten = thvm_tensor(ctx, &bs_f, SHAPE(1));
 
-    // Broadcast masks for dynamic SHRINK pairs construction
-    // pairs_x = start * MASK_S + end * MASK_E + FIXED  →  [start, end, 0, 784]
     f32 ms[] = {1,0,0,0}, me[] = {0,1,0,0};
     f32 fx[] = {0,0,0,784}, fy[] = {0,0,0,10};
-    Term MASK_S   = thvm_tensor(ctx, ms, SHAPE(4));
-    Term MASK_E   = thvm_tensor(ctx, me, SHAPE(4));
-    Term FIXED_X  = thvm_tensor(ctx, fx, SHAPE(4));
-    Term FIXED_Y  = thvm_tensor(ctx, fy, SHAPE(4));
+    Term MASK_S  = thvm_tensor(ctx, ms, SHAPE(4));
+    Term MASK_E  = thvm_tensor(ctx, me, SHAPE(4));
+    Term FIXED_X = thvm_tensor(ctx, fx, SHAPE(4));
+    Term FIXED_Y = thvm_tensor(ctx, fy, SHAPE(4));
 
     u32 n_weights = ctx->tensor_count;
 
-    // ── Training: chunked recursive inet ─────────────────────
-    u32 chunk_size = 50;
-    u32 n_chunks = n_batches / chunk_size;
-    printf("  %u epochs × %u chunks × %u steps (BS=%u)\n\n",
-           n_epochs, n_chunks, chunk_size, BS);
+    // ONE program, ONE reduce
+    f32 sb = 0.0f;
+    Term SB_ten = thvm_tensor(ctx, &sb, SHAPE(1));
+    f32 ns = (f32)n_batches;
+    Term NS_ten = thvm_tensor(ctx, &ns, SHAPE(1));
 
-    for (u32 epoch = 0; epoch < n_epochs; epoch++) {
-        for (u32 c = 0; c < n_chunks; c++) {
-            f32 sb = (f32)(c * chunk_size);
-            Term SB_ten = thvm_tensor(ctx, &sb, SHAPE(1));
-            f32 ns = (f32)chunk_size;
-            Term NS_ten = thvm_tensor(ctx, &ns, SHAPE(1));
+    Term program = mnist_train_program(ctx,
+        W1, B1, W2, B2, X_all, Y_all, LR, INV_N,
+        MASK_S, MASK_E, FIXED_X, MASK_S, MASK_E, FIXED_Y,
+        BS_ten, NS_ten, SB_ten, BS, H, (int)n_batches);
 
-            Term program = mnist_train_program(ctx,
-                W1, B1, W2, B2, X_all, Y_all, LR, INV_N,
-                MASK_S, MASK_E, FIXED_X,
-                MASK_S, MASK_E, FIXED_Y,
-                BS_ten, NS_ten, SB_ten,
-                BS, H, (int)chunk_size);
-
-            thvm_reduce(ctx, program);
-
-            // Invalidate host caches so next chunk reads updated weights
-            for (u32 i = 0; i < n_weights; i++) {
-                if (ctx->tensors[i].host_ptr) {
-                    free(ctx->tensors[i].host_ptr);
-                    ctx->tensors[i].host_ptr = NULL;
-                }
-            }
-            thvm_reset(ctx, n_weights);
-        }
-        printf("  Epoch %u complete — itrs=%llu\n\n", epoch + 1,
-               (unsigned long long)ctx->itrs);
+    printf("  reducing %u-step inet (1 epoch, BS=%u)...\n", n_batches, BS);
+    @autoreleasepool {
+        thvm_reduce(ctx, program);
     }
+    printf("  done — itrs=%llu\n\n", (unsigned long long)ctx->itrs);
 
-    // ── Test accuracy ────────────────────────────────────────
+    // Eval
     printf("  Evaluating test set...\n");
-    u32 test_correct = 0;
-    u32 test_batches = n_test / BS;
-    for (u32 b = 0; b < test_batches; b++) {
-        u32 offset = b * BS;
-        Term X = thvm_tensor(ctx, &test_images[offset * 784], SHAPE(BS, 784));
-        Term z1  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1), B1);
-        Term h   = thvm_op(ctx, UOP_RELU, z1, term_era());
+    u32 correct = 0, test_bs = BS, tb = data->n_test / test_bs;
+    for (u32 b = 0; b < tb; b++) {
+        u32 off = b * test_bs;
+        Term X = thvm_tensor(ctx, &data->test_images[off * 784], SHAPE(test_bs, 784));
+        Term z1 = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1), B1);
+        Term h  = thvm_op(ctx, UOP_RELU, z1, term_era());
         Term out = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2), B2));
         f32 *od = thvm_to_host(ctx, out);
-        for (u32 i = 0; i < BS; i++) {
+        for (u32 i = 0; i < test_bs; i++) {
             u32 pred = 0; f32 mx = od[i * 10];
             for (u32 j = 1; j < 10; j++)
                 if (od[i * 10 + j] > mx) { mx = od[i * 10 + j]; pred = j; }
-            if (pred == test_raw[offset + i]) test_correct++;
+            if (pred == data->test_labels[off + i]) correct++;
         }
         thvm_reset(ctx, n_weights);
     }
 
-    f32 acc = 100.0f * (f32)test_correct / (f32)(test_batches * BS);
-    printf("\n  Test accuracy: %.1f%% (%u/%u)\n", acc, test_correct, test_batches * BS);
-    printf("\n  %s: MNIST test accuracy %s 90%%\n",
-           acc > 90 ? "PASS" : "FAIL", acc > 90 ? ">" : "<");
+    f32 acc = 100.0f * (f32)correct / (f32)(tb * test_bs);
+    printf("\n  Test accuracy: %.1f%% (%u/%u)\n", acc, correct, tb * test_bs);
+    printf("  %s: MLP accuracy %s 90%%\n", acc > 90 ? "PASS" : "FAIL", acc > 90 ? ">" : "<");
 
     thvm_free(ctx);
-    free(train_images); free(train_onehot); free(train_raw);
-    free(test_images);  free(test_onehot);  free(test_raw);
     return acc > 90 ? 0 : 1;
+}
+
+// ============================================================
+// CNN: IC autograd + Adam, per-step C loop (conv needs reset)
+// ============================================================
+
+static int run_cnn(MNISTData *data) {
+    printf("=== MNIST CNN — IC autograd (%s) ===\n\n", DEVICE);
+
+    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+
+    #define N_LAYERS 14
+    Layer model[N_LAYERS] = {
+        {.type=LAYER_CONV2D, .conv={make_weight(ctx, (Shape){.dims={32,1,5,5},.rank=4}, 25, 32),
+                                     make_zeros(ctx, 32), 1, 32, 5}},
+        {.type=LAYER_FN, .fn=relu_fn},
+        {.type=LAYER_CONV2D, .conv={make_weight(ctx, (Shape){.dims={32,32,5,5},.rank=4}, 800, 32),
+                                     make_zeros(ctx, 32), 32, 32, 5}},
+        {.type=LAYER_FN, .fn=relu_fn},
+        {.type=LAYER_BN, .bn={make_ones(ctx, 32), make_zeros(ctx, 32),
+                               make_zeros(ctx, 32), make_ones(ctx, 32), 32}},
+        {.type=LAYER_MAXPOOL, .pool={2}},
+        {.type=LAYER_CONV2D, .conv={make_weight(ctx, (Shape){.dims={64,32,3,3},.rank=4}, 288, 64),
+                                     make_zeros(ctx, 64), 32, 64, 3}},
+        {.type=LAYER_FN, .fn=relu_fn},
+        {.type=LAYER_CONV2D, .conv={make_weight(ctx, (Shape){.dims={64,64,3,3},.rank=4}, 576, 64),
+                                     make_zeros(ctx, 64), 64, 64, 3}},
+        {.type=LAYER_FN, .fn=relu_fn},
+        {.type=LAYER_BN, .bn={make_ones(ctx, 64), make_zeros(ctx, 64),
+                               make_zeros(ctx, 64), make_ones(ctx, 64), 64}},
+        {.type=LAYER_MAXPOOL, .pool={2}},
+        {.type=LAYER_FLATTEN},
+        {.type=LAYER_LINEAR, .lin={make_weight(ctx, SHAPE(576, 10), 576, 10),
+                                    make_zeros(ctx, 10), 576, 10}},
+    };
+
+    // Extract params
+    Term params[N_LAYERS * 2];
+    u32 param_sizes[N_LAYERS * 2];
+    u32 n_params = 0;
+    for (u32 i = 0; i < N_LAYERS; i++) {
+        Layer *l = &model[i];
+        switch (l->type) {
+            case LAYER_CONV2D:
+                params[n_params] = l->conv.w; param_sizes[n_params] = ctx->tensors[(u32)term_val(l->conv.w)].view.numel; n_params++;
+                params[n_params] = l->conv.b; param_sizes[n_params] = ctx->tensors[(u32)term_val(l->conv.b)].view.numel; n_params++;
+                break;
+            case LAYER_BN:
+                params[n_params] = l->bn.gamma; param_sizes[n_params] = ctx->tensors[(u32)term_val(l->bn.gamma)].view.numel; n_params++;
+                params[n_params] = l->bn.beta;  param_sizes[n_params] = ctx->tensors[(u32)term_val(l->bn.beta)].view.numel;  n_params++;
+                break;
+            case LAYER_LINEAR:
+                params[n_params] = l->lin.w; param_sizes[n_params] = ctx->tensors[(u32)term_val(l->lin.w)].view.numel; n_params++;
+                params[n_params] = l->lin.b; param_sizes[n_params] = ctx->tensors[(u32)term_val(l->lin.b)].view.numel; n_params++;
+                break;
+            default: break;
+        }
+    }
+    for (u32 i = 0; i < n_params; i++)
+        thvm_set_requires_grad(ctx, params[i]);
+
+    u32 BS = 128;
+    Term train_data = thvm_tensor(ctx, data->train_images,
+        (Shape){.dims={data->n_train, 1, 28, 28}, .rank=4});
+
+    Adam opt = adam_init(ctx, 0.001f, n_params);
+    for (u32 i = 0; i < n_params; i++)
+        adam_add_param(ctx, &opt, i, (u32)term_val(params[i]), param_sizes[i]);
+
+    u32 n_weights = ctx->tensor_count;
+    u32 n_batches = data->n_train / BS;
+    u32 n_steps = 70;
+    f32 lr_max = 0.001f, lr_min = 0.0001f;
+    printf("  %u params, %u steps, BS=%u\n\n", n_params, n_steps, BS);
+
+    for (u32 step = 0; step < n_steps; step++) {
+      @autoreleasepool {
+        f32 progress = (f32)step / (f32)n_steps;
+        opt.lr = lr_min + 0.5f * (lr_max - lr_min) * (1.0f + cosf(3.14159f * progress));
+        clock_t t0 = clock();
+
+        if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+
+        u32 bi = step % n_batches;
+        Term x = thvm_shrink(ctx, train_data,
+            (u32[]){bi*BS, (bi+1)*BS, 0, 1, 0, 28, 0, 28}, 4);
+        thvm_set_requires_grad(ctx, x);
+        u8 *by = &data->train_labels[bi * BS];
+
+        Term logits = thvm_sequential(ctx, x, model, N_LAYERS, BS, 1);
+        Term loss = cross_entropy_loss(ctx, logits, by, BS, 10);
+
+        if (ctx->backend->end_batch) ctx->backend->end_batch();
+
+        Term loss_r = thvm_reduce(ctx, loss);
+        f32 loss_val = thvm_to_host(ctx, loss_r)[0];
+
+        if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+
+        Term grad_terms[n_params];
+        thvm_backward(ctx, loss_r, params, grad_terms, n_params);
+        u32 grad_ids[n_params];
+        for (u32 i = 0; i < n_params; i++) {
+            Term g = thvm_reduce(ctx, grad_terms[i]);
+            grad_ids[i] = (term_tag(g) == TAG_TEN) ? (u32)term_val(g) : 0;
+        }
+
+        adam_step(ctx, &opt, grad_ids);
+        if (ctx->backend->end_batch) ctx->backend->end_batch();
+
+        f32 ms = 1000.0f * (f32)(clock() - t0) / (f32)CLOCKS_PER_SEC;
+        if (step % 10 == 0 || step == n_steps - 1)
+            printf("  step %3u/%u  loss=%.4f  lr=%.5f  (%.0fms)\n",
+                   step, n_steps, loss_val, opt.lr, ms);
+
+        thvm_reset(ctx, n_weights);
+      }
+    }
+
+    // Eval
+    printf("\n  Evaluating test set...\n");
+    Term test_data = thvm_tensor(ctx, data->test_images,
+        (Shape){.dims={data->n_test, 1, 28, 28}, .rank=4});
+    u32 eval_keep = ctx->tensor_count;
+    u32 correct = 0, tbs = 64, tb = data->n_test / tbs;
+    for (u32 b = 0; b < tb; b++) {
+        Term x = thvm_shrink(ctx, test_data,
+            (u32[]){b*tbs, (b+1)*tbs, 0, 1, 0, 28, 0, 28}, 4);
+        Term logits = thvm_sequential(ctx, x, model, N_LAYERS, tbs, 0);
+        f32 batch_acc = thvm_eval_accuracy(ctx, logits, &data->test_labels[b*tbs], tbs, 10);
+        correct += (u32)(batch_acc * (f32)tbs / 100.0f);
+        thvm_reset(ctx, eval_keep);
+    }
+
+    f32 acc = 100.0f * (f32)correct / (f32)(tb * tbs);
+    printf("\n  Test accuracy: %.1f%% (%u/%u)\n", acc, correct, tb * tbs);
+    printf("  %s: CNN accuracy %s 90%%\n", acc > 90 ? "PASS" : "FAIL", acc > 90 ? ">" : "<");
+
+    adam_free(&opt);
+    thvm_free(ctx);
+    return acc > 90 ? 0 : 1;
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+int main(int argc, char **argv) {
+    srand(42);
+    const char *arch = (argc > 1) ? argv[1] : "mlp";
+    int cnn = (strcmp(arch, "cnn") == 0);
+
+    MNISTData data = mnist_load("data");
+    printf("  Train: %u, Test: %u\n\n", data.n_train, data.n_test);
+
+    int rc = cnn ? run_cnn(&data) : run_mlp(&data);
+
+    mnist_free(&data);
+    return rc;
 }

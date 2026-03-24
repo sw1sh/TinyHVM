@@ -1,7 +1,7 @@
 // cpu/pool.c — CPU buffer pool: ID → pointer
 // Uses simple array mapping. Buffer 0 is reserved (null).
 
-#define MAX_BUFS 131072
+#define MAX_BUFS 524288
 
 static struct {
     void *bufs[MAX_BUFS];

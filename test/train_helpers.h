@@ -96,7 +96,7 @@ static Term train_program(TinyHVM *ctx,
 // Each step computes batch offset from the counter, uses SHRINK
 // with a dynamically-computed pairs tensor.
 //
-// Architecture: [feat] → [H] → [10], ReLU, MSE loss, SGD.
+// Architecture: [feat] → [H] → [10], ReLU, cross-entropy loss, SGD.
 //
 // train = λcounter. IFZ(counter, ERA, λm.
 //   step = N - counter
@@ -161,12 +161,25 @@ static Term mnist_train_program(TinyHVM *ctx,
     Term out = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
                        thvm_expand(ctx, B2, SHAPE(batch_size, 10)));
 
-    // MSE loss → scalar
-    Term diff = thvm_op(ctx, UOP_SUB, out, Y);
-    Term sq   = thvm_op(ctx, UOP_MUL, diff, diff);
-    u32 axes[] = {0, 1};
-    Term loss = thvm_sum_axes(ctx, sq, axes, 2);
-    loss = thvm_op(ctx, UOP_MUL, loss, INV_N);
+    // Cross-entropy loss: -mean(sum(Y * log(softmax(out)), axis=1))
+    // Softmax: max → sub → exp → sum → div
+    Term x_max = thvm_op(ctx, UOP_RMAX, out, term_era());         // [BS,1]
+    Term shifted = thvm_op(ctx, UOP_SUB, out,
+                   thvm_expand(ctx, x_max, SHAPE(batch_size, 10)));
+    Term e = thvm_op(ctx, UOP_EXP, shifted, term_era());          // [BS,10]
+    Term e_sum = thvm_op(ctx, UOP_SUM, e, term_era());            // [BS,1]
+    Term probs = thvm_op(ctx, UOP_DIV, e,
+                 thvm_expand(ctx, e_sum, SHAPE(batch_size, 10)));
+    // Clamped log
+    f32 eps = 1e-7f;
+    Term clamped = thvm_op(ctx, UOP_MAX, probs,
+                   thvm_expand(ctx, thvm_tensor(ctx, &eps, SHAPE(1,1)), SHAPE(batch_size, 10)));
+    Term log_probs = thvm_op(ctx, UOP_LOG, clamped, term_era());
+    // Masked sum
+    Term masked = thvm_op(ctx, UOP_MUL, Y, log_probs);            // one-hot × log_probs
+    Term sum_c  = thvm_op(ctx, UOP_SUM, masked, term_era());      // sum classes → [BS,1]
+    Term sum_b  = thvm_op(ctx, UOP_SUM, sum_c, term_era());       // sum batch  → [1,1]
+    Term loss   = thvm_op(ctx, UOP_MUL, thvm_op(ctx, UOP_NEG, sum_b, term_era()), INV_N);
     loss = thvm_reshape(ctx, loss, SHAPE(1));
 
     // Gradients

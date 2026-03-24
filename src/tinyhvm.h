@@ -339,7 +339,7 @@ static inline u32 dtype_size(u32 dtype) {
 }
 
 #define MAX_DIM 8
-#define MAX_TENSORS 131072
+#define MAX_TENSORS 524288
 
 // Shape: dims + rank bundled together
 typedef struct {

@@ -442,9 +442,7 @@ typedef struct {
     Backend *backend;
     u64         itrs;       // interaction count
     u8          no_fuse;    // 1 to skip fusion (used during GRAD subnet re-reduction)
-    // DUP-SUP memo: cache reduced TAG_TOP results by heap location
-    Term       *reduce_memo;   // array[MAX_HEAP], 0 = not cached
-    u64         reduce_memo_size;
+
     // Named definitions for TAG_REF (global def table)
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term
     u32         def_count;
@@ -544,6 +542,9 @@ f32      thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
 // Gradient ops go through thvm_op → get taped → grad(grad(f)) works.
 Term     thvm_grad(TinyHVM *ctx, Term y, Term x);
 void     thvm_backward(TinyHVM *ctx, Term loss, Term *params, Term *grads, u32 n_params);
+void     thvm_train_step(TinyHVM *ctx,
+                         Term *pW1, Term *pB1, Term *pW2, Term *pB2,
+                         Term X, Term Y, Term LR);
 
 // Movement ops
 Term     thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim);

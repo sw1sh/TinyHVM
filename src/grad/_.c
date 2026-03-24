@@ -1,19 +1,11 @@
 Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
-    // Reduce y to get its shape for the ones-gradient seed.
-    // This is the single necessary force-eval in the backward pass:
-    // the seed must match y's output shape.
-    Term yr = thvm_reduce(ctx, y);
-    Term seed;
-    if (term_tag(yr) == TAG_TEN) {
-        u32 y_id = (u32)term_val(yr);
-        seed = term_ten(tensor_fill(ctx, ctx->tensors[y_id].view.shape, 1.0f),
-                        ctx->tensors[y_id].dtype);
-    } else {
-        f32 one = 1.0f;
-        seed = thvm_tensor(ctx, &one, SHAPE(1));
-    }
+    // Fully lazy: store unreduced y. The GRAD handler will reduce y
+    // when it processes this term. Seed is scalar ones — the loss is
+    // always reduced to a scalar before calling thvm_grad.
+    f32 one = 1.0f;
+    Term seed = thvm_tensor(ctx, &one, SHAPE(1));
     u64 loc = heap_alloc(ctx, 3);
-    heap_set(ctx, loc,     yr);
+    heap_set(ctx, loc,     y);     // unreduced — lazy
     heap_set(ctx, loc + 1, seed);
     heap_set(ctx, loc + 2, x);
     return term_new(TAG_TOP, UOP_GRAD, loc);
@@ -30,6 +22,47 @@ void thvm_backward(TinyHVM *ctx, Term loss, Term *params, Term *grads, u32 n_par
 
 
 
+// ============================================================
+// thvm_train_step — N training steps as one lazy inet program
+// ============================================================
+//
+// Builds the full N-step training as a single term:
+//   ASSIGN(W, W - LR * GRAD(loss, W))  chained N times.
+// ONE thvm_reduce(program) drives everything.
+
+void thvm_train_step(TinyHVM *ctx,
+                     Term *pW1, Term *pB1, Term *pW2, Term *pB2,
+                     Term X, Term Y, Term LR) {
+    Term W1 = *pW1, B1 = *pB1, W2 = *pW2, B2 = *pB2;
+
+    // -- Forward: 2-layer MLP (lazy) --
+    Term z1  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1),
+                       thvm_expand(ctx, B1, SHAPE(4, 4)));
+    Term h   = thvm_op(ctx, UOP_RELU, z1, term_era());
+    Term out = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
+                       thvm_expand(ctx, B2, SHAPE(4, 1)));
+
+    // -- MSE Loss (lazy) --
+    Term diff = thvm_op(ctx, UOP_SUB, out, Y);
+    Term sq   = thvm_op(ctx, UOP_MUL, diff, diff);
+    u32 axes[] = {0, 1};
+    Term loss = thvm_sum_axes(ctx, sq, axes, 2);
+    f32 inv_n = 1.0f / 4.0f;
+    loss = thvm_op(ctx, UOP_MUL, loss, thvm_tensor(ctx, &inv_n, SHAPE(1)));
+    loss = thvm_reshape(ctx, loss, SHAPE(1)); // ensure scalar [1] for GRAD seed
+
+    // -- Gradients (thvm_grad reduces loss to get seed shape, returns lazy GRAD) --
+    Term gW1 = thvm_grad(ctx, loss, W1);
+    Term gB1 = thvm_grad(ctx, loss, B1);
+    Term gW2 = thvm_grad(ctx, loss, W2);
+    Term gB2 = thvm_grad(ctx, loss, B2);
+
+    // -- SGD: W' = ASSIGN(W, W - LR * grad) — all lazy --
+    *pW1 = thvm_assign(ctx, W1, thvm_op(ctx, UOP_SUB, W1, thvm_op(ctx, UOP_MUL, LR, gW1)));
+    *pB1 = thvm_assign(ctx, B1, thvm_op(ctx, UOP_SUB, B1, thvm_op(ctx, UOP_MUL, LR, gB1)));
+    *pW2 = thvm_assign(ctx, W2, thvm_op(ctx, UOP_SUB, W2, thvm_op(ctx, UOP_MUL, LR, gW2)));
+    *pB2 = thvm_assign(ctx, B2, thvm_op(ctx, UOP_SUB, B2, thvm_op(ctx, UOP_MUL, LR, gB2)));
+}
 
 // ============================================================
 // Profiling — dispatch to backend

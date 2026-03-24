@@ -1,19 +1,8 @@
 static Term thvm_interact(TinyHVM *ctx, Term t) {
-    u64 memo_loc = 0;  // set for TAG_TOP to enable caching
-    if (term_tag(t) == TAG_TOP) {
-        memo_loc = term_val(t);
-        if (memo_loc < ctx->reduce_memo_size && ctx->reduce_memo[memo_loc] != 0) {
-            return ctx->reduce_memo[memo_loc];  // already cached — no interaction needed
-        }
-    }
-    // Macro: cache the result for TAG_TOP terms.
-    // Use thvm_reduce (not a raw thvm_interact loop) so nested lazy TAG_TOPs
-    // go through the proper enter/apply trampoline and are fully resolved.
+    // Resolve TAG_TOP results through the trampoline, then return.
     #define MEMO_RETURN(result) do { \
         Term _r = (result); \
         if (term_tag(_r) == TAG_TOP) _r = thvm_reduce(ctx, _r); \
-        if (memo_loc && memo_loc < ctx->reduce_memo_size) \
-            ctx->reduce_memo[memo_loc] = _r; \
         return _r; \
     } while(0)
 
@@ -33,6 +22,12 @@ inet_step:
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
                 Term x  = heap_read(ctx, loc + 2);
+
+                // Reduce x if lazy (trampoline only auto-reduces slots 0,1; slot 2 stays raw)
+                if (term_tag(x) != TAG_TEN && term_tag(x) != TAG_ERA) {
+                    x = thvm_reduce(ctx, x);
+                    heap_set(ctx, loc + 2, x);  // cache for re-entries
+                }
 
                 if (term_tag(y) == TAG_TEN) {
                     u32 y_id = (u32)term_val(y);
@@ -135,26 +130,18 @@ inet_step:
                         case UOP_FUSING: {
                             // General FUSING backward: re-reduce the original unfused subnet
                             // with provenance recording, then GRAD through the result.
-                            // By temporarily clearing reduce_memo[fusing_loc] we bypass the
-                            // forward memo cache, so thvm_reduce runs the full unfused path and
-                            // records proper provenance. We then restore the FUSING memo so
-                            // future forward reductions still get the fast fused result.
                             u64 orig_loc = ctx->tensors[y_id].fusing_loc;
                             u32 orig_uop = ctx->tensors[y_id].fusing_uop;
 
-                            Term saved_fusing = ctx->reduce_memo[orig_loc];
-                            u8   saved_nf     = ctx->no_fuse;
-
-                            ctx->reduce_memo[orig_loc] = 0; // clear so fresh reduction runs
-                            ctx->no_fuse   = 1;             // prevent re-fusing the same pattern
+                            u8 saved_nf = ctx->no_fuse;
+                            ctx->no_fuse = 1; // prevent re-fusing the same pattern
 
                             Term orig = term_new(TAG_TOP, orig_uop, orig_loc);
-                            Term unfused = thvm_reduce(ctx, orig); // fully unfused, with provenance
+                            Term unfused = thvm_reduce(ctx, orig);
 
-                            ctx->reduce_memo[orig_loc] = saved_fusing; // restore FUSING fast path
-                            ctx->no_fuse   = saved_nf;
+                            ctx->no_fuse = saved_nf;
 
-                            // GRAD through the unfused result — works for any subnet topology
+                            // GRAD through the unfused result
                             MEMO_RETURN(GRAD3(unfused, gy, x));
                         }
                         case UOP_SUM: {
@@ -265,22 +252,27 @@ inet_step:
             if (uop == UOP_ASSIGN) {
                 // UOP_ASSIGN(dst, src) — reduce src, blit into dst's buffer in-place
                 Term dst_t = heap_read(ctx, loc);
-                Term src_t = thvm_reduce(ctx, heap_read(ctx, loc + 1));
+                Term src_raw = heap_read(ctx, loc + 1);
+                Term src_t = thvm_reduce(ctx, src_raw);
                 Term dst_r = thvm_reduce(ctx, dst_t);
                 if (term_tag(dst_r) == TAG_TEN && term_tag(src_t) == TAG_TEN) {
                     u32 dst_id = (u32)term_val(dst_r);
                     u32 src_id = (u32)term_val(src_t);
-                    TensorMeta *md = &ctx->tensors[dst_id];
-                    TensorMeta *ms = &ctx->tensors[src_id];
-                    u64 nbytes = (u64)md->view.numel * sizeof(f32);
-                    f32 *dst_host = (f32 *)thvm_to_host(ctx, dst_r);
-                    f32 *src_host = (f32 *)thvm_to_host(ctx, src_t);
-                    memcpy(dst_host, src_host, nbytes);
-                    if (ctx->backend)
-                        ctx->backend->buf_write(md->buf_id, dst_host, nbytes);
-                    (void)ms;
+                    if (dst_id != src_id) {
+                        // First fire: blit src into dst's buffer
+                        TensorMeta *md = &ctx->tensors[dst_id];
+                        u64 nbytes = (u64)md->view.numel * sizeof(f32);
+                        f32 *dst_host = (f32 *)thvm_to_host(ctx, dst_r);
+                        f32 *src_host = (f32 *)thvm_to_host(ctx, src_t);
+                        memcpy(dst_host, src_host, nbytes);
+                        if (ctx->backend)
+                            ctx->backend->buf_write(md->buf_id, dst_host, nbytes);
+                        // Make re-fires idempotent: src slot now points to dst itself
+                        heap_set(ctx, loc + 1, dst_r);
+                    } else {
+                    }
                     ctx->itrs++;
-                    MEMO_RETURN(dst_r); // same TAG_TEN, same buf_id, mutated value
+                    MEMO_RETURN(dst_r);
                 }
                 MEMO_RETURN(term_era());
             }

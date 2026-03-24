@@ -17,9 +17,6 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     // Memo hit for TAG_TOP
     if (tag == TAG_TOP) {
         u64 loc = term_val(next);
-        if (loc < ctx->reduce_memo_size && ctx->reduce_memo[loc]) {
-            whnf = ctx->reduce_memo[loc]; goto apply;
-        }
         // Push node as frame, enter arg-slot 0 (strict left operand)
         PUSH(next);
         next = heap_read(ctx, loc + 0);
@@ -50,11 +47,6 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
 
             // Check arg1: is it already ready?
             Term a1 = heap_read(ctx, loc + 1);
-            if (term_tag(a1) == TAG_TOP) {
-                u64 al = term_val(a1);
-                if (al < ctx->reduce_memo_size && ctx->reduce_memo[al])
-                    { a1 = ctx->reduce_memo[al]; heap_set(ctx, loc+1, a1); }
-            }
             // Any WNF in arg1 slot is "ready" (TEN for tensors, NUM for axes, ERA for optional)
             u8 a1t2 = term_tag(a1);
             if (a1t2 == TAG_TEN || a1t2 == TAG_ERA || a1t2 == TAG_NUM ||
@@ -109,12 +101,6 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     free(stk);
     #undef PUSH
 
-    // Prefer memo for root
-    if (term_tag(root) == TAG_TOP) {
-        u64 loc = term_val(root);
-        if (loc < ctx->reduce_memo_size && ctx->reduce_memo[loc])
-            return ctx->reduce_memo[loc];
-    }
     return whnf;
 }
 

@@ -55,10 +55,11 @@ int main(void) {
     thvm_set_requires_grad(ctx, B1);
     thvm_set_requires_grad(ctx, W2);
     thvm_set_requires_grad(ctx, B2);
-    int nw = (int)ctx->tensor_count;
 
     f32 lr_val = 0.5f;
     Term LR = thvm_tensor(ctx, &lr_val, SHAPE(1));
+
+    int nw = (int)ctx->tensor_count;  // includes X, Y, weights, AND LR
 
     f32 loss_before = eval_loss(ctx, X, W1, B1, W2, B2, Y, nw);
     printf("  loss before: %.6f\n", loss_before);
@@ -66,12 +67,21 @@ int main(void) {
     // ── Build the program — NO computation yet ────────────────────────────
     // This is ONE lazy term encoding all N training steps.
     int N = 50;
-    Term program = thvm_train_step(ctx, N, W1, B1, W2, B2, X, Y, LR);
+    for (int step = 0; step < N; step++)
+        thvm_train_step(ctx, &W1, &B1, &W2, &B2, X, Y, LR);
 
-    // ── ONE reduction drives the full training ────────────────────────────
+    // ── ONE reduction per weight drives the full training ─────────────────
     printf("  reducing %d-step inet...\n", N);
-    thvm_reduce(ctx, program);
-    printf("  done — itrs=%u\n", ctx->itrs);
+    thvm_reduce(ctx, W1);
+    thvm_reduce(ctx, B1);
+    thvm_reduce(ctx, W2);
+    thvm_reduce(ctx, B2);
+    printf("  done — itrs=%llu\n", ctx->itrs);
+
+    // Invalidate host caches so eval_loss re-reads updated GPU buffers
+    for (int i = 0; i < nw; i++) {
+        if (ctx->tensors[i].host_ptr) { free(ctx->tensors[i].host_ptr); ctx->tensors[i].host_ptr = NULL; }
+    }
     thvm_reset(ctx, nw);
 
     f32 loss_after = eval_loss(ctx, X, W1, B1, W2, B2, Y, nw);

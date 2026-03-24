@@ -12,9 +12,6 @@ TinyHVM *thvm_init(Backend *backend) {
     ctx->heap = calloc(HEAP_CAP, sizeof(Term));
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();  // sentinel: prevent TAG_APP(0) self-loop
-    // DUP-SUP memo: same size as heap, 0 = not cached
-    ctx->reduce_memo = calloc(HEAP_CAP, sizeof(Term));
-    ctx->reduce_memo_size = HEAP_CAP;
     ctx->backend = backend;
     if (backend && backend->init) backend->init();
     return ctx;
@@ -33,7 +30,6 @@ void thvm_free(TinyHVM *ctx) {
         if (ctx->tensors[i].host_ptr) free(ctx->tensors[i].host_ptr);
     }
     free(ctx->heap);
-    free(ctx->reduce_memo);
     free(ctx);
 }
 
@@ -55,8 +51,6 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
     ctx->tensor_count = keep;
     ctx->heap_pos = 1;  // reset heap (keep weight terms as raw IDs)
     ctx->heap[0] = term_era();  // sentinel
-    // Clear DUP-SUP memo
-    memset(ctx->reduce_memo, 0, ctx->reduce_memo_size * sizeof(Term));
 }
 
 Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {

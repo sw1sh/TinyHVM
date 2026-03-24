@@ -121,8 +121,9 @@ typedef u64 Term;
 #define UOP_WHERE     25  // elementwise select: WHERE(cond_ten, then_ten, else_ten)
 #define UOP_IFZ       26  // if-zero branch: IFZ(counter_ten, zero_case, succ_lam)
                           // counter==0 → zero_case; counter>0 → APP(succ_lam, counter-1)
+#define UOP_LOG_PRINT 27  // print scalar tensor value, return tensor unchanged
 
-#define UOP_COUNT     27
+#define UOP_COUNT     28
 
 // Internal ops — not part of tinyspec, only used for autograd provenance
 #define UOP_POOL_GATHER 100  // sliding window gather (im2col equivalent)
@@ -132,7 +133,8 @@ typedef u64 Term;
 static const char *uop_names[] = {
     "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
-    "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","FUSING","ASSIGN","WHERE"
+    "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","FUSING","ASSIGN","WHERE",
+    "IFZ","LOG_PRINT"
 };
 
 // ============================================================
@@ -502,6 +504,7 @@ Term     thvm_sup(TinyHVM *ctx, Term a, Term b);             // TAG_SUP(a, b)
 Term     thvm_where(TinyHVM *ctx, Term cond, Term then_t, Term else_t);
 Term     thvm_assign(TinyHVM *ctx, Term dst, Term src);      // in-place weight update
 Term     thvm_ifz(TinyHVM *ctx, Term counter, Term zero_case, Term succ_lam); // if-zero branch
+Term     thvm_log_print(TinyHVM *ctx, Term tensor);  // print scalar value, return tensor
 
 // Profiling (dispatches to backend->profile_report/reset)
 void     thvm_profile_report(TinyHVM *ctx);

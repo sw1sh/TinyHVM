@@ -45,6 +45,9 @@ static Term train_program(TinyHVM *ctx,
     Term gW2 = thvm_grad(ctx, loss, W2);
     Term gB2 = thvm_grad(ctx, loss, B2);
 
+    // Log loss (side-effect: prints scalar, returns tensor for sequencing)
+    Term log_loss = thvm_log_print(ctx, loss);
+
     // ASSIGNs (independent)
     Term aW1 = thvm_assign(ctx, W1,
         thvm_op(ctx, UOP_SUB, W1, thvm_op(ctx, UOP_MUL, LR, gW1)));
@@ -55,7 +58,8 @@ static Term train_program(TinyHVM *ctx,
     Term aB2 = thvm_assign(ctx, B2,
         thvm_op(ctx, UOP_SUB, B2, thvm_op(ctx, UOP_MUL, LR, gB2)));
 
-    // succ_lam = λm. APP(aW1, APP(aB1, APP(aW2, APP(aB2, APP(REF(train), m)))))
+    // succ_lam = λm. APP(log_loss, APP(aW1, APP(aB1, APP(aW2, APP(aB2, APP(REF(train), m))))))
+    // log_loss forces+prints the loss, returns TEN → APP-TEN fires → continues to assigns
     Term var_m;
     Term rec = thvm_app(ctx, thvm_ref(ctx, train_id), term_era()); // placeholder
     // Build with proper var binding:
@@ -63,10 +67,11 @@ static Term train_program(TinyHVM *ctx,
     var_m = term_new(TAG_VAR, 0, lm);
     heap_set(ctx, lm, term_set_sub(var_m));
     rec = thvm_app(ctx, thvm_ref(ctx, train_id), var_m);
-    Term chain = thvm_app(ctx, aW1,
+    Term chain = thvm_app(ctx, log_loss,
+                 thvm_app(ctx, aW1,
                  thvm_app(ctx, aB1,
                  thvm_app(ctx, aW2,
-                 thvm_app(ctx, aB2, rec))));
+                 thvm_app(ctx, aB2, rec)))));
     heap_set(ctx, lm + 1, chain);
     Term succ_lam = term_new(TAG_LAM, 0, lm);
 

@@ -10,7 +10,8 @@ static inline int uop_allocates_fresh(u32 uop) {
         case UOP_GRAD:
             return 0;  // complex autograd — don't touch
         case UOP_IFZ:
-            return 0;  // returns sub-terms, not a fresh tensor
+        case UOP_LOG_PRINT:
+            return 0;  // returns sub-terms / passthrough, not a fresh tensor
         default:
             return 1;  // compute ops: ADD, SUB, MUL, MM, SUM, etc.
     }

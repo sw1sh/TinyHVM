@@ -328,6 +328,20 @@ inet_step:
                 }
             }
 
+            // UOP_LOG_PRINT(tensor) — print scalar value, return tensor unchanged
+            if (uop == UOP_LOG_PRINT) {
+                Term t = thvm_reduce(ctx, heap_read(ctx, loc));
+                ctx->itrs++;
+                if (term_tag(t) == TAG_TEN) {
+                    u32 tid = (u32)term_val(t);
+                    f32 *val = thvm_to_host(ctx, t);
+                    u32 n = ctx->tensors[tid].view.numel;
+                    if (n == 1) printf("  loss: %.6f\n", val[0]);
+                    else        printf("  tensor[%u]: %.6f ...\n", n, val[0]);
+                }
+                RETURN_REDUCED(t);
+            }
+
             // === FUSED MUL+SUM: pattern match SUM(MUL(a, b)) ===
             // Avoids materializing the huge MUL intermediate buffer.
             if (uop == UOP_SUM && !ctx->no_fuse) {

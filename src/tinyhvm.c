@@ -298,9 +298,11 @@ static Term thvm_interact(TinyHVM *ctx, Term t) {
         }
     }
     // Macro: cache the result for TAG_TOP terms.
+    // Use thvm_reduce (not a raw thvm_interact loop) so nested lazy TAG_TOPs
+    // go through the proper enter/apply trampoline and are fully resolved.
     #define MEMO_RETURN(result) do { \
         Term _r = (result); \
-        while (term_tag(_r) == TAG_TOP) _r = thvm_interact(ctx, _r); \
+        if (term_tag(_r) == TAG_TOP) _r = thvm_reduce(ctx, _r); \
         if (memo_loc && memo_loc < ctx->reduce_memo_size) \
             ctx->reduce_memo[memo_loc] = _r; \
         return _r; \
@@ -774,15 +776,16 @@ inet_step:
             // Movement ops: modify View, share buffer
             int is_movement = (uop >= UOP_RESHAPE && uop <= UOP_PAD);
 
-            // Reduce arguments
-            Term a = thvm_reduce(ctx, heap_read(ctx, loc));
+            // Args resolved by thvm_reduce's enter/apply loop before firing.
+            // Direct reads here — no thvm_reduce recursion.
+            Term a = heap_read(ctx, loc);
             heap_set(ctx, loc, a);
 
             int is_binary = (uop >= UOP_ADD && uop <= UOP_SUB) || uop == UOP_MM;
             int is_reduce = (uop == UOP_SUM || uop == UOP_RMAX);
             Term b = term_era();
             if (is_binary || is_movement) {
-                b = thvm_reduce(ctx, heap_read(ctx, loc + 1));
+                b = heap_read(ctx, loc + 1);
                 heap_set(ctx, loc + 1, b);
             }
 
@@ -1263,25 +1266,163 @@ inet_step:
 }
 
 // ============================================================
-// thvm_reduce: single-chain normal-order reduction trampoline.
+// thvm_reduce: enter/apply trampoline — HVM wnf/_.c style.
 //
-// Calls thvm_interact(t) and follows the result until WNF.
-// This is sequential "normal order" reduction from the root —
-// NOT a full active-pair queue reducer.
+// Two phases, mirrored exactly from HVM4:
 //
-// A true concurrent inet reducer would maintain a pairs[] queue,
-// scan the heap for all active pairs (nodes meeting at principal ports),
-// and process them in any order (or in parallel). Here we only follow
-// a single chain from the root, which is correct for TinyHVM's
-// tree-shaped tensor computation graph but doesn't exploit parallelism.
+//   ENTER: walk the head, pushing eliminators as frames.
+//     TAG_APP  → push frame, enter fun (slot 0)
+//     TAG_DP0/DP1 → push frame, enter sup (slot 0)
+//     TAG_REF  → unfold definition, go enter
+//     TAG_TOP  → push frame, enter arg-slot 0 (strict left arg)
+//     WNF (TEN/ERA/NUM/LAM/SUP) → jump to APPLY
+//
+//   APPLY: we have a WHNF in `whnf`. Pop frames and dispatch:
+//     APP frame + LAM whnf  → beta-reduce, goto enter on body
+//     APP frame + SUP whnf  → APP-SUP rule, continue apply
+//     TAG_TOP frame + TEN whnf → check arg1: if TEN → fire rule
+//                              → else push TOP1_TEN frame, enter arg1
+//     TOP1_TEN frame + TEN whnf → arg1 ready, fire the rule
+//     DP0/DP1 frame + SUP whnf → DUP-SUP annihilate, goto enter
+//     DP0/DP1 frame + LAM whnf → DUP-LAM, goto enter
+//     (stuck): rebuild term, continue
+//
+// For tensor ops with 2 required TAG_TEN args this is parallel to
+// HVM's OP2 treatment: enter x, then enter y, then fire op(x,y).
+// For unary ops (1 TAG_TEN arg), arg1 = term_era() which is WNF,
+// so TOP1_TEN fires immediately after checking arg1.
+//
+// thvm_interact is unchanged: it fires a complete rule given a term
+// whose args are ready (used from APPLY). The MEMO_RETURN inside
+// interact functions becomes the single result cache point.
 // ============================================================
 
-Term thvm_reduce(TinyHVM *ctx, Term t) {
-    while (1) {
-        Term next = thvm_interact(ctx, t);
-        if (next == t) return t;  // WNF — no rule fired, t is in normal form
-        t = next;
+// Frame tags for staged tensor-op arg resolution (mimic HVM's F_OP2_NUM)
+// TAG_TOP1: "arg0 is TEN (in heap[loc+0]), now reducing arg1"
+// TAG_TOP2: reserved for 3-arg ops (GRAD etc.) — not yet used.
+#define TAG_TOP1 0x7E  // sentinel for "arg0 done, entering arg1"
+#define TAG_TOP2 0x7F  // sentinel for "arg1 done, entering arg2" (3-arg ops)
+
+// Frame stack lives on the C stack (via recurse thvm_reduce calls are bounded
+// by graph depth, not arity). For the outer-level call we use a heap buffer.
+#define FRAME_CAP 65536
+
+Term thvm_reduce(TinyHVM *ctx, Term root) {
+    Term *stk = (Term *)malloc(FRAME_CAP * sizeof(Term));
+    int   sp  = 0;
+
+    Term next = root;
+    Term whnf;
+
+    #define PUSH(f_)  do { assert(sp < FRAME_CAP); stk[sp++] = (f_); } while(0)
+
+  enter: {
+    u8 tag = term_tag(next);
+
+    // Already WNF atoms → go directly to apply
+    if (tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
+        tag == TAG_LAM || tag == TAG_SUP) { whnf = next; goto apply; }
+
+    // Memo hit for TAG_TOP
+    if (tag == TAG_TOP) {
+        u64 loc = term_val(next);
+        if (loc < ctx->reduce_memo_size && ctx->reduce_memo[loc]) {
+            whnf = ctx->reduce_memo[loc]; goto apply;
+        }
+        // Push node as frame, enter arg-slot 0 (strict left operand)
+        PUSH(next);
+        next = heap_read(ctx, loc + 0);
+        goto enter;
     }
+
+    // Combinator tags: dispatch thvm_interact (handles APP/REF/DP0/DP1)
+    {
+        Term r = thvm_interact(ctx, next);
+        if (r == next) { whnf = next; goto apply; }  // combinator WNF or stuck
+        next = r;
+        goto enter;
+    }
+  }
+
+  apply: {
+    while (sp > 0) {
+        Term frame = stk[--sp];
+        u8   ftag  = term_tag(frame);
+
+        if (ftag == TAG_TOP) {
+            // arg0 just finished. whnf = arg0's result.
+            u64 loc = term_val(frame);
+            if (term_tag(whnf) != TAG_TEN) { heap_set(ctx, loc+0, whnf); whnf = frame; continue; }
+            heap_set(ctx, loc + 0, whnf);  // store arg0 result
+
+            // Check arg1: is it already ready?
+            Term a1 = heap_read(ctx, loc + 1);
+            if (term_tag(a1) == TAG_TOP) {
+                u64 al = term_val(a1);
+                if (al < ctx->reduce_memo_size && ctx->reduce_memo[al])
+                    { a1 = ctx->reduce_memo[al]; heap_set(ctx, loc+1, a1); }
+            }
+            // Any WNF in arg1 slot is "ready" (TEN for tensors, NUM for axes, ERA for optional)
+            u8 a1t2 = term_tag(a1);
+            if (a1t2 == TAG_TEN || a1t2 == TAG_ERA || a1t2 == TAG_NUM ||
+                a1t2 == TAG_LAM || a1t2 == TAG_SUP) {
+                // Both args ready — fire
+                Term r = thvm_interact(ctx, frame);
+                if (r == frame) { whnf = frame; continue; }
+                next = r; goto enter;
+            }
+            // arg1 not ready: push TOP1 sentinel frame (val=loc, ext=loc so we can find it),
+            // then enter arg1. When arg1 returns, TOP1 handler fires the rule.
+            PUSH(term_new(TAG_TOP1, (u8)term_ext(frame), loc));  // sentinel: "waiting for arg1"
+            next = a1;
+            goto enter;
+        }
+
+        if (ftag == TAG_TOP1) {
+            // arg1 just finished. whnf = arg1's result (any WNF is valid: TEN, ERA, NUM, LAM, SUP).
+            u64 loc = term_val(frame);
+            u8  w1t = term_tag(whnf);
+            // Accept any WNF as "ready"
+            if (w1t != TAG_TEN && w1t != TAG_ERA && w1t != TAG_NUM &&
+                w1t != TAG_LAM && w1t != TAG_SUP) { whnf = frame; continue; }
+            heap_set(ctx, loc + 1, whnf);  // store arg1 result
+            Term top_frame = term_new(TAG_TOP, term_ext(frame), loc);
+            Term r = thvm_interact(ctx, top_frame);
+            if (r == top_frame) { whnf = top_frame; continue; }
+            next = r; goto enter;
+        }
+
+        // Combinator frames (APP, DP0, DP1)
+        {
+            u64 floc = term_val(frame);
+            if (ftag == TAG_APP) {
+                heap_set(ctx, floc + 0, whnf);
+                Term r = thvm_interact(ctx, frame);
+                if (r == frame) { whnf = frame; continue; }
+                next = r; goto enter;
+            }
+            if (ftag == TAG_DP0 || ftag == TAG_DP1) {
+                heap_set(ctx, floc + 0, whnf);
+                Term r = thvm_interact(ctx, frame);
+                if (r == frame) { whnf = frame; continue; }
+                next = r; goto enter;
+            }
+            whnf = frame; continue;
+        }
+    }
+    // Stack empty — whnf is the result
+  }
+
+    free(stk);
+    #undef PUSH
+
+    // Prefer memo for root
+    if (term_tag(root) == TAG_TOP) {
+        u64 loc = term_val(root);
+        if (loc < ctx->reduce_memo_size && ctx->reduce_memo[loc])
+            return ctx->reduce_memo[loc];
+    }
+    return whnf;
 }
 
 // ============================================================

@@ -1,8 +1,8 @@
 // test_mlp_grad.m — Simple MLP gradient correctness test
 // No convs. Verifies: gradients exist, loss decreases, no memory leak.
 #include "../src/tinyhvm.c"
-#include "../src/cpu.c"
-#include "../src/metal.m"
+#include "../src/backend/cpu/_.c"
+#include "../src/backend/metal/_.m"
 
 static void fill_rand(f32 *buf, u32 n, f32 scale) {
     for (u32 i = 0; i < n; i++)

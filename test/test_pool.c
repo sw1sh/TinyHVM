@@ -1,5 +1,5 @@
 #include "../src/tinyhvm.c"
-#include "../src/cpu.c"
+#include "../src/backend/cpu/_.c"
 
 int main() {
     TinyHVM ctx = {0};

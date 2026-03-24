@@ -1,40 +1,4 @@
-// gpu_cpu.c — CPU fallback backend with strided kernel dispatch
-// Uses Accelerate BLAS for matmul, strided loops for everything else.
-
-#include "tinyhvm.h"
-#include <stdlib.h>
-#include <string.h>
-
-#ifdef __APPLE__
-#define ACCELERATE_NEW_LAPACK
-#include <Accelerate/Accelerate.h>
-#define HAS_BLAS 1
-#else
-#define HAS_BLAS 0
-#endif
-
-// ============================================================
-// Buffer pool: ID → pointer
-// ============================================================
-
-#define MAX_BUFS 16384
-
-static struct {
-    void *bufs[MAX_BUFS];
-    u64   sizes[MAX_BUFS];
-    u32   count;
-} cpu_pool;
-
-static int  cpu_init(void)          { memset(&cpu_pool, 0, sizeof(cpu_pool)); cpu_pool.count = 1; return 0; }
-static void cpu_shutdown(void)      { for (u32 i = 1; i < cpu_pool.count; i++) free(cpu_pool.bufs[i]); memset(&cpu_pool, 0, sizeof(cpu_pool)); }
-static u32  cpu_buf_alloc(u64 b)    { u32 id = cpu_pool.count++; cpu_pool.bufs[id] = calloc(1, b); cpu_pool.sizes[id] = b; return id; }
-static void cpu_buf_free(u32 id)    { free(cpu_pool.bufs[id]); cpu_pool.bufs[id] = NULL; }
-static void cpu_buf_write(u32 id, const void *d, u64 b) { memcpy(cpu_pool.bufs[id], d, b); }
-static void cpu_buf_read(u32 id, void *o, u64 b)        { memcpy(o, cpu_pool.bufs[id], b); }
-
-// ============================================================
-// Strided indexing helpers
-// ============================================================
+// cpu/ops.c — CPU compute kernels: strided unary, binary, matmul, reduce
 
 // Convert flat output index → strided input index
 static inline u32 strided_index(u32 flat, const View *v) {
@@ -47,10 +11,6 @@ static inline u32 strided_index(u32 flat, const View *v) {
     }
     return idx;
 }
-
-// ============================================================
-// Strided unary op
-// ============================================================
 
 static void cpu_op_unary(u32 uop, u32 dst, const View *dv,
                          u32 src, const View *sv) {
@@ -71,10 +31,6 @@ static void cpu_op_unary(u32 uop, u32 dst, const View *dv,
         }
     }
 }
-
-// ============================================================
-// Strided binary op (handles broadcasting via stride=0)
-// ============================================================
 
 static void cpu_op_binary(u32 uop, u32 dst, const View *dv,
                           u32 a, const View *av, u32 b, const View *bv) {
@@ -98,15 +54,11 @@ static void cpu_op_binary(u32 uop, u32 dst, const View *dv,
         }
     }
 }
-// ============================================================
-// Matmul (BLAS or naive, handles non-contiguous via stride check)
-// ============================================================
 
 // Check if View is a simple transpose (strides swapped from row-major)
 static int is_transposed_2d(const View *v) {
     if (v->shape.rank != 2) return 0;
     u32 M = v->shape.dims[0], N = v->shape.dims[1];
-    // Transposed: strides = [1, M] instead of row-major [N, 1]
     return (v->strides[0] == 1 && v->strides[1] == (i32)M) ||
            (v->strides[0] == 1 && v->strides[1] == (i32)N && !v->contiguous);
     (void)N;
@@ -125,7 +77,6 @@ static f32 *materialize_2d(u32 buf, const View *v, u32 rows, u32 cols) {
 static void cpu_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
                       u32 M, u32 K, u32 N) {
 #if HAS_BLAS
-    // Materialize non-contiguous inputs (e.g. from permute) for BLAS
     f32 *pa = !av->contiguous ? materialize_2d(a, av, M, K) : (f32 *)cpu_pool.bufs[a];
     f32 *pb = !bv->contiguous ? materialize_2d(b, bv, K, N) : (f32 *)cpu_pool.bufs[b];
 
@@ -137,13 +88,11 @@ static void cpu_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
     if (!av->contiguous) free(pa);
     if (!bv->contiguous) free(pb);
 #else
-    // Naive fallback: always materialize via strided index
     f32 *pd = cpu_pool.bufs[dst];
     for (u32 i = 0; i < M; i++)
         for (u32 j = 0; j < N; j++) {
             f32 s = 0;
             for (u32 k = 0; k < K; k++) {
-                // Build 2D flat index, then use strided_index
                 u32 a_flat = i * K + k;
                 u32 b_flat = k * N + j;
                 f32 va = ((f32*)cpu_pool.bufs[a])[strided_index(a_flat, av)];
@@ -154,11 +103,6 @@ static void cpu_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
         }
 #endif
 }
-
-// ============================================================
-// Reduce op (sum/max along last axis)
-// src is [outer × reduce_dim], dst is [outer]
-// ============================================================
 
 static void cpu_op_reduce(u32 uop, u32 dst, u32 dst_numel,
                            u32 src, u32 src_numel, u32 reduce_dim) {
@@ -177,43 +121,3 @@ static void cpu_op_reduce(u32 uop, u32 dst, u32 dst_numel,
         pd[o] = acc;
     }
 }
-
-static void cpu_pool_reset(u32 keep) {
-    // Free buffers above `keep` (keep is number of *tensors*, buf IDs start at 1)
-    u32 buf_keep = keep + 1;  // tensor 0 → buf 1, tensor N-1 → buf N
-    for (u32 i = buf_keep; i < cpu_pool.count; i++) {
-        free(cpu_pool.bufs[i]);
-        cpu_pool.bufs[i] = NULL;
-    }
-    cpu_pool.count = buf_keep;
-}
-
-Backend cpu_backend = {
-    .init      = cpu_init,
-    .shutdown  = cpu_shutdown,
-    .buf_alloc = cpu_buf_alloc,
-    .buf_free  = cpu_buf_free,
-    .buf_write = cpu_buf_write,
-    .buf_read  = cpu_buf_read,
-    .op_unary  = cpu_op_unary,
-    .op_binary = cpu_op_binary,
-    .op_mm     = cpu_op_mm,
-    .op_reduce = cpu_op_reduce,
-    .op_im2col = NULL,
-    .op_col2im = NULL,
-    .op_nhwc_to_nchw = NULL,
-    .op_nchw_to_nhwc = NULL,
-    .op_bias_add = NULL,
-    .op_col_sum  = NULL,
-    .op_transpose = NULL,
-    .op_maxpool_fwd = NULL,
-    .op_maxpool_bwd = NULL,
-    .op_relu_bwd = NULL,
-    .op_zero_fill = NULL,
-    .op_adam_step = NULL,
-    .pool_reset = cpu_pool_reset,
-    .begin_batch = NULL,  // CPU: no batching needed
-    .end_batch   = NULL,
-    .profile_report = NULL,
-    .profile_reset  = NULL,
-};

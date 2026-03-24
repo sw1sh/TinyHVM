@@ -13,8 +13,8 @@
 // When n==0, return (compute final loss to verify convergence).
 
 #include "../src/tinyhvm.c"
-#include "../src/cpu.c"
-#include "../src/metal.m"
+#include "../src/backend/cpu/_.c"
+#include "../src/backend/metal/_.m"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

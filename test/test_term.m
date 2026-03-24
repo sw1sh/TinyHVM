@@ -2,8 +2,8 @@
 // Change DEVICE to "metal" to run all tests on GPU.
 
 #include "../src/tinyhvm.c"
-#include "../src/cpu.c"
-#include "../src/metal.m"
+#include "../src/backend/cpu/_.c"
+#include "../src/backend/metal/_.m"
 
 #define DEVICE "cpu"
 

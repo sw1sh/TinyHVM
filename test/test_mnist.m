@@ -5,9 +5,9 @@
 // Usage: ./test_mnist [cpu|metal]
 
 #include "../src/tinyhvm.c"
-#include "../src/cpu.c"
+#include "../src/backend/cpu/_.c"
 #ifdef __APPLE__
-  #include "../src/metal.m"
+  #include "../src/backend/metal/_.m"
 #endif
 
 #ifndef DEVICE

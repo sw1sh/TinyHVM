@@ -1,6 +1,6 @@
 #include "../src/tinyhvm.c"
-#include "../src/cpu.c"
-#include "../src/metal.m"
+#include "../src/backend/cpu/_.c"
+#include "../src/backend/metal/_.m"
 #include <math.h>
 int main() {
     srand(42);

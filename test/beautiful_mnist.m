@@ -7,11 +7,11 @@
 // No manual backward pass. Weights are IC Terms.
 
 #include "../src/tinyhvm.c"
-#include "../src/cpu.c"
+#include "../src/backend/cpu/_.c"
 #ifdef __APPLE__
-  #include "../src/metal.m"
+  #include "../src/backend/metal/_.m"
 #endif
-#include "../src/layers.c"
+#include "../src/nn/_.c"
 #include "../src/nn/datasets.c"
 
 #ifndef DEVICE

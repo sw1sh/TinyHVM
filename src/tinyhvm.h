@@ -119,8 +119,10 @@ typedef u64 Term;
 #define UOP_FUSING    23  // fused kernel (SUM(MUL) etc); see ic_fusion.md
 #define UOP_ASSIGN    24  // in-place weight update: blit src buf into dst buf
 #define UOP_WHERE     25  // elementwise select: WHERE(cond_ten, then_ten, else_ten)
+#define UOP_IFZ       26  // if-zero branch: IFZ(counter_ten, zero_case, succ_lam)
+                          // counter==0 → zero_case; counter>0 → APP(succ_lam, counter-1)
 
-#define UOP_COUNT     26
+#define UOP_COUNT     27
 
 // Internal ops — not part of tinyspec, only used for autograd provenance
 #define UOP_POOL_GATHER 100  // sliding window gather (im2col equivalent)
@@ -499,6 +501,7 @@ Term     thvm_sup(TinyHVM *ctx, Term a, Term b);             // TAG_SUP(a, b)
 // Inet ops
 Term     thvm_where(TinyHVM *ctx, Term cond, Term then_t, Term else_t);
 Term     thvm_assign(TinyHVM *ctx, Term dst, Term src);      // in-place weight update
+Term     thvm_ifz(TinyHVM *ctx, Term counter, Term zero_case, Term succ_lam); // if-zero branch
 
 // Profiling (dispatches to backend->profile_report/reset)
 void     thvm_profile_report(TinyHVM *ctx);
@@ -542,9 +545,6 @@ f32      thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
 // Gradient ops go through thvm_op → get taped → grad(grad(f)) works.
 Term     thvm_grad(TinyHVM *ctx, Term y, Term x);
 void     thvm_backward(TinyHVM *ctx, Term loss, Term *params, Term *grads, u32 n_params);
-void     thvm_train_step(TinyHVM *ctx,
-                         Term *pW1, Term *pB1, Term *pW2, Term *pB2,
-                         Term X, Term Y, Term LR);
 
 // Movement ops
 Term     thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim);

@@ -3,6 +3,7 @@
 #include "../src/tinyhvm.c"
 #include "../src/backend/cpu/_.c"
 #include "../src/backend/metal/_.m"
+#include "train_helpers.h"
 
 int main(void) {
     TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
@@ -31,16 +32,11 @@ int main(void) {
 
     printf("before: W1[0]=%.6f\n", thvm_to_host(ctx, W1)[0]);
 
-    // Build 2-step lazy program
-    for (int step = 0; step < 2; step++)
-        thvm_train_step(ctx, &W1, &B1, &W2, &B2, X, Y, LR);
+    // Build 2-step lazy recursive program (no C loop!)
+    Term program = train_program(ctx, W1, B1, W2, B2, X, Y, LR, 2);
 
     printf("reducing...\n");
-    // Reduce all 4 weight ASSIGN chains
-    thvm_reduce(ctx, W1);
-    thvm_reduce(ctx, B1);
-    thvm_reduce(ctx, W2);
-    thvm_reduce(ctx, B2);
+    thvm_reduce(ctx, program);
     // Invalidate host cache
     for (u32 i = 0; i < ctx->tensor_count; i++)
         if (ctx->tensors[i].host_ptr) { free(ctx->tensors[i].host_ptr); ctx->tensors[i].host_ptr = NULL; }

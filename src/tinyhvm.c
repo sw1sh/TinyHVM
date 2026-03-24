@@ -70,6 +70,9 @@ static u32  tensor_fill(TinyHVM *ctx, Shape s, f32 val);
 static u32  tensor_transpose_2d(TinyHVM *ctx, u32 src_id);
 static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target);
 
+// ── clone/ — deep-copy (ALO) for REF unfolding ──────────────────────────────
+#include "clone/_.c"
+
 // ── interact/ — one interaction rule per active pair ─────────────────────────
 #include "interact/_.c"
 

@@ -1,6 +1,7 @@
 static Term thvm_interact(TinyHVM *ctx, Term t) {
-    // Resolve TAG_TOP results through the trampoline, then return.
-    #define MEMO_RETURN(result) do { \
+    // If result is TAG_TOP, reduce it before returning (ensures the trampoline
+    // drives lazy ops to completion before handing back to the caller).
+    #define RETURN_REDUCED(result) do { \
         Term _r = (result); \
         if (term_tag(_r) == TAG_TOP) _r = thvm_reduce(ctx, _r); \
         return _r; \
@@ -35,13 +36,13 @@ inet_step:
 
                     // Base case: y == x → return grad_y
                     if (term_tag(x) == TAG_TEN && (u32)term_val(x) == y_id)
-                        MEMO_RETURN(thvm_reduce(ctx, gy));
+                        RETURN_REDUCED(thvm_reduce(ctx, gy));
 
                     TensorMeta *my = &ctx->tensors[y_id];
 
                     // Leaf (no provenance, not x) → ERA (no gradient path)
                     if (!my->creator_op) {
-                        MEMO_RETURN(term_era());
+                        RETURN_REDUCED(term_era());
                     }
 
                     // DUP-op interaction via provenance
@@ -71,43 +72,43 @@ inet_step:
                         case UOP_ADD: {
                             Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
                             Term db = sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape);
-                            MEMO_RETURN(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
+                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
                         }
                         case UOP_SUB: {
                             Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
                             Term neg = thvm_op(ctx, UOP_NEG,
                                 sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape), term_era());
-                            MEMO_RETURN(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,neg,x)));
+                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,neg,x)));
                         }
                         case UOP_MUL: {
                             Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt),
                                                    my->view.shape, ma->view.shape);
                             Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at),
                                                    my->view.shape, mb_p->view.shape);
-                            MEMO_RETURN(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
+                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
                         }
                         case UOP_MM: {
                             u32 bt_id = tensor_transpose_2d(ctx, bid);
                             u32 at_id = tensor_transpose_2d(ctx, aid);
                             Term da = thvm_op(ctx, UOP_MM, gy, term_ten(bt_id, mb_p->dtype));
                             Term db = thvm_op(ctx, UOP_MM, term_ten(at_id, ma->dtype), gy);
-                            MEMO_RETURN(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
+                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
                         }
                         case UOP_RELU: {
                             f32 z = 0.0f;
                             Term mask = thvm_op(ctx, UOP_CMP, at, thvm_tensor(ctx, &z, SHAPE(1)));
-                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, mask), x));
+                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, mask), x));
                         }
                         case UOP_NEG:
-                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_NEG, gy, term_era()), x));
+                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_NEG, gy, term_era()), x));
                         case UOP_EXP:
-                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, y), x));
+                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, y), x));
                         case UOP_LOG:
-                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, at), x));
+                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, at), x));
                         case UOP_SQRT: {
                             f32 two = 2.0f;
                             Term denom = thvm_op(ctx, UOP_MUL, thvm_tensor(ctx, &two, SHAPE(1)), y);
-                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, denom), x));
+                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, denom), x));
                         }
                         case UOP_DIV: {
                             Term da = thvm_op(ctx, UOP_DIV, gy, bt);
@@ -115,7 +116,7 @@ inet_step:
                             Term db = thvm_op(ctx, UOP_DIV,
                                 thvm_op(ctx, UOP_MUL, ng, at),
                                 thvm_op(ctx, UOP_MUL, bt, bt));
-                            MEMO_RETURN(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
+                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
                         }
                         case UOP_MAX: {
                             Term mask = thvm_op(ctx, UOP_CMP, y, at);
@@ -125,7 +126,7 @@ inet_step:
                             Term inv = thvm_op(ctx, UOP_SUB, thvm_tensor(ctx, &one, SHAPE(1)), mask);
                             Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, inv),
                                                    my->view.shape, mb_p->view.shape);
-                            MEMO_RETURN(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
+                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
                         }
                         case UOP_FUSING: {
                             // General FUSING backward: re-reduce the original unfused subnet
@@ -142,13 +143,13 @@ inet_step:
                             ctx->no_fuse = saved_nf;
 
                             // GRAD through the unfused result
-                            MEMO_RETURN(GRAD3(unfused, gy, x));
+                            RETURN_REDUCED(GRAD3(unfused, gy, x));
                         }
                         case UOP_SUM: {
                             // Plain SUM (no fused MUL). gy has keepdims shape; expand to input shape.
                             Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
                             Term g = thvm_expand(ctx, gy_r, ma->view.shape);
-                            MEMO_RETURN(GRAD3(at, g, x));
+                            RETURN_REDUCED(GRAD3(at, g, x));
                         }
 
                         case UOP_RMAX: {
@@ -156,12 +157,12 @@ inet_step:
                                 thvm_reshape(ctx, y, my->view.shape), ma->view.shape);
                             Term mask = thvm_op(ctx, UOP_CMP, at, max_bc);
                             Term gbc = thvm_expand(ctx, gy, ma->view.shape);
-                            MEMO_RETURN(GRAD3(at, thvm_op(ctx, UOP_MUL, gbc, mask), x));
+                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_MUL, gbc, mask), x));
                         }
                         case UOP_RESHAPE:
-                            MEMO_RETURN(GRAD3(at, thvm_reshape(ctx, gy, ma->view.shape), x));
+                            RETURN_REDUCED(GRAD3(at, thvm_reshape(ctx, gy, ma->view.shape), x));
                         case UOP_EXPAND:
-                            MEMO_RETURN(GRAD3(at,
+                            RETURN_REDUCED(GRAD3(at,
                                 sum_to_shape(ctx, gy, my->view.shape, ma->view.shape), x));
                         case UOP_PERMUTE: {
                             u32 rank = ctx->tensors[bid].view.numel;
@@ -170,7 +171,7 @@ inet_step:
                             u32 inv[MAX_DIM];
                             for (u32 j = 0; j < rank; j++) inv[(u32)af[j]] = j;
                             free(af);
-                            MEMO_RETURN(GRAD3(at, thvm_permute(ctx, gy, inv, rank), x));
+                            RETURN_REDUCED(GRAD3(at, thvm_permute(ctx, gy, inv, rank), x));
                         }
                         case UOP_PAD: {
                             TensorMeta *mp = &ctx->tensors[bid];
@@ -180,7 +181,7 @@ inet_step:
                             u32 sp[MAX_DIM*2];
                             for (u32 j=0;j<nd;j++){sp[j*2]=(u32)pf[j*2];sp[j*2+1]=(u32)pf[j*2]+ma->view.shape.dims[j];}
                             free(pf);
-                            MEMO_RETURN(GRAD3(at, thvm_shrink(ctx, gy, sp, nd), x));
+                            RETURN_REDUCED(GRAD3(at, thvm_shrink(ctx, gy, sp, nd), x));
                         }
                         case UOP_SHRINK: {
                             TensorMeta *ms2 = &ctx->tensors[bid];
@@ -190,7 +191,7 @@ inet_step:
                             u32 pp[MAX_DIM*2];
                             for (u32 j=0;j<nd;j++){pp[j*2]=(u32)sf[j*2];pp[j*2+1]=ma->view.shape.dims[j]-(u32)sf[j*2+1];}
                             free(sf);
-                            MEMO_RETURN(GRAD3(at, thvm_pad(ctx, gy, pp, nd), x));
+                            RETURN_REDUCED(GRAD3(at, thvm_pad(ctx, gy, pp, nd), x));
                         }
                         case UOP_POOL_GATHER: {
                             TensorMeta *mp = &ctx->tensors[bid];
@@ -205,7 +206,7 @@ inet_step:
                                 u32 pa[MAX_DIM];
                                 for(u32 j=0;j<pbd;j++)pa[j]=j;
                                 pa[pbd]=pbd;pa[pbd+1]=pbd+2;pa[pbd+2]=pbd+1;pa[pbd+3]=pbd+3;
-                                MEMO_RETURN(GRAD3(at,
+                                RETURN_REDUCED(GRAD3(at,
                                     thvm_reshape(ctx,thvm_permute(ctx,gy,pa,pbd+4),ma->view.shape),x));
                             } else {
                                 u32 bd[MAX_DIM]; for(u32 j=0;j<pbd;j++)bd[j]=ma->view.shape.dims[j];
@@ -226,13 +227,13 @@ inet_step:
                                     Term pd=thvm_pad(ctx,s2,pp2,rr);
                                     dx=(term_tag(dx)==TAG_ERA)?pd:thvm_op(ctx,UOP_ADD,dx,pd);
                                 }
-                                MEMO_RETURN(GRAD3(at, dx, x));
+                                RETURN_REDUCED(GRAD3(at, dx, x));
                             }
                         }
                         default: {
                             // Unknown op → zero
                             u32 zid = tensor_fill(ctx, my->view.shape, 0.0f);
-                            MEMO_RETURN(term_ten(zid, my->dtype));
+                            RETURN_REDUCED(term_ten(zid, my->dtype));
                         }
                     }
                     #undef GRAD3
@@ -244,7 +245,7 @@ inet_step:
                     heap_set(ctx, loc, yr);
                     return thvm_reduce(ctx, t); // retry with reduced y
                 }
-                MEMO_RETURN(term_era());
+                RETURN_REDUCED(term_era());
             }
 
             // === Phase 3 inet ops ===
@@ -272,9 +273,9 @@ inet_step:
                     } else {
                     }
                     ctx->itrs++;
-                    MEMO_RETURN(dst_r);
+                    RETURN_REDUCED(dst_r);
                 }
-                MEMO_RETURN(term_era());
+                RETURN_REDUCED(term_era());
             }
 
             if (uop == UOP_WHERE) {
@@ -284,7 +285,7 @@ inet_step:
                 Term then_t = thvm_reduce(ctx, heap_read(ctx, loc + 1));
                 Term else_t = thvm_reduce(ctx, heap_read(ctx, loc + 2));
                 if (term_tag(cond_t) != TAG_TEN || term_tag(then_t) != TAG_TEN ||
-                    term_tag(else_t) != TAG_TEN) MEMO_RETURN(term_era());
+                    term_tag(else_t) != TAG_TEN) RETURN_REDUCED(term_era());
                 u32 c_id = (u32)term_val(cond_t);
                 u32 a_wid = (u32)term_val(then_t);
                 u32 b_wid = (u32)term_val(else_t);
@@ -305,9 +306,27 @@ inet_step:
                 ctx->backend->buf_write(ctx->tensors[dst_wid].buf_id, rp, n*sizeof(f32));
                 free(rp);
                 ctx->itrs++;
-                MEMO_RETURN(term_ten(dst_wid, ma_w->dtype));
+                RETURN_REDUCED(term_ten(dst_wid, ma_w->dtype));
             }
 
+            // UOP_IFZ(counter, zero_case, succ_lam)
+            // counter==0 → zero_case; counter>0 → APP(succ_lam, TEN(counter-1))
+            if (uop == UOP_IFZ) {
+                Term ctr = thvm_reduce(ctx, heap_read(ctx, loc));
+                if (term_tag(ctr) != TAG_TEN) RETURN_REDUCED(term_era());
+                f32 *val = thvm_to_host(ctx, ctr);
+                ctx->itrs++;
+                if (val[0] <= 0.0f) {
+                    // Base case: return zero_case (slot 1)
+                    return heap_read(ctx, loc + 1);
+                } else {
+                    // Recursive case: decrement, apply succ_lam
+                    f32 nv = val[0] - 1.0f;
+                    Term dec = thvm_tensor(ctx, &nv, SHAPE(1));
+                    Term succ_lam = heap_read(ctx, loc + 2);
+                    return thvm_app(ctx, succ_lam, dec);
+                }
+            }
 
             // === FUSED MUL+SUM: pattern match SUM(MUL(a, b)) ===
             // Avoids materializing the huge MUL intermediate buffer.
@@ -443,7 +462,7 @@ inet_step:
                                     free(a_ptr); free(b_ptr); free(dst_ptr);
                                 }
                                 ctx->itrs++;
-                                MEMO_RETURN(term_ten(dst_id, ma->dtype));
+                                RETURN_REDUCED(term_ten(dst_id, ma->dtype));
                             }
                         } // if (ok)
                     }
@@ -475,11 +494,11 @@ inet_step:
                 int a_ten = (at == TAG_TEN), b_ten = (bt2 == TAG_TEN);
                 if (a_era || b_era) {
                     // Both ERA → ERA
-                    if (a_era && b_era) MEMO_RETURN(term_era());
+                    if (a_era && b_era) RETURN_REDUCED(term_era());
                     // ERA+TEN or TEN+ERA
-                    if (uop == UOP_ADD) MEMO_RETURN(a_era ? b_check : a);
-                    if (uop == UOP_SUB) MEMO_RETURN(a_era ? term_era() : a); // ERA-x=ERA, x-ERA=x
-                    if (uop == UOP_MUL || uop == UOP_DIV) MEMO_RETURN(term_era());
+                    if (uop == UOP_ADD) RETURN_REDUCED(a_era ? b_check : a);
+                    if (uop == UOP_SUB) RETURN_REDUCED(a_era ? term_era() : a); // ERA-x=ERA, x-ERA=x
+                    if (uop == UOP_MUL || uop == UOP_DIV) RETURN_REDUCED(term_era());
                     (void)a_ten; (void)b_ten;
                 }
             }
@@ -608,7 +627,7 @@ inet_step:
                             md->src_ids[1] = b_id;
                         }
                         ctx->itrs++;
-                        MEMO_RETURN(term_ten(dst_id, ma->dtype));
+                        RETURN_REDUCED(term_ten(dst_id, ma->dtype));
                     }
                     default:
                         assert(0 && "unknown movement op");
@@ -624,7 +643,7 @@ inet_step:
                     md->src_ids[1] = b_id;
                 }
                 ctx->itrs++;
-                MEMO_RETURN(term_ten(dst_id, ma->dtype));
+                RETURN_REDUCED(term_ten(dst_id, ma->dtype));
             }
 
             if (!ctx->backend) return t;
@@ -859,7 +878,7 @@ inet_step:
             }
 
             ctx->itrs++;
-            MEMO_RETURN(term_ten(dst_id, ma->dtype));
+            RETURN_REDUCED(term_ten(dst_id, ma->dtype));
         }
 
         // TAG_APP: beta reduction — APP(LAM(x, body), arg) → body[x ← arg]
@@ -876,6 +895,13 @@ inet_step:
                 t = heap_read(ctx, lam_loc + 1);  // body is the next term to reduce
                 goto inet_step;                   // loop — no recursive call
             }
+            // APP-TEN: APP(TEN, x) → x — tensor in function pos, discard and return arg
+            // Enables sequencing: APP(ASSIGN(...), continuation) forces ASSIGN, then continues.
+            if (term_tag(fun) == TAG_TEN || term_tag(fun) == TAG_ERA) {
+                ctx->itrs++;
+                t = heap_read(ctx, loc + 1);      // return argument
+                goto inet_step;
+            }
             return t;
         }
 
@@ -883,15 +909,14 @@ inet_step:
         case TAG_LAM:
             return t;
 
-        // TAG_REF: port-link — link body into the net, continue loop.
-        // REF interacts with its environment by relinking its port to the body's root.
-        // No recursive call — the active-pair loop handles the continuation.
+        // TAG_REF: unfold definition — deep-clone body (ALO semantics).
+        // Each unfold gets fresh heap nodes so recursive defs work correctly.
         case TAG_REF: {
             u32 name = (u32)term_ext(t);
             assert(name < ctx->def_count);
             ctx->itrs++;
-            t = ctx->defs[name];  // link: t becomes the body root
-            goto inet_step;       // loop — no recursive call
+            t = term_clone(ctx, ctx->defs[name]);
+            goto inet_step;
         }
 
         // TAG_SUP: superposition — returned as-is until projected by DP0/DP1
@@ -987,7 +1012,7 @@ inet_step:
 // so TOP1_TEN fires immediately after checking arg1.
 //
 // thvm_interact is unchanged: it fires a complete rule given a term
-// whose args are ready (used from APPLY). The MEMO_RETURN inside
+// whose args are ready (used from APPLY). The RETURN_REDUCED inside
 // interact functions becomes the single result cache point.
 // ============================================================
 

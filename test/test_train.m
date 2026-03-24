@@ -16,6 +16,7 @@
 #ifdef __APPLE__
   #include "../src/backend/metal/_.m"
 #endif
+#include "train_helpers.h"
 #include <stdio.h>
 
 #ifndef DEVICE
@@ -64,18 +65,13 @@ int main(void) {
     f32 loss_before = eval_loss(ctx, X, W1, B1, W2, B2, Y, nw);
     printf("  loss before: %.6f\n", loss_before);
 
-    // ── Build the program — NO computation yet ────────────────────────────
-    // This is ONE lazy term encoding all N training steps.
+    // ── Build recursive inet program — NO computation, NO loop ─────────────
     int N = 50;
-    for (int step = 0; step < N; step++)
-        thvm_train_step(ctx, &W1, &B1, &W2, &B2, X, Y, LR);
+    Term program = train_program(ctx, W1, B1, W2, B2, X, Y, LR, N);
 
-    // ── ONE reduction per weight drives the full training ─────────────────
+    // ── ONE reduction drives the entire N-step training ───────────────────
     printf("  reducing %d-step inet...\n", N);
-    thvm_reduce(ctx, W1);
-    thvm_reduce(ctx, B1);
-    thvm_reduce(ctx, W2);
-    thvm_reduce(ctx, B2);
+    thvm_reduce(ctx, program);
     printf("  done — itrs=%llu\n", ctx->itrs);
 
     // Invalidate host caches so eval_loss re-reads updated GPU buffers

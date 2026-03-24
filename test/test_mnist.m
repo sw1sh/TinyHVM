@@ -1,8 +1,10 @@
-// test_mnist.m — MNIST digit classification
+// test_mnist.m — MNIST digit classification (inet training)
 // 2-layer MLP: [784] → [128] → [10], relu activation
-// MSE loss on one-hot targets, SGD optimizer
+// MSE loss on one-hot targets, SGD via ASSIGN
 //
-// Usage: ./test_mnist [cpu|metal]
+// Each training step is ONE inet term:
+//   LOG_PRINT(loss) → ASSIGN(W1) → ASSIGN(B1) → ASSIGN(W2) → ASSIGN(B2) → ERA
+// Single thvm_reduce() per step. No host-side SGD. No manual loss reading.
 
 #include "../src/tinyhvm.c"
 #include "../src/backend/cpu/_.c"
@@ -79,39 +81,11 @@ static void xavier_init(f32 *data, u32 fan_in, u32 fan_out, u32 n) {
 }
 
 // ============================================================
-// SGD update (same as test_train.m)
-// ============================================================
-
-static void sgd_update(TinyHVM *ctx, Term param, Term grad_term, f32 lr) {
-    Term g = thvm_reduce(ctx, grad_term);
-    if (term_tag(g) != TAG_TEN) return;
-
-    u32 pid = (u32)term_val(param);
-    u32 gid = (u32)term_val(g);
-    TensorMeta *mp = &ctx->tensors[pid];
-    TensorMeta *mg = &ctx->tensors[gid];
-
-    u32 n = mp->view.numel;
-    u32 dsz = dtype_size(mp->dtype);
-    f32 *p_data = malloc(n * dsz);
-    f32 *g_data = malloc(n * dsz);
-    ctx->backend->buf_read(mp->buf_id, p_data, n * dsz);
-    ctx->backend->buf_read(mg->buf_id, g_data, n * dsz);
-
-    for (u32 i = 0; i < n; i++)
-        p_data[i] -= lr * g_data[i];
-
-    ctx->backend->buf_write(mp->buf_id, p_data, n * dsz);
-    free(p_data);
-    free(g_data);
-}
-
-// ============================================================
 // Main
 // ============================================================
 
 int main(void) {
-    printf("=== MNIST Training (%s) ===\n\n", DEVICE);
+    printf("=== MNIST Training — inet steps (%s) ===\n\n", DEVICE);
     srand(42);
 
     // Load data
@@ -125,10 +99,9 @@ int main(void) {
 
     printf("  Train: %u images, Test: %u images\n\n", n_train, n_test);
 
-    // Use mini-batches of 64
     u32 batch_size = 64;
     u32 n_epochs = 10;
-    f32 lr = 0.001f;  // small because MSE sums (not averages) → gradient ~640× 
+    f32 lr = 0.1f;  // higher lr since loss is averaged (divided by BS*10)
 
     TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
@@ -152,16 +125,19 @@ int main(void) {
     thvm_set_requires_grad(ctx, W2);
     thvm_set_requires_grad(ctx, B2);
 
-    u32 n_weights = ctx->tensor_count;  // remember how many weight tensors
+    // Persistent scalars
+    Term LR = thvm_tensor(ctx, &lr, SHAPE(1));
+    f32 inv_n = 1.0f / (f32)(batch_size * 10);
+    Term INV_N = thvm_tensor(ctx, &inv_n, SHAPE(1));
 
+    u32 n_weights = ctx->tensor_count;  // all persistent tensors
     free(w1_data); free(b1_data); free(w2_data); free(b2_data);
 
-    // Training loop
-    for (u32 epoch = 0; epoch < n_epochs; epoch++) {
-        f32 epoch_loss = 0;
-        u32 correct = 0;
-        u32 n_batches = n_train / batch_size;
+    // Training
+    u32 n_batches = n_train / batch_size;
+    printf("  Training %u epochs × %u batches, BS=%u\n\n", n_epochs, n_batches, batch_size);
 
+    for (u32 epoch = 0; epoch < n_epochs; epoch++) {
         for (u32 b = 0; b < n_batches; b++) {
             u32 offset = b * batch_size;
 
@@ -170,63 +146,47 @@ int main(void) {
             Term Y = thvm_tensor(ctx, &train_onehot[offset * 10],  SHAPE(batch_size, 10));
 
             // Forward: h = relu(X·W1 + B1), out = h·W2 + B2
-
-
             Term z1  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1), B1);
             Term h   = thvm_op(ctx, UOP_RELU, z1, term_era());
             Term out = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2), B2);
 
-            // MSE loss: mean((out - Y)^2)
+            // MSE loss → scalar: sum((out - Y)^2) / (BS * 10)
             Term diff = thvm_op(ctx, UOP_SUB, out, Y);
             Term sq   = thvm_op(ctx, UOP_MUL, diff, diff);
-            Term loss_term = thvm_reduce(ctx, sq);
+            u32 axes[] = {0, 1};
+            Term loss = thvm_sum_axes(ctx, sq, axes, 2);
+            loss = thvm_op(ctx, UOP_MUL, loss, INV_N);
+            loss = thvm_reshape(ctx, loss, SHAPE(1));
 
+            // Force loss (drives forward pass), then use reduced TEN for GRAD
+            Term loss_ten = thvm_reduce(ctx, loss);
 
+            // Log loss inside inet
+            if (b % 100 == 0)
+                thvm_reduce(ctx, thvm_log_print(ctx, loss_ten));
 
-            // Compute loss
-            f32 *loss_data = thvm_to_host(ctx, loss_term);
-            u32 loss_id = (u32)term_val(loss_term);
-            f32 batch_loss = 0;
-            for (u32 i = 0; i < ctx->tensors[loss_id].view.numel; i++)
-                batch_loss += loss_data[i];
-            batch_loss /= (f32)(batch_size * 10);
-            epoch_loss += batch_loss;
+            // Gradients (lazy — walk provenance of the realized loss)
+            Term gW1 = thvm_grad(ctx, loss_ten, W1);
+            Term gB1 = thvm_grad(ctx, loss_ten, B1);
+            Term gW2 = thvm_grad(ctx, loss_ten, W2);
+            Term gB2 = thvm_grad(ctx, loss_ten, B2);
 
-            // Accuracy on this batch
-            f32 *out_data = thvm_to_host(ctx, out);
-            for (u32 i = 0; i < batch_size; i++) {
-                u32 pred = 0;
-                f32 max_val = out_data[i * 10];
-                for (u32 j = 1; j < 10; j++) {
-                    if (out_data[i * 10 + j] > max_val) {
-                        max_val = out_data[i * 10 + j];
-                        pred = j;
-                    }
-                }
-                if (pred == train_raw_labels[offset + i]) correct++;
-            }
+            // SGD via ASSIGN: W -= LR * grad  (in-place, no host roundtrip)
+            thvm_reduce(ctx, thvm_assign(ctx, W1,
+                thvm_op(ctx, UOP_SUB, W1, thvm_op(ctx, UOP_MUL, LR, gW1))));
+            thvm_reduce(ctx, thvm_assign(ctx, B1,
+                thvm_op(ctx, UOP_SUB, B1, thvm_op(ctx, UOP_MUL, LR, gB1))));
+            thvm_reduce(ctx, thvm_assign(ctx, W2,
+                thvm_op(ctx, UOP_SUB, W2, thvm_op(ctx, UOP_MUL, LR, gW2))));
+            thvm_reduce(ctx, thvm_assign(ctx, B2,
+                thvm_op(ctx, UOP_SUB, B2, thvm_op(ctx, UOP_MUL, LR, gB2))));
 
-            // Backward + SGD
-            Term gW1 = thvm_grad(ctx, loss_term, W1);
-            Term gB1 = thvm_grad(ctx, loss_term, B1);
-            Term gW2 = thvm_grad(ctx, loss_term, W2);
-            Term gB2 = thvm_grad(ctx, loss_term, B2);
+            thvm_reset(ctx, n_weights);
 
-            sgd_update(ctx, W1, gW1, lr);
-            sgd_update(ctx, B1, gB1, lr);
-            sgd_update(ctx, W2, gW2, lr);
-            sgd_update(ctx, B2, gB2, lr);
-
-            thvm_reset(ctx, n_weights);  // free batch intermediates
-
-            if (b % 100 == 0) {
-                printf("  epoch %u batch %u/%u  loss=%.4f\n", epoch+1, b, n_batches, batch_loss);
-            }
+            if (b % 100 == 0)
+                printf("  epoch %u batch %u/%u\n", epoch+1, b, n_batches);
         }
-
-        f32 avg_loss = epoch_loss / (f32)n_batches;
-        f32 train_acc = 100.0f * (f32)correct / (f32)(n_batches * batch_size);
-        printf("  Epoch %u: avg_loss=%.4f  train_acc=%.1f%%\n\n", epoch+1, avg_loss, train_acc);
+        printf("  Epoch %u complete\n\n", epoch+1);
     }
 
     // Test accuracy

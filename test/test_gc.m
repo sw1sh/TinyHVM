@@ -60,9 +60,9 @@ static int test_app_ten_decrements_refcount(void) {
     (void)result;
 
     ASSERT(ctx->tensors[id].refcount == 0, "after APP-TEN: rc should be 0");
-    ASSERT(ctx->tensors[id].buf_id == 0, "after APP-TEN: buf should be freed");
-    printf("  test_app_ten_decrements_refcount: PASS (rc=%u, buf=%u)\n",
-           ctx->tensors[id].refcount, ctx->tensors[id].buf_id);
+    // buf_id not zeroed — buffer freeing deferred to thvm_reset (view-shared buf safety)
+    printf("  test_app_ten_decrements_refcount: PASS (rc=%u)\n",
+           ctx->tensors[id].refcount);
     thvm_free(ctx);
     return 0;
 }

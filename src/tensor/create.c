@@ -39,10 +39,7 @@ static inline void tensor_incref(TinyHVM *ctx, u32 id) {
 
 static inline void tensor_decref(TinyHVM *ctx, u32 id) {
     TensorMeta *m = &ctx->tensors[id];
-    if (m->refcount > 0 && --m->refcount == 0) {
-        if (ctx->backend && m->buf_id)
-            ctx->backend->buf_free(m->buf_id);
-        if (m->host_ptr) { free(m->host_ptr); m->host_ptr = NULL; }
-        m->buf_id = 0;
-    }
+    if (m->refcount > 0) m->refcount--;
+    // Buffer freeing deferred to thvm_reset — view-shared bufs make eager free unsafe.
+    (void)ctx;
 }

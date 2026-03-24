@@ -38,3 +38,8 @@ test_mlp_grad
 test_mlp_cpu
 test_grad_check
 test_low_lr
+
+# Debug/ASAN test binaries
+test_term_dbg
+test_term_asan*
+test_term_pre

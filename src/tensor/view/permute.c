@@ -1,0 +1,10 @@
+// tensor/view/permute.c — view_permute(): reorder axes
+static View view_permute(View v, const u32 *axes) {
+  View r = v;
+  for (u32 i = 0; i < v.shape.rank; i++) {
+    r.shape.dims[i] = v.shape.dims[axes[i]];
+    r.strides[i]    = v.strides[axes[i]];
+  }
+  r.contiguous = 0;
+  return r;
+}

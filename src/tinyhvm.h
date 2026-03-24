@@ -118,10 +118,9 @@ typedef u64 Term;
 // heap root in src_ids, so GRAD can walk back through the unfused lazy graph.
 #define UOP_FUSING    23  // fused kernel (SUM(MUL) etc); see ic_fusion.md
 #define UOP_ASSIGN    24  // in-place weight update: blit src buf into dst buf
-#define UOP_ITE       25  // conditional: ITE(cond, then, else)
-#define UOP_LOAD_BATCH 26 // lazy batch load: LOAD(data_ptr_term, idx_term)
+#define UOP_WHERE     25  // elementwise select: WHERE(cond_ten, then_ten, else_ten)
 
-#define UOP_COUNT     27
+#define UOP_COUNT     26
 
 // Internal ops — not part of tinyspec, only used for autograd provenance
 #define UOP_POOL_GATHER 100  // sliding window gather (im2col equivalent)
@@ -129,9 +128,9 @@ typedef u64 Term;
 
 // UOp name table (device-agnostic)
 static const char *uop_names[] = {
-    "LOAD","STORE","CONST","CAST","NEG","RELU","EXP","LOG","SQRT","RECIP",
-    "ADD","MUL","MAX","CMP","SUB","SUM","RMAX","MM",
-    "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD"
+    "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
+    "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
+    "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","FUSING","ASSIGN","WHERE"
 };
 
 // ============================================================
@@ -500,8 +499,7 @@ Term     thvm_ref(TinyHVM *ctx, u32 name);                   // TAG_REF(name)
 Term     thvm_sup(TinyHVM *ctx, Term a, Term b);             // TAG_SUP(a, b)
 
 // Inet ops
-Term     thvm_ite(TinyHVM *ctx, Term cond, Term then_t, Term else_t);
-Term     thvm_load(TinyHVM *ctx, const f32 *data, u32 numel_per_item, Shape item_shape, Term idx);
+Term     thvm_where(TinyHVM *ctx, Term cond, Term then_t, Term else_t);
 Term     thvm_assign(TinyHVM *ctx, Term dst, Term src);      // in-place weight update
 
 // Profiling (dispatches to backend->profile_report/reset)

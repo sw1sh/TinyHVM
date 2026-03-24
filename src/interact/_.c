@@ -56,6 +56,46 @@ inet_step:
                     TensorMeta *mb_p = is_bin ? &ctx->tensors[bid] : NULL;
                     Term bt = is_bin ? term_ten(bid, mb_p->dtype) : term_era();
 
+                    // REACHES: can tensor `from` reach tensor `target` via src_ids?
+                    // Returns 1 if from==target or any provenance ancestor reaches target.
+                    // Used to prune dead GRAD branches in binary ops.
+                    int a_reaches = 1, b_reaches = 1;
+                    if (is_bin && term_tag(x) == TAG_TEN) {
+                        // Quick DFS with cycle-safe depth limit
+                        #define REACHES_MAX 64
+                        u32 x_tgt = (u32)term_val(x);
+                        // Check if aid can reach x_tgt
+                        { u32 stk_r[REACHES_MAX]; int rp = 0;
+                          stk_r[rp++] = aid;
+                          a_reaches = 0;
+                          while (rp > 0 && rp < REACHES_MAX) {
+                              u32 cur = stk_r[--rp];
+                              if (cur == x_tgt) { a_reaches = 1; break; }
+                              TensorMeta *mc = &ctx->tensors[cur];
+                              if (mc->creator_op && mc->src_ids[0] < ctx->tensor_count)
+                                  stk_r[rp++] = mc->src_ids[0];
+                              if (mc->creator_op && mc->src_ids[1] < ctx->tensor_count &&
+                                  mc->src_ids[1] != mc->src_ids[0])
+                                  stk_r[rp++] = mc->src_ids[1];
+                          }
+                        }
+                        { u32 stk_r[REACHES_MAX]; int rp = 0;
+                          stk_r[rp++] = bid;
+                          b_reaches = 0;
+                          while (rp > 0 && rp < REACHES_MAX) {
+                              u32 cur = stk_r[--rp];
+                              if (cur == x_tgt) { b_reaches = 1; break; }
+                              TensorMeta *mc = &ctx->tensors[cur];
+                              if (mc->creator_op && mc->src_ids[0] < ctx->tensor_count)
+                                  stk_r[rp++] = mc->src_ids[0];
+                              if (mc->creator_op && mc->src_ids[1] < ctx->tensor_count &&
+                                  mc->src_ids[1] != mc->src_ids[0])
+                                  stk_r[rp++] = mc->src_ids[1];
+                          }
+                        }
+                        #undef REACHES_MAX
+                    }
+
                     // Helper macro: create recursive GRAD term (3 heap slots)
                     #define GRAD3(y_,gy_,x_) ({ \
                         u64 _l = heap_alloc(ctx, 3); \
@@ -70,29 +110,57 @@ inet_step:
 
                     switch (cop) {
                         case UOP_ADD: {
-                            Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
-                            Term db = sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape);
-                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
+                            Term ga = term_era(), gb = term_era();
+                            if (a_reaches) {
+                                Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
+                                ga = GRAD3(at,da,x);
+                            }
+                            if (b_reaches) {
+                                Term db = sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape);
+                                gb = GRAD3(bt,db,x);
+                            }
+                            RETURN_REDUCED(GRAD_ADD(ga, gb));
                         }
                         case UOP_SUB: {
-                            Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
-                            Term neg = thvm_op(ctx, UOP_NEG,
-                                sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape), term_era());
-                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,neg,x)));
+                            Term ga = term_era(), gb = term_era();
+                            if (a_reaches) {
+                                Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
+                                ga = GRAD3(at,da,x);
+                            }
+                            if (b_reaches) {
+                                Term neg = thvm_op(ctx, UOP_NEG,
+                                    sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape), term_era());
+                                gb = GRAD3(bt,neg,x);
+                            }
+                            RETURN_REDUCED(GRAD_ADD(ga, gb));
                         }
                         case UOP_MUL: {
-                            Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt),
-                                                   my->view.shape, ma->view.shape);
-                            Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at),
-                                                   my->view.shape, mb_p->view.shape);
-                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
+                            Term ga = term_era(), gb = term_era();
+                            if (a_reaches) {
+                                Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt),
+                                                       my->view.shape, ma->view.shape);
+                                ga = GRAD3(at,da,x);
+                            }
+                            if (b_reaches) {
+                                Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at),
+                                                       my->view.shape, mb_p->view.shape);
+                                gb = GRAD3(bt,db,x);
+                            }
+                            RETURN_REDUCED(GRAD_ADD(ga, gb));
                         }
                         case UOP_MM: {
-                            u32 bt_id = tensor_transpose_2d(ctx, bid);
-                            u32 at_id = tensor_transpose_2d(ctx, aid);
-                            Term da = thvm_op(ctx, UOP_MM, gy, term_ten(bt_id, mb_p->dtype));
-                            Term db = thvm_op(ctx, UOP_MM, term_ten(at_id, ma->dtype), gy);
-                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
+                            Term ga = term_era(), gb = term_era();
+                            if (a_reaches) {
+                                u32 bt_id = tensor_transpose_2d(ctx, bid);
+                                Term da = thvm_op(ctx, UOP_MM, gy, term_ten(bt_id, mb_p->dtype));
+                                ga = GRAD3(at,da,x);
+                            }
+                            if (b_reaches) {
+                                u32 at_id = tensor_transpose_2d(ctx, aid);
+                                Term db = thvm_op(ctx, UOP_MM, term_ten(at_id, ma->dtype), gy);
+                                gb = GRAD3(bt,db,x);
+                            }
+                            RETURN_REDUCED(GRAD_ADD(ga, gb));
                         }
                         case UOP_RELU: {
                             f32 z = 0.0f;
@@ -119,7 +187,8 @@ inet_step:
                             RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
                         }
                         case UOP_MAX: {
-                            Term mask = thvm_op(ctx, UOP_CMP, y, at);
+                            // mask = (a > b): gradient flows to a where a was the max
+                            Term mask = thvm_op(ctx, UOP_CMP, at, bt);
                             Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, mask),
                                                    my->view.shape, ma->view.shape);
                             f32 one = 1.0f;
@@ -155,7 +224,11 @@ inet_step:
                         case UOP_RMAX: {
                             Term max_bc = thvm_expand(ctx,
                                 thvm_reshape(ctx, y, my->view.shape), ma->view.shape);
-                            Term mask = thvm_op(ctx, UOP_CMP, at, max_bc);
+                            // mask = 1 where input >= max (CMP is strict >, so invert)
+                            f32 one = 1.0f;
+                            Term mask = thvm_op(ctx, UOP_SUB,
+                                thvm_tensor(ctx, &one, SHAPE(1)),
+                                thvm_op(ctx, UOP_CMP, max_bc, at));
                             Term gbc = thvm_expand(ctx, gy, ma->view.shape);
                             RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_MUL, gbc, mask), x));
                         }

@@ -38,14 +38,24 @@ static void top_decref_inputs(TinyHVM *ctx, u64 loc, u32 uop, Term result) {
     }
 }
 
+// Pre-allocated stack pool to avoid malloc/free in the hot path.
+// thvm_reduce is called recursively from GRAD — each depth level
+// gets a slice of 4096 terms from the shared pool.
+#define REDUCE_SLICE 4096
+#define REDUCE_MAX_DEPTH 64
+static _Thread_local Term reduce_pool[REDUCE_SLICE * REDUCE_MAX_DEPTH];
+static _Thread_local int  reduce_depth = 0;
+
 Term thvm_reduce(TinyHVM *ctx, Term root) {
-    Term *stk = (Term *)malloc(FRAME_CAP * sizeof(Term));
+    int depth = reduce_depth++;
+    assert(depth < REDUCE_MAX_DEPTH);
+    Term *stk = &reduce_pool[depth * REDUCE_SLICE];
     int   sp  = 0;
 
     Term next = root;
     Term whnf;
 
-    #define PUSH(f_)  do { assert(sp < FRAME_CAP); stk[sp++] = (f_); } while(0)
+    #define PUSH(f_)  do { assert(sp < REDUCE_SLICE); stk[sp++] = (f_); } while(0)
 
   enter: {
     u8 tag = term_tag(next);
@@ -140,7 +150,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     // Stack empty — whnf is the result
   }
 
-    free(stk);
+    reduce_depth--;
     #undef PUSH
 
     return whnf;

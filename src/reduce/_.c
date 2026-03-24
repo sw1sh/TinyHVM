@@ -1,3 +1,42 @@
+// Does this UOP allocate a fresh buffer (safe to decref inputs)?
+// Movement ops share the input buffer → NOT safe to decref.
+static inline int uop_allocates_fresh(u32 uop) {
+    switch (uop) {
+        case UOP_RESHAPE: case UOP_PERMUTE: case UOP_EXPAND:
+        case UOP_SHRINK:  case UOP_PAD:
+            return 0;  // shares buffer
+        case UOP_ASSIGN:
+            return 0;  // result IS the dst input
+        case UOP_GRAD:
+            return 0;  // complex autograd — don't touch
+        case UOP_IFZ:
+            return 0;  // returns sub-terms, not a fresh tensor
+        default:
+            return 1;  // compute ops: ADD, SUB, MUL, MM, SUM, etc.
+    }
+}
+
+// Decref input tensors after a TOP fires and produces a fresh output.
+// Skip if the OUTPUT is grad-tracked — GRAD walks src_ids backward through
+// the entire forward tape, so all intermediate tensors must stay alive.
+static void top_decref_inputs(TinyHVM *ctx, u64 loc, u32 uop, Term result) {
+    if (!uop_allocates_fresh(uop)) return;
+    // If the result tensor needs grad, the inputs are part of the tape
+    if (term_tag(result) == TAG_TEN) {
+        u32 rid = (u32)term_val(result);
+        if (ctx->tensors[rid].requires_grad) return;
+    }
+    u32 arity = (uop == UOP_WHERE) ? 3 : 2;
+    for (u32 i = 0; i < arity; i++) {
+        Term a = heap_read(ctx, loc + i);
+        if (term_tag(a) == TAG_TEN) {
+            u32 tid = (u32)term_val(a);
+            if (!ctx->tensors[tid].requires_grad)
+                tensor_decref(ctx, tid);
+        }
+    }
+}
+
 Term thvm_reduce(TinyHVM *ctx, Term root) {
     Term *stk = (Term *)malloc(FRAME_CAP * sizeof(Term));
     int   sp  = 0;
@@ -54,6 +93,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 // Both args ready — fire
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
+                top_decref_inputs(ctx, loc, term_ext(frame), r);
                 next = r; goto enter;
             }
             // arg1 not ready: push TOP1 sentinel frame (val=loc, ext=loc so we can find it),
@@ -74,6 +114,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             Term top_frame = term_new(TAG_TOP, term_ext(frame), loc);
             Term r = thvm_interact(ctx, top_frame);
             if (r == top_frame) { whnf = top_frame; continue; }
+            top_decref_inputs(ctx, loc, term_ext(frame), r);
             next = r; goto enter;
         }
 

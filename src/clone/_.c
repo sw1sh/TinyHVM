@@ -19,9 +19,11 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs) {
     switch (tag) {
         // ── Terminals: no heap state ──────────────────────────────
         case TAG_NUM:
-        case TAG_TEN:
         case TAG_ERA:
         case TAG_REF:
+            return t;
+        case TAG_TEN:
+            tensor_incref(ctx, (u32)term_val(t));
             return t;
 
         // ── VAR: look up relocation table for rebound location ───

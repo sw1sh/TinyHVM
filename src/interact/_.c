@@ -897,9 +897,15 @@ inet_step:
             }
             // APP-TEN: APP(TEN, x) → x — tensor in function pos, discard and return arg
             // Enables sequencing: APP(ASSIGN(...), continuation) forces ASSIGN, then continues.
-            if (term_tag(fun) == TAG_TEN || term_tag(fun) == TAG_ERA) {
+            if (term_tag(fun) == TAG_TEN) {
+                tensor_decref(ctx, (u32)term_val(fun));
                 ctx->itrs++;
-                t = heap_read(ctx, loc + 1);      // return argument
+                t = heap_read(ctx, loc + 1);
+                goto inet_step;
+            }
+            if (term_tag(fun) == TAG_ERA) {
+                ctx->itrs++;
+                t = heap_read(ctx, loc + 1);
                 goto inet_step;
             }
             return t;

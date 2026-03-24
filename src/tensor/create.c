@@ -31,3 +31,18 @@ static u32 tensor_view_of(TinyHVM *ctx, u32 src_id, View new_view) {
   m->view     = new_view;
   return id;
 }
+
+// Refcount helpers for inet GC
+static inline void tensor_incref(TinyHVM *ctx, u32 id) {
+    ctx->tensors[id].refcount++;
+}
+
+static inline void tensor_decref(TinyHVM *ctx, u32 id) {
+    TensorMeta *m = &ctx->tensors[id];
+    if (m->refcount > 0 && --m->refcount == 0) {
+        if (ctx->backend && m->buf_id)
+            ctx->backend->buf_free(m->buf_id);
+        if (m->host_ptr) { free(m->host_ptr); m->host_ptr = NULL; }
+        m->buf_id = 0;
+    }
+}

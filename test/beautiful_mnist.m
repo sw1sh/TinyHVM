@@ -192,7 +192,6 @@ int main(void) {
         u8 *by = &data.train_labels[start];
 
         // Forward — pure IC graph composition
-        thvm_start_recording(ctx);
         Term logits = thvm_sequential(ctx, x, model, N_LAYERS, BS, 1);
 
         // Loss — cross-entropy (pure UOp composition, fully differentiable)
@@ -206,9 +205,6 @@ int main(void) {
         f32 *loss_host = thvm_to_host(ctx, loss_reduced);
         f32 loss_val = loss_host[0];
 
-        // Stop recording AFTER loss is reduced — all forward ops now have creator_op
-        // Backward runs with recording OFF so gradient ops can use SUM(MUL) fusion
-        thvm_stop_recording(ctx);
 
         // === BACKWARD PHASE ===
         thvm_prof_phase(PHASE_BACKWARD);

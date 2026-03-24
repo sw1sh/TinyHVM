@@ -2225,13 +2225,7 @@ void thvm_set_requires_grad(TinyHVM *ctx, Term t) {
     }
 }
 
-void thvm_start_recording(TinyHVM *ctx) {
-    (void)ctx; // recording always-on; stub kept for API compat
-}
 
-void thvm_stop_recording(TinyHVM *ctx) {
-    (void)ctx; // recording always-on; stub kept for API compat
-}
 
 
 

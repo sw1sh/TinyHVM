@@ -491,8 +491,6 @@ void     thvm_print_term(TinyHVM *ctx, Term t);
 
 // Autograd
 void     thvm_set_requires_grad(TinyHVM *ctx, Term t);
-void     thvm_start_recording(TinyHVM *ctx);  // no-op — provenance always-on
-void     thvm_stop_recording(TinyHVM *ctx);   // no-op — provenance always-on
 
 // Lambda / inet combinators
 Term     thvm_lam(TinyHVM *ctx, Term *var_out, Term body);   // allocate LAM node

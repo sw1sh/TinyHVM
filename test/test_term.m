@@ -240,9 +240,7 @@ static void test_grad_x2(void) {
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx, x);
 
-    thvm_start_recording(ctx);
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_MUL, x, x));
-    thvm_stop_recording(ctx);
 
     f32 *fwd = thvm_to_host(ctx, yr);
     ASSERT_NEAR(fwd[0], 9.0f, 1e-5f, "3*3 = 9");
@@ -266,9 +264,7 @@ static void test_grad_add(void) {
     thvm_set_requires_grad(ctx, a);
     thvm_set_requires_grad(ctx, b);
 
-    thvm_start_recording(ctx);
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD, a, b));
-    thvm_stop_recording(ctx);
 
     f32 *fwd = thvm_to_host(ctx, yr);
     ASSERT_NEAR(fwd[0], 7.0f, 1e-5f, "2+5 = 7");
@@ -289,9 +285,7 @@ static void test_grad_relu(void) {
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx, x);
 
-    thvm_start_recording(ctx);
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_RELU, x, term_era()));
-    thvm_stop_recording(ctx);
 
     f32 *fwd = thvm_to_host(ctx, yr);
     ASSERT_NEAR(fwd[0], 0.0f, 1e-5f, "relu(-2)=0");
@@ -318,9 +312,7 @@ static void test_grad_mm(void) {
     thvm_set_requires_grad(ctx, a);
     thvm_set_requires_grad(ctx, b);
 
-    thvm_start_recording(ctx);
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_MM, a, b));
-    thvm_stop_recording(ctx);
 
     f32 *fwd = thvm_to_host(ctx, yr);
     ASSERT_NEAR(fwd[0], 19.0f, 1e-4f, "mm[0,0]=19");
@@ -355,7 +347,6 @@ static void test_grad_of_grad(void) {
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx, x);
 
-    thvm_start_recording(ctx);
     Term t1 = thvm_op(ctx, UOP_MUL, x, x);
     Term y  = thvm_op(ctx, UOP_MUL, t1, x);
     Term yr = thvm_reduce(ctx, y);
@@ -365,7 +356,6 @@ static void test_grad_of_grad(void) {
 
     Term dy_dx = thvm_grad(ctx, yr, x);
     Term dy_val = thvm_reduce(ctx, dy_dx);
-    thvm_stop_recording(ctx);
 
     f32 *g1 = thvm_to_host(ctx, dy_val);
     ASSERT(g1 != NULL, "first grad exists");
@@ -387,10 +377,8 @@ static void test_grad_sum(void) {
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx, x);
 
-    thvm_start_recording(ctx);
     Term s1 = thvm_op(ctx, UOP_SUM, x, term_era());       // [2,1]
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_SUM, s1, term_era()));  // [1,1]
-    thvm_stop_recording(ctx);
 
     f32 *fwd = thvm_to_host(ctx, yr);
     printf("  sum_val = %.4f (expected 21)\n", fwd[0]);
@@ -422,9 +410,7 @@ static void test_grad_exp_log(void) {
     thvm_set_requires_grad(ctx, x);
 
     // exp
-    thvm_start_recording(ctx);
     Term yr1 = thvm_reduce(ctx, thvm_op(ctx, UOP_EXP, x, term_era()));
-    thvm_stop_recording(ctx);
 
     f32 *ge = thvm_to_host(ctx, thvm_grad(ctx, yr1, x));
     ASSERT_NEAR(ge[0], expf(1.0f), 1e-4f, "d(exp(1))/dx = e");
@@ -436,9 +422,7 @@ static void test_grad_exp_log(void) {
     Term x2 = thvm_tensor(ctx2, x2_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx2, x2);
 
-    thvm_start_recording(ctx2);
     Term yr2 = thvm_reduce(ctx2, thvm_op(ctx2, UOP_LOG, x2, term_era()));
-    thvm_stop_recording(ctx2);
 
     f32 *gl = thvm_to_host(ctx2, thvm_grad(ctx2, yr2, x2));
     ASSERT_NEAR(gl[0], 0.5f, 1e-4f, "d(log(2))/dx = 0.5");
@@ -462,9 +446,7 @@ static void test_grad_div(void) {
     thvm_set_requires_grad(ctx, a);
     thvm_set_requires_grad(ctx, b);
 
-    thvm_start_recording(ctx);
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_DIV, a, b));
-    thvm_stop_recording(ctx);
 
     f32 *fwd = thvm_to_host(ctx, yr);
     ASSERT_NEAR(fwd[0], 2.0f, 1e-4f, "6/3=2");
@@ -491,12 +473,10 @@ static void test_grad_broadcast_expand(void) {
     thvm_set_requires_grad(ctx, x);
     thvm_set_requires_grad(ctx, b);
 
-    thvm_start_recording(ctx);
     // sum(x + broadcast(b)) — loss is scalar
     Term added = thvm_op(ctx, UOP_ADD, x, b);  // broadcasts b from [1,3] to [2,3]
     Term s1 = thvm_op(ctx, UOP_SUM, added, term_era());
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_SUM, s1, term_era()));
-    thvm_stop_recording(ctx);
 
     f32 *fwd = thvm_to_host(ctx, yr);
     printf("  sum_val = %.4f (expected 141)\n", fwd[0]);
@@ -533,13 +513,11 @@ static void test_grad_chain(void) {
     thvm_set_requires_grad(ctx, w);
     thvm_set_requires_grad(ctx, b);
 
-    thvm_start_recording(ctx);
     Term mm = thvm_op(ctx, UOP_MM, x, w);
     Term added = thvm_op(ctx, UOP_ADD, mm, b);
     Term act = thvm_op(ctx, UOP_RELU, added, term_era());
     Term s1 = thvm_op(ctx, UOP_SUM, act, term_era());
     Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_SUM, s1, term_era()));
-    thvm_stop_recording(ctx);
 
     f32 *fwd = thvm_to_host(ctx, yr);
     printf("  chain_fwd = %.4f\n", fwd[0]);
@@ -566,7 +544,6 @@ static void test_grad_softmax_loss(void) {
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx, x);
 
-    thvm_start_recording(ctx);
     // softmax: exp(x) / sum(exp(x))
     Term ex = thvm_op(ctx, UOP_EXP, x, term_era());
     Term ex_sum = thvm_op(ctx, UOP_SUM, ex, term_era());  // [1,1]
@@ -578,7 +555,6 @@ static void test_grad_softmax_loss(void) {
     // Pick class 0: shrink to [1,1]
     Term loss = thvm_shrink(ctx, neg, (u32[]){0, 1, 0, 1}, 2);
     Term yr = thvm_reduce(ctx, loss);
-    thvm_stop_recording(ctx);
 
     f32 *fwd = thvm_to_host(ctx, yr);
     printf("  loss = %.4f\n", fwd[0]);

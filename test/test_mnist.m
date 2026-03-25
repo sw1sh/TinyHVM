@@ -318,7 +318,7 @@ static int run_cnn(MNISTData *data) {
         extern double flush_total_ms;
         extern u32 flush_count_total;
         if (step == 0) {
-            printf("    GPU dispatches: %u, flushes: %u, flush_time: %.1fms\n",
+            printf("    step 0: dispatches=%u flushes=%u flush_time=%.1fms\n",
                    total_dispatches, flush_count_total, flush_total_ms);
             total_dispatches = 0; flush_total_ms = 0; flush_count_total = 0;
         }

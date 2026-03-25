@@ -51,46 +51,32 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
 static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
                          u32 M, u32 K, u32 N) {
     u64 t0 = thvm_prof_tick();
-    if (batch_dirty) metal_flush();
 
-    id<MTLBuffer> buf_a = metal_pool.bufs[a];
-    id<MTLBuffer> buf_b = metal_pool.bufs[b];
-    id<MTLBuffer> tmp_a = nil, tmp_b = nil;
-
+    // Contiguify non-contiguous inputs on GPU (no CPU round-trip)
+    u32 buf_a_id = a, buf_b_id = b;
     if (!av->contiguous) {
         u32 n = M * K;
-        tmp_a = [mtl_dev newBufferWithLength:n * sizeof(float) options:MTLResourceStorageModeShared];
-        float *src = (float *)buf_a.contents;
-        float *dst_ptr = (float *)tmp_a.contents;
-        for (u32 i = 0; i < n; i++) {
-            u32 idx = (u32)av->offset, rem = i;
-            for (i32 d = (i32)av->shape.rank - 1; d >= 0; d--) {
-                u32 coord = rem % av->shape.dims[d];
-                rem /= av->shape.dims[d];
-                idx += coord * (u32)av->strides[d];
-            }
-            dst_ptr[i] = src[idx];
-        }
-        buf_a = tmp_a;
+        u32 tmp = metal_buf_alloc(n * sizeof(float));
+        metal_contiguify(tmp, n, a, av);
+        buf_a_id = tmp;
     }
-
     if (!bv->contiguous) {
         u32 n = K * N;
-        tmp_b = [mtl_dev newBufferWithLength:n * sizeof(float) options:MTLResourceStorageModeShared];
-        float *src = (float *)buf_b.contents;
-        float *dst_ptr = (float *)tmp_b.contents;
-        for (u32 i = 0; i < n; i++) {
-            u32 idx = (u32)bv->offset, rem = i;
-            for (i32 d = (i32)bv->shape.rank - 1; d >= 0; d--) {
-                u32 coord = rem % bv->shape.dims[d];
-                rem /= bv->shape.dims[d];
-                idx += coord * (u32)bv->strides[d];
-            }
-            dst_ptr[i] = src[idx];
-        }
-        buf_b = tmp_b;
+        u32 tmp = metal_buf_alloc(n * sizeof(float));
+        metal_contiguify(tmp, n, b, bv);
+        buf_b_id = tmp;
     }
 
+    // End compute encoder (MPS needs its own encoding), keep command buffer
+    if (batch_encoder) {
+        [batch_encoder endEncoding];
+        batch_encoder = nil;
+    }
+
+    // Ensure we have a command buffer
+    if (!batch_cmd) batch_cmd = [mtl_queue commandBuffer];
+
+    // Encode MPS matmul on the SAME command buffer — no commit, no wait
     MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
         matrixDescriptorWithRows:M columns:K rowBytes:K*sizeof(float)
         dataType:MPSDataTypeFloat32];
@@ -101,8 +87,8 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
         matrixDescriptorWithRows:M columns:N rowBytes:N*sizeof(float)
         dataType:MPSDataTypeFloat32];
 
-    MPSMatrix *matA = [[MPSMatrix alloc] initWithBuffer:buf_a descriptor:descA];
-    MPSMatrix *matB = [[MPSMatrix alloc] initWithBuffer:buf_b descriptor:descB];
+    MPSMatrix *matA = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[buf_a_id] descriptor:descA];
+    MPSMatrix *matB = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[buf_b_id] descriptor:descB];
     MPSMatrix *matC = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[dst] descriptor:descC];
 
     MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
@@ -110,18 +96,10 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
         resultRows:M resultColumns:N interiorColumns:K
         alpha:1.0 beta:0.0];
 
-    id<MTLCommandBuffer> cmd = [mtl_queue commandBuffer];
-    [mm encodeToCommandBuffer:cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
-    [cmd commit];
+    [mm encodeToCommandBuffer:batch_cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
+    batch_dirty = 1;
+    // Next dispatch_1d will lazily create a new compute encoder via get_encoder()
 
-    if (!batch_active) {
-        [cmd waitUntilCompleted];
-    } else {
-        [cmd waitUntilCompleted];
-    }
-
-    tmp_a = nil;
-    tmp_b = nil;
     thvm_prof_record(UOP_MM, t0);
 }
 

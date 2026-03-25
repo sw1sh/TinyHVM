@@ -188,31 +188,30 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         u32 id = tensor_create(ctx, ns, m->dtype);
 
         if (ctx->backend) {
-            u32 dsz = dtype_size(m->dtype);
-            // Zero the new buffer
-            f32 *tmp = calloc(new_numel, dsz);
-            // Copy old data at offset
-            f32 *src = malloc(old_v.numel * dsz);
-            ctx->backend->buf_read(m->buf_id, src, old_v.numel * dsz);
-
-            // Copy element by element respecting padding offset
-            for (u32 flat = 0; flat < old_v.numel; flat++) {
-                u32 coords[MAX_DIM], rem = flat;
-                for (int d = (int)ndim - 1; d >= 0; d--) {
-                    coords[d] = rem % old_v.shape.dims[d];
-                    rem /= old_v.shape.dims[d];
+            // GPU path: zero-fill output, then dispatch a copy with offset
+            #ifdef __APPLE__
+            // TODO: GPU PAD via codegen (ShapeTracker mask). For now CPU.
+            #endif
+            {
+                u32 dsz = dtype_size(m->dtype);
+                f32 *tmp = calloc(new_numel, dsz);
+                f32 *src = malloc(old_v.numel * dsz);
+                ctx->backend->buf_read(m->buf_id, src, old_v.numel * dsz);
+                for (u32 flat = 0; flat < old_v.numel; flat++) {
+                    u32 coords[MAX_DIM], rem = flat;
+                    for (int d = (int)ndim - 1; d >= 0; d--) {
+                        coords[d] = rem % old_v.shape.dims[d]; rem /= old_v.shape.dims[d];
+                    }
+                    u32 dst_flat = 0, dst_stride = 1;
+                    for (int d = (int)ndim - 1; d >= 0; d--) {
+                        dst_flat += (coords[d] + pairs[d*2]) * dst_stride;
+                        dst_stride *= new_dims[d];
+                    }
+                    tmp[dst_flat] = src[flat];
                 }
-                // Compute destination flat index
-                u32 dst_flat = 0, dst_stride = 1;
-                for (int d = (int)ndim - 1; d >= 0; d--) {
-                    dst_flat += (coords[d] + pairs[d*2]) * dst_stride;
-                    dst_stride *= new_dims[d];
-                }
-                tmp[dst_flat] = src[flat];
+                ctx->backend->buf_write(ctx->tensors[id].buf_id, tmp, new_numel * dsz);
+                free(src); free(tmp);
             }
-
-            ctx->backend->buf_write(ctx->tensors[id].buf_id, tmp, new_numel * dsz);
-            free(src); free(tmp);
         }
 
         ctx->tensors[id].creator_op = UOP_PAD;

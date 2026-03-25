@@ -527,3 +527,35 @@ kernel void mul_reduce_sum(device float *dst [[buffer(0)]],
     }
     dst[i] = acc;
 }
+
+// ============================================================
+// PAD: zero-pad a tensor (thread per OUTPUT element)
+// ============================================================
+
+kernel void pad_kernel(device float *dst [[buffer(0)]],
+                       device const float *src [[buffer(1)]],
+                       constant ViewParams &sv [[buffer(2)]],
+                       constant int *pad_before [[buffer(3)]],
+                       constant uint *src_shape [[buffer(4)]],
+                       constant uint *dst_shape [[buffer(5)]],
+                       constant uint &rank [[buffer(6)]],
+                       constant uint &dst_numel [[buffer(7)]],
+                       uint gid [[thread_position_in_grid]]) {
+    if (gid >= dst_numel) return;
+    // Decompose gid into dst coordinates
+    uint coords[8], rem = gid;
+    for (int d = int(rank) - 1; d >= 0; d--) {
+        coords[d] = rem % dst_shape[d];
+        rem /= dst_shape[d];
+    }
+    // Check if inside source region
+    uint src_idx = 0, src_stride = 1;
+    bool inside = true;
+    for (int d = int(rank) - 1; d >= 0; d--) {
+        int sc = int(coords[d]) - pad_before[d];
+        if (sc < 0 || uint(sc) >= src_shape[d]) { inside = false; break; }
+        src_idx += uint(sc) * src_stride;
+        src_stride *= src_shape[d];
+    }
+    dst[gid] = inside ? src[src_idx] : 0.0f;
+}

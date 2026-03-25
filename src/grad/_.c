@@ -209,7 +209,7 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
             u32 bc_shape[MAX_DIM], bc_ndim;
             int bc_ok = view_broadcast(&ctx->tensors[gy_id].view, &mb->view,
                                        &av_bc, &bv_bc, bc_shape, &bc_ndim);
-            if (0) { // disable fused MUL backward
+            if (bc_ok && bc_ndim == my->view.shape.rank) { // fused MUL backward
                 // Compute reduce axes for d_a: dims where a was broadcast
                 u32 da_rdims[MAX_DIM], da_rstrides_gy[MAX_DIM], da_rstrides_b[MAX_DIM];
                 u32 da_n = 0;
@@ -379,10 +379,45 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
             break;
         }
         case UOP_EXPAND: {
-            // EXPAND backward = sum over broadcast axes to undo the expansion.
-            // TODO: use GPU mul_reduce_sum to avoid CPU multi-axis SUM (slow for large tensors)
-            Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
-            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
+            // EXPAND backward = sum over broadcast axes.
+            // Use mul_reduce_sum(gy, ones=1, axes) on GPU to avoid CPU multi-axis SUM.
+            u32 rn_e = 0;
+            u32 rdims_e[MAX_DIM], rstrides_gy_e[MAX_DIM], rstrides_ones_e[MAX_DIM];
+            View gy_v_e = ctx->tensors[gy_id].view;
+            for (u32 d = 0; d < my->view.shape.rank; d++) {
+                if (d < ma->view.shape.rank && my->view.shape.dims[d] != ma->view.shape.dims[d]) {
+                    rdims_e[rn_e] = my->view.shape.dims[d];
+                    rstrides_gy_e[rn_e] = (u32)(d < gy_v_e.shape.rank && gy_v_e.strides[d] > 0 ? gy_v_e.strides[d] : 0);
+                    rstrides_ones_e[rn_e] = 0;
+                    rn_e++;
+                }
+            }
+            if (rn_e > 0) {
+                #ifdef __APPLE__
+                if (ctx->backend == &metal_backend) {
+                    f32 one_val = 1.0f;
+                    u32 ones_buf = ctx->backend->buf_alloc(sizeof(f32));
+                    ctx->backend->buf_write(ones_buf, &one_val, sizeof(f32));
+                    View ones_v = ctx->tensors[gy_id].view;  // same rank as gy
+                    for (u32 d2=0; d2<ones_v.shape.rank; d2++) ones_v.strides[d2] = 0;
+                    ones_v.offset = 0; ones_v.contiguous = 0;
+                    u32 da_id = tensor_create(ctx, ma->view.shape, DTYPE_F32);
+                    View da_ov = view_create(ma->view.shape);
+                    metal_mul_reduce_sum(
+                        ctx->tensors[da_id].buf_id, ma->view.numel,
+                        ctx->tensors[gy_id].buf_id, &gy_v_e,
+                        ones_buf, &ones_v,
+                        &da_ov, rn_e, rdims_e, rstrides_gy_e, rstrides_ones_e);
+                    grad_accum(ctx, ga, aid, da_id);
+                } else
+                #endif
+                {
+                    Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
+                    grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
+                }
+            } else {
+                grad_accum(ctx, ga, aid, gy_id);
+            }
             break;
         }
         case UOP_PERMUTE: {

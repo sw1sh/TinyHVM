@@ -20,7 +20,7 @@ static id<MTLComputePipelineState> pipe_bias_add, pipe_col_sum;
 static id<MTLComputePipelineState> pipe_adam_step;
 static id<MTLComputePipelineState> pipe_maxpool2d_fwd, pipe_maxpool2d_bwd;
 static id<MTLComputePipelineState> pipe_relu_bwd;
-static id<MTLComputePipelineState> pipe_matrix_transpose, pipe_zero_fill;
+static id<MTLComputePipelineState> pipe_matrix_transpose, pipe_zero_fill, pipe_pad;
 
 // Buffer pool
 static struct {
@@ -129,7 +129,7 @@ static int metal_init(void) {
     pipe_relu_bwd = make_pipe(@"relu_bwd");
     pipe_matrix_transpose = make_pipe(@"matrix_transpose");
     pipe_zero_fill = make_pipe(@"zero_fill");
-    pipe_reduce_sum = make_pipe(@"reduce_sum");
+    pipe_pad = make_pipe(@"pad_kernel");    pipe_reduce_sum = make_pipe(@"reduce_sum");
     pipe_reduce_max = make_pipe(@"reduce_max");
     pipe_mul_reduce_sum = make_pipe(@"mul_reduce_sum");
 

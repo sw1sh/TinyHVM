@@ -38,7 +38,5 @@ static void metal_begin_batch(void) {
 }
 
 static void metal_end_batch(void) {
-    // DON'T flush here — GPU work continues into reduce/backward.
-    // Only flush when we actually need to read results (buf_read).
     batch_active = 0;
 }

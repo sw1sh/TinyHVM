@@ -10,7 +10,8 @@
       "WebFetch(domain:www.chatbench.org)",
       "WebFetch(domain:ai-benchmark.com)",
       "WebFetch(domain:gimletlabs.ai)",
-      "WebFetch(domain:arxiv.org)"
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:medium.com)"
     ]
   }
 }

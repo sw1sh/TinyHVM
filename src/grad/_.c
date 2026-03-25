@@ -17,6 +17,115 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
 // Each tensor is visited ONCE. Gradients accumulate via ADD.
 // No REACHES DFS, no per-parameter traversal.
 
+static u32 reduce_id(TinyHVM *ctx, Term t);// ============================================================
+// Elementwise fusion: walk lazy TAG_TOP tree, fuse into one kernel
+// ============================================================
+
+static int is_elementwise(u32 uop) {
+    return uop==UOP_ADD||uop==UOP_SUB||uop==UOP_MUL||uop==UOP_DIV||
+           uop==UOP_MAX||uop==UOP_CMP||uop==UOP_NEG||uop==UOP_RELU||
+           uop==UOP_EXP||uop==UOP_LOG||uop==UOP_SQRT;
+}
+static int is_binary(u32 uop) {
+    return uop==UOP_ADD||uop==UOP_SUB||uop==UOP_MUL||uop==UOP_DIV||
+           uop==UOP_MAX||uop==UOP_CMP;
+}
+
+#define FUSE_MAX_OPS 32
+#define FUSE_MAX_LEAVES 16
+
+// Walk a lazy TAG_TOP tree, collecting ops and leaves.
+// Returns number of ops collected, or 0 if not fusable.
+static u32 fuse_walk(TinyHVM *ctx, Term t,
+                     FusedOp *ops, u32 *n_ops,
+                     u32 *leaf_ids, const View **leaf_views, u32 *n_leaves) {
+    if (term_tag(t) == TAG_TEN) {
+        // Leaf: already realized tensor
+        u32 tid = (u32)term_val(t);
+        // Check if already in leaves
+        for (u32 i = 0; i < *n_leaves; i++)
+            if (leaf_ids[i] == tid) return i;
+        if (*n_leaves >= FUSE_MAX_LEAVES) return ~0u;
+        u32 idx = (*n_leaves)++;
+        leaf_ids[idx] = tid;
+        leaf_views[idx] = &ctx->tensors[tid].view;
+        return idx;
+    }
+    if (term_tag(t) != TAG_TOP) return ~0u;
+    u32 uop = term_ext(t);
+    if (!is_elementwise(uop)) return ~0u;
+    if (*n_ops >= FUSE_MAX_OPS) return ~0u;
+
+    u64 loc = term_val(t);
+    Term a = heap_read(ctx, loc);
+    Term b = heap_read(ctx, loc + 1);
+
+    u32 arg_a = fuse_walk(ctx, a, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+    if (arg_a == ~0u) return ~0u;
+    u32 arg_b = 0;
+    if (is_binary(uop)) {
+        arg_b = fuse_walk(ctx, b, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+        if (arg_b == ~0u) return ~0u;
+    }
+
+    u32 op_idx = (*n_ops)++;
+    ops[op_idx] = (FusedOp){ .uop = uop, .arg_a = arg_a, .arg_b = arg_b };
+    return *n_leaves + op_idx;  // temp var index
+}
+
+// Try to fuse a lazy term into a single kernel. Returns tensor id, or ~0u if not fusable.
+static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
+    // Only try fusion for TAG_TOP elementwise ops
+    if (term_tag(t) != TAG_TOP || !is_elementwise(term_ext(t))) {
+        return reduce_id(ctx, t);
+    }
+
+    FusedOp ops[FUSE_MAX_OPS];
+    u32 n_ops = 0;
+    u32 leaf_ids[FUSE_MAX_LEAVES];
+    const View *leaf_views[FUSE_MAX_LEAVES];
+    u32 n_leaves = 0;
+
+    u32 result_idx = fuse_walk(ctx, t, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
+    if (1 || result_idx == ~0u || n_ops < 2) {
+        // Not fusable or too simple — fall back to normal reduce
+        return reduce_id(ctx, t);
+    }
+
+    // Determine output shape: broadcast of all leaf shapes
+    // For elementwise ops, the output shape is the broadcast of all inputs.
+    // Use the first leaf's shape as base, broadcast with others.
+    View out_view = *leaf_views[0];
+    for (u32 i = 1; i < n_leaves; i++) {
+        View av_bc, bv_bc;
+        u32 bc_shape[MAX_DIM], bc_ndim;
+        if (!view_broadcast(&out_view, leaf_views[i], &av_bc, &bv_bc, bc_shape, &bc_ndim)) {
+            return reduce_id(ctx, t);  // broadcast fail, fall back
+        }
+        out_view = view_create(shape_of(bc_shape, bc_ndim));
+    }
+    u32 out_numel = out_view.numel;
+
+    // Allocate output tensor
+    u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
+
+    // Dispatch fused kernel
+    #ifdef __APPLE__
+    if (ctx->backend == &metal_backend) {
+        u32 bufs[FUSE_MAX_LEAVES];
+        for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
+        metal_dispatch_fused_v2(ctx->tensors[dst_id].buf_id, out_numel,
+                                  bufs, leaf_views, n_leaves, ops, n_ops);
+    } else
+    #endif
+    {
+        // CPU fallback: just reduce normally
+        return reduce_id(ctx, t);
+    }
+
+    return dst_id;
+}
+
 // Helper: reduce a lazy Term to TAG_TEN, return tensor id. Returns ~0u on failure.
 static u32 reduce_id(TinyHVM *ctx, Term t) {
     t = thvm_reduce(ctx, t);
@@ -32,7 +141,7 @@ static void grad_accum(TinyHVM *ctx, u32 *ga, u32 target, u32 grad_id) {
         Term sum = thvm_op(ctx, UOP_ADD,
             term_ten(ga[target], DTYPE_F32),
             term_ten(grad_id, DTYPE_F32));
-        u32 result = reduce_id(ctx, sum);
+        u32 result = fuse_or_reduce(ctx, sum);
         if (result != ~0u) ga[target] = result;
     }
 }
@@ -58,20 +167,20 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
     switch (cop) {
         case UOP_ADD: {
             Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             if (mb) {
                 Term db = sum_to_shape(ctx, gy, my->view.shape, mb->view.shape);
-                grad_accum(ctx, ga, bid, reduce_id(ctx, db));
+                grad_accum(ctx, ga, bid, fuse_or_reduce(ctx, db));
             }
             break;
         }
         case UOP_SUB: {
             Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             if (mb) {
                 Term neg = thvm_op(ctx, UOP_NEG,
                     sum_to_shape(ctx, gy, my->view.shape, mb->view.shape), term_era());
-                grad_accum(ctx, ga, bid, reduce_id(ctx, neg));
+                grad_accum(ctx, ga, bid, fuse_or_reduce(ctx, neg));
             }
             break;
         }
@@ -112,12 +221,12 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
                     {
                         Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt),
                                                my->view.shape, ma->view.shape);
-                        da_id = reduce_id(ctx, da);
+                        da_id = fuse_or_reduce(ctx, da);
                     }
                     grad_accum(ctx, ga, aid, da_id);
                 } else {
                     Term da = thvm_op(ctx, UOP_MUL, gy, bt);
-                    grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+                    grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
                 }
                 // d_b
                 if (mb) {
@@ -146,23 +255,23 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
                         {
                             Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at),
                                                    my->view.shape, mb->view.shape);
-                            db_id = reduce_id(ctx, db);
+                            db_id = fuse_or_reduce(ctx, db);
                         }
                         grad_accum(ctx, ga, bid, db_id);
                     } else {
                         Term db = thvm_op(ctx, UOP_MUL, gy, at);
-                        grad_accum(ctx, ga, bid, reduce_id(ctx, db));
+                        grad_accum(ctx, ga, bid, fuse_or_reduce(ctx, db));
                     }
                 }
             } else {
                 // Fallback: non-fusable
                 Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt),
                                        my->view.shape, ma->view.shape);
-                grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+                grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
                 if (mb) {
                     Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at),
                                            my->view.shape, mb->view.shape);
-                    grad_accum(ctx, ga, bid, reduce_id(ctx, db));
+                    grad_accum(ctx, ga, bid, fuse_or_reduce(ctx, db));
                 }
             }
             break;
@@ -170,68 +279,68 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
         case UOP_MM: {
             u32 bt_id = tensor_transpose_2d(ctx, bid);
             Term da = thvm_op(ctx, UOP_MM, gy, term_ten(bt_id, mb->dtype));
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             u32 at_id = tensor_transpose_2d(ctx, aid);
             Term db = thvm_op(ctx, UOP_MM, term_ten(at_id, ma->dtype), gy);
-            grad_accum(ctx, ga, bid, reduce_id(ctx, db));
+            grad_accum(ctx, ga, bid, fuse_or_reduce(ctx, db));
             break;
         }
         case UOP_RELU: {
             f32 z = 0.0f;
             Term mask = thvm_op(ctx, UOP_CMP, at, thvm_tensor(ctx, &z, SHAPE(1)));
             Term da = thvm_op(ctx, UOP_MUL, gy, mask);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             break;
         }
         case UOP_NEG: {
             Term da = thvm_op(ctx, UOP_NEG, gy, term_era());
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             break;
         }
         case UOP_EXP: {
             Term da = thvm_op(ctx, UOP_MUL, gy, y);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             break;
         }
         case UOP_LOG: {
             Term da = thvm_op(ctx, UOP_DIV, gy, at);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             break;
         }
         case UOP_SQRT: {
             f32 two = 2.0f;
             Term denom = thvm_op(ctx, UOP_MUL, thvm_tensor(ctx, &two, SHAPE(1)), y);
             Term da = thvm_op(ctx, UOP_DIV, gy, denom);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             break;
         }
         case UOP_DIV: {
             Term da = thvm_op(ctx, UOP_DIV, gy, bt);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             Term ng = thvm_op(ctx, UOP_NEG, gy, term_era());
             Term db = thvm_op(ctx, UOP_DIV,
                 thvm_op(ctx, UOP_MUL, ng, at),
                 thvm_op(ctx, UOP_MUL, bt, bt));
-            grad_accum(ctx, ga, bid, reduce_id(ctx, db));
+            grad_accum(ctx, ga, bid, fuse_or_reduce(ctx, db));
             break;
         }
         case UOP_MAX: {
             Term mask = thvm_op(ctx, UOP_CMP, at, bt);
             Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, mask),
                                    my->view.shape, ma->view.shape);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             f32 one = 1.0f;
             Term inv = thvm_op(ctx, UOP_SUB, thvm_tensor(ctx, &one, SHAPE(1)), mask);
             Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, inv),
                                    my->view.shape, mb->view.shape);
-            grad_accum(ctx, ga, bid, reduce_id(ctx, db));
+            grad_accum(ctx, ga, bid, fuse_or_reduce(ctx, db));
             break;
         }
         case UOP_CMP:
             break;  // CMP has zero gradient (step function)
         case UOP_SUM: {
             Term g = thvm_expand(ctx, term_ten(gy_id, DTYPE_F32), ma->view.shape);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, g));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, g));
             break;
         }
         case UOP_RMAX: {
@@ -243,19 +352,19 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
                 thvm_op(ctx, UOP_CMP, max_bc, at));
             Term gbc = thvm_expand(ctx, term_ten(gy_id, DTYPE_F32), ma->view.shape);
             Term da = thvm_op(ctx, UOP_MUL, gbc, mask);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             break;
         }
         case UOP_RESHAPE: {
             Term da = thvm_reshape(ctx, gy, ma->view.shape);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             break;
         }
         case UOP_EXPAND: {
             // EXPAND backward = sum over broadcast axes to undo the expansion.
             // TODO: use GPU mul_reduce_sum to avoid CPU multi-axis SUM (slow for large tensors)
             Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             break;
         }
         case UOP_PERMUTE: {
@@ -266,7 +375,7 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
             for (u32 j = 0; j < rank; j++) inv[(u32)af[j]] = j;
             free(af);
             Term da = thvm_permute(ctx, gy, inv, rank);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             break;
         }
         case UOP_PAD: {
@@ -278,7 +387,7 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
             for (u32 j=0;j<nd;j++){sp[j*2]=(u32)pf[j*2];sp[j*2+1]=(u32)pf[j*2]+ma->view.shape.dims[j];}
             free(pf);
             Term da = thvm_shrink(ctx, gy, sp, nd);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             break;
         }
         case UOP_SHRINK: {
@@ -290,7 +399,7 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
             for (u32 j=0;j<nd;j++){pp[j*2]=(u32)sf[j*2];pp[j*2+1]=ma->view.shape.dims[j]-(u32)sf[j*2+1];}
             free(sf);
             Term da = thvm_pad(ctx, gy, pp, nd);
-            grad_accum(ctx, ga, aid, reduce_id(ctx, da));
+            grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
             break;
         }
         case UOP_FUSING: {
@@ -385,7 +494,7 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
                     Term da_lazy = sum_to_shape(ctx,
                         thvm_op(ctx, UOP_MUL, term_ten(gy_exp_id, DTYPE_F32), term_ten(mb_id, DTYPE_F32)),
                         bc_s, fa->view.shape);
-                    da_id = reduce_id(ctx, da_lazy);
+                    da_id = fuse_or_reduce(ctx, da_lazy);
                 }
                 grad_accum(ctx, ga, ma_id, da_id);
             }
@@ -421,7 +530,7 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
                     Term db_lazy = sum_to_shape(ctx,
                         thvm_op(ctx, UOP_MUL, term_ten(gy_exp_id, DTYPE_F32), term_ten(ma_id, DTYPE_F32)),
                         bc_s, fb->view.shape);
-                    db_id = reduce_id(ctx, db_lazy);
+                    db_id = fuse_or_reduce(ctx, db_lazy);
                 }
                 grad_accum(ctx, ga, mb_id, db_id);
             }
@@ -453,7 +562,15 @@ void thvm_backward(TinyHVM *ctx, Term loss, Term *params, Term *grads, u32 n_par
     for (u32 i = loss_id; i > 0; i--) {
         if (!ga[i]) continue;
         if (!ctx->tensors[i].creator_op) continue;
+        clock_t _c0 = clock();
         backward_local(ctx, i, ga[i], ga);
+        clock_t _c1 = clock();
+        f32 _ms = 1000.0f*(f32)(_c1-_c0)/(f32)CLOCKS_PER_SEC;
+        if (_ms > 20.0f)
+            fprintf(stderr, "SLOW bw[%u] cop=%u %.0fms shape=[%u,%u,%u,%u]\n",
+                i, ctx->tensors[i].creator_op, _ms,
+                ctx->tensors[i].view.shape.dims[0], ctx->tensors[i].view.shape.dims[1],
+                ctx->tensors[i].view.shape.dims[2], ctx->tensors[i].view.shape.dims[3]);
     }
 
     // Extract gradients for requested parameters

@@ -1,6 +1,8 @@
-# Engineering Patterns: Lessons from ggml and tinygrad
+# Engineering Patterns: Lessons from ggml, tinygrad, and C-ML
 
-Reference doc for TinyHVM development. Studied from source: `/Users/swish/src/ggml`.
+Reference doc for TinyHVM development. Studied from source:
+- ggml: `/Users/swish/src/ggml`
+- C-ML: `https://github.com/jaywyawhare/C-ML` (cloned 2026-03-25)
 
 ---
 
@@ -128,7 +130,115 @@ We already do (1), (2), and (3) — our `View` struct is basically ShapeTracker.
 
 ---
 
-## 5. Concrete Action Items for TinyHVM
+## 5. C-ML Architecture
+
+C-ML (`github.com/jaywyawhare/C-ML`) is a pure-C ML framework: ~117K lines across 216 source files and 180+ headers. Zero external dependencies. Covers tensors, autograd, IR compilation, multi-backend execution, 28 NN layers, 9 optimizers, and pre-built model zoo (ResNet, ViT, BERT, GPT-2, YOLO).
+
+### Pipeline: Lazy IR with tensor facades
+
+```
+Tensor API → IRNode graph (lazy) → Optimize → Fuse → Schedule → Codegen → Execute
+```
+
+Tensors are thin facades over IR nodes. Operations build a graph — no computation happens until `tensor_data_ptr()` or `tensor_ensure_executed()` forces materialization:
+
+```c
+struct Tensor {
+    int* shape;
+    int ndim;
+    DType dtype;                // 16+ types: f32, f16, bf16, fp8, int8, ...
+    DeviceType device;          // CPU/CUDA/Metal/ROCm/OpenCL/Vulkan/WebGPU
+    struct IRNode* ir_node;     // Lazy: points to computation graph node
+    bool is_executed;           // False until materialized
+    void* data;                 // NULL until executed
+    bool requires_grad;
+    struct Tensor* grad;        // Also lazy
+    int ref_count;
+    struct Tensor* base;        // View source
+    size_t* strides;
+    size_t storage_offset;
+};
+```
+
+This is the same lazy pattern as tinygrad, but in C with explicit IR nodes rather than Python lazy buffers.
+
+### What TinyHVM should study
+
+**✅ Module/Parameter abstraction.** C-ML wraps every trainable weight in a `Parameter` struct and groups them under `Module`:
+
+```c
+struct Module {
+    char* name;
+    ForwardFn forward;       // Function pointer
+    FreeFn free;
+    Parameter** parameters;  // Collected for optimizer
+    int num_parameters;
+    bool training;           // Training vs eval mode
+};
+
+struct Parameter {
+    Tensor* tensor;
+    bool requires_grad;
+    char* name;
+};
+```
+
+This enables `module_collect_parameters()` → hand to optimizer → `optim_step()` updates all at once. Our current approach passes tensors directly. As we add more layers (BN, conv, etc.), a thin module wrapper would help organize parameter management and training/eval mode switching.
+
+**✅ Loss functions as UOp compositions.** C-ML builds all 13+ loss functions from primitives:
+
+```c
+Tensor* tensor_mse_loss(Tensor* input, Tensor* target) {
+    Tensor* diff = uop_sub(input, target);
+    Tensor* squared = uop_mul(diff, diff);
+    return uop_mean(squared, &reduce_params);
+}
+```
+
+We already do this — our cross-entropy loss composes from log, exp, reduce_sum. Confirms we're on the right track. Key losses to have: MSE, cross-entropy, NLL, BCE.
+
+**✅ Timeline memory planner.** C-ML tracks tensor allocation/deallocation timestamps across the computation graph, then computes minimum peak memory and reuses freed blocks for later tensors. This is the smart version of our "two pools" idea from the ggml study:
+
+```
+Instead of:  allocate/free per tensor (fragmentation, overhead)
+Do:          scan graph → compute lifetimes → assign offsets into pre-allocated pool
+```
+
+**✅ Plugin fusion patterns.** C-ML has a registerable fusion system:
+
+```c
+struct FusionPattern {
+    const char* name;
+    FusionTarget target;     // Which backend
+    int priority;
+    FusionMatchFn match;     // Does this pattern apply?
+    FusionEmitFn emit;       // Emit fused code
+};
+```
+
+Users register patterns like MatMul+Bias+ReLU or Conv+BN+ReLU. The optimizer walks the IR graph matching patterns by priority. This is cleaner than hand-fusing in the backend — and something we should consider when we add kernel fusion.
+
+**✅ LR schedulers.** C-ML has 7 schedulers (StepLR, CosineAnnealing, OneCycle, ReduceOnPlateau, etc.). We'll need at least `StepLR` and `CosineAnnealing` for real training runs. These are simple to implement — just a function that takes (base_lr, step, config) → current_lr.
+
+**✅ Reference counting on tensors.** C-ML tracks `ref_count` on each tensor for safe sharing across views and gradient chains. Our current approach frees buffers in `thvm_reduce()` which works for now, but as we support more complex graphs (e.g., skip connections sharing tensors), ref counting prevents use-after-free.
+
+### Pattern comparison: three approaches to the same problem
+
+| Concern | ggml | tinygrad | C-ML | TinyHVM |
+|---------|------|----------|------|---------|
+| Graph repr | tensor.src[] | LazyBuffer | IRNode | IC heap |
+| Lazy eval | No (eager) | Yes (realize) | Yes (ensure_executed) | Yes (thvm_reduce) |
+| Fusion | Backend-level | Scheduler | Plugin registry | Not yet |
+| Memory | Static alloc | Lazy alloc | TLSF + timeline | Per-op alloc |
+| Shaders | One giant file | Codegen per kernel | Codegen per target | Separate functions |
+| Tensor rank | Fixed 4D | Variable | Variable | Variable (max 8) |
+| Total LoC | ~250K | ~8K | ~117K | ~3K |
+
+Key insight: **all three converge on the same core ideas** (lazy graphs, composed ops, view/stride tricks, batched execution). The differences are in scale and where they put complexity. ggml puts it in the backend, tinygrad puts it in the scheduler, C-ML puts it in the IR compiler. TinyHVM should keep complexity in the IC reduction layer — that's our unique advantage.
+
+---
+
+## 6. Concrete Action Items for TinyHVM
 
 ### Immediate (before MNIST)
 - [ ] **Batch Metal command buffers**: Accumulate ops, one `commit` per `thvm_reduce()`
@@ -138,16 +248,28 @@ We already do (1), (2), and (3) — our `View` struct is basically ShapeTracker.
 - [ ] **Graph-level backend interface**: Replace per-op dispatch with `graph_compute(cgraph)`
 - [ ] **Fixed 4D tensors**: Simplify shaders, match ggml convention
 - [ ] **Kernel arg structs**: Per-op structs shared between host and Metal shaders
+- [ ] **Module/Parameter wrapper**: Thin struct to group layer params, collect for optimizer, toggle train/eval
+- [ ] **Ref counting on tensors**: Prevent use-after-free in complex graphs (skip connections, weight sharing)
 
 ### Long-term
 - [ ] **Metal function constants**: One generic unary/binary kernel, specialized via constants
-- [ ] **Static memory allocation**: Pre-compute buffer sizes from the graph, two pools (weights + activations)
+- [ ] **Timeline memory planner**: Scan graph for tensor lifetimes, pre-allocate one pool, assign offsets (study C-ML's TLSF approach)
+- [ ] **Fusion pattern registry**: Registerable match/emit functions for common patterns (MatMul+Bias+ReLU, Conv+BN)
+- [ ] **LR schedulers**: At minimum StepLR and CosineAnnealing
 - [ ] **Quantization support**: ggml has 30+ quant types — we need at least f16
 
 ---
 
-## 6. What NOT to Copy from ggml
+## 7. What NOT to Copy
 
+### From ggml
 - **Op count bloat**: ggml has 80+ ops, many ML-specific (ROPE, flash attention, SSM). We should keep our op set minimal and compose.
 - **428KB shader file**: ggml-metal.metal is enormous because every op × every quant type = separate kernel. We should aim for generic kernels.
-- **Complexity**: ggml is 250K+ lines of core C. Their Metal backend alone is 800K+ lines across 13 files. We're at ~700 lines total for the whole framework. Keep it small.
+- **Complexity**: ggml is 250K+ lines of core C. Their Metal backend alone is 800K+ lines across 13 files. We're at ~3K lines total. Keep it small.
+
+### From C-ML
+- **200+ UOps when 30 suffice**: C-ML has separate UOps for RELU6, HARD_SIGMOID, CELU, SELU, LOGSIGMOID, etc. These all compose trivially from base ops (e.g., `relu6(x) = min(max(x, 0), 6)`). Adding dedicated ops for each activation defeats the point of a composable op set.
+- **117K lines for a from-scratch framework**: C-ML has massive abstraction surface area (distributed training, 7 backends, model zoo) before any single path is rock-solid. Build depth before breadth.
+- **IR compiler before the basics work**: C-ML has codegen targets for CUDA PTX, SPIRV, WGSL, Metal, OpenCL, LLVM JIT — but the simpler path is to make one backend excellent first. We should make Metal fast and correct before thinking about multi-target codegen.
+- **Heavyweight autograd engine**: C-ML's autograd has mutex locks, anomaly detection, nested gradient support. We should keep backward pass simple — tape-based or adjoint on the IC graph — until we actually need higher-order derivatives.
+- **Pre-built model zoo**: ResNet, ViT, BERT, GPT-2, YOLO baked into the framework. Models should live in user code, not the framework. Keep the core generic.

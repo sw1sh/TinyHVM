@@ -62,6 +62,10 @@ extern void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
                                  const u32 *reduce_dims,
                                  const u32 *reduce_strides_a,
                                  const u32 *reduce_strides_b);
+typedef struct { u32 uop; u32 arg_a; u32 arg_b; } FusedOp;
+extern void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
+                                     u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+                                     FusedOp *ops, u32 n_ops);
 extern Backend metal_backend;
 #endif
 

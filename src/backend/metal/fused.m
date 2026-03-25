@@ -1,4 +1,4 @@
-// metal/fused.m — Fused MUL+SUM and runtime kernel codegen
+// metal/fused.m — Fused kernel dispatch: MUL+SUM, and general elementwise+reduce JIT
 
 typedef struct {
     uint32_t n_reduce;
@@ -29,7 +29,6 @@ void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
         rp.reduce_strides_b[i] = reduce_strides_b[i];
         rp.reduce_numel *= reduce_dims[i];
     }
-
     id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a_buf], metal_pool.bufs[b_buf] };
     const void *params[] = { &avp, &bvp, &ovp, &rp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams), sizeof(ViewParams), sizeof(MulReduceParams) };
@@ -37,24 +36,150 @@ void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
     thvm_prof_record(UOP_SUM, t0);
 }
 
-// Runtime kernel codegen cache
-#define FUSED_CACHE_SIZE 8
+// ============================================================
+// General fused elementwise kernel codegen
+// ============================================================
+//
+// Fuses arbitrary chains of elementwise+optional reduce ops into one kernel.
+// Each op in the chain references inputs by index (leaf buffer or prior temp).
+// Leaf inputs are read via strided indexing (handles broadcast/permute/expand).
+//
+// FusedOp: { uop, arg_a, arg_b }
+//   arg_a/arg_b: 0..n_leaves-1 = leaf buffer, n_leaves+ = temp var from prior op
+//   For unary ops: arg_b is ignored.
 
+// FusedOp defined in tinyhvm.c (before this file is included)
+
+#define FUSED_CACHE_SIZE 64
 static struct {
     u64 key;
     id<MTLComputePipelineState> pipe;
 } fused_cache[FUSED_CACHE_SIZE];
 static u32 fused_cache_count = 0;
 
-static u64 fuse_hash(const u32 *ops, u32 n_ops, int has_reduce) {
+static u64 fuse_hash_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
     u64 h = 0xcbf29ce484222325ULL;
+    h ^= n_leaves; h *= 0x100000001b3ULL;
     for (u32 i = 0; i < n_ops; i++) {
-        h ^= ops[i];
-        h *= 0x100000001b3ULL;
+        h ^= ops[i].uop; h *= 0x100000001b3ULL;
+        h ^= ops[i].arg_a; h *= 0x100000001b3ULL;
+        h ^= ops[i].arg_b; h *= 0x100000001b3ULL;
     }
-    h ^= (u64)has_reduce;
     return h;
 }
+
+// strided_idx: maps flat output index to physical buffer offset using View strides
+static const char *strided_idx_helper =
+    "inline uint strided_idx(uint flat, constant int *strides, constant uint *shape, int offset, uint rank) {\n"
+    "  uint phys = uint(offset);\n"
+    "  for (int d = int(rank) - 1; d >= 0; d--) {\n"
+    "    phys += (flat % shape[d]) * uint(strides[d] > 0 ? strides[d] : 0);\n"
+    "    flat /= shape[d];\n"
+    "  }\n"
+    "  return phys;\n"
+    "}\n";
+
+static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
+    NSMutableString *src = [NSMutableString stringWithCapacity:4096];
+    [src appendString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
+
+    // ViewParams struct (must match C side)
+    [src appendString:@"struct VP { int strides[8]; uint shape[8]; int offset; uint rank; uint numel; };\n"];
+    [src appendFormat:@"%s\n", strided_idx_helper];
+
+    [src appendString:@"kernel void fused_v2(\n"];
+    [src appendString:@"  device float *out [[buffer(0)]],\n"];
+    for (u32 i = 0; i < n_leaves; i++)
+        [src appendFormat:@"  device const float *in%u [[buffer(%u)]],\n", i, i + 1];
+    for (u32 i = 0; i < n_leaves; i++)
+        [src appendFormat:@"  constant VP &v%u [[buffer(%u)]],\n", i, n_leaves + 1 + i];
+    [src appendFormat:@"  constant uint &numel [[buffer(%u)]],\n", 2 * n_leaves + 1];
+    [src appendString:@"  uint gid [[thread_position_in_grid]])\n{\n"];
+    [src appendString:@"  if (gid >= numel) return;\n"];
+
+    // Read leaf inputs
+    for (u32 i = 0; i < n_leaves; i++)
+        [src appendFormat:@"  float t%u = in%u[strided_idx(gid, v%u.strides, v%u.shape, v%u.offset, v%u.rank)];\n",
+            i, i, i, i, i, i];
+
+    // Apply ops
+    for (u32 i = 0; i < n_ops; i++) {
+        u32 tid = n_leaves + i;
+        u32 a = ops[i].arg_a, b = ops[i].arg_b;
+        switch (ops[i].uop) {
+            case UOP_ADD:  [src appendFormat:@"  float t%u = t%u + t%u;\n", tid, a, b]; break;
+            case UOP_SUB:  [src appendFormat:@"  float t%u = t%u - t%u;\n", tid, a, b]; break;
+            case UOP_MUL:  [src appendFormat:@"  float t%u = t%u * t%u;\n", tid, a, b]; break;
+            case UOP_DIV:  [src appendFormat:@"  float t%u = t%u / t%u;\n", tid, a, b]; break;
+            case UOP_MAX:  [src appendFormat:@"  float t%u = max(t%u, t%u);\n", tid, a, b]; break;
+            case UOP_CMP:  [src appendFormat:@"  float t%u = t%u > t%u ? 1.0f : 0.0f;\n", tid, a, b]; break;
+            case UOP_NEG:  [src appendFormat:@"  float t%u = -t%u;\n", tid, a]; break;
+            case UOP_RELU: [src appendFormat:@"  float t%u = max(t%u, 0.0f);\n", tid, a]; break;
+            case UOP_EXP:  [src appendFormat:@"  float t%u = exp(t%u);\n", tid, a]; break;
+            case UOP_LOG:  [src appendFormat:@"  float t%u = log(t%u);\n", tid, a]; break;
+            case UOP_SQRT: [src appendFormat:@"  float t%u = sqrt(t%u);\n", tid, a]; break;
+            default:       [src appendFormat:@"  float t%u = t%u;\n", tid, a]; break;  // passthrough
+        }
+    }
+    [src appendFormat:@"  out[gid] = t%u;\n", n_leaves + n_ops - 1];
+    [src appendString:@"}\n"];
+    return src;
+}
+
+static id<MTLComputePipelineState> get_fused_pipe_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
+    u64 key = fuse_hash_v2(ops, n_ops, n_leaves);
+    for (u32 i = 0; i < fused_cache_count && i < FUSED_CACHE_SIZE; i++)
+        if (fused_cache[i].key == key) return fused_cache[i].pipe;
+
+    NSString *src = codegen_fused_v2(ops, n_ops, n_leaves);
+    NSError *err = nil;
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:opts error:&err];
+    if (!lib) { NSLog(@"TinyHVM fused v2 codegen error: %@\n%@", err, src); return nil; }
+    id<MTLFunction> fn = [lib newFunctionWithName:@"fused_v2"];
+    id<MTLComputePipelineState> pipe = [mtl_dev newComputePipelineStateWithFunction:fn error:&err];
+    if (!pipe) { NSLog(@"TinyHVM fused v2 pipeline: %@", err); return nil; }
+
+    u32 slot = fused_cache_count < FUSED_CACHE_SIZE ?
+               fused_cache_count++ : ((fused_cache_count++) % FUSED_CACHE_SIZE);
+    fused_cache[slot].key = key;
+    fused_cache[slot].pipe = pipe;
+    return pipe;
+}
+
+// Dispatch a fused elementwise kernel.
+// leaf_bufs: buffer IDs for leaf inputs. leaf_views: View pointers for each.
+// ops: the fused op chain. Result goes to out_buf.
+void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
+                               u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+                               FusedOp *ops, u32 n_ops) {
+    id<MTLComputePipelineState> pipe = get_fused_pipe_v2(ops, n_ops, n_leaves);
+    if (!pipe) return;
+
+    // buffers: out, in0, in1, ...
+    id<MTLBuffer> bufs[16];
+    bufs[0] = metal_pool.bufs[out_buf];
+    for (u32 i = 0; i < n_leaves && i < 15; i++)
+        bufs[i + 1] = metal_pool.bufs[leaf_bufs[i]];
+
+    // params: v0, v1, ..., numel
+    ViewParams vps[8];
+    const void *params[16];
+    u64 psizes[16];
+    for (u32 i = 0; i < n_leaves; i++) {
+        vps[i] = view_to_params(leaf_views[i]);
+        params[i] = &vps[i];
+        psizes[i] = sizeof(ViewParams);
+    }
+    params[n_leaves] = &out_numel;
+    psizes[n_leaves] = sizeof(u32);
+
+    dispatch_1d(pipe, bufs, n_leaves + 1, params, psizes, n_leaves + 1, out_numel);
+}
+
+// ============================================================
+// Legacy: old unary-only codegen (kept for compatibility)
+// ============================================================
 
 static NSString *metal_codegen_fused(const u32 *ops, u32 n_ops, u32 n_inputs,
                                       int has_reduce) {
@@ -112,10 +237,9 @@ static NSString *metal_codegen_fused(const u32 *ops, u32 n_ops, u32 n_inputs,
 
 static id<MTLComputePipelineState> get_fused_pipe(const u32 *ops, u32 n_ops,
                                                     u32 n_inputs, int has_reduce) {
-    u64 key = fuse_hash(ops, n_ops, has_reduce);
+    u64 key = fuse_hash_v2((FusedOp[]){}, 0, 0) ^ n_ops ^ has_reduce; // legacy hash
     for (u32 i = 0; i < fused_cache_count && i < FUSED_CACHE_SIZE; i++)
         if (fused_cache[i].key == key) return fused_cache[i].pipe;
-
     NSString *src = metal_codegen_fused(ops, n_ops, n_inputs, has_reduce);
     NSError *err = nil;
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
@@ -123,8 +247,7 @@ static id<MTLComputePipelineState> get_fused_pipe(const u32 *ops, u32 n_ops,
     if (!lib) { NSLog(@"TinyHVM fused codegen: %@\n%@", err, src); return nil; }
     id<MTLFunction> fn = [lib newFunctionWithName:@"fused_kernel"];
     id<MTLComputePipelineState> pipe = [mtl_dev newComputePipelineStateWithFunction:fn error:&err];
-    if (!pipe) { NSLog(@"TinyHVM fused pipeline: %@", err); return nil; }
-
+    if (!pipe) return nil;
     u32 slot = fused_cache_count < FUSED_CACHE_SIZE ?
                fused_cache_count++ : ((fused_cache_count++) % FUSED_CACHE_SIZE);
     fused_cache[slot].key = key;
@@ -137,12 +260,10 @@ void metal_dispatch_fused(u32 out_buf, u32 *input_bufs, u32 n_inputs,
                            u32 out_numel, u32 reduce_dim, u32 total_numel) {
     id<MTLComputePipelineState> pipe = get_fused_pipe(ops, n_ops, n_inputs, has_reduce);
     if (!pipe) return;
-
     id<MTLBuffer> bufs[6];
     bufs[0] = metal_pool.bufs[out_buf];
     for (u32 i = 0; i < n_inputs; i++)
         bufs[i + 1] = metal_pool.bufs[input_bufs[i]];
-
     const void *params[] = { &reduce_dim, &total_numel };
     u64 psizes[] = { sizeof(u32), sizeof(u32) };
     dispatch_1d(pipe, bufs, n_inputs + 1, params, psizes, 2, out_numel);

@@ -90,15 +90,50 @@ static void fuse_remap(FusedOp *ops, u32 n_ops, u32 n_leaves) {
 
 // Try to fuse a lazy term into a single kernel. Returns tensor id, or ~0u if not fusable.
 // Handles: elementwise chains AND SUM(elementwise_chain).
+static u32 fuse_unfused_count = 0, fuse_fused_count = 0;
 static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     if (term_tag(t) != TAG_TOP) return reduce_id(ctx, t);
     u32 top_uop = term_ext(t);
 
-    // TODO: SUM(elementwise_chain) reduce+elementwise fusion needs strided reduce indexing
+    // Check for fusable patterns:
+    // 1. elementwise_chain → fuse into one kernel
+    // 2. SUM(elementwise_chain) → fuse reduce+elementwise
+    // 3. RESHAPE(SUM(elementwise_chain)) → same as #2, reshape output shape
     int has_reduce = 0;
     Term ew_root = t;
+    Term sum_term = term_era();  // the SUM term if has_reduce
+    Term reshape_term = term_era();  // outer RESHAPE if present
 
-    if (!is_elementwise(term_ext(ew_root))) return reduce_id(ctx, t);
+    if (top_uop == UOP_RESHAPE) {
+        // Look through RESHAPE to find SUM(ew_chain) pattern
+        u64 rs_loc = term_val(t);
+        Term inner = heap_read(ctx, rs_loc);
+        if (term_tag(inner) == TAG_TOP && term_ext(inner) == UOP_SUM) {
+            u64 sum_loc = term_val(inner);
+            Term sum_input = heap_read(ctx, sum_loc);
+            if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
+                has_reduce = 1;
+                sum_term = inner;
+                reshape_term = t;
+                ew_root = sum_input;
+            }
+        }
+        if (!has_reduce) { fuse_unfused_count++; return reduce_id(ctx, t); }
+    } else if (top_uop == UOP_SUM) {
+        u64 sum_loc = term_val(t);
+        Term sum_input = heap_read(ctx, sum_loc);
+        if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
+            has_reduce = 1;
+            sum_term = t;
+            ew_root = sum_input;
+        } else {
+            fuse_unfused_count++;
+            return reduce_id(ctx, t);
+        }
+    } else if (!is_elementwise(term_ext(ew_root))) {
+        fuse_unfused_count++;
+        return reduce_id(ctx, t);
+    }
 
     FusedOp ops[FUSE_MAX_OPS];
     u32 n_ops = 0;
@@ -127,22 +162,40 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     View out_view = ew_view;
     u32 reduce_dim = 1;
     if (has_reduce) {
-        // Find the last non-1 dim to reduce (simple heuristic matching single-axis SUM)
-        u32 rank = ew_view.shape.rank;
-        for (int d = (int)rank - 1; d >= 0; d--) {
-            if (ew_view.shape.dims[d] > 1) {
-                reduce_dim = ew_view.shape.dims[d];
-                out_view.shape.dims[d] = 1;
-                break;
+        // Get reduce axis from SUM's second arg, or default to last dim
+        u64 sum_loc = term_val(sum_term);
+        Term sum_axes = heap_read(ctx, sum_loc + 1);
+        int reduce_axis = -1;
+        if (term_tag(sum_axes) == TAG_TEN) {
+            // Explicit axis — read it (nosync since it's CPU metadata)
+            u32 ax_id = (u32)term_val(sum_axes);
+            TensorMeta *axt = &ctx->tensors[ax_id];
+            if (axt->view.numel == 1) {
+                f32 ax_val;
+                META_READ(ctx, axt->buf_id, &ax_val, sizeof(f32));
+                reduce_axis = (int)ax_val;
             }
         }
-        out_view.numel = ew_view.numel / reduce_dim;
+        if (reduce_axis < 0) {
+            // No explicit axis or multi-axis: reduce last non-1 dim
+            for (int d = (int)ew_view.shape.rank - 1; d >= 0; d--)
+                if (ew_view.shape.dims[d] > 1) { reduce_axis = d; break; }
+        }
+        if (reduce_axis >= 0 && reduce_axis < (int)ew_view.shape.rank) {
+            reduce_dim = ew_view.shape.dims[reduce_axis];
+            out_view.shape.dims[reduce_axis] = 1;
+            out_view.numel = ew_view.numel / reduce_dim;
+        } else {
+            // Can't determine reduce axis — fall back
+            return reduce_id(ctx, t);
+        }
     }
     u32 out_numel = out_view.numel;
 
     // Allocate output tensor
     u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
 
+    fuse_fused_count++;
     // Dispatch fused kernel
     #ifdef __APPLE__
     if (ctx->backend == &metal_backend) {
@@ -156,6 +209,23 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     {
         // CPU fallback: just reduce normally
         return reduce_id(ctx, t);
+    }
+
+    // If there was an outer RESHAPE, apply it as a view alias
+    if (has_reduce && term_tag(reshape_term) != TAG_ERA) {
+        u64 rs_loc = term_val(reshape_term);
+        Term shape_t = heap_read(ctx, rs_loc + 1);
+        if (term_tag(shape_t) == TAG_TEN) {
+            TensorMeta *ms = &ctx->tensors[(u32)term_val(shape_t)];
+            u32 rank = ms->view.numel;
+            f32 dims_f[MAX_DIM];
+            META_READ(ctx, ms->buf_id, dims_f, rank * sizeof(f32));
+            Shape ns = {.rank = rank};
+            for (u32 i = 0; i < rank; i++) ns.dims[i] = (u32)dims_f[i];
+            // Create view alias with new shape (same buffer, same numel)
+            u32 rs_id = tensor_view_of(ctx, dst_id, view_create(ns));
+            return rs_id;
+        }
     }
 
     return dst_id;

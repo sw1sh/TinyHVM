@@ -6,7 +6,7 @@
 #include <string.h>
 
 typedef struct {
-    f32 *train_images;   // [n_train, 784] normalized to [0,1]
+    f32 *train_images;   // [n_train, 784] raw [0,255]
     u8  *train_labels;   // [n_train]
     f32 *test_images;    // [n_test, 784]
     u8  *test_labels;    // [n_test]
@@ -27,7 +27,7 @@ static f32 *mnist_load_images(const char *path, u32 *n) {
     u8 *raw = malloc(sz);
     fread(raw, 1, sz, f); fclose(f);
     f32 *out = malloc(sz * sizeof(f32));
-    for (u32 i = 0; i < sz; i++) out[i] = (f32)raw[i] / 255.0f;
+    for (u32 i = 0; i < sz; i++) out[i] = (f32)raw[i];  // raw [0,255] matching tinygrad
     free(raw);
     return out;
 }

@@ -278,11 +278,13 @@ static int run_cnn(MNISTData *data) {
     f32 lr_max = 0.001f, lr_min = 0.0001f;
     printf("  %u params, %u steps, BS=%u\n\n", n_params, n_steps, BS);
 
+    struct timespec train_start; clock_gettime(CLOCK_MONOTONIC, &train_start);
+
     for (u32 step = 0; step < n_steps; step++) {
       @autoreleasepool {
         f32 progress = (f32)step / (f32)n_steps;
         opt.lr = lr_min + 0.5f * (lr_max - lr_min) * (1.0f + cosf(3.14159f * progress));
-        clock_t t0 = clock();
+        struct timespec t0_wall; clock_gettime(CLOCK_MONOTONIC, &t0_wall);
 
         if (ctx->backend->begin_batch) ctx->backend->begin_batch();
 
@@ -317,7 +319,9 @@ static int run_cnn(MNISTData *data) {
             }
         }
 
-        f32 ms = 1000.0f * (f32)(clock() - t0) / (f32)CLOCKS_PER_SEC;
+        struct timespec t1_wall; clock_gettime(CLOCK_MONOTONIC, &t1_wall);
+        f32 ms = (f32)(t1_wall.tv_sec - t0_wall.tv_sec)*1000.0f +
+                 (f32)(t1_wall.tv_nsec - t0_wall.tv_nsec)/1e6f;
         if (step % 10 == 0 || step == n_steps - 1)
             printf("  step %3u/%u  loss=%.4f  lr=%.5f  (%.0fms)\n",
                    step, n_steps, loss_val, opt.lr, ms);
@@ -326,8 +330,14 @@ static int run_cnn(MNISTData *data) {
       }
     }
 
+    struct timespec train_end; clock_gettime(CLOCK_MONOTONIC, &train_end);
+    f32 train_s = (f32)(train_end.tv_sec - train_start.tv_sec) +
+                  (f32)(train_end.tv_nsec - train_start.tv_nsec)/1e9f;
+    printf("\n  Train: %.1fs (%.0fms/step avg)\n", train_s, train_s*1000.0f/(f32)n_steps);
+
     // Eval
-    printf("\n  Evaluating test set...\n");
+    struct timespec eval_start; clock_gettime(CLOCK_MONOTONIC, &eval_start);
+    printf("  Evaluating test set...\n");
     Term test_data = thvm_tensor(ctx, data->test_images,
         (Shape){.dims={data->n_test, 1, 28, 28}, .rank=4});
     u32 eval_keep = ctx->tensor_count;
@@ -341,8 +351,13 @@ static int run_cnn(MNISTData *data) {
         thvm_reset(ctx, eval_keep);
     }
 
+    struct timespec eval_end; clock_gettime(CLOCK_MONOTONIC, &eval_end);
+    f32 eval_s = (f32)(eval_end.tv_sec - eval_start.tv_sec) +
+                 (f32)(eval_end.tv_nsec - eval_start.tv_nsec)/1e9f;
+
     f32 acc = 100.0f * (f32)correct / (f32)(tb * tbs);
     printf("\n  Test accuracy: %.1f%% (%u/%u)\n", acc, correct, tb * tbs);
+    printf("  Eval: %.1fs  Total: %.1fs\n", eval_s, train_s + eval_s);
     printf("  %s: CNN accuracy %s 90%%\n", acc > 90 ? "PASS" : "FAIL", acc > 90 ? ">" : "<");
 
     adam_free(&opt);

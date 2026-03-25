@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Read(//Users/swish/src/HVM4/**)"
+      "Read(//Users/swish/src/HVM4/**)",
+      "WebSearch",
+      "WebFetch(domain:mlcommons.org)",
+      "WebFetch(domain:docs.mlcommons.org)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

@@ -89,11 +89,16 @@ static void fuse_remap(FusedOp *ops, u32 n_ops, u32 n_leaves) {
 }
 
 // Try to fuse a lazy term into a single kernel. Returns tensor id, or ~0u if not fusable.
+// Handles: elementwise chains AND SUM(elementwise_chain).
 static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
-    // Only try fusion for TAG_TOP elementwise ops
-    if (term_tag(t) != TAG_TOP || !is_elementwise(term_ext(t))) {
-        return reduce_id(ctx, t);
-    }
+    if (term_tag(t) != TAG_TOP) return reduce_id(ctx, t);
+    u32 top_uop = term_ext(t);
+
+    // TODO: SUM(elementwise_chain) reduce+elementwise fusion needs strided reduce indexing
+    int has_reduce = 0;
+    Term ew_root = t;
+
+    if (!is_elementwise(term_ext(ew_root))) return reduce_id(ctx, t);
 
     FusedOp ops[FUSE_MAX_OPS];
     u32 n_ops = 0;
@@ -101,26 +106,37 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     const View *leaf_views[FUSE_MAX_LEAVES];
     u32 n_leaves = 0;
 
-    int walk_result = fuse_walk_inner(ctx, t, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
+    int walk_result = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
     if (walk_result < 0) return reduce_id(ctx, t);
     fuse_remap(ops, n_ops, n_leaves);
-    u32 result_idx = (u32)walk_result; // not used further, just check validity
-    if (result_idx == ~0u || n_ops < 2) {
-        // Not fusable or too simple — fall back to normal reduce
-        return reduce_id(ctx, t);
-    }
+    u32 min_ops = has_reduce ? 1 : 2;  // reduce+1op is worth fusing
+    if (n_ops < min_ops) return reduce_id(ctx, t);
 
-    // Determine output shape: broadcast of all leaf shapes
-    // For elementwise ops, the output shape is the broadcast of all inputs.
-    // Use the first leaf's shape as base, broadcast with others.
-    View out_view = *leaf_views[0];
+    // Determine elementwise output shape (broadcast of all leaves)
+    View ew_view = *leaf_views[0];
     for (u32 i = 1; i < n_leaves; i++) {
         View av_bc, bv_bc;
         u32 bc_shape[MAX_DIM], bc_ndim;
-        if (!view_broadcast(&out_view, leaf_views[i], &av_bc, &bv_bc, bc_shape, &bc_ndim)) {
-            return reduce_id(ctx, t);  // broadcast fail, fall back
+        if (!view_broadcast(&ew_view, leaf_views[i], &av_bc, &bv_bc, bc_shape, &bc_ndim)) {
+            return reduce_id(ctx, t);
         }
-        out_view = view_create(shape_of(bc_shape, bc_ndim));
+        ew_view = view_create(shape_of(bc_shape, bc_ndim));
+    }
+
+    // For reduce: output shape has reduce dims = 1
+    View out_view = ew_view;
+    u32 reduce_dim = 1;
+    if (has_reduce) {
+        // Find the last non-1 dim to reduce (simple heuristic matching single-axis SUM)
+        u32 rank = ew_view.shape.rank;
+        for (int d = (int)rank - 1; d >= 0; d--) {
+            if (ew_view.shape.dims[d] > 1) {
+                reduce_dim = ew_view.shape.dims[d];
+                out_view.shape.dims[d] = 1;
+                break;
+            }
+        }
+        out_view.numel = ew_view.numel / reduce_dim;
     }
     u32 out_numel = out_view.numel;
 
@@ -133,7 +149,8 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         u32 bufs[FUSE_MAX_LEAVES];
         for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
         metal_dispatch_fused_v2(ctx->tensors[dst_id].buf_id, out_numel,
-                                  bufs, leaf_views, n_leaves, ops, n_ops);
+                                  bufs, leaf_views, n_leaves, ops, n_ops,
+                                  has_reduce, reduce_dim);
     } else
     #endif
     {

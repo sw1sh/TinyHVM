@@ -606,13 +606,15 @@ inet_step:
                             ctx->backend->buf_read(ma->buf_id, raw, buf_bytes * sizeof(f32));
                             // Gather with strides
                             for (u32 flat = 0; flat < numel; flat++) {
-                                u32 rem = flat, idx = ma->view.offset;
+                                u32 rem = flat; i32 idx = ma->view.offset;
+                                int msk = 0;
                                 for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
                                     u32 coord = rem % ma->view.shape.dims[d];
                                     rem /= ma->view.shape.dims[d];
-                                    idx += coord * (u32)((ma->view.strides[d] >= 0) ? ma->view.strides[d] : 0);
+                                    if (ma->view.has_mask && (coord < ma->view.mask_begin[d] || coord >= ma->view.mask_end[d])) msk = 1;
+                                    idx += (i32)coord * (ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
                                 }
-                                src[flat] = (idx < buf_bytes) ? raw[idx] : 0.f;
+                                src[flat] = (msk || idx < 0 || (u32)idx >= buf_bytes) ? 0.f : raw[(u32)idx];
                             }
                             free(raw);
                             // Create fresh contiguous tensor, then apply reshape view
@@ -893,22 +895,24 @@ inet_step:
                     f32 *mat_src = NULL;
                     u32 use_buf = ma->buf_id;
                     if (!ma->view.contiguous) {
-                        u32 max_buf_idx = (u32)ma->view.offset;
+                        u32 max_buf_idx = 0;
                         for (u32 d = 0; d < ma->view.shape.rank; d++)
                             if (ma->view.strides[d] > 0)
                                 max_buf_idx += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
+                        max_buf_idx += (ma->view.offset > 0) ? (u32)ma->view.offset : 0;
                         f32 *raw = malloc((max_buf_idx+1) * sizeof(f32));
                         if (ctx->backend->end_batch) ctx->backend->end_batch();
                         ctx->backend->buf_read(ma->buf_id, raw, (u64)(max_buf_idx+1)*sizeof(f32));
                         if (ctx->backend->begin_batch) ctx->backend->begin_batch();
                         mat_src = malloc(src_numel * sizeof(f32));
                         for (u32 flat = 0; flat < src_numel; flat++) {
-                            u32 rem = flat, phys = (u32)ma->view.offset;
+                            u32 rem = flat; i32 phys = ma->view.offset; int msk = 0;
                             for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
                                 u32 c = rem % ma->view.shape.dims[d]; rem /= ma->view.shape.dims[d];
-                                phys += c * (u32)(ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
+                                if (ma->view.has_mask && (c < ma->view.mask_begin[d] || c >= ma->view.mask_end[d])) msk = 1;
+                                phys += (i32)c * (ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
                             }
-                            mat_src[flat] = raw[phys];
+                            mat_src[flat] = (msk || phys < 0 || (u32)phys > max_buf_idx) ? 0.f : raw[(u32)phys];
                         }
                         free(raw);
                         use_buf = ctx->backend->buf_alloc(src_numel * sizeof(f32));

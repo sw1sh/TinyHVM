@@ -37,16 +37,19 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t) {
     if (!m->host_ptr) m->host_ptr = malloc((size_t)m->view.numel * sizeof(f32));
     f32 *dst = (f32 *)m->host_ptr;
 
-    // Strided copy
+    // Strided copy (with mask support)
     for (u32 flat = 0; flat < m->view.numel; flat++) {
         u32 rem = flat;
-        u32 src_idx = m->view.offset;
+        i32 src_idx_s = m->view.offset;
+        int masked_out = 0;
         for (i32 d = (i32)m->view.shape.rank - 1; d >= 0; d--) {
             u32 coord = rem % m->view.shape.dims[d];
             rem /= m->view.shape.dims[d];
-            src_idx += coord * (u32)m->view.strides[d];
+            if (m->view.has_mask && (coord < m->view.mask_begin[d] || coord >= m->view.mask_end[d]))
+                masked_out = 1;
+            src_idx_s += (i32)coord * (m->view.strides[d] > 0 ? m->view.strides[d] : 0);
         }
-        dst[flat] = src_buf[src_idx];
+        dst[flat] = masked_out ? 0.0f : src_buf[(u32)src_idx_s];
     }
     free(src_buf);
     return dst;

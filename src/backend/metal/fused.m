@@ -89,7 +89,7 @@ static const char *strided_idx_helper =
     "  return buf[strided_idx(flat, v.strides, v.shape, v.offset, v.rank)];\n"
     "}\n";
 
-static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
+static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves, int has_reduce) {
     NSMutableString *src = [NSMutableString stringWithCapacity:4096];
     [src appendString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
 
@@ -104,44 +104,61 @@ static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
     for (u32 i = 0; i < n_leaves; i++)
         [src appendFormat:@"  constant VP &v%u [[buffer(%u)]],\n", i, n_leaves + 1 + i];
     [src appendFormat:@"  constant uint &numel [[buffer(%u)]],\n", 2 * n_leaves + 1];
+    if (has_reduce)
+        [src appendFormat:@"  constant uint &reduce_dim [[buffer(%u)]],\n", 2 * n_leaves + 2];
     [src appendString:@"  uint gid [[thread_position_in_grid]])\n{\n"];
     [src appendString:@"  if (gid >= numel) return;\n"];
 
-    // Read leaf inputs: t0..t{n_leaves-1} (with mask support)
-    for (u32 i = 0; i < n_leaves; i++)
-        [src appendFormat:@"  float t%u = masked_read_v(in%u, gid, v%u);\n",
-            i, i, i];
-
-    // Apply ops
-    for (u32 i = 0; i < n_ops; i++) {
-        u32 tid = n_leaves + i;
-        u32 a = ops[i].arg_a, b = ops[i].arg_b;
-        switch (ops[i].uop) {
-            case UOP_ADD:  [src appendFormat:@"  float t%u = t%u + t%u;\n", tid, a, b]; break;
-            case UOP_SUB:  [src appendFormat:@"  float t%u = t%u - t%u;\n", tid, a, b]; break;
-            case UOP_MUL:  [src appendFormat:@"  float t%u = t%u * t%u;\n", tid, a, b]; break;
-            case UOP_DIV:  [src appendFormat:@"  float t%u = t%u / t%u;\n", tid, a, b]; break;
-            case UOP_MAX:  [src appendFormat:@"  float t%u = max(t%u, t%u);\n", tid, a, b]; break;
-            case UOP_CMP:  [src appendFormat:@"  float t%u = t%u > t%u ? 1.0f : 0.0f;\n", tid, a, b]; break;
-            case UOP_NEG:  [src appendFormat:@"  float t%u = -t%u;\n", tid, a]; break;
-            case UOP_RELU: [src appendFormat:@"  float t%u = max(t%u, 0.0f);\n", tid, a]; break;
-            case UOP_EXP:  [src appendFormat:@"  float t%u = exp(t%u);\n", tid, a]; break;
-            case UOP_LOG:  [src appendFormat:@"  float t%u = log(t%u);\n", tid, a]; break;
-            case UOP_SQRT: [src appendFormat:@"  float t%u = sqrt(t%u);\n", tid, a]; break;
-            default:       [src appendFormat:@"  float t%u = t%u;\n", tid, a]; break;  // passthrough
+    // Helper macro for ops
+    #define EMIT_LEAF_READS(idx_var) \
+        for (u32 i = 0; i < n_leaves; i++) \
+            [src appendFormat:@"    float t%u = masked_read_v(in%u, %s, v%u);\n", i, i, idx_var, i]
+    #define EMIT_OPS(indent) \
+        for (u32 i = 0; i < n_ops; i++) { \
+            u32 tid = n_leaves + i; \
+            u32 a = ops[i].arg_a, b = ops[i].arg_b; \
+            switch (ops[i].uop) { \
+                case UOP_ADD:  [src appendFormat:@"%@float t%u = t%u + t%u;\n", indent, tid, a, b]; break; \
+                case UOP_SUB:  [src appendFormat:@"%@float t%u = t%u - t%u;\n", indent, tid, a, b]; break; \
+                case UOP_MUL:  [src appendFormat:@"%@float t%u = t%u * t%u;\n", indent, tid, a, b]; break; \
+                case UOP_DIV:  [src appendFormat:@"%@float t%u = t%u / t%u;\n", indent, tid, a, b]; break; \
+                case UOP_MAX:  [src appendFormat:@"%@float t%u = max(t%u, t%u);\n", indent, tid, a, b]; break; \
+                case UOP_CMP:  [src appendFormat:@"%@float t%u = t%u > t%u ? 1.0f : 0.0f;\n", indent, tid, a, b]; break; \
+                case UOP_NEG:  [src appendFormat:@"%@float t%u = -t%u;\n", indent, tid, a]; break; \
+                case UOP_RELU: [src appendFormat:@"%@float t%u = max(t%u, 0.0f);\n", indent, tid, a]; break; \
+                case UOP_EXP:  [src appendFormat:@"%@float t%u = exp(t%u);\n", indent, tid, a]; break; \
+                case UOP_LOG:  [src appendFormat:@"%@float t%u = log(t%u);\n", indent, tid, a]; break; \
+                case UOP_SQRT: [src appendFormat:@"%@float t%u = sqrt(t%u);\n", indent, tid, a]; break; \
+                default:       [src appendFormat:@"%@float t%u = t%u;\n", indent, tid, a]; break; \
+            } \
         }
+
+    if (has_reduce) {
+        [src appendString:@"  float acc = 0.0f;\n"];
+        [src appendString:@"  for (uint r = 0; r < reduce_dim; r++) {\n"];
+        [src appendString:@"    uint idx = gid * reduce_dim + r;\n"];
+        EMIT_LEAF_READS("idx");
+        EMIT_OPS(@"    ");
+        [src appendFormat:@"    acc += t%u;\n", n_leaves + n_ops - 1];
+        [src appendString:@"  }\n"];
+        [src appendString:@"  out[gid] = acc;\n"];
+    } else {
+        EMIT_LEAF_READS("gid");
+        EMIT_OPS(@"  ");
+        [src appendFormat:@"  out[gid] = t%u;\n", n_leaves + n_ops - 1];
     }
-    [src appendFormat:@"  out[gid] = t%u;\n", n_leaves + n_ops - 1];
+    #undef EMIT_LEAF_READS
+    #undef EMIT_OPS
     [src appendString:@"}\n"];
     return src;
 }
 
-static id<MTLComputePipelineState> get_fused_pipe_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
-    u64 key = fuse_hash_v2(ops, n_ops, n_leaves);
+static id<MTLComputePipelineState> get_fused_pipe_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves, int has_reduce) {
+    u64 key = fuse_hash_v2(ops, n_ops, n_leaves) ^ ((u64)has_reduce << 63);
     for (u32 i = 0; i < fused_cache_count && i < FUSED_CACHE_SIZE; i++)
         if (fused_cache[i].key == key) return fused_cache[i].pipe;
 
-    NSString *src = codegen_fused_v2(ops, n_ops, n_leaves);
+    NSString *src = codegen_fused_v2(ops, n_ops, n_leaves, has_reduce);
     NSError *err = nil;
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
     id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:opts error:&err];
@@ -162,17 +179,16 @@ static id<MTLComputePipelineState> get_fused_pipe_v2(const FusedOp *ops, u32 n_o
 // ops: the fused op chain. Result goes to out_buf.
 void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
                                u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
-                               FusedOp *ops, u32 n_ops) {
-    id<MTLComputePipelineState> pipe = get_fused_pipe_v2(ops, n_ops, n_leaves);
+                               FusedOp *ops, u32 n_ops,
+                               int has_reduce, u32 reduce_dim) {
+    id<MTLComputePipelineState> pipe = get_fused_pipe_v2(ops, n_ops, n_leaves, has_reduce);
     if (!pipe) return;
 
-    // buffers: out, in0, in1, ...
     id<MTLBuffer> bufs[16];
     bufs[0] = metal_pool.bufs[out_buf];
     for (u32 i = 0; i < n_leaves && i < 15; i++)
         bufs[i + 1] = metal_pool.bufs[leaf_bufs[i]];
 
-    // params: v0, v1, ..., numel
     ViewParams vps[8];
     const void *params[16];
     u64 psizes[16];
@@ -183,8 +199,13 @@ void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
     }
     params[n_leaves] = &out_numel;
     psizes[n_leaves] = sizeof(u32);
-
-    dispatch_1d(pipe, bufs, n_leaves + 1, params, psizes, n_leaves + 1, out_numel);
+    if (has_reduce) {
+        params[n_leaves + 1] = &reduce_dim;
+        psizes[n_leaves + 1] = sizeof(u32);
+        dispatch_1d(pipe, bufs, n_leaves + 1, params, psizes, n_leaves + 2, out_numel);
+    } else {
+        dispatch_1d(pipe, bufs, n_leaves + 1, params, psizes, n_leaves + 1, out_numel);
+    }
 }
 
 // ============================================================

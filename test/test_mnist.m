@@ -317,9 +317,9 @@ static int run_cnn(MNISTData *data) {
         extern u32 total_dispatches;
         extern double flush_total_ms;
         extern u32 flush_count_total;
-        if (step == 0) {
-            printf("    step 0: dispatches=%u flushes=%u flush_time=%.1fms\n",
-                   total_dispatches, flush_count_total, flush_total_ms);
+        if (step <= 2) {
+            printf("    step %u: dispatches=%u flush_time=%.1fms\n",
+                   step, total_dispatches, flush_total_ms);
             total_dispatches = 0; flush_total_ms = 0; flush_count_total = 0;
         }
 

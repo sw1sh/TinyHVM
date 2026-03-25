@@ -19,6 +19,9 @@ static id<MTLComputePipelineState> pipe_nhwc_to_nchw, pipe_nchw_to_nhwc;
 static id<MTLComputePipelineState> pipe_bias_add, pipe_col_sum;
 static id<MTLComputePipelineState> pipe_adam_step;
 static id<MTLComputePipelineState> pipe_maxpool2d_fwd, pipe_maxpool2d_bwd;
+// Fast contiguous kernels (no ViewParams overhead)
+static id<MTLComputePipelineState> fpipe_add, fpipe_sub, fpipe_mul, fpipe_div, fpipe_max, fpipe_cmp;
+static id<MTLComputePipelineState> fpipe_neg, fpipe_relu, fpipe_exp, fpipe_log, fpipe_sqrt;
 static id<MTLComputePipelineState> pipe_relu_bwd;
 static id<MTLComputePipelineState> pipe_matrix_transpose, pipe_zero_fill, pipe_pad;
 
@@ -53,7 +56,6 @@ typedef struct {
     uint32_t has_mask;
     uint32_t mask_begin[8];
     uint32_t mask_end[8];
-    uint32_t contiguous;  // 1 = flat indexing (no strided_idx needed)
 } ViewParams;
 
 static ViewParams view_to_params(const View *v) {
@@ -62,7 +64,6 @@ static ViewParams view_to_params(const View *v) {
     p.rank   = v->shape.rank;
     p.numel  = v->numel;
     p.has_mask = v->has_mask;
-    p.contiguous = v->contiguous && !v->has_mask && v->offset == 0;
     for (u32 i = 0; i < v->shape.rank; i++) {
         p.strides[i] = v->strides[i];
         p.shape[i]   = v->shape.dims[i];
@@ -140,6 +141,19 @@ static int metal_init(void) {
     pipe_pad = make_pipe(@"pad_kernel");    pipe_reduce_sum = make_pipe(@"reduce_sum");
     pipe_reduce_max = make_pipe(@"reduce_max");
     pipe_mul_reduce_sum = make_pipe(@"mul_reduce_sum");
+
+    // Fast contiguous kernels
+    fpipe_add  = make_pipe(@"fast_add");
+    fpipe_sub  = make_pipe(@"fast_sub");
+    fpipe_mul  = make_pipe(@"fast_mul");
+    fpipe_div  = make_pipe(@"fast_div");
+    fpipe_max  = make_pipe(@"fast_max");
+    fpipe_cmp  = make_pipe(@"fast_cmp");
+    fpipe_neg  = make_pipe(@"fast_neg");
+    fpipe_relu = make_pipe(@"fast_relu");
+    fpipe_exp  = make_pipe(@"fast_exp");
+    fpipe_log  = make_pipe(@"fast_log");
+    fpipe_sqrt = make_pipe(@"fast_sqrt");
 
     memset(&metal_pool, 0, sizeof(metal_pool));
     metal_pool.count = 1;

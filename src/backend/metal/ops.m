@@ -1,8 +1,45 @@
 // metal/ops.m — Core Metal compute ops: unary, binary, matmul, reduce
 
+// Check if view is truly contiguous for fast-path (offset=0, standard strides, no mask)
+static int is_fast_view(const View *v) {
+    if (v->offset != 0 || v->has_mask) return 0;
+    i32 expected = 1;
+    for (int d = (int)v->shape.rank - 1; d >= 0; d--) {
+        if (v->shape.dims[d] > 1) {
+            if (v->strides[d] != expected) return 0;
+            expected *= (i32)v->shape.dims[d];
+        }
+    }
+    return 1;
+}
+
 static void metal_op_unary(u32 uop, u32 dst, const View *dv,
                             u32 src, const View *sv) {
     u64 t0 = thvm_prof_tick();
+
+    // Fast path: contiguous input, direct indexing (no ViewParams overhead)
+    if (is_fast_view(sv)) {
+        id<MTLComputePipelineState> fpipe = nil;
+        switch (uop) {
+            case UOP_NEG:  fpipe = fpipe_neg;  break;
+            case UOP_RELU: fpipe = fpipe_relu; break;
+            case UOP_EXP:  fpipe = fpipe_exp;  break;
+            case UOP_LOG:  fpipe = fpipe_log;  break;
+            case UOP_SQRT: fpipe = fpipe_sqrt; break;
+            default: break;
+        }
+        if (fpipe) {
+            u32 n = dv->numel;
+            id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+            const void *params[] = { &n };
+            u64 psizes[] = { sizeof(u32) };
+            dispatch_1d(fpipe, bufs, 2, params, psizes, 1, n);
+            thvm_prof_record(uop, t0);
+            return;
+        }
+    }
+
+    // Slow path: strided ViewParams
     id<MTLComputePipelineState> pipe = nil;
     switch (uop) {
         case UOP_NEG:  pipe = pipe_neg;  break;
@@ -12,10 +49,8 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
         case UOP_SQRT: pipe = pipe_sqrt; break;
         default: return;
     }
-
     ViewParams dvp = view_to_params(dv);
     ViewParams svp = view_to_params(sv);
-
     id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
     const void *params[] = { &dvp, &svp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams) };
@@ -26,6 +61,31 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
 static void metal_op_binary(u32 uop, u32 dst, const View *dv,
                              u32 a, const View *av, u32 b, const View *bv) {
     u64 t0 = thvm_prof_tick();
+
+    // Fast path: both inputs contiguous, no broadcast
+    if (is_fast_view(av) && is_fast_view(bv) && av->numel == bv->numel) {
+        id<MTLComputePipelineState> fpipe = nil;
+        switch (uop) {
+            case UOP_ADD: fpipe = fpipe_add; break;
+            case UOP_MUL: fpipe = fpipe_mul; break;
+            case UOP_SUB: fpipe = fpipe_sub; break;
+            case UOP_DIV: fpipe = fpipe_div; break;
+            case UOP_MAX: fpipe = fpipe_max; break;
+            case UOP_CMP: fpipe = fpipe_cmp; break;
+            default: break;
+        }
+        if (fpipe) {
+            u32 n = dv->numel;
+            id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
+            const void *params[] = { &n };
+            u64 psizes[] = { sizeof(u32) };
+            dispatch_1d(fpipe, bufs, 3, params, psizes, 1, n);
+            thvm_prof_record(uop, t0);
+            return;
+        }
+    }
+
+    // Slow path: strided ViewParams with broadcast support
     id<MTLComputePipelineState> pipe = nil;
     switch (uop) {
         case UOP_ADD: pipe = pipe_add; break;
@@ -36,18 +96,15 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
         case UOP_CMP: pipe = pipe_cmp; break;
         default: return;
     }
-
     ViewParams dvp = view_to_params(dv);
     ViewParams avp = view_to_params(av);
     ViewParams bvp = view_to_params(bv);
-
     id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
     const void *params[] = { &dvp, &avp, &bvp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams), sizeof(ViewParams) };
     dispatch_1d(pipe, bufs, 3, params, psizes, 3, dv->numel);
     thvm_prof_record(uop, t0);
 }
-
 static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
                          u32 M, u32 K, u32 N) {
     u64 t0 = thvm_prof_tick();

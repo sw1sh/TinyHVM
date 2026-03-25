@@ -18,7 +18,6 @@ struct ViewParams {
     uint32_t has_mask;
     uint32_t mask_begin[8];
     uint32_t mask_end[8];
-    uint32_t contiguous;  // 1 = flat indexing (skip strided_idx)
 };
 
 static inline uint strided_idx(uint flat, constant ViewParams &v) {
@@ -32,10 +31,8 @@ static inline uint strided_idx(uint flat, constant ViewParams &v) {
     return idx;
 }
 
-// Fast read: contiguous → direct index, non-contiguous → strided
 static inline float masked_read(device const float *buf, uint flat,
                                  constant ViewParams &v) {
-    if (v.contiguous == 1) return buf[flat];
     if (v.has_mask) {
         uint rem = flat;
         for (int d = int(v.rank) - 1; d >= 0; d--) {
@@ -583,4 +580,102 @@ kernel void pad_kernel(device float *dst [[buffer(0)]],
         src_stride *= src_shape[d];
     }
     dst[gid] = inside ? src[src_idx] : 0.0f;
+}
+
+// ============================================================
+// Fast kernels: contiguous inputs, no ViewParams overhead
+// ============================================================
+
+kernel void fast_add(device float *dst [[buffer(0)]],
+                     device const float *a [[buffer(1)]],
+                     device const float *b [[buffer(2)]],
+                     constant uint &n [[buffer(3)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = a[i] + b[i];
+}
+
+kernel void fast_sub(device float *dst [[buffer(0)]],
+                     device const float *a [[buffer(1)]],
+                     device const float *b [[buffer(2)]],
+                     constant uint &n [[buffer(3)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = a[i] - b[i];
+}
+
+kernel void fast_mul(device float *dst [[buffer(0)]],
+                     device const float *a [[buffer(1)]],
+                     device const float *b [[buffer(2)]],
+                     constant uint &n [[buffer(3)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = a[i] * b[i];
+}
+
+kernel void fast_div(device float *dst [[buffer(0)]],
+                     device const float *a [[buffer(1)]],
+                     device const float *b [[buffer(2)]],
+                     constant uint &n [[buffer(3)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = a[i] / b[i];
+}
+
+kernel void fast_neg(device float *dst [[buffer(0)]],
+                     device const float *a [[buffer(1)]],
+                     constant uint &n [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = -a[i];
+}
+
+kernel void fast_relu(device float *dst [[buffer(0)]],
+                      device const float *a [[buffer(1)]],
+                      constant uint &n [[buffer(2)]],
+                      uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = max(a[i], 0.0f);
+}
+
+kernel void fast_exp(device float *dst [[buffer(0)]],
+                     device const float *a [[buffer(1)]],
+                     constant uint &n [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = exp(a[i]);
+}
+
+kernel void fast_log(device float *dst [[buffer(0)]],
+                     device const float *a [[buffer(1)]],
+                     constant uint &n [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = log(a[i]);
+}
+
+kernel void fast_sqrt(device float *dst [[buffer(0)]],
+                      device const float *a [[buffer(1)]],
+                      constant uint &n [[buffer(2)]],
+                      uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = sqrt(a[i]);
+}
+
+kernel void fast_max(device float *dst [[buffer(0)]],
+                     device const float *a [[buffer(1)]],
+                     device const float *b [[buffer(2)]],
+                     constant uint &n [[buffer(3)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = max(a[i], b[i]);
+}
+
+kernel void fast_cmp(device float *dst [[buffer(0)]],
+                     device const float *a [[buffer(1)]],
+                     device const float *b [[buffer(2)]],
+                     constant uint &n [[buffer(3)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = a[i] > b[i] ? 1.0f : 0.0f;
 }

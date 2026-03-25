@@ -88,17 +88,40 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
     if (term_tag(t) == TAG_TEN) {
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
-        // Use view_reshape to check if the reshape can be a view alias.
-        // It returns contiguous=1 only when the source strides are compatible
-        // (no stride-0, no permutation that breaks contiguity).
+        // Use view_reshape's merge-split algorithm to compute new strides.
+        // Returns valid strides for contiguous, expanded (stride-0), and
+        // compatible permuted views. Falls to lazy only when strides are
+        // truly incompatible (mixed stride-0/non-zero, or non-contiguous merge).
         View rv = view_reshape(m->view, new_shape);
-        if (!rv.contiguous) goto lazy;
-        // Reshape is valid as a view alias — same buffer, new shape + strides
+        // view_reshape returns contiguous=0 in two cases:
+        // 1. Reshapable but non-contiguous (stride-0 dims) — strides are valid
+        // 2. Not reshapable — strides are placeholder, needs materialization
+        // Check: if any stride-0 dim in source has no corresponding stride-0
+        // in result, it's case 2 (not reshapable). Simple heuristic: if result
+        // has stride-0 dims or is contiguous, it's valid.
+        int valid = rv.contiguous;
+        if (!valid) {
+            // Check if view_reshape produced valid non-contiguous strides
+            // (stride-0 dims properly propagated). If any non-trivial dim
+            // has stride 0, it's a valid expanded view alias.
+            int has_stride0 = 0;
+            for (u32 d = 0; d < new_shape.rank; d++)
+                if (new_shape.dims[d] > 1 && rv.strides[d] == 0) has_stride0 = 1;
+            // If source had stride-0 and result has stride-0, the merge-split
+            // algorithm succeeded. If source had stride-0 but result has none,
+            // it's the fallback (not reshapable).
+            int src_has_stride0 = 0;
+            for (u32 d = 0; d < m->view.shape.rank; d++)
+                if (m->view.shape.dims[d] > 1 && m->view.strides[d] == 0) src_has_stride0 = 1;
+            if (src_has_stride0 && has_stride0) valid = 1;
+            if (!src_has_stride0 && !has_stride0) valid = 0; // permuted, needs materialize
+        }
+        if (!valid) goto lazy;
+        // Reshape is valid as a view alias — same buffer, computed strides
         u32 id = ctx->tensor_count++;
         ctx->tensors[id] = *m;
         ctx->tensors[id].view = rv;
         ctx->tensors[id].host_ptr = NULL;
-        // Track provenance for autograd
         ctx->tensors[id].creator_op = UOP_RESHAPE;
         ctx->tensors[id].src_ids[0] = src_id;
         if (m->requires_grad) ctx->tensors[id].requires_grad = 1;

@@ -519,25 +519,28 @@ def layer_norm(x, gamma, beta, eps=1e-5):
 
 ---
 
-## 12. Source Architecture
+## 12. Source Architecture (~5.9K LoC)
 
 ```
 src/
-├── tinyhvm.h          -- types, UOp codes, API
-├── tinyhvm.c          -- hub (includes all sub-files)
-├── term/              -- term constructors, tag helpers
-├── heap/              -- bump allocator, read/write
-├── tensor/            -- tensor creation, view algebra
-├── interact/          -- interaction rules (the core)
-├── reduce/            -- enter/apply reducer (HVM4-style)
-├── grad/              -- autograd (GRAD handler)
-├── ops/               -- tensor op dispatch
-├── ctx/               -- context management
-├── nn/                -- high-level layers (softmax, loss, etc.)
+├── tinyhvm.h              -- types, UOp codes, API (564 lines)
+├── tinyhvm.c              -- hub (includes all sub-files)
+├── main.c                 -- standalone entry point
+├── term/                  -- term constructors, tag/ext/val/sub helpers
+├── heap/                  -- bump allocator, read/write
+├── tensor/                -- tensor creation, view algebra
+│   └── view/              -- broadcast, reshape, permute, expand, shrink, pad, stride
+├── interact/_.c           -- interaction rules — the core (1143 lines)
+├── reduce/_.c             -- enter/apply reducer, HVM4-style trampoline
+├── grad/_.c               -- autograd GRAD handler (733 lines)
+├── ops/_.c                -- tensor op dispatch helpers
+├── clone/_.c              -- term cloning (ALO-style)
+├── ctx/init.c             -- context init/reset
+├── nn/                    -- NN layers: conv, batchnorm, linear, loss, adam, softmax, datasets, sequential
 ├── backend/
-│   ├── cpu/           -- CPU backend
-│   └── metal/         -- Metal backend
-└── shaders/           -- GPU shader source
+│   ├── cpu/               -- CPU backend (Accelerate matmul, strided elementwise)
+│   └── metal/             -- Metal backend (init, ops, conv, pool, fused, batch, optim, profile)
+└── shaders.metal          -- MSL compute shaders (529 lines)
 ```
 
 ---

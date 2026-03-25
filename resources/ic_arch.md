@@ -235,14 +235,23 @@ are handled correctly.
 
 ## 8. Source Map
 
-| File | What it does |
+| Path | What it does |
 |------|-------------|
 | `src/tinyhvm.h` | All types, UOp codes, API declarations |
-| `src/tinyhvm.c` | Reducer, autograd, movement ops, high-level API |
-| `src/cpu.c` | CPU backend: elementwise, reduce, matmul loops |
-| `src/metal.m` | Metal backend: GPU kernels, `metal_mul_reduce_sum` |
+| `src/tinyhvm.c` | Hub — includes all sub-files |
+| `src/reduce/_.c` | Enter/apply trampoline reducer |
+| `src/interact/_.c` | Interaction rules (tensor op dispatch, autograd, fusing) |
+| `src/grad/_.c` | GRAD handler — chain rule per op |
+| `src/ops/_.c` | Tensor op dispatch helpers |
+| `src/clone/_.c` | Term cloning (ALO-style) |
+| `src/heap/` | Bump allocator, read/write |
+| `src/term/` | Term constructors, tag/ext/val/sub helpers |
+| `src/tensor/` | Tensor creation, view algebra (broadcast, reshape, permute, etc.) |
+| `src/ctx/init.c` | Context init/reset |
+| `src/nn/` | NN layers (conv, batchnorm, linear, loss, adam, softmax, datasets) |
+| `src/backend/cpu/` | CPU backend: Accelerate matmul, strided elementwise |
+| `src/backend/metal/` | Metal backend: compute shaders, MPS matmul, fused kernels, profiling |
 | `src/shaders.metal` | MSL compute shaders |
-| `src/layers.c` | Conv2d, maxpool, sequential model helpers |
 | `resources/ic_arch.md` | This document |
 | `resources/ic_pure_inet.md` | Pure inet training model & PoC implementation plan |
 | `resources/ic_autograd.md` | Autograd design notes |

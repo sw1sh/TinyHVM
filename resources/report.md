@@ -65,7 +65,7 @@ HVM has evolved through four generations:
 **HVM4 memory layout (64-bit term pointers):**
 
 ```
-SUB (1 bit) | TAG (7 bits) | EXT (16 bits) | VAL (40 bits)
+SUB (1 bit) | TAG (7 bits) | EXT (18 bits) | VAL (38 bits)
 ```
 
 Tags include: APP, LAM, SUP, DUP, NUM, OP2, MAT, SWI, CTR, REF, etc.
@@ -318,27 +318,25 @@ Define custom interaction rules for fusion:
 
 ### Phase 1: Core Runtime ✅
 
-Completed. TinyHVM is a standalone C library (~4700 LoC) with:
+Completed. TinyHVM is a standalone C library (~5.9K LoC) with:
 
-- **Interaction calculus core**: 64-bit term encoding (SUB:1 | TAG:7 | EXT:18 | VAL:38), bump-allocated heap, weak normal form reduction engine
-- **Tensor abstraction**: `Shape` struct (variable rank up to 8D), `View` with strides/offset (tinygrad-inspired ShapeTracker), dtype-aware with `dtype_size()` helper
+- **Interaction calculus core**: 64-bit term encoding (SUB:1 | TAG:7 | EXT:18 | VAL:38), bump-allocated heap, enter/apply trampoline reducer (HVM4-style)
+- **Tensor abstraction**: `View` struct (variable rank up to 8D) with strides/offset (tinygrad-inspired ShapeTracker), dtype-aware
 - **Backend interface**: `Backend` vtable with `init/shutdown/buf_alloc/buf_free/buf_write/buf_read/op_unary/op_binary/op_mm` + CNN dispatch ops + profiling. Runtime selection via `thvm_device("cpu"|"metal")`
-- **CPU backend** (`cpu.c`): Accelerate/vDSP matmul, strided elementwise ops
-- **Metal backend** (`metal.m`): Compute shaders + MPS matmul, `StorageModeShared` for zero-copy on Apple Silicon, command buffer batching
-- **23 UOps** (aligned with [tinyspec](https://github.com/tinygrad/tinyspec)): movement (reshape/permute/expand/shrink/pad), elementwise (neg/exp/log/relu/sqrt/cast + add/mul/div/sub/max/cmp), reduce (sum/rmax), matmul
+- **CPU backend** (`backend/cpu/`): Accelerate/vDSP matmul, strided elementwise ops
+- **Metal backend** (`backend/metal/`): Compute shaders + MPS matmul, `StorageModeShared` for zero-copy on Apple Silicon, fused kernels, profiling
+- **23+ UOps** (aligned with [tinyspec](https://github.com/tinygrad/tinyspec)): movement (reshape/permute/expand/shrink/pad), elementwise (neg/exp/log/relu/sqrt/cast + add/mul/div/sub/max/cmp), reduce (sum/rmax), matmul
 - **Broadcasting**: Full numpy-style shape broadcasting with stride manipulation
-- **Tests**: 127/127 unit tests passing on both CPU and Metal
 
 ```
-src/tinyhvm.h      409 lines  — types, constants, API, profiling, Layer abstraction
-src/tinyhvm.c     1586 lines  — reduction engine, views, autograd, UOp compositions
-src/cpu.c          219 lines  — CPU backend (Accelerate)
-src/metal.m        608 lines  — Metal backend (MPS + compute shaders + profiling)
-src/layers.c       572 lines  — CNN layers (direct Metal dispatch), Layer sequential
-src/shaders.metal  475 lines  — Metal compute kernels
-test/test_term.m   409 lines  — 93 unit tests
-test/test_train.m  144 lines  — XOR training end-to-end
-test/beautiful_mnist.m  281 lines — CNN MNIST training (96.2% accuracy)
+src/tinyhvm.h         564 lines  — types, constants, API, profiling
+src/interact/_.c     1143 lines  — interaction rules (tensor ops, autograd, fusing)
+src/grad/_.c          733 lines  — GRAD handler (chain rule per op)
+src/reduce/_.c        212 lines  — enter/apply trampoline reducer
+src/nn/               593 lines  — conv, batchnorm, linear, loss, adam, softmax, datasets, sequential
+src/backend/cpu/      196 lines  — CPU backend (Accelerate)
+src/backend/metal/    931 lines  — Metal backend (10 files: init, ops, conv, pool, fused, batch, etc.)
+src/shaders.metal     529 lines  — MSL compute kernels
 ```
 
 ### Phase 2: Autograd & Training ✅

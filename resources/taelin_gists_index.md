@@ -40,9 +40,9 @@
 
 | Link | Target |
 |------|--------|
-| `/Users/swish/src/TinyHVM/HVM` | `/Users/swish/src/HVM` (HVM2) |
-| `/Users/swish/src/TinyHVM/HVM4` | `/Users/swish/src/HVM4` (HVM4) |
-| `/Users/swish/src/TinyHVM/tinygrad` | `/Users/swish/src/tinygrad` |
+| `HVM/` | HVM2 repo |
+| `HVM4/` | HVM4 repo |
+| `tinygrad/` | tinygrad repo |
 
 ## Key Papers and Talks
 

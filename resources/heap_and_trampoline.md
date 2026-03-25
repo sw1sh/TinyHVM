@@ -2,7 +2,7 @@
 
 ## Term Representation
 
-Every term is a 64-bit packed word: `[tag:5 | lab:24 | val:35]`
+Every term is a 64-bit packed word: `[SUB:1 | TAG:7 | EXT:18 | VAL:38]`
 
 | Tag | What it is | WNF? |
 |-----|-----------|------|
@@ -31,7 +31,7 @@ TOP at heap[loc]:    [loc] = arg0 (left operand)
                      [loc+1] = arg1 (right operand / shape)
 ```
 
-## Trampoline (reduce/_.c)
+## Trampoline (`src/reduce/_.c`)
 
 Two-phase loop, no recursion for the hot path:
 

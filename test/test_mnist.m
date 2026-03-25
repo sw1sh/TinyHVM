@@ -31,20 +31,35 @@
 #include <string.h>
 #include <time.h>
 
-static void xavier_init(f32 *data, u32 fan_in, u32 fan_out, u32 n) {
-    f32 scale = sqrtf(2.0f / (f32)(fan_in + fan_out));
+// Kaiming uniform init: uniform(-bound, bound) where bound = 1/sqrt(fan_in)
+// Matches tinygrad's Conv2d/Linear default initialization.
+static void kaiming_init(f32 *data, u32 fan_in, u32 n) {
+    f32 bound = 1.0f / sqrtf((f32)fan_in);
     for (u32 i = 0; i < n; i++)
-        data[i] = scale * ((f32)rand() / (f32)RAND_MAX * 2.0f - 1.0f);
+        data[i] = bound * ((f32)rand() / (f32)RAND_MAX * 2.0f - 1.0f);
 }
 
 static Term make_weight(TinyHVM *ctx, Shape s, u32 fan_in, u32 fan_out) {
+    (void)fan_out;
     u32 n = 1;
     for (u32 i = 0; i < s.rank; i++) n *= s.dims[i];
     f32 *data = malloc(n * sizeof(f32));
-    xavier_init(data, fan_in, fan_out, n);
+    kaiming_init(data, fan_in, n);
     Term t = thvm_tensor(ctx, data, s);
     free(data);
     return t;
+}
+
+// Load weights from binary file (dumped from tinygrad for exact parity)
+static f32 *load_weights_bin(const char *path, u32 *out_size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    f32 *data = malloc((size_t)sz);
+    fread(data, 1, (size_t)sz, f);
+    fclose(f);
+    *out_size = (u32)(sz / sizeof(f32));
+    return data;
 }
 
 static Term make_zeros(TinyHVM *ctx, u32 n) {
@@ -81,9 +96,9 @@ static int run_mlp(MNISTData *data) {
     TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
     // Weights
-    f32 *w1d = malloc(784 * H * sizeof(f32)); xavier_init(w1d, 784, H, 784 * H);
+    f32 *w1d = malloc(784 * H * sizeof(f32)); kaiming_init(w1d, 784, 784 * H);
     f32 *b1d = calloc(H, sizeof(f32));
-    f32 *w2d = malloc(H * 10 * sizeof(f32));  xavier_init(w2d, H, 10, H * 10);
+    f32 *w2d = malloc(H * 10 * sizeof(f32));  kaiming_init(w2d, H, H * 10);
     f32 *b2d = calloc(10, sizeof(f32));
 
     Term W1 = thvm_tensor(ctx, w1d, SHAPE(784, H));
@@ -175,30 +190,54 @@ static int run_cnn(MNISTData *data) {
 
     TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 
+    // Try to load tinygrad-dumped weights for exact parity
+    u32 wsize = 0;
+    f32 *wbin = load_weights_bin("/tmp/tinygrad_weights/init_thvm.bin", &wsize);
+    f32 *wp = wbin;  // cursor
+
+    // Helper: load next n floats from binary or use fallback
+    #define LOAD_OR_INIT(shape, fan_in, fan_out) \
+        (wp ? ({ u32 _n = 1; for (u32 _i=0;_i<(shape).rank;_i++) _n*=(shape).dims[_i]; \
+                 Term _t = thvm_tensor(ctx, wp, (shape)); wp += _n; _t; }) \
+            : make_weight(ctx, (shape), (fan_in), (fan_out)))
+    #define LOAD_OR_ZEROS(n) \
+        (wp ? ({ f32 *_p = wp; wp += (n); thvm_tensor(ctx, _p, SHAPE(n)); }) \
+            : make_zeros(ctx, (n)))
+    #define LOAD_OR_ONES(n) \
+        (wp ? ({ f32 *_p = wp; wp += (n); thvm_tensor(ctx, _p, SHAPE(n)); }) \
+            : make_ones(ctx, (n)))
+
+    if (wbin) printf("  Loaded tinygrad weights (%u floats) for exact parity\n", wsize);
+    else printf("  Using Kaiming uniform init (no tinygrad weights found)\n");
+
     #define N_LAYERS 14
     Layer model[N_LAYERS] = {
-        {.type=LAYER_CONV2D, .conv={make_weight(ctx, (Shape){.dims={32,1,5,5},.rank=4}, 25, 32),
-                                     make_zeros(ctx, 32), 1, 32, 5}},
+        {.type=LAYER_CONV2D, .conv={LOAD_OR_INIT(((Shape){.dims={32,1,5,5},.rank=4}), 25, 32),
+                                     LOAD_OR_ZEROS(32), 1, 32, 5}},
         {.type=LAYER_FN, .fn=relu_fn},
-        {.type=LAYER_CONV2D, .conv={make_weight(ctx, (Shape){.dims={32,32,5,5},.rank=4}, 800, 32),
-                                     make_zeros(ctx, 32), 32, 32, 5}},
+        {.type=LAYER_CONV2D, .conv={LOAD_OR_INIT(((Shape){.dims={32,32,5,5},.rank=4}), 800, 32),
+                                     LOAD_OR_ZEROS(32), 32, 32, 5}},
         {.type=LAYER_FN, .fn=relu_fn},
-        {.type=LAYER_BN, .bn={make_ones(ctx, 32), make_zeros(ctx, 32),
-                               make_zeros(ctx, 32), make_ones(ctx, 32), 32, 20, 20}},
+        {.type=LAYER_BN, .bn={LOAD_OR_ONES(32), LOAD_OR_ZEROS(32),
+                               LOAD_OR_ZEROS(32), LOAD_OR_ONES(32), 32, 20, 20}},
         {.type=LAYER_MAXPOOL, .pool={2}},
-        {.type=LAYER_CONV2D, .conv={make_weight(ctx, (Shape){.dims={64,32,3,3},.rank=4}, 288, 64),
-                                     make_zeros(ctx, 64), 32, 64, 3}},
+        {.type=LAYER_CONV2D, .conv={LOAD_OR_INIT(((Shape){.dims={64,32,3,3},.rank=4}), 288, 64),
+                                     LOAD_OR_ZEROS(64), 32, 64, 3}},
         {.type=LAYER_FN, .fn=relu_fn},
-        {.type=LAYER_CONV2D, .conv={make_weight(ctx, (Shape){.dims={64,64,3,3},.rank=4}, 576, 64),
-                                     make_zeros(ctx, 64), 64, 64, 3}},
+        {.type=LAYER_CONV2D, .conv={LOAD_OR_INIT(((Shape){.dims={64,64,3,3},.rank=4}), 576, 64),
+                                     LOAD_OR_ZEROS(64), 64, 64, 3}},
         {.type=LAYER_FN, .fn=relu_fn},
-        {.type=LAYER_BN, .bn={make_ones(ctx, 64), make_zeros(ctx, 64),
-                               make_zeros(ctx, 64), make_ones(ctx, 64), 64, 6, 6}},
+        {.type=LAYER_BN, .bn={LOAD_OR_ONES(64), LOAD_OR_ZEROS(64),
+                               LOAD_OR_ZEROS(64), LOAD_OR_ONES(64), 64, 6, 6}},
         {.type=LAYER_MAXPOOL, .pool={2}},
         {.type=LAYER_FLATTEN, .flat={576}},
-        {.type=LAYER_LINEAR, .lin={make_weight(ctx, SHAPE(576, 10), 576, 10),
-                                    make_zeros(ctx, 10), 576, 10}},
+        {.type=LAYER_LINEAR, .lin={LOAD_OR_INIT(SHAPE(576, 10), 576, 10),
+                                    LOAD_OR_ZEROS(10), 576, 10}},
     };
+    if (wbin) free(wbin);
+    #undef LOAD_OR_INIT
+    #undef LOAD_OR_ZEROS
+    #undef LOAD_OR_ONES
 
     // Extract params
     Term params[N_LAYERS * 2];

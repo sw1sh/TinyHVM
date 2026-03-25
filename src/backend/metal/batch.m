@@ -1,13 +1,23 @@
 // metal/batch.m — Command buffer batching
 
+#include <time.h>
+static double flush_total_ms = 0;
+static u32 flush_count_total = 0;
+
 static void metal_flush(void) {
     if (batch_encoder) {
         [batch_encoder endEncoding];
         batch_encoder = nil;
     }
     if (batch_cmd) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         [batch_cmd commit];
         [batch_cmd waitUntilCompleted];
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (double)(t1.tv_sec-t0.tv_sec)*1000.0 + (double)(t1.tv_nsec-t0.tv_nsec)/1e6;
+        flush_total_ms += ms;
+        flush_count_total++;
         batch_cmd = nil;
     }
     batch_dirty = 0;

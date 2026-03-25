@@ -5,7 +5,12 @@
       "WebSearch",
       "WebFetch(domain:mlcommons.org)",
       "WebFetch(domain:docs.mlcommons.org)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:www.chatbench.org)",
+      "WebFetch(domain:ai-benchmark.com)",
+      "WebFetch(domain:gimletlabs.ai)",
+      "WebFetch(domain:arxiv.org)"
     ]
   }
 }

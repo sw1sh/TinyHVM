@@ -70,7 +70,6 @@ static void metal_buf_read(u32 id, void *out, u64 bytes) {
 }
 
 static void metal_pool_reset(u32 keep) {
-    // Flush pending GPU work — required before reusing buffers
     if (batch_dirty) metal_flush();
     u32 buf_keep = keep + 1;
     u32 n_free = metal_pool.count - buf_keep;

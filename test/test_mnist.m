@@ -300,7 +300,8 @@ static int run_cnn(MNISTData *data) {
         if (ctx->backend->end_batch) ctx->backend->end_batch();
 
         Term loss_r = thvm_reduce(ctx, loss);
-        f32 loss_val = thvm_to_host(ctx, loss_r)[0];
+        // DON'T read loss yet — let backward+adam queue their GPU work first
+        // Then read loss → ONE flush for all GPU work (forward+backward+adam)
 
         Term grad_terms[n_params];
         thvm_backward(ctx, loss_r, params, grad_terms, n_params);
@@ -310,10 +311,16 @@ static int run_cnn(MNISTData *data) {
 
         adam_step(ctx, &opt, grad_ids);
 
+        // Read loss AFTER all GPU work queued — single flush
+        f32 loss_val = thvm_to_host(ctx, loss_r)[0];
+
         extern u32 total_dispatches;
+        extern double flush_total_ms;
+        extern u32 flush_count_total;
         if (step == 0) {
-            printf("    GPU dispatches: %u (tinygrad: ~186)\n", total_dispatches);
-            total_dispatches = 0;
+            printf("    GPU dispatches: %u, flushes: %u, flush_time: %.1fms\n",
+                   total_dispatches, flush_count_total, flush_total_ms);
+            total_dispatches = 0; flush_total_ms = 0; flush_count_total = 0;
         }
 
         // Invalidate host caches so next step reads updated weights

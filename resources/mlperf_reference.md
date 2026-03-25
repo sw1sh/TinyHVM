@@ -304,7 +304,55 @@ Given existing ops, a minimum viable ResNet-50 Inference Edge submission could t
 
 ---
 
-## 7. Key GitHub Repos
+## 7. Software-Focused Benchmarks and Landscape
+
+MLPerf is a **system** benchmark (hardware + software together). There is no dedicated software-only leaderboard. But there are ways to showcase framework quality.
+
+### MLPerf framework tracking
+
+Every MLPerf submission lists its ML framework. The interactive dashboards allow filtering by framework. But it's metadata, not a controlled variable — comparing frameworks requires finding submissions on identical hardware with different software, which is rare.
+
+### Precedent: tinygrad MLPerf submissions
+
+**tinygrad has made official MLPerf submissions** — Training v5.0 (BERT on tinybox) and Training v6.0 (LLaMA on AMD MI300X/MI350X). This proves a small framework (~8K LoC) can compete on a recognized leaderboard. Directly relevant precedent for TinyHVM.
+
+### Other benchmarks
+
+| Benchmark | What it measures | Metal? | Status |
+|-----------|-----------------|--------|--------|
+| **KernelBench** (Stanford, 2025) | AI-generated kernel quality vs PyTorch. 250+ workloads. | No (CUDA/Triton/HIP) | Active, leaderboard planned |
+| **Gimlet Labs Metal Kernels** (2025) | AI-generated Metal kernels on Apple Silicon. 1.2–1.9x speedup over PyTorch baseline. | **Yes** | One-off study |
+| **MultiKernelBench** (2025) | Kernel generation across 6 platforms (CUDA, Triton, AscendC, Pallas, SYCL, TileLang). | No (Metal not supported) | Active |
+| **TritonBench** (2025) | 184 real-world Triton operators from GitHub. | No | Active |
+| **TritonGym** (2025) | Agentic Triton kernel generation workflow. | No | Active, has leaderboard |
+| **FlashInfer-Bench** (2025) | LLM serving kernels (MLSys 2026 competition). | No (B200 only) | Competition |
+| **KernelCraft** (2026) | Kernel generation for emerging/novel accelerator ISAs. | No | Active |
+| **DAWNBench** (Stanford) | Compared frameworks on same tasks. | No | **Retired** (2020) |
+| **metal-benchmarks** (philipturner) | Raw Apple GPU FLOPS. M4: ~2.9 TFLOPS FP32 via MPS. | **Yes** | Active |
+| **llama.cpp Discussion #4167** | Crowdsourced Apple Silicon throughput table across M-series chips. | **Yes** | Community-maintained |
+
+### Apple Silicon framework comparison (arXiv:2511.05502, Nov 2025)
+
+LLM inference throughput on Apple Silicon:
+
+```
+MLX (~230 tok/s) > MLC-LLM (~190 tok/s) > llama.cpp (~150 tok/s) > Ollama (20-40 tok/s) > PyTorch MPS (~7-9 tok/s)
+```
+
+### Gaps and opportunities
+
+- **No Metal kernel benchmark leaderboard** — CUDA/Triton dominated
+- **No Apple Silicon ML framework comparison leaderboard** — only one-off papers
+- **No minimal-framework benchmark** — nothing measures LOC vs performance
+- **No MultiKernelBench Metal backend** — could be a contribution opportunity
+
+### Bottom line for TinyHVM
+
+The most credible path to a recognized leaderboard remains **MLPerf Inference Edge, Open Division**. tinygrad proved a small framework can do this. For Apple Silicon specifically, the landscape is sparse — there's room to be the first Metal-native C framework with MLPerf numbers.
+
+---
+
+## 8. Key GitHub Repos
 
 | Repo | Purpose |
 |------|---------|
@@ -318,7 +366,7 @@ Given existing ops, a minimum viable ResNet-50 Inference Edge submission could t
 
 ---
 
-## 8. Key Datasets
+## 9. Key Datasets
 
 | Dataset | Size | Used By |
 |---------|------|---------|

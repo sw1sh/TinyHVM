@@ -446,7 +446,7 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
         case UOP_PERMUTE: {
             u32 rank = ctx->tensors[bid].view.numel;
             f32 *af = malloc(rank * sizeof(f32));
-            ctx->backend->buf_read(ctx->tensors[bid].buf_id, af, rank*sizeof(f32));
+            META_READ(ctx, ctx->tensors[bid].buf_id, af, rank*sizeof(f32));
             u32 inv[MAX_DIM];
             for (u32 j = 0; j < rank; j++) inv[(u32)af[j]] = j;
             free(af);
@@ -458,7 +458,7 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
             TensorMeta *mp = &ctx->tensors[bid];
             u32 nd = mp->view.numel / 2;
             f32 *pf = malloc(mp->view.numel * sizeof(f32));
-            ctx->backend->buf_read(mp->buf_id, pf, mp->view.numel*sizeof(f32));
+            META_READ(ctx, mp->buf_id, pf, mp->view.numel*sizeof(f32));
             u32 sp[MAX_DIM*2];
             for (u32 j=0;j<nd;j++){sp[j*2]=(u32)pf[j*2];sp[j*2+1]=(u32)pf[j*2]+ma->view.shape.dims[j];}
             free(pf);
@@ -470,7 +470,7 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
             TensorMeta *ms2 = &ctx->tensors[bid];
             u32 nd = ms2->view.numel / 2;
             f32 *sf = malloc(ms2->view.numel * sizeof(f32));
-            ctx->backend->buf_read(ms2->buf_id, sf, ms2->view.numel*sizeof(f32));
+            META_READ(ctx, ms2->buf_id, sf, ms2->view.numel*sizeof(f32));
             u32 pp[MAX_DIM*2];
             for (u32 j=0;j<nd;j++){pp[j*2]=(u32)sf[j*2];pp[j*2+1]=ma->view.shape.dims[j]-(u32)sf[j*2+1];}
             free(sf);
@@ -505,7 +505,7 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
                     TensorMeta *axt = &ctx->tensors[ax_id];
                     n_reduce = axt->view.numel;
                     f32 *axes_f = malloc(n_reduce * sizeof(f32));
-                    ctx->backend->buf_read(axt->buf_id, axes_f, n_reduce * sizeof(f32));
+                    META_READ(ctx, axt->buf_id, axes_f, n_reduce * sizeof(f32));
                     for (u32 i = 0; i < n_reduce; i++) reduce_axes[i] = (u32)axes_f[i];
                     free(axes_f);
                 }

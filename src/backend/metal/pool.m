@@ -43,6 +43,14 @@ static void metal_buf_write(u32 id, const void *data, u64 bytes) {
     thvm_prof_buf_write(bytes);
 }
 
+// Read without flushing — safe for CPU-written metadata that GPU hasn't touched.
+void metal_buf_read_nosync(u32 id, void *out, u64 bytes) {
+    u64 actual = metal_pool.sizes[id];
+    u64 n = bytes < actual ? bytes : actual;
+    memcpy(out, metal_pool.bufs[id].contents, n);
+    if (n < bytes) memset((char*)out + n, 0, bytes - n);
+}
+
 static void metal_buf_read(u32 id, void *out, u64 bytes) {
     if (batch_dirty) metal_flush();
     u64 actual = metal_pool.sizes[id];

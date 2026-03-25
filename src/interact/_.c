@@ -1,3 +1,15 @@
+// Read small metadata (axes, shapes, pad specs) without GPU flush.
+// These are CPU-written and never GPU-modified.
+#ifdef __APPLE__
+#define META_READ(ctx, buf_id, out, bytes) \
+    ((ctx)->backend == &metal_backend ? \
+     metal_buf_read_nosync((buf_id), (out), (bytes)) : \
+     (ctx)->backend->buf_read((buf_id), (out), (bytes)))
+#else
+#define META_READ(ctx, buf_id, out, bytes) \
+    (ctx)->backend->buf_read((buf_id), (out), (bytes))
+#endif
+
 static Term thvm_interact(TinyHVM *ctx, Term t) {
     // If result is TAG_TOP, reduce it before returning (ensures the trampoline
     // drives lazy ops to completion before handing back to the caller).
@@ -250,7 +262,7 @@ inet_step:
                         case UOP_PERMUTE: {
                             u32 rank = ctx->tensors[bid].view.numel;
                             f32 *af = malloc(rank * sizeof(f32));
-                            ctx->backend->buf_read(ctx->tensors[bid].buf_id, af, rank*sizeof(f32));
+                            META_READ(ctx, ctx->tensors[bid].buf_id, af, rank*sizeof(f32));
                             u32 inv[MAX_DIM];
                             for (u32 j = 0; j < rank; j++) inv[(u32)af[j]] = j;
                             free(af);
@@ -260,7 +272,7 @@ inet_step:
                             TensorMeta *mp = &ctx->tensors[bid];
                             u32 nd = mp->view.numel / 2;
                             f32 *pf = malloc(mp->view.numel * sizeof(f32));
-                            ctx->backend->buf_read(mp->buf_id, pf, mp->view.numel*sizeof(f32));
+                            META_READ(ctx, mp->buf_id, pf, mp->view.numel*sizeof(f32));
                             u32 sp[MAX_DIM*2];
                             for (u32 j=0;j<nd;j++){sp[j*2]=(u32)pf[j*2];sp[j*2+1]=(u32)pf[j*2]+ma->view.shape.dims[j];}
                             free(pf);
@@ -270,7 +282,7 @@ inet_step:
                             TensorMeta *ms2 = &ctx->tensors[bid];
                             u32 nd = ms2->view.numel / 2;
                             f32 *sf = malloc(ms2->view.numel * sizeof(f32));
-                            ctx->backend->buf_read(ms2->buf_id, sf, ms2->view.numel*sizeof(f32));
+                            META_READ(ctx, ms2->buf_id, sf, ms2->view.numel*sizeof(f32));
                             u32 pp[MAX_DIM*2];
                             for (u32 j=0;j<nd;j++){pp[j*2]=(u32)sf[j*2];pp[j*2+1]=ma->view.shape.dims[j]-(u32)sf[j*2+1];}
                             free(sf);
@@ -422,7 +434,7 @@ inet_step:
                                     TensorMeta *max = &ctx->tensors[ax_id];
                                     n_reduce = max->view.numel;
                                     f32 *axes_f = malloc(n_reduce * sizeof(f32));
-                                    ctx->backend->buf_read(max->buf_id, axes_f, n_reduce * sizeof(f32));
+                                    META_READ(ctx, max->buf_id, axes_f, n_reduce * sizeof(f32));
                                     for (u32 i = 0; i < n_reduce; i++) reduce_axes[i] = (u32)axes_f[i];
                                     free(axes_f);
                                 }
@@ -581,7 +593,7 @@ inet_step:
                         TensorMeta *mb = &ctx->tensors[b_id];
                         Shape ns = {.rank = mb->view.numel};
                         f32 *dims = malloc(ns.rank * sizeof(f32));
-                        ctx->backend->buf_read(mb->buf_id, dims, ns.rank * sizeof(f32));
+                        META_READ(ctx, mb->buf_id, dims, ns.rank * sizeof(f32));
                         for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
                         free(dims);
 
@@ -647,7 +659,7 @@ inet_step:
                         TensorMeta *mb = &ctx->tensors[b_id];
                         Shape ns = {.rank = mb->view.numel};
                         f32 *dims = malloc(ns.rank * sizeof(f32));
-                        ctx->backend->buf_read(mb->buf_id, dims, ns.rank * sizeof(f32));
+                        META_READ(ctx, mb->buf_id, dims, ns.rank * sizeof(f32));
                         for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
                         free(dims);
                         new_view = view_expand(ma->view, ns);
@@ -658,7 +670,7 @@ inet_step:
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 rank = mb->view.numel;
                         f32 *axes_f = malloc(rank * sizeof(f32));
-                        ctx->backend->buf_read(mb->buf_id, axes_f, rank * sizeof(f32));
+                        META_READ(ctx, mb->buf_id, axes_f, rank * sizeof(f32));
                         u32 axes[MAX_DIM];
                         for (u32 i = 0; i < rank; i++) axes[i] = (u32)axes_f[i];
                         free(axes_f);
@@ -671,7 +683,7 @@ inet_step:
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 n_pairs = mb->view.numel;
                         f32 *pairs = malloc(n_pairs * sizeof(f32));
-                        ctx->backend->buf_read(mb->buf_id, pairs, n_pairs * sizeof(f32));
+                        META_READ(ctx, mb->buf_id, pairs, n_pairs * sizeof(f32));
                         u32 starts[MAX_DIM], ends[MAX_DIM];
                         for (u32 i = 0; i < n_pairs / 2; i++) {
                             starts[i] = (u32)pairs[i * 2];
@@ -688,7 +700,7 @@ inet_step:
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 n_pairs = mb->view.numel;
                         f32 *pairs = malloc(n_pairs * sizeof(f32));
-                        ctx->backend->buf_read(mb->buf_id, pairs, n_pairs * sizeof(f32));
+                        META_READ(ctx, mb->buf_id, pairs, n_pairs * sizeof(f32));
                         u32 pad_before[MAX_DIM], pad_after[MAX_DIM];
                         for (u32 i = 0; i < n_pairs / 2; i++) {
                             pad_before[i] = (u32)pairs[i * 2];
@@ -747,7 +759,7 @@ inet_step:
                         TensorMeta *max_t = &ctx->tensors[ax_id];
                         u32 n_axes = max_t->view.numel;
                         f32 *axes_f = malloc(n_axes * sizeof(f32));
-                        ctx->backend->buf_read(max_t->buf_id, axes_f, n_axes * sizeof(f32));
+                        META_READ(ctx, max_t->buf_id, axes_f, n_axes * sizeof(f32));
                         for (u32 i = 0; i < n_axes; i++) {
                             u32 ax = (u32)axes_f[i];
                             out_shape[ax] = 1;
@@ -816,7 +828,7 @@ inet_step:
                         TensorMeta *axt = &ctx->tensors[ax_id];
                         n_explicit = axt->view.numel;
                         f32 *af = malloc(n_explicit * sizeof(f32));
-                        ctx->backend->buf_read(axt->buf_id, af, n_explicit * sizeof(f32));
+                        META_READ(ctx, axt->buf_id, af, n_explicit * sizeof(f32));
                         for (u32 i = 0; i < n_explicit; i++) explicit_axes[i] = (u32)af[i];
                         free(af);
                     }

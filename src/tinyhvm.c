@@ -68,6 +68,7 @@ extern void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
                                      FusedOp *ops, u32 n_ops,
                                      int has_reduce, u32 reduce_dim);
 extern void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view);
+extern void metal_buf_read_nosync(u32 id, void *out, u64 bytes);
 extern Backend metal_backend;
 #endif
 

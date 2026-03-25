@@ -310,11 +310,10 @@ static int run_cnn(MNISTData *data) {
 
         adam_step(ctx, &opt, grad_ids);
 
-        extern u32 total_dispatches, fuse_fused_count, fuse_unfused_count;
+        extern u32 total_dispatches;
         if (step == 0) {
             printf("    GPU dispatches: %u (tinygrad: ~186)\n", total_dispatches);
-            printf("    fuse_or_reduce: %u fused, %u unfused\n", fuse_fused_count, fuse_unfused_count);
-            total_dispatches = 0; fuse_fused_count = 0; fuse_unfused_count = 0;
+            total_dispatches = 0;
         }
 
         // Invalidate host caches so next step reads updated weights

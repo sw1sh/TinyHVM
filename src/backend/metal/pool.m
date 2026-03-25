@@ -70,16 +70,20 @@ static void metal_buf_read(u32 id, void *out, u64 bytes) {
 }
 
 static void metal_pool_reset(u32 keep) {
+    // Flush pending GPU work — required before reusing buffers
     if (batch_dirty) metal_flush();
     u32 buf_keep = keep + 1;
+    u32 n_free = metal_pool.count - buf_keep;
+    if (n_free == 0) return;
+
+    // Move to free list for reuse (no deallocation)
     for (u32 i = buf_keep; i < metal_pool.count; i++) {
-        thvm_prof_buf_free(metal_pool.sizes[i]);
         if (metal_pool.bufs[i] && free_count < MAX_FREE_BUFS) {
             free_list[free_count].buf = metal_pool.bufs[i];
             free_list[free_count].size = metal_pool.sizes[i];
             free_count++;
+            metal_pool.bufs[i] = nil;
         }
-        metal_pool.bufs[i] = nil;
         metal_pool.sizes[i] = 0;
     }
     metal_pool.count = buf_keep;

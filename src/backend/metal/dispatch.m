@@ -19,3 +19,18 @@ static void dispatch_1d(id<MTLComputePipelineState> pipe,
     batch_dirty = 1;
     total_dispatches++;
 }
+
+// Measure GPU+CPU time between marks
+#include <time.h>
+static struct timespec gpu_mark_t;
+
+void metal_mark_gpu_start(void) {
+    clock_gettime(CLOCK_MONOTONIC, &gpu_mark_t);
+}
+
+double metal_get_gpu_elapsed_ms(void) {
+    if (batch_dirty) metal_flush();
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)(now.tv_sec - gpu_mark_t.tv_sec)*1000.0 +
+           (double)(now.tv_nsec - gpu_mark_t.tv_nsec)/1e6;
+}

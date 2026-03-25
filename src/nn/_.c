@@ -16,4 +16,5 @@ static u32 tensor_from(TinyHVM *ctx, f32 *data, Shape s) {
 #include "linear.c"
 #include "batchnorm.c"
 #include "adam.c"
+#include "conv.c"
 #include "sequential.c"

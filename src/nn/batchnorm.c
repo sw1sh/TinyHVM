@@ -22,6 +22,7 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
     f32 inv_count = 1.0f / (f32)count;
 
     Term batch_mean, batch_var;
+    Term assign_rm = term_era(), assign_rv = term_era();
 
     if (training) {
         // batch_mean = x.mean(axis=(0,2,3))
@@ -45,31 +46,19 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
 
         // running_mean.assign((1-m)*running_mean + m*detach(batch_mean))
         // running_var.assign((1-m)*running_var + m*bessel*detach(batch_var))
+        // Lazy assigns — chained into the output so the outer reduce executes them.
         f32 mom = 0.1f, bessel = (f32)count / (f32)(count - 1);
         Term mean_d = thvm_detach(ctx, batch_mean);
         Term var_d = thvm_detach(ctx, batch_var);
-        f32 omm = 1.0f - mom;
-        Term omm_t = thvm_tensor(ctx, &omm, SHAPE(1));
-        Term mom_t = thvm_tensor(ctx, &mom, SHAPE(1));
-        f32 mb = mom * bessel;
-        Term mb_t = thvm_tensor(ctx, &mb, SHAPE(1));
-        // new_rm = (1-m)*rm + m*mean
-        Term new_rm = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD,
-            thvm_op(ctx, UOP_MUL, rmean, omm_t),
-            thvm_op(ctx, UOP_MUL, mean_d, mom_t)));
-        // new_rv = (1-m)*rv + m*bessel*var
-        Term new_rv = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD,
-            thvm_op(ctx, UOP_MUL, rvar, omm_t),
-            thvm_op(ctx, UOP_MUL, var_d, mb_t)));
-        // assign: copy new_rm/new_rv GPU buffers into rmean/rvar GPU buffers
-        u32 rm_id = (u32)term_val(thvm_reduce(ctx, rmean));
-        u32 rv_id = (u32)term_val(thvm_reduce(ctx, rvar));
-        { f32 tmp[MAX_TENSORS > 256 ? 256 : 64]; // enough for C channels
-          ctx->backend->buf_read(ctx->tensors[(u32)term_val(new_rm)].buf_id, tmp, C*sizeof(f32));
-          ctx->backend->buf_write(ctx->tensors[rm_id].buf_id, tmp, C*sizeof(f32));
-          ctx->backend->buf_read(ctx->tensors[(u32)term_val(new_rv)].buf_id, tmp, C*sizeof(f32));
-          ctx->backend->buf_write(ctx->tensors[rv_id].buf_id, tmp, C*sizeof(f32));
-        }
+        f32 omm = 1.0f - mom, mb = mom * bessel;
+        Term new_rm = thvm_op(ctx, UOP_ADD,
+            thvm_op(ctx, UOP_MUL, rmean, thvm_tensor(ctx, &omm, SHAPE(1))),
+            thvm_op(ctx, UOP_MUL, mean_d, thvm_tensor(ctx, &mom, SHAPE(1))));
+        Term new_rv = thvm_op(ctx, UOP_ADD,
+            thvm_op(ctx, UOP_MUL, rvar, thvm_tensor(ctx, &omm, SHAPE(1))),
+            thvm_op(ctx, UOP_MUL, var_d, thvm_tensor(ctx, &mb, SHAPE(1))));
+        assign_rm = thvm_assign(ctx, rmean, new_rm);
+        assign_rv = thvm_assign(ctx, rvar, new_rv);
     } else {
         batch_mean = rmean;
         batch_var = rvar;
@@ -89,8 +78,14 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
     Term beta_bc = thvm_expand(ctx, thvm_reshape(ctx, beta, SHAPE(1,C,1,1)),
         (Shape){.dims={B,C,H,W},.rank=4});
 
-    return thvm_op(ctx, UOP_ADD,
+    Term out = thvm_op(ctx, UOP_ADD,
         thvm_op(ctx, UOP_MUL, thvm_op(ctx, UOP_MUL,
             thvm_op(ctx, UOP_SUB, x, mean_bc), invstd_bc), gamma_bc),
         beta_bc);
+
+    // Chain running stats assigns: APP(assign, continuation) forces assign via APP-TEN rule.
+    // The outer reduce executes: assign_rm → assign_rv → out.
+    if (term_tag(assign_rm) != TAG_ERA)
+        out = thvm_app(ctx, assign_rm, thvm_app(ctx, assign_rv, out));
+    return out;
 }

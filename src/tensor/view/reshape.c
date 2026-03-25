@@ -42,6 +42,7 @@ static View view_reshape(View v, Shape new_shape) {
     }
     r.strides[i] = st;
   }
-  r.contiguous = truly_contiguous;
+  if (v.has_mask) r.contiguous = 0;  // masked reshape requires materialization
+  else r.contiguous = truly_contiguous;
   return r;
 }

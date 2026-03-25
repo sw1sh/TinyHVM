@@ -175,48 +175,18 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
     if (term_tag(t) == TAG_TEN) {
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
-        // Pad requires materializing: new buffer with zeros + copy
-        // We must allocate a new buffer and copy data
-        View old_v = m->view;
-        u32 new_dims[MAX_DIM];
-        for (u32 i = 0; i < ndim; i++)
-            new_dims[i] = old_v.shape.dims[i] + pairs[i*2] + pairs[i*2+1];
-        Shape ns = shape_of(new_dims, ndim);
-        u32 new_numel = 1;
-        for (u32 i = 0; i < ndim; i++) new_numel *= new_dims[i];
-
-        u32 id = tensor_create(ctx, ns, m->dtype);
-
-        if (ctx->backend) {
-            // GPU path: zero-fill output, then dispatch a copy with offset
-            #ifdef __APPLE__
-            // TODO: GPU PAD via codegen (ShapeTracker mask). For now CPU.
-            #endif
-            {
-                u32 dsz = dtype_size(m->dtype);
-                f32 *tmp = calloc(new_numel, dsz);
-                f32 *src = malloc(old_v.numel * dsz);
-                ctx->backend->buf_read(m->buf_id, src, old_v.numel * dsz);
-                for (u32 flat = 0; flat < old_v.numel; flat++) {
-                    u32 coords[MAX_DIM], rem = flat;
-                    for (int d = (int)ndim - 1; d >= 0; d--) {
-                        coords[d] = rem % old_v.shape.dims[d]; rem /= old_v.shape.dims[d];
-                    }
-                    u32 dst_flat = 0, dst_stride = 1;
-                    for (int d = (int)ndim - 1; d >= 0; d--) {
-                        dst_flat += (coords[d] + pairs[d*2]) * dst_stride;
-                        dst_stride *= new_dims[d];
-                    }
-                    tmp[dst_flat] = src[flat];
-                }
-                ctx->backend->buf_write(ctx->tensors[id].buf_id, tmp, new_numel * dsz);
-                free(src); free(tmp);
-            }
+        u32 pad_before[MAX_DIM], pad_after[MAX_DIM];
+        for (u32 i = 0; i < ndim; i++) {
+            pad_before[i] = pairs[i*2];
+            pad_after[i] = pairs[i*2+1];
         }
-
+        // Zero-copy: create view with mask
+        u32 id = ctx->tensor_count++;
+        ctx->tensors[id] = *m;
+        ctx->tensors[id].host_ptr = NULL;
+        ctx->tensors[id].view = view_pad(m->view, pad_before, pad_after);
         ctx->tensors[id].creator_op = UOP_PAD;
         ctx->tensors[id].src_ids[0] = src_id;
-        // Store pairs as tensor for backward
         f32 pairs_f[MAX_DIM * 2];
         for (u32 i2 = 0; i2 < ndim * 2; i2++) pairs_f[i2] = (f32)pairs[i2];
         Term pt = thvm_tensor(ctx, pairs_f, SHAPE(ndim * 2));
@@ -224,6 +194,7 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
+    // Lazy fallback
     f32 pairs_f[MAX_DIM * 2];
     for (u32 i = 0; i < ndim * 2; i++) pairs_f[i] = (f32)pairs[i];
     Term pairs_t = thvm_tensor(ctx, pairs_f, SHAPE(ndim * 2));

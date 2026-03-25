@@ -19,6 +19,13 @@ static View view_expand(View v, Shape new_shape) {
     r.shape.dims[i] = new_shape.dims[i];
     r.numel         *= new_shape.dims[i];
   }
+  if (v.has_mask) {
+    r.has_mask = 1;
+    for (u32 i = 0; i < new_shape.rank; i++) {
+      r.mask_begin[i] = v.mask_begin[i];
+      r.mask_end[i] = (v.shape.dims[i] == 1 && new_shape.dims[i] > 1) ? new_shape.dims[i] : v.mask_end[i];
+    }
+  }
   r.contiguous = 0;
   return r;
 }

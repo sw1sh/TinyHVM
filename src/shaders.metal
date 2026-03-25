@@ -15,6 +15,9 @@ struct ViewParams {
     int32_t  offset;
     uint32_t rank;
     uint32_t numel;
+    uint32_t has_mask;
+    uint32_t mask_begin[8];
+    uint32_t mask_end[8];
 };
 
 static inline uint strided_idx(uint flat, constant ViewParams &v) {
@@ -28,6 +31,20 @@ static inline uint strided_idx(uint flat, constant ViewParams &v) {
     return idx;
 }
 
+static inline float masked_read(device const float *buf, uint flat,
+                                 constant ViewParams &v) {
+    if (v.has_mask) {
+        uint rem = flat;
+        for (int d = int(v.rank) - 1; d >= 0; d--) {
+            uint coord = rem % v.shape[d];
+            rem /= v.shape[d];
+            if (coord < v.mask_begin[d] || coord >= v.mask_end[d])
+                return 0.0f;
+        }
+    }
+    return buf[strided_idx(flat, v)];
+}
+
 // ============================================================
 // Unary ops (strided)
 // ============================================================
@@ -38,7 +55,7 @@ kernel void unary_neg(device float *dst [[buffer(0)]],
                       constant ViewParams &sv [[buffer(3)]],
                       uint i [[thread_position_in_grid]]) {
     if (i >= dv.numel) return;
-    dst[i] = -src[strided_idx(i, sv)];
+    dst[i] = -masked_read(src, i, sv);
 }
 
 kernel void unary_relu(device float *dst [[buffer(0)]],
@@ -47,7 +64,7 @@ kernel void unary_relu(device float *dst [[buffer(0)]],
                        constant ViewParams &sv [[buffer(3)]],
                        uint i [[thread_position_in_grid]]) {
     if (i >= dv.numel) return;
-    float val = src[strided_idx(i, sv)];
+    float val = masked_read(src, i, sv);
     dst[i] = val > 0.0f ? val : 0.0f;
 }
 
@@ -57,7 +74,7 @@ kernel void unary_exp(device float *dst [[buffer(0)]],
                       constant ViewParams &sv [[buffer(3)]],
                       uint i [[thread_position_in_grid]]) {
     if (i >= dv.numel) return;
-    dst[i] = exp(src[strided_idx(i, sv)]);
+    dst[i] = exp(masked_read(src, i, sv));
 }
 
 kernel void unary_log(device float *dst [[buffer(0)]],
@@ -66,7 +83,7 @@ kernel void unary_log(device float *dst [[buffer(0)]],
                       constant ViewParams &sv [[buffer(3)]],
                       uint i [[thread_position_in_grid]]) {
     if (i >= dv.numel) return;
-    dst[i] = log(src[strided_idx(i, sv)]);
+    dst[i] = log(masked_read(src, i, sv));
 }
 
 kernel void unary_sqrt(device float *dst [[buffer(0)]],
@@ -75,7 +92,7 @@ kernel void unary_sqrt(device float *dst [[buffer(0)]],
                        constant ViewParams &sv [[buffer(3)]],
                        uint i [[thread_position_in_grid]]) {
     if (i >= dv.numel) return;
-    dst[i] = sqrt(src[strided_idx(i, sv)]);
+    dst[i] = sqrt(masked_read(src, i, sv));
 }
 
 // ============================================================
@@ -90,7 +107,7 @@ kernel void binary_add(device float *dst [[buffer(0)]],
                        constant ViewParams &bv [[buffer(5)]],
                        uint i [[thread_position_in_grid]]) {
     if (i >= dv.numel) return;
-    dst[i] = a[strided_idx(i, av)] + b[strided_idx(i, bv)];
+    dst[i] = masked_read(a, i, av) + masked_read(b, i, bv);
 }
 
 kernel void binary_mul(device float *dst [[buffer(0)]],
@@ -101,7 +118,7 @@ kernel void binary_mul(device float *dst [[buffer(0)]],
                        constant ViewParams &bv [[buffer(5)]],
                        uint i [[thread_position_in_grid]]) {
     if (i >= dv.numel) return;
-    dst[i] = a[strided_idx(i, av)] * b[strided_idx(i, bv)];
+    dst[i] = masked_read(a, i, av) * masked_read(b, i, bv);
 }
 
 kernel void binary_sub(device float *dst [[buffer(0)]],
@@ -112,7 +129,7 @@ kernel void binary_sub(device float *dst [[buffer(0)]],
                        constant ViewParams &bv [[buffer(5)]],
                        uint i [[thread_position_in_grid]]) {
     if (i >= dv.numel) return;
-    dst[i] = a[strided_idx(i, av)] - b[strided_idx(i, bv)];
+    dst[i] = masked_read(a, i, av) - masked_read(b, i, bv);
 }
 
 kernel void binary_div(device float *dst [[buffer(0)]],
@@ -123,8 +140,8 @@ kernel void binary_div(device float *dst [[buffer(0)]],
                        constant ViewParams &bv [[buffer(5)]],
                        uint i [[thread_position_in_grid]]) {
     if (i >= dv.numel) return;
-    float vb = b[strided_idx(i, bv)];
-    dst[i] = vb != 0.0f ? a[strided_idx(i, av)] / vb : 0.0f;
+    float vb = masked_read(b, i, bv);
+    dst[i] = vb != 0.0f ? masked_read(a, i, av) / vb : 0.0f;
 }
 
 kernel void binary_max(device float *dst [[buffer(0)]],
@@ -135,7 +152,7 @@ kernel void binary_max(device float *dst [[buffer(0)]],
                        constant ViewParams &bv [[buffer(5)]],
                        uint i [[thread_position_in_grid]]) {
     if (i >= dv.numel) return;
-    float va = a[strided_idx(i, av)], vb = b[strided_idx(i, bv)];
+    float va = masked_read(a, i, av), vb = masked_read(b, i, bv);
     dst[i] = va > vb ? va : vb;
 }
 
@@ -147,7 +164,7 @@ kernel void binary_cmp(device float *dst [[buffer(0)]],
                        constant ViewParams &bv [[buffer(5)]],
                        uint i [[thread_position_in_grid]]) {
     if (i >= dv.numel) return;
-    float va = a[strided_idx(i, av)], vb = b[strided_idx(i, bv)];
+    float va = masked_read(a, i, av), vb = masked_read(b, i, bv);
     dst[i] = va > vb ? 1.0f : 0.0f;
 }
 

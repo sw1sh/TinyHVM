@@ -15,5 +15,6 @@ static View view_create(Shape s) {
   }
   v.offset      = 0;
   v.contiguous  = 1;
+  v.has_mask    = 0;
   return v;
 }

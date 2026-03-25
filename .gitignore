@@ -55,3 +55,4 @@ test/debug_*.m
 test/bench_*.m
 test/bench_*.py
 test/test_conv.m
+.claude/worktrees/

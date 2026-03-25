@@ -365,6 +365,9 @@ typedef struct {
     i32 offset;             // starting element in buffer
     u32 numel;              // product of shape (logical element count)
     u8  contiguous;         // 1 if standard row-major, no offset
+    u8  has_mask;           // 1 if view has a per-dim valid region mask
+    u32 mask_begin[MAX_DIM]; // per-dim start of valid region
+    u32 mask_end[MAX_DIM];   // per-dim end of valid region
 } View;
 
 typedef struct {

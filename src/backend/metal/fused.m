@@ -68,7 +68,7 @@ static u64 fuse_hash_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
     return h;
 }
 
-// strided_idx: maps flat output index to physical buffer offset using View strides
+// strided_idx + masked_read: maps flat output index to physical buffer offset using View strides
 static const char *strided_idx_helper =
     "inline uint strided_idx(uint flat, constant int *strides, constant uint *shape, int offset, uint rank) {\n"
     "  uint phys = uint(offset);\n"
@@ -77,6 +77,16 @@ static const char *strided_idx_helper =
     "    flat /= shape[d];\n"
     "  }\n"
     "  return phys;\n"
+    "}\n"
+    "inline float masked_read_v(device const float *buf, uint flat, constant VP &v) {\n"
+    "  if (v.has_mask) {\n"
+    "    uint rem = flat;\n"
+    "    for (int d = int(v.rank) - 1; d >= 0; d--) {\n"
+    "      uint c = rem % v.shape[d]; rem /= v.shape[d];\n"
+    "      if (c < v.mask_begin[d] || c >= v.mask_end[d]) return 0.0f;\n"
+    "    }\n"
+    "  }\n"
+    "  return buf[strided_idx(flat, v.strides, v.shape, v.offset, v.rank)];\n"
     "}\n";
 
 static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
@@ -84,7 +94,7 @@ static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
     [src appendString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
 
     // ViewParams struct (must match C side)
-    [src appendString:@"struct VP { int strides[8]; uint shape[8]; int offset; uint rank; uint numel; };\n"];
+    [src appendString:@"struct VP { int strides[8]; uint shape[8]; int offset; uint rank; uint numel; uint has_mask; uint mask_begin[8]; uint mask_end[8]; };\n"];
     [src appendFormat:@"%s\n", strided_idx_helper];
 
     [src appendString:@"kernel void fused_v2(\n"];
@@ -97,10 +107,10 @@ static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
     [src appendString:@"  uint gid [[thread_position_in_grid]])\n{\n"];
     [src appendString:@"  if (gid >= numel) return;\n"];
 
-    // Read leaf inputs: t0..t{n_leaves-1}
+    // Read leaf inputs: t0..t{n_leaves-1} (with mask support)
     for (u32 i = 0; i < n_leaves; i++)
-        [src appendFormat:@"  float t%u = in%u[strided_idx(gid, v%u.strides, v%u.shape, v%u.offset, v%u.rank)];\n",
-            i, i, i, i, i, i];
+        [src appendFormat:@"  float t%u = masked_read_v(in%u, gid, v%u);\n",
+            i, i, i];
 
     // Apply ops
     for (u32 i = 0; i < n_ops; i++) {

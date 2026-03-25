@@ -667,7 +667,7 @@ inet_step:
                     }
                     case UOP_PAD: {
                         // b is a 1D tensor: [before0, after0, before1, after1, ...]
-                        // PAD requires physical copy: alloc zeroed buffer, copy src into it
+                        // Zero-copy: use view_pad to set mask on the view
                         assert(b_id);
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 n_pairs = mb->view.numel;
@@ -679,54 +679,8 @@ inet_step:
                             pad_after[i]  = (u32)pairs[i * 2 + 1];
                         }
                         free(pairs);
-
-                        // Compute padded shape
-                        Shape ps = {.rank = ma->view.shape.rank};
-                        u32 numel = 1;
-                        for (u32 i = 0; i < ps.rank; i++) {
-                            ps.dims[i] = ma->view.shape.dims[i] + pad_before[i] + pad_after[i];
-                            numel *= ps.dims[i];
-                        }
-
-                        // Allocate zeroed output
-                        u32 dst_id = tensor_create(ctx, ps, ma->dtype);
-                        TensorMeta *md = &ctx->tensors[dst_id];
-
-                        if (ctx->backend) {
-                            u32 src_numel = ma->view.numel;
-                            f32 *src_data = malloc(src_numel * sizeof(f32));
-                            f32 *dst_data = calloc(numel, sizeof(f32));
-                            ctx->backend->buf_read(ma->buf_id, src_data, src_numel * sizeof(f32));
-
-                            // Scatter src into padded dst at offset
-                            for (u32 flat = 0; flat < src_numel; flat++) {
-                                u32 coords[MAX_DIM], rem = flat;
-                                for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
-                                    coords[d] = rem % ma->view.shape.dims[d];
-                                    rem /= ma->view.shape.dims[d];
-                                }
-                                u32 dst_idx = 0, stride = 1;
-                                for (int d = (int)ps.rank - 1; d >= 0; d--) {
-                                    dst_idx += (coords[d] + pad_before[d]) * stride;
-                                    stride *= ps.dims[d];
-                                }
-                                dst_data[dst_idx] = src_data[flat];
-                            }
-
-                            ctx->backend->buf_write(md->buf_id, dst_data, numel * sizeof(f32));
-                            free(src_data);
-                            free(dst_data);
-                        }
-
-                        // Record provenance
-                        if (ma->requires_grad) {
-                            md->requires_grad = 1;
-                            md->creator_op = uop;
-                            md->src_ids[0] = a_id;
-                            md->src_ids[1] = b_id;
-                        }
-                        ctx->itrs++;
-                        RETURN_REDUCED(term_ten(dst_id, ma->dtype));
+                        new_view = view_pad(ma->view, pad_before, pad_after);
+                        break;
                     }
                     default:
                         assert(0 && "unknown movement op");

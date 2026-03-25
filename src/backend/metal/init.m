@@ -50,6 +50,9 @@ typedef struct {
     int32_t  offset;
     uint32_t rank;
     uint32_t numel;
+    uint32_t has_mask;
+    uint32_t mask_begin[8];
+    uint32_t mask_end[8];
 } ViewParams;
 
 static ViewParams view_to_params(const View *v) {
@@ -57,9 +60,12 @@ static ViewParams view_to_params(const View *v) {
     p.offset = v->offset;
     p.rank   = v->shape.rank;
     p.numel  = v->numel;
+    p.has_mask = v->has_mask;
     for (u32 i = 0; i < v->shape.rank; i++) {
         p.strides[i] = v->strides[i];
         p.shape[i]   = v->shape.dims[i];
+        p.mask_begin[i] = v->mask_begin[i];
+        p.mask_end[i] = v->mask_end[i];
     }
     return p;
 }

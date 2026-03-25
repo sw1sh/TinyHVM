@@ -495,11 +495,8 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
             break;
         }
         case UOP_BATCHNORM: {
-            { f32 *dyd = thvm_to_host(ctx, term_ten(gy_id, DTYPE_F32));
-              fprintf(stderr, "BN bw: y=%u gy=%u gy[0..3]=[%.4f,%.4f,%.4f,%.4f] x=%u\n",
-                y_id, gy_id, dyd[0], dyd[1], dyd[2], dyd[3], my->bn_x_id);
-            }
-            // CPU BN backward: recompute x_hat and std from x (avoids stale tensor ID issues).
+            // CPU BN backward using STORED x_hat and inv_std from forward.
+            // Recomputation from x gives different mean/var due to IC term consumption.
             u32 x_id = my->bn_x_id;
             u32 gamma_id = my->bn_gamma_id;
             u32 beta_id2 = my->bn_beta_id;
@@ -507,41 +504,26 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
             u32 H = my->view.shape.dims[2], W = my->view.shape.dims[3];
             u32 N = B * H * W, total = B * C * H * W;
             f32 *dy = thvm_to_host(ctx, term_ten(gy_id, DTYPE_F32));
-            // Read x fresh from GPU (invalidate any stale host cache)
-            if (ctx->tensors[x_id].host_ptr) { free(ctx->tensors[x_id].host_ptr); ctx->tensors[x_id].host_ptr = NULL; }
-            f32 *x_data = thvm_to_host(ctx, term_ten(x_id, DTYPE_F32));
             f32 *gam = thvm_to_host(ctx, term_ten(gamma_id, DTYPE_F32));
-            f32 eps_bn = 1e-5f;
+            f32 *xhat = thvm_to_host(ctx, term_ten(my->bn_x_hat_id, DTYPE_F32));
+            f32 *std_v = thvm_to_host(ctx, term_ten(my->bn_inv_std_id, DTYPE_F32));
 
-            // Recompute per-channel mean, var, std, x_hat from x
-            f32 *mean_c = calloc(C, sizeof(f32));
-            f32 *var_c = calloc(C, sizeof(f32));
-            for (u32 b=0;b<B;b++) for (u32 c=0;c<C;c++) for (u32 hw=0;hw<H*W;hw++)
-                mean_c[c] += x_data[(b*C+c)*H*W+hw];
-            for (u32 c=0;c<C;c++) mean_c[c] /= (f32)N;
-            for (u32 b=0;b<B;b++) for (u32 c=0;c<C;c++) for (u32 hw=0;hw<H*W;hw++) {
-                f32 d = x_data[(b*C+c)*H*W+hw] - mean_c[c];
-                var_c[c] += d*d;
-            }
-            for (u32 c=0;c<C;c++) var_c[c] /= (f32)N;
-            f32 *std_c = malloc(C*sizeof(f32));
-            f32 *xhat = malloc(total*sizeof(f32));
-            for (u32 c=0;c<C;c++) std_c[c] = sqrtf(var_c[c] + eps_bn);
-            for (u32 b=0;b<B;b++) for (u32 c=0;c<C;c++) for (u32 hw=0;hw<H*W;hw++)
-                xhat[(b*C+c)*H*W+hw] = (x_data[(b*C+c)*H*W+hw] - mean_c[c]) / std_c[c];
-
-            // BN backward
+            // Per-channel sums using stored x_hat
             f32 *s_dy = calloc(C, sizeof(f32)), *s_dxh = calloc(C, sizeof(f32));
             f32 *dg = calloc(C, sizeof(f32));
             for (u32 b=0;b<B;b++) for (u32 c=0;c<C;c++) for (u32 hw=0;hw<H*W;hw++) {
                 u32 i2 = (b*C+c)*H*W+hw;
                 s_dy[c] += dy[i2]; s_dxh[c] += dy[i2]*xhat[i2]; dg[c] += dy[i2]*xhat[i2];
             }
+            // dx = (gamma/std) * (1/N) * (N*dy - sum_dy - x_hat*sum_dy_xhat)
             f32 *dxd = malloc(total*sizeof(f32));
             f32 inv_N = 1.0f/(f32)N;
-            for (u32 b=0;b<B;b++) for (u32 c=0;c<C;c++) for (u32 hw=0;hw<H*W;hw++) {
-                u32 i2 = (b*C+c)*H*W+hw;
-                dxd[i2] = (gam[c]/std_c[c])*inv_N*((f32)N*dy[i2] - s_dy[c] - xhat[i2]*s_dxh[c]);
+            for (u32 b=0;b<B;b++) for (u32 c=0;c<C;c++) {
+                f32 std_c = std_v[c*H*W]; // broadcast: all elements in channel c share same std
+                for (u32 hw=0;hw<H*W;hw++) {
+                    u32 i2 = (b*C+c)*H*W+hw;
+                    dxd[i2] = (gam[c]/std_c)*inv_N*((f32)N*dy[i2] - s_dy[c] - xhat[i2]*s_dxh[c]);
+                }
             }
             u32 dx_id = tensor_create(ctx, my->view.shape, DTYPE_F32);
             ctx->backend->buf_write(ctx->tensors[dx_id].buf_id, dxd, total*sizeof(f32));
@@ -552,7 +534,6 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
             u32 db_id = tensor_create(ctx, ctx->tensors[beta_id2].view.shape, DTYPE_F32);
             ctx->backend->buf_write(ctx->tensors[db_id].buf_id, s_dy, C*sizeof(f32));
             grad_accum(ctx, ga, beta_id2, db_id);
-            free(mean_c); free(var_c); free(std_c); free(xhat);
             free(dxd); free(s_dy); free(s_dxh); free(dg);
             break;
         }

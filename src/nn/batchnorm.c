@@ -63,12 +63,12 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
     f32 eps_f = eps;
     Term eps_bc = thvm_expand(ctx, thvm_tensor(ctx, &eps_f, SHAPE(1)), SHAPE(C));
     Term var_eps = thvm_op(ctx, UOP_ADD, var_t, eps_bc);
+    Term std_t = thvm_reduce(ctx, thvm_op(ctx, UOP_SQRT, var_eps, term_era())); // [C]
     Term inv_std = thvm_expand(ctx,
-        thvm_reshape(ctx, thvm_op(ctx, UOP_SQRT, var_eps, term_era()),
-                     SHAPE(1, C, 1, 1)),
+        thvm_reshape(ctx, std_t, SHAPE(1, C, 1, 1)),
         (Shape){.dims={B,C,H,W}, .rank=4});
-    Term x_hat = thvm_reduce(ctx, thvm_op(ctx, UOP_DIV, centered, inv_std));
-    Term inv_std_r = thvm_reduce(ctx, inv_std);  // cache for backward
+    Term inv_std_r = thvm_reduce(ctx, inv_std);
+    Term x_hat = thvm_reduce(ctx, thvm_op(ctx, UOP_DIV, centered, inv_std_r));
 
     // Scale + shift: gamma * x_hat + beta
     Term gamma_bc = thvm_expand(ctx,

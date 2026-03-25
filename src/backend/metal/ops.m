@@ -2,7 +2,7 @@
 
 static u32 fast_dispatch_count = 0, slow_dispatch_count = 0;
 
-// Check if view is truly contiguous for fast-path (offset=0, standard strides, no mask)
+// Check if view is truly contiguous (offset=0, standard strides, no mask, no stride-0)
 static int is_fast_view(const View *v) {
     if (v->offset != 0 || v->has_mask) return 0;
     i32 expected = 1;
@@ -15,12 +15,19 @@ static int is_fast_view(const View *v) {
     return 1;
 }
 
+// Check if view has stride-0 (broadcast) dims
+static int has_broadcast(const View *v) {
+    for (u32 d = 0; d < v->shape.rank; d++)
+        if (v->shape.dims[d] > 1 && v->strides[d] == 0) return 1;
+    return 0;
+}
+
 static void metal_op_unary(u32 uop, u32 dst, const View *dv,
                             u32 src, const View *sv) {
     u64 t0 = thvm_prof_tick();
 
-    // Fast path: contiguous input, direct indexing (no ViewParams overhead)
     if (is_fast_view(sv)) {
+        // Fast path: direct indexing
         id<MTLComputePipelineState> fpipe = nil;
         switch (uop) {
             case UOP_NEG:  fpipe = fpipe_neg;  break;
@@ -31,7 +38,6 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
             default: break;
         }
         if (fpipe) {
-            fast_dispatch_count++;
             u32 n = dv->numel;
             id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
             const void *params[] = { &n };
@@ -41,9 +47,8 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
             return;
         }
     }
-    slow_dispatch_count++;
 
-    // Slow path: strided ViewParams
+    // Slow path: strided ViewParams (broadcast, permuted, masked)
     id<MTLComputePipelineState> pipe = nil;
     switch (uop) {
         case UOP_NEG:  pipe = pipe_neg;  break;
@@ -65,31 +70,27 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
 static void metal_op_binary(u32 uop, u32 dst, const View *dv,
                              u32 a, const View *av, u32 b, const View *bv) {
     u64 t0 = thvm_prof_tick();
-
-    // Fast path: both inputs contiguous, no broadcast
-    if (is_fast_view(av) && is_fast_view(bv) && av->numel == bv->numel) {
-        id<MTLComputePipelineState> fpipe = nil;
-        switch (uop) {
-            case UOP_ADD: fpipe = fpipe_add; break;
-            case UOP_MUL: fpipe = fpipe_mul; break;
-            case UOP_SUB: fpipe = fpipe_sub; break;
-            case UOP_DIV: fpipe = fpipe_div; break;
-            case UOP_MAX: fpipe = fpipe_max; break;
-            case UOP_CMP: fpipe = fpipe_cmp; break;
-            default: break;
-        }
-        if (fpipe) {
-            fast_dispatch_count++;
-            u32 n = dv->numel;
-            id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
-            const void *params[] = { &n };
-            u64 psizes[] = { sizeof(u32) };
-            dispatch_1d(fpipe, bufs, 3, params, psizes, 1, n);
-            thvm_prof_record(uop, t0);
-            return;
-        }
+    id<MTLComputePipelineState> fpipe = nil;
+    switch (uop) {
+        case UOP_ADD: fpipe = fpipe_add; break;
+        case UOP_MUL: fpipe = fpipe_mul; break;
+        case UOP_SUB: fpipe = fpipe_sub; break;
+        case UOP_DIV: fpipe = fpipe_div; break;
+        case UOP_MAX: fpipe = fpipe_max; break;
+        case UOP_CMP: fpipe = fpipe_cmp; break;
+        default: return;
     }
-    slow_dispatch_count++;
+
+    // Fast path: both inputs contiguous, same numel
+    if (is_fast_view(av) && is_fast_view(bv) && av->numel == bv->numel) {
+        u32 n = dv->numel;
+        id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
+        const void *params[] = { &n };
+        u64 psizes[] = { sizeof(u32) };
+        dispatch_1d(fpipe, bufs, 3, params, psizes, 1, n);
+        thvm_prof_record(uop, t0);
+        return;
+    }
 
     // Slow path: strided ViewParams with broadcast support
     id<MTLComputePipelineState> pipe = nil;
@@ -111,11 +112,11 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
     dispatch_1d(pipe, bufs, 3, params, psizes, 3, dv->numel);
     thvm_prof_record(uop, t0);
 }
+
 static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
                          u32 M, u32 K, u32 N) {
     u64 t0 = thvm_prof_tick();
 
-    // Contiguify non-contiguous inputs on GPU (no CPU round-trip)
     u32 buf_a_id = a, buf_b_id = b;
     if (!av->contiguous) {
         u32 n = M * K;
@@ -130,16 +131,9 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
         buf_b_id = tmp;
     }
 
-    // End compute encoder (MPS needs its own encoding), keep command buffer
-    if (batch_encoder) {
-        [batch_encoder endEncoding];
-        batch_encoder = nil;
-    }
-
-    // Ensure we have a command buffer
+    if (batch_encoder) { [batch_encoder endEncoding]; batch_encoder = nil; }
     if (!batch_cmd) batch_cmd = [mtl_queue commandBuffer];
 
-    // Encode MPS matmul on the SAME command buffer — no commit, no wait
     MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
         matrixDescriptorWithRows:M columns:K rowBytes:K*sizeof(float)
         dataType:MPSDataTypeFloat32];
@@ -161,8 +155,6 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
 
     [mm encodeToCommandBuffer:batch_cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
     batch_dirty = 1;
-    // Next dispatch_1d will lazily create a new compute encoder via get_encoder()
-
     thvm_prof_record(UOP_MM, t0);
 }
 

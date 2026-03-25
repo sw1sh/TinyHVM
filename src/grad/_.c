@@ -398,6 +398,12 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
         case UOP_EXPAND: {
             // EXPAND backward = sum over broadcast axes.
             // Use mul_reduce_sum(gy, ones=1, axes) on GPU to avoid CPU multi-axis SUM.
+            // If gy has a mask, fall back to sum_to_shape (mask-aware CPU path)
+            if (ctx->tensors[gy_id].view.has_mask) {
+                Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
+                grad_accum(ctx, ga, aid, fuse_or_reduce(ctx, da));
+                break;
+            }
             u32 rn_e = 0;
             u32 rdims_e[MAX_DIM], rstrides_gy_e[MAX_DIM], rstrides_ones_e[MAX_DIM];
             View gy_v_e = ctx->tensors[gy_id].view;
@@ -415,9 +421,9 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
                     f32 one_val = 1.0f;
                     u32 ones_buf = ctx->backend->buf_alloc(sizeof(f32));
                     ctx->backend->buf_write(ones_buf, &one_val, sizeof(f32));
-                    View ones_v = ctx->tensors[gy_id].view;  // same rank as gy
+                    View ones_v = view_create(gy_v_e.shape);  // same shape as gy, no mask
                     for (u32 d2=0; d2<ones_v.shape.rank; d2++) ones_v.strides[d2] = 0;
-                    ones_v.offset = 0; ones_v.contiguous = 0;
+                    ones_v.offset = 0; ones_v.contiguous = 0; ones_v.has_mask = 0;
                     u32 da_id = tensor_create(ctx, ma->view.shape, DTYPE_F32);
                     View da_ov = view_create(ma->view.shape);
                     metal_mul_reduce_sum(

@@ -65,6 +65,7 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
     }
 
     // x.batchnorm(gamma, beta, batch_mean, (batch_var + eps).rsqrt())
+    // Live mean in output path (gradient flows through mean for BN backward correction)
     Term mean_bc = thvm_expand(ctx, thvm_reshape(ctx, batch_mean, SHAPE(1,C,1,1)),
         (Shape){.dims={B,C,H,W},.rank=4});
     Term eps_bc = thvm_expand(ctx, thvm_tensor(ctx, &eps_val, SHAPE(1)), SHAPE(C));

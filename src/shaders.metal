@@ -540,7 +540,12 @@ kernel void mul_reduce_sum(device float *dst [[buffer(0)]],
             off_a += rc * rp.reduce_strides_a[ri];
             off_b += rc * rp.reduce_strides_b[ri];
         }
-        acc += a[base_a + off_a] * b[base_b + off_b];
+        // Mask check for a and b
+        float va = a[base_a + off_a];
+        float vb = b[base_b + off_b];
+        // TODO: add full mask checking for mul_reduce_sum inputs
+        // For now, inputs with masks should be materialized before reaching this kernel
+        acc += va * vb;
     }
     dst[i] = acc;
 }

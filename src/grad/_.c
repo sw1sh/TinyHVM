@@ -293,73 +293,6 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
             grad_accum(ctx, ga, aid, reduce_id(ctx, da));
             break;
         }
-        case UOP_POOL_GATHER: {
-            // POOL_GATHER backward: scatter-add, exact inverse of forward gather.
-            // Forward: dst[batch, oh, ow, kh, kw] = src[batch, oh*s+kh, ow*s+kw]
-            // Backward: d_src[batch, oh*s+kh, ow*s+kw] += d_dst[batch, oh, ow, kh, kw]
-            TensorMeta *mp = &ctx->tensors[bid];
-            u32 plen = mp->view.numel;
-            f32 *pf = malloc(plen * sizeof(f32));
-            ctx->backend->buf_read(mp->buf_id, pf, plen*sizeof(f32));
-            u32 ns=(u32)pf[0], pk[2],ps[2],pi[2],po[2],pbd;
-            for (u32 j=0;j<ns;j++){pk[j]=(u32)pf[1+j];ps[j]=(u32)pf[1+ns+j];pi[j]=(u32)pf[1+2*ns+j];po[j]=(u32)pf[1+3*ns+j];}
-            pbd=(u32)pf[1+4*ns]; free(pf);
-            assert(ns==2);
-
-            if (ps[0]==pk[0]&&ps[1]==pk[1]) {
-                // Simple path (k == stride): just permute + reshape
-                u32 pa[MAX_DIM];
-                for(u32 j=0;j<pbd;j++)pa[j]=j;
-                pa[pbd]=pbd;pa[pbd+1]=pbd+2;pa[pbd+2]=pbd+1;pa[pbd+3]=pbd+3;
-                Term da = thvm_reshape(ctx,thvm_permute(ctx,gy,pa,pbd+4),ma->view.shape);
-                grad_accum(ctx, ga, aid, reduce_id(ctx, da));
-            } else {
-                // Complex path (k > stride): CPU scatter-add matching the forward gather
-                u32 ndim_in = ma->view.shape.rank;
-                u32 ndim_out = my->view.shape.rank;
-
-                // Read d_output (gy) — must use thvm_to_host for strided/view tensors
-                u32 out_numel = my->view.numel;
-                f32 *d_out_host = thvm_to_host(ctx, term_ten(gy_id, DTYPE_F32));
-                f32 *d_out = malloc(out_numel * sizeof(f32));
-                memcpy(d_out, d_out_host, out_numel * sizeof(f32));
-
-                // Zero d_input
-                u32 in_numel = ma->view.numel;
-                f32 *d_in = calloc(in_numel, sizeof(f32));
-
-                // Scatter-add: iterate over d_output, accumulate to d_input
-                u32 *out_dims = my->view.shape.dims;
-                for (u32 flat = 0; flat < out_numel; flat++) {
-                    u32 coords[MAX_DIM], rem = flat;
-                    for (int d = (int)ndim_out - 1; d >= 0; d--) {
-                        coords[d] = rem % out_dims[d];
-                        rem /= out_dims[d];
-                    }
-                    // Map output coords to input coords (same as forward gather)
-                    u32 src_idx = 0, src_stride = 1;
-                    for (int d = (int)ndim_in - 1; d >= 0; d--) {
-                        u32 coord;
-                        if ((u32)d < pbd) {
-                            coord = coords[d];  // batch dims pass through
-                        } else {
-                            u32 si = (u32)d - pbd;
-                            coord = coords[pbd + si] * ps[si] + coords[pbd + ns + si];
-                        }
-                        src_idx += coord * src_stride;
-                        src_stride *= ma->view.shape.dims[d];
-                    }
-                    d_in[src_idx] += d_out[flat];
-                }
-
-                // Write result
-                u32 da_id = tensor_create(ctx, ma->view.shape, ma->dtype);
-                ctx->backend->buf_write(ctx->tensors[da_id].buf_id, d_in, in_numel * sizeof(f32));
-                free(d_out); free(d_in);
-                grad_accum(ctx, ga, aid, da_id);
-            }
-            break;
-        }
         case UOP_FUSING: {
             // Fused SUM(MUL(a, b)) backward using mul_reduce_sum directly.
             // d_a = mul_reduce_sum(expand(gy), b, axes_for_a)
@@ -492,49 +425,6 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
                 }
                 grad_accum(ctx, ga, mb_id, db_id);
             }
-            break;
-        }
-        case UOP_BATCHNORM: {
-            // CPU BN backward using STORED x_hat and inv_std from forward.
-            // Recomputation from x gives different mean/var due to IC term consumption.
-            u32 x_id = my->bn_x_id;
-            u32 gamma_id = my->bn_gamma_id;
-            u32 beta_id2 = my->bn_beta_id;
-            u32 B = my->view.shape.dims[0], C = my->view.shape.dims[1];
-            u32 H = my->view.shape.dims[2], W = my->view.shape.dims[3];
-            u32 N = B * H * W, total = B * C * H * W;
-            f32 *dy = thvm_to_host(ctx, term_ten(gy_id, DTYPE_F32));
-            f32 *gam = thvm_to_host(ctx, term_ten(gamma_id, DTYPE_F32));
-            f32 *xhat = thvm_to_host(ctx, term_ten(my->bn_x_hat_id, DTYPE_F32));
-            f32 *std_v = thvm_to_host(ctx, term_ten(my->bn_inv_std_id, DTYPE_F32));
-
-            // Per-channel sums using stored x_hat
-            f32 *s_dy = calloc(C, sizeof(f32)), *s_dxh = calloc(C, sizeof(f32));
-            f32 *dg = calloc(C, sizeof(f32));
-            for (u32 b=0;b<B;b++) for (u32 c=0;c<C;c++) for (u32 hw=0;hw<H*W;hw++) {
-                u32 i2 = (b*C+c)*H*W+hw;
-                s_dy[c] += dy[i2]; s_dxh[c] += dy[i2]*xhat[i2]; dg[c] += dy[i2]*xhat[i2];
-            }
-            // dx = (gamma/std) * (1/N) * (N*dy - sum_dy - x_hat*sum_dy_xhat)
-            f32 *dxd = malloc(total*sizeof(f32));
-            f32 inv_N = 1.0f/(f32)N;
-            for (u32 b=0;b<B;b++) for (u32 c=0;c<C;c++) {
-                f32 std_c = std_v[c*H*W]; // broadcast: all elements in channel c share same std
-                for (u32 hw=0;hw<H*W;hw++) {
-                    u32 i2 = (b*C+c)*H*W+hw;
-                    dxd[i2] = (gam[c]/std_c)*inv_N*((f32)N*dy[i2] - s_dy[c] - xhat[i2]*s_dxh[c]);
-                }
-            }
-            u32 dx_id = tensor_create(ctx, my->view.shape, DTYPE_F32);
-            ctx->backend->buf_write(ctx->tensors[dx_id].buf_id, dxd, total*sizeof(f32));
-            grad_accum(ctx, ga, x_id, dx_id);
-            u32 dg_id = tensor_create(ctx, ctx->tensors[gamma_id].view.shape, DTYPE_F32);
-            ctx->backend->buf_write(ctx->tensors[dg_id].buf_id, dg, C*sizeof(f32));
-            grad_accum(ctx, ga, gamma_id, dg_id);
-            u32 db_id = tensor_create(ctx, ctx->tensors[beta_id2].view.shape, DTYPE_F32);
-            ctx->backend->buf_write(ctx->tensors[db_id].buf_id, s_dy, C*sizeof(f32));
-            grad_accum(ctx, ga, beta_id2, db_id);
-            free(dxd); free(s_dy); free(s_dxh); free(dg);
             break;
         }
         default:

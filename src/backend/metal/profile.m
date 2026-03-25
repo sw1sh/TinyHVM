@@ -30,13 +30,11 @@ static void metal_profile_report(void) {
     u32 total_uop_cnt = 0;
     u32 total_uop_tens = 0;
     const char *ext_uop_names[] = {
-        [UOP_POOL_GATHER] = "POOL_G"
     };
     for (u32 i = 0; i < PROF_UOP_MAX; i++) {
         if (thvm_prof_global.uop_cnt[i] == 0 && thvm_prof_global.uop_tensors[i] == 0) continue;
         const char *name = "?";
         if (i < UOP_COUNT && i < sizeof(uop_names)/sizeof(uop_names[0])) name = uop_names[i];
-        else if (i == UOP_POOL_GATHER) name = "POOL_G";
         f32 total_ms = (f32)thvm_prof_global.uop_ns[i] / 1e6f;
         f32 avg_us = thvm_prof_global.uop_cnt[i] ?
             (f32)thvm_prof_global.uop_ns[i] / (f32)thvm_prof_global.uop_cnt[i] / 1e3f : 0;

@@ -276,50 +276,6 @@ inet_step:
                             free(sf);
                             GRAD_STEP(GRAD3(at, thvm_pad(ctx, gy, pp, nd), x));
                         }
-                        case UOP_POOL_GATHER: {
-                            TensorMeta *mp = &ctx->tensors[bid];
-                            u32 plen = mp->view.numel;
-                            f32 *pf = malloc(plen * sizeof(f32));
-                            ctx->backend->buf_read(mp->buf_id, pf, plen*sizeof(f32));
-                            u32 ns=(u32)pf[0], pk[2],ps[2],pi[2],po[2],pbd;
-                            for (u32 j=0;j<ns;j++){pk[j]=(u32)pf[1+j];ps[j]=(u32)pf[1+ns+j];pi[j]=(u32)pf[1+2*ns+j];po[j]=(u32)pf[1+3*ns+j];}
-                            pbd=(u32)pf[1+4*ns]; free(pf);
-                            assert(ns==2);
-                            if (ps[0]==pk[0]&&ps[1]==pk[1]) {
-                                u32 pa[MAX_DIM];
-                                for(u32 j=0;j<pbd;j++)pa[j]=j;
-                                pa[pbd]=pbd;pa[pbd+1]=pbd+2;pa[pbd+2]=pbd+1;pa[pbd+3]=pbd+3;
-                                GRAD_STEP(GRAD3(at,
-                                    thvm_reshape(ctx,thvm_permute(ctx,gy,pa,pbd+4),ma->view.shape),x));
-                            } else {
-                                // Complex path: direct CPU scatter-add
-                                Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
-                                u32 gy_rid = (u32)term_val(gy_r);
-                                u32 ndim_in = ma->view.shape.rank;
-                                u32 ndim_out = my->view.shape.rank;
-                                u32 out_numel = my->view.numel;
-                                f32 *d_out_host = thvm_to_host(ctx, gy_r);
-                                f32 *d_out = malloc(out_numel * sizeof(f32));
-                                memcpy(d_out, d_out_host, out_numel * sizeof(f32));
-                                u32 in_numel = ma->view.numel;
-                                f32 *d_in = calloc(in_numel, sizeof(f32));
-                                u32 *od = my->view.shape.dims;
-                                for (u32 flat=0; flat<out_numel; flat++) {
-                                    u32 coords[MAX_DIM], rem=flat;
-                                    for(int d=(int)ndim_out-1;d>=0;d--){coords[d]=rem%od[d];rem/=od[d];}
-                                    u32 si2=0, ss=1;
-                                    for(int d=(int)ndim_in-1;d>=0;d--){
-                                        u32 c = ((u32)d<pbd) ? coords[d] : coords[pbd+((u32)d-pbd)]*ps[(u32)d-pbd]+coords[pbd+ns+((u32)d-pbd)];
-                                        si2+=c*ss; ss*=ma->view.shape.dims[d];
-                                    }
-                                    d_in[si2]+=d_out[flat];
-                                }
-                                u32 dx_id = tensor_create(ctx, ma->view.shape, ma->dtype);
-                                ctx->backend->buf_write(ctx->tensors[dx_id].buf_id, d_in, in_numel*sizeof(f32));
-                                free(d_out); free(d_in);
-                                GRAD_STEP(GRAD3(at, term_ten(dx_id, ma->dtype), x));
-                            }
-                        }
                         default: {
                             // Unknown op → zero
                             u32 zid = tensor_fill(ctx, my->view.shape, 0.0f);

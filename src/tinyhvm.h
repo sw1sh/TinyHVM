@@ -123,19 +123,18 @@ typedef u64 Term;
                           // counter==0 → zero_case; counter>0 → APP(succ_lam, counter-1)
 #define UOP_LOG_PRINT 27  // print scalar tensor value, return tensor unchanged
 
-#define UOP_COUNT     28
+#define UOP_GRAD      28   // IC gradient: DUP-op interaction in the reducer
+#define UOP_COUNT     29
 
-// Internal ops — not part of tinyspec, only used for autograd provenance
-#define UOP_POOL_GATHER 100  // sliding window gather (im2col equivalent)
-#define UOP_GRAD        101  // IC gradient: DUP-op interaction in the reducer
-#define UOP_BATCHNORM   102  // composite BN with dedicated backward formula
+// (LAYER_OP_POOL_GATHER and LAYER_OP_BATCHNORM removed — both are now
+// composed from standard UOps with standard backward rules.)
 
 // UOp name table (device-agnostic)
 static const char *uop_names[] = {
     "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
     "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","FUSING","ASSIGN","WHERE",
-    "IFZ","LOG_PRINT"
+    "IFZ","LOG_PRINT","GRAD"
 };
 
 // ============================================================
@@ -384,14 +383,6 @@ typedef struct {
     u64         fusing_loc; // heap loc of the original subnet root TAG_TOP
     u32         fusing_uop; // UOP of the subnet root (e.g. UOP_SUM)
 
-    // BatchNorm metadata (only when creator_op == UOP_BATCHNORM)
-    // src_ids[0] = x (input), src_ids[1] = gamma
-    u32         bn_x_hat_id;  // x_hat tensor for backward
-    u32         bn_inv_std_id; // inv_std tensor for backward
-    u32         bn_count;      // B*H*W
-    u32         bn_x_id;       // original input x
-    u32         bn_gamma_id;   // gamma weight
-    u32         bn_beta_id;    // beta weight
 } TensorMeta;
 
 
@@ -535,9 +526,9 @@ typedef struct {
     LayerType type;
     union {
         struct { Term w, b; u32 ci, co, k; }    conv;
-        struct { Term gamma, beta, rmean, rvar; u32 c; } bn;
+        struct { Term gamma, beta, rmean, rvar; u32 c, h, w; } bn;
         struct { u32 ks; }                       pool;
-        struct { u32 from_dim; }                  flat;
+        struct { u32 flat_features; }             flat;
         struct { Term w, b; u32 in_f, out_f; }   lin;
         LayerFn fn;
     };

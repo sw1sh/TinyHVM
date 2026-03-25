@@ -1,4 +1,6 @@
 // nn/sequential.c — Sequential model composition
+// No thvm_reduce calls — layers compose lazily where possible.
+// BN is inherently eager (training stats + stored tensor IDs for backward).
 
 Term thvm_sequential(TinyHVM *ctx, Term x, Layer *layers, u32 n,
                      u32 BS, int training) {
@@ -13,14 +15,11 @@ Term thvm_sequential(TinyHVM *ctx, Term x, Layer *layers, u32 n,
                 break;
             }
             case LAYER_BN: {
-                Term xr = thvm_reduce(ctx, x);
-                TensorMeta *mx = &ctx->tensors[(u32)term_val(xr)];
-                u32 C = mx->view.shape.dims[1];
-                u32 H = mx->view.shape.dims[2];
-                u32 W = mx->view.shape.dims[3];
-                x = batchnorm_term(ctx, xr,
+                // BN needs shapes from layer struct, not from tensor reduction.
+                // BN forward is eager internally (running stats + backward tensor IDs).
+                x = batchnorm_term(ctx, x,
                     l->bn.gamma, l->bn.beta, l->bn.rmean, l->bn.rvar,
-                    BS, C, H, W, training);
+                    BS, l->bn.c, l->bn.h, l->bn.w, training);
                 break;
             }
             case LAYER_MAXPOOL: {
@@ -30,10 +29,8 @@ Term thvm_sequential(TinyHVM *ctx, Term x, Layer *layers, u32 n,
                 break;
             }
             case LAYER_FLATTEN: {
-                Term xr = thvm_reduce(ctx, x);
-                TensorMeta *mx = &ctx->tensors[(u32)term_val(xr)];
-                u32 numel = mx->view.numel / BS;
-                x = thvm_reshape(ctx, xr, SHAPE(BS, numel));
+                // Use layer-provided feature count — no thvm_reduce needed.
+                x = thvm_reshape(ctx, x, SHAPE(BS, l->flat.flat_features));
                 break;
             }
             case LAYER_LINEAR: {

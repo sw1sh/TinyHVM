@@ -320,125 +320,90 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
     Term t = xr;
 
     if (need_complex) {
-        // Differentiable path using only traceable UOps:
-        // For each spatial dim j with k > s:
-        //   Create k_j shifted copies via shrink, each of size o_j
-        //   Stack along new kernel dimension
-        //
-        // For conv2d (s=1): x[b,c, oh+kh, ow+kw] for each (kh,kw)
-        // = shrink x along spatial dims to [oh+kh : oh+kh + 1] for each kernel pos
-        //
-        // Strategy: process one spatial dim at a time.
-        // For dim j: reshape to (..., i_j) then for each k in 0..k_j-1,
-        //   shrink to [k, k+o_j) to get shifted copy of size o_j
-        //   pad to full size i_j with zeros, accumulate via reshape
-        // Finally reshape to (..., o_j, k_j)
-        //
-        // Simpler: for 2D conv (the common case), create the full [BS, Cin, OH, OW, KH, KW]
-        // tensor by iterating over kernel positions and writing shrunk slices.
-        // Each shrink IS differentiable (has gradient rule now).
+        // Tinygrad's _pool pattern: repeat → shrink → reshape → shrink → reshape → permute
+        // All standard UOps — backward flows through standard rules, no special POOL_GATHER op.
+        // See tinygrad tensor.py _pool() lines 2285-2296
+        assert(n_spatial == 2);
 
-        // For 2D spatial: iterate over (kh, kw), shrink input for each position
-        assert(n_spatial == 2);  // 2D pooling for now
-        u32 bs_dims[MAX_DIM];
-        for (u32 j = 0; j < bd; j++) bs_dims[j] = mx->view.shape.dims[j];
+        // f_ = scaling factors (always 1 for s=1, d=1)
+        u32 f_[2];
+        for (u32 j = 0; j < n_spatial; j++)
+            f_[j] = 1 + (o_[j] * s_[j] > (i_[j] - (k_[j] - 1)) ? 1 : 0);
 
-        // We need: result[batch, o0, o1, k0, k1] = x[batch, o0*s0+k0, o1*s1+k1]
-        // Build by creating k0*k1 shrunk slices and concatenating
-
-        // Output shape: [batch_dims..., o0, o1, k0, k1]
-        u32 out_dims[MAX_DIM], out_rank = ndim + n_spatial;
-        for (u32 j = 0; j < bd; j++) out_dims[j] = mx->view.shape.dims[j];
+        // repeat: tile input so we can extract overlapping windows without padding
+        u32 reps[MAX_DIM];
+        for (u32 j = 0; j < bd; j++) reps[j] = 1;
         for (u32 j = 0; j < n_spatial; j++) {
-            out_dims[bd + j]             = o_[j];
-            out_dims[bd + n_spatial + j] = k_[j];
+            u32 ij = i_[j], kj = k_[j], fj = f_[j];
+            reps[bd + j] = (kj * (ij * fj + 1) + ij - 1) / ij;  // ceildiv
         }
+        t = thvm_repeat(ctx, t, reps, ndim);
 
-        // For each kernel position (kh, kw), produce a shrunk view of x
-        // with shape [batch, o0, o1] and place it at position [kh, kw]
-        // in the kernel dimensions.
-        //
-        // In the output tensor [batch, o0, o1, k0, k1]:
-        //   element [b, oh, ow, kh, kw] = x[b, oh*s0+kh, ow*s1+kw]
-        //
-        // We create this by doing k0*k1 shrink ops and summing into the right spot.
-        // Each shrink produces [batch, o0, o1].
-        // Reshape to [batch, o0, o1, 1, 1], pad to [batch, o0, o1, k0, k1] at (kh,kw).
-
-        // Actually simplest: build entire output on CPU using shrink results.
-        // Each shrink IS a traceable UOp. Read shrunk data, write to output position.
-
-        // Even simpler and fully lazy: build the output as a sum of padded shrinks.
-        // For each (kh,kw): shrink → reshape to [batch,o0,o1,1,1] → pad to place at (kh,kw)
-        // Then sum all k0*k1 terms. But that's really wasteful in memory.
-
-        // Most practical: CPU gather but WITH proper provenance tracking.
-        // Store source tensor + params, implement scatter-add backward.
-
-        // Since we can't avoid materialization for overlapping windows without
-        // a dedicated unfolding UOp, materialize on CPU but record provenance.
-        u32 out_numel = 1;
-        for (u32 j = 0; j < out_rank; j++) out_numel *= out_dims[j];
-
-        Shape os = {.rank = out_rank};
-        for (u32 j = 0; j < out_rank; j++) os.dims[j] = out_dims[j];
-        u32 dst_id = tensor_create(ctx, os, mx->dtype);
-
-        if (ctx->backend) {
-            u32 src_numel = mx->view.numel;
-            f32 *src = malloc(src_numel * sizeof(f32));
-            f32 *dst = malloc(out_numel * sizeof(f32));
-            ctx->backend->buf_read(mx->buf_id, src, src_numel * sizeof(f32));
-
-            for (u32 flat = 0; flat < out_numel; flat++) {
-                u32 coords[MAX_DIM], rem = flat;
-                for (int d = (int)out_rank - 1; d >= 0; d--) {
-                    coords[d] = rem % out_dims[d];
-                    rem /= out_dims[d];
-                }
-                u32 src_idx = 0, src_stride = 1;
-                for (int d = (int)ndim - 1; d >= 0; d--) {
-                    u32 coord;
-                    if ((u32)d < bd) {
-                        coord = coords[d];
-                    } else {
-                        u32 si = (u32)d - bd;
-                        coord = coords[bd + si] * s_[si] + coords[bd + n_spatial + si];
-                    }
-                    src_idx += coord * src_stride;
-                    src_stride *= mx->view.shape.dims[d];
-                }
-                dst[flat] = src[src_idx];
-            }
-
-            ctx->backend->buf_write(ctx->tensors[dst_id].buf_id, dst, out_numel * sizeof(f32));
-            free(src);
-            free(dst);
-        }
-
-        // Record provenance: custom POOL op for autograd
-        // Store source id + pool params (n_spatial, kernel, stride, input spatial dims)
-        ctx->tensors[dst_id].creator_op = UOP_POOL_GATHER;
-        ctx->tensors[dst_id].src_ids[0] = (u32)term_val(xr);
-        // Store pool params: [n_spatial, k0, k1, s0, s1, i0, i1, o0, o1, bd]
-        f32 params[MAX_DIM * 2];  // needs 1 + 4*n_spatial + 1 entries
-        params[0] = (f32)n_spatial;
+        // shrink to [batch, k0*(i0*f0+1), k1*(i1*f1+1)]
+        u32 sh1[MAX_DIM * 2];
+        for (u32 j = 0; j < bd; j++) { sh1[j*2] = 0; sh1[j*2+1] = mx->view.shape.dims[j]; }
         for (u32 j = 0; j < n_spatial; j++) {
-            params[1 + j]               = (f32)k_[j];
-            params[1 + n_spatial + j]    = (f32)s_[j];
-            params[1 + 2*n_spatial + j]  = (f32)i_[j];
-            params[1 + 3*n_spatial + j]  = (f32)o_[j];
+            sh1[(bd+j)*2] = 0;
+            sh1[(bd+j)*2+1] = k_[j] * (i_[j] * f_[j] + 1);
         }
-        params[1 + 4*n_spatial] = (f32)bd;
-        u32 plen = 2 + 4*n_spatial;
-        Term pt = thvm_tensor(ctx, params, SHAPE(plen));
-        ctx->tensors[dst_id].src_ids[1] = (u32)term_val(pt);
+        t = thvm_shrink(ctx, t, sh1, ndim);
 
-        if (mx->requires_grad) {
-            ctx->tensors[dst_id].requires_grad = 1;
+        // reshape to [batch, k0, i0*f0+1, k1, i1*f1+1]
+        u32 rs1[MAX_DIM], rs1_rank = bd + n_spatial * 2;
+        for (u32 j = 0; j < bd; j++) rs1[j] = mx->view.shape.dims[j];
+        for (u32 j = 0; j < n_spatial; j++) {
+            rs1[bd + j*2] = k_[j];
+            rs1[bd + j*2 + 1] = i_[j] * f_[j] + 1;
         }
-        ctx->itrs++;
-        return term_ten(dst_id, mx->dtype);
+        t = thvm_reshape(ctx, t, shape_of(rs1, rs1_rank));
+
+        // shrink to [batch, k0, o0*s0, k1, o1*s1]
+        u32 sh2[MAX_DIM * 2];
+        for (u32 j = 0; j < bd; j++) { sh2[j*2] = 0; sh2[j*2+1] = mx->view.shape.dims[j]; }
+        for (u32 j = 0; j < n_spatial; j++) {
+            sh2[(bd + j*2)*2] = 0;
+            sh2[(bd + j*2)*2 + 1] = k_[j];
+            sh2[(bd + j*2+1)*2] = 0;
+            sh2[(bd + j*2+1)*2 + 1] = o_[j] * s_[j];
+        }
+        t = thvm_shrink(ctx, t, sh2, rs1_rank);
+
+        // reshape to [batch, k0, o0, s0, k1, o1, s1]
+        u32 rs2[MAX_DIM], rs2_rank = bd + n_spatial * 3;
+        for (u32 j = 0; j < bd; j++) rs2[j] = mx->view.shape.dims[j];
+        for (u32 j = 0; j < n_spatial; j++) {
+            rs2[bd + j*3] = k_[j];
+            rs2[bd + j*3 + 1] = o_[j];
+            rs2[bd + j*3 + 2] = s_[j];
+        }
+        t = thvm_reshape(ctx, t, shape_of(rs2, rs2_rank));
+
+        // shrink stride dim to 1: [batch, k0, o0, 1, k1, o1, 1]
+        u32 sh3[MAX_DIM * 2];
+        for (u32 j = 0; j < rs2_rank; j++) { sh3[j*2] = 0; sh3[j*2+1] = rs2[j]; }
+        for (u32 j = 0; j < n_spatial; j++) {
+            u32 si = bd + j*3 + 2;
+            sh3[si*2+1] = 1;
+        }
+        t = thvm_shrink(ctx, t, sh3, rs2_rank);
+
+        // reshape to [batch, k0, o0, k1, o1]
+        u32 rs3[MAX_DIM], rs3_rank = bd + n_spatial * 2;
+        for (u32 j = 0; j < bd; j++) rs3[j] = mx->view.shape.dims[j];
+        for (u32 j = 0; j < n_spatial; j++) {
+            rs3[bd + j*2] = k_[j];
+            rs3[bd + j*2+1] = o_[j];
+        }
+        t = thvm_reshape(ctx, t, shape_of(rs3, rs3_rank));
+
+        // permute to [batch, o0, o1, k0, k1]
+        u32 perm[MAX_DIM], pi = 0;
+        for (u32 j = 0; j < bd; j++) perm[pi++] = j;
+        for (u32 j = 0; j < n_spatial; j++) perm[pi++] = bd + j*2 + 1;  // o dims
+        for (u32 j = 0; j < n_spatial; j++) perm[pi++] = bd + j*2;      // k dims
+        t = thvm_permute(ctx, t, perm, rs3_rank);
+
+        return t;
     }
 
     // Simple path: k <= s (e.g., maxpool 2x2/2)

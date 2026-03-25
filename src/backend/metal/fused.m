@@ -97,7 +97,7 @@ static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
     [src appendString:@"  uint gid [[thread_position_in_grid]])\n{\n"];
     [src appendString:@"  if (gid >= numel) return;\n"];
 
-    // Read leaf inputs
+    // Read leaf inputs: t0..t{n_leaves-1}
     for (u32 i = 0; i < n_leaves; i++)
         [src appendFormat:@"  float t%u = in%u[strided_idx(gid, v%u.strides, v%u.shape, v%u.offset, v%u.rank)];\n",
             i, i, i, i, i, i];

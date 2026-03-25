@@ -36,41 +36,56 @@ static int is_binary(u32 uop) {
 
 // Walk a lazy TAG_TOP tree, collecting ops and leaves.
 // Returns number of ops collected, or 0 if not fusable.
-static u32 fuse_walk(TinyHVM *ctx, Term t,
-                     FusedOp *ops, u32 *n_ops,
-                     u32 *leaf_ids, const View **leaf_views, u32 *n_leaves) {
+// Two-pass walk: first discover all leaves, then assign op indices.
+// Pass 1: walk tree, collect leaves and ops with PLACEHOLDER indices.
+// Pass 2: remap op indices to n_leaves + op_idx.
+
+// Internal: walk tree, record ops. Leaf indices are NEGATIVE (-1 - leaf_idx).
+// Op return values are NEGATIVE too during walk, fixed up after.
+#define WALK_LEAF_BASE 10000  // offset to distinguish leaf refs from op refs during walk
+
+static int fuse_walk_inner(TinyHVM *ctx, Term t,
+                           FusedOp *ops, u32 *n_ops,
+                           u32 *leaf_ids, const View **leaf_views, u32 *n_leaves) {
     if (term_tag(t) == TAG_TEN) {
-        // Leaf: already realized tensor
         u32 tid = (u32)term_val(t);
-        // Check if already in leaves
         for (u32 i = 0; i < *n_leaves; i++)
-            if (leaf_ids[i] == tid) return i;
-        if (*n_leaves >= FUSE_MAX_LEAVES) return ~0u;
+            if (leaf_ids[i] == tid) return (int)(WALK_LEAF_BASE + i);
+        if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
         u32 idx = (*n_leaves)++;
         leaf_ids[idx] = tid;
         leaf_views[idx] = &ctx->tensors[tid].view;
-        return idx;
+        return (int)(WALK_LEAF_BASE + idx);
     }
-    if (term_tag(t) != TAG_TOP) return ~0u;
+    if (term_tag(t) != TAG_TOP) return -1;
     u32 uop = term_ext(t);
-    if (!is_elementwise(uop)) return ~0u;
-    if (*n_ops >= FUSE_MAX_OPS) return ~0u;
+    if (!is_elementwise(uop)) return -1;
+    if (*n_ops >= FUSE_MAX_OPS) return -1;
 
     u64 loc = term_val(t);
-    Term a = heap_read(ctx, loc);
-    Term b = heap_read(ctx, loc + 1);
-
-    u32 arg_a = fuse_walk(ctx, a, ops, n_ops, leaf_ids, leaf_views, n_leaves);
-    if (arg_a == ~0u) return ~0u;
-    u32 arg_b = 0;
+    int arg_a = fuse_walk_inner(ctx, heap_read(ctx, loc), ops, n_ops, leaf_ids, leaf_views, n_leaves);
+    if (arg_a < 0) return -1;
+    int arg_b = 0;
     if (is_binary(uop)) {
-        arg_b = fuse_walk(ctx, b, ops, n_ops, leaf_ids, leaf_views, n_leaves);
-        if (arg_b == ~0u) return ~0u;
+        arg_b = fuse_walk_inner(ctx, heap_read(ctx, loc + 1), ops, n_ops, leaf_ids, leaf_views, n_leaves);
+        if (arg_b < 0) return -1;
     }
-
     u32 op_idx = (*n_ops)++;
-    ops[op_idx] = (FusedOp){ .uop = uop, .arg_a = arg_a, .arg_b = arg_b };
-    return *n_leaves + op_idx;  // temp var index
+    // Use a temporary marker: ops start at WALK_LEAF_BASE * 2
+    ops[op_idx] = (FusedOp){ .uop = uop, .arg_a = (u32)arg_a, .arg_b = (u32)arg_b };
+    return (int)(WALK_LEAF_BASE * 2 + op_idx);
+}
+
+// After walk: remap all references.
+// WALK_LEAF_BASE + i → i (leaf var index)
+// WALK_LEAF_BASE*2 + i → n_leaves + i (op var index)
+static void fuse_remap(FusedOp *ops, u32 n_ops, u32 n_leaves) {
+    for (u32 i = 0; i < n_ops; i++) {
+        if (ops[i].arg_a >= WALK_LEAF_BASE * 2) ops[i].arg_a = n_leaves + (ops[i].arg_a - WALK_LEAF_BASE * 2);
+        else if (ops[i].arg_a >= WALK_LEAF_BASE) ops[i].arg_a -= WALK_LEAF_BASE;
+        if (ops[i].arg_b >= WALK_LEAF_BASE * 2) ops[i].arg_b = n_leaves + (ops[i].arg_b - WALK_LEAF_BASE * 2);
+        else if (ops[i].arg_b >= WALK_LEAF_BASE) ops[i].arg_b -= WALK_LEAF_BASE;
+    }
 }
 
 // Try to fuse a lazy term into a single kernel. Returns tensor id, or ~0u if not fusable.
@@ -86,8 +101,11 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     const View *leaf_views[FUSE_MAX_LEAVES];
     u32 n_leaves = 0;
 
-    u32 result_idx = fuse_walk(ctx, t, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
-    if (1 || result_idx == ~0u || n_ops < 2) {
+    int walk_result = fuse_walk_inner(ctx, t, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
+    if (walk_result < 0) return reduce_id(ctx, t);
+    fuse_remap(ops, n_ops, n_leaves);
+    u32 result_idx = (u32)walk_result; // not used further, just check validity
+    if (result_idx == ~0u || n_ops < 2) {
         // Not fusable or too simple — fall back to normal reduce
         return reduce_id(ctx, t);
     }
@@ -562,15 +580,7 @@ void thvm_backward(TinyHVM *ctx, Term loss, Term *params, Term *grads, u32 n_par
     for (u32 i = loss_id; i > 0; i--) {
         if (!ga[i]) continue;
         if (!ctx->tensors[i].creator_op) continue;
-        clock_t _c0 = clock();
         backward_local(ctx, i, ga[i], ga);
-        clock_t _c1 = clock();
-        f32 _ms = 1000.0f*(f32)(_c1-_c0)/(f32)CLOCKS_PER_SEC;
-        if (_ms > 20.0f)
-            fprintf(stderr, "SLOW bw[%u] cop=%u %.0fms shape=[%u,%u,%u,%u]\n",
-                i, ctx->tensors[i].creator_op, _ms,
-                ctx->tensors[i].view.shape.dims[0], ctx->tensors[i].view.shape.dims[1],
-                ctx->tensors[i].view.shape.dims[2], ctx->tensors[i].view.shape.dims[3]);
     }
 
     // Extract gradients for requested parameters

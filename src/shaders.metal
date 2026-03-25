@@ -18,6 +18,7 @@ struct ViewParams {
     uint32_t has_mask;
     uint32_t mask_begin[8];
     uint32_t mask_end[8];
+    uint32_t contiguous;  // 1 = flat indexing (skip strided_idx)
 };
 
 static inline uint strided_idx(uint flat, constant ViewParams &v) {
@@ -31,8 +32,10 @@ static inline uint strided_idx(uint flat, constant ViewParams &v) {
     return idx;
 }
 
+// Fast read: contiguous → direct index, non-contiguous → strided
 static inline float masked_read(device const float *buf, uint flat,
                                  constant ViewParams &v) {
+    if (v.contiguous == 1) return buf[flat];
     if (v.has_mask) {
         uint rem = flat;
         for (int d = int(v.rank) - 1; d >= 0; d--) {

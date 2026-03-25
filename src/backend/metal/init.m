@@ -53,6 +53,7 @@ typedef struct {
     uint32_t has_mask;
     uint32_t mask_begin[8];
     uint32_t mask_end[8];
+    uint32_t contiguous;  // 1 = flat indexing (no strided_idx needed)
 } ViewParams;
 
 static ViewParams view_to_params(const View *v) {
@@ -61,6 +62,7 @@ static ViewParams view_to_params(const View *v) {
     p.rank   = v->shape.rank;
     p.numel  = v->numel;
     p.has_mask = v->has_mask;
+    p.contiguous = v->contiguous && !v->has_mask && v->offset == 0;
     for (u32 i = 0; i < v->shape.rank; i++) {
         p.strides[i] = v->strides[i];
         p.shape[i]   = v->shape.dims[i];

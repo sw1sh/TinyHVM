@@ -79,6 +79,7 @@ static const char *strided_idx_helper =
     "  return phys;\n"
     "}\n"
     "inline float masked_read_v(device const float *buf, uint flat, constant VP &v) {\n"
+    "  // contiguous fast path disabled for fused — leaf views may have non-zero offset\n"
     "  if (v.has_mask) {\n"
     "    uint rem = flat;\n"
     "    for (int d = int(v.rank) - 1; d >= 0; d--) {\n"
@@ -94,7 +95,7 @@ static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves, i
     [src appendString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
 
     // ViewParams struct (must match C side)
-    [src appendString:@"struct VP { int strides[8]; uint shape[8]; int offset; uint rank; uint numel; uint has_mask; uint mask_begin[8]; uint mask_end[8]; };\n"];
+    [src appendString:@"struct VP { int strides[8]; uint shape[8]; int offset; uint rank; uint numel; uint has_mask; uint mask_begin[8]; uint mask_end[8]; uint contiguous; };\n"];
     [src appendFormat:@"%s\n", strided_idx_helper];
 
     [src appendString:@"kernel void fused_v2(\n"];

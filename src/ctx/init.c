@@ -9,6 +9,7 @@ Backend *thvm_device(const char *name) {
 
 TinyHVM *thvm_init(Backend *backend) {
     TinyHVM *ctx = calloc(1, sizeof(TinyHVM));
+    ctx->tensors = calloc(MAX_TENSORS, sizeof(TensorMeta));
     ctx->heap = calloc(HEAP_CAP, sizeof(Term));
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();  // sentinel: prevent TAG_APP(0) self-loop
@@ -29,6 +30,7 @@ void thvm_free(TinyHVM *ctx) {
     for (u32 i = 0; i < ctx->tensor_count; i++) {
         if (ctx->tensors[i].host_ptr) free(ctx->tensors[i].host_ptr);
     }
+    free(ctx->tensors);
     free(ctx->heap);
     free(ctx);
 }
@@ -114,7 +116,15 @@ Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
         ctx->tensors[id] = *m;
         ctx->tensors[id].host_ptr = NULL;
         View *v = &ctx->tensors[id].view;
-        assert(v->shape.rank == new_shape.rank);
+        if (v->shape.rank != new_shape.rank) {
+            fprintf(stderr, "expand rank mismatch: tensor %u has rank %u, target rank %u\n"
+                            "  tensor shape: [", src_id, v->shape.rank, new_shape.rank);
+            for (u32 d=0;d<v->shape.rank;d++) fprintf(stderr, "%u%s", v->shape.dims[d], d+1<v->shape.rank?",":"");
+            fprintf(stderr, "]  target: [");
+            for (u32 d=0;d<new_shape.rank;d++) fprintf(stderr, "%u%s", new_shape.dims[d], d+1<new_shape.rank?",":"");
+            fprintf(stderr, "]\n  creator_op=%u\n", ctx->tensors[src_id].creator_op);
+            assert(0 && "expand rank mismatch");
+        }
         u32 numel = 1;
         for (u32 i = 0; i < new_shape.rank; i++) {
             if (v->shape.dims[i] == 1 && new_shape.dims[i] > 1) {
@@ -566,18 +576,12 @@ Term thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
 // ============================================================
 
 Term thvm_maxpool2d(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_) {
-    // pooled = _pool(x, kernel, stride)
-    // return pooled.max(kernel_axes)
     u32 k[] = {kernel[0], kernel[1]};
     u32 s[] = {stride_[0], stride_[1]};
-    Term pooled = thvm_pool(ctx, x, k, s, 2);
-    // pooled shape: [BS, C, OY, OX, KH, KW]
-    // reduce max over last 2 dims (KH, KW), squeezing between
 
-    // Compute pool output dims algebraically — no thvm_reduce needed.
-    // x must be a TAG_TEN (caller contract: x is realized input).
-    Term pr = x;  // pass through — shape read from input
-    if (term_tag(x) != TAG_TEN) pr = thvm_reduce(ctx, x);  // ensure realized
+    // Compute output spatial dims from input shape
+    Term pr = x;
+    if (term_tag(x) != TAG_TEN) pr = thvm_reduce(ctx, x);
     TensorMeta *mp = &ctx->tensors[(u32)term_val(pr)];
     u32 bs = mp->view.shape.dims[0];
     u32 c  = mp->view.shape.dims[1];
@@ -586,6 +590,8 @@ Term thvm_maxpool2d(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_)
     u32 kh = kernel[0], kw2 = kernel[1];
     u32 oy = (IH - kh) / stride_[0] + 1;
     u32 ox = (IW - kw2) / stride_[1] + 1;
+
+    // Single pool call — pooled shape: [BS, C, OY, OX, KH, KW]
     Term pool_t = thvm_pool(ctx, pr, k, s, 2);
 
     Term r1 = thvm_op(ctx, UOP_RMAX, pool_t, term_era());

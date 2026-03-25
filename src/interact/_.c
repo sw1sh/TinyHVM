@@ -6,6 +6,10 @@ static Term thvm_interact(TinyHVM *ctx, Term t) {
         if (term_tag(_r) == TAG_TOP) _r = thvm_reduce(ctx, _r); \
         return _r; \
     } while(0)
+    // GRAD iterative step: instead of GRAD_STEP(GRAD3(...)) which recurses
+    // O(chain_depth) via thvm_reduce, loop back to inet_step in the same frame.
+    // Only works for pure GRAD3 results (not GRAD_ADD which needs reduction first).
+    #define GRAD_STEP(result) do { t = (result); goto inet_step; } while(0)
 
     u32 tag;
 inet_step:
@@ -101,12 +105,17 @@ inet_step:
                         u64 _l = heap_alloc(ctx, 3); \
                         heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
                         term_new(TAG_TOP, UOP_GRAD, _l); })
-                    // Combine two gradient branches — skip ERA (no-path) operands
-                    #define GRAD_ADD(ga, gb) ({ \
+                    // Combine two gradient branches — skip ERA (no-path) operands.
+                    // Single live branch → GRAD_STEP (iterative, no depth increase).
+                    // Both live → RETURN_REDUCED (must reduce both, adds depth).
+                    #define GRAD_COMBINE(ga, gb) do { \
                         Term _ga = (ga), _gb = (gb); \
-                        term_tag(_ga)==TAG_ERA ? _gb : \
-                        term_tag(_gb)==TAG_ERA ? _ga : \
-                        thvm_op(ctx, UOP_ADD, _ga, _gb); })
+                        if (term_tag(_ga)==TAG_ERA && term_tag(_gb)==TAG_ERA) \
+                            RETURN_REDUCED(term_era()); \
+                        if (term_tag(_gb)==TAG_ERA) GRAD_STEP(_ga); \
+                        if (term_tag(_ga)==TAG_ERA) GRAD_STEP(_gb); \
+                        RETURN_REDUCED(thvm_op(ctx, UOP_ADD, _ga, _gb)); \
+                    } while(0)
 
                     switch (cop) {
                         case UOP_ADD: {
@@ -119,7 +128,7 @@ inet_step:
                                 Term db = sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape);
                                 gb = GRAD3(bt,db,x);
                             }
-                            RETURN_REDUCED(GRAD_ADD(ga, gb));
+                            GRAD_COMBINE(ga, gb);
                         }
                         case UOP_SUB: {
                             Term ga = term_era(), gb = term_era();
@@ -132,7 +141,7 @@ inet_step:
                                     sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape), term_era());
                                 gb = GRAD3(bt,neg,x);
                             }
-                            RETURN_REDUCED(GRAD_ADD(ga, gb));
+                            GRAD_COMBINE(ga, gb);
                         }
                         case UOP_MUL: {
                             Term ga = term_era(), gb = term_era();
@@ -146,7 +155,7 @@ inet_step:
                                                        my->view.shape, mb_p->view.shape);
                                 gb = GRAD3(bt,db,x);
                             }
-                            RETURN_REDUCED(GRAD_ADD(ga, gb));
+                            GRAD_COMBINE(ga, gb);
                         }
                         case UOP_MM: {
                             Term ga = term_era(), gb = term_era();
@@ -160,23 +169,23 @@ inet_step:
                                 Term db = thvm_op(ctx, UOP_MM, term_ten(at_id, ma->dtype), gy);
                                 gb = GRAD3(bt,db,x);
                             }
-                            RETURN_REDUCED(GRAD_ADD(ga, gb));
+                            GRAD_COMBINE(ga, gb);
                         }
                         case UOP_RELU: {
                             f32 z = 0.0f;
                             Term mask = thvm_op(ctx, UOP_CMP, at, thvm_tensor(ctx, &z, SHAPE(1)));
-                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, mask), x));
+                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, mask), x));
                         }
                         case UOP_NEG:
-                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_NEG, gy, term_era()), x));
+                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_NEG, gy, term_era()), x));
                         case UOP_EXP:
-                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, y), x));
+                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, y), x));
                         case UOP_LOG:
-                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, at), x));
+                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, at), x));
                         case UOP_SQRT: {
                             f32 two = 2.0f;
                             Term denom = thvm_op(ctx, UOP_MUL, thvm_tensor(ctx, &two, SHAPE(1)), y);
-                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, denom), x));
+                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, denom), x));
                         }
                         case UOP_DIV: {
                             Term da = thvm_op(ctx, UOP_DIV, gy, bt);
@@ -184,7 +193,7 @@ inet_step:
                             Term db = thvm_op(ctx, UOP_DIV,
                                 thvm_op(ctx, UOP_MUL, ng, at),
                                 thvm_op(ctx, UOP_MUL, bt, bt));
-                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
+                            { Term _a = GRAD3(at,da,x), _b = GRAD3(bt,db,x); GRAD_COMBINE(_a, _b); }
                         }
                         case UOP_MAX: {
                             // mask = (a > b): gradient flows to a where a was the max
@@ -195,7 +204,7 @@ inet_step:
                             Term inv = thvm_op(ctx, UOP_SUB, thvm_tensor(ctx, &one, SHAPE(1)), mask);
                             Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, inv),
                                                    my->view.shape, mb_p->view.shape);
-                            RETURN_REDUCED(GRAD_ADD(GRAD3(at,da,x), GRAD3(bt,db,x)));
+                            { Term _a = GRAD3(at,da,x), _b = GRAD3(bt,db,x); GRAD_COMBINE(_a, _b); }
                         }
                         case UOP_FUSING: {
                             // General FUSING backward: re-reduce the original unfused subnet
@@ -212,13 +221,14 @@ inet_step:
                             ctx->no_fuse = saved_nf;
 
                             // GRAD through the unfused result
-                            RETURN_REDUCED(GRAD3(unfused, gy, x));
+                            GRAD_STEP(GRAD3(unfused, gy, x));
                         }
                         case UOP_SUM: {
-                            // Plain SUM (no fused MUL). gy has keepdims shape; expand to input shape.
+                            // SUM backward: expand gy to input shape.
+                            // expand needs TAG_TEN (rank must match), so reduce gy first.
                             Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
                             Term g = thvm_expand(ctx, gy_r, ma->view.shape);
-                            RETURN_REDUCED(GRAD3(at, g, x));
+                            GRAD_STEP(GRAD3(at, g, x));
                         }
 
                         case UOP_RMAX: {
@@ -230,12 +240,12 @@ inet_step:
                                 thvm_tensor(ctx, &one, SHAPE(1)),
                                 thvm_op(ctx, UOP_CMP, max_bc, at));
                             Term gbc = thvm_expand(ctx, gy, ma->view.shape);
-                            RETURN_REDUCED(GRAD3(at, thvm_op(ctx, UOP_MUL, gbc, mask), x));
+                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_MUL, gbc, mask), x));
                         }
                         case UOP_RESHAPE:
-                            RETURN_REDUCED(GRAD3(at, thvm_reshape(ctx, gy, ma->view.shape), x));
+                            GRAD_STEP(GRAD3(at, thvm_reshape(ctx, gy, ma->view.shape), x));
                         case UOP_EXPAND:
-                            RETURN_REDUCED(GRAD3(at,
+                            GRAD_STEP(GRAD3(at,
                                 sum_to_shape(ctx, gy, my->view.shape, ma->view.shape), x));
                         case UOP_PERMUTE: {
                             u32 rank = ctx->tensors[bid].view.numel;
@@ -244,7 +254,7 @@ inet_step:
                             u32 inv[MAX_DIM];
                             for (u32 j = 0; j < rank; j++) inv[(u32)af[j]] = j;
                             free(af);
-                            RETURN_REDUCED(GRAD3(at, thvm_permute(ctx, gy, inv, rank), x));
+                            GRAD_STEP(GRAD3(at, thvm_permute(ctx, gy, inv, rank), x));
                         }
                         case UOP_PAD: {
                             TensorMeta *mp = &ctx->tensors[bid];
@@ -254,7 +264,7 @@ inet_step:
                             u32 sp[MAX_DIM*2];
                             for (u32 j=0;j<nd;j++){sp[j*2]=(u32)pf[j*2];sp[j*2+1]=(u32)pf[j*2]+ma->view.shape.dims[j];}
                             free(pf);
-                            RETURN_REDUCED(GRAD3(at, thvm_shrink(ctx, gy, sp, nd), x));
+                            GRAD_STEP(GRAD3(at, thvm_shrink(ctx, gy, sp, nd), x));
                         }
                         case UOP_SHRINK: {
                             TensorMeta *ms2 = &ctx->tensors[bid];
@@ -264,7 +274,7 @@ inet_step:
                             u32 pp[MAX_DIM*2];
                             for (u32 j=0;j<nd;j++){pp[j*2]=(u32)sf[j*2];pp[j*2+1]=ma->view.shape.dims[j]-(u32)sf[j*2+1];}
                             free(sf);
-                            RETURN_REDUCED(GRAD3(at, thvm_pad(ctx, gy, pp, nd), x));
+                            GRAD_STEP(GRAD3(at, thvm_pad(ctx, gy, pp, nd), x));
                         }
                         case UOP_POOL_GATHER: {
                             TensorMeta *mp = &ctx->tensors[bid];
@@ -279,28 +289,35 @@ inet_step:
                                 u32 pa[MAX_DIM];
                                 for(u32 j=0;j<pbd;j++)pa[j]=j;
                                 pa[pbd]=pbd;pa[pbd+1]=pbd+2;pa[pbd+2]=pbd+1;pa[pbd+3]=pbd+3;
-                                RETURN_REDUCED(GRAD3(at,
+                                GRAD_STEP(GRAD3(at,
                                     thvm_reshape(ctx,thvm_permute(ctx,gy,pa,pbd+4),ma->view.shape),x));
                             } else {
-                                u32 bd[MAX_DIM]; for(u32 j=0;j<pbd;j++)bd[j]=ma->view.shape.dims[j];
-                                Term dx=term_era();
-                                for(u32 kh=0;kh<pk[0];kh++) for(u32 kw=0;kw<pk[1];kw++){
-                                    u32 sh[MAX_DIM*2];
-                                    for(u32 j=0;j<pbd;j++){sh[j*2]=0;sh[j*2+1]=bd[j];}
-                                    sh[pbd*2]=0;sh[pbd*2+1]=po[0];sh[(pbd+1)*2]=0;sh[(pbd+1)*2+1]=po[1];
-                                    sh[(pbd+2)*2]=kh;sh[(pbd+2)*2+1]=kh+1;sh[(pbd+3)*2]=kw;sh[(pbd+3)*2+1]=kw+1;
-                                    Term sl=thvm_shrink(ctx,gy,sh,pbd+4);
-                                    u32 rd[MAX_DIM],rr=pbd+2; for(u32 j=0;j<pbd;j++)rd[j]=bd[j];
-                                    rd[pbd]=po[0];rd[pbd+1]=po[1];
-                                    Term s2=thvm_reshape(ctx,sl,shape_of(rd,rr));
-                                    assert(ps[0]==1&&ps[1]==1);
-                                    u32 pp2[MAX_DIM*2]; for(u32 j=0;j<pbd;j++){pp2[j*2]=0;pp2[j*2+1]=0;}
-                                    pp2[pbd*2]=kh;pp2[pbd*2+1]=pi[0]-po[0]-kh;
-                                    pp2[(pbd+1)*2]=kw;pp2[(pbd+1)*2+1]=pi[1]-po[1]-kw;
-                                    Term pd=thvm_pad(ctx,s2,pp2,rr);
-                                    dx=(term_tag(dx)==TAG_ERA)?pd:thvm_op(ctx,UOP_ADD,dx,pd);
+                                // Complex path: direct CPU scatter-add
+                                Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
+                                u32 gy_rid = (u32)term_val(gy_r);
+                                u32 ndim_in = ma->view.shape.rank;
+                                u32 ndim_out = my->view.shape.rank;
+                                u32 out_numel = my->view.numel;
+                                f32 *d_out_host = thvm_to_host(ctx, gy_r);
+                                f32 *d_out = malloc(out_numel * sizeof(f32));
+                                memcpy(d_out, d_out_host, out_numel * sizeof(f32));
+                                u32 in_numel = ma->view.numel;
+                                f32 *d_in = calloc(in_numel, sizeof(f32));
+                                u32 *od = my->view.shape.dims;
+                                for (u32 flat=0; flat<out_numel; flat++) {
+                                    u32 coords[MAX_DIM], rem=flat;
+                                    for(int d=(int)ndim_out-1;d>=0;d--){coords[d]=rem%od[d];rem/=od[d];}
+                                    u32 si2=0, ss=1;
+                                    for(int d=(int)ndim_in-1;d>=0;d--){
+                                        u32 c = ((u32)d<pbd) ? coords[d] : coords[pbd+((u32)d-pbd)]*ps[(u32)d-pbd]+coords[pbd+ns+((u32)d-pbd)];
+                                        si2+=c*ss; ss*=ma->view.shape.dims[d];
+                                    }
+                                    d_in[si2]+=d_out[flat];
                                 }
-                                RETURN_REDUCED(GRAD3(at, dx, x));
+                                u32 dx_id = tensor_create(ctx, ma->view.shape, ma->dtype);
+                                ctx->backend->buf_write(ctx->tensors[dx_id].buf_id, d_in, in_numel*sizeof(f32));
+                                free(d_out); free(d_in);
+                                GRAD_STEP(GRAD3(at, term_ten(dx_id, ma->dtype), x));
                             }
                         }
                         default: {
@@ -310,7 +327,7 @@ inet_step:
                         }
                     }
                     #undef GRAD3
-                    #undef GRAD_ADD
+                    #undef GRAD_COMBINE
                 }
                 // y is not TAG_TEN (still lazy or ERA) → reduce y first, then retry
                 if (term_tag(y) == TAG_TOP) {
@@ -611,7 +628,46 @@ inet_step:
                         ctx->backend->buf_read(mb->buf_id, dims, ns.rank * sizeof(f32));
                         for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
                         free(dims);
+
+                        // If input is non-contiguous (e.g. from expand with stride-0),
+                        // we must materialize before reshape. Otherwise the new view's
+                        // contiguous strides will index beyond the 1-element buffer.
                         new_view = view_reshape(ma->view, ns);
+                        if (!new_view.contiguous) {
+                            // Materialize: read with strided access, write contiguous
+                            u32 numel = ma->view.numel;
+                            f32 *src = malloc(numel * sizeof(f32));
+                            f32 *buf_raw = malloc((ma->view.offset + numel + 1) * sizeof(f32));
+                            u32 buf_bytes = 0;
+                            for (u32 d = 0; d < ma->view.shape.rank; d++) {
+                                u32 need = ma->view.offset + 1;
+                                if (ma->view.strides[d] > 0)
+                                    need += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
+                                if (need > buf_bytes) buf_bytes = need;
+                            }
+                            if (buf_bytes == 0) buf_bytes = 1;
+                            f32 *raw = malloc(buf_bytes * sizeof(f32));
+                            ctx->backend->buf_read(ma->buf_id, raw, buf_bytes * sizeof(f32));
+                            // Gather with strides
+                            for (u32 flat = 0; flat < numel; flat++) {
+                                u32 rem = flat, idx = ma->view.offset;
+                                for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
+                                    u32 coord = rem % ma->view.shape.dims[d];
+                                    rem /= ma->view.shape.dims[d];
+                                    idx += coord * (u32)((ma->view.strides[d] >= 0) ? ma->view.strides[d] : 0);
+                                }
+                                src[flat] = (idx < buf_bytes) ? raw[idx] : 0.f;
+                            }
+                            free(raw);
+                            // Create fresh contiguous tensor, then apply reshape view
+                            u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
+                            ctx->backend->buf_write(ctx->tensors[mat_id].buf_id, src, numel * sizeof(f32));
+                            free(src);
+                            // Replace a_id with materialized tensor for the view_of below
+                            a_id = mat_id;
+                            ma = &ctx->tensors[a_id];
+                            new_view = view_reshape(ma->view, ns);
+                        }
                         break;
                     }
                     case UOP_EXPAND: {
@@ -841,75 +897,85 @@ inet_step:
                 }
 
                 if (n_explicit > 0) {
-                    // Multi-axis reduce: use CPU strided iteration for correctness.
-                    // The generic op_reduce kernel only handles contiguous trailing dims.
-                    // For arbitrary axis combinations, we iterate with strides.
+                    // Multi-axis reduce via GPU: SUM(x, axes) = mul_reduce_sum(x, 1, axes)
                     u32 rank = ma->view.shape.rank;
-                    u32 in_numel = ma->view.numel;
                     u32 out_numel = md->view.numel;
 
                     u8 is_ra[MAX_DIM] = {0};
                     for (u32 i = 0; i < n_explicit; i++) is_ra[explicit_axes[i]] = 1;
 
-                    // Read input data — use strided indexing (handles expand/broadcast views)
-                    u32 buf_numel = ma->view.numel;
-                    f32 *raw = NULL;
+                    // Build reduce dims and strides for mul_reduce_sum
+                    u32 rdims[MAX_DIM], rstrides_a[MAX_DIM], rstrides_ones[MAX_DIM];
+                    u32 rn = 0;
+                    for (u32 d = 0; d < rank; d++) {
+                        if (is_ra[d]) {
+                            rdims[rn] = ma->view.shape.dims[d];
+                            rstrides_a[rn] = (u32)(ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
+                            rstrides_ones[rn] = 0;
+                            rn++;
+                        }
+                    }
+
+                    #ifdef __APPLE__
+                    if (uop == UOP_SUM && ctx->backend == &metal_backend) {
+                        // GPU path: mul_reduce_sum(input, ones=1.0, reduce_axes)
+                        // Allocate ones_buf each time (freed by pool_reset, reused from free_list)
+                        f32 one_val = 1.0f;
+                        u32 ones_buf = ctx->backend->buf_alloc(sizeof(f32));
+                        ctx->backend->buf_write(ones_buf, &one_val, sizeof(f32));
+                        // ones view: same rank as output, all strides=0 (broadcast scalar)
+                        View ones_v = md->view;
+                        for (u32 d = 0; d < ones_v.shape.rank; d++) ones_v.strides[d] = 0;
+                        ones_v.offset = 0;
+                        ones_v.contiguous = 0;
+                        metal_mul_reduce_sum(
+                            md->buf_id, out_numel,
+                            ma->buf_id, &ma->view,
+                            ones_buf, &ones_v,
+                            &md->view, rn, rdims, rstrides_a, rstrides_ones);
+                        // Don't free ones_buf here — GPU hasn't executed yet.
+                        // It'll be reclaimed by pool_reset.
+                    } else
+                    #endif
                     {
-                        // Read the backing buffer (may be smaller if stride=0 broadcast)
-                        u64 buf_sz = ctx->backend == &metal_backend
-                            ? (u64)buf_numel * sizeof(f32) : 0;
-                        // Use enough bytes to cover the backing buffer
+                        // CPU fallback: strided iteration
+                        u32 in_numel = ma->view.numel;
                         u32 max_buf_idx = (u32)ma->view.offset;
-                        for (u32 d = 0; d < ma->view.shape.rank; d++)
+                        for (u32 d = 0; d < rank; d++)
                             if (ma->view.strides[d] > 0)
                                 max_buf_idx += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
-                        raw = malloc((max_buf_idx+1) * sizeof(f32));
+                        f32 *raw = malloc((max_buf_idx+1) * sizeof(f32));
                         if (ctx->backend->end_batch) ctx->backend->end_batch();
                         ctx->backend->buf_read(ma->buf_id, raw, (u64)(max_buf_idx+1)*sizeof(f32));
                         if (ctx->backend->begin_batch) ctx->backend->begin_batch();
-                        (void)buf_sz;
+                        f32 *in_data = malloc(in_numel * sizeof(f32));
+                        for (u32 flat = 0; flat < in_numel; flat++) {
+                            u32 rem = flat, phys = (u32)ma->view.offset;
+                            for (int d = (int)rank - 1; d >= 0; d--) {
+                                u32 c = rem % ma->view.shape.dims[d]; rem /= ma->view.shape.dims[d];
+                                phys += c * (u32)(ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
+                            }
+                            in_data[flat] = raw[phys];
+                        }
+                        free(raw);
+                        f32 *out_data = calloc(out_numel, sizeof(f32));
+                        u32 out_strides[MAX_DIM];
+                        out_strides[rank-1] = 1;
+                        for (int d = (int)rank - 2; d >= 0; d--)
+                            out_strides[d] = out_strides[d+1] * out_shape[d+1];
+                        for (u32 flat = 0; flat < in_numel; flat++) {
+                            u32 coords[MAX_DIM], rem = flat;
+                            for (int d = (int)rank - 1; d >= 0; d--) {
+                                coords[d] = rem % ma->view.shape.dims[d]; rem /= ma->view.shape.dims[d];
+                            }
+                            u32 of = 0;
+                            for (u32 d = 0; d < rank; d++) of += (is_ra[d] ? 0 : coords[d]) * out_strides[d];
+                            if (uop == UOP_SUM) out_data[of] += in_data[flat];
+                            else if (in_data[flat] > out_data[of]) out_data[of] = in_data[flat];
+                        }
+                        ctx->backend->buf_write(md->buf_id, out_data, out_numel * sizeof(f32));
+                        free(in_data); free(out_data);
                     }
-                    f32 *in_data = malloc(in_numel * sizeof(f32));
-                    for (u32 flat = 0; flat < in_numel; flat++) {
-                        // Compute strided physical index using view strides
-                        u32 coords[MAX_DIM], rem = flat, phys = (u32)ma->view.offset;
-                        for (int d = (int)rank - 1; d >= 0; d--) {
-                            coords[d] = rem % ma->view.shape.dims[d];
-                            rem /= ma->view.shape.dims[d];
-                            phys += coords[d] * (u32)(ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
-                        }
-                        in_data[flat] = raw[phys];
-                    }
-                    free(raw);
-                    f32 *out_data = calloc(out_numel, sizeof(f32));
-
-                    // Build output strides (row-major, with 1s on reduce axes)
-                    u32 out_strides[MAX_DIM];
-                    out_strides[rank-1] = 1;
-                    for (int d = (int)rank - 2; d >= 0; d--)
-                        out_strides[d] = out_strides[d+1] * out_shape[d+1];
-
-                    // Iterate over all input elements, accumulate to output
-                    for (u32 flat = 0; flat < in_numel; flat++) {
-                        u32 coords[MAX_DIM], rem = flat;
-                        for (int d = (int)rank - 1; d >= 0; d--) {
-                            coords[d] = rem % ma->view.shape.dims[d];
-                            rem /= ma->view.shape.dims[d];
-                        }
-                        u32 out_flat = 0;
-                        for (u32 d = 0; d < rank; d++) {
-                            u32 c = is_ra[d] ? 0 : coords[d];
-                            out_flat += c * out_strides[d];
-                        }
-                        if (uop == UOP_SUM) {
-                            out_data[out_flat] += in_data[flat];
-                        } else {
-                            if (in_data[flat] > out_data[out_flat])
-                                out_data[out_flat] = in_data[flat];
-                        }
-                    }
-                    ctx->backend->buf_write(md->buf_id, out_data, out_numel * sizeof(f32));
-                    free(in_data); free(out_data);
                 } else {
                     // Single-axis reduce: last non-1 dim
                     // Materialize non-contiguous input first (e.g. expand strides=0)

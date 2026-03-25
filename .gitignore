@@ -48,3 +48,10 @@ test_train_dbg
 test_term_dbg
 test_mnist_cpu
 test_mnist_metal
+debug_cnn
+debug_grad
+test_mnist
+test/debug_*.m
+test/bench_*.m
+test/bench_*.py
+test/test_conv.m

@@ -135,7 +135,9 @@ static int run_mlp(MNISTData *data) {
     @autoreleasepool {
         thvm_reduce(ctx, program);
     }
-    printf("  done — itrs=%llu\n\n", (unsigned long long)ctx->itrs);
+    printf("  done — itrs=%llu\n", (unsigned long long)ctx->itrs);
+    printf("  peak: %u tensors, %llu heap slots\n\n",
+           ctx->tensor_count, (unsigned long long)ctx->heap_pos);
 
     // Eval
     printf("  Evaluating test set...\n");
@@ -234,7 +236,7 @@ static int run_cnn(MNISTData *data) {
     u32 n_weights = ctx->tensor_count;
     u32 n_batches = data->n_train / BS;
     u32 n_steps = 70;
-    f32 lr_max = 0.001f, lr_min = 0.0001f;
+    f32 lr_max = 0.01f, lr_min = 0.001f;
     printf("  %u params, %u steps, BS=%u\n\n", n_params, n_steps, BS);
 
     for (u32 step = 0; step < n_steps; step++) {
@@ -259,18 +261,24 @@ static int run_cnn(MNISTData *data) {
         Term loss_r = thvm_reduce(ctx, loss);
         f32 loss_val = thvm_to_host(ctx, loss_r)[0];
 
-        if (ctx->backend->begin_batch) ctx->backend->begin_batch();
-
         Term grad_terms[n_params];
         thvm_backward(ctx, loss_r, params, grad_terms, n_params);
-        u32 grad_ids[n_params];
-        for (u32 i = 0; i < n_params; i++) {
-            Term g = thvm_reduce(ctx, grad_terms[i]);
-            grad_ids[i] = (term_tag(g) == TAG_TEN) ? (u32)term_val(g) : 0;
-        }
 
-        adam_step(ctx, &opt, grad_ids);
-        if (ctx->backend->end_batch) ctx->backend->end_batch();
+        // SGD: param = param - lr * grad
+        for (u32 i = 0; i < n_params; i++) {
+            if (term_tag(grad_terms[i]) != TAG_TEN) continue;
+            Term new_val = thvm_op(ctx, UOP_SUB, params[i],
+                thvm_op(ctx, UOP_MUL, thvm_tensor(ctx, &opt.lr, SHAPE(1)), grad_terms[i]));
+            Term nv = thvm_reduce(ctx, new_val);
+            u32 pid = (u32)term_val(params[i]);
+            f32 *ndata = thvm_to_host(ctx, nv);
+            ctx->backend->buf_write(ctx->tensors[pid].buf_id, ndata,
+                (u64)ctx->tensors[pid].view.numel * sizeof(f32));
+            if (ctx->tensors[pid].host_ptr) {
+                free(ctx->tensors[pid].host_ptr);
+                ctx->tensors[pid].host_ptr = NULL;
+            }
+        }
 
         f32 ms = 1000.0f * (f32)(clock() - t0) / (f32)CLOCKS_PER_SEC;
         if (step % 10 == 0 || step == n_steps - 1)

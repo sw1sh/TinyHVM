@@ -38,19 +38,19 @@ static void top_decref_inputs(TinyHVM *ctx, u64 loc, u32 uop, Term result) {
     }
 }
 
-// Pre-allocated stack pool to avoid malloc/free in the hot path.
-// thvm_reduce is called recursively from GRAD — each depth level
-// gets a slice of 4096 terms from the shared pool.
-#define REDUCE_SLICE 4096
-#define REDUCE_MAX_DEPTH 64
-static _Thread_local Term reduce_pool[REDUCE_SLICE * REDUCE_MAX_DEPTH];
+// Pre-allocated stack pool — each recursion level gets a slice.
+// GRAD backward through deep networks (CNN) causes O(chain_length) recursion
+// via RETURN_REDUCED in thvm_interact. Keep SLICE small to fit in TLS.
+#define REDUCE_SLICE 256
+#define REDUCE_MAX_DEPTH 512
+static _Thread_local Term reduce_pool[REDUCE_SLICE * REDUCE_MAX_DEPTH];  // 1MB TLS
 static _Thread_local int  reduce_depth = 0;
 
 Term thvm_reduce(TinyHVM *ctx, Term root) {
     int depth = reduce_depth++;
     assert(depth < REDUCE_MAX_DEPTH);
     Term *stk = &reduce_pool[depth * REDUCE_SLICE];
-    int   sp  = 0;
+    int  sp = 0;
 
     Term next = root;
     Term whnf;
@@ -152,7 +152,6 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
 
     reduce_depth--;
     #undef PUSH
-
     return whnf;
 }
 

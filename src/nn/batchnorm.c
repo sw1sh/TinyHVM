@@ -9,6 +9,11 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
     Term mean_t, var_t;
 
     if (training) {
+        // Compute batch mean and variance.
+        // These are side-effect computations for running stats — NOT part of the
+        // gradient graph. Mark all intermediate tensors as requires_grad=0 so
+        // single-pass backward doesn't traverse them and double-count x's gradient.
+        u32 tc_before = ctx->tensor_count;
         Term x_perm = thvm_permute(ctx, x, (u32[]){1,0,2,3}, 4);
         Term x_flat = thvm_reshape(ctx, x_perm, SHAPE(C, count));
         Term x_sum = thvm_reshape(ctx,
@@ -27,6 +32,9 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
         Term d2_sum = thvm_reshape(ctx,
             thvm_op(ctx, UOP_SUM, d2_flat, term_era()), SHAPE(C));
         var_t = thvm_op(ctx, UOP_MUL, d2_sum, inv_n);
+        // Clear provenance on training-only tensors to prevent backward traversal
+        for (u32 t = tc_before; t < ctx->tensor_count; t++)
+            ctx->tensors[t].creator_op = 0;
 
         f32 *m_host = thvm_to_host(ctx, thvm_reduce(ctx, mean_t));
         f32 *v_host = thvm_to_host(ctx, thvm_reduce(ctx, var_t));

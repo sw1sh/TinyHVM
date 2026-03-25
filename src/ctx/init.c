@@ -88,11 +88,15 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
     if (term_tag(t) == TAG_TEN) {
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
-        // Create a view alias: same buffer, new shape
+        // Use view_reshape to check if the reshape can be a view alias.
+        // It returns contiguous=1 only when the source strides are compatible
+        // (no stride-0, no permutation that breaks contiguity).
+        View rv = view_reshape(m->view, new_shape);
+        if (!rv.contiguous) goto lazy;
+        // Reshape is valid as a view alias — same buffer, new shape + strides
         u32 id = ctx->tensor_count++;
         ctx->tensors[id] = *m;
-        ctx->tensors[id].view = view_create(new_shape);
-        ctx->tensors[id].view.offset = m->view.offset;
+        ctx->tensors[id].view = rv;
         ctx->tensors[id].host_ptr = NULL;
         // Track provenance for autograd
         ctx->tensors[id].creator_op = UOP_RESHAPE;
@@ -100,6 +104,7 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
         if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
+lazy:;
     // Lazy fallback
     f32 dims[MAX_DIM];
     for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (f32)new_shape.dims[i];

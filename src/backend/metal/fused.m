@@ -174,6 +174,25 @@ static id<MTLComputePipelineState> get_fused_pipe_v2(const FusedOp *ops, u32 n_o
     return pipe;
 }
 
+// GPU contiguify: copy non-contiguous view to contiguous buffer via strided read.
+// Uses fused_v2 codegen with 0 ops and 1 leaf (identity copy with ViewParams).
+void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view) {
+    const View *views[] = { src_view };
+    u32 bufs[] = { src_buf };
+    FusedOp ops[1]; // unused but array must exist
+    id<MTLComputePipelineState> pipe = get_fused_pipe_v2(ops, 0, 1, 0);
+    if (!pipe) return;
+
+    id<MTLBuffer> mbufs[2];
+    mbufs[0] = metal_pool.bufs[dst_buf];
+    mbufs[1] = metal_pool.bufs[src_buf];
+
+    ViewParams vp = view_to_params(src_view);
+    const void *params[] = { &vp, &numel };
+    u64 psizes[] = { sizeof(ViewParams), sizeof(u32) };
+    dispatch_1d(pipe, mbufs, 2, params, psizes, 2, numel);
+}
+
 // Dispatch a fused elementwise kernel.
 // leaf_bufs: buffer IDs for leaf inputs. leaf_views: View pointers for each.
 // ops: the fused op chain. Result goes to out_buf.

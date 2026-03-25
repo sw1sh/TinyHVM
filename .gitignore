@@ -56,3 +56,7 @@ test/bench_*.m
 test/bench_*.py
 test/test_conv.m
 .claude/worktrees/
+test_bn_grad
+test_mnist_asan
+test_mnist_dbg
+bn_debug.log

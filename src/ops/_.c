@@ -18,16 +18,14 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t) {
 
     // Non-contiguous (e.g. expand with stride=0): need strided copy
     // Read the underlying buffer (may be smaller than numel)
-    u32 src_numel = 1;
+    // Sum all dimension extents (not max!) to get total buffer span
+    u32 src_numel = (m->view.offset > 0) ? (u32)m->view.offset : 0;
     for (u32 d = 0; d < m->view.shape.rank; d++) {
-        u32 dim_extent = m->view.shape.dims[d];
         i32 stride = m->view.strides[d];
-        if (stride != 0) {
-            u32 end_idx = m->view.offset + (dim_extent - 1) * (u32)stride;
-            if (end_idx + 1 > src_numel) src_numel = end_idx + 1;
-        }
+        if (stride > 0)
+            src_numel += (m->view.shape.dims[d] - 1) * (u32)stride;
     }
-    // Fallback: compute from buffer if we can't determine exact extents
+    src_numel += 1;
     if (src_numel == 0) src_numel = 1;
 
     f32 *src_buf = malloc((size_t)src_numel * sizeof(f32));

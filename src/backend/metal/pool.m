@@ -45,7 +45,14 @@ static void metal_buf_write(u32 id, const void *data, u64 bytes) {
 
 static void metal_buf_read(u32 id, void *out, u64 bytes) {
     if (batch_dirty) metal_flush();
-    memcpy(out, metal_pool.bufs[id].contents, bytes);
+    u64 actual = metal_pool.sizes[id];
+    if (bytes > actual) {
+        // Read what we can, zero the rest (view strides may exceed buffer for broadcasts)
+        memcpy(out, metal_pool.bufs[id].contents, actual);
+        memset((char*)out + actual, 0, bytes - actual);
+    } else {
+        memcpy(out, metal_pool.bufs[id].contents, bytes);
+    }
     thvm_prof_buf_read(bytes);
 }
 

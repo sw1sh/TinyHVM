@@ -590,38 +590,52 @@ inet_step:
                         // contiguous strides will index beyond the 1-element buffer.
                         new_view = view_reshape(ma->view, ns);
                         if (!new_view.contiguous) {
-                            // Materialize: read with strided access, write contiguous
+                            // Materialize non-contiguous view to contiguous buffer
                             u32 numel = ma->view.numel;
-                            f32 *src = malloc(numel * sizeof(f32));
-                            f32 *buf_raw = malloc((ma->view.offset + numel + 1) * sizeof(f32));
-                            u32 buf_bytes = 0;
-                            for (u32 d = 0; d < ma->view.shape.rank; d++) {
-                                u32 need = ma->view.offset + 1;
-                                if (ma->view.strides[d] > 0)
-                                    need += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
-                                if (need > buf_bytes) buf_bytes = need;
-                            }
-                            if (buf_bytes == 0) buf_bytes = 1;
-                            f32 *raw = malloc(buf_bytes * sizeof(f32));
-                            ctx->backend->buf_read(ma->buf_id, raw, buf_bytes * sizeof(f32));
-                            // Gather with strides
-                            for (u32 flat = 0; flat < numel; flat++) {
-                                u32 rem = flat; i32 idx = ma->view.offset;
-                                int msk = 0;
-                                for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
-                                    u32 coord = rem % ma->view.shape.dims[d];
-                                    rem /= ma->view.shape.dims[d];
-                                    if (ma->view.has_mask && (coord < ma->view.mask_begin[d] || coord >= ma->view.mask_end[d])) msk = 1;
-                                    idx += (i32)coord * (ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
-                                }
-                                src[flat] = (msk || idx < 0 || (u32)idx >= buf_bytes) ? 0.f : raw[(u32)idx];
-                            }
-                            free(raw);
-                            // Create fresh contiguous tensor, then apply reshape view
+                            u32 orig_a_id = a_id;
                             u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
-                            ctx->backend->buf_write(ctx->tensors[mat_id].buf_id, src, numel * sizeof(f32));
-                            free(src);
-                            // Replace a_id with materialized tensor for the view_of below
+
+                            #ifdef __APPLE__
+                            if (ctx->backend == &metal_backend) {
+                                // GPU path: strided copy via fused identity kernel
+                                metal_contiguify(ctx->tensors[mat_id].buf_id, numel,
+                                                 ma->buf_id, &ma->view);
+                            } else
+                            #endif
+                            {
+                                // CPU path: strided gather
+                                f32 *src = malloc(numel * sizeof(f32));
+                                u32 buf_bytes = (ma->view.offset > 0) ? (u32)ma->view.offset : 0;
+                                for (u32 d = 0; d < ma->view.shape.rank; d++)
+                                    if (ma->view.strides[d] > 0)
+                                        buf_bytes += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
+                                buf_bytes += 1;
+                                if (buf_bytes == 0) buf_bytes = 1;
+                                f32 *raw = malloc(buf_bytes * sizeof(f32));
+                                ctx->backend->buf_read(ma->buf_id, raw, buf_bytes * sizeof(f32));
+                                for (u32 flat = 0; flat < numel; flat++) {
+                                    u32 rem = flat; i32 idx = ma->view.offset;
+                                    int msk = 0;
+                                    for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
+                                        u32 coord = rem % ma->view.shape.dims[d];
+                                        rem /= ma->view.shape.dims[d];
+                                        if (ma->view.has_mask && (coord < ma->view.mask_begin[d] || coord >= ma->view.mask_end[d])) msk = 1;
+                                        idx += (i32)coord * (ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
+                                    }
+                                    src[flat] = (msk || idx < 0 || (u32)idx >= buf_bytes) ? 0.f : raw[(u32)idx];
+                                }
+                                free(raw);
+                                ctx->backend->buf_write(ctx->tensors[mat_id].buf_id, src, numel * sizeof(f32));
+                                free(src);
+                            }
+
+                            // Record provenance for backward chain
+                            if (ctx->tensors[orig_a_id].requires_grad) {
+                                ctx->tensors[mat_id].requires_grad = 1;
+                                ctx->tensors[mat_id].creator_op = UOP_RESHAPE;
+                                ctx->tensors[mat_id].src_ids[0] = orig_a_id;
+                                ctx->tensors[mat_id].src_ids[1] = b_id;
+                            }
                             a_id = mat_id;
                             ma = &ctx->tensors[a_id];
                             new_view = view_reshape(ma->view, ns);

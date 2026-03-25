@@ -1,6 +1,18 @@
 // nn/batchnorm.c — Batch normalization (pure IC Term composition)
-// Forward: lazy graph composition. Running stats: single eager side-effect.
-// Detach mean for variance (d(var)/d(mean)=0), live mean+var for output.
+// Matches tinygrad: detach mean for variance, live mean+var for output.
+// Running stats via buf_write (equivalent to tinygrad's .assign()).
+
+static Term thvm_detach(TinyHVM *ctx, Term t) {
+    t = thvm_reduce(ctx, t);
+    if (term_tag(t) != TAG_TEN) return t;
+    u32 src = (u32)term_val(t);
+    u32 id = ctx->tensor_count++;
+    ctx->tensors[id] = ctx->tensors[src];
+    ctx->tensors[id].host_ptr = NULL;
+    ctx->tensors[id].creator_op = 0;
+    ctx->tensors[id].requires_grad = 0;
+    return term_ten(id, ctx->tensors[src].dtype);
+}
 
 static Term batchnorm_term(TinyHVM *ctx, Term x,
                             Term gamma, Term beta, Term rmean, Term rvar,
@@ -12,7 +24,7 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
     Term batch_mean, batch_var;
 
     if (training) {
-        // batch_mean = mean(x, axis=(0,2,3)) — lazy
+        // batch_mean = x.mean(axis=(0,2,3))
         Term x_perm = thvm_permute(ctx, x, (u32[]){1,0,2,3}, 4);
         Term x_flat = thvm_reshape(ctx, x_perm, SHAPE(C, count));
         Term x_sum = thvm_reshape(ctx,
@@ -20,16 +32,8 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
         Term inv_n = thvm_expand(ctx, thvm_tensor(ctx, &inv_count, SHAPE(1)), SHAPE(C));
         batch_mean = thvm_op(ctx, UOP_MUL, x_sum, inv_n);
 
-        // Detach mean for variance computation: reduce once, create leaf copy
-        Term mean_r = thvm_reduce(ctx, batch_mean);
-        u32 mean_det_id = ctx->tensor_count++;
-        ctx->tensors[mean_det_id] = ctx->tensors[(u32)term_val(mean_r)];
-        ctx->tensors[mean_det_id].host_ptr = NULL;
-        ctx->tensors[mean_det_id].creator_op = 0;   // DETACH
-        ctx->tensors[mean_det_id].requires_grad = 0;
-        Term mean_det = term_ten(mean_det_id, DTYPE_F32);
-
-        // batch_var = mean((x - detach(mean))^2, axis=(0,2,3)) — lazy
+        // batch_var = ((x - detach(mean))^2).mean(axis=(0,2,3))
+        Term mean_det = thvm_detach(ctx, batch_mean);
         Term md4 = thvm_expand(ctx, thvm_reshape(ctx, mean_det, SHAPE(1,C,1,1)),
             (Shape){.dims={B,C,H,W},.rank=4});
         Term y = thvm_op(ctx, UOP_SUB, x, md4);
@@ -39,26 +43,39 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
         Term y2s = thvm_reshape(ctx, thvm_op(ctx, UOP_SUM, y2f, term_era()), SHAPE(C));
         batch_var = thvm_op(ctx, UOP_MUL, y2s, inv_n);
 
-        // Running stats update — the ONLY eager part
-        f32 momentum = 0.1f;
-        Term var_r = thvm_reduce(ctx, batch_var);
-        f32 *m = thvm_to_host(ctx, mean_r);
-        f32 *v = thvm_to_host(ctx, var_r);
-        f32 *rm = thvm_to_host(ctx, thvm_reduce(ctx, rmean));
-        f32 *rv = thvm_to_host(ctx, thvm_reduce(ctx, rvar));
-        f32 bessel = (f32)count / (f32)(count - 1);
-        for (u32 c = 0; c < C; c++) {
-            rm[c] = (1-momentum)*rm[c] + momentum*m[c];
-            rv[c] = (1-momentum)*rv[c] + momentum*v[c]*bessel;
+        // running_mean.assign((1-m)*running_mean + m*detach(batch_mean))
+        // running_var.assign((1-m)*running_var + m*bessel*detach(batch_var))
+        f32 mom = 0.1f, bessel = (f32)count / (f32)(count - 1);
+        Term mean_d = thvm_detach(ctx, batch_mean);
+        Term var_d = thvm_detach(ctx, batch_var);
+        f32 omm = 1.0f - mom;
+        Term omm_t = thvm_tensor(ctx, &omm, SHAPE(1));
+        Term mom_t = thvm_tensor(ctx, &mom, SHAPE(1));
+        f32 mb = mom * bessel;
+        Term mb_t = thvm_tensor(ctx, &mb, SHAPE(1));
+        // new_rm = (1-m)*rm + m*mean
+        Term new_rm = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD,
+            thvm_op(ctx, UOP_MUL, rmean, omm_t),
+            thvm_op(ctx, UOP_MUL, mean_d, mom_t)));
+        // new_rv = (1-m)*rv + m*bessel*var
+        Term new_rv = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD,
+            thvm_op(ctx, UOP_MUL, rvar, omm_t),
+            thvm_op(ctx, UOP_MUL, var_d, mb_t)));
+        // assign: copy new_rm/new_rv GPU buffers into rmean/rvar GPU buffers
+        u32 rm_id = (u32)term_val(thvm_reduce(ctx, rmean));
+        u32 rv_id = (u32)term_val(thvm_reduce(ctx, rvar));
+        { f32 tmp[MAX_TENSORS > 256 ? 256 : 64]; // enough for C channels
+          ctx->backend->buf_read(ctx->tensors[(u32)term_val(new_rm)].buf_id, tmp, C*sizeof(f32));
+          ctx->backend->buf_write(ctx->tensors[rm_id].buf_id, tmp, C*sizeof(f32));
+          ctx->backend->buf_read(ctx->tensors[(u32)term_val(new_rv)].buf_id, tmp, C*sizeof(f32));
+          ctx->backend->buf_write(ctx->tensors[rv_id].buf_id, tmp, C*sizeof(f32));
         }
-        ctx->backend->buf_write(ctx->tensors[(u32)term_val(thvm_reduce(ctx, rmean))].buf_id, rm, C*sizeof(f32));
-        ctx->backend->buf_write(ctx->tensors[(u32)term_val(thvm_reduce(ctx, rvar))].buf_id, rv, C*sizeof(f32));
     } else {
         batch_mean = rmean;
         batch_var = rvar;
     }
 
-    // Output: (x - mean) * rsqrt(var + eps) * gamma + beta — lazy
+    // x.batchnorm(gamma, beta, batch_mean, (batch_var + eps).rsqrt())
     Term mean_bc = thvm_expand(ctx, thvm_reshape(ctx, batch_mean, SHAPE(1,C,1,1)),
         (Shape){.dims={B,C,H,W},.rank=4});
     Term eps_bc = thvm_expand(ctx, thvm_tensor(ctx, &eps_val, SHAPE(1)), SHAPE(C));
@@ -72,8 +89,8 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
     Term beta_bc = thvm_expand(ctx, thvm_reshape(ctx, beta, SHAPE(1,C,1,1)),
         (Shape){.dims={B,C,H,W},.rank=4});
 
-    Term centered = thvm_op(ctx, UOP_SUB, x, mean_bc);
     return thvm_op(ctx, UOP_ADD,
-        thvm_op(ctx, UOP_MUL, thvm_op(ctx, UOP_MUL, centered, invstd_bc), gamma_bc),
+        thvm_op(ctx, UOP_MUL, thvm_op(ctx, UOP_MUL,
+            thvm_op(ctx, UOP_SUB, x, mean_bc), invstd_bc), gamma_bc),
         beta_bc);
 }

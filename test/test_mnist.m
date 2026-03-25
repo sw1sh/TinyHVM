@@ -317,10 +317,15 @@ static int run_cnn(MNISTData *data) {
         extern u32 total_dispatches;
         extern double flush_total_ms;
         extern u32 flush_count_total;
-        if (step <= 2) {
-            printf("    step %u: dispatches=%u flush_time=%.1fms\n",
-                   step, total_dispatches, flush_total_ms);
+        extern u32 fast_dispatch_count, slow_dispatch_count;
+        if (step == 0) {
+            struct timespec now_; clock_gettime(CLOCK_MONOTONIC, &now_);
+            f32 wall_ = (f32)(now_.tv_sec - t0_wall.tv_sec)*1000.0f + (f32)(now_.tv_nsec - t0_wall.tv_nsec)/1e6f;
+            printf("    step 0: dispatches=%u gpu=%.0fms cpu=%.0fms wall=%.0fms\n",
+                   total_dispatches, flush_total_ms, wall_-(f32)flush_total_ms, wall_);
+            fflush(stdout);
             total_dispatches = 0; flush_total_ms = 0; flush_count_total = 0;
+            fast_dispatch_count = 0; slow_dispatch_count = 0;
         }
 
         // Invalidate host caches so next step reads updated weights

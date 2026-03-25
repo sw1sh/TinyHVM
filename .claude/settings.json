@@ -11,7 +11,8 @@
       "WebFetch(domain:ai-benchmark.com)",
       "WebFetch(domain:gimletlabs.ai)",
       "WebFetch(domain:arxiv.org)",
-      "WebFetch(domain:medium.com)"
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:andrewkchan.dev)"
     ]
   }
 }

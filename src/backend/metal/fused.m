@@ -159,6 +159,9 @@ static id<MTLComputePipelineState> get_fused_pipe_v2(const FusedOp *ops, u32 n_o
         if (fused_cache[i].key == key) return fused_cache[i].pipe;
 
     NSString *src = codegen_fused_v2(ops, n_ops, n_leaves, has_reduce);
+    static u32 jit_compile_count = 0;
+    jit_compile_count++;
+    if (jit_compile_count <= 30) fprintf(stderr, "JIT compile #%u: n_ops=%u n_leaves=%u reduce=%d\n", jit_compile_count, n_ops, n_leaves, has_reduce);
     NSError *err = nil;
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
     id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:opts error:&err];

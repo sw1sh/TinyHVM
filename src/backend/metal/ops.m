@@ -1,5 +1,7 @@
 // metal/ops.m — Core Metal compute ops: unary, binary, matmul, reduce
 
+static u32 fast_dispatch_count = 0, slow_dispatch_count = 0;
+
 // Check if view is truly contiguous for fast-path (offset=0, standard strides, no mask)
 static int is_fast_view(const View *v) {
     if (v->offset != 0 || v->has_mask) return 0;
@@ -29,6 +31,7 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
             default: break;
         }
         if (fpipe) {
+            fast_dispatch_count++;
             u32 n = dv->numel;
             id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
             const void *params[] = { &n };
@@ -38,6 +41,7 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
             return;
         }
     }
+    slow_dispatch_count++;
 
     // Slow path: strided ViewParams
     id<MTLComputePipelineState> pipe = nil;
@@ -75,6 +79,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
             default: break;
         }
         if (fpipe) {
+            fast_dispatch_count++;
             u32 n = dv->numel;
             id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
             const void *params[] = { &n };
@@ -84,6 +89,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
             return;
         }
     }
+    slow_dispatch_count++;
 
     // Slow path: strided ViewParams with broadcast support
     id<MTLComputePipelineState> pipe = nil;

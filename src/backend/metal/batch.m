@@ -1,5 +1,7 @@
 // metal/batch.m — Command buffer batching
 
+static u32 flush_count = 0;
+
 static void metal_flush(void) {
     if (batch_encoder) {
         [batch_encoder endEncoding];
@@ -9,6 +11,7 @@ static void metal_flush(void) {
         [batch_cmd commit];
         [batch_cmd waitUntilCompleted];
         batch_cmd = nil;
+        flush_count++;
     }
     batch_dirty = 0;
 }
@@ -31,3 +34,6 @@ static void metal_end_batch(void) {
     if (batch_dirty) metal_flush();
     batch_active = 0;
 }
+
+u32 metal_get_flush_count(void) { return flush_count; }
+void metal_reset_flush_count(void) { flush_count = 0; }

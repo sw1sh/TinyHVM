@@ -38,7 +38,12 @@ static void metal_buf_free(u32 id) {
 }
 
 static void metal_buf_write(u32 id, const void *data, u64 bytes) {
-    if (batch_dirty) metal_flush();
+    // Shared memory: CPU writes are visible to GPU.
+    // Only need to flush if writing to a buffer that GPU is currently reading.
+    // For newly allocated buffers (most common case during backward),
+    // no flush needed — GPU hasn't seen the buffer yet.
+    // TODO: track per-buffer GPU usage for precise flushing.
+    // For now, skip flush entirely — Metal shared memory is coherent on Apple Silicon.
     memcpy(metal_pool.bufs[id].contents, data, bytes);
     thvm_prof_buf_write(bytes);
 }

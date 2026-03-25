@@ -128,6 +128,7 @@ typedef u64 Term;
 // Internal ops — not part of tinyspec, only used for autograd provenance
 #define UOP_POOL_GATHER 100  // sliding window gather (im2col equivalent)
 #define UOP_GRAD        101  // IC gradient: DUP-op interaction in the reducer
+#define UOP_BATCHNORM   102  // composite BN with dedicated backward formula
 
 // UOp name table (device-agnostic)
 static const char *uop_names[] = {
@@ -382,6 +383,15 @@ typedef struct {
     // Fusion metadata (only when creator_op == UOP_FUSING)
     u64         fusing_loc; // heap loc of the original subnet root TAG_TOP
     u32         fusing_uop; // UOP of the subnet root (e.g. UOP_SUM)
+
+    // BatchNorm metadata (only when creator_op == UOP_BATCHNORM)
+    // src_ids[0] = x (input), src_ids[1] = gamma
+    u32         bn_x_hat_id;  // x_hat tensor for backward
+    u32         bn_inv_std_id; // inv_std tensor for backward
+    u32         bn_count;      // B*H*W
+    u32         bn_x_id;       // original input x
+    u32         bn_gamma_id;   // gamma weight
+    u32         bn_beta_id;    // beta weight
 } TensorMeta;
 
 

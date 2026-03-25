@@ -318,17 +318,22 @@ inet_step:
                     u32 dst_id = (u32)term_val(dst_r);
                     u32 src_id = (u32)term_val(src_t);
                     if (dst_id != src_id) {
-                        // First fire: blit src into dst's buffer
+                        // Blit src into dst's buffer — GPU copy via contiguify
                         TensorMeta *md = &ctx->tensors[dst_id];
-                        u64 nbytes = (u64)md->view.numel * sizeof(f32);
-                        f32 *dst_host = (f32 *)thvm_to_host(ctx, dst_r);
-                        f32 *src_host = (f32 *)thvm_to_host(ctx, src_t);
-                        memcpy(dst_host, src_host, nbytes);
-                        if (ctx->backend)
-                            ctx->backend->buf_write(md->buf_id, dst_host, nbytes);
-                        // Make re-fires idempotent: src slot now points to dst itself
+                        TensorMeta *ms = &ctx->tensors[src_id];
+                        #ifdef __APPLE__
+                        if (ctx->backend == &metal_backend) {
+                            metal_contiguify(md->buf_id, md->view.numel,
+                                             ms->buf_id, &ms->view);
+                        } else
+                        #endif
+                        {
+                            u64 nbytes = (u64)md->view.numel * sizeof(f32);
+                            f32 *src_host = (f32 *)thvm_to_host(ctx, src_t);
+                            ctx->backend->buf_write(md->buf_id, src_host, nbytes);
+                        }
+                        if (md->host_ptr) { free(md->host_ptr); md->host_ptr = NULL; }
                         heap_set(ctx, loc + 1, dst_r);
-                    } else {
                     }
                     ctx->itrs++;
                     RETURN_REDUCED(dst_r);

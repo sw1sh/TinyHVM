@@ -310,6 +310,9 @@ static int run_cnn(MNISTData *data) {
 
         adam_step(ctx, &opt, grad_ids);
 
+        extern u32 total_dispatches;
+        if (step == 0) { printf("    GPU dispatches: %u (tinygrad: ~186)\n", total_dispatches); total_dispatches = 0; }
+
         // Invalidate host caches so next step reads updated weights
         for (u32 i = 0; i < n_params; i++) {
             u32 pid = (u32)term_val(params[i]);

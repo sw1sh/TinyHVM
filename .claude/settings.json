@@ -12,7 +12,13 @@
       "WebFetch(domain:gimletlabs.ai)",
       "WebFetch(domain:arxiv.org)",
       "WebFetch(domain:medium.com)",
-      "WebFetch(domain:andrewkchan.dev)"
+      "WebFetch(domain:andrewkchan.dev)",
+      "WebFetch(domain:dougallj.github.io)",
+      "WebFetch(domain:kieber-emmons.medium.com)",
+      "WebFetch(domain:flopper.io)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "WebFetch(domain:www.macobserver.com)",
+      "WebFetch(domain:lowendmac.com)"
     ]
   }
 }

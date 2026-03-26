@@ -48,14 +48,23 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
         }
     }
 
-    // JIT path: dispatch as 1-op fused kernel with specialized leaf indexing
-    {
-        FusedOp op = { .uop = uop, .arg_a = 0, .arg_b = 0 };
-        u32 leaf_buf = src;
-        const View *lv[] = { sv };
-        metal_dispatch_fused_v2(dst, dv->numel, &leaf_buf, lv, 1, &op, 1, 0, 0);
-        thvm_prof_record(uop, t0);
+    // Slow path: pre-built strided kernel
+    id<MTLComputePipelineState> pipe = nil;
+    switch (uop) {
+        case UOP_NEG:  pipe = pipe_neg;  break;
+        case UOP_RELU: pipe = pipe_relu; break;
+        case UOP_EXP:  pipe = pipe_exp;  break;
+        case UOP_LOG:  pipe = pipe_log;  break;
+        case UOP_SQRT: pipe = pipe_sqrt; break;
+        default: return;
     }
+    ViewParams dvp = view_to_params(dv);
+    ViewParams svp = view_to_params(sv);
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+    const void *params[] = { &dvp, &svp };
+    u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams) };
+    dispatch_1d(pipe, bufs, 2, params, psizes, 2, dv->numel);
+    thvm_prof_record(uop, t0);
 }
 
 static void metal_op_binary(u32 uop, u32 dst, const View *dv,
@@ -83,14 +92,25 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
         return;
     }
 
-    // JIT path: dispatch as 1-op fused kernel with specialized leaf indexing
-    {
-        FusedOp op = { .uop = uop, .arg_a = 0, .arg_b = 1 };
-        u32 leaf_bufs[] = { a, b };
-        const View *lvs[] = { av, bv };
-        metal_dispatch_fused_v2(dst, dv->numel, leaf_bufs, lvs, 2, &op, 1, 0, 0);
-        thvm_prof_record(uop, t0);
+    // Slow path: pre-built strided kernel
+    id<MTLComputePipelineState> pipe = nil;
+    switch (uop) {
+        case UOP_ADD: pipe = pipe_add; break;
+        case UOP_MUL: pipe = pipe_mul; break;
+        case UOP_SUB: pipe = pipe_sub; break;
+        case UOP_DIV: pipe = pipe_div; break;
+        case UOP_MAX: pipe = pipe_max; break;
+        case UOP_CMP: pipe = pipe_cmp; break;
+        default: return;
     }
+    ViewParams dvp = view_to_params(dv);
+    ViewParams avp = view_to_params(av);
+    ViewParams bvp = view_to_params(bv);
+    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
+    const void *params[] = { &dvp, &avp, &bvp };
+    u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams), sizeof(ViewParams) };
+    dispatch_1d(pipe, bufs, 3, params, psizes, 3, dv->numel);
+    thvm_prof_record(uop, t0);
 }
 
 static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,

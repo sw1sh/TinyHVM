@@ -78,6 +78,24 @@ static u32  tensor_fill(TinyHVM *ctx, Shape s, f32 val);
 static u32  tensor_transpose_2d(TinyHVM *ctx, u32 src_id);
 static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target);
 
+// FuseDesc: kernel descriptor for general FUSE nodes (defined in grad/_.c)
+#define FUSE_MAX_OPS_FWD 32
+#define FUSE_MAX_LEAVES_FWD 16
+typedef struct {
+    FusedOp ops[FUSE_MAX_OPS_FWD];
+    u32     n_ops;
+    View    composed_views[FUSE_MAX_LEAVES_FWD];
+    Term    leaf_terms[FUSE_MAX_LEAVES_FWD];
+    u32     n_leaves;
+    Shape   out_shape;
+    u32     out_numel;
+    int     has_reduce;
+    u32     reduce_dim;
+} FuseDesc;
+// Side table (defined in grad/_.c, used in interact/_.c)
+static FuseDesc fuse_descs[512];
+static u32 fuse_desc_count;
+
 // ── clone/ — deep-copy (ALO) for REF unfolding ──────────────────────────────
 #include "clone/_.c"
 

@@ -405,6 +405,53 @@ inet_step:
                 RETURN_REDUCED(t);
             }
 
+            // === General FUSE dispatch ===
+            // Created by fuse_or_reduce when the fuser collected a chain with
+            // lazy leaves. heap[loc]=ERA, heap[loc+1]=NUM(desc_id).
+            // The desc_id indexes into fuse_descs[] which holds ops, views, etc.
+            // General FUSE: heap[loc]=ERA, heap[loc+1]=TAG_TEN(desc_id_tensor)
+            if (uop == UOP_FUSING && term_tag(heap_read(ctx, loc)) == TAG_ERA
+                && term_tag(heap_read(ctx, loc + 1)) == TAG_TEN) {
+                u32 dt = (u32)term_val(heap_read(ctx, loc + 1));
+                if (ctx->tensors[dt].view.numel == 1 && ctx->tensors[dt].view.shape.rank == 1) {
+                f32 did_f; META_READ(ctx, ctx->tensors[dt].buf_id, &did_f, sizeof(f32));
+                u32 desc_id = (u32)did_f;
+                FuseDesc *fd = &fuse_descs[desc_id];
+                fprintf(stderr, "FUSE_DISPATCH desc=%u n_leaves=%u n_ops=%u\n", desc_id, fd->n_leaves, fd->n_ops);
+
+                // Reduce all lazy leaf terms to TAG_TEN
+                // Disable fusion during leaf reduction to prevent FUSE recursion
+                u8 saved_nf = ctx->no_fuse; ctx->no_fuse = 1;
+                u32 leaf_bufs[FUSE_MAX_LEAVES_FWD];
+                const View *leaf_views[FUSE_MAX_LEAVES_FWD];
+                for (u32 i = 0; i < fd->n_leaves; i++) {
+                    Term lt = thvm_reduce(ctx, fd->leaf_terms[i]);
+                    if (term_tag(lt) != TAG_TEN) RETURN_REDUCED(t); // can't fuse
+                    u32 tid = (u32)term_val(lt);
+                    TensorMeta *lm = &ctx->tensors[tid];
+                    leaf_bufs[i] = lm->buf_id;
+                    // Use composed view if we have one; otherwise use tensor's view
+                    if (fd->composed_views[i].shape.rank > 0)
+                        leaf_views[i] = &fd->composed_views[i];
+                    else
+                        leaf_views[i] = &lm->view;
+                }
+
+                ctx->no_fuse = saved_nf;
+                // Allocate output tensor
+                u32 dst_id = tensor_create(ctx, fd->out_shape, DTYPE_F32);
+                #ifdef __APPLE__
+                if (ctx->backend == &metal_backend) {
+                    metal_dispatch_fused_v2(
+                        ctx->tensors[dst_id].buf_id, fd->out_numel,
+                        leaf_bufs, leaf_views, fd->n_leaves,
+                        fd->ops, fd->n_ops,
+                        fd->has_reduce, fd->reduce_dim, &fd->out_shape);
+                }
+                #endif
+                RETURN_REDUCED(term_ten(dst_id, DTYPE_F32));
+            }} // end desc_id check + FUSING check
+
             // === FUSED MUL+SUM: pattern match SUM(MUL(a, b)) ===
             // Avoids materializing the huge MUL intermediate buffer.
             if (uop == UOP_SUM && !ctx->no_fuse) {

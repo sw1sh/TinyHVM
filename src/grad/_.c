@@ -34,11 +34,8 @@ static int is_binary(u32 uop) {
 #define FUSE_MAX_OPS 32
 #define FUSE_MAX_LEAVES 16
 
-// Walk a lazy TAG_TOP tree, collecting ops and leaves.
-// Returns number of ops collected, or 0 if not fusable.
-// Two-pass walk: first discover all leaves, then assign op indices.
-// Pass 1: walk tree, collect leaves and ops with PLACEHOLDER indices.
-// Pass 2: remap op indices to n_leaves + op_idx.
+// FuseDesc side table (defined in tinyhvm.c)
+#define MAX_FUSE_DESCS 512
 
 // Internal: walk tree, record ops. Leaf indices are NEGATIVE (-1 - leaf_idx).
 // Op return values are NEGATIVE too during walk, fixed up after.
@@ -76,6 +73,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         if (inner >= (int)(WALK_LEAF_BASE * 2)) return -1; // can't compose onto op
         u32 leaf_idx = inner - WALK_LEAF_BASE;
         const View *base = leaf_views[leaf_idx];
+        if (!base) return -1; // lazy leaf — can't compose views (view unknown)
         Term arg2 = heap_read(ctx, loc + 1);
         if (term_tag(arg2) != TAG_TEN) return -1;
         TensorMeta *mp = &ctx->tensors[(u32)term_val(arg2)];
@@ -217,14 +215,13 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     u32 min_ops = has_reduce ? 1 : 2;  // reduce+1op is worth fusing
     if (n_ops < min_ops) return reduce_id(ctx, t);
 
-    // Determine elementwise output shape (broadcast of all leaves)
+    // Determine elementwise output shape (broadcast of all leaf views)
     View ew_view = *leaf_views[0];
     for (u32 i = 1; i < n_leaves; i++) {
         View av_bc, bv_bc;
         u32 bc_shape[MAX_DIM], bc_ndim;
-        if (!view_broadcast(&ew_view, leaf_views[i], &av_bc, &bv_bc, bc_shape, &bc_ndim)) {
+        if (!view_broadcast(&ew_view, leaf_views[i], &av_bc, &bv_bc, bc_shape, &bc_ndim))
             return reduce_id(ctx, t);
-        }
         ew_view = view_create(shape_of(bc_shape, bc_ndim));
     }
 
@@ -232,12 +229,10 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     View out_view = ew_view;
     u32 reduce_dim = 1;
     if (has_reduce) {
-        // Get reduce axis from SUM's second arg, or default to last dim
         u64 sum_loc = term_val(sum_term);
         Term sum_axes = heap_read(ctx, sum_loc + 1);
         int reduce_axis = -1;
         if (term_tag(sum_axes) == TAG_TEN) {
-            // Explicit axis — read it (nosync since it's CPU metadata)
             u32 ax_id = (u32)term_val(sum_axes);
             TensorMeta *axt = &ctx->tensors[ax_id];
             if (axt->view.numel == 1) {
@@ -247,7 +242,6 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             }
         }
         if (reduce_axis < 0) {
-            // No explicit axis or multi-axis: reduce last non-1 dim
             for (int d = (int)ew_view.shape.rank - 1; d >= 0; d--)
                 if (ew_view.shape.dims[d] > 1) { reduce_axis = d; break; }
         }
@@ -256,17 +250,15 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             out_view.shape.dims[reduce_axis] = 1;
             out_view.numel = ew_view.numel / reduce_dim;
         } else {
-            // Can't determine reduce axis — fall back
             return reduce_id(ctx, t);
         }
     }
     u32 out_numel = out_view.numel;
 
-    // Allocate output tensor
+    // All leaves are TAG_TEN — dispatch immediately
     u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
 
     fuse_fused_count++;
-    // Dispatch fused kernel
     #ifdef __APPLE__
     if (ctx->backend == &metal_backend) {
         u32 bufs[FUSE_MAX_LEAVES];
@@ -277,7 +269,6 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     } else
     #endif
     {
-        // CPU fallback: just reduce normally
         return reduce_id(ctx, t);
     }
 

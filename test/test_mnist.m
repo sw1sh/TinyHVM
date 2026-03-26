@@ -292,9 +292,8 @@ static int run_cnn(MNISTData *data) {
 
         f32 loss_val;
 
-        if (step == 0) {
-            // Step 0: normal execution with JIT capture
-            jit_begin_capture(n_weights);
+        if (1) { // JIT disabled — all steps run normally
+            if (step == 0) jit_begin_capture(n_weights);
 
             if (ctx->backend->begin_batch) ctx->backend->begin_batch();
 
@@ -320,14 +319,7 @@ static int run_cnn(MNISTData *data) {
             adam_step(ctx, &opt, grad_ids);
 
             loss_val = thvm_to_host(ctx, loss_r)[0];
-            jit_end_capture();
-        } else {
-            // Steps 1+: JIT replay — re-encodes all GPU commands, skips IC/fusion/tensor work
-            jit_replay();
-            // Flush GPU work
-            extern void metal_flush(void);
-            metal_flush();
-            loss_val = 0.0f;  // Loss readback TODO — for now just measure speed
+            if (step == 0) jit_end_capture();
         }
 
         extern u32 total_dispatches, bc2d_count;

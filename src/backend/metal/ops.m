@@ -87,7 +87,7 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
     id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
     const void *params[] = { &dvp, &svp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams) };
-    dispatch_1d(pipe, bufs, 2, params, psizes, 2, dv->numel);
+    dc_tag=DC_SLOW_UN; dispatch_1d(pipe, bufs, 2, params, psizes, 2, dv->numel);
     thvm_prof_record(uop, t0);
 }
 
@@ -122,7 +122,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
                 id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
                 const void *params[] = { &n4 };
                 u64 psizes[] = { sizeof(u32) };
-                dispatch_1d(f4p, bufs, 3, params, psizes, 1, n4);
+                dc_tag=DC_F4_BIN; dispatch_1d(f4p, bufs, 3, params, psizes, 1, n4);
                 thvm_prof_record(uop, t0);
                 return;
             }
@@ -131,7 +131,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
         id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
         const void *params[] = { &n };
         u64 psizes[] = { sizeof(u32) };
-        dispatch_1d(fpipe, bufs, 3, params, psizes, 1, n);
+        dc_tag=DC_FAST_BIN; dispatch_1d(fpipe, bufs, 3, params, psizes, 1, n);
         thvm_prof_record(uop, t0);
         return;
     }
@@ -187,7 +187,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
                     const void *params[] = { &n_spatial, &n_bc, &C_dim };
                     u64 psizes[] = { sizeof(u32), sizeof(u32), sizeof(u32) };
                     bc2d_count++;
-                    dispatch_2d(bc_pipe, bufs, 3, params, psizes, 3, n_spatial, n_bc);
+                    dc_tag=DC_BC2D; dispatch_2d(bc_pipe, bufs, 3, params, psizes, 3, n_spatial, n_bc);
                     thvm_prof_record(uop, t0);
                     return;
                 }
@@ -221,7 +221,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
     id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
     const void *params[] = { &dvp, &avp, &bvp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams), sizeof(ViewParams) };
-    dispatch_1d(pipe, bufs, 3, params, psizes, 3, dv->numel);
+    dc_tag=DC_SLOW_BIN; dispatch_1d(pipe, bufs, 3, params, psizes, 3, dv->numel);
     thvm_prof_record(uop, t0);
 }
 
@@ -266,7 +266,7 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
         alpha:1.0 beta:0.0];
 
     [mm encodeToCommandBuffer:batch_cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
-    batch_dirty = 1;
+    batch_dirty = 1; total_dispatches++; dc[DC_MM]++;
     thvm_prof_record(UOP_MM, t0);
 }
 
@@ -284,6 +284,6 @@ static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
     id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
     const void *params[] = { &reduce_dim };
     u64 psizes[] = { sizeof(u32) };
-    dispatch_1d(pipe, bufs, 2, params, psizes, 1, dst_numel);
+    dc_tag=DC_REDUCE; dispatch_1d(pipe, bufs, 2, params, psizes, 1, dst_numel);
     thvm_prof_record(uop, t0);
 }

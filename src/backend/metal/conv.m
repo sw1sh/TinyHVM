@@ -4,7 +4,7 @@ static void metal_op_im2col(u32 dst, u32 src, Conv2dParams p) {
     id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
     const void *params[] = { &p };
     u64 psizes[] = { sizeof(Conv2dParams) };
-    dispatch_1d(pipe_im2col, bufs, 2, params, psizes, 1, p.n_patches * p.patch_size);
+    dc_tag=DC_IM2COL; dispatch_1d(pipe_im2col, bufs, 2, params, psizes, 1, p.n_patches * p.patch_size);
 }
 
 static void metal_op_col2im(u32 dst, u32 src, Conv2dParams p) {

@@ -6,7 +6,7 @@ static void metal_op_maxpool_fwd(u32 out, u32 mask, u32 src, u32 B, u32 C, u32 H
     id<MTLBuffer> bufs[] = { metal_pool.bufs[out], metal_pool.bufs[mask], metal_pool.bufs[src] };
     const void *params[] = { &lp };
     u64 psizes[] = { sizeof(LayoutParams) };
-    dispatch_1d(pipe_maxpool2d_fwd, bufs, 3, params, psizes, 1, B * C * OH * OW);
+    dc_tag=DC_MAXPOOL; dispatch_1d(pipe_maxpool2d_fwd, bufs, 3, params, psizes, 1, B * C * OH * OW);
 }
 
 static void metal_op_maxpool_bwd(u32 dx, u32 dout, u32 mask, u32 B, u32 C, u32 H, u32 W) {
@@ -15,7 +15,7 @@ static void metal_op_maxpool_bwd(u32 dx, u32 dout, u32 mask, u32 B, u32 C, u32 H
     id<MTLBuffer> bufs[] = { metal_pool.bufs[dx], metal_pool.bufs[dout], metal_pool.bufs[mask] };
     const void *params[] = { &lp };
     u64 psizes[] = { sizeof(LayoutParams) };
-    dispatch_1d(pipe_maxpool2d_bwd, bufs, 3, params, psizes, 1, B * C * OH * OW);
+    dc_tag=DC_MAXPOOL; dispatch_1d(pipe_maxpool2d_bwd, bufs, 3, params, psizes, 1, B * C * OH * OW);
 }
 
 static void metal_op_relu_bwd(u32 dx, u32 dout, u32 x, u32 n) {
@@ -37,5 +37,5 @@ static void metal_op_adam_step(u32 param, u32 grad, u32 m, u32 v,
                               metal_pool.bufs[m], metal_pool.bufs[v] };
     const void *params[] = { &ap };
     u64 psizes[] = { sizeof(AP) };
-    dispatch_1d(pipe_adam_step, bufs, 4, params, psizes, 1, n);
+    dc_tag=DC_ADAM; dispatch_1d(pipe_adam_step, bufs, 4, params, psizes, 1, n);
 }

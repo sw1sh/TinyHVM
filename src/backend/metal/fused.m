@@ -32,7 +32,7 @@ void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
     id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a_buf], metal_pool.bufs[b_buf] };
     const void *params[] = { &avp, &bvp, &ovp, &rp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams), sizeof(ViewParams), sizeof(MulReduceParams) };
-    dispatch_1d(pipe_mul_reduce_sum, bufs, 3, params, psizes, 4, dst_numel);
+    dc_tag=DC_MRS; dispatch_1d(pipe_mul_reduce_sum, bufs, 3, params, psizes, 4, dst_numel);
     thvm_prof_record(UOP_SUM, t0);
 }
 
@@ -193,7 +193,7 @@ void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view)
     ViewParams vp = view_to_params(src_view);
     const void *params[] = { &vp, &numel };
     u64 psizes[] = { sizeof(ViewParams), sizeof(u32) };
-    dispatch_1d(pipe, mbufs, 2, params, psizes, 2, numel);
+    dc_tag=DC_CONTIGUIFY; dispatch_1d(pipe, mbufs, 2, params, psizes, 2, numel); /* contiguify_general */
 }
 
 // Dispatch a fused elementwise kernel.
@@ -224,9 +224,9 @@ void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
     if (has_reduce) {
         params[n_leaves + 1] = &reduce_dim;
         psizes[n_leaves + 1] = sizeof(u32);
-        dispatch_1d(pipe, bufs, n_leaves + 1, params, psizes, n_leaves + 2, out_numel);
+        dc_tag=DC_FUSED; dispatch_1d(pipe, bufs, n_leaves + 1, params, psizes, n_leaves + 2, out_numel);
     } else {
-        dispatch_1d(pipe, bufs, n_leaves + 1, params, psizes, n_leaves + 1, out_numel);
+        dc_tag=DC_FUSED; dispatch_1d(pipe, bufs, n_leaves + 1, params, psizes, n_leaves + 1, out_numel);
     }
 }
 
@@ -529,7 +529,7 @@ void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
     [enc dispatchThreads:MTLSizeMake(gw, gh, gd)
        threadsPerThreadgroup:MTLSizeMake(tw, th, td)];
     batch_dirty = 1;
-    total_dispatches++;
+    dc[DC_MDIM]++; total_dispatches++;
 }
 
 // Multi-dim unary kernel codegen (same approach as binary)
@@ -641,5 +641,5 @@ dispatch_unary:;
     u32 tw = MIN(gw, 256u);
     [enc dispatchThreads:MTLSizeMake(gw,gh,gd) threadsPerThreadgroup:MTLSizeMake(tw,1,1)];
     batch_dirty = 1;
-    total_dispatches++;
+    dc[DC_OTHER]++; total_dispatches++;
 }

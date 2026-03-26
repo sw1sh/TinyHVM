@@ -317,7 +317,7 @@ static int run_cnn(MNISTData *data) {
         extern u32 total_dispatches, bc2d_count;
         extern double flush_total_ms;
         extern u32 flush_count_total;
-        if (step == 0) {
+        if (step == 0) { extern void print_dispatch_breakdown(void); print_dispatch_breakdown();
             struct timespec now_; clock_gettime(CLOCK_MONOTONIC, &now_);
             f32 wall_ = (f32)(now_.tv_sec - t0_wall.tv_sec)*1000.0f + (f32)(now_.tv_nsec - t0_wall.tv_nsec)/1e6f;
             printf("    step 0: dispatches=%u (2d_bc=%u) gpu=%.0fms wall=%.0fms\n",

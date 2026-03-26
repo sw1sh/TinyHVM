@@ -921,56 +921,74 @@ inet_step:
                     }
                 } else {
                     // Single-axis reduce: last non-1 dim
-                    // Materialize non-contiguous input first (e.g. expand strides=0)
-                    u32 src_numel = ma->view.numel;
-                    u32 use_buf = ma->buf_id;
-                    if (!ma->view.contiguous) {
-                        #ifdef __APPLE__
-                        if (ctx->backend == &metal_backend) {
-                            // GPU contiguify — no CPU round-trip, no flush
-                            use_buf = ctx->backend->buf_alloc(src_numel * sizeof(f32));
-                            metal_contiguify(use_buf, src_numel, ma->buf_id, &ma->view);
-                        } else
-                        #endif
-                        {
-                            u32 max_buf_idx = 0;
-                            for (u32 d = 0; d < ma->view.shape.rank; d++)
-                                if (ma->view.strides[d] > 0)
-                                    max_buf_idx += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
-                            max_buf_idx += (ma->view.offset > 0) ? (u32)ma->view.offset : 0;
-                            f32 *raw = malloc((max_buf_idx+1) * sizeof(f32));
-                            ctx->backend->buf_read(ma->buf_id, raw, (u64)(max_buf_idx+1)*sizeof(f32));
-                            f32 *mat_src = malloc(src_numel * sizeof(f32));
-                            for (u32 flat = 0; flat < src_numel; flat++) {
-                                u32 rem = flat; i32 phys = ma->view.offset; int msk = 0;
-                                for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
-                                    u32 c = rem % ma->view.shape.dims[d]; rem /= ma->view.shape.dims[d];
-                                    if (ma->view.has_mask && (c < ma->view.mask_begin[d] || c >= ma->view.mask_end[d])) msk = 1;
-                                    phys += (i32)c * (ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
-                                }
-                                mat_src[flat] = (msk || phys < 0 || (u32)phys > max_buf_idx) ? 0.f : raw[(u32)phys];
-                            }
-                            free(raw);
-                            use_buf = ctx->backend->buf_alloc(src_numel * sizeof(f32));
-                            ctx->backend->buf_write(use_buf, mat_src, src_numel * sizeof(f32));
-                            free(mat_src);
-                        }
-                    }
+                    // Single-axis reduce: find the last non-1 dimension
                     u32 reduce_dim = 1;
                     int ra = -1;
                     for (int i = (int)ma->view.shape.rank - 1; i >= 0; i--) {
-                        reduce_dim *= ma->view.shape.dims[i];
                         if (ma->view.shape.dims[i] > 1 && ra < 0) ra = i;
-                        if (ra >= 0 && i <= ra) break;
+                        if (ra >= 0) { reduce_dim *= ma->view.shape.dims[i]; break; }
                     }
-                    if (ra >= 0) {
-                        reduce_dim = 1;
-                        for (u32 i = (u32)ra; i < ma->view.shape.rank; i++)
-                            reduce_dim *= ma->view.shape.dims[i];
+                    if (ra < 0) ra = (int)ma->view.shape.rank - 1;
+
+                    #ifdef __APPLE__
+                    if (uop == UOP_SUM && ctx->backend == &metal_backend && !ma->view.contiguous) {
+                        // Use mul_reduce_sum(input, ones, reduce_axis) — handles non-contiguous
+                        // via ViewParams. Avoids contiguify dispatch.
+                        u32 rdims[] = {(u32)reduce_dim};
+                        u32 rstrides_a[] = {(u32)(ma->view.strides[ra] > 0 ? ma->view.strides[ra] : 0)};
+                        u32 rstrides_ones[] = {0};
+                        f32 one_val = 1.0f;
+                        u32 ones_buf = ctx->backend->buf_alloc(sizeof(f32));
+                        ctx->backend->buf_write(ones_buf, &one_val, sizeof(f32));
+                        View ones_v = md->view;
+                        for (u32 d2 = 0; d2 < ones_v.shape.rank; d2++) ones_v.strides[d2] = 0;
+                        ones_v.offset = 0; ones_v.contiguous = 0;
+                        metal_mul_reduce_sum(
+                            md->buf_id, md->view.numel,
+                            ma->buf_id, &ma->view,
+                            ones_buf, &ones_v,
+                            &md->view, 1, rdims, rstrides_a, rstrides_ones);
+                    } else
+                    #endif
+                    {
+                        // Contiguify if needed, then use simple reduce kernel
+                        u32 src_numel = ma->view.numel;
+                        u32 use_buf = ma->buf_id;
+                        if (!ma->view.contiguous) {
+                            #ifdef __APPLE__
+                            if (ctx->backend == &metal_backend) {
+                                use_buf = ctx->backend->buf_alloc(src_numel * sizeof(f32));
+                                metal_contiguify(use_buf, src_numel, ma->buf_id, &ma->view);
+                            } else
+                            #endif
+                            {
+                                u32 max_buf_idx = 0;
+                                for (u32 d = 0; d < ma->view.shape.rank; d++)
+                                    if (ma->view.strides[d] > 0)
+                                        max_buf_idx += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
+                                max_buf_idx += (ma->view.offset > 0) ? (u32)ma->view.offset : 0;
+                                f32 *raw = malloc((max_buf_idx+1) * sizeof(f32));
+                                ctx->backend->buf_read(ma->buf_id, raw, (u64)(max_buf_idx+1)*sizeof(f32));
+                                f32 *mat_src = malloc(src_numel * sizeof(f32));
+                                for (u32 flat = 0; flat < src_numel; flat++) {
+                                    u32 rem = flat; i32 phys = ma->view.offset; int msk = 0;
+                                    for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
+                                        u32 c = rem % ma->view.shape.dims[d]; rem /= ma->view.shape.dims[d];
+                                        if (ma->view.has_mask && (c < ma->view.mask_begin[d] || c >= ma->view.mask_end[d])) msk = 1;
+                                        phys += (i32)c * (ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
+                                    }
+                                    mat_src[flat] = (msk || phys < 0 || (u32)phys > max_buf_idx) ? 0.f : raw[(u32)phys];
+                                }
+                                free(raw);
+                                use_buf = ctx->backend->buf_alloc(src_numel * sizeof(f32));
+                                ctx->backend->buf_write(use_buf, mat_src, src_numel * sizeof(f32));
+                                free(mat_src);
+                            }
+                        }
+                        ctx->backend->op_reduce(uop, md->buf_id, md->view.numel,
+                                                use_buf, src_numel, reduce_dim);
+                        if (use_buf != ma->buf_id) ctx->backend->buf_free(use_buf);
                     }
-                    ctx->backend->op_reduce(uop, md->buf_id, md->view.numel,
-                                            use_buf, src_numel, reduce_dim);
-                    if (use_buf != ma->buf_id) ctx->backend->buf_free(use_buf);
                 }
             } else if (is_binary) {
                 ctx->backend->op_binary(uop, md->buf_id, &md->view,

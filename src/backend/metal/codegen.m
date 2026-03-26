@@ -184,11 +184,26 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
         [s appendFormat:@"  uint base=iz*%uu+iy*%uu+inner_base;\n", mid*inner, inner];
         [s appendFormat:@"  for(uint r=0;r<%uu;r++){\n", reduce_dim];
         [s appendFormat:@"    uint ridx=base*%uu+r;\n", reduce_dim];
+        u32 full_numel = inner * mid * outer * reduce_dim;
         for (u32 li = 0; li < n_leaves; li++) {
-            if (cg_leaf_is_flat(leaf_views[li], inner*mid*outer*reduce_dim))
+            const View *lv = leaf_views[li];
+            if (cg_leaf_is_flat(lv, full_numel)) {
                 [s appendFormat:@"    float t%u=in%u[ridx];\n", li, li];
-            else
-                [s appendFormat:@"    float t%u=in%u[i%u];\n", li, li, li]; // TODO: proper reduce indexing
+            } else {
+                // Decompose ridx through the leaf's PHYSICAL shape
+                // (same "different rank" approach as elementwise path)
+                [s appendFormat:@"    {uint _r%u=ridx; uint _i%u=%d", li, li, lv->offset];
+                u32 divisor = 1;
+                for (int d = (int)lv->shape.rank - 1; d >= 0; d--) {
+                    if (lv->strides[d] == 0) { divisor *= lv->shape.dims[d]; continue; }
+                    if (divisor == 1)
+                        [s appendFormat:@"+(_r%u%%%uu)*%d", li, lv->shape.dims[d], lv->strides[d]];
+                    else
+                        [s appendFormat:@"+((_r%u/%uu)%%%uu)*%d", li, divisor, lv->shape.dims[d], lv->strides[d]];
+                    divisor *= lv->shape.dims[d];
+                }
+                [s appendFormat:@";}\n    float t%u=in%u[_i%u];\n", li, li, li];
+            }
         }
     } else if (use_f4) {
         // Float4 reads

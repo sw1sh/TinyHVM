@@ -224,29 +224,45 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
     if (!ew_init) return reduce_id(ctx, t);
 
-    // Reduce axis
+    // Reduce axes: read all axes, compute combined reduce dim.
+    // The codegen flattens all reduce dims into one reduce loop.
     View out_view = ew_view; u32 reduce_dim = 1;
     if (has_reduce) {
         u64 sum_loc = term_val(sum_term);
         Term sum_axes = heap_read(ctx, sum_loc + 1);
-        int reduce_axis = -1;
+        int found_axes = 0;
         if (term_tag(sum_axes) == TAG_TEN) {
             u32 ax_id = (u32)term_val(sum_axes);
             TensorMeta *axt = &ctx->tensors[ax_id];
-            if (axt->view.numel == 1) {
-                f32 ax_val;
-                META_READ(ctx, axt->buf_id, &ax_val, sizeof(f32));
-                reduce_axis = (int)ax_val;
+            u32 n_axes = axt->view.numel;
+            f32 axes_f[MAX_DIM];
+            META_READ(ctx, axt->buf_id, axes_f, n_axes * sizeof(f32));
+            // Collapse all reduce axes: they must be contiguous at the end
+            // (or we fall back). The codegen treats them as one flat reduce dim.
+            for (u32 i = 0; i < n_axes; i++) {
+                int ax = (int)axes_f[i];
+                if (ax >= 0 && ax < (int)ew_view.shape.rank) {
+                    reduce_dim *= ew_view.shape.dims[ax];
+                    out_view.shape.dims[ax] = 1;
+                    found_axes = 1;
+                }
+            }
+            if (found_axes)
+                out_view.numel = ew_view.numel / reduce_dim;
+        }
+        if (!found_axes) {
+            // No explicit axes: reduce last non-1 dim
+            for (int d = (int)ew_view.shape.rank - 1; d >= 0; d--) {
+                if (ew_view.shape.dims[d] > 1) {
+                    reduce_dim = ew_view.shape.dims[d];
+                    out_view.shape.dims[d] = 1;
+                    out_view.numel = ew_view.numel / reduce_dim;
+                    found_axes = 1;
+                    break;
+                }
             }
         }
-        if (reduce_axis < 0)
-            for (int d = (int)ew_view.shape.rank - 1; d >= 0; d--)
-                if (ew_view.shape.dims[d] > 1) { reduce_axis = d; break; }
-        if (reduce_axis >= 0 && reduce_axis < (int)ew_view.shape.rank) {
-            reduce_dim = ew_view.shape.dims[reduce_axis];
-            out_view.shape.dims[reduce_axis] = 1;
-            out_view.numel = ew_view.numel / reduce_dim;
-        } else return reduce_id(ctx, t);
+        if (!found_axes) return reduce_id(ctx, t);
     }
     u32 out_numel = out_view.numel;
 

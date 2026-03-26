@@ -258,7 +258,9 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
 
     // ── Deferred dispatch (lazy leaves) ─────────────────────────
     if (has_lazy) {
-        return reduce_id(ctx, t); // BUG: view replay wrong
+        // DISABLED: FUSE output lacks backward provenance.
+        // Need to implement FUSE backward or set proper creator_op/src_ids.
+        return reduce_id(ctx, t);
         if (fuse_desc_count >= MAX_FUSE_DESCS) return reduce_id(ctx, t);
         u32 desc_id = fuse_desc_count++;
         FuseDesc *fd = &fuse_descs[desc_id];

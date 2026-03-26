@@ -272,6 +272,8 @@ static id<MTLComputePipelineState> cg_get_pipe(const FusedOp *ops, u32 n_ops,
         if (cg_cache[i].key == key) return cg_cache[i].pipe;
 
     NSString *src = codegen_kernel(ops, n_ops, n_leaves, leaf_views, out_numel, has_reduce, reduce_dim, out_shape_hint);
+    static int _kp = 0;
+    if (_kp < 8) { fprintf(stderr, "KERNEL(ops=%u leaves=%u out=%u rank=%u):\n%s\n", n_ops, n_leaves, out_numel, out_shape_hint?out_shape_hint->rank:0, [src UTF8String]); _kp++; }
     NSError *err;
     id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
     if (!lib) { NSLog(@"codegen error: %@\n%@", err, src); return nil; }

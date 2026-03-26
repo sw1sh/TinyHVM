@@ -72,7 +72,7 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
         }
     }
 
-    // Slow path: strided ViewParams (broadcast, permuted, masked)
+    // Fallback: generic strided ViewParams
     id<MTLComputePipelineState> pipe = nil;
     switch (uop) {
         case UOP_NEG:  pipe = pipe_neg;  break;

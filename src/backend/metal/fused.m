@@ -531,3 +531,115 @@ void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
     batch_dirty = 1;
     total_dispatches++;
 }
+
+// Multi-dim unary kernel codegen (same approach as binary)
+void metal_dispatch_mdim_unary(u32 uop, u32 dst, const View *dv,
+                                u32 src_buf, const View *sv) {
+    // Reuse binary codegen with b = dummy
+    // Actually, generate a simpler kernel
+    u64 h = 0xcbf29ce484222325ULL;
+    h ^= uop; h *= 0x100000001b3ULL;
+    h ^= 0xAAAA; h *= 0x100000001b3ULL; // mark as unary
+    for (u32 d = 0; d < dv->shape.rank; d++) {
+        h ^= dv->shape.dims[d]; h *= 0x100000001b3ULL;
+    }
+    for (u32 d = 0; d < sv->shape.rank; d++) {
+        h ^= (u64)(u32)sv->strides[d]; h *= 0x100000001b3ULL;
+    }
+    h ^= (u64)sv->offset; h *= 0x100000001b3ULL;
+
+    for (u32 i = 0; i < mdim_cache_count && i < MDIM_CACHE_SIZE; i++)
+        if (mdim_cache[i].key == h) goto dispatch_unary;
+
+    {
+        u32 rank = dv->shape.rank;
+        u32 inner = 1, mid = 1, outer = 1;
+        u32 inner_start = rank, mid_start;
+        for (int d = (int)rank - 1; d >= 0; d--) {
+            if (inner * dv->shape.dims[d] <= 1024) { inner *= dv->shape.dims[d]; inner_start = (u32)d; }
+            else break;
+        }
+        mid_start = inner_start;
+        for (int d = (int)inner_start - 1; d >= 0; d--) {
+            if (mid * dv->shape.dims[d] <= 65535) { mid *= dv->shape.dims[d]; mid_start = (u32)d; }
+            else break;
+        }
+        for (u32 d = 0; d < mid_start; d++) outer *= dv->shape.dims[d];
+
+        const char *op_expr;
+        switch(uop) {
+            case UOP_NEG:  op_expr = "-a[a_idx]"; break;
+            case UOP_RELU: op_expr = "max(a[a_idx], 0.0f)"; break;
+            case UOP_EXP:  op_expr = "exp(a[a_idx])"; break;
+            case UOP_LOG:  op_expr = "log(a[a_idx])"; break;
+            case UOP_SQRT: op_expr = "sqrt(a[a_idx])"; break;
+            default: return;
+        }
+
+        NSMutableString *src = [NSMutableString stringWithCapacity:1024];
+        [src appendString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
+        [src appendFormat:@"kernel void mdim_un(device float *out[[buffer(0)]],device const float *a[[buffer(1)]],uint3 gid[[thread_position_in_grid]]){\n"];
+        [src appendFormat:@"  uint inner_idx=gid.x,mid_idx=gid.y,outer_idx=gid.z;\n"];
+        [src appendFormat:@"  if(inner_idx>=%uu||mid_idx>=%uu||outer_idx>=%uu)return;\n", inner, mid, outer];
+
+        for (u32 d = 0; d < rank; d++) {
+            const char *group;
+            u32 group_end;
+            if (d < mid_start) { group = "outer_idx"; group_end = mid_start; }
+            else if (d < inner_start) { group = "mid_idx"; group_end = inner_start; }
+            else { group = "inner_idx"; group_end = rank; }
+            u32 divisor = 1;
+            for (u32 dd = d + 1; dd < group_end; dd++) divisor *= dv->shape.dims[dd];
+            if (divisor == 1 && dv->shape.dims[d] == 1)
+                [src appendFormat:@"  uint c%u=0;\n", d];
+            else if (divisor == 1)
+                [src appendFormat:@"  uint c%u=%s%%%uu;\n", d, group, dv->shape.dims[d]];
+            else
+                [src appendFormat:@"  uint c%u=(%s/%uu)%%%uu;\n", d, group, divisor, dv->shape.dims[d]];
+        }
+
+        [src appendFormat:@"  uint a_idx=%d", sv->offset];
+        for (u32 d = 0; d < rank; d++)
+            if (sv->strides[d] != 0) {
+                if (sv->strides[d] == 1) [src appendFormat:@"+c%u", d];
+                else [src appendFormat:@"+c%u*%du", d, sv->strides[d]];
+            }
+        [src appendString:@";\n"];
+        [src appendFormat:@"  uint out_idx=outer_idx*%uu+mid_idx*%uu+inner_idx;\n", mid*inner, inner];
+        [src appendFormat:@"  out[out_idx]=%s;\n}\n", op_expr];
+
+        NSError *err;
+        id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
+        if (!lib) { NSLog(@"mdim unary error: %@\n%@", err, src); return; }
+        id<MTLComputePipelineState> pipe = [mtl_dev newComputePipelineStateWithFunction:
+            [lib newFunctionWithName:@"mdim_un"] error:&err];
+        if (!pipe) return;
+        u32 slot = mdim_cache_count < MDIM_CACHE_SIZE ?
+            mdim_cache_count++ : (mdim_cache_count++ % MDIM_CACHE_SIZE);
+        mdim_cache[slot].key = h;
+        mdim_cache[slot].pipe = pipe;
+    }
+
+dispatch_unary:;
+    u32 rank = dv->shape.rank;
+    u32 gw = 1, gh = 1, gd = 1;
+    u32 is2 = rank;
+    for (int d = (int)rank-1; d >= 0; d--) { if (gw*dv->shape.dims[d]<=1024) { gw*=dv->shape.dims[d]; is2=(u32)d; } else break; }
+    u32 ms = is2;
+    for (int d = (int)is2-1; d >= 0; d--) { if (gh*dv->shape.dims[d]<=65535) { gh*=dv->shape.dims[d]; ms=(u32)d; } else break; }
+    for (u32 d = 0; d < ms; d++) gd *= dv->shape.dims[d];
+
+    id<MTLComputePipelineState> pipe = nil;
+    for (u32 i = 0; i < mdim_cache_count && i < MDIM_CACHE_SIZE; i++)
+        if (mdim_cache[i].key == h) { pipe = mdim_cache[i].pipe; break; }
+    if (!pipe) return;
+
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:pipe];
+    [enc setBuffer:metal_pool.bufs[dst] offset:0 atIndex:0];
+    [enc setBuffer:metal_pool.bufs[src_buf] offset:0 atIndex:1];
+    u32 tw = MIN(gw, 256u);
+    [enc dispatchThreads:MTLSizeMake(gw,gh,gd) threadsPerThreadgroup:MTLSizeMake(tw,1,1)];
+    batch_dirty = 1;
+    total_dispatches++;
+}

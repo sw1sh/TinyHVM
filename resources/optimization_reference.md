@@ -483,7 +483,7 @@ TinyHVM's JIT already does:
 
 ### 7.2 Next-Level Opportunities
 
-**From tinygrad — adopt:**
+**From tinygrad** (see tinygrad_reference.md §6, §5 for details)**:**
 1. **Beam search over kernel configs** — axis types, tile sizes, unroll factors
 2. **ShapeTracker-like lazy views** — avoid materializing reshape/permute/expand
 3. **Three-level caching** — method cache + disk cache + beam cache

@@ -512,10 +512,142 @@ compute_grid:;
     return nil;
 }
 
+// Try float4 mdim dispatch. Returns 1 if handled, 0 if caller should use scalar.
+static int try_mdim_float4(u32 uop, u32 dst, const View *dv,
+                            u32 a_buf, const View *av, u32 b_buf, const View *bv) {
+    u32 rank = dv->shape.rank;
+    if (rank == 0) return 0;
+    i32 a_is = av->strides[rank-1], b_is = bv->strides[rank-1];
+    u32 idim = dv->shape.dims[rank-1];
+    // Float4: innermost dim divisible by 4, both inputs stride 1 or 0 on innermost, at least one stride 1
+    if (idim % 4 != 0) return 0;
+    if (a_is != 1 && a_is != 0) return 0;
+    if (b_is != 1 && b_is != 0) return 0;
+    if (a_is != 1 && b_is != 1) return 0;
+
+    // Build the float4 kernel key
+    u64 key = mdim_hash(uop, dv, av, bv) ^ 0xF4F4F4F4ULL;
+    id<MTLComputePipelineState> pipe = nil;
+    for (u32 i = 0; i < mdim_cache_count && i < MDIM_CACHE_SIZE; i++)
+        if (mdim_cache[i].key == key) { pipe = mdim_cache[i].pipe; break; }
+
+    if (!pipe) {
+        // Generate float4 kernel: same as scalar mdim but with float4 loads and /4 dispatch
+        NSMutableString *src = [NSMutableString stringWithCapacity:2048];
+        [src appendString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
+        [src appendFormat:@"kernel void mdim_f4(\n"
+            "  device float *out [[buffer(0)]],\n"
+            "  device const float *a [[buffer(1)]],\n"
+            "  device const float *b [[buffer(2)]],\n"
+            "  uint3 gid [[thread_position_in_grid]])\n{\n"];
+
+        // Same group collapsing as scalar
+        u32 inner = 1, mid = 1, outer = 1;
+        u32 inner_start = rank;
+        for (int d = (int)rank - 1; d >= 0; d--) {
+            if (inner * dv->shape.dims[d] <= 1024) { inner *= dv->shape.dims[d]; inner_start = (u32)d; }
+            else break;
+        }
+        u32 mid_start = inner_start;
+        for (int d = (int)inner_start - 1; d >= 0; d--) {
+            if (mid * dv->shape.dims[d] <= 65535) { mid *= dv->shape.dims[d]; mid_start = (u32)d; }
+            else break;
+        }
+        for (u32 d = 0; d < mid_start; d++) outer *= dv->shape.dims[d];
+
+        // gid.x covers inner/4, gid.y covers mid, gid.z covers outer
+        [src appendFormat:@"  uint raw = gid.x; // [0, %u)\n", inner/4];
+        [src appendFormat:@"  uint inner_idx = raw * 4u; // base inner coordinate\n"];
+        [src appendFormat:@"  uint mid_idx = gid.y;\n  uint outer_idx = gid.z;\n"];
+
+        // Decompose coordinates (same as scalar)
+        for (u32 d = 0; d < rank; d++) {
+            const char *group;
+            u32 group_end;
+            if (d < mid_start) { group = "outer_idx"; group_end = mid_start; }
+            else if (d < inner_start) { group = "mid_idx"; group_end = inner_start; }
+            else { group = "inner_idx"; group_end = rank; }
+            u32 divisor = 1;
+            for (u32 dd = d + 1; dd < group_end; dd++) divisor *= dv->shape.dims[dd];
+            if (divisor == 1 && dv->shape.dims[d] == 1)
+                [src appendFormat:@"  uint c%u = 0;\n", d];
+            else if (divisor == 1)
+                [src appendFormat:@"  uint c%u = %s %% %uu;\n", d, group, dv->shape.dims[d]];
+            else
+                [src appendFormat:@"  uint c%u = (%s / %uu) %% %uu;\n", d, group, divisor, dv->shape.dims[d]];
+        }
+
+        // Compute base indices
+        for (int inp = 0; inp < 2; inp++) {
+            const View *v = (inp == 0) ? av : bv;
+            const char *nm = (inp == 0) ? "a" : "b";
+            [src appendFormat:@"  uint %s_idx = %d", nm, v->offset];
+            for (u32 d = 0; d < rank; d++)
+                if (v->strides[d] != 0) {
+                    if (v->strides[d] == 1) [src appendFormat:@" + c%u", d];
+                    else [src appendFormat:@" + c%u * %du", d, v->strides[d]];
+                }
+            [src appendString:@";\n"];
+        }
+
+        // Float4 loads: stride=1 → float4 load, stride=0 → scalar broadcast
+        [src appendFormat:@"  float4 va = %s;\n",
+            (a_is == 1) ? "*((device const float4*)(a + a_idx))" : "float4(a[a_idx])"];
+        [src appendFormat:@"  float4 vb = %s;\n",
+            (b_is == 1) ? "*((device const float4*)(b + b_idx))" : "float4(b[b_idx])"];
+
+        // Output base index
+        [src appendFormat:@"  uint out_base = outer_idx * %uu + mid_idx * %uu + inner_idx;\n",
+            mid * inner, inner];
+
+        // Op
+        if (uop == UOP_CMP)
+            [src appendString:@"  *((device float4*)(out+out_base)) = float4(va.x>vb.x?1.f:0.f,va.y>vb.y?1.f:0.f,va.z>vb.z?1.f:0.f,va.w>vb.w?1.f:0.f);\n"];
+        else if (uop == UOP_MAX)
+            [src appendString:@"  *((device float4*)(out+out_base)) = max(va,vb);\n"];
+        else
+            [src appendFormat:@"  *((device float4*)(out+out_base)) = va %s vb;\n", uop_to_op(uop)];
+        [src appendString:@"}\n"];
+
+        NSError *err;
+        id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
+        if (!lib) { NSLog(@"mdim f4 error: %@\n%@", err, src); return 0; }
+        pipe = [mtl_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mdim_f4"] error:&err];
+        if (!pipe) return 0;
+        u32 slot = mdim_cache_count < MDIM_CACHE_SIZE ? mdim_cache_count++ : (mdim_cache_count++ % MDIM_CACHE_SIZE);
+        mdim_cache[slot].key = key;
+        mdim_cache[slot].pipe = pipe;
+    }
+
+    // Recompute grid dims for dispatch
+    u32 inner2 = 1, mid2 = 1, outer2 = 1;
+    { u32 is2 = rank;
+      for (int d = (int)rank-1; d >= 0; d--) { if (inner2*dv->shape.dims[d]<=1024) { inner2*=dv->shape.dims[d]; is2=(u32)d; } else break; }
+      u32 ms2 = is2;
+      for (int d = (int)is2-1; d >= 0; d--) { if (mid2*dv->shape.dims[d]<=65535) { mid2*=dv->shape.dims[d]; ms2=(u32)d; } else break; }
+      for (u32 d = 0; d < ms2; d++) outer2 *= dv->shape.dims[d];
+    }
+    u32 gw = inner2/4, gh = mid2, gd = outer2;
+    u32 tw = MIN(gw, 256u);
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:pipe];
+    [enc setBuffer:metal_pool.bufs[dst] offset:0 atIndex:0];
+    [enc setBuffer:metal_pool.bufs[a_buf] offset:0 atIndex:1];
+    [enc setBuffer:metal_pool.bufs[b_buf] offset:0 atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(gw, gh, gd) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    batch_dirty = 1;
+    dc[DC_MDIM]++; total_dispatches++;
+    return 1;
+}
+
 // Dispatch a multi-dim binary kernel
 void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
                                  u32 a_buf, const View *av,
                                  u32 b_buf, const View *bv) {
+    // Try float4 first
+    if (try_mdim_float4(uop, dst, dv, a_buf, av, b_buf, bv)) return;
+
+    // Scalar fallback
     u32 gw, gh, gd, tw, th, td;
     id<MTLComputePipelineState> pipe = get_mdim_binary_pipe(uop, dv, av, bv,
                                                               &gw, &gh, &gd, &tw, &th, &td);

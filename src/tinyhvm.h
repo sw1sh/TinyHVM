@@ -376,19 +376,20 @@ typedef struct {
 // Every TAG_TOP gets its output view stored eagerly at creation time.
 // Keyed by heap loc. The fuser reads these to get pre-computed views
 // for lazy nodes without reducing them.
-#define ST_TABLE_SIZE 65536
+// Hash table with collision detection via stored key (heap_loc).
+#define ST_TABLE_SIZE (1 << 18)  // 256K — much larger than heap usage per step
 static View    st_views[ST_TABLE_SIZE];
-static u8      st_valid[ST_TABLE_SIZE];
+static u64     st_keys[ST_TABLE_SIZE]; // 0 = empty
 
 static inline void st_set(u64 heap_loc, const View *v) {
     u32 idx = (u32)(heap_loc % ST_TABLE_SIZE);
     st_views[idx] = *v;
-    st_valid[idx] = 1;
+    st_keys[idx] = heap_loc + 1; // +1 so 0 means empty
 }
 
 static inline const View *st_get(u64 heap_loc) {
     u32 idx = (u32)(heap_loc % ST_TABLE_SIZE);
-    return st_valid[idx] ? &st_views[idx] : NULL;
+    return (st_keys[idx] == heap_loc + 1) ? &st_views[idx] : NULL;
 }
 
 typedef struct {

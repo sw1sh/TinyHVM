@@ -417,25 +417,70 @@ inet_step:
                 f32 did_f; META_READ(ctx, ctx->tensors[dt].buf_id, &did_f, sizeof(f32));
                 u32 desc_id = (u32)did_f;
                 FuseDesc *fd = &fuse_descs[desc_id];
-                fprintf(stderr, "FUSE_DISPATCH desc=%u n_leaves=%u n_ops=%u\n", desc_id, fd->n_leaves, fd->n_ops);
+                fprintf(stderr, "FUSE_DISPATCH desc=%u n_leaves=%u n_ops=%u out=[",
+                    desc_id, fd->n_leaves, fd->n_ops);
+                for(u32 _d=0;_d<fd->out_shape.rank;_d++) fprintf(stderr,"%u,",fd->out_shape.dims[_d]);
+                fprintf(stderr,"] numel=%u reduce=%d/%u ops=[", fd->out_numel, fd->has_reduce, fd->reduce_dim);
+                for(u32 _o=0;_o<fd->n_ops;_o++) fprintf(stderr,"%s,",uop_names[fd->ops[_o].uop]);
+                fprintf(stderr,"]\n");
 
-                // Reduce all lazy leaf terms to TAG_TEN
-                // Disable fusion during leaf reduction to prevent FUSE recursion
+                // Reduce all lazy leaf terms, then replay view chains
                 u8 saved_nf = ctx->no_fuse; ctx->no_fuse = 1;
                 u32 leaf_bufs[FUSE_MAX_LEAVES_FWD];
+                static View fuse_dispatch_views[FUSE_MAX_LEAVES_FWD]; // static to avoid stack overflow
                 const View *leaf_views[FUSE_MAX_LEAVES_FWD];
                 for (u32 i = 0; i < fd->n_leaves; i++) {
                     Term lt = thvm_reduce(ctx, fd->leaf_terms[i]);
-                    if (term_tag(lt) != TAG_TEN) RETURN_REDUCED(t); // can't fuse
+                    if (term_tag(lt) != TAG_TEN) { ctx->no_fuse = saved_nf; RETURN_REDUCED(t); }
                     u32 tid = (u32)term_val(lt);
                     TensorMeta *lm = &ctx->tensors[tid];
                     leaf_bufs[i] = lm->buf_id;
-                    // Use the ACTUAL reduced tensor's view. Shape tracking
-                    // gave us shapes for fusion eligibility checks, but the
-                    // physical strides come from the materialized tensor.
-                    leaf_views[i] = &lm->view;
+                    // Start with actual tensor view, then replay view ops
+                    View v = lm->view;
+                    for (u32 vi = 0; vi < fd->leaf_n_views[i]; vi++) {
+                        FuseViewOp *vo = &fd->leaf_view_chain[i][vi];
+                        Term arg2 = heap_read(ctx, vo->loc + 1);
+                        if (term_tag(arg2) != TAG_TEN) break;
+                        TensorMeta *mp = &ctx->tensors[(u32)term_val(arg2)];
+                        u32 rank = mp->view.numel;
+                        f32 pf[MAX_DIM];
+                        META_READ(ctx, mp->buf_id, pf, rank * sizeof(f32));
+                        if (vo->uop == UOP_PERMUTE) {
+                            View nv = {0};
+                            nv.offset = v.offset; nv.shape.rank = rank; nv.numel = v.numel;
+                            for (u32 j = 0; j < rank; j++) {
+                                nv.shape.dims[j] = v.shape.dims[(u32)pf[j]];
+                                nv.strides[j] = v.strides[(u32)pf[j]];
+                            }
+                            nv.contiguous = 0;
+                            v = nv;
+                        } else if (vo->uop == UOP_EXPAND) {
+                            v.numel = 1;
+                            for (u32 j = 0; j < rank; j++) {
+                                u32 nd = (u32)pf[j];
+                                if (j < v.shape.rank && v.shape.dims[j] == 1 && nd > 1)
+                                    v.strides[j] = 0;
+                                v.shape.dims[j] = nd; v.numel *= nd;
+                            }
+                            v.shape.rank = rank; v.contiguous = 0;
+                        } else if (vo->uop == UOP_RESHAPE) {
+                            Shape ns = {.rank = rank};
+                            for (u32 j = 0; j < rank; j++) ns.dims[j] = (u32)pf[j];
+                            View nv = view_reshape(v, ns);
+                            // Non-aliasable: keep physical view (codegen handles rank mismatch)
+                            if (!nv.contiguous && !v.contiguous) {
+                                i32 exp = 1; int dense = 1;
+                                for (int d = (int)rank - 1; d >= 0; d--) {
+                                    if (ns.dims[d] > 1 && nv.strides[d] != exp) { dense = 0; break; }
+                                    exp *= (i32)ns.dims[d];
+                                }
+                                if (dense) { /* keep v as-is */ } else v = nv;
+                            } else v = nv;
+                        }
+                    }
+                    fuse_dispatch_views[i] = v;
+                    leaf_views[i] = &fuse_dispatch_views[i];
                 }
-
                 ctx->no_fuse = saved_nf;
                 // Allocate output tensor
                 u32 dst_id = tensor_create(ctx, fd->out_shape, DTYPE_F32);

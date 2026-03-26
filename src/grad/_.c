@@ -46,6 +46,9 @@ static View fuse_composed_views[FUSE_MAX_LEAVES];
 
 // Leaf terms for lazy FUSE nodes (may be TAG_TEN or TAG_TOP)
 static Term fuse_leaf_terms[FUSE_MAX_LEAVES];
+// View op chain per leaf: recorded during walk, replayed at dispatch
+static FuseViewOp fuse_leaf_vops[FUSE_MAX_LEAVES][FUSE_MAX_VIEW_OPS];
+static u32 fuse_leaf_nvops[FUSE_MAX_LEAVES];
 
 static int fuse_walk_inner(TinyHVM *ctx, Term t,
                            FusedOp *ops, u32 *n_ops,
@@ -59,6 +62,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         leaf_ids[idx] = tid;
         leaf_views[idx] = &ctx->tensors[tid].view;
         fuse_leaf_terms[idx] = t;
+        fuse_leaf_nvops[idx] = 0; // no view ops for direct leaves
         return (int)(WALK_LEAF_BASE + idx);
     }
     if (term_tag(t) != TAG_TOP) return -1;
@@ -123,24 +127,24 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
         u32 new_idx = (*n_leaves)++;
         leaf_ids[new_idx] = leaf_ids[leaf_idx];
+        fuse_leaf_terms[new_idx] = fuse_leaf_terms[leaf_idx];
         fuse_composed_views[new_idx] = nv;
         leaf_views[new_idx] = &fuse_composed_views[new_idx];
+        // Copy existing view chain from inner leaf, then append this view op
+        u32 nv_ops = fuse_leaf_nvops[leaf_idx];
+        for (u32 j = 0; j < nv_ops; j++)
+            fuse_leaf_vops[new_idx][j] = fuse_leaf_vops[leaf_idx][j];
+        if (nv_ops < FUSE_MAX_VIEW_OPS) {
+            fuse_leaf_vops[new_idx][nv_ops] = (FuseViewOp){.uop = uop, .loc = loc};
+            fuse_leaf_nvops[new_idx] = nv_ops + 1;
+        } else {
+            fuse_leaf_nvops[new_idx] = nv_ops;
+        }
         return (int)(WALK_LEAF_BASE + new_idx);
     }
 
     // Non-elementwise TAG_TOP (SUM, MM, etc.): lazy leaf boundary.
-    // Read pre-computed view from shape table (set at node creation).
-    if (!is_elementwise(uop)) {
-        const View *sv = st_get(term_val(t));
-        if (!sv) return -1; // no shape info → can't use as leaf
-        if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
-        u32 idx = (*n_leaves)++;
-        leaf_ids[idx] = ~0u; // lazy — tensor ID filled at dispatch
-        fuse_composed_views[idx] = *sv;
-        leaf_views[idx] = &fuse_composed_views[idx];
-        fuse_leaf_terms[idx] = t;
-        return (int)(WALK_LEAF_BASE + idx);
-    }
+    if (!is_elementwise(uop)) return -1;
     if (*n_ops >= FUSE_MAX_OPS) return -1;
 
     u64 loc = term_val(t);
@@ -282,7 +286,10 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         fd->n_leaves = n_leaves;
         for (u32 i = 0; i < n_leaves; i++) {
             fd->leaf_terms[i] = fuse_leaf_terms[i];
-            fd->composed_views[i] = *leaf_views[i]; // views are known from shape table!
+            // Store view op chain for replay at dispatch time
+            fd->leaf_n_views[i] = fuse_leaf_nvops[i];
+            for (u32 j = 0; j < fuse_leaf_nvops[i]; j++)
+                fd->leaf_view_chain[i][j] = fuse_leaf_vops[i][j];
         }
         fd->out_shape = ew_view.shape;
         fd->out_numel = out_numel;

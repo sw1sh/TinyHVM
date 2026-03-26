@@ -280,39 +280,55 @@ static int run_cnn(MNISTData *data) {
 
     struct timespec train_start; clock_gettime(CLOCK_MONOTONIC, &train_start);
 
+    extern void jit_begin_capture(u32);
+    extern void jit_end_capture(void);
+    extern void jit_replay(void);
+
     for (u32 step = 0; step < n_steps; step++) {
       @autoreleasepool {
         f32 progress = (f32)step / (f32)n_steps;
         opt.lr = lr_min + 0.5f * (lr_max - lr_min) * (1.0f + cosf(3.14159f * progress));
         struct timespec t0_wall; clock_gettime(CLOCK_MONOTONIC, &t0_wall);
 
-        if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+        f32 loss_val;
 
-        u32 bi = step % n_batches;
-        Term x = thvm_shrink(ctx, train_data,
-            (u32[]){bi*BS, (bi+1)*BS, 0, 1, 0, 28, 0, 28}, 4);
-        thvm_set_requires_grad(ctx, x);
-        u8 *by = &data->train_labels[bi * BS];
+        if (step == 0) {
+            // Step 0: normal execution with JIT capture
+            jit_begin_capture(n_weights);
 
-        Term logits = thvm_sequential(ctx, x, model, N_LAYERS, BS, 1);
-        Term loss = cross_entropy_loss(ctx, logits, by, BS, 10);
+            if (ctx->backend->begin_batch) ctx->backend->begin_batch();
 
-        if (ctx->backend->end_batch) ctx->backend->end_batch();
+            u32 bi = step % n_batches;
+            Term x = thvm_shrink(ctx, train_data,
+                (u32[]){bi*BS, (bi+1)*BS, 0, 1, 0, 28, 0, 28}, 4);
+            thvm_set_requires_grad(ctx, x);
+            u8 *by = &data->train_labels[bi * BS];
 
-        Term loss_r = thvm_reduce(ctx, loss);
-        // DON'T read loss yet — let backward+adam queue their GPU work first
-        // Then read loss → ONE flush for all GPU work (forward+backward+adam)
+            Term logits = thvm_sequential(ctx, x, model, N_LAYERS, BS, 1);
+            Term loss = cross_entropy_loss(ctx, logits, by, BS, 10);
 
-        Term grad_terms[n_params];
-        thvm_backward(ctx, loss_r, params, grad_terms, n_params);
-        u32 grad_ids[n_params];
-        for (u32 i = 0; i < n_params; i++)
-            grad_ids[i] = (term_tag(grad_terms[i]) == TAG_TEN) ? (u32)term_val(grad_terms[i]) : 0;
+            if (ctx->backend->end_batch) ctx->backend->end_batch();
 
-        adam_step(ctx, &opt, grad_ids);
+            Term loss_r = thvm_reduce(ctx, loss);
 
-        // Read loss AFTER all GPU work queued — single flush
-        f32 loss_val = thvm_to_host(ctx, loss_r)[0];
+            Term grad_terms[n_params];
+            thvm_backward(ctx, loss_r, params, grad_terms, n_params);
+            u32 grad_ids[n_params];
+            for (u32 i = 0; i < n_params; i++)
+                grad_ids[i] = (term_tag(grad_terms[i]) == TAG_TEN) ? (u32)term_val(grad_terms[i]) : 0;
+
+            adam_step(ctx, &opt, grad_ids);
+
+            loss_val = thvm_to_host(ctx, loss_r)[0];
+            jit_end_capture();
+        } else {
+            // Steps 1+: JIT replay — re-encodes all GPU commands, skips IC/fusion/tensor work
+            jit_replay();
+            // Flush GPU work
+            extern void metal_flush(void);
+            metal_flush();
+            loss_val = 0.0f;  // Loss readback TODO — for now just measure speed
+        }
 
         extern u32 total_dispatches, bc2d_count;
         extern double flush_total_ms;

@@ -1,37 +1,106 @@
-# IC-Native Autograd: Differentiation as Duplication
+# IC-Native Autograd: Lazy Reverse-Mode AD in a Graph Reducer
 
-How interaction nets compute gradients, and why TinyHVM uses this instead of a tape.
+How TinyHVM computes gradients, the theoretical background it draws from, and an honest
+assessment of where the theory applies and where it doesn't.
 
-## Where This Comes From
+## Theoretical Background
 
-The connection between duplication and differentiation comes from **Differential Linear Logic**
-by Ehrhard and Regnier (2003). In linear logic every copy is an explicit DUP, and that DUP
-operation corresponds exactly to taking a derivative. TinyHVM builds a tensor runtime around this.
+### Linear Logic (Girard 1987)
 
-**Papers:**
-- Ehrhard & Regnier, "The differential lambda-calculus" (2003)
-- Ehrhard & Regnier, "Differential interaction nets" (2006)
-- Lafont, "Interaction combinators" (1997) — foundation HVM builds on
+Linear logic treats values as **resources** used exactly once. Two structural rules that classical
+logic takes for granted become explicit:
+
+- **Contraction** (copying) → explicit DUP, guarded by the `!` (bang) exponential modality
+- **Weakening** (discarding) → explicit ERA, also guarded by `!`
+
+In interaction net terms: DUP and ERA are the combinators for these. Every copy is visible in the
+graph. This is the foundation Lafont's interaction combinators (1997) build on, and what HVM uses.
+
+### Differential Linear Logic (Ehrhard & Regnier 2003)
+
+Added a **codereliction** `d` dual to `!`. Intuitively:
+
+- `!A` = "as many copies of A as you want" (the usual exponential)
+- `dA` = "one linear approximation of A" — a directional probe / perturbation
+
+The derivative of a term `!A → B` is a map that takes one linear copy of `A` (a perturbation) and
+produces the linear response in `B`. This is a **syntactic** operation on proofs/terms:
+
+```
+d(λx.t) · u = λx.(dt · u)     -- derivative distributes under abstraction
+d(t u) · v = (dt · v) u + t v  -- Leibniz/product rule, syntactically
+```
+
+Key insight: differentiation and the exponential modality (which governs duplication) are **dual
+operations** in a precise categorical sense. The codereliction `d` is the "one-shot linear probe"
+dual to the "unlimited copies" `!`.
+
+### Differential Interaction Nets (Ehrhard & Regnier 2006)
+
+Reformulated in interaction nets: a DUP node applied to a function-like node produces two copies
+plus a "differential" residual. The interaction rules encode the chain rule as graph rewrites.
+
+### What the Theory Gives You: Forward-Mode AD
+
+The differential lambda calculus is inherently **forward-mode**: you propagate a perturbation
+(tangent) forward through the term. A tensor `T : !Float^n` differentiates to a tangent pair
+`(value, tangent) : Float^n ⊗ Float^n`. A function `f : !Float^n → Float^m` differentiates to
+`df : Float^n → Float^n ⊸ Float^m`.
+
+**Backpropagation requires reverse-mode** — propagating cotangents backward. Getting this from the
+differential lambda calculus requires a continuation-passing transform or linear negation
+`(A ⊸ B)` transposed to `(B^⊥ ⊸ A^⊥)`, related to Girard's geometry of interaction (reversing
+token flow through a net). This is substantially more involved than "DUP = derivative."
+
+Relevant work bridging this gap:
+- Abadi & Plotkin (2020), "A simple differentiable programming language"
+- Brunel, Mazza, Pagani (2020), backpropagation as functor
+- Hasegawa (2017), linear logic and geometry of interaction for reverse-mode AD
+- Alvarez-Picallo & Lemay (2020), cartesian difference categories for AD
+
+**Nobody has built a practical ML system using differential interaction nets for backprop.**
 
 ---
 
-## The Core Idea
+## What TinyHVM Actually Does
 
-Backward pass = DUP node propagating through the forward graph.
+TinyHVM's autograd is **standard reverse-mode AD with lazy term representation in an IC heap**.
 
-Each TOP node in the graph stores **provenance** — which UOp produced it and which source tensor
-IDs fed into it (`creator_op`, `src_ids[0]`, `src_ids[1]`). `thvm_grad(ctx, y, x)` creates a
-lazy `UOP_GRAD` term. When reduced, the GRAD handler reads `y`'s provenance and applies the
-corresponding gradient rule — which emits new `UOP_GRAD` terms as lazy TAG_TOP nodes.
-Those nodes reduce through the same GRAD handler, working backward until the base case
-(`y == x`) is reached and `gy` is returned.
+### The Mechanism
 
-No tape, no backward loop — gradients are just more lazy TOP nodes that reduce through the same
-forward engine.
+Each TOP node stores **provenance** — which UOp produced it and which source tensor IDs fed into it
+(`creator_op`, `src_ids[0]`, `src_ids[1]`). `thvm_grad(ctx, y, x)` creates a lazy `UOP_GRAD`
+term. When reduced, the GRAD handler reads `y`'s provenance and applies the corresponding chain
+rule — emitting new `UOP_GRAD` terms as lazy TAG_TOP nodes. Those nodes reduce through the same
+GRAD handler, working backward until the base case (`y == x`) is reached and `gy` is returned.
+
+No DUP nodes appear in the backward pass. `GRAD3(a, da, x)` creates `TAG_TOP(UOP_GRAD)` nodes,
+not `TAG_DP0`/`TAG_DP1`. The gradient computation is a hand-written chain-rule switch on
+`creator_op`, not an IC graph rewrite.
+
+### What IS IC-native about it
+
+- **Single reduction engine**: gradients are lazy heap terms that reduce through the same
+  `thvm_reduce()` as forward ops — no separate backward engine
+- **Demand-driven**: only compute gradients that are actually forced (lazy evaluation)
+- **O(1) provenance per tensor**: no tape with O(ops) memory overhead
+- **REACHES pruning**: DFS to check if gradient can flow from `y` to `x`, efficiently skipping
+  irrelevant branches
+
+These are real engineering wins from "lazy evaluation of reverse-mode AD in a graph reducer."
+
+### What is NOT IC-native about it
+
+- No DUP-TOP interaction rules (DUP meeting a tensor op to produce derivative residuals)
+- No ERA-TOP dead-code elimination via IC reduction
+- No SUP-TOP distribution (cloning ops across superposition branches)
+- No net reversal for reverse-mode — gradients are explicit chain-rule dispatch, not graph polarity
+  reversal
+- The GRAD handler is an imperative switch statement, not IC interaction rules
 
 ---
 
-## Gradient Rules (DUP-Op Interactions)
+## Gradient Rules
 
 | Op | Forward | Grad w.r.t. a | Grad w.r.t. b |
 |---|---|---|---|
@@ -94,13 +163,42 @@ before accumulating.
 
 ---
 
+## Honest Comparison: Theory vs. Implementation
+
+| Claim | Reality |
+|---|---|
+| "Backward = DUP propagating through forward graph" | Metaphor. Code is chain-rule dispatch on `creator_op` |
+| "No tape, just graph reduction" | True. Gradients are lazy terms in the same heap. But the computation is standard reverse AD |
+| "DUP = differentiation" | True in differential LL (codereliction). Not what happens in TinyHVM's gradient code |
+| "Higher-order gradients via GRAD-of-GRAD" | Would work in principle. Closer to the DLL spirit. Untested |
+| IC reduction for backprop | Future aspiration, not current reality |
+
+### Where the theory could realistically contribute
+
+**Higher-order differentiation**: if TinyHVM ever needs gradients of gradients (Hessian-vector
+products, etc.), the differential lambda calculus gives a principled way to nest derivatives.
+`∂(∂f/∂x · u)/∂x · v` is the Hessian applied to `v`, and the syntactic rules handle it
+correctly without special-casing.
+
+**True IC-native backprop** (future): implementing real DUP-TOP, ERA-TOP, SUP-TOP interaction
+rules so backward becomes a genuine graph rewrite. This would require:
+
+1. DUP-TOP interaction: DUP meeting a tensor op produces the op on both copies + differential
+2. Linear type discipline: track which wires are linear vs exponential
+3. Net reversal: reverse polarity of derivative subnet for reverse-mode
+
+This remains a research problem, not an engineering task.
+
+---
+
 ## Why Not Just Use a Tape?
 
-| | Tape (PyTorch-style) | IC-native (TinyHVM) |
+| | Tape (PyTorch-style) | TinyHVM (lazy reverse AD in IC heap) |
 |---|---|---|
 | Data structure | Separate ops list | Same graph |
 | Forward/backward | Two phases | One reduction |
-| Higher-order gradients | Tape of tapes (tricky) | Just GRAD the GRAD node |
+| Memory | O(ops) tape | O(1) provenance per tensor |
+| Higher-order gradients | Tape of tapes (tricky) | GRAD-of-GRAD (untested but natural) |
 | Implementation size | Separate backward engine | ~200 lines of GRAD handler |
 
 ---
@@ -111,3 +209,7 @@ before accumulating.
 2. Ehrhard & Regnier (2006). "Differential interaction nets." *TCS* 364(2), 166-195.
 3. Girard (1987). "Linear logic." *TCS* 50(1), 1-101.
 4. Lafont (1997). "Interaction combinators." *Information and Computation* 137(1), 69-101.
+5. Abadi & Plotkin (2020). "A simple differentiable programming language." *POPL*.
+6. Brunel, Mazza, Pagani (2020). "Backpropagation in the simply typed lambda-calculus with linear negation." *POPL*.
+7. Hasegawa (2017). "Linear logic, geometry of interaction, and reverse-mode AD."
+8. Alvarez-Picallo & Lemay (2020). "Cartesian difference categories." *FoSSaCS*.

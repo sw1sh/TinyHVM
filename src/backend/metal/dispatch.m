@@ -24,8 +24,10 @@ static void dispatch_1d(id<MTLComputePipelineState> pipe,
        threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     batch_dirty = 1;
     total_dispatches++;
-    dc[dc_tag]++;
-    dc_tag = DC_OTHER;
+    dc[dc_tag]++; dc_tag = DC_OTHER;
+    if (jit.state == JIT_CAPTURE)
+        jit_record_dispatch_1d(pipe, bufs, n_bufs, params, param_sizes, n_params,
+                                numel, 1, 1, (u32)tpg, 1, 1);
 }
 
 static void dispatch_2d(id<MTLComputePipelineState> pipe,
@@ -45,8 +47,10 @@ static void dispatch_2d(id<MTLComputePipelineState> pipe,
        threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
     batch_dirty = 1;
     total_dispatches++;
-    dc[dc_tag]++;
-    dc_tag = DC_OTHER;
+    dc[dc_tag]++; dc_tag = DC_OTHER;
+    if (jit.state == JIT_CAPTURE)
+        jit_record_dispatch_1d(pipe, bufs, n_bufs, params, param_sizes, n_params,
+                                width, height, 1, (u32)tw, (u32)th, 1);
 }
 
 void print_dispatch_breakdown(void) {

@@ -43,6 +43,38 @@ static id<MTLComputeCommandEncoder> batch_encoder;
 static int                          batch_active;
 static int                          batch_dirty;
 
+// JIT capture/replay state (forward declaration — implementation in jit.m)
+#define JIT_MAX_CMDS    2048
+#define JIT_MAX_SLOTS   2048
+#define JIT_MAX_PARAMS  2048
+
+typedef struct {
+    id<MTLComputePipelineState> pipe;
+    u32 buf_slots[16]; u32 n_bufs;
+    u8 params[JIT_MAX_PARAMS]; u32 param_sizes[8]; u32 n_params;
+    u32 grid[3]; u32 tg[3]; u8 is_mps;
+    u32 mps_m, mps_k, mps_n, mps_dst_slot, mps_a_slot, mps_b_slot;
+} JITCmd;
+
+typedef struct {
+    u64 alloc_size; u32 buf_id; u8 persistent;
+} JITSlot;
+
+typedef struct {
+    JITCmd cmds[JIT_MAX_CMDS]; u32 n_cmds;
+    JITSlot slots[JIT_MAX_SLOTS]; u32 n_slots;
+    u32 persistent_count;
+    enum { JIT_OFF, JIT_CAPTURE, JIT_REPLAY } state;
+    u32 loss_slot;
+} JITState;
+
+static JITState jit = {0};
+
+// JIT function forward declarations (implementation in jit.m)
+static void jit_record_dispatch_1d(id<MTLComputePipelineState>, id<MTLBuffer>*, u32,
+                                     const void**, u64*, u32, u32,u32,u32, u32,u32,u32);
+static void jit_record_mps(u32, u32, u32, u32, u32, u32);
+
 // Free-list for buffer reuse
 #define MAX_FREE_BUFS 512
 static struct {

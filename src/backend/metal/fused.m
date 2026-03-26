@@ -530,6 +530,10 @@ void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
        threadsPerThreadgroup:MTLSizeMake(tw, th, td)];
     batch_dirty = 1;
     dc[DC_MDIM]++; total_dispatches++;
+    if (jit.state == JIT_CAPTURE) {
+        id<MTLBuffer> bufs[] = {metal_pool.bufs[dst], metal_pool.bufs[a_buf], metal_pool.bufs[b_buf]};
+        jit_record_dispatch_1d(pipe, bufs, 3, NULL, NULL, 0, gw, gh, gd, tw, th, td);
+    }
 }
 
 // Multi-dim unary kernel codegen (same approach as binary)

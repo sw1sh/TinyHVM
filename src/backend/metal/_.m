@@ -16,6 +16,7 @@
 #include "conv.m"     // CNN/layout ops
 #include "optim.m"    // optimizer/pooling GPU kernels
 #include "fused.m"    // fused kernel codegen
+#include "jit.m"      // JIT capture/replay
 #include "profile.m"  // profiling
 
 Backend metal_backend = {

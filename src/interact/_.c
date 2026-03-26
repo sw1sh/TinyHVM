@@ -482,17 +482,68 @@ inet_step:
                     leaf_views[i] = &fuse_dispatch_views[i];
                 }
                 ctx->no_fuse = saved_nf;
-                // Allocate output tensor
-                u32 dst_id = tensor_create(ctx, fd->out_shape, DTYPE_F32);
+
+                // Debug: show actual leaf views after reduce+replay
+                static int _avd=0; if(_avd<3){for(u32 li=0;li<fd->n_leaves;li++){
+                    fprintf(stderr,"  ACTUAL_LEAF[%u] buf=%u r=%u n=%u d=[",li,leaf_bufs[li],leaf_views[li]->shape.rank,leaf_views[li]->numel);
+                    for(u32 d=0;d<leaf_views[li]->shape.rank;d++) fprintf(stderr,"%u,",leaf_views[li]->shape.dims[d]);
+                    fprintf(stderr,"] s=[");
+                    for(u32 d=0;d<leaf_views[li]->shape.rank;d++) fprintf(stderr,"%d,",leaf_views[li]->strides[d]);
+                    fprintf(stderr,"]\n");}_avd++;}
+                // Recompute output shape from ACTUAL leaf views
+                View ew_v = *leaf_views[0];
+                int bc_ok = 1;
+                for (u32 li = 1; li < fd->n_leaves; li++) {
+                    View av_bc, bv_bc; u32 bc_s[MAX_DIM], bc_n;
+                    if (view_broadcast(&ew_v, leaf_views[li], &av_bc, &bv_bc, bc_s, &bc_n))
+                        ew_v = view_create(shape_of(bc_s, bc_n));
+                    else { bc_ok = 0; break; }
+                }
+                if (!bc_ok) RETURN_REDUCED(t); // can't broadcast — stuck
+                Shape real_out = ew_v.shape;
+                u32 real_numel = ew_v.numel;
+                // Apply reduce if needed
+                if (fd->has_reduce && fd->reduce_dim > 1) {
+                    for (int d = (int)real_out.rank - 1; d >= 0; d--) {
+                        if (real_out.dims[d] == fd->reduce_dim) {
+                            real_out.dims[d] = 1;
+                            real_numel /= fd->reduce_dim;
+                            break;
+                        }
+                    }
+                }
+
+                u32 dst_id = tensor_create(ctx, real_out, DTYPE_F32);
                 #ifdef __APPLE__
                 if (ctx->backend == &metal_backend) {
                     metal_dispatch_fused_v2(
-                        ctx->tensors[dst_id].buf_id, fd->out_numel,
+                        ctx->tensors[dst_id].buf_id, real_numel,
                         leaf_bufs, leaf_views, fd->n_leaves,
                         fd->ops, fd->n_ops,
-                        fd->has_reduce, fd->reduce_dim, &fd->out_shape);
+                        fd->has_reduce, fd->reduce_dim, &ew_v.shape);
                 }
                 #endif
+                // Validate: compare first few elements against eager reduction
+                static int _fv = 0;
+                if (_fv < 10) {
+                    // Read FUSE result
+                    f32 fuse_vals[4] = {0};
+                    u32 n_check = fd->out_numel < 4 ? fd->out_numel : 4;
+                    ctx->backend->buf_read(ctx->tensors[dst_id].buf_id, fuse_vals, n_check * sizeof(f32));
+                    fprintf(stderr, "FUSE_CHECK[%d] desc=%u numel=%u out=[%.6f,%.6f,%.6f,%.6f]\n",
+                        _fv, desc_id, fd->out_numel, fuse_vals[0], fuse_vals[1], fuse_vals[2], fuse_vals[3]);
+                    // Compare leaf views
+                    for (u32 li = 0; li < fd->n_leaves; li++) {
+                        const View *lv = leaf_views[li];
+                        fprintf(stderr, "  leaf[%u]: buf=%u r=%u n=%u s=[", li, leaf_bufs[li],
+                            lv->shape.rank, lv->numel);
+                        for (u32 d=0;d<lv->shape.rank;d++) fprintf(stderr,"%d,",lv->strides[d]);
+                        fprintf(stderr,"] d=[");
+                        for (u32 d=0;d<lv->shape.rank;d++) fprintf(stderr,"%u,",lv->shape.dims[d]);
+                        fprintf(stderr,"] nvops=%u\n", fd->leaf_n_views[li]);
+                    }
+                    _fv++;
+                }
                 RETURN_REDUCED(term_ten(dst_id, DTYPE_F32));
             }} // end desc_id check + FUSING check
 

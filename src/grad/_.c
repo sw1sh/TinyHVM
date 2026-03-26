@@ -293,8 +293,8 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     for (u32 i = 0; i < n_leaves; i++)
         if (leaf_ids[i] == ~0u) { has_lazy = 1; break; }
 
-    static int _hl=0; if(has_lazy && _hl<3){fprintf(stderr,"HAS_LAZY n_l=%u n_o=%u\n",n_leaves,n_ops);_hl++;}
     if (has_lazy) {
+        return reduce_id(ctx, t); // DISABLED — view chain recording bug causes wrong output shapes
         static int _fc=0; if(_fc<5){
             fprintf(stderr,"FUSE_CREATE[%d] n_ops=%u n_leaves=%u out_numel=%u out=[",_fc,n_ops,n_leaves,out_numel);
             for(u32 d=0;d<ew_view.shape.rank;d++) fprintf(stderr,"%u,",ew_view.shape.dims[d]);

@@ -430,11 +430,10 @@ inet_step:
                     u32 tid = (u32)term_val(lt);
                     TensorMeta *lm = &ctx->tensors[tid];
                     leaf_bufs[i] = lm->buf_id;
-                    // Use composed view if we have one; otherwise use tensor's view
-                    if (fd->composed_views[i].shape.rank > 0)
-                        leaf_views[i] = &fd->composed_views[i];
-                    else
-                        leaf_views[i] = &lm->view;
+                    // Use the ACTUAL reduced tensor's view. Shape tracking
+                    // gave us shapes for fusion eligibility checks, but the
+                    // physical strides come from the materialized tensor.
+                    leaf_views[i] = &lm->view;
                 }
 
                 ctx->no_fuse = saved_nf;

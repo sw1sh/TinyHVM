@@ -73,7 +73,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         if (inner >= (int)(WALK_LEAF_BASE * 2)) return -1; // can't compose onto op
         u32 leaf_idx = inner - WALK_LEAF_BASE;
         const View *base = leaf_views[leaf_idx];
-        if (!base) return -1; // lazy leaf — can't compose views (view unknown)
+        if (!base) return -1;
         Term arg2 = heap_read(ctx, loc + 1);
         if (term_tag(arg2) != TAG_TEN) return -1;
         TensorMeta *mp = &ctx->tensors[(u32)term_val(arg2)];
@@ -128,7 +128,19 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         return (int)(WALK_LEAF_BASE + new_idx);
     }
 
-    if (!is_elementwise(uop)) return -1;
+    // Non-elementwise TAG_TOP (SUM, MM, etc.): lazy leaf boundary.
+    // Read pre-computed view from shape table (set at node creation).
+    if (!is_elementwise(uop)) {
+        const View *sv = st_get(term_val(t));
+        if (!sv) return -1; // no shape info → can't use as leaf
+        if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
+        u32 idx = (*n_leaves)++;
+        leaf_ids[idx] = ~0u; // lazy — tensor ID filled at dispatch
+        fuse_composed_views[idx] = *sv;
+        leaf_views[idx] = &fuse_composed_views[idx];
+        fuse_leaf_terms[idx] = t;
+        return (int)(WALK_LEAF_BASE + idx);
+    }
     if (*n_ops >= FUSE_MAX_OPS) return -1;
 
     u64 loc = term_val(t);
@@ -255,7 +267,38 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
     u32 out_numel = out_view.numel;
 
-    // All leaves are TAG_TEN — dispatch immediately
+    // Check if any leaves are lazy (need FUSE node for deferred dispatch)
+    int has_lazy = 0;
+    for (u32 i = 0; i < n_leaves; i++)
+        if (leaf_ids[i] == ~0u) { has_lazy = 1; break; }
+
+    if (has_lazy) {
+        // Deferred: create FUSE node. Trampoline reduces leaves, interact dispatches.
+        if (fuse_desc_count >= MAX_FUSE_DESCS) return reduce_id(ctx, t);
+        u32 desc_id = fuse_desc_count++;
+        FuseDesc *fd = &fuse_descs[desc_id];
+        fd->n_ops = n_ops;
+        for (u32 i = 0; i < n_ops; i++) fd->ops[i] = ops[i];
+        fd->n_leaves = n_leaves;
+        for (u32 i = 0; i < n_leaves; i++) {
+            fd->leaf_terms[i] = fuse_leaf_terms[i];
+            fd->composed_views[i] = *leaf_views[i]; // views are known from shape table!
+        }
+        fd->out_shape = ew_view.shape;
+        fd->out_numel = out_numel;
+        fd->has_reduce = has_reduce;
+        fd->reduce_dim = reduce_dim;
+
+        f32 did = (f32)desc_id;
+        Term desc_ten = thvm_tensor(ctx, &did, SHAPE(1));
+        u64 floc = heap_alloc(ctx, 2);
+        heap_set(ctx, floc, term_era());
+        heap_set(ctx, floc + 1, desc_ten);
+        fuse_fused_count++;
+        return reduce_id(ctx, term_new(TAG_TOP, UOP_FUSING, floc));
+    }
+
+    // Immediate: all leaves are TAG_TEN
     u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
 
     fuse_fused_count++;

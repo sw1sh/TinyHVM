@@ -370,6 +370,27 @@ typedef struct {
     u32 mask_end[MAX_DIM];   // per-dim end of valid region
 } View;
 
+// ============================================================
+// Shape tracking for lazy TAG_TOP nodes (ShapeTracker)
+// ============================================================
+// Every TAG_TOP gets its output view stored eagerly at creation time.
+// Keyed by heap loc. The fuser reads these to get pre-computed views
+// for lazy nodes without reducing them.
+#define ST_TABLE_SIZE 65536
+static View    st_views[ST_TABLE_SIZE];
+static u8      st_valid[ST_TABLE_SIZE];
+
+static inline void st_set(u64 heap_loc, const View *v) {
+    u32 idx = (u32)(heap_loc % ST_TABLE_SIZE);
+    st_views[idx] = *v;
+    st_valid[idx] = 1;
+}
+
+static inline const View *st_get(u64 heap_loc) {
+    u32 idx = (u32)(heap_loc % ST_TABLE_SIZE);
+    return st_valid[idx] ? &st_views[idx] : NULL;
+}
+
 typedef struct {
     u32         buf_id;     // GPU buffer handle
     u32         dtype;

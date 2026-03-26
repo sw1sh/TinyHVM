@@ -68,21 +68,11 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     if (tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
         tag == TAG_LAM || tag == TAG_SUP) { whnf = next; goto apply; }
 
-    // TAG_TOP: try elementwise fusion BEFORE reducing args depth-first.
-    // This catches chains like (x-mean)*invstd*gamma+beta as ONE kernel.
+    // TAG_TOP: reduce args depth-first, then fire interact.
+    // Fusion happens locally in interact handlers (SUM(MUL), etc.)
+    // and via FUSE nodes — no global interceptor.
     if (tag == TAG_TOP) {
-        u32 uop = term_ext(next);
-        if (!ctx->no_fuse && is_elementwise(uop)) {
-            ctx->no_fuse = 1;
-            u32 fused_id = fuse_or_reduce(ctx, next);
-            ctx->no_fuse = 0;
-            if (fused_id != ~0u) {
-                whnf = term_ten(fused_id, DTYPE_F32);
-                goto apply;
-            }
-        }
         u64 loc = term_val(next);
-        // Push node as frame, enter arg-slot 0 (strict left operand)
         PUSH(next);
         next = heap_read(ctx, loc + 0);
         goto enter;

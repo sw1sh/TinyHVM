@@ -69,18 +69,19 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         tag == TAG_LAM || tag == TAG_SUP) { whnf = next; goto apply; }
 
     // TAG_TOP: reduce args depth-first, then fire interact.
-    // FUSE nodes are handled HERE — call fuse_or_reduce on the chain
-    // before depth-first reduction breaks the lazy structure.
+    // No global fusion interceptor — fusion happens:
+    // 1. In the scheduler (injects FUSE at range boundaries)
+    // 2. In interact handlers (SUM dispatches fused reduce+ew kernels)
     if (tag == TAG_TOP) {
         u32 uop = term_ext(next);
+        // FUSE nodes: dispatch the wrapped chain via fuse_or_reduce
+        // before depth-first reduction breaks the lazy structure.
         if (uop == UOP_FUSING) {
             u64 floc = term_val(next);
             Term chain = heap_read(ctx, floc);
             if (term_tag(chain) == TAG_TOP && term_tag(heap_read(ctx, floc+1)) == TAG_ERA) {
-                // Elementwise chain FUSE: dispatch via fuse_or_reduce
                 u32 fid = fuse_or_reduce(ctx, chain);
                 if (fid != ~0u) { whnf = term_ten(fid, DTYPE_F32); goto apply; }
-                // Fallback: reduce chain normally
             }
         }
         u64 loc = term_val(next);

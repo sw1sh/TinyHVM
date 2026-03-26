@@ -196,10 +196,16 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             if (cg_leaf_is_flat(lv, flat_out_numel)) {
                 [s appendFormat:@"  uint fi%u=iz*%uu+iy*%uu+inner_base;\n", li, mid*inner, inner];
                 [s appendFormat:@"  float4 t%u=*((device const float4*)(in%u+fi%u));\n", li, li, li];
-            } else if (ist == 0) {
+            } else if (ist == 0 || lv->numel < 4) {
+                // Broadcast: scalar load → float4 (stride=0 or buffer too small for float4)
                 [s appendFormat:@"  float4 t%u=float4(in%u[i%u]);\n", li, li, li];
-            } else {
+            } else if (lv->numel == flat_out_numel && ist == 1) {
+                // Same size, contiguous innermost: safe float4 load
                 [s appendFormat:@"  float4 t%u=*((device const float4*)(in%u+i%u));\n", li, li, li];
+            } else {
+                // Non-contiguous or mismatched size: scalar broadcast to be safe
+                [s appendFormat:@"  float4 t%u=float4(in%u[i%u],in%u[i%u+1u],in%u[i%u+2u],in%u[i%u+3u]);\n",
+                    li, li, li, li, li, li, li, li, li];
             }
         }
     } else {
@@ -252,6 +258,7 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     }
 
     [s appendString:@"}\n"];
+    { static u32 _pk=0; if(n_ops>=2 && ++_pk<=2) fprintf(stderr, "KERNEL(ops=%u leaves=%u out=%u rank=%u):\n%s\n", n_ops, n_leaves, out_numel, out_rank, [s UTF8String]); }
     return s;
 }
 

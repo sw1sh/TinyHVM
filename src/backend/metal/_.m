@@ -15,7 +15,8 @@
 #include "ops.m"      // unary, binary, matmul, reduce
 #include "conv.m"     // CNN/layout ops
 #include "optim.m"    // optimizer/pooling GPU kernels
-#include "fused.m"    // fused kernel codegen
+#include "fused.m"    // fused kernel codegen (legacy — being replaced by codegen.m)
+#include "codegen.m"  // unified JIT codegen
 #include "jit.m"      // JIT capture/replay
 #include "profile.m"  // profiling
 

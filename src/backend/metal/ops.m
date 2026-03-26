@@ -1,9 +1,12 @@
 // metal/ops.m — Core Metal compute ops: unary, binary, matmul, reduce
 
-// Forward declaration (defined in fused.m, included after ops.m)
+// Forward declarations (defined in fused.m/codegen.m, included after ops.m)
 void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
                                  u32 a_buf, const View *av,
                                  u32 b_buf, const View *bv);
+void metal_dispatch_kernel(u32 out_buf, u32 out_numel,
+                            u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+                            FusedOp *ops, u32 n_ops, int has_reduce, u32 reduce_dim);
 
 static u32 fast_dispatch_count = 0, slow_dispatch_count = 0;
 u32 bc2d_count = 0;
@@ -32,6 +35,17 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
                             u32 src, const View *sv) {
     u64 t0 = thvm_prof_tick();
 
+    // Unified codegen path
+    if (!sv->has_mask && sv->shape.rank <= 8 && sv->shape.rank > 0) {
+        FusedOp op = { .uop = uop, .arg_a = 0, .arg_b = 0 };
+        u32 leaf_bufs[] = { src };
+        const View *lvs[] = { sv };
+        metal_dispatch_kernel(dst, dv->numel, leaf_bufs, lvs, 1, &op, 1, 0, 0);
+        thvm_prof_record(uop, t0);
+        return;
+    }
+
+    // Legacy fallback
     if (is_fast_view(sv)) {
         u32 n = dv->numel;
         // Float4 vectorized path (4x throughput)
@@ -94,6 +108,20 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
 static void metal_op_binary(u32 uop, u32 dst, const View *dv,
                              u32 a, const View *av, u32 b, const View *bv) {
     u64 t0 = thvm_prof_tick();
+
+    // Unified codegen: JIT-generates optimal kernel for any stride pattern
+    if (av->shape.rank == bv->shape.rank && !av->has_mask && !bv->has_mask &&
+        av->shape.rank <= 8 && av->shape.rank > 0) {
+        FusedOp op = { .uop = uop, .arg_a = 0, .arg_b = 1 };
+        u32 leaf_bufs[] = { a, b };
+        const View *lvs[] = { av, bv };
+        metal_dispatch_kernel(dst, dv->numel, leaf_bufs, lvs, 2, &op, 1, 0, 0);
+        thvm_prof_record(uop, t0);
+        return;
+    }
+
+    // Legacy fallback for rank mismatch or masks
+    {
     id<MTLComputePipelineState> fpipe = nil;
     switch (uop) {
         case UOP_ADD: fpipe = fpipe_add; break;
@@ -223,6 +251,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams), sizeof(ViewParams) };
     dc_tag=DC_SLOW_BIN; dispatch_1d(pipe, bufs, 3, params, psizes, 3, dv->numel);
     thvm_prof_record(uop, t0);
+    } // end legacy fallback
 }
 
 static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,

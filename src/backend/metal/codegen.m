@@ -130,13 +130,38 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             // Flat contiguous
             if (use_f4) [s appendFormat:@"  // leaf %u: flat (f4)\n", li];
             else [s appendFormat:@"  uint i%u=iz*%uu+iy*%uu+inner_base;\n", li, mid*inner, inner];
-        } else {
-            // Coordinate-based: sum(c[d] * stride[d]) + offset
+        } else if (lv->shape.rank == out_rank && ({
+            // Same rank: check that mismatched dims have stride 0 (broadcast)
+            int _ok = 1;
+            for (u32 _d = 0; _d < out_rank; _d++)
+                if (lv->shape.dims[_d] != out_shape[_d] && lv->strides[_d] != 0)
+                    { _ok = 0; break; }
+            _ok; })) {
+            // Same rank, broadcast-safe: use output coordinates (no divisions)
             [s appendFormat:@"  uint i%u=%d", li, lv->offset];
-            for (u32 d = 0; d < out_rank && d < lv->shape.rank; d++) {
+            for (u32 d = 0; d < out_rank; d++) {
                 if (lv->strides[d] == 0) continue;
                 if (lv->strides[d] == 1) [s appendFormat:@"+c%u", d];
                 else [s appendFormat:@"+c%u*%du", d, lv->strides[d]];
+            }
+            [s appendString:@";\n"];
+        } else {
+            // Different rank: decompose flat output index through LEAF's shape
+            // (uses compile-time constant divisions — baked in, not runtime ViewParams)
+            u32 flat_numel = 1;
+            for (u32 d = 0; d < out_rank; d++) flat_numel *= out_shape[d];
+            [s appendFormat:@"  uint fi%u=iz*%uu+iy*%uu+inner_base;\n", li, mid*inner, inner];
+            [s appendFormat:@"  uint i%u=%d", li, lv->offset];
+            u32 leaf_divisor = 1;
+            for (int d = (int)lv->shape.rank - 1; d >= 0; d--) {
+                if (lv->strides[d] == 0) { leaf_divisor *= lv->shape.dims[d]; continue; }
+                if (leaf_divisor == 1 && lv->strides[d] == 1)
+                    [s appendFormat:@"+(fi%u%%%uu)", li, lv->shape.dims[d]];
+                else if (leaf_divisor == 1)
+                    [s appendFormat:@"+(fi%u%%%uu)*%du", li, lv->shape.dims[d], lv->strides[d]];
+                else
+                    [s appendFormat:@"+((fi%u/%uu)%%%uu)*%du", li, leaf_divisor, lv->shape.dims[d], lv->strides[d]];
+                leaf_divisor *= lv->shape.dims[d];
             }
             [s appendString:@";\n"];
         }
@@ -247,6 +272,7 @@ static id<MTLComputePipelineState> cg_get_pipe(const FusedOp *ops, u32 n_ops,
 }
 
 // Unified dispatch: handles any elementwise op (single or fused chain)
+// out_shape_hint/out_rank_hint: if non-NULL/non-zero, use this instead of inferring from leaves
 void metal_dispatch_kernel(u32 out_buf, u32 out_numel,
                             u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
                             FusedOp *ops, u32 n_ops,
@@ -255,7 +281,7 @@ void metal_dispatch_kernel(u32 out_buf, u32 out_numel,
                                                       out_numel, has_reduce, reduce_dim);
     if (!pipe) return;
 
-    // Compute grid dims (same logic as codegen)
+    // Compute grid dims
     u32 out_shape[MAX_DIM], out_rank;
     cg_output_shape(leaf_views, n_leaves, out_shape, &out_rank);
     if (out_rank == 0) out_rank = 1;

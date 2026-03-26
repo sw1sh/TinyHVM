@@ -13,7 +13,9 @@ static id<MTLComputePipelineState> pipe_neg, pipe_relu, pipe_exp, pipe_log, pipe
 static id<MTLComputePipelineState> pipe_add, pipe_mul, pipe_sub, pipe_div, pipe_max, pipe_cmp;
 static id<MTLComputePipelineState> pipe_mm;
 static id<MTLComputePipelineState> pipe_reduce_sum, pipe_reduce_max;
+static id<MTLComputePipelineState> pipe_reduce_sum_par, pipe_reduce_max_par;
 static id<MTLComputePipelineState> pipe_mul_reduce_sum;
+static id<MTLComputePipelineState> pipe_mul_reduce_sum_parallel;
 static id<MTLComputePipelineState> pipe_im2col, pipe_col2im;
 static id<MTLComputePipelineState> pipe_nhwc_to_nchw, pipe_nchw_to_nhwc;
 static id<MTLComputePipelineState> pipe_bias_add, pipe_col_sum;
@@ -178,6 +180,9 @@ static int metal_init(void) {
     pipe_pad = make_pipe(@"pad_kernel");    pipe_reduce_sum = make_pipe(@"reduce_sum");
     pipe_reduce_max = make_pipe(@"reduce_max");
     pipe_mul_reduce_sum = make_pipe(@"mul_reduce_sum");
+    pipe_mul_reduce_sum_parallel = make_pipe(@"mul_reduce_sum_parallel");
+    pipe_reduce_sum_par = make_pipe(@"reduce_sum_parallel");
+    pipe_reduce_max_par = make_pipe(@"reduce_max_parallel");
 
     // Fast contiguous kernels
     fpipe_add  = make_pipe(@"fast_add");

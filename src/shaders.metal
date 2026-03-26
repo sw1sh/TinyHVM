@@ -215,6 +215,34 @@ kernel void reduce_max(device float *dst [[buffer(0)]],
     dst[i] = acc;
 }
 
+// Parallel reduce_sum — one threadgroup (32 threads) per output element
+kernel void reduce_sum_parallel(device float *dst [[buffer(0)]],
+                                 device const float *src [[buffer(1)]],
+                                 constant uint &reduce_dim [[buffer(2)]],
+                                 uint tg_id [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_threadgroup]]) {
+    uint base = tg_id * reduce_dim;
+    float acc = 0.0f;
+    for (uint r = lane; r < reduce_dim; r += 32)
+        acc += src[base + r];
+    acc = simd_sum(acc);
+    if (lane == 0) dst[tg_id] = acc;
+}
+
+// Parallel reduce_max — one threadgroup (32 threads) per output element
+kernel void reduce_max_parallel(device float *dst [[buffer(0)]],
+                                 device const float *src [[buffer(1)]],
+                                 constant uint &reduce_dim [[buffer(2)]],
+                                 uint tg_id [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_threadgroup]]) {
+    uint base = tg_id * reduce_dim;
+    float acc = -1e30f;
+    for (uint r = lane; r < reduce_dim; r += 32)
+        acc = max(acc, src[base + r]);
+    acc = simd_max(acc);
+    if (lane == 0) dst[tg_id] = acc;
+}
+
 // ============================================================
 // Im2col: [B, Cin, H, W] → [B*OH*OW, Cin*KH*KW]
 // Thread per output element (row, col) in the col matrix
@@ -548,6 +576,75 @@ kernel void mul_reduce_sum(device float *dst [[buffer(0)]],
         acc += va * vb;
     }
     dst[i] = acc;
+}
+
+// ============================================================
+// Parallel MUL + SUM — one threadgroup per output element.
+// Each thread in the SIMD group handles reduce_numel/32 elements,
+// then simd_sum() reduces across the 32-wide SIMD group.
+// Specialized fast path for n_reduce==1 (single reduce axis).
+// ============================================================
+
+kernel void mul_reduce_sum_parallel(
+        device float *dst [[buffer(0)]],
+        device const float *a [[buffer(1)]],
+        device const float *b [[buffer(2)]],
+        constant ViewParams &av [[buffer(3)]],
+        constant ViewParams &bv [[buffer(4)]],
+        constant ViewParams &ov [[buffer(5)]],
+        constant MulReduceParams &rp [[buffer(6)]],
+        uint tg_id [[threadgroup_position_in_grid]],
+        uint lane   [[thread_index_in_threadgroup]]) {
+
+    uint out_idx = tg_id;
+    if (out_idx >= ov.numel) return;
+
+    // Compute N-d coordinates from flat output index
+    uint coords[8];
+    uint rem = out_idx;
+    for (int d = int(ov.rank) - 1; d >= 0; d--) {
+        coords[d] = rem % ov.shape[d];
+        rem /= ov.shape[d];
+    }
+
+    // Base offsets into a and b for this output element
+    uint base_a = uint(av.offset);
+    uint base_b = uint(bv.offset);
+    for (uint d = 0; d < ov.rank; d++) {
+        base_a += coords[d] * uint(av.strides[d]);
+        base_b += coords[d] * uint(bv.strides[d]);
+    }
+
+    float acc = 0.0f;
+    uint R = rp.reduce_numel;
+
+    if (rp.n_reduce == 1) {
+        // Fast path: single reduce axis — simple stride, no coordinate decomp
+        uint stride_a = rp.reduce_strides_a[0];
+        uint stride_b = rp.reduce_strides_b[0];
+        for (uint r = lane; r < R; r += 32) {
+            acc += a[base_a + r * stride_a] * b[base_b + r * stride_b];
+        }
+    } else {
+        // General multi-axis path — stride over reduce elements
+        for (uint r = lane; r < R; r += 32) {
+            uint off_a = 0, off_b = 0, rr = r;
+            for (uint ri = 0; ri < rp.n_reduce; ri++) {
+                uint rc = rr % rp.reduce_dims[ri];
+                rr /= rp.reduce_dims[ri];
+                off_a += rc * rp.reduce_strides_a[ri];
+                off_b += rc * rp.reduce_strides_b[ri];
+            }
+            acc += a[base_a + off_a] * b[base_b + off_b];
+        }
+    }
+
+    // Parallel reduction across SIMD group
+    acc = simd_sum(acc);
+
+    if (lane == 0) {
+        dst[out_idx] = acc;
+    }
 }
 
 // ============================================================

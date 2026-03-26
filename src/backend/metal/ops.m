@@ -305,6 +305,33 @@ static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
                              u32 src, u32 src_numel, u32 reduce_dim) {
     u64 t0 = thvm_prof_tick();
     (void)src_numel;
+
+    // Parallel path: use simd_sum/simd_max with 32 threads per output element
+    if (reduce_dim >= 32) {
+        id<MTLComputePipelineState> par_pipe = nil;
+        switch (uop) {
+            case UOP_SUM:  par_pipe = pipe_reduce_sum_par; break;
+            case UOP_RMAX: par_pipe = pipe_reduce_max_par; break;
+            default: break;
+        }
+        if (par_pipe) {
+            id<MTLComputeCommandEncoder> enc = get_encoder();
+            [enc setComputePipelineState:par_pipe];
+            [enc setBuffer:metal_pool.bufs[dst] offset:0 atIndex:0];
+            [enc setBuffer:metal_pool.bufs[src] offset:0 atIndex:1];
+            [enc setBytes:&reduce_dim length:sizeof(u32) atIndex:2];
+            // One threadgroup of 32 per output element
+            [enc dispatchThreadgroups:MTLSizeMake(dst_numel, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            batch_dirty = 1;
+            total_dispatches++;
+            dc[DC_REDUCE]++;
+            thvm_prof_record(uop, t0);
+            return;
+        }
+    }
+
+    // Serial fallback (small reduce_dim)
     id<MTLComputePipelineState> pipe = nil;
     switch (uop) {
         case UOP_SUM:  pipe = pipe_reduce_sum; break;

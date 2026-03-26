@@ -29,10 +29,33 @@ void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
         rp.reduce_strides_b[i] = reduce_strides_b[i];
         rp.reduce_numel *= reduce_dims[i];
     }
-    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a_buf], metal_pool.bufs[b_buf] };
+    id<MTLBuffer> mbufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a_buf], metal_pool.bufs[b_buf] };
     const void *params[] = { &avp, &bvp, &ovp, &rp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams), sizeof(ViewParams), sizeof(MulReduceParams) };
-    dc_tag=DC_MRS; dispatch_1d(pipe_mul_reduce_sum, bufs, 3, params, psizes, 4, dst_numel);
+
+    if (rp.reduce_numel >= 32) {
+        // Parallel path: one threadgroup (32 threads = 1 SIMD group) per output element
+        // Use dispatchThreads with total_threads = dst_numel * 32 so that exactly
+        // dst_numel threadgroups are created, each with 32 threads.
+        u32 total_threads = dst_numel * 32;
+        id<MTLComputeCommandEncoder> enc = get_encoder();
+        [enc setComputePipelineState:pipe_mul_reduce_sum_parallel];
+        for (u32 i = 0; i < 3; i++)
+            [enc setBuffer:mbufs[i] offset:0 atIndex:i];
+        for (u32 i = 0; i < 4; i++)
+            [enc setBytes:params[i] length:psizes[i] atIndex:3 + i];
+        [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        batch_dirty = 1;
+        total_dispatches++;
+        dc[DC_MRS]++; dc_tag = DC_OTHER;
+        if (jit.state == JIT_CAPTURE)
+            jit_record_dispatch_1d(pipe_mul_reduce_sum_parallel, mbufs, 3, params, psizes, 4,
+                                    total_threads, 1, 1, 32, 1, 1);
+    } else {
+        // Small reduce: serial path (original kernel)
+        dc_tag=DC_MRS; dispatch_1d(pipe_mul_reduce_sum, mbufs, 3, params, psizes, 4, dst_numel);
+    }
     thvm_prof_record(UOP_SUM, t0);
 }
 

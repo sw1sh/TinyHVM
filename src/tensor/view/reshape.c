@@ -7,8 +7,13 @@ static View view_reshape(View v, Shape new_shape) {
   u32 new_numel = 1;
   for (u32 i = 0; i < new_shape.rank; i++)
     new_numel *= new_shape.dims[i];
-  if (new_numel != v.numel)
-    fprintf(stderr, "reshape: numel mismatch old=%u new=%u\n", v.numel, new_numel);
+  if (new_numel != v.numel) {
+    fprintf(stderr, "reshape: numel mismatch old=%u new=%u old_shape=[", v.numel, new_numel);
+    for (u32 _d=0;_d<v.shape.rank;_d++) fprintf(stderr,"%u,",v.shape.dims[_d]);
+    fprintf(stderr,"] new_shape=[");
+    for (u32 _d=0;_d<new_shape.rank;_d++) fprintf(stderr,"%u,",new_shape.dims[_d]);
+    fprintf(stderr,"]\n");
+  }
   assert(new_numel == v.numel && "reshape: numel mismatch");
 
   if (v.has_mask) {

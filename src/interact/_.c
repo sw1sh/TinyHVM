@@ -426,7 +426,8 @@ inet_step:
 
                 // Reduce all lazy leaf terms, then replay view chains
                 u8 saved_nf = ctx->no_fuse;
-                ctx->no_fuse = 0; // allow full fusion during leaf reduction
+                // Restore caller's no_fuse (trampoline may have set it)
+                // Don't force no_fuse=1 — leaf reduction needs SUM(MUL) fusion
                 u32 leaf_bufs[FUSE_MAX_LEAVES_FWD];
                 u32 leaf_tids[FUSE_MAX_LEAVES_FWD];
                 static View fuse_dispatch_views[FUSE_MAX_LEAVES_FWD];
@@ -551,8 +552,41 @@ inet_step:
                 }
 
                 u32 dst_id = tensor_create(ctx, real_out, DTYPE_F32);
-                // No provenance needed — FUSE only runs for detached chains
-                // (requires_grad check in fuse_or_reduce filters differentiable ones)
+                // Set provenance: create view-aliased tensors for composed views
+                // so backward_local sees correct shapes via standard GRAD rules.
+                if (fd->n_ops >= 1) {
+                    u32 last_op = fd->n_ops - 1;
+                    u32 ai = fd->ops[last_op].arg_a;
+                    u32 bi = fd->ops[last_op].arg_b;
+                    // Create view-aliased tensors with composed views
+                    if (ai < fd->n_leaves) {
+                        u32 va_id = ctx->tensor_count++;
+                        ctx->tensors[va_id] = ctx->tensors[leaf_tids[ai]];
+                        ctx->tensors[va_id].view = *leaf_views[ai]; // composed view
+                        ctx->tensors[va_id].host_ptr = NULL;
+                        ctx->tensors[dst_id].src_ids[0] = va_id;
+                        if (ctx->tensors[leaf_tids[ai]].requires_grad) {
+                            ctx->tensors[va_id].requires_grad = 1;
+                            ctx->tensors[dst_id].requires_grad = 1;
+                        }
+                    }
+                    if (bi < fd->n_leaves) {
+                        u32 vb_id = ctx->tensor_count++;
+                        ctx->tensors[vb_id] = ctx->tensors[leaf_tids[bi]];
+                        ctx->tensors[vb_id].view = *leaf_views[bi];
+                        ctx->tensors[vb_id].host_ptr = NULL;
+                        ctx->tensors[dst_id].src_ids[1] = vb_id;
+                        if (ctx->tensors[leaf_tids[bi]].requires_grad) {
+                            ctx->tensors[vb_id].requires_grad = 1;
+                            ctx->tensors[dst_id].requires_grad = 1;
+                        }
+                    }
+                    // For single-op FUSE, backward is just the op's backward rule
+                    if (fd->n_ops == 1)
+                        ctx->tensors[dst_id].creator_op = fd->ops[0].uop;
+                    // Multi-op: chain backward through intermediate ops
+                    // TODO: for now only single-op FUSE has correct backward
+                }
                 #ifdef __APPLE__
                 if (ctx->backend == &metal_backend) {
                     metal_dispatch_fused_v2(

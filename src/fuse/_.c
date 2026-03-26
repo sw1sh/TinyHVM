@@ -52,8 +52,10 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
     if (term_tag(t) != TAG_TOP) return -1;
     u32 uop = term_ext(t);
 
-    // View ops: walk through, compose view onto leaf
-    if (uop == UOP_EXPAND || uop == UOP_PERMUTE || uop == UOP_RESHAPE) {
+    // View ops: walk through, compose view onto leaf.
+    // Only when the input is already TAG_TEN (no speculative deep walking).
+    if ((uop == UOP_EXPAND || uop == UOP_PERMUTE || uop == UOP_RESHAPE) &&
+        term_tag(heap_read(ctx, term_val(t))) == TAG_TEN) {
         u64 loc = term_val(t);
         int inner = fuse_walk_inner(ctx, heap_read(ctx, loc), ops, n_ops, leaf_ids, leaf_views, n_leaves);
         if (inner < 0) return -1;
@@ -257,10 +259,9 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     u32 out_numel = out_view.numel;
 
     // ── Deferred dispatch (lazy leaves) ─────────────────────────
+    // Only single-op FUSE with small output for now
+    if (has_lazy && (n_ops > 1 || ew_view.numel > 4096)) return reduce_id(ctx, t);
     if (has_lazy) {
-        // DISABLED: FUSE output lacks backward provenance.
-        // Need to implement FUSE backward or set proper creator_op/src_ids.
-        return reduce_id(ctx, t);
         if (fuse_desc_count >= MAX_FUSE_DESCS) return reduce_id(ctx, t);
         u32 desc_id = fuse_desc_count++;
         FuseDesc *fd = &fuse_descs[desc_id];

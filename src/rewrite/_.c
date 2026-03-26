@@ -31,7 +31,9 @@ static Term rule_sum_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b) {
     rewrite_active = 1;
     u32 fid = fuse_or_reduce(ctx, t);
     rewrite_active = 0;
-    if (fid != ~0u) return term_ten(fid, DTYPE_F32);
+    if (fid != ~0u) {
+        return term_ten(fid, DTYPE_F32);
+    }
     return t;
 }
 
@@ -59,7 +61,27 @@ static Term rule_elementwise_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b)
 // ============================================================
 // Rule table
 // ============================================================
+// Rule: RESHAPE(SUM/RMAX(ew_chain)) → fuse_or_reduce handles this pattern
+static Term rule_reshape_reduce_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b) {
+    (void)b; (void)loc;
+    if (term_tag(a) != TAG_TOP) return t;
+    u32 inner_uop = term_ext(a);
+    if (inner_uop != UOP_SUM && inner_uop != UOP_RMAX) return t;
+    // Check if the SUM/RMAX's child is elementwise/view
+    u64 sum_loc = term_val(a);
+    Term sum_input = heap_read(ctx, sum_loc);
+    if (term_tag(sum_input) != TAG_TOP) return t;
+    if (!is_elementwise(term_ext(sum_input)) && !is_view_op(term_ext(sum_input))) return t;
+    rewrite_active = 1;
+    u32 fid = fuse_or_reduce(ctx, t);
+    rewrite_active = 0;
+    if (fid != ~0u) return term_ten(fid, DTYPE_F32);
+    return t;
+}
+
 static RewriteRule rewrite_rules[] = {
+    // RESHAPE(SUM/RMAX(ew_chain)) — must be before SUM/RMAX rules
+    { UOP_RESHAPE, UOP_ANY, rule_reshape_reduce_fuse },
     // Reduce + elementwise fusion (SUM(ew_chain), RMAX(ew_chain))
     { UOP_SUM,  UOP_ANY, rule_sum_fuse },
     { UOP_RMAX, UOP_ANY, rule_sum_fuse },

@@ -213,14 +213,22 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     u32 min_ops = (has_reduce || has_lazy) ? 1 : 2;
     if (n_ops < min_ops) return reduce_id(ctx, t);
 
-    // Output shape: broadcast all leaf views
-    View ew_view = *leaf_views[0];
-    for (u32 i = 1; i < n_leaves; i++) {
+    // Output shape: broadcast only USED leaves (not unused base entries)
+    u8 leaf_used[FUSE_MAX_LEAVES] = {0};
+    for (u32 i = 0; i < n_ops; i++) {
+        if (ops[i].arg_a < n_leaves) leaf_used[ops[i].arg_a] = 1;
+        if (ops[i].arg_b < n_leaves) leaf_used[ops[i].arg_b] = 1;
+    }
+    View ew_view = {0}; int ew_init = 0;
+    for (u32 i = 0; i < n_leaves; i++) {
+        if (!leaf_used[i]) continue;
+        if (!ew_init) { ew_view = *leaf_views[i]; ew_init = 1; continue; }
         View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
         if (!view_broadcast(&ew_view, leaf_views[i], &av_bc, &bv_bc, bc_shape, &bc_ndim))
             return reduce_id(ctx, t);
         ew_view = view_create(shape_of(bc_shape, bc_ndim));
     }
+    if (!ew_init) return reduce_id(ctx, t);
 
     // Reduce axis
     View out_view = ew_view; u32 reduce_dim = 1;
@@ -250,8 +258,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
 
     // ── Deferred dispatch (lazy leaves) ─────────────────────────
     if (has_lazy) {
-        // TODO: fix view chain replay mismatch, then enable
-        return reduce_id(ctx, t);
+        return reduce_id(ctx, t); // BUG: view replay wrong
         if (fuse_desc_count >= MAX_FUSE_DESCS) return reduce_id(ctx, t);
         u32 desc_id = fuse_desc_count++;
         FuseDesc *fd = &fuse_descs[desc_id];

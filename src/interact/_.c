@@ -490,16 +490,23 @@ inet_step:
                     fprintf(stderr,"] s=[");
                     for(u32 d=0;d<leaf_views[li]->shape.rank;d++) fprintf(stderr,"%d,",leaf_views[li]->strides[d]);
                     fprintf(stderr,"]\n");}_avd++;}
-                // Recompute output shape from ACTUAL leaf views
-                View ew_v = *leaf_views[0];
-                int bc_ok = 1;
-                for (u32 li = 1; li < fd->n_leaves; li++) {
+                // Recompute output shape from USED leaf views only
+                // (unused base leaves from view composition can have different shapes)
+                u8 leaf_used[FUSE_MAX_LEAVES_FWD] = {0};
+                for (u32 oi = 0; oi < fd->n_ops; oi++) {
+                    if (fd->ops[oi].arg_a < fd->n_leaves) leaf_used[fd->ops[oi].arg_a] = 1;
+                    if (fd->ops[oi].arg_b < fd->n_leaves) leaf_used[fd->ops[oi].arg_b] = 1;
+                }
+                View ew_v = {0}; int bc_ok = 1, ew_init = 0;
+                for (u32 li = 0; li < fd->n_leaves; li++) {
+                    if (!leaf_used[li]) continue;
+                    if (!ew_init) { ew_v = *leaf_views[li]; ew_init = 1; continue; }
                     View av_bc, bv_bc; u32 bc_s[MAX_DIM], bc_n;
                     if (view_broadcast(&ew_v, leaf_views[li], &av_bc, &bv_bc, bc_s, &bc_n))
                         ew_v = view_create(shape_of(bc_s, bc_n));
                     else { bc_ok = 0; break; }
                 }
-                if (!bc_ok) RETURN_REDUCED(t); // can't broadcast — stuck
+                if (!bc_ok || !ew_init) RETURN_REDUCED(t);
                 Shape real_out = ew_v.shape;
                 u32 real_numel = ew_v.numel;
                 // Apply reduce if needed

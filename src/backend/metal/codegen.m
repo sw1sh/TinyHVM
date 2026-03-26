@@ -177,7 +177,10 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     NSString *idx_var = has_reduce ? @"ridx" : nil;
 
     if (has_reduce) {
-        [s appendFormat:@"  float acc=0.0f;\n"];
+        if (has_reduce == UOP_RMAX)
+            [s appendFormat:@"  float acc=-1e30f;\n"];
+        else
+            [s appendFormat:@"  float acc=0.0f;\n"];
         [s appendFormat:@"  uint base=iz*%uu+iy*%uu+inner_base;\n", mid*inner, inner];
         [s appendFormat:@"  for(uint r=0;r<%uu;r++){\n", reduce_dim];
         [s appendFormat:@"    uint ridx=base*%uu+r;\n", reduce_dim];
@@ -242,13 +245,16 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             case UOP_SQRT: [s appendFormat:@"  %@ t%u=sqrt(t%u);\n", ft, tid, a]; break;
             default:       [s appendFormat:@"  %@ t%u=t%u;\n", ft, tid, a]; break;
         }
-        if (has_reduce) [s appendFormat:@"    acc+="];
+        // (accumulation added after last op below)
     }
 
     // Write output
     u32 last = n_leaves + n_ops - 1;
     if (has_reduce) {
-        [s appendFormat:@"    acc+=t%u;\n  }\n", last];
+        if (has_reduce == UOP_RMAX)
+            [s appendFormat:@"    acc=max(acc,t%u);\n  }\n", last];
+        else
+            [s appendFormat:@"    acc+=t%u;\n  }\n", last];
         [s appendFormat:@"  uint oi=iz*%uu+iy*%uu+inner_base;\n  out[oi]=acc;\n", mid*inner, inner];
     } else if (use_f4) {
         [s appendFormat:@"  uint oi=iz*%uu+iy*%uu+inner_base;\n", mid*inner, inner];

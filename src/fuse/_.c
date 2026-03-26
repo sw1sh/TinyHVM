@@ -161,8 +161,8 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     if (term_tag(t) != TAG_TOP) return reduce_id(ctx, t);
     u32 top_uop = term_ext(t);
 
-    // Pattern match: elementwise, SUM(ew), RESHAPE(SUM(ew))
-    int has_reduce = 0;
+    // Pattern match: elementwise, SUM/RMAX(ew), RESHAPE(SUM/RMAX(ew))
+    u32 has_reduce = 0; // 0=none, UOP_SUM, UOP_RMAX
     Term ew_root = t, sum_term = term_era(), reshape_term = term_era();
 
     if (top_uop == UOP_RESHAPE) {
@@ -172,7 +172,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             u64 sum_loc = term_val(inner);
             Term sum_input = heap_read(ctx, sum_loc);
             if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
-                has_reduce = 1; sum_term = inner; reshape_term = t; ew_root = sum_input;
+                has_reduce = term_ext(inner); sum_term = inner; reshape_term = t; ew_root = sum_input;
             }
         }
         if (!has_reduce) return reduce_id(ctx, t);
@@ -180,7 +180,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         u64 sum_loc = term_val(t);
         Term sum_input = heap_read(ctx, sum_loc);
         if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
-            has_reduce = 1; sum_term = t; ew_root = sum_input;
+            has_reduce = top_uop; sum_term = t; ew_root = sum_input;
         } else return reduce_id(ctx, t);
     } else if (!is_elementwise(top_uop)) {
         return reduce_id(ctx, t);

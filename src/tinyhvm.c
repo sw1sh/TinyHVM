@@ -116,8 +116,17 @@ static u32 fuse_desc_count;
 // ── ops/ — thvm_realize, supporting kernel functions ─────────────────────────
 #include "ops/_.c"
 
-// ── grad/ — thvm_grad, thvm_backward, lam/app/ref/ite/load/assign ────────────
+// Forward declarations for cross-module dependencies
+static u32 reduce_id(TinyHVM *ctx, Term t);
+
+// ── fuse/ — elementwise fusion (fuse_walk_inner, fuse_or_reduce) ─────────────
+#include "fuse/_.c"
+
+// ── grad/ — thvm_grad, thvm_backward ─────────────────────────────────────────
 #include "grad/_.c"
+
+// ── inet/ — interaction combinator term constructors ─────────────────────────
+#include "inet/_.c"
 
 // ── schedule/ — lazy graph compiler ──────────────────────────────────────────
 #include "schedule/_.c"

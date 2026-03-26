@@ -1,0 +1,310 @@
+// fuse/_.c — Elementwise fusion: walk lazy TAG_TOP tree, fuse into one kernel
+//
+// The fuser collects elementwise ops and their leaf tensors into a single
+// codegen kernel. View ops (RESHAPE, PERMUTE, EXPAND) are transparent —
+// they compose into leaf index expressions. Non-elementwise TAG_TOPs
+// (SUM, MM) become lazy leaf boundaries with shapes from the shape table.
+
+static int is_elementwise(u32 uop) {
+    return uop==UOP_ADD||uop==UOP_SUB||uop==UOP_MUL||uop==UOP_DIV||
+           uop==UOP_MAX||uop==UOP_CMP||uop==UOP_NEG||uop==UOP_RELU||
+           uop==UOP_EXP||uop==UOP_LOG||uop==UOP_SQRT;
+}
+static int is_binary(u32 uop) {
+    return uop==UOP_ADD||uop==UOP_SUB||uop==UOP_MUL||uop==UOP_DIV||
+           uop==UOP_MAX||uop==UOP_CMP;
+}
+
+#define FUSE_MAX_OPS 32
+#define FUSE_MAX_LEAVES 16
+#define MAX_FUSE_DESCS 512
+
+// Per-walk storage
+#define WALK_LEAF_BASE 10000
+static View fuse_composed_views[FUSE_MAX_LEAVES];
+static Term fuse_leaf_terms[FUSE_MAX_LEAVES];
+static FuseViewOp fuse_leaf_vops[FUSE_MAX_LEAVES][FUSE_MAX_VIEW_OPS];
+static u32 fuse_leaf_nvops[FUSE_MAX_LEAVES];
+
+// ============================================================
+// fuse_walk_inner: recursive walk of lazy TAG_TOP tree
+// ============================================================
+// Returns WALK_LEAF_BASE + leaf_idx for leaves,
+//         WALK_LEAF_BASE*2 + op_idx for ops, or -1 on failure.
+
+static int fuse_walk_inner(TinyHVM *ctx, Term t,
+                           FusedOp *ops, u32 *n_ops,
+                           u32 *leaf_ids, const View **leaf_views, u32 *n_leaves) {
+    // TAG_TEN: concrete tensor leaf
+    if (term_tag(t) == TAG_TEN) {
+        u32 tid = (u32)term_val(t);
+        // Dedup: same tensor → reuse leaf index
+        for (u32 i = 0; i < *n_leaves; i++)
+            if (leaf_ids[i] == tid) return (int)(WALK_LEAF_BASE + i);
+        if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
+        u32 idx = (*n_leaves)++;
+        leaf_ids[idx] = tid;
+        leaf_views[idx] = &ctx->tensors[tid].view;
+        fuse_leaf_terms[idx] = t;
+        fuse_leaf_nvops[idx] = 0;
+        return (int)(WALK_LEAF_BASE + idx);
+    }
+    if (term_tag(t) != TAG_TOP) return -1;
+    u32 uop = term_ext(t);
+
+    // View ops: walk through, compose view onto leaf
+    if (uop == UOP_EXPAND || uop == UOP_PERMUTE || uop == UOP_RESHAPE) {
+        u64 loc = term_val(t);
+        int inner = fuse_walk_inner(ctx, heap_read(ctx, loc), ops, n_ops, leaf_ids, leaf_views, n_leaves);
+        if (inner < 0) return -1;
+        if (inner >= (int)(WALK_LEAF_BASE * 2)) return -1;
+        u32 leaf_idx = inner - WALK_LEAF_BASE;
+        const View *base = leaf_views[leaf_idx];
+        if (!base) return -1;
+        Term arg2 = heap_read(ctx, loc + 1);
+        if (term_tag(arg2) != TAG_TEN) return -1;
+        TensorMeta *mp = &ctx->tensors[(u32)term_val(arg2)];
+        u32 rank = mp->view.numel;
+        if (rank > MAX_DIM) return -1;
+        f32 pf[MAX_DIM];
+        const f32 *cached = (const f32 *)mp->host_ptr;
+        if (cached) memcpy(pf, cached, rank * sizeof(f32));
+        else META_READ(ctx, mp->buf_id, pf, rank * sizeof(f32));
+
+        View nv = {0};
+        if (uop == UOP_PERMUTE) {
+            nv.offset = base->offset; nv.shape.rank = rank; nv.numel = base->numel;
+            for (u32 j = 0; j < rank; j++) {
+                nv.shape.dims[j] = base->shape.dims[(u32)pf[j]];
+                nv.strides[j] = base->strides[(u32)pf[j]];
+            }
+            nv.contiguous = 0;
+        } else if (uop == UOP_EXPAND) {
+            nv = *base; nv.shape.rank = rank; nv.numel = 1;
+            for (u32 j = 0; j < rank; j++) {
+                u32 nd = (u32)pf[j];
+                if (j < base->shape.rank && base->shape.dims[j] == 1 && nd > 1)
+                    nv.strides[j] = 0;
+                nv.shape.dims[j] = nd; nv.numel *= nd;
+            }
+            nv.contiguous = 0;
+        } else { // RESHAPE
+            Shape ns = {.rank = rank};
+            for (u32 j = 0; j < rank; j++) ns.dims[j] = (u32)pf[j];
+            nv = view_reshape(*base, ns);
+            if (!nv.contiguous && !base->contiguous) {
+                i32 exp = 1; int dense = 1;
+                for (int d = (int)rank - 1; d >= 0; d--) {
+                    if (ns.dims[d] > 1 && nv.strides[d] != exp) { dense = 0; break; }
+                    exp *= (i32)ns.dims[d];
+                }
+                if (dense) nv = *base; // non-aliasable: keep physical view
+            }
+        }
+        // Always create a NEW leaf for composed views (no dedup —
+        // the composed view differs from the base leaf's view)
+        if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
+        u32 new_idx = (*n_leaves)++;
+        leaf_ids[new_idx] = leaf_ids[leaf_idx];
+        fuse_leaf_terms[new_idx] = fuse_leaf_terms[leaf_idx];
+        fuse_composed_views[new_idx] = nv;
+        leaf_views[new_idx] = &fuse_composed_views[new_idx];
+        u32 nv_ops = fuse_leaf_nvops[leaf_idx];
+        for (u32 j = 0; j < nv_ops; j++)
+            fuse_leaf_vops[new_idx][j] = fuse_leaf_vops[leaf_idx][j];
+        if (nv_ops < FUSE_MAX_VIEW_OPS) {
+            fuse_leaf_vops[new_idx][nv_ops] = (FuseViewOp){.uop = uop, .loc = loc};
+            fuse_leaf_nvops[new_idx] = nv_ops + 1;
+        } else {
+            fuse_leaf_nvops[new_idx] = nv_ops;
+        }
+        return (int)(WALK_LEAF_BASE + new_idx);
+    }
+
+    // Non-elementwise TAG_TOP (SUM, MM, etc.): lazy leaf boundary.
+    // Shape from the shape table (set at node creation in thvm_op).
+    if (!is_elementwise(uop)) {
+        const View *sv = st_get(term_val(t));
+        if (!sv) return -1;
+        if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
+        u32 idx = (*n_leaves)++;
+        // Use heap loc as unique ID (not ~0u) to prevent false dedup
+        leaf_ids[idx] = (u32)(term_val(t) | 0x80000000u); // high bit = lazy marker
+        fuse_composed_views[idx] = *sv;
+        leaf_views[idx] = &fuse_composed_views[idx];
+        fuse_leaf_terms[idx] = t;
+        fuse_leaf_nvops[idx] = 0;
+        return (int)(WALK_LEAF_BASE + idx);
+    }
+
+    // Elementwise ops: recurse into children, record op
+    if (*n_ops >= FUSE_MAX_OPS) return -1;
+    u64 loc = term_val(t);
+    int arg_a = fuse_walk_inner(ctx, heap_read(ctx, loc), ops, n_ops, leaf_ids, leaf_views, n_leaves);
+    if (arg_a < 0) return -1;
+    int arg_b = 0;
+    if (is_binary(uop)) {
+        arg_b = fuse_walk_inner(ctx, heap_read(ctx, loc + 1), ops, n_ops, leaf_ids, leaf_views, n_leaves);
+        if (arg_b < 0) return -1;
+    }
+    u32 op_idx = (*n_ops)++;
+    ops[op_idx] = (FusedOp){ .uop = uop, .arg_a = (u32)arg_a, .arg_b = (u32)arg_b };
+    return (int)(WALK_LEAF_BASE * 2 + op_idx);
+}
+
+// Remap walk references to final indices
+static void fuse_remap(FusedOp *ops, u32 n_ops, u32 n_leaves) {
+    for (u32 i = 0; i < n_ops; i++) {
+        if (ops[i].arg_a >= WALK_LEAF_BASE * 2) ops[i].arg_a = n_leaves + (ops[i].arg_a - WALK_LEAF_BASE * 2);
+        else if (ops[i].arg_a >= WALK_LEAF_BASE) ops[i].arg_a -= WALK_LEAF_BASE;
+        if (ops[i].arg_b >= WALK_LEAF_BASE * 2) ops[i].arg_b = n_leaves + (ops[i].arg_b - WALK_LEAF_BASE * 2);
+        else if (ops[i].arg_b >= WALK_LEAF_BASE) ops[i].arg_b -= WALK_LEAF_BASE;
+    }
+}
+
+#define LEAF_IS_LAZY(id) ((id) & 0x80000000u)
+
+// ============================================================
+// fuse_or_reduce: try to fuse, or fall back to normal reduction
+// ============================================================
+static u32 fuse_unfused_count = 0, fuse_fused_count = 0;
+
+static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
+    if (term_tag(t) != TAG_TOP) return reduce_id(ctx, t);
+    u32 top_uop = term_ext(t);
+
+    // Pattern match: elementwise, SUM(ew), RESHAPE(SUM(ew))
+    int has_reduce = 0;
+    Term ew_root = t, sum_term = term_era(), reshape_term = term_era();
+
+    if (top_uop == UOP_RESHAPE) {
+        u64 rs_loc = term_val(t);
+        Term inner = heap_read(ctx, rs_loc);
+        if (term_tag(inner) == TAG_TOP && term_ext(inner) == UOP_SUM) {
+            u64 sum_loc = term_val(inner);
+            Term sum_input = heap_read(ctx, sum_loc);
+            if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
+                has_reduce = 1; sum_term = inner; reshape_term = t; ew_root = sum_input;
+            }
+        }
+        if (!has_reduce) return reduce_id(ctx, t);
+    } else if (top_uop == UOP_SUM) {
+        u64 sum_loc = term_val(t);
+        Term sum_input = heap_read(ctx, sum_loc);
+        if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
+            has_reduce = 1; sum_term = t; ew_root = sum_input;
+        } else return reduce_id(ctx, t);
+    } else if (!is_elementwise(top_uop)) {
+        return reduce_id(ctx, t);
+    }
+
+    // Walk the tree
+    FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0;
+    u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
+
+    int walk_result = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
+    if (walk_result < 0) return reduce_id(ctx, t);
+    fuse_remap(ops, n_ops, n_leaves);
+
+    int has_lazy = 0;
+    for (u32 i = 0; i < n_leaves; i++)
+        if (LEAF_IS_LAZY(leaf_ids[i])) { has_lazy = 1; break; }
+
+    u32 min_ops = (has_reduce || has_lazy) ? 1 : 2;
+    if (n_ops < min_ops) return reduce_id(ctx, t);
+
+    // Output shape: broadcast all leaf views
+    View ew_view = *leaf_views[0];
+    for (u32 i = 1; i < n_leaves; i++) {
+        View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
+        if (!view_broadcast(&ew_view, leaf_views[i], &av_bc, &bv_bc, bc_shape, &bc_ndim))
+            return reduce_id(ctx, t);
+        ew_view = view_create(shape_of(bc_shape, bc_ndim));
+    }
+
+    // Reduce axis
+    View out_view = ew_view; u32 reduce_dim = 1;
+    if (has_reduce) {
+        u64 sum_loc = term_val(sum_term);
+        Term sum_axes = heap_read(ctx, sum_loc + 1);
+        int reduce_axis = -1;
+        if (term_tag(sum_axes) == TAG_TEN) {
+            u32 ax_id = (u32)term_val(sum_axes);
+            TensorMeta *axt = &ctx->tensors[ax_id];
+            if (axt->view.numel == 1) {
+                f32 ax_val;
+                META_READ(ctx, axt->buf_id, &ax_val, sizeof(f32));
+                reduce_axis = (int)ax_val;
+            }
+        }
+        if (reduce_axis < 0)
+            for (int d = (int)ew_view.shape.rank - 1; d >= 0; d--)
+                if (ew_view.shape.dims[d] > 1) { reduce_axis = d; break; }
+        if (reduce_axis >= 0 && reduce_axis < (int)ew_view.shape.rank) {
+            reduce_dim = ew_view.shape.dims[reduce_axis];
+            out_view.shape.dims[reduce_axis] = 1;
+            out_view.numel = ew_view.numel / reduce_dim;
+        } else return reduce_id(ctx, t);
+    }
+    u32 out_numel = out_view.numel;
+
+    // ── Deferred dispatch (lazy leaves) ─────────────────────────
+    if (has_lazy) {
+        // TODO: fix view chain replay mismatch, then enable
+        return reduce_id(ctx, t);
+        if (fuse_desc_count >= MAX_FUSE_DESCS) return reduce_id(ctx, t);
+        u32 desc_id = fuse_desc_count++;
+        FuseDesc *fd = &fuse_descs[desc_id];
+        fd->n_ops = n_ops;
+        for (u32 i = 0; i < n_ops; i++) fd->ops[i] = ops[i];
+        fd->n_leaves = n_leaves;
+        for (u32 i = 0; i < n_leaves; i++) {
+            fd->leaf_terms[i] = fuse_leaf_terms[i];
+            fd->leaf_n_views[i] = fuse_leaf_nvops[i];
+            for (u32 j = 0; j < fuse_leaf_nvops[i]; j++)
+                fd->leaf_view_chain[i][j] = fuse_leaf_vops[i][j];
+        }
+        fd->out_shape = ew_view.shape;
+        fd->out_numel = out_numel;
+        fd->has_reduce = has_reduce;
+        fd->reduce_dim = reduce_dim;
+
+        f32 did = (f32)desc_id;
+        Term desc_ten = thvm_tensor(ctx, &did, SHAPE(1));
+        u64 floc = heap_alloc(ctx, 2);
+        heap_set(ctx, floc, term_era());
+        heap_set(ctx, floc + 1, desc_ten);
+        fuse_fused_count++;
+        return reduce_id(ctx, term_new(TAG_TOP, UOP_FUSING, floc));
+    }
+
+    // ── Immediate dispatch (all leaves TAG_TEN) ─────────────────
+    u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
+    fuse_fused_count++;
+    #ifdef __APPLE__
+    if (ctx->backend == &metal_backend) {
+        u32 bufs[FUSE_MAX_LEAVES];
+        for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
+        metal_dispatch_fused_v2(ctx->tensors[dst_id].buf_id, out_numel,
+                                  bufs, leaf_views, n_leaves, ops, n_ops,
+                                  has_reduce, reduce_dim, &ew_view.shape);
+    } else
+    #endif
+    { return reduce_id(ctx, t); }
+
+    if (has_reduce && term_tag(reshape_term) != TAG_ERA) {
+        u64 rs_loc = term_val(reshape_term);
+        Term shape_t = heap_read(ctx, rs_loc + 1);
+        if (term_tag(shape_t) == TAG_TEN) {
+            TensorMeta *ms = &ctx->tensors[(u32)term_val(shape_t)];
+            u32 rank = ms->view.numel;
+            f32 dims_f[MAX_DIM];
+            META_READ(ctx, ms->buf_id, dims_f, rank * sizeof(f32));
+            Shape ns = {.rank = rank};
+            for (u32 i = 0; i < rank; i++) ns.dims[i] = (u32)dims_f[i];
+            u32 rs_id = tensor_view_of(ctx, dst_id, view_create(ns));
+            return rs_id;
+        }
+    }
+    return dst_id;
+}

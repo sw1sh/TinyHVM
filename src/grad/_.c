@@ -238,9 +238,14 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     u32 n_leaves = 0;
 
     int walk_result = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
+    static int _wr=0; if(walk_result<0 && _wr<3){fprintf(stderr,"WALK_FAIL uop=%s n_ops=%u n_leaves=%u\n",uop_names[term_ext(ew_root)],n_ops,n_leaves);_wr++;}
     if (walk_result < 0) return reduce_id(ctx, t);
     fuse_remap(ops, n_ops, n_leaves);
-    u32 min_ops = has_reduce ? 1 : 2;  // reduce+1op is worth fusing
+    // Check if any leaves are lazy (need FUSE for deferred dispatch)
+    int has_lazy_pre = 0;
+    for (u32 i = 0; i < n_leaves; i++)
+        if (leaf_ids[i] == ~0u) { has_lazy_pre = 1; break; }
+    u32 min_ops = (has_reduce || has_lazy_pre) ? 1 : 2;
     if (n_ops < min_ops) return reduce_id(ctx, t);
 
     // Determine elementwise output shape (broadcast of all leaf views)
@@ -288,8 +293,8 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     for (u32 i = 0; i < n_leaves; i++)
         if (leaf_ids[i] == ~0u) { has_lazy = 1; break; }
 
+    static int _hl=0; if(has_lazy && _hl<3){fprintf(stderr,"HAS_LAZY n_l=%u n_o=%u\n",n_leaves,n_ops);_hl++;}
     if (has_lazy) {
-        return reduce_id(ctx, t); // DEBUG: skip FUSE, fall back to normal
         static int _fc=0; if(_fc<5){
             fprintf(stderr,"FUSE_CREATE[%d] n_ops=%u n_leaves=%u out_numel=%u out=[",_fc,n_ops,n_leaves,out_numel);
             for(u32 d=0;d<ew_view.shape.rank;d++) fprintf(stderr,"%u,",ew_view.shape.dims[d]);

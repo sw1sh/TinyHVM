@@ -18,3 +18,23 @@ static void dispatch_1d(id<MTLComputePipelineState> pipe,
     batch_dirty = 1;
     total_dispatches++;
 }
+
+static void dispatch_2d(id<MTLComputePipelineState> pipe,
+                        id<MTLBuffer> *bufs, u32 n_bufs,
+                        const void **params, u64 *param_sizes, u32 n_params,
+                        u32 width, u32 height) {
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:pipe];
+    for (u32 i = 0; i < n_bufs; i++)
+        [enc setBuffer:bufs[i] offset:0 atIndex:i];
+    for (u32 i = 0; i < n_params; i++)
+        [enc setBytes:params[i] length:param_sizes[i] atIndex:n_bufs + i];
+    NSUInteger tpg = pipe.maxTotalThreadsPerThreadgroup;
+    // 2D threadgroup: sqrt-ish split. 16x16 or 32x8 etc.
+    NSUInteger tw = MIN(32, width);
+    NSUInteger th = MIN(tpg / tw, (NSUInteger)height);
+    [enc dispatchThreads:MTLSizeMake(width, height, 1)
+       threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+    batch_dirty = 1;
+    total_dispatches++;
+}

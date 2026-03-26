@@ -1,6 +1,7 @@
 // metal/ops.m — Core Metal compute ops: unary, binary, matmul, reduce
 
 static u32 fast_dispatch_count = 0, slow_dispatch_count = 0;
+u32 bc2d_count = 0;
 
 // Check if view is truly contiguous (offset=0, standard strides, no mask, no stride-0)
 static int is_fast_view(const View *v) {
@@ -128,6 +129,65 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
         dispatch_1d(fpipe, bufs, 3, params, psizes, 1, n);
         thvm_prof_record(uop, t0);
         return;
+    }
+
+    // 2D broadcast path: a[B,C,H,W] contiguous, b[B,C,H,W] with strides [0,s,0,0]
+    // (or vice versa). Uses 2D dispatch to avoid divisions.
+    {
+        const View *contig_v = NULL, *bcast_v = NULL;
+        u32 contig_buf = 0, bcast_buf = 0;
+        int swapped = 0;
+
+        if (is_fast_view(av) && bv->shape.rank >= 3 && !bv->has_mask && bv->offset == 0) {
+            contig_v = av; contig_buf = a;
+            bcast_v = bv; bcast_buf = b;
+        } else if (is_fast_view(bv) && av->shape.rank >= 3 && !av->has_mask && av->offset == 0) {
+            contig_v = bv; contig_buf = b;
+            bcast_v = av; bcast_buf = a;
+            swapped = 1;
+        }
+
+        if (contig_v && bcast_v) {
+            // Check broadcast pattern: exactly one non-zero stride dim
+            u32 rank = bcast_v->shape.rank;
+            int bc_dim = -1;
+            int bc_ok = 1;
+            for (u32 d = 0; d < rank; d++) {
+                if (bcast_v->strides[d] != 0 && bcast_v->shape.dims[d] > 1) {
+                    if (bc_dim >= 0) { bc_ok = 0; break; } // multiple non-zero strides
+                    bc_dim = (int)d;
+                }
+            }
+            if (bc_ok && bc_dim >= 0) {
+                // Compute spatial dims (everything after bc_dim)
+                u32 n_spatial = 1;
+                for (u32 d = (u32)bc_dim + 1; d < rank; d++) n_spatial *= bcast_v->shape.dims[d];
+                u32 C_dim = bcast_v->shape.dims[bc_dim];
+                u32 n_bc = dv->numel / n_spatial;
+
+                id<MTLComputePipelineState> bc_pipe = nil;
+                // For non-commutative ops with swapped inputs, adjust
+                if (!swapped || uop == UOP_ADD || uop == UOP_MUL || uop == UOP_MAX) {
+                    switch (uop) {
+                        case UOP_ADD: bc_pipe = bc2d_add; break;
+                        case UOP_MUL: bc_pipe = bc2d_mul; break;
+                        case UOP_SUB: if (!swapped) bc_pipe = bc2d_sub; break;
+                        case UOP_DIV: if (!swapped) bc_pipe = bc2d_div; break;
+                        case UOP_CMP: if (!swapped) bc_pipe = bc2d_cmp; break;
+                        default: break;
+                    }
+                }
+                if (bc_pipe) {
+                    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[contig_buf], metal_pool.bufs[bcast_buf] };
+                    const void *params[] = { &n_spatial, &n_bc, &C_dim };
+                    u64 psizes[] = { sizeof(u32), sizeof(u32), sizeof(u32) };
+                    bc2d_count++;
+                    dispatch_2d(bc_pipe, bufs, 3, params, psizes, 3, n_spatial, n_bc);
+                    thvm_prof_record(uop, t0);
+                    return;
+                }
+            }
+        }
     }
 
     // Slow path: strided ViewParams with broadcast support

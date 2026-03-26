@@ -726,3 +726,76 @@ kernel void fast4_relu(device float4 *dst [[buffer(0)]],
     if (i >= n4) return;
     dst[i] = max(a[i], float4(0.0f));
 }
+
+// ============================================================
+// 2D dispatch kernels — NO integer divisions
+// For [B,C,H,W] tensors: gid.x = spatial (h*W+w), gid.y = batch*C+c
+// Broadcast [1,C,1,1]: index into b = gid.y % C
+// ============================================================
+
+// Binary add: a[B,C,H,W] contiguous + b[1,C,1,1] broadcast
+// Params: n_spatial (H*W), n_bc (B*C), C
+kernel void add_bc_2d(device float *dst [[buffer(0)]],
+                       device const float *a [[buffer(1)]],
+                       device const float *b [[buffer(2)]],
+                       constant uint &n_spatial [[buffer(3)]],
+                       constant uint &n_bc [[buffer(4)]],
+                       constant uint &C [[buffer(5)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= n_spatial || gid.y >= n_bc) return;
+    uint flat = gid.y * n_spatial + gid.x;
+    uint c = gid.y % C;
+    dst[flat] = a[flat] + b[c];
+}
+
+kernel void mul_bc_2d(device float *dst [[buffer(0)]],
+                       device const float *a [[buffer(1)]],
+                       device const float *b [[buffer(2)]],
+                       constant uint &n_spatial [[buffer(3)]],
+                       constant uint &n_bc [[buffer(4)]],
+                       constant uint &C [[buffer(5)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= n_spatial || gid.y >= n_bc) return;
+    uint flat = gid.y * n_spatial + gid.x;
+    uint c = gid.y % C;
+    dst[flat] = a[flat] * b[c];
+}
+
+kernel void sub_bc_2d(device float *dst [[buffer(0)]],
+                       device const float *a [[buffer(1)]],
+                       device const float *b [[buffer(2)]],
+                       constant uint &n_spatial [[buffer(3)]],
+                       constant uint &n_bc [[buffer(4)]],
+                       constant uint &C [[buffer(5)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= n_spatial || gid.y >= n_bc) return;
+    uint flat = gid.y * n_spatial + gid.x;
+    uint c = gid.y % C;
+    dst[flat] = a[flat] - b[c];
+}
+
+kernel void div_bc_2d(device float *dst [[buffer(0)]],
+                       device const float *a [[buffer(1)]],
+                       device const float *b [[buffer(2)]],
+                       constant uint &n_spatial [[buffer(3)]],
+                       constant uint &n_bc [[buffer(4)]],
+                       constant uint &C [[buffer(5)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= n_spatial || gid.y >= n_bc) return;
+    uint flat = gid.y * n_spatial + gid.x;
+    uint c = gid.y % C;
+    dst[flat] = a[flat] / b[c];
+}
+
+kernel void cmp_bc_2d(device float *dst [[buffer(0)]],
+                       device const float *a [[buffer(1)]],
+                       device const float *b [[buffer(2)]],
+                       constant uint &n_spatial [[buffer(3)]],
+                       constant uint &n_bc [[buffer(4)]],
+                       constant uint &C [[buffer(5)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= n_spatial || gid.y >= n_bc) return;
+    uint flat = gid.y * n_spatial + gid.x;
+    uint c = gid.y % C;
+    dst[flat] = a[flat] > b[c] ? 1.0f : 0.0f;
+}

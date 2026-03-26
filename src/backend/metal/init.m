@@ -25,6 +25,8 @@ static id<MTLComputePipelineState> fpipe_neg, fpipe_relu, fpipe_exp, fpipe_log, 
 // Float4 vectorized (4x throughput)
 static id<MTLComputePipelineState> f4pipe_add, f4pipe_sub, f4pipe_mul;
 static id<MTLComputePipelineState> f4pipe_neg, f4pipe_relu;
+// 2D broadcast kernels: a[B,C,H,W] op b[1,C,1,1]
+static id<MTLComputePipelineState> bc2d_add, bc2d_mul, bc2d_sub, bc2d_div, bc2d_cmp;
 static id<MTLComputePipelineState> pipe_relu_bwd;
 static id<MTLComputePipelineState> pipe_matrix_transpose, pipe_zero_fill, pipe_pad;
 
@@ -162,6 +164,11 @@ static int metal_init(void) {
     f4pipe_mul  = make_pipe(@"fast4_mul");
     f4pipe_neg  = make_pipe(@"fast4_neg");
     f4pipe_relu = make_pipe(@"fast4_relu");
+    bc2d_add  = make_pipe(@"add_bc_2d");
+    bc2d_mul  = make_pipe(@"mul_bc_2d");
+    bc2d_sub  = make_pipe(@"sub_bc_2d");
+    bc2d_div  = make_pipe(@"div_bc_2d");
+    bc2d_cmp  = make_pipe(@"cmp_bc_2d");
 
     memset(&metal_pool, 0, sizeof(metal_pool));
     metal_pool.count = 1;

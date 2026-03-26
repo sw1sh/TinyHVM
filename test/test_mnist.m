@@ -314,15 +314,14 @@ static int run_cnn(MNISTData *data) {
         // Read loss AFTER all GPU work queued — single flush
         f32 loss_val = thvm_to_host(ctx, loss_r)[0];
 
-        extern u32 total_dispatches;
+        extern u32 total_dispatches, bc2d_count;
         extern double flush_total_ms;
         extern u32 flush_count_total;
-        extern u32 fast_dispatch_count, slow_dispatch_count;
         if (step == 0) {
             struct timespec now_; clock_gettime(CLOCK_MONOTONIC, &now_);
             f32 wall_ = (f32)(now_.tv_sec - t0_wall.tv_sec)*1000.0f + (f32)(now_.tv_nsec - t0_wall.tv_nsec)/1e6f;
-            printf("    step 0: dispatches=%u gpu=%.0fms cpu=%.0fms wall=%.0fms\n",
-                   total_dispatches, flush_total_ms, wall_-(f32)flush_total_ms, wall_);
+            printf("    step 0: dispatches=%u (2d_bc=%u) gpu=%.0fms wall=%.0fms\n",
+                   total_dispatches, bc2d_count, flush_total_ms, wall_);
             fflush(stdout);
             total_dispatches = 0; flush_total_ms = 0; flush_count_total = 0;
             fast_dispatch_count = 0; slow_dispatch_count = 0;

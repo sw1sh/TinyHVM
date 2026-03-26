@@ -18,7 +18,24 @@
       "WebFetch(domain:flopper.io)",
       "WebFetch(domain:en.wikipedia.org)",
       "WebFetch(domain:www.macobserver.com)",
-      "WebFetch(domain:lowendmac.com)"
+      "WebFetch(domain:lowendmac.com)",
+      "Read(//Users/swish/src/TinyHVM/tinygrad/tinygrad/engine/**)",
+      "Read(//Users/swish/src/tinygrad/tinygrad/engine/**)",
+      "Read(//Users/swish/src/TinyHVM/tinygrad/tinygrad/codegen/**)",
+      "Read(//Users/swish/src/tinygrad/tinygrad/codegen/**)",
+      "Read(//Users/swish/src/TinyHVM/tinygrad/tinygrad/renderer/**)",
+      "Read(//Users/swish/src/tinygrad/tinygrad/renderer/**)",
+      "WebFetch(domain:karpathy.github.io)",
+      "WebFetch(domain:no-free-lunch.org)",
+      "WebFetch(domain:tvm.apache.org)",
+      "WebFetch(domain:openai.com)",
+      "WebFetch(domain:egraphs-good.github.io)",
+      "Read(//Users/swish/src/TinyHVM/tinygrad/tinygrad/runtime/**)",
+      "Read(//Users/swish/src/tinygrad/tinygrad/runtime/**)",
+      "Read(//Users/swish/src/TinyHVM/tinygrad/tinygrad/**)",
+      "Read(//Users/swish/src/tinygrad/tinygrad/**)",
+      "Read(//Users/swish/src/TinyHVM/tinygrad/tinygrad/uop/**)",
+      "Read(//Users/swish/src/tinygrad/tinygrad/uop/**)"
     ]
   }
 }

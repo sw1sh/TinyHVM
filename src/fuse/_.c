@@ -290,6 +290,27 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
 
     // ── Immediate dispatch (all leaves TAG_TEN) ─────────────────
     u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
+
+    // Provenance: set creator_op to the LAST op, src_ids to its leaf args.
+    // This lets backward trace through the fused chain correctly.
+    if (n_ops >= 1) {
+        FusedOp *last = &ops[n_ops - 1];
+        ctx->tensors[dst_id].creator_op = last->uop;
+        if (last->arg_a < n_leaves) {
+            ctx->tensors[dst_id].src_ids[0] = leaf_ids[last->arg_a];
+            if (ctx->tensors[leaf_ids[last->arg_a]].requires_grad)
+                ctx->tensors[dst_id].requires_grad = 1;
+        }
+        if (last->arg_b < n_leaves) {
+            ctx->tensors[dst_id].src_ids[1] = leaf_ids[last->arg_b];
+            if (ctx->tensors[leaf_ids[last->arg_b]].requires_grad)
+                ctx->tensors[dst_id].requires_grad = 1;
+        }
+        // For multi-op chains: intermediate ops need their own tensors
+        // for backward to trace through. Create view-aliased intermediates.
+        // For now, only single-op fusion has full backward support.
+    }
+
     fuse_fused_count++;
     #ifdef __APPLE__
     if (ctx->backend == &metal_backend) {

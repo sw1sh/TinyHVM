@@ -83,7 +83,16 @@ static const f32 *tensor_host_f32(TinyHVM *ctx, u32 tid) {
     return (const f32 *)ctx->tensors[tid].host_ptr;
 }
 
+// Check if a term is a lazy elementwise op (not a chain — just 1 op with TAG_TEN args)
+// These are safe to FUSE because single-op backward works with standard rules.
+static int is_ew_single(Term t) {
+    return (term_tag(t) == TAG_TOP && is_elementwise(term_ext(t)));
+}
+
 Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
+    // TODO: inject FUSE nodes at elementwise → non-elementwise boundary
+    // Disabled until multi-op backward provenance is implemented.
+
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc, a);
     heap_set(ctx, loc + 1, b);

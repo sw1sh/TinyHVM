@@ -405,11 +405,22 @@ inet_step:
                 RETURN_REDUCED(t);
             }
 
-            // === General FUSE dispatch ===
-            // Created by fuse_or_reduce when the fuser collected a chain with
-            // lazy leaves. heap[loc]=ERA, heap[loc+1]=NUM(desc_id).
-            // The desc_id indexes into fuse_descs[] which holds ops, views, etc.
-            // General FUSE: heap[loc]=ERA, heap[loc+1]=TAG_TEN(desc_id_tensor)
+            // === Elementwise chain FUSE ===
+            // Injected at graph construction: FUSE(ew_chain, ERA).
+            // The trampoline reduced ew_chain's args depth-first, so all
+            // leaves are TAG_TEN. Dispatch via fuse_or_reduce.
+            if (uop == UOP_FUSING && term_tag(heap_read(ctx, loc + 1)) == TAG_ERA
+                && term_tag(heap_read(ctx, loc)) == TAG_TOP) {
+                Term chain = heap_read(ctx, loc);
+                u32 fid = fuse_or_reduce(ctx, chain);
+                if (fid != ~0u) RETURN_REDUCED(term_ten(fid, DTYPE_F32));
+                // Fallback: reduce normally
+                Term r = thvm_reduce(ctx, chain);
+                RETURN_REDUCED(r);
+            }
+
+            // === Deferred FUSE dispatch ===
+            // Created by fuse_or_reduce for lazy leaves: FUSE(ERA, desc_id_tensor).
             if (uop == UOP_FUSING && term_tag(heap_read(ctx, loc)) == TAG_ERA
                 && term_tag(heap_read(ctx, loc + 1)) == TAG_TEN) {
                 u32 dt = (u32)term_val(heap_read(ctx, loc + 1));

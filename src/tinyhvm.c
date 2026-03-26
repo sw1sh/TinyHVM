@@ -101,6 +101,12 @@ typedef struct {
 static FuseDesc fuse_descs[512];
 static u32 fuse_desc_count;
 
+// Forward declarations for cross-module dependencies
+static u32 reduce_id(TinyHVM *ctx, Term t);
+static u32 fuse_or_reduce(TinyHVM *ctx, Term t);
+static int is_elementwise(u32 uop);
+static int is_binary(u32 uop);
+
 // ── clone/ — deep-copy (ALO) for REF unfolding ──────────────────────────────
 #include "clone/_.c"
 
@@ -115,9 +121,6 @@ static u32 fuse_desc_count;
 
 // ── ops/ — thvm_realize, supporting kernel functions ─────────────────────────
 #include "ops/_.c"
-
-// Forward declarations for cross-module dependencies
-static u32 reduce_id(TinyHVM *ctx, Term t);
 
 // ── fuse/ — elementwise fusion (fuse_walk_inner, fuse_or_reduce) ─────────────
 #include "fuse/_.c"

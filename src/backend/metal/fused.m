@@ -50,7 +50,7 @@ void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
 
 // FusedOp defined in tinyhvm.c (before this file is included)
 
-#define FUSED_CACHE_SIZE 256
+#define FUSED_CACHE_SIZE 64
 static struct {
     u64 key;
     id<MTLComputePipelineState> pipe;
@@ -89,8 +89,7 @@ static const char *strided_idx_helper =
     "  return buf[strided_idx(flat, v.strides, v.shape, v.offset, v.rank)];\n"
     "}\n";
 
-static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves, int has_reduce,
-                                   const View **leaf_views, u32 out_numel) {
+static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves, int has_reduce) {
     NSMutableString *src = [NSMutableString stringWithCapacity:4096];
     [src appendString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
 
@@ -110,55 +109,10 @@ static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves, i
     [src appendString:@"  uint gid [[thread_position_in_grid]])\n{\n"];
     [src appendString:@"  if (gid >= numel) return;\n"];
 
-    // Compute output shape for inline index divisors
-    u32 oshape[MAX_DIM] = {0}, orank = 0;
-    if (leaf_views) {
-        for (u32 i = 0; i < n_leaves; i++) {
-            if (leaf_views[i]->shape.rank > orank) orank = leaf_views[i]->shape.rank;
-            for (u32 d = 0; d < leaf_views[i]->shape.rank; d++)
-                if (leaf_views[i]->shape.dims[d] > oshape[d]) oshape[d] = leaf_views[i]->shape.dims[d];
-        }
-    }
-
-    // Helper: check if leaf is contiguous and same numel as output
-    #define LEAF_IS_CONTIG(lv) (0)  /* disabled — test accuracy */
-
-    // Emit per-leaf reads with inline index expressions where possible
+    // Helper macro for ops
     #define EMIT_LEAF_READS(idx_var) \
-        for (u32 _li = 0; _li < n_leaves; _li++) { \
-            if (leaf_views && LEAF_IS_CONTIG(leaf_views[_li])) { \
-                [src appendFormat:@"    float t%u = in%u[%s];\n", _li, _li, idx_var]; \
-            } else if (0 && leaf_views && !leaf_views[_li]->has_mask && \
-                       leaf_views[_li]->shape.rank == orank) { \
-                /* Inline index: use output shape divisors */ \
-                const View *_lv = leaf_views[_li]; \
-                [src appendFormat:@"    float t%u = in%u[", _li, _li]; \
-                int _first = 1; \
-                u32 _divs[MAX_DIM]; \
-                { u32 _d2 = 1; \
-                  for (int _d = (int)orank - 1; _d >= 0; _d--) { \
-                      _divs[_d] = _d2; _d2 *= oshape[_d]; \
-                  } \
-                } \
-                for (u32 _d = 0; _d < orank; _d++) { \
-                    if (_lv->strides[_d] == 0) continue; \
-                    if (oshape[_d] <= 1) continue; \
-                    if (!_first) [src appendString:@" + "]; \
-                    _first = 0; \
-                    if (_lv->strides[_d] == 1 && _divs[_d] == 1) \
-                        [src appendFormat:@"(%s %% %uu)", idx_var, oshape[_d]]; \
-                    else if (_divs[_d] == 1) \
-                        [src appendFormat:@"(%s %% %uu) * %du", idx_var, oshape[_d], _lv->strides[_d]]; \
-                    else \
-                        [src appendFormat:@"((%s / %uu) %% %uu) * %du", idx_var, _divs[_d], oshape[_d], _lv->strides[_d]]; \
-                } \
-                if (_lv->offset != 0) [src appendFormat:@" + %d", _lv->offset]; \
-                if (_first) [src appendString:@"0"]; \
-                [src appendString:@"];\n"]; \
-            } else { \
-                [src appendFormat:@"    float t%u = masked_read_v(in%u, %s, v%u);\n", _li, _li, idx_var, _li]; \
-            } \
-        }
+        for (u32 i = 0; i < n_leaves; i++) \
+            [src appendFormat:@"    float t%u = masked_read_v(in%u, %s, v%u);\n", i, i, idx_var, i]
     #define EMIT_OPS(indent) \
         for (u32 i = 0; i < n_ops; i++) { \
             u32 tid = n_leaves + i; \
@@ -199,27 +153,15 @@ static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves, i
     return src;
 }
 
-static id<MTLComputePipelineState> get_fused_pipe_v2(const FusedOp *ops, u32 n_ops,
-                                                       u32 n_leaves, int has_reduce,
-                                                       const View **leaf_views, u32 out_numel) {
-    // Hash includes op chain + leaf view patterns (inline expressions bake dims/strides)
+static id<MTLComputePipelineState> get_fused_pipe_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves, int has_reduce) {
     u64 key = fuse_hash_v2(ops, n_ops, n_leaves) ^ ((u64)has_reduce << 63);
-    if (leaf_views) {
-        for (u32 i = 0; i < n_leaves; i++) {
-            const View *v = leaf_views[i];
-            key ^= (u64)v->numel; key *= 0x100000001b3ULL;
-            key ^= (u64)v->offset; key *= 0x100000001b3ULL;
-            for (u32 d = 0; d < v->shape.rank; d++) {
-                key ^= (u64)v->shape.dims[d]; key *= 0x100000001b3ULL;
-                key ^= (u64)(u32)v->strides[d]; key *= 0x100000001b3ULL;
-            }
-        }
-        key ^= (u64)out_numel; key *= 0x100000001b3ULL;
-    }
     for (u32 i = 0; i < fused_cache_count && i < FUSED_CACHE_SIZE; i++)
         if (fused_cache[i].key == key) return fused_cache[i].pipe;
 
-    NSString *src = codegen_fused_v2(ops, n_ops, n_leaves, has_reduce, leaf_views, out_numel);
+    NSString *src = codegen_fused_v2(ops, n_ops, n_leaves, has_reduce);
+    static u32 jit_compile_count = 0;
+    jit_compile_count++;
+    if (jit_compile_count <= 30) fprintf(stderr, "JIT compile #%u: n_ops=%u n_leaves=%u reduce=%d\n", jit_compile_count, n_ops, n_leaves, has_reduce);
     NSError *err = nil;
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
     id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:opts error:&err];
@@ -241,7 +183,7 @@ void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view)
     const View *views[] = { src_view };
     u32 bufs[] = { src_buf };
     FusedOp ops[1]; // unused but array must exist
-    id<MTLComputePipelineState> pipe = get_fused_pipe_v2(ops, 0, 1, 0, NULL, 0);
+    id<MTLComputePipelineState> pipe = get_fused_pipe_v2(ops, 0, 1, 0);
     if (!pipe) return;
 
     id<MTLBuffer> mbufs[2];
@@ -261,7 +203,7 @@ void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
                                u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
                                FusedOp *ops, u32 n_ops,
                                int has_reduce, u32 reduce_dim) {
-    id<MTLComputePipelineState> pipe = get_fused_pipe_v2(ops, n_ops, n_leaves, has_reduce, leaf_views, out_numel);
+    id<MTLComputePipelineState> pipe = get_fused_pipe_v2(ops, n_ops, n_leaves, has_reduce);
     if (!pipe) return;
 
     id<MTLBuffer> bufs[16];

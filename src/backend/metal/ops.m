@@ -48,7 +48,7 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
         }
     }
 
-    // Slow path: pre-built strided kernel
+    // Slow path: strided ViewParams (broadcast, permuted, masked)
     id<MTLComputePipelineState> pipe = nil;
     switch (uop) {
         case UOP_NEG:  pipe = pipe_neg;  break;
@@ -92,7 +92,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
         return;
     }
 
-    // Slow path: pre-built strided kernel
+    // Slow path: strided ViewParams with broadcast support
     id<MTLComputePipelineState> pipe = nil;
     switch (uop) {
         case UOP_ADD: pipe = pipe_add; break;

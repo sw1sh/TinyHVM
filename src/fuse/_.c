@@ -168,7 +168,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     if (top_uop == UOP_RESHAPE) {
         u64 rs_loc = term_val(t);
         Term inner = heap_read(ctx, rs_loc);
-        if (term_tag(inner) == TAG_TOP && term_ext(inner) == UOP_SUM) {
+        if (term_tag(inner) == TAG_TOP && (term_ext(inner) == UOP_SUM || term_ext(inner) == UOP_RMAX)) {
             u64 sum_loc = term_val(inner);
             Term sum_input = heap_read(ctx, sum_loc);
             if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
@@ -176,7 +176,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             }
         }
         if (!has_reduce) return reduce_id(ctx, t);
-    } else if (top_uop == UOP_SUM) {
+    } else if (top_uop == UOP_SUM || top_uop == UOP_RMAX) {
         u64 sum_loc = term_val(t);
         Term sum_input = heap_read(ctx, sum_loc);
         if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {

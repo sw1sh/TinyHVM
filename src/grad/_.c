@@ -44,6 +44,12 @@ static int is_binary(u32 uop) {
 // Op return values are NEGATIVE too during walk, fixed up after.
 #define WALK_LEAF_BASE 10000  // offset to distinguish leaf refs from op refs during walk
 
+// Composed view storage for leaves behind view ops
+static View fuse_composed_views[FUSE_MAX_LEAVES];
+
+// Leaf terms for lazy FUSE nodes (may be TAG_TEN or TAG_TOP)
+static Term fuse_leaf_terms[FUSE_MAX_LEAVES];
+
 static int fuse_walk_inner(TinyHVM *ctx, Term t,
                            FusedOp *ops, u32 *n_ops,
                            u32 *leaf_ids, const View **leaf_views, u32 *n_leaves) {
@@ -55,10 +61,75 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         u32 idx = (*n_leaves)++;
         leaf_ids[idx] = tid;
         leaf_views[idx] = &ctx->tensors[tid].view;
+        fuse_leaf_terms[idx] = t;
         return (int)(WALK_LEAF_BASE + idx);
     }
     if (term_tag(t) != TAG_TOP) return -1;
     u32 uop = term_ext(t);
+
+    // View ops: walk through, compose view onto leaf.
+    if (uop == UOP_EXPAND || uop == UOP_PERMUTE || uop == UOP_RESHAPE) {
+        u64 loc = term_val(t);
+        Term vi = heap_read(ctx, loc);
+        int inner = fuse_walk_inner(ctx, vi, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+        if (inner < 0) return -1;
+        if (inner >= (int)(WALK_LEAF_BASE * 2)) return -1; // can't compose onto op
+        u32 leaf_idx = inner - WALK_LEAF_BASE;
+        const View *base = leaf_views[leaf_idx];
+        Term arg2 = heap_read(ctx, loc + 1);
+        if (term_tag(arg2) != TAG_TEN) return -1;
+        TensorMeta *mp = &ctx->tensors[(u32)term_val(arg2)];
+        u32 rank = mp->view.numel;
+        if (rank > MAX_DIM) return -1;
+        f32 pf[MAX_DIM];
+        META_READ(ctx, mp->buf_id, pf, rank * sizeof(f32));
+
+        View nv = {0};
+        if (uop == UOP_PERMUTE) {
+            nv.offset = base->offset; nv.shape.rank = rank; nv.numel = base->numel;
+            for (u32 j = 0; j < rank; j++) {
+                nv.shape.dims[j] = base->shape.dims[(u32)pf[j]];
+                nv.strides[j] = base->strides[(u32)pf[j]];
+            }
+            nv.contiguous = 0;
+        } else if (uop == UOP_EXPAND) {
+            nv = *base; nv.shape.rank = rank; nv.numel = 1;
+            for (u32 j = 0; j < rank; j++) {
+                u32 nd = (u32)pf[j];
+                if (j < base->shape.rank && base->shape.dims[j] == 1 && nd > 1)
+                    nv.strides[j] = 0;
+                nv.shape.dims[j] = nd; nv.numel *= nd;
+            }
+            nv.contiguous = 0;
+        } else { // RESHAPE
+            Shape ns = {.rank = rank};
+            for (u32 j = 0; j < rank; j++) ns.dims[j] = (u32)pf[j];
+            nv = view_reshape(*base, ns);
+            // Non-aliasable reshape: keep the PHYSICAL view (base).
+            // The codegen's "different rank" branch handles this:
+            // it decomposes the flat output index through the leaf's
+            // physical shape and applies physical strides.
+            if (!nv.contiguous && !base->contiguous) {
+                i32 exp = 1; int dense = 1;
+                for (int d = (int)rank - 1; d >= 0; d--) {
+                    if (ns.dims[d] > 1 && nv.strides[d] != exp) { dense = 0; break; }
+                    exp *= (i32)ns.dims[d];
+                }
+                if (dense) {
+                    // Failed reshape: use base's physical view as-is.
+                    // The flat output index maps through the physical shape.
+                    nv = *base;
+                }
+            }
+        }
+        if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
+        u32 new_idx = (*n_leaves)++;
+        leaf_ids[new_idx] = leaf_ids[leaf_idx];
+        fuse_composed_views[new_idx] = nv;
+        leaf_views[new_idx] = &fuse_composed_views[new_idx];
+        return (int)(WALK_LEAF_BASE + new_idx);
+    }
+
     if (!is_elementwise(uop)) return -1;
     if (*n_ops >= FUSE_MAX_OPS) return -1;
 
@@ -71,7 +142,6 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         if (arg_b < 0) return -1;
     }
     u32 op_idx = (*n_ops)++;
-    // Use a temporary marker: ops start at WALK_LEAF_BASE * 2
     ops[op_idx] = (FusedOp){ .uop = uop, .arg_a = (u32)arg_a, .arg_b = (u32)arg_b };
     return (int)(WALK_LEAF_BASE * 2 + op_idx);
 }

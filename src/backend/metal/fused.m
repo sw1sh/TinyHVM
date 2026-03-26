@@ -103,10 +103,15 @@ static u64 fuse_hash_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves,
         h ^= ops[i].arg_a; h *= 0x100000001b3ULL;
         h ^= ops[i].arg_b; h *= 0x100000001b3ULL;
     }
-    // Include leaf access patterns in hash (depends on out_numel for broadcast check)
+    // Include leaf view patterns in hash (shape, strides determine generated code)
     for (u32 i = 0; i < n_leaves; i++) {
-        h ^= (u64)leaf_is_contiguous(leaf_views[i]) << i;
-        h *= 0x100000001b3ULL;
+        const View *v = leaf_views[i];
+        h ^= (u64)v->numel; h *= 0x100000001b3ULL;
+        h ^= (u64)v->offset; h *= 0x100000001b3ULL;
+        for (u32 d = 0; d < v->shape.rank; d++) {
+            h ^= (u64)v->shape.dims[d]; h *= 0x100000001b3ULL;
+            h ^= (u64)(u32)v->strides[d]; h *= 0x100000001b3ULL;
+        }
     }
     h ^= (u64)fused_out_numel_hint; h *= 0x100000001b3ULL;
     return h;
@@ -149,13 +154,51 @@ static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     [src appendString:@"  uint gid [[thread_position_in_grid]])\n{\n"];
     [src appendString:@"  if (gid >= numel) return;\n"];
 
-    // Emit leaf reads with specialized indexing
+    // Generate per-leaf inline index expression based on view pattern.
+    // For each leaf, emit the most efficient read for its specific strides.
+    // leaf_views are known at JIT time, so we bake strides into the code.
     #define EMIT_LEAF_READS_SPEC(idx_var) \
-        for (u32 i = 0; i < n_leaves; i++) { \
-            if (leaf_is_contiguous(leaf_views[i])) \
-                [src appendFormat:@"    float t%u = in%u[%s];\n", i, i, idx_var]; \
-            else \
-                [src appendFormat:@"    float t%u = sr(in%u, %s, v%u);\n", i, i, idx_var, i]; \
+        for (u32 li = 0; li < n_leaves; li++) { \
+            const View *lv = leaf_views[li]; \
+            if (leaf_is_contiguous(lv)) { \
+                [src appendFormat:@"    float t%u = in%u[%s];\n", li, li, idx_var]; \
+            } else if (!lv->has_mask) { \
+                /* Generate inline index: sum of (flat/divisor % dim) * stride per active dim */ \
+                [src appendFormat:@"    float t%u = in%u[", li, li]; \
+                u32 divisor = 1; \
+                int first = 1; \
+                /* Walk dims from innermost to outermost (reverse) */ \
+                /* Build products from the right: divisor[d] = product of shape[d+1..rank-1] */ \
+                u32 divisors[MAX_DIM]; \
+                { u32 div = 1; \
+                  for (int d = (int)lv->shape.rank - 1; d >= 0; d--) { \
+                      divisors[d] = div; div *= lv->shape.dims[d]; \
+                  } \
+                } \
+                for (u32 d = 0; d < lv->shape.rank; d++) { \
+                    if (lv->shape.dims[d] <= 1) continue; /* skip trivial dims */ \
+                    if (lv->strides[d] == 0) continue; /* skip broadcast dims */ \
+                    if (!first) [src appendString:@" + "]; \
+                    first = 0; \
+                    /* coord[d] = (flat / divisor[d]) % shape[d] */ \
+                    /* phys += coord[d] * stride[d] */ \
+                    if (lv->strides[d] == 1 && divisors[d] == 1) { \
+                        /* innermost contiguous dim: just flat % shape */ \
+                        [src appendFormat:@"(%s %% %uu)", idx_var, lv->shape.dims[d]]; \
+                    } else if (divisors[d] == 1) { \
+                        [src appendFormat:@"(%s %% %uu) * %du", idx_var, lv->shape.dims[d], lv->strides[d]]; \
+                    } else { \
+                        [src appendFormat:@"((%s / %uu) %% %uu) * %du", idx_var, divisors[d], lv->shape.dims[d], lv->strides[d]]; \
+                    } \
+                } \
+                if (lv->offset != 0) { \
+                    [src appendFormat:@" + %d", lv->offset]; \
+                } \
+                if (first) [src appendString:@"0"]; /* all dims broadcast = scalar */ \
+                [src appendString:@"];\n"]; \
+            } else { \
+                [src appendFormat:@"    float t%u = sr(in%u, %s, v%u);\n", li, li, idx_var, li]; \
+            } \
         }
 
     #define EMIT_OPS(indent) \

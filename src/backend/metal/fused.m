@@ -360,155 +360,89 @@ static const char *uop_to_op(u32 uop) {
     }
 }
 
-// Generate a tinygrad-style kernel with 6-slot dispatch (gid.xyz + lid.xyz).
-// Maps up to 6 non-trivial dims directly to hardware coordinates — ZERO divisions.
-// For >6 non-trivial dims: collapse innermost extras into lid.x with minimal divisions.
-
-// Slot assignment helpers
-typedef struct {
-    u32 grid[3];    // threadgroup grid (gid range)
-    u32 local[3];   // threadgroup size (lid range)
-    int dim_slot[MAX_DIM]; // which slot each dim uses (-1=trivial, 0-5=slot, 6+=collapsed)
-    u32 collapse_start;    // first dim collapsed into lid.x
-    u32 n_slots;           // number of direct-mapped slots used
-} SlotPlan;
-
-static SlotPlan plan_slots(const View *dv) {
-    SlotPlan p = {.grid={1,1,1}, .local={1,1,1}, .collapse_start=MAX_DIM};
-    u32 rank = dv->shape.rank;
-    for (u32 d = 0; d < rank; d++) p.dim_slot[d] = -1;
-
-    // Collect non-trivial dims (outermost first)
-    u32 nt[MAX_DIM], nt_n = 0;
-    for (u32 d = 0; d < rank; d++)
-        if (dv->shape.dims[d] > 1) nt[nt_n++] = d;
-
-    // Assign dims to hardware slots. Up to 4 direct slots:
-    // gid.z (slot 0), gid.y (slot 1), lid.z (slot 3), lid.y (slot 4).
-    // gid.x reserved for collapsed dims (or 5th direct dim if ≤6 total).
-    // lid.x reserved for 6th direct dim (if fits) or unused.
-    u32 lid_product = 1;
-    u32 assigned = 0;
-
-    if (nt_n <= 6) {
-        // ≤6 dims: assign each to a slot, no collapsing needed
-        for (u32 i = 0; i < nt_n; i++) {
-            u32 d = nt[i], sz = dv->shape.dims[d];
-            if (i < 3) {
-                p.grid[2 - i] = sz;  // gid.z, gid.y, gid.x
-                p.dim_slot[d] = (int)i;
-            } else {
-                if (lid_product * sz <= 1024) {
-                    p.local[5 - i] = sz;  // lid.z, lid.y, lid.x
-                    lid_product *= sz;
-                    p.dim_slot[d] = (int)i;
-                } else {
-                    // Doesn't fit — remaining go to gid.x as collapsed
-                    u32 coll = 1;
-                    for (u32 j = i; j < nt_n; j++) {
-                        coll *= dv->shape.dims[nt[j]];
-                        p.dim_slot[nt[j]] = 6;
-                    }
-                    // Move slot 2 (gid.x) dim to collapsed if needed
-                    // Actually: i >= 3, so gid.x might already be assigned
-                    // We need gid.x for collapsed, so move the dim from gid.x to collapsed
-                    if (i > 2) {
-                        // gid.x was already used by slot 2 — conflict!
-                        // Move that dim into the collapsed group
-                        for (u32 dd = 0; dd < rank; dd++) {
-                            if (p.dim_slot[dd] == 2) {
-                                coll *= dv->shape.dims[dd];
-                                p.dim_slot[dd] = 6;
-                                p.grid[0] = 1;  // clear gid.x
-                                break;
-                            }
-                        }
-                    }
-                    p.grid[0] = coll;
-                    break;
-                }
-            }
-        }
-    } else {
-        // >6 dims: first 2 → gid.z/y (slots 0,1), next 2 → lid.z/y (slots 3,4)
-        // Collapse rest → gid.x ONLY (slot 2 skipped for direct dims)
-        u32 direct_slots[] = {0, 1, 3, 4};  // gid.z, gid.y, lid.z, lid.y
-        for (u32 i = 0; i < nt_n; i++) {
-            u32 d = nt[i], sz = dv->shape.dims[d];
-            if (assigned < 4) {
-                u32 slot = direct_slots[assigned];
-                if (slot < 3) {
-                    // gid slot
-                    p.grid[2 - slot] = sz;
-                } else {
-                    // lid slot — check 1024 limit
-                    if (lid_product * sz > 1024) { p.dim_slot[d] = 6; continue; }
-                    u32 li = 5 - slot;  // slot 3→local[2], slot 4→local[1]
-                    p.local[li] = sz;
-                    lid_product *= sz;
-                }
-                p.dim_slot[d] = (int)slot;
-                assigned++;
-            } else {
-                p.dim_slot[d] = 6;  // collapsed into gid.x
-            }
-        }
-        // Set gid.x to total collapsed product
-        u32 coll = 1;
-        for (u32 d = 0; d < rank; d++)
-            if (p.dim_slot[d] == 6) coll *= dv->shape.dims[d];
-        p.grid[0] = coll;
-    }
-    return p;
-}
-
+// Generate a tinygrad-style kernel for binary op with any stride pattern.
+// Uses 3D grid: collapse output dims into (inner, mid, outer).
+// Each input's physical index = sum(coord[d] * stride[d]) — multiplies only.
 static id<MTLComputePipelineState> get_mdim_binary_pipe(
     u32 uop, const View *dv, const View *av, const View *bv,
-    u32 grid[3], u32 local[3]) {
+    u32 *grid_w, u32 *grid_h, u32 *grid_d,
+    u32 *tg_w, u32 *tg_h, u32 *tg_d) {
 
     u64 key = mdim_hash(uop, dv, av, bv);
     for (u32 i = 0; i < mdim_cache_count && i < MDIM_CACHE_SIZE; i++)
         if (mdim_cache[i].key == key) {
-            SlotPlan p = plan_slots(dv);
-            for (int i2=0;i2<3;i2++) { grid[i2]=p.grid[i2]; local[i2]=p.local[i2]; }
-            return mdim_cache[i].pipe;
+            // Recompute grid dims (same for same key)
+            goto compute_grid;
         }
 
     {
         u32 rank = dv->shape.rank;
-        SlotPlan p = plan_slots(dv);
-
         NSMutableString *src = [NSMutableString stringWithCapacity:2048];
         [src appendString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
         [src appendFormat:@"kernel void mdim_bin(\n"
             "  device float *out [[buffer(0)]],\n"
             "  device const float *a [[buffer(1)]],\n"
             "  device const float *b [[buffer(2)]],\n"
-            "  uint3 gid [[threadgroup_position_in_grid]],\n"
-            "  uint3 lid [[thread_position_in_threadgroup]])\n{\n"];
+            "  uint3 gid [[thread_position_in_grid]])\n{\n"];
 
-        // Slot variable names
-        const char *slot_var[] = {"gid.z","gid.y","gid.x","lid.z","lid.y","lid.x"};
+        // Collapse dims into 3 groups: outer, mid, inner
+        // inner = last dims, mid = middle, outer = first dims
+        // Goal: each group is one gid component
+        u32 inner = 1, mid = 1, outer = 1;
+        u32 inner_start = rank; // dims in inner group: [inner_start, rank)
 
-        // Extract coordinates — direct from hardware (no division!)
+        // Inner group: rightmost dims up to ~256 elements
+        for (int d = (int)rank - 1; d >= 0; d--) {
+            if (inner * dv->shape.dims[d] <= 1024) {
+                inner *= dv->shape.dims[d];
+                inner_start = (u32)d;
+            } else break;
+        }
+        // Mid group: next dims
+        u32 mid_start = inner_start;
+        for (int d = (int)inner_start - 1; d >= 0; d--) {
+            if (mid * dv->shape.dims[d] <= 65535) {
+                mid *= dv->shape.dims[d];
+                mid_start = (u32)d;
+            } else break;
+        }
+        // Outer: remaining
+        for (u32 d = 0; d < mid_start; d++) outer *= dv->shape.dims[d];
+
+        [src appendFormat:@"  uint inner_idx = gid.x; // [0, %u)\n", inner];
+        [src appendFormat:@"  uint mid_idx = gid.y;   // [0, %u)\n", mid];
+        [src appendFormat:@"  uint outer_idx = gid.z; // [0, %u)\n", outer];
+        [src appendFormat:@"  if (inner_idx >= %uu || mid_idx >= %uu || outer_idx >= %uu) return;\n",
+            inner, mid, outer];
+
+        // Decompose each group into per-dim coordinates using multiplies only
+        // (since the dim sizes are compile-time constants, Metal compiler optimizes)
+        [src appendString:@"  // Decompose coordinates\n"];
+
+        // For each dim, compute: coord[d] = (group_idx / divisor) % shape[d]
+        // divisor = product of dims below d within the group
+        // Since these are compile-time constants, compiler optimizes to shifts/masks
         for (u32 d = 0; d < rank; d++) {
-            if (p.dim_slot[d] == -1) {
+            const char *group;
+            u32 group_start, group_end;
+            if (d < mid_start) { group = "outer_idx"; group_start = 0; group_end = mid_start; }
+            else if (d < inner_start) { group = "mid_idx"; group_start = mid_start; group_end = inner_start; }
+            else { group = "inner_idx"; group_start = inner_start; group_end = rank; }
+
+            u32 divisor = 1;
+            for (u32 dd = d + 1; dd < group_end; dd++) divisor *= dv->shape.dims[dd];
+
+            if (divisor == 1 && dv->shape.dims[d] == 1) {
                 [src appendFormat:@"  uint c%u = 0;\n", d];
-            } else if (p.dim_slot[d] < 6) {
-                [src appendFormat:@"  uint c%u = %s;\n", d, slot_var[p.dim_slot[d]]];
+            } else if (divisor == 1) {
+                [src appendFormat:@"  uint c%u = %s %% %uu;\n", d, group, dv->shape.dims[d]];
             } else {
-                // Collapsed dim: decompose from gid.x (needs division)
-                u32 divisor = 1;
-                for (u32 d2 = d + 1; d2 < rank; d2++)
-                    if (p.dim_slot[d2] == 6) divisor *= dv->shape.dims[d2];
-                if (divisor == 1)
-                    [src appendFormat:@"  uint c%u = gid.x %% %uu;\n", d, dv->shape.dims[d]];
-                else
-                    [src appendFormat:@"  uint c%u = (gid.x / %uu) %% %uu;\n", d, divisor, dv->shape.dims[d]];
+                [src appendFormat:@"  uint c%u = (%s / %uu) %% %uu;\n", d, group, divisor, dv->shape.dims[d]];
             }
         }
 
-        // Physical index for each input
+        // Compute physical index for each input: sum(c[d] * stride[d]) + offset
+        // Stride=0 dims contribute nothing (broadcast)
         for (int inp = 0; inp < 2; inp++) {
             const View *v = (inp == 0) ? av : bv;
             const char *name = (inp == 0) ? "a" : "b";
@@ -524,31 +458,20 @@ static id<MTLComputePipelineState> get_mdim_binary_pipe(
             [src appendString:@";\n"];
         }
 
-        // Output flat index (contiguous): sum of coord * output_stride
-        [src appendFormat:@"  uint out_idx = 0"];
-        { u32 ostride = 1;
-          for (int d = (int)rank - 1; d >= 0; d--) {
-              if (dv->shape.dims[d] > 1) {
-                  if (ostride == 1)
-                      [src appendFormat:@" + c%u", d];
-                  else
-                      [src appendFormat:@" + c%u * %uu", d, ostride];
-              }
-              ostride *= dv->shape.dims[d];
-          }
-        }
-        [src appendString:@";\n"];
+        // Output flat index: outer * (mid*inner) + mid * inner + inner
+        [src appendFormat:@"  uint out_idx = outer_idx * %uu + mid_idx * %uu + inner_idx;\n",
+            mid * inner, inner];
 
         // The op
-        if (uop == UOP_CMP)
+        if (uop == UOP_CMP) {
             [src appendString:@"  out[out_idx] = a[a_idx] > b[b_idx] ? 1.0f : 0.0f;\n"];
-        else if (uop == UOP_MAX)
+        } else if (uop == UOP_MAX) {
             [src appendString:@"  out[out_idx] = max(a[a_idx], b[b_idx]);\n"];
-        else
+        } else {
             [src appendFormat:@"  out[out_idx] = a[a_idx] %s b[b_idx];\n", uop_to_op(uop)];
+        }
 
         [src appendString:@"}\n"];
-
 
         NSError *err = nil;
         id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
@@ -561,18 +484,41 @@ static id<MTLComputePipelineState> get_mdim_binary_pipe(
             mdim_cache_count++ : (mdim_cache_count++ % MDIM_CACHE_SIZE);
         mdim_cache[slot].key = key;
         mdim_cache[slot].pipe = pipe;
-
-        for (int i2=0;i2<3;i2++) { grid[i2]=p.grid[i2]; local[i2]=p.local[i2]; }
-        return pipe;
     }
+
+compute_grid:;
+    // Compute grid dimensions
+    u32 rank = dv->shape.rank;
+    u32 inner_s = rank, mid_s = 0;
+    *grid_w = 1; *grid_h = 1; *grid_d = 1;
+    for (int d = (int)rank - 1; d >= 0; d--) {
+        if (*grid_w * dv->shape.dims[d] <= 1024) { *grid_w *= dv->shape.dims[d]; inner_s = (u32)d; }
+        else break;
+    }
+    for (int d = (int)inner_s - 1; d >= 0; d--) {
+        if (*grid_h * dv->shape.dims[d] <= 65535) { *grid_h *= dv->shape.dims[d]; mid_s = (u32)d; }
+        else break;
+    }
+    for (u32 d = 0; d < mid_s; d++) *grid_d *= dv->shape.dims[d];
+
+    // Threadgroup: use 256 threads (Metal sweet spot)
+    *tg_w = MIN(*grid_w, 256u);
+    *tg_h = 1; *tg_d = 1;
+
+    // Return the cached pipe
+    for (u32 i = 0; i < mdim_cache_count && i < MDIM_CACHE_SIZE; i++)
+        if (mdim_cache[i].key == mdim_hash(uop, dv, av, bv))
+            return mdim_cache[i].pipe;
+    return nil;
 }
 
 // Dispatch a multi-dim binary kernel
 void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
                                  u32 a_buf, const View *av,
                                  u32 b_buf, const View *bv) {
-    u32 grid[3], local[3];
-    id<MTLComputePipelineState> pipe = get_mdim_binary_pipe(uop, dv, av, bv, grid, local);
+    u32 gw, gh, gd, tw, th, td;
+    id<MTLComputePipelineState> pipe = get_mdim_binary_pipe(uop, dv, av, bv,
+                                                              &gw, &gh, &gd, &tw, &th, &td);
     if (!pipe) return;
 
     id<MTLComputeCommandEncoder> enc = get_encoder();
@@ -580,8 +526,8 @@ void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
     [enc setBuffer:metal_pool.bufs[dst] offset:0 atIndex:0];
     [enc setBuffer:metal_pool.bufs[a_buf] offset:0 atIndex:1];
     [enc setBuffer:metal_pool.bufs[b_buf] offset:0 atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(grid[0], grid[1], grid[2])
-       threadsPerThreadgroup:MTLSizeMake(local[0], local[1], local[2])];
+    [enc dispatchThreads:MTLSizeMake(gw, gh, gd)
+       threadsPerThreadgroup:MTLSizeMake(tw, th, td)];
     batch_dirty = 1;
     total_dispatches++;
 }

@@ -144,7 +144,19 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
     }
 
     // Non-elementwise TAG_TOP (SUM, MM, etc.): lazy leaf boundary.
-    if (!is_elementwise(uop)) return -1;
+    if (!is_elementwise(uop)) {
+        const View *sv = st_get(term_val(t));
+        static int _ll2=0; if(_ll2<5 && uop==UOP_SUM){fprintf(stderr,"LAZY_SUM: sv=%s loc=%llu\n",sv?"Y":"N",term_val(t));_ll2++;}
+        if (!sv) return -1;
+        if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
+        u32 idx = (*n_leaves)++;
+        leaf_ids[idx] = ~0u;
+        fuse_composed_views[idx] = *sv;
+        leaf_views[idx] = &fuse_composed_views[idx];
+        fuse_leaf_terms[idx] = t;
+        fuse_leaf_nvops[idx] = 0;
+        return (int)(WALK_LEAF_BASE + idx);
+    }
     if (*n_ops >= FUSE_MAX_OPS) return -1;
 
     u64 loc = term_val(t);
@@ -277,7 +289,23 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         if (leaf_ids[i] == ~0u) { has_lazy = 1; break; }
 
     if (has_lazy) {
-        // Deferred: create FUSE node. Trampoline reduces leaves, interact dispatches.
+        return reduce_id(ctx, t); // DEBUG: skip FUSE, fall back to normal
+        static int _fc=0; if(_fc<5){
+            fprintf(stderr,"FUSE_CREATE[%d] n_ops=%u n_leaves=%u out_numel=%u out=[",_fc,n_ops,n_leaves,out_numel);
+            for(u32 d=0;d<ew_view.shape.rank;d++) fprintf(stderr,"%u,",ew_view.shape.dims[d]);
+            fprintf(stderr,"] ops=[");
+            for(u32 i=0;i<n_ops;i++) fprintf(stderr,"%s(%u,%u),",uop_names[ops[i].uop],ops[i].arg_a,ops[i].arg_b);
+            fprintf(stderr,"]\n");
+            for(u32 i=0;i<n_leaves;i++){
+                fprintf(stderr,"  leaf[%u] tid=%u r=%u n=%u s=[",i,leaf_ids[i],
+                    leaf_views[i]->shape.rank, leaf_views[i]->numel);
+                for(u32 d=0;d<leaf_views[i]->shape.rank;d++) fprintf(stderr,"%d,",leaf_views[i]->strides[d]);
+                fprintf(stderr,"] d=[");
+                for(u32 d=0;d<leaf_views[i]->shape.rank;d++) fprintf(stderr,"%u,",leaf_views[i]->shape.dims[d]);
+                fprintf(stderr,"] lazy=%d nvops=%u\n", leaf_ids[i]==~0u, fuse_leaf_nvops[i]);
+            }
+            _fc++;
+        }
         if (fuse_desc_count >= MAX_FUSE_DESCS) return reduce_id(ctx, t);
         u32 desc_id = fuse_desc_count++;
         FuseDesc *fd = &fuse_descs[desc_id];
@@ -306,6 +334,11 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
 
     // Immediate: all leaves are TAG_TEN
+    static int _ic=0; if(_ic<3){
+        fprintf(stderr,"IMMED_FUSE[%d] n_ops=%u n_leaves=%u out_numel=%u out=[",_ic,n_ops,n_leaves,out_numel);
+        for(u32 d=0;d<ew_view.shape.rank;d++) fprintf(stderr,"%u,",ew_view.shape.dims[d]);
+        fprintf(stderr,"]\n"); _ic++;
+    }
     u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
 
     fuse_fused_count++;

@@ -61,13 +61,113 @@ Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {
     if (ctx->backend && data) {
         ctx->backend->buf_write(m->buf_id, data, (u64)m->view.numel * dtype_size(m->dtype));
     }
+    // Cache host data for small metadata tensors (shapes, axes, permutations).
+    // This allows shape tracking in thvm_op to read data without GPU buffer access.
+    if (data && m->view.numel <= MAX_DIM) {
+        m->host_ptr = malloc(m->view.numel * sizeof(f32));
+        memcpy(m->host_ptr, data, m->view.numel * sizeof(f32));
+    }
     return term_ten(id, DTYPE_F32);
+}
+
+// Get the output view of any term (TAG_TEN or TAG_TOP with shape tracking)
+static const View *term_view(TinyHVM *ctx, Term t) {
+    if (term_tag(t) == TAG_TEN) return &ctx->tensors[(u32)term_val(t)].view;
+    if (term_tag(t) == TAG_TOP) return st_get(term_val(t));
+    return NULL;
+}
+
+// Read cached metadata from a TAG_TEN's host_ptr (no GPU access).
+// Returns NULL if not cached.
+static const f32 *tensor_host_f32(TinyHVM *ctx, u32 tid) {
+    return (const f32 *)ctx->tensors[tid].host_ptr;
 }
 
 Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc, a);
     heap_set(ctx, loc + 1, b);
+
+    // Shape tracking: eagerly compute and store output view.
+    // View ops with metadata (RESHAPE, EXPAND, SHRINK, PAD, PERMUTE) store
+    // shape even without input view. Elementwise/reduce need input view.
+    const View *va = term_view(ctx, a);
+    {
+        View out = {0};
+        int stored = 0;
+
+        // View ops: output shape deterministic from metadata
+        if (term_tag(b) == TAG_TEN) {
+            const f32 *bf = tensor_host_f32(ctx, (u32)term_val(b));
+            u32 bn = bf ? ctx->tensors[(u32)term_val(b)].view.numel : 0;
+            if (bf && uop == UOP_RESHAPE) {
+                Shape ns = {.rank = bn}; u32 nn = 1;
+                for (u32 i = 0; i < bn; i++) { ns.dims[i] = (u32)bf[i]; nn *= ns.dims[i]; }
+                if (va && nn == va->numel) out = view_reshape(*va, ns);
+                else out = view_create(ns);
+                st_set(loc, &out); stored = 1;
+            } else if (bf && uop == UOP_EXPAND) {
+                if (va) {
+                    out = *va; out.shape.rank = bn; out.numel = 1;
+                    for (u32 i = 0; i < bn; i++) {
+                        u32 nd = (u32)bf[i];
+                        if (i < va->shape.rank && va->shape.dims[i] == 1 && nd > 1) out.strides[i] = 0;
+                        out.shape.dims[i] = nd; out.numel *= nd;
+                    }
+                    out.contiguous = 0;
+                } else {
+                    Shape ns = {.rank = bn};
+                    for (u32 i = 0; i < bn; i++) ns.dims[i] = (u32)bf[i];
+                    out = view_create(ns);
+                }
+                st_set(loc, &out); stored = 1;
+            } else if (bf && uop == UOP_SHRINK) {
+                u32 ndim = bn / 2;
+                Shape ns = {.rank = ndim}; u32 nn = 1;
+                for (u32 i = 0; i < ndim; i++) { ns.dims[i] = (u32)bf[i*2+1] - (u32)bf[i*2]; nn *= ns.dims[i]; }
+                out = view_create(ns);
+                st_set(loc, &out); stored = 1;
+            } else if (bf && uop == UOP_PAD && va) {
+                u32 ndim = bn / 2;
+                out = *va;
+                for (u32 i = 0; i < ndim; i++)
+                    out.shape.dims[i] += (u32)bf[i*2] + (u32)bf[i*2+1];
+                out.numel = 1;
+                for (u32 i = 0; i < out.shape.rank; i++) out.numel *= out.shape.dims[i];
+                out = view_create(out.shape);
+                st_set(loc, &out); stored = 1;
+            } else if (bf && uop == UOP_PERMUTE && va) {
+                out = (View){0}; out.offset = va->offset; out.shape.rank = bn; out.numel = va->numel;
+                for (u32 i = 0; i < bn; i++) {
+                    out.shape.dims[i] = va->shape.dims[(u32)bf[i]];
+                    out.strides[i] = va->strides[(u32)bf[i]];
+                }
+                out.contiguous = 0;
+                st_set(loc, &out); stored = 1;
+            } else if (bf && (uop == UOP_SUM || uop == UOP_RMAX) && va) {
+                out = *va;
+                for (u32 i = 0; i < bn; i++) {
+                    u32 ax = (u32)bf[i];
+                    if (ax < out.shape.rank) out.shape.dims[ax] = 1;
+                }
+                out = view_create(out.shape);
+                st_set(loc, &out); stored = 1;
+            }
+        }
+
+        // Elementwise: needs both input views for broadcast
+        if (!stored && va && is_elementwise(uop)) {
+            const View *vb = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
+            if (vb) {
+                View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
+                if (view_broadcast(va, vb, &av_bc, &bv_bc, bc_shape, &bc_ndim))
+                    out = view_create(shape_of(bc_shape, bc_ndim));
+                else out = *va;
+            } else out = *va;
+            st_set(loc, &out);
+        }
+    }
+
     return term_top(uop, loc);
 }
 

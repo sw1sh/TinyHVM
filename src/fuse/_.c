@@ -205,7 +205,10 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
 
     int walk_result = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
-    if (walk_result < 0) return reduce_id(ctx, t);
+    if (walk_result < 0) {
+        static int _wf=0; if(_wf<5){fprintf(stderr,"WALK_FAIL: top=%s n_ops=%u n_leaves=%u\n",uop_names[term_ext(ew_root)],n_ops,n_leaves);_wf++;}
+        return reduce_id(ctx, t);
+    }
     fuse_remap(ops, n_ops, n_leaves);
 
     int has_lazy = 0;
@@ -215,13 +218,9 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     u32 min_ops = (has_reduce || has_lazy) ? 1 : 2;
     if (n_ops < min_ops) return reduce_id(ctx, t);
 
-    // Don't fuse differentiable chains — backward needs intermediate data
-    // that fusion eliminates. Only fuse detached chains.
-    int any_grad = 0;
-    for (u32 i = 0; i < n_leaves; i++)
-        if (!LEAF_IS_LAZY(leaf_ids[i]) && ctx->tensors[leaf_ids[i]].requires_grad)
-            any_grad = 1;
-    if (any_grad) return reduce_id(ctx, t);
+    // Virtual intermediate tensors handle backward provenance —
+    // each op in the chain gets a virtual tensor with correct creator_op
+    // and src_ids, so standard GRAD rules trace through the fused chain.
 
     // Output shape: broadcast only USED leaves (not unused base entries)
     u8 leaf_used[FUSE_MAX_LEAVES] = {0};
@@ -298,6 +297,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
 
     // ── Immediate dispatch (all leaves TAG_TEN) ─────────────────
+    static int _id=0; if(_id<10){fprintf(stderr,"IMMED n_ops=%u n_leaves=%u numel=%u\n",n_ops,n_leaves,out_numel);_id++;}
     u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
 
     // Provenance: create virtual intermediate tensors for backward.

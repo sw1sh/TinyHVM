@@ -326,6 +326,9 @@ static int run_cnn(MNISTData *data) {
         extern double flush_total_ms;
         extern u32 flush_count_total;
         if (step == 0) { extern void print_dispatch_breakdown(void); print_dispatch_breakdown();
+            extern u32 rule_ew_hit, rule_ew_miss, fuse_fused_count, fuse_unfused_count;
+            fprintf(stderr, "Rewrite: ew_hit=%u ew_miss=%u fuse_fused=%u fuse_unfused=%u\n",
+                rule_ew_hit, rule_ew_miss, fuse_fused_count, fuse_unfused_count);
             struct timespec now_; clock_gettime(CLOCK_MONOTONIC, &now_);
             f32 wall_ = (f32)(now_.tv_sec - t0_wall.tv_sec)*1000.0f + (f32)(now_.tv_nsec - t0_wall.tv_nsec)/1e6f;
             printf("    step 0: dispatches=%u (2d_bc=%u) gpu=%.0fms wall=%.0fms\n",

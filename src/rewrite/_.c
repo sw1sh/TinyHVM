@@ -25,15 +25,26 @@ typedef struct {
 // ============================================================
 static Term rule_sum_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b) {
     (void)b; (void)loc;
-    if (term_tag(a) != TAG_TOP) return t;
+    if (term_tag(a) != TAG_TOP) {
+        static int _sn=0; if(_sn<20) { fprintf(stderr,"SUM_SKIP: a_tag=%u\n",term_tag(a)); _sn++; }
+        return t;
+    }
     u32 child_uop = term_ext(a);
-    if (!is_elementwise(child_uop) && !is_view_op(child_uop)) return t;
+    if (!is_elementwise(child_uop) && !is_view_op(child_uop)) {
+        static int _sn2=0; if(_sn2<10) { fprintf(stderr,"SUM_SKIP: a_uop=%s (not ew/view)\n",uop_names[child_uop]); _sn2++; }
+        return t;
+    }
     rewrite_active = 1;
     u32 fid = fuse_or_reduce(ctx, t);
     rewrite_active = 0;
-    if (fid != ~0u) return term_ten(fid, DTYPE_F32);
+    if (fid != ~0u) {
+        static int _sf=0; if(_sf<20) { fprintf(stderr, "RULE_SUM_FUSE: fid=%u\n", fid); _sf++; }
+        return term_ten(fid, DTYPE_F32);
+    }
     return t;
 }
+
+static u32 rule_ew_hit = 0, rule_ew_miss = 0;
 
 // ============================================================
 // Rule: elementwise chain (2+ ops) → fuse into one kernel
@@ -51,7 +62,17 @@ static Term rule_elementwise_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b)
     rewrite_active = 1;
     u32 fid = fuse_or_reduce(ctx, t);
     rewrite_active = 0;
-    if (fid != ~0u) return term_ten(fid, DTYPE_F32);
+    if (fid != ~0u) {
+        rule_ew_hit++;
+        return term_ten(fid, DTYPE_F32);
+    }
+    rule_ew_miss++;
+    static int _em=0; if(_em<3){
+        fprintf(stderr,"EW_MISS: uop=%s a_tag=%u a_uop=%s\n",
+            uop_names[term_ext(t)], term_tag(a),
+            term_tag(a)==TAG_TOP?uop_names[term_ext(a)]:"n/a");
+        _em++;
+    }
     return t;
 }
 

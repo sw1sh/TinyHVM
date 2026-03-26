@@ -1,5 +1,8 @@
 # Computational Graphs on Interaction Nets: A Feasibility Report
 
+> For comprehensive HVM/Interaction Calculus reference (history, theory, performance,
+> commercial direction), see **hvm_reference.md**.
+
 ## Executive Summary
 
 This report explores whether tinygrad's computational graph model can be built on top of HVM's interaction net runtime, creating a deep learning framework that inherits HVM's massively parallel execution model. The core thesis: **map tinygrad's lazy UOp graph onto HVM's interaction combinator network, gaining automatic parallelism and optimal sharing for free.**

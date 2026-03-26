@@ -1,5 +1,7 @@
 # IC Rewriting as Optimization
 
+> For comprehensive HVM/Interaction Calculus reference, see **hvm_reference.md**.
+
 Can we use interaction net reduction rules for kernel optimization? What do DUP/SUP/ERA give us that tinygrad's pattern matcher doesn't?
 
 ## What Tinygrad Does

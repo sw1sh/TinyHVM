@@ -1,5 +1,8 @@
 # Engineering Patterns: Lessons from HVM, ggml, tinygrad, and C-ML
 
+> For comprehensive HVM/Interaction Calculus reference (history, theory, performance,
+> commercial direction), see **hvm_reference.md**.
+
 Reference doc for TinyHVM development. Studied from source:
 - HVM4: `github.com/HigherOrderCO/HVM` (symlinked at `HVM4/`)
 - ggml: `github.com/ggerganov/ggml` (local clone)

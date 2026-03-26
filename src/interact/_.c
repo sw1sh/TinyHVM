@@ -10,6 +10,10 @@
     (ctx)->backend->buf_read((buf_id), (out), (bytes))
 #endif
 
+// Forward declarations for fusion (defined in grad/_.c, included after interact/_.c)
+static int is_elementwise(u32 uop);
+static u32 fuse_or_reduce(TinyHVM *ctx, Term t);
+
 static Term thvm_interact(TinyHVM *ctx, Term t) {
     // If result is TAG_TOP, reduce it before returning (ensures the trampoline
     // drives lazy ops to completion before handing back to the caller).
@@ -544,6 +548,23 @@ inet_step:
                         } // if (ok)
                     }
                 }
+            }
+
+            // Try elementwise fusion BEFORE reducing args individually.
+            // fuse_or_reduce walks the unreduced TAG_TOP tree, collects chains,
+            // and dispatches one fused kernel via codegen. If it succeeds, we
+            // skip per-op dispatch entirely.
+            // Guard: no_fuse prevents infinite recursion (fuse_or_reduce calls
+            // reduce_id which calls thvm_reduce which re-enters here).
+            if (!ctx->no_fuse && is_elementwise(uop)) {
+                ctx->no_fuse = 1;
+                u32 fused_id = fuse_or_reduce(ctx, t);
+                ctx->no_fuse = 0;
+                if (fused_id != ~0u) {
+                    ctx->itrs++;
+                    RETURN_REDUCED(term_ten(fused_id, DTYPE_F32));
+                }
+                // Fusion failed or returned single-op — fall through to per-op dispatch
             }
 
             // Movement ops: modify View, share buffer

@@ -144,7 +144,21 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
                 }
                 out.contiguous = 0;
                 st_set(loc, &out); stored = 1;
-            } else if (bf && (uop == UOP_SUM || uop == UOP_RMAX) && va) {
+            } else if ((uop == UOP_SUM || uop == UOP_RMAX)) {
+                if (!bf) {
+                    static int _snb=0;if(_snb<3){fprintf(stderr,"SUM_NO_BF: loc=%llu b_tag=%u bf=%p bn=%u\n",loc,term_tag(b),bf,bn);_snb++;}
+                }
+                if (bf) {
+                if (!va) {
+                    static int _sn=0; if(_sn<3){
+                        fprintf(stderr,"SUM_NO_VA: loc=%llu a_tag=%u",loc,term_tag(a));
+                        if(term_tag(a)==TAG_TOP) fprintf(stderr," a_uop=%s a_loc=%llu st=%s",
+                            uop_names[term_ext(a)], term_val(a), st_get(term_val(a))?"Y":"N");
+                        fprintf(stderr,"\n"); _sn++;
+                    }
+                }
+                if (!va) goto skip_sum;
+                // va available:
                 out = *va;
                 for (u32 i = 0; i < bn; i++) {
                     u32 ax = (u32)bf[i];
@@ -152,19 +166,32 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
                 }
                 out = view_create(out.shape);
                 st_set(loc, &out); stored = 1;
-            }
+                skip_sum:;
+            }} // close bf check + view op metadata block
         }
 
-        // Elementwise: needs both input views for broadcast
-        if (!stored && va && is_elementwise(uop)) {
+        // SUM/RMAX with no explicit axes (b=ERA): reduce last non-1 dim
+        if (!stored && va && (uop == UOP_SUM || uop == UOP_RMAX) && term_tag(b) == TAG_ERA) {
+            out = *va;
+            for (int d = (int)va->shape.rank - 1; d >= 0; d--)
+                if (va->shape.dims[d] > 1) { out.shape.dims[d] = 1; break; }
+            out = view_create(out.shape);
+            st_set(loc, &out); stored = 1;
+        }
+
+        // Elementwise: broadcast if both views available, propagate if one
+        if (!stored && is_elementwise(uop)) {
             const View *vb = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
-            if (vb) {
+            if (va && vb) {
                 View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
                 if (view_broadcast(va, vb, &av_bc, &bv_bc, bc_shape, &bc_ndim))
                     out = view_create(shape_of(bc_shape, bc_ndim));
                 else out = *va;
-            } else out = *va;
+            } else if (va) out = *va;
+            else if (vb) out = *vb;
+            else goto skip_st;
             st_set(loc, &out);
+            skip_st:;
         }
     }
 

@@ -896,3 +896,29 @@ kernel void cmp_bc_2d(device float *dst [[buffer(0)]],
     uint c = gid.y % C;
     dst[flat] = a[flat] > b[c] ? 1.0f : 0.0f;
 }
+
+// Float4 Adam step — 4x throughput for contiguous params
+kernel void adam_step_f4(device float4 *param [[buffer(0)]],
+                          device const float4 *grad [[buffer(1)]],
+                          device float4 *m [[buffer(2)]],
+                          device float4 *v [[buffer(3)]],
+                          constant AdamParams &p [[buffer(4)]],
+                          uint gid [[thread_position_in_grid]]) {
+    float4 g = grad[gid];
+    float4 mi = p.beta1 * m[gid] + (1.0f - p.beta1) * g;
+    float4 vi = p.beta2 * v[gid] + (1.0f - p.beta2) * g * g;
+    m[gid] = mi;
+    v[gid] = vi;
+    float4 m_hat = mi / p.bc1;
+    float4 v_hat = vi / p.bc2;
+    param[gid] -= p.lr * m_hat / (sqrt(v_hat) + p.eps);
+}
+
+kernel void relu_bwd_f4(device float4 *dx [[buffer(0)]],
+                         device const float4 *dout [[buffer(1)]],
+                         device const float4 *x [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    float4 xv = x[gid];
+    float4 dv = dout[gid];
+    dx[gid] = float4(xv.x>0?dv.x:0, xv.y>0?dv.y:0, xv.z>0?dv.z:0, xv.w>0?dv.w:0);
+}

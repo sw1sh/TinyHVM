@@ -37,5 +37,5 @@ static void metal_op_adam_step(u32 param, u32 grad, u32 m, u32 v,
                               metal_pool.bufs[m], metal_pool.bufs[v] };
     const void *params[] = { &ap };
     u64 psizes[] = { sizeof(AP) };
-    dc_tag=DC_ADAM; dispatch_1d(pipe_adam_step, bufs, 4, params, psizes, 1, n);
+    if (n % 4 == 0) { dc_tag=DC_ADAM; dispatch_1d(pipe_adam_step_f4, bufs, 4, params, psizes, 1, n / 4); } else { dc_tag=DC_ADAM; dispatch_1d(pipe_adam_step, bufs, 4, params, psizes, 1, n); }
 }

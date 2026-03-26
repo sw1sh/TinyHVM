@@ -19,7 +19,7 @@ static id<MTLComputePipelineState> pipe_mul_reduce_sum_parallel;
 static id<MTLComputePipelineState> pipe_im2col, pipe_col2im;
 static id<MTLComputePipelineState> pipe_nhwc_to_nchw, pipe_nchw_to_nhwc;
 static id<MTLComputePipelineState> pipe_bias_add, pipe_col_sum;
-static id<MTLComputePipelineState> pipe_adam_step;
+static id<MTLComputePipelineState> pipe_adam_step, pipe_adam_step_f4;
 static id<MTLComputePipelineState> pipe_maxpool2d_fwd, pipe_maxpool2d_bwd;
 // Fast contiguous kernels (no ViewParams overhead)
 static id<MTLComputePipelineState> fpipe_add, fpipe_sub, fpipe_mul, fpipe_div, fpipe_max, fpipe_cmp;
@@ -172,6 +172,7 @@ static int metal_init(void) {
     pipe_bias_add = make_pipe(@"bias_add");
     pipe_col_sum = make_pipe(@"col_sum");
     pipe_adam_step = make_pipe(@"adam_step");
+    pipe_adam_step_f4 = make_pipe(@"adam_step_f4");
     pipe_maxpool2d_fwd = make_pipe(@"maxpool2d_fwd");
     pipe_maxpool2d_bwd = make_pipe(@"maxpool2d_bwd");
     pipe_relu_bwd = make_pipe(@"relu_bwd");

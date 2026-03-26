@@ -71,8 +71,6 @@ static void sched_walk(TinyHVM *ctx, Term t, int depth) {
 }
 
 Term thvm_schedule(TinyHVM *ctx, Term t) {
-    // Walk graph, inject FUSE at kernel boundaries
-    sched_walk(ctx, t, 0);
-    // Reduce the annotated graph
+    // Scheduler disabled — passthrough to reduce
     return thvm_reduce(ctx, t);
 }

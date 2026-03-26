@@ -215,6 +215,14 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     u32 min_ops = (has_reduce || has_lazy) ? 1 : 2;
     if (n_ops < min_ops) return reduce_id(ctx, t);
 
+    // Don't fuse differentiable chains — backward needs intermediate data
+    // that fusion eliminates. Only fuse detached chains.
+    int any_grad = 0;
+    for (u32 i = 0; i < n_leaves; i++)
+        if (!LEAF_IS_LAZY(leaf_ids[i]) && ctx->tensors[leaf_ids[i]].requires_grad)
+            any_grad = 1;
+    if (any_grad) return reduce_id(ctx, t);
+
     // Output shape: broadcast only USED leaves (not unused base entries)
     u8 leaf_used[FUSE_MAX_LEAVES] = {0};
     for (u32 i = 0; i < n_ops; i++) {
@@ -258,7 +266,8 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
     u32 out_numel = out_view.numel;
 
-    // ── Deferred dispatch (lazy leaves) ─────────────────────────
+    // ── Deferred dispatch disabled (lazy leaves need provenance fix)
+    if (has_lazy) return reduce_id(ctx, t);
     // Only single-op FUSE with small output for now
     if (has_lazy && (n_ops > 1 || ew_view.numel > 4096)) return reduce_id(ctx, t);
     if (has_lazy) {
@@ -291,24 +300,52 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     // ── Immediate dispatch (all leaves TAG_TEN) ─────────────────
     u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
 
-    // Provenance: set creator_op to the LAST op, src_ids to its leaf args.
-    // This lets backward trace through the fused chain correctly.
-    if (n_ops >= 1) {
-        FusedOp *last = &ops[n_ops - 1];
-        ctx->tensors[dst_id].creator_op = last->uop;
-        if (last->arg_a < n_leaves) {
-            ctx->tensors[dst_id].src_ids[0] = leaf_ids[last->arg_a];
-            if (ctx->tensors[leaf_ids[last->arg_a]].requires_grad)
-                ctx->tensors[dst_id].requires_grad = 1;
+    // Provenance: create virtual intermediate tensors for backward.
+    // Each intermediate gets the shape from the original lazy term's
+    // shape table entry (computed at graph construction time).
+    // Backward reads shapes (for sum_to_shape) not data from intermediates.
+    {
+        u32 var_tid[FUSE_MAX_LEAVES + FUSE_MAX_OPS];
+        for (u32 i = 0; i < n_leaves; i++) var_tid[i] = leaf_ids[i];
+
+        // Reconstruct the original term for each op to get its shape
+        // from the shape table. The terms are on the heap in the original
+        // lazy structure. We walk `ew_root` to find them.
+        // For simplicity: compute intermediate shapes from leaf shapes + ops.
+        for (u32 i = 0; i < n_ops; i++) {
+            u32 tid = (i == n_ops - 1) ? dst_id : ctx->tensor_count++;
+            // Compute intermediate shape from operand shapes
+            View iv;
+            u32 a_var = ops[i].arg_a, b_var = ops[i].arg_b;
+            View va_v = ctx->tensors[var_tid[a_var]].view;
+            if (is_binary(ops[i].uop)) {
+                View vb_v = ctx->tensors[var_tid[b_var]].view;
+                View av_bc, bv_bc; u32 bc_s[MAX_DIM], bc_n;
+                if (view_broadcast(&va_v, &vb_v, &av_bc, &bv_bc, bc_s, &bc_n))
+                    iv = view_create(shape_of(bc_s, bc_n));
+                else
+                    iv = va_v;
+            } else {
+                iv = va_v; // unary: output shape = input shape
+            }
+            if (tid != dst_id) {
+                ctx->tensors[tid] = (TensorMeta){
+                    .buf_id = ctx->tensors[dst_id].buf_id,
+                    .dtype = DTYPE_F32,
+                    .view = iv,
+                };
+            } else {
+                // dst already has correct shape from tensor_create
+            }
+            ctx->tensors[tid].creator_op = ops[i].uop;
+            ctx->tensors[tid].src_ids[0] = var_tid[a_var];
+            ctx->tensors[tid].src_ids[1] = is_binary(ops[i].uop) ? var_tid[b_var] : 0;
+            if (ctx->tensors[var_tid[a_var]].requires_grad)
+                ctx->tensors[tid].requires_grad = 1;
+            if (is_binary(ops[i].uop) && ctx->tensors[var_tid[b_var]].requires_grad)
+                ctx->tensors[tid].requires_grad = 1;
+            var_tid[n_leaves + i] = tid;
         }
-        if (last->arg_b < n_leaves) {
-            ctx->tensors[dst_id].src_ids[1] = leaf_ids[last->arg_b];
-            if (ctx->tensors[leaf_ids[last->arg_b]].requires_grad)
-                ctx->tensors[dst_id].requires_grad = 1;
-        }
-        // For multi-op chains: intermediate ops need their own tensors
-        // for backward to trace through. Create view-aliased intermediates.
-        // For now, only single-op fusion has full backward support.
     }
 
     fuse_fused_count++;

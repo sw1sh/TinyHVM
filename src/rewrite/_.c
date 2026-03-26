@@ -79,7 +79,7 @@ static RewriteRule rewrite_rules[] = {
 
 // Try all matching rewrite rules. Returns rewritten term, or t if none matched.
 static Term rewrite_apply(TinyHVM *ctx, Term t) {
-    if (rewrite_active) return t; // prevent recursion
+    if (rewrite_active) return t;
     if (term_tag(t) != TAG_TOP) return t;
     u32 uop = term_ext(t);
     u64 loc = term_val(t);

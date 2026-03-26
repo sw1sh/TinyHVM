@@ -6,7 +6,8 @@ void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
                                  u32 b_buf, const View *bv);
 void metal_dispatch_kernel(u32 out_buf, u32 out_numel,
                             u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
-                            FusedOp *ops, u32 n_ops, int has_reduce, u32 reduce_dim);
+                            FusedOp *ops, u32 n_ops, int has_reduce, u32 reduce_dim,
+                            const Shape *out_shape_hint);
 
 static u32 fast_dispatch_count = 0, slow_dispatch_count = 0;
 u32 bc2d_count = 0;
@@ -40,7 +41,7 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
         FusedOp op = { .uop = uop, .arg_a = 0, .arg_b = 0 };
         u32 leaf_bufs[] = { src };
         const View *lvs[] = { sv };
-        metal_dispatch_kernel(dst, dv->numel, leaf_bufs, lvs, 1, &op, 1, 0, 0);
+        metal_dispatch_kernel(dst, dv->numel, leaf_bufs, lvs, 1, &op, 1, 0, 0, &dv->shape);
         thvm_prof_record(uop, t0);
         return;
     }
@@ -115,7 +116,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
         FusedOp op = { .uop = uop, .arg_a = 0, .arg_b = 1 };
         u32 leaf_bufs[] = { a, b };
         const View *lvs[] = { av, bv };
-        metal_dispatch_kernel(dst, dv->numel, leaf_bufs, lvs, 2, &op, 1, 0, 0);
+        metal_dispatch_kernel(dst, dv->numel, leaf_bufs, lvs, 2, &op, 1, 0, 0, &dv->shape);
         thvm_prof_record(uop, t0);
         return;
     }

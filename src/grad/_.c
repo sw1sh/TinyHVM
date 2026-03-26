@@ -203,7 +203,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
         metal_dispatch_fused_v2(ctx->tensors[dst_id].buf_id, out_numel,
                                   bufs, leaf_views, n_leaves, ops, n_ops,
-                                  has_reduce, reduce_dim);
+                                  has_reduce, reduce_dim, &ew_view.shape);
     } else
     #endif
     {

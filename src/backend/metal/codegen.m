@@ -66,9 +66,15 @@ static int cg_leaf_is_flat(const View *v, u32 out_numel) {
 // Generate the unified kernel
 static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                                   const View **leaf_views, u32 out_numel,
-                                  int has_reduce, u32 reduce_dim) {
+                                  int has_reduce, u32 reduce_dim,
+                                  const Shape *out_shape_hint) {
     u32 out_shape[MAX_DIM], out_rank;
-    cg_output_shape(leaf_views, n_leaves, out_shape, &out_rank);
+    if (out_shape_hint && out_shape_hint->rank > 0) {
+        out_rank = out_shape_hint->rank;
+        for (u32 d = 0; d < out_rank; d++) out_shape[d] = out_shape_hint->dims[d];
+    } else {
+        cg_output_shape(leaf_views, n_leaves, out_shape, &out_rank);
+    }
     if (out_rank == 0) out_rank = 1;
 
     // Collapse output dims into 3 groups for 3D dispatch
@@ -252,12 +258,13 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
 // Get or compile a cached kernel
 static id<MTLComputePipelineState> cg_get_pipe(const FusedOp *ops, u32 n_ops,
                                                   u32 n_leaves, const View **leaf_views,
-                                                  u32 out_numel, int has_reduce, u32 reduce_dim) {
+                                                  u32 out_numel, int has_reduce, u32 reduce_dim,
+                                                  const Shape *out_shape_hint) {
     u64 key = cg_hash(ops, n_ops, n_leaves, leaf_views, out_numel) ^ ((u64)has_reduce << 63);
     for (u32 i = 0; i < cg_cache_count && i < CODEGEN_CACHE_SIZE; i++)
         if (cg_cache[i].key == key) return cg_cache[i].pipe;
 
-    NSString *src = codegen_kernel(ops, n_ops, n_leaves, leaf_views, out_numel, has_reduce, reduce_dim);
+    NSString *src = codegen_kernel(ops, n_ops, n_leaves, leaf_views, out_numel, has_reduce, reduce_dim, out_shape_hint);
     NSError *err;
     id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
     if (!lib) { NSLog(@"codegen error: %@\n%@", err, src); return nil; }
@@ -272,18 +279,23 @@ static id<MTLComputePipelineState> cg_get_pipe(const FusedOp *ops, u32 n_ops,
 }
 
 // Unified dispatch: handles any elementwise op (single or fused chain)
-// out_shape_hint/out_rank_hint: if non-NULL/non-zero, use this instead of inferring from leaves
 void metal_dispatch_kernel(u32 out_buf, u32 out_numel,
                             u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
                             FusedOp *ops, u32 n_ops,
-                            int has_reduce, u32 reduce_dim) {
+                            int has_reduce, u32 reduce_dim,
+                            const Shape *out_shape_hint) {
     id<MTLComputePipelineState> pipe = cg_get_pipe(ops, n_ops, n_leaves, leaf_views,
-                                                      out_numel, has_reduce, reduce_dim);
+                                                      out_numel, has_reduce, reduce_dim, out_shape_hint);
     if (!pipe) return;
 
-    // Compute grid dims
+    // Compute grid dims (use hint if available)
     u32 out_shape[MAX_DIM], out_rank;
-    cg_output_shape(leaf_views, n_leaves, out_shape, &out_rank);
+    if (out_shape_hint && out_shape_hint->rank > 0) {
+        out_rank = out_shape_hint->rank;
+        for (u32 d = 0; d < out_rank; d++) out_shape[d] = out_shape_hint->dims[d];
+    } else {
+        cg_output_shape(leaf_views, n_leaves, out_shape, &out_rank);
+    }
     if (out_rank == 0) out_rank = 1;
 
     u32 inner = 1, mid = 1, outer = 1;

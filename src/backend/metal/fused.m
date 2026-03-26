@@ -202,19 +202,16 @@ void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view)
 void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
                                u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
                                FusedOp *ops, u32 n_ops,
-                               int has_reduce, u32 reduce_dim) {
-    // Unified codegen for fused chains — disabled until leaf-shape decomposition is debugged
-    if (0 && !has_reduce && n_leaves <= 16 && n_ops <= 32) {
+                               int has_reduce, u32 reduce_dim,
+                               const Shape *out_shape) {
+    // Unified codegen for non-reduce fused chains
+    if (0 && !has_reduce && n_leaves <= 16 && n_ops <= 32 && out_shape) {
         int no_masks = 1;
         for (u32 i = 0; i < n_leaves; i++)
             if (leaf_views[i]->has_mask) { no_masks = 0; break; }
-        u32 max_rank = 0;
-        for (u32 i = 0; i < n_leaves; i++)
-            if (leaf_views[i]->shape.rank > max_rank) max_rank = leaf_views[i]->shape.rank;
-
-        if (no_masks && max_rank <= 8 && max_rank > 0) {
+        if (no_masks && out_shape->rank <= 8 && out_shape->rank > 0) {
             metal_dispatch_kernel(out_buf, out_numel, leaf_bufs, leaf_views, n_leaves,
-                                   ops, n_ops, 0, 0);
+                                   ops, n_ops, 0, 0, out_shape);
             return;
         }
     }

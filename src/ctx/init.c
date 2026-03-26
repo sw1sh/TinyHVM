@@ -64,102 +64,10 @@ Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {
     return term_ten(id, DTYPE_F32);
 }
 
-// Get the output view of any term (TAG_TEN or TAG_TOP with shape tracking)
-static const View *term_view(TinyHVM *ctx, Term t) {
-    if (term_tag(t) == TAG_TEN)
-        return &ctx->tensors[(u32)term_val(t)].view;
-    if (term_tag(t) == TAG_TOP)
-        return st_get(term_val(t));
-    return NULL;
-}
-
 Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc, a);
     heap_set(ctx, loc + 1, b);
-
-    // Shape tracking: compute output view eagerly
-    const View *va = term_view(ctx, a);
-    if (va) {
-        View out;
-        if (is_elementwise(uop)) {
-            // Elementwise: output = broadcast(a, b) or just a for unary
-            const View *vb = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
-            if (vb) {
-                View av_bc, bv_bc;
-                u32 bc_shape[MAX_DIM], bc_ndim;
-                if (view_broadcast(va, vb, &av_bc, &bv_bc, bc_shape, &bc_ndim))
-                    out = view_create(shape_of(bc_shape, bc_ndim));
-                else
-                    out = *va; // fallback
-            } else {
-                out = *va; // unary
-            }
-            st_set(loc, &out);
-        } else if (uop == UOP_SUM || uop == UOP_RMAX) {
-            // Reduce: output shape = input with last non-1 dim → 1
-            // (exact axis determined at reduce time, approximate here)
-            out = *va;
-            for (int d = (int)va->shape.rank - 1; d >= 0; d--) {
-                if (va->shape.dims[d] > 1) {
-                    out.shape.dims[d] = 1;
-                    out.numel = va->numel / va->shape.dims[d];
-                    break;
-                }
-            }
-            st_set(loc, &out);
-        } else if (uop == UOP_RESHAPE) {
-            // Reshape: target shape from b (metadata tensor)
-            if (term_tag(b) == TAG_TEN) {
-                TensorMeta *mb = &ctx->tensors[(u32)term_val(b)];
-                u32 rank = mb->view.numel;
-                f32 sf[MAX_DIM];
-                META_READ(ctx, mb->buf_id, sf, rank * sizeof(f32));
-                Shape ns = {.rank = rank};
-                for (u32 i = 0; i < rank; i++) ns.dims[i] = (u32)sf[i];
-                out = view_reshape(*va, ns);
-                st_set(loc, &out);
-            }
-        } else if (uop == UOP_EXPAND) {
-            if (term_tag(b) == TAG_TEN) {
-                TensorMeta *mb = &ctx->tensors[(u32)term_val(b)];
-                u32 rank = mb->view.numel;
-                f32 sf[MAX_DIM];
-                META_READ(ctx, mb->buf_id, sf, rank * sizeof(f32));
-                out = *va;
-                out.shape.rank = rank;
-                out.numel = 1;
-                for (u32 i = 0; i < rank; i++) {
-                    u32 nd = (u32)sf[i];
-                    if (i < va->shape.rank && va->shape.dims[i] == 1 && nd > 1)
-                        out.strides[i] = 0;
-                    out.shape.dims[i] = nd;
-                    out.numel *= nd;
-                }
-                out.contiguous = 0;
-                st_set(loc, &out);
-            }
-        } else if (uop == UOP_PERMUTE) {
-            if (term_tag(b) == TAG_TEN) {
-                TensorMeta *mb = &ctx->tensors[(u32)term_val(b)];
-                u32 rank = mb->view.numel;
-                f32 pf[MAX_DIM];
-                META_READ(ctx, mb->buf_id, pf, rank * sizeof(f32));
-                out = (View){0};
-                out.offset = va->offset;
-                out.shape.rank = rank;
-                out.numel = va->numel;
-                for (u32 i = 0; i < rank; i++) {
-                    out.shape.dims[i] = va->shape.dims[(u32)pf[i]];
-                    out.strides[i] = va->strides[(u32)pf[i]];
-                }
-                out.contiguous = 0;
-                st_set(loc, &out);
-            }
-        }
-        // MM, SHRINK, PAD, etc. — not tracked yet (add as needed)
-    }
-
     return term_top(uop, loc);
 }
 

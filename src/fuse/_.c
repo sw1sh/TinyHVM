@@ -17,14 +17,11 @@ static int is_binary(u32 uop) {
 
 #define FUSE_MAX_OPS 32
 #define FUSE_MAX_LEAVES 16
-#define MAX_FUSE_DESCS 512
 
 // Per-walk storage
 #define WALK_LEAF_BASE 10000
 static View fuse_composed_views[FUSE_MAX_LEAVES];
 static Term fuse_leaf_terms[FUSE_MAX_LEAVES];
-static FuseViewOp fuse_leaf_vops[FUSE_MAX_LEAVES][FUSE_MAX_VIEW_OPS];
-static u32 fuse_leaf_nvops[FUSE_MAX_LEAVES];
 
 // ============================================================
 // fuse_walk_inner: recursive walk of lazy TAG_TOP tree
@@ -46,7 +43,6 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         leaf_ids[idx] = tid;
         leaf_views[idx] = &ctx->tensors[tid].view;
         fuse_leaf_terms[idx] = t;
-        fuse_leaf_nvops[idx] = 0;
         return (int)(WALK_LEAF_BASE + idx);
     }
     if (term_tag(t) != TAG_TOP) return -1;
@@ -111,15 +107,6 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         fuse_leaf_terms[new_idx] = fuse_leaf_terms[leaf_idx];
         fuse_composed_views[new_idx] = nv;
         leaf_views[new_idx] = &fuse_composed_views[new_idx];
-        u32 nv_ops = fuse_leaf_nvops[leaf_idx];
-        for (u32 j = 0; j < nv_ops; j++)
-            fuse_leaf_vops[new_idx][j] = fuse_leaf_vops[leaf_idx][j];
-        if (nv_ops < FUSE_MAX_VIEW_OPS) {
-            fuse_leaf_vops[new_idx][nv_ops] = (FuseViewOp){.uop = uop, .loc = loc};
-            fuse_leaf_nvops[new_idx] = nv_ops + 1;
-        } else {
-            fuse_leaf_nvops[new_idx] = nv_ops;
-        }
         return (int)(WALK_LEAF_BASE + new_idx);
     }
 
@@ -135,7 +122,6 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         fuse_composed_views[idx] = *sv;
         leaf_views[idx] = &fuse_composed_views[idx];
         fuse_leaf_terms[idx] = t;
-        fuse_leaf_nvops[idx] = 0;
         return (int)(WALK_LEAF_BASE + idx);
     }
 
@@ -206,7 +192,6 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
 
     int walk_result = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
     if (walk_result < 0) {
-        static int _wf=0; if(_wf<5){fprintf(stderr,"WALK_FAIL: top=%s n_ops=%u n_leaves=%u\n",uop_names[term_ext(ew_root)],n_ops,n_leaves);_wf++;}
         return reduce_id(ctx, t);
     }
     fuse_remap(ops, n_ops, n_leaves);
@@ -265,39 +250,12 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
     u32 out_numel = out_view.numel;
 
-    // ── Deferred dispatch disabled (lazy leaves need provenance fix)
+    // Lazy leaves: can't dispatch yet (leaves not reduced to TAG_TEN).
+    // Fall back to normal reduction — the trampoline reduces leaves
+    // depth-first, then the rewrite rules catch the chain again.
     if (has_lazy) return reduce_id(ctx, t);
-    // Only single-op FUSE with small output for now
-    if (has_lazy && (n_ops > 1 || ew_view.numel > 4096)) return reduce_id(ctx, t);
-    if (has_lazy) {
-        if (fuse_desc_count >= MAX_FUSE_DESCS) return reduce_id(ctx, t);
-        u32 desc_id = fuse_desc_count++;
-        FuseDesc *fd = &fuse_descs[desc_id];
-        fd->n_ops = n_ops;
-        for (u32 i = 0; i < n_ops; i++) fd->ops[i] = ops[i];
-        fd->n_leaves = n_leaves;
-        for (u32 i = 0; i < n_leaves; i++) {
-            fd->leaf_terms[i] = fuse_leaf_terms[i];
-            fd->leaf_n_views[i] = fuse_leaf_nvops[i];
-            for (u32 j = 0; j < fuse_leaf_nvops[i]; j++)
-                fd->leaf_view_chain[i][j] = fuse_leaf_vops[i][j];
-        }
-        fd->out_shape = ew_view.shape;
-        fd->out_numel = out_numel;
-        fd->has_reduce = has_reduce;
-        fd->reduce_dim = reduce_dim;
-
-        f32 did = (f32)desc_id;
-        Term desc_ten = thvm_tensor(ctx, &did, SHAPE(1));
-        u64 floc = heap_alloc(ctx, 2);
-        heap_set(ctx, floc, term_era());
-        heap_set(ctx, floc + 1, desc_ten);
-        fuse_fused_count++;
-        return reduce_id(ctx, term_new(TAG_TOP, UOP_FUSING, floc));
-    }
 
     // ── Immediate dispatch (all leaves TAG_TEN) ─────────────────
-    static int _id=0; if(_id<10){fprintf(stderr,"IMMED n_ops=%u n_leaves=%u numel=%u\n",n_ops,n_leaves,out_numel);_id++;}
     u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
 
     // Provenance: create virtual intermediate tensors for backward.

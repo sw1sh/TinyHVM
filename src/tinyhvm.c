@@ -113,6 +113,9 @@ static int is_binary(u32 uop);
 // ── interact/ — one interaction rule per active pair ─────────────────────────
 #include "interact/_.c"
 
+// ── rewrite/ — declarative pattern-based rewrite rules ───────────────────────
+#include "rewrite/_.c"
+
 // ── reduce/ — enter/apply trampoline ─────────────────────────────────────────
 #include "reduce/_.c"
 

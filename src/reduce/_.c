@@ -68,22 +68,14 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     if (tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
         tag == TAG_LAM || tag == TAG_SUP) { whnf = next; goto apply; }
 
-    // TAG_TOP: reduce args depth-first, then fire interact.
-    // No global fusion interceptor — fusion happens:
-    // 1. In the scheduler (injects FUSE at range boundaries)
-    // 2. In interact handlers (SUM dispatches fused reduce+ew kernels)
+    // TAG_TOP: try declarative rewrite rules first (fusion, etc.).
+    // If no rule matches, reduce args depth-first then fire interact.
     if (tag == TAG_TOP) {
-        u32 uop = term_ext(next);
-        // FUSE nodes: dispatch the wrapped chain via fuse_or_reduce
-        // before depth-first reduction breaks the lazy structure.
-        if (uop == UOP_FUSING) {
-            u64 floc = term_val(next);
-            Term chain = heap_read(ctx, floc);
-            if (term_tag(chain) == TAG_TOP && term_tag(heap_read(ctx, floc+1)) == TAG_ERA) {
-                u32 fid = fuse_or_reduce(ctx, chain);
-                if (fid != ~0u) { whnf = term_ten(fid, DTYPE_F32); goto apply; }
-            }
-        }
+        // Rewrite rules: pattern-match and dispatch (fusion, etc.)
+        Term rw = rewrite_apply(ctx, next);
+        if (rw != next) { next = rw; goto enter; }
+
+        // No rule matched: default depth-first reduction
         u64 loc = term_val(next);
         PUSH(next);
         next = heap_read(ctx, loc + 0);

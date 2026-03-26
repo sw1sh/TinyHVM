@@ -14,11 +14,7 @@ static int is_boundary(u32 uop) {
     return uop == UOP_SUM || uop == UOP_RMAX || uop == UOP_MM;
 }
 
-// Check if UOP is transparent (view op — doesn't generate compute)
-static int is_view_op(u32 uop) {
-    return uop == UOP_RESHAPE || uop == UOP_PERMUTE || uop == UOP_EXPAND ||
-           uop == UOP_SHRINK || uop == UOP_PAD;
-}
+// is_view_op defined in rewrite/_.c
 
 // Check if a term's subgraph is a fusable elementwise+view chain.
 // Returns 1 if the term is elementwise or a view op with elementwise below.

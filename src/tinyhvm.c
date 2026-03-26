@@ -96,3 +96,6 @@ static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target)
 // ── grad/ — thvm_grad, thvm_backward, lam/app/ref/ite/load/assign ────────────
 #include "grad/_.c"
 
+// ── schedule/ — lazy graph compiler ──────────────────────────────────────────
+#include "schedule/_.c"
+

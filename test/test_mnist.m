@@ -308,7 +308,7 @@ static int run_cnn(MNISTData *data) {
 
             if (ctx->backend->end_batch) ctx->backend->end_batch();
 
-            Term loss_r = thvm_reduce(ctx, loss);
+            Term loss_r = thvm_schedule(ctx, loss);  // lazy graph compiler (phase 1: passthrough)
 
             Term grad_terms[n_params];
             thvm_backward(ctx, loss_r, params, grad_terms, n_params);

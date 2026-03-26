@@ -1,5 +1,10 @@
 // metal/ops.m — Core Metal compute ops: unary, binary, matmul, reduce
 
+// Forward declaration (defined in fused.m, included after ops.m)
+void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
+                                 u32 a_buf, const View *av,
+                                 u32 b_buf, const View *bv);
+
 static u32 fast_dispatch_count = 0, slow_dispatch_count = 0;
 u32 bc2d_count = 0;
 
@@ -190,7 +195,16 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
         }
     }
 
-    // Slow path: strided ViewParams with broadcast support
+    // Multi-dim JIT path: generates kernel with no integer divisions
+    // Uses 3D dispatch, coordinates → multiply-only index computation
+    if (av->shape.rank == bv->shape.rank && !av->has_mask && !bv->has_mask &&
+        av->shape.rank <= 8) {
+        metal_dispatch_mdim_binary(uop, dst, dv, a, av, b, bv);
+        thvm_prof_record(uop, t0);
+        return;
+    }
+
+    // Fallback: generic strided ViewParams (rank mismatch, masks)
     id<MTLComputePipelineState> pipe = nil;
     switch (uop) {
         case UOP_ADD: pipe = pipe_add; break;

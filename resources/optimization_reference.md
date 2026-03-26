@@ -1,230 +1,16 @@
 # Optimization Reference: Kernel Performance, Autotuning & Systematic Fast Code
 
-Reference for TinyHVM development — aggregating tinygrad internals, Karpathy's
-autoresearch methodology, autotuning theory, and performance engineering principles.
+Reference for TinyHVM development — aggregating Karpathy's autoresearch methodology,
+autotuning theory, and performance engineering principles.
+
+For tinygrad-specific internals (kernel pipeline, beam search, ShapeTracker, device
+backends, architecture, releases), see **tinygrad_reference.md**.
 
 ---
 
-## 1. Tinygrad Kernel Optimization Pipeline
+## 1. Karpathy's Autoresearch Methodology
 
-### 1.1 High-Level Flow
-
-```
-Tensor ops → Lazy graph (UOps) → Schedule (fusion) → Kernel optimization → Codegen → Runtime dispatch
-```
-
-Every operation is lazy until `.realize()` or `.numpy()` forces materialization.
-The scheduler decides which ops fuse into a single kernel, then optimization
-transforms the kernel before code generation.
-
-### 1.2 Scheduling & Fusion
-
-The scheduler (`engine/schedule.py`, `schedule/grouper.py`) decides what gets fused:
-
-**Fusion rules:**
-- Only **contiguous** operations can fuse (ShapeTracker must be contiguous)
-- At most **one REDUCE_AXIS** per kernel
-- At most **one output buffer** per kernel
-- If a parent is already realized, fusion breaks there
-- Unsafe pad ops and shape mismatches force realization
-
-**Fusion priority:**
-- COPY ops across device boundaries get priority (heuristic=1000)
-- Otherwise topological BFS ordering
-- "Reduce chasing": once a reduce realizes, chase down to contiguous children
-
-**Key insight:** fusion is conservative — better to emit two correct kernels
-than one incorrect fused kernel. The beam search handles the rest.
-
-### 1.3 Optimization Axes
-
-Each kernel has dimensions classified into axis types:
-
-| Axis Type | Color | Meaning |
-|-----------|-------|---------|
-| GLOBAL | blue | Work items in global dispatch |
-| LOCAL | cyan | Work items in threadgroup |
-| LOOP | white | Sequential loops per work item |
-| UPCAST | yellow | Unrolled as separate loads/ops |
-| UNROLL | magenta | Fully unrolled |
-| GROUP_REDUCE | green | Grouped reduction (shared memory) |
-| REDUCE | red | Pure reduction dimension |
-
-Transformations available:
-- **UPCAST(axis, amt)** — tile a dimension, unroll inner portion
-- **UNROLL(axis, amt)** — fully unroll a dimension
-- **LOCAL(axis, amt)** — split global → threadgroup local
-- **GROUP(axis, amt)** — group reduce dimensions (use shared memory)
-- **GROUPTOP(axis, amt)** — same but placed at outer position
-- **PADTO(axis, 32)** — pad dimension to multiple of 32
-- **TC(axis, arg)** — apply tensor core mapping
-- **SWAP(axis0, axis1)** — permute axes for cache locality
-
-### 1.4 Two-Level Optimization Strategy
-
-**Level 1 — Heuristics** (fast, ~0ms):
-Applied first via `hand_coded_optimizations()`:
-
-1. **Tensor core detection**: look for `MUL → CAST? → REDUCE(ADD)` pattern
-2. **Matvec specialization**: if reduce with ADD, stride-1 on reduce axis, output ≤ 2048
-   - `MV_BLOCKSIZE=4, MV_THREADS_PER_ROW=8, MV_ROWS_PER_THREAD=4`
-3. **GROUPTOP**: if output ≤ 2048 elements, try group size 16
-4. **Image upcast**: float4 images upcasted to 4
-5. **Masked axis upcast**: small dims (≤7) with masks get upcasted
-6. **Reduce unroll**: reduce dim ≤32 → UNROLL; if ≤3 → full unroll
-7. **Local grouping**: expand axes (stride-0) become LOCAL, try sizes `[32,16,8,4,3,2]`
-8. **Final upcast**: if nothing was upcasted, upcast last dim by 4
-
-**Level 2 — Beam Search** (thorough, seconds–minutes):
-Only runs when `BEAM > 0`. Explores optimization space:
-
-```python
-actions = [
-  UPCAST(axis=0..7, amt=[0,2,3,4,5,7])       # 48 actions
-  UNROLL(axis=0..4, amt=[0,4,7])              # 15 actions
-  LOCAL(axis=0..5, amt=[2,3,4,8,13,16,29])    # 42 actions
-  GROUPTOP(axis=0..2, amt=[13,16,28,29,32,49,64,256])  # 24 actions
-  GROUP(axis=0..2, amt=[0,4,8,16])            # 12 actions
-  PADTO(axis=0..6, amt=[32])                  # 7 actions
-  TC(...)                                      # variable
-  SWAP(axis pairs 0..4)                        # 10 actions
-]
-# Total: ~200+ candidate transformations per iteration
-```
-
-**Beam search algorithm:**
-1. Start with unoptimized kernel
-2. Generate all valid single-step transformations
-3. Compile and time each candidate (parallel, `PARALLEL=cpu_count`)
-4. Keep top `amt` candidates (beam width)
-5. Repeat until: no improvement, improvement < 0.01µs, or no valid actions
-6. Exit early if candidate uses 1000× more compute than minimum
-
-**Filtering thresholds:**
-- `BEAM_UPCAST_MAX = 256` — max total upcast
-- `BEAM_LOCAL_MAX = 1024` — max local elements
-- `BEAM_UOPS_MAX = 3000` — max generated UOps
-- `BEAM_TIMEOUT_SEC = 10` — compilation timeout per kernel
-- Early stop if kernel time > 3× current best
-
-### 1.5 ShapeTracker: Zero-Copy Lazy Shapes
-
-The single most important optimization in tinygrad: **movements don't move data**.
-
-```python
-@dataclass(frozen=True)
-class ShapeTracker:
-    views: tuple[View, ...]  # Composed view operations
-```
-
-Operations that compose views without allocation:
-- `pad()` — add zeros around boundaries
-- `shrink()` — crop dimensions
-- `expand()` — broadcast (stride becomes 0)
-- `permute()` — reorder dimensions
-- `flip()` — reverse strides
-- `reshape()` — merge/split dimensions (if possible)
-
-Each `View` stores `(shape, strides, offset, mask, contiguous)`. The indexing
-expression is computed symbolically at codegen time — no intermediate buffers.
-
-`simplify()` merges adjacent views when possible. `real_strides()` extracts
-actual memory access patterns for optimization decisions.
-
-### 1.6 Tensor Core Integration
-
-Pre-configured for each architecture:
-
-| Arch | Dims (N×M×K) | Threads | Input → Output |
-|------|-------------|---------|----------------|
-| NVIDIA SM80 | 8×16×16 | 32 | fp16/bf16 → fp32 |
-| NVIDIA SM75 | 8×16×8 | 32 | tf32 → fp32 |
-| AMD RDNA3/4 | 16×16×16 | 32 | fp16/bf16 → fp32 |
-| AMD CDNA | 16×16×16 | 64 | fp16/bf16 → fp32 |
-| Apple Metal | 8×8×8 | 32 | fp16 → fp32 |
-| Apple AMX | up to 64×64 | 1 | various |
-| Intel | 8×8×16 | 8 | fp16 → fp32 |
-
-Detection: find `MUL + CAST? + REDUCE(ADD)` in the compute graph,
-match stride-0 axes to TC N/M/K dimensions, pad if needed.
-
-### 1.7 Memory Optimization
-
-**TLSF allocator** for suballocation:
-- Minimum block 4 KB (`0x1000`)
-- Allocates 2× needed for ~15% fragmentation headroom
-- Tracks first/last appearance of each buffer in schedule
-- Reuses buffers across schedule items when lifetimes don't overlap
-
-**JIT graph batching:**
-- TinyJit captures execution on 2nd run, replays on 3rd+
-- Batches kernels into device-specific graph objects
-- Exponential backoff on batch size (doubles on success)
-
-### 1.8 Codegen: Pattern-Matching Rewrite Pipeline
-
-The entire optimization and lowering pipeline is pattern-matching rewrites:
-
-```
-AST → view_push → optimize → lower → expand → devectorize → linearize → render
-```
-
-Each phase is a `PatternMatcher` with declarative rules:
-- **view_left/view_right**: push views before/after ops
-- **pm_lowerer**: convert high-level ops to indexed loads/stores
-- **expander**: vectorize operations
-- **devectorize**: split to hardware vector widths (Metal: [4,2], CUDA: [16,8,4,2])
-- **linearizer**: schedule UOps with priority (loads: -1000, barriers: -1500)
-
-**UOp deduplication**: global weak-ref cache ensures structural sharing and
-automatic CSE (common subexpression elimination).
-
-### 1.9 Metal-Specific Details
-
-**MetalRenderer** codegen:
-- `kernel_typedef = "kernel void"`
-- `buffer_prefix = "device "`
-- `smem_prefix = "threadgroup __attribute__((aligned(16))) "`
-- Workgroup via `uint3 gid [[threadgroup_position_in_grid]]`
-- Thread via `uint3 lid [[thread_position_in_threadgroup]]`
-- Barrier: `threadgroup_barrier(mem_flags::mem_threadgroup)`
-- Tensor cores: simdgroup 8×8 matrix operations
-
-**MetalCompiler** uses private MTLCompiler.framework:
-- `REQUEST_TYPE_COMPILE = 13` (undocumented API)
-- Compiles Metal source → MTLB binary library
-- `METAL_FAST_MATH` env flag for `-ffast-math`
-
-**MetalAllocator** (LRU-based):
-- `MTLResourceStorageModeShared` (unified memory)
-- CPU cache mode: DefaultCache
-- GPU timing: nanosecond precision via command buffer timestamps
-
-### 1.10 Caching Architecture
-
-Three-level caching:
-1. **Method cache** (in-memory): `{(device, ast_key, context_flags)} → CompiledRunner`
-2. **Disk cache** (SQLite): SHA256-content-addressed compiler output
-3. **Beam cache** (SQLite): `{ast_key, beam_amt, device} → applied_opts`
-
-`CACHELEVEL=2` (default): memory + disk. Survives process restarts.
-
-### 1.11 Key Environment Variables
-
-```
-DEBUG=0..7      # 2=timing, 5=AST, 6=UOps, 7=disasm
-BEAM=0..N       # Beam search width (0=heuristics only)
-NOOPT=0|1       # Skip all kernel optimization
-USE_TC=0|1|2    # Tensor cores (0=off, 1=on, 2=shapes only)
-JIT=0|1|2       # 0=disabled, 1=graph, 2=batch (default 2 on macOS)
-PROFILE=0|1     # GPU trace events
-```
-
----
-
-## 2. Karpathy's Autoresearch Methodology
-
-### 2.1 Core Concept
+### 1.1 Core Concept
 
 Give an AI agent a small but real training setup. Let it experiment autonomously.
 It modifies code, trains for a fixed time, checks if the result improved, keeps
@@ -233,7 +19,7 @@ or discards, and repeats.
 **Result**: 700 experiments over 2 days on already-optimized code → 20 genuine
 improvements → 11% speedup (2.02h → 1.80h to GPT-2 quality).
 
-### 2.2 Architecture
+### 1.2 Architecture
 
 Three files, strict separation:
 
@@ -246,7 +32,7 @@ Three files, strict separation:
 **Why ~630 lines**: entire codebase fits in LLM context window. The agent can
 maintain holistic understanding. Minimizes code generation errors.
 
-### 2.3 The Loop
+### 1.3 The Loop
 
 ```
 while not done:
@@ -260,13 +46,13 @@ while not done:
 
 **~12 experiments/hour. ~100 experiments overnight.**
 
-### 2.4 Scoring: val_bpb
+### 1.4 Scoring: val_bpb
 
 Validation bits-per-byte. Lower is better. Vocabulary-size-independent so
 architectural changes (different tokenizer configs, model sizes) are fairly
 comparable. The metric is defined in the immutable `prepare.py`.
 
-### 2.5 Constraints & Simplicity Criterion
+### 1.5 Constraints & Simplicity Criterion
 
 - Only `train.py` is editable
 - No new package dependencies
@@ -276,7 +62,7 @@ comparable. The metric is defined in the immutable `prepare.py`.
 - Removing something and getting equal or better results → great outcome
 - Agent operates autonomously — no pausing for confirmation
 
-### 2.6 What Makes This Generalizable
+### 1.6 What Makes This Generalizable
 
 The pattern underneath has nothing to do with GPUs or neural networks. It works
 on **anything you can score**:
@@ -288,7 +74,7 @@ on **anything you can score**:
 5. **Git-based rollback** — every experiment is reversible
 6. **Simplicity pressure** — prevents complexity creep
 
-### 2.7 Application to TinyHVM
+### 1.7 Application to TinyHVM
 
 Direct analogue for kernel optimization:
 - `train.py` → kernel source or codegen template
@@ -299,7 +85,7 @@ Direct analogue for kernel optimization:
 
 ---
 
-## 3. Karpathy's Recipe for Training Neural Networks
+## 2. Karpathy's Recipe for Training Neural Networks
 
 Six-stage systematic methodology. The core insight: **"neural net training fails
 silently"** — wrong configs produce working but suboptimal models, not errors.
@@ -345,9 +131,9 @@ explicit hypotheses. **Never change two things at once.**
 
 ---
 
-## 4. Performance Engineering Fundamentals
+## 3. Performance Engineering Fundamentals
 
-### 4.1 The Roofline Model
+### 3.1 The Roofline Model
 
 Every computation is bounded by one of two limits:
 1. **Compute ceiling**: peak FLOPS of the hardware
@@ -379,7 +165,7 @@ compute-bound (above the ridge).
 5. If compute-bound: use tensor cores, increase occupancy, reduce wasted ops
 6. Measure again → verify optimization moved the point in the right direction
 
-### 4.2 Measure, Don't Guess
+### 3.2 Measure, Don't Guess
 
 The single most important principle in performance engineering.
 
@@ -401,7 +187,7 @@ The single most important principle in performance engineering.
 - Measuring too-small problems (overhead dominates)
 - Not isolating the thing being measured
 
-### 4.3 Bentley Rules (MIT 6.172)
+### 3.3 Bentley Rules (MIT 6.172)
 
 Practical optimization checklist from Jon Bentley, taught in MIT's Performance
 Engineering course:
@@ -427,7 +213,7 @@ Engineering course:
 - Short-circuit evaluation
 - Algebraic identity reduction (x+0, x*1, etc.)
 
-### 4.4 Memory Hierarchy Exploitation
+### 3.4 Memory Hierarchy Exploitation
 
 The dominant factor in modern performance:
 
@@ -447,9 +233,9 @@ The dominant factor in modern performance:
 
 ---
 
-## 5. Autotuning Theory & Practice
+## 4. Autotuning Theory & Practice
 
-### 5.1 The No Free Lunch Theorem
+### 4.1 The No Free Lunch Theorem
 
 No single optimization strategy universally works best across all targets and
 workloads. The search space is combinatorial: structural transformations are
@@ -458,7 +244,7 @@ tightly coupled with hardware resource constraints.
 **Implication**: you must search (or be hardware-specific). General-purpose
 optimizers will always leave performance on the table.
 
-### 5.2 Historical Systems
+### 4.2 Historical Systems
 
 | System | Year | Approach | Domain |
 |--------|------|----------|--------|
@@ -470,7 +256,7 @@ optimizers will always leave performance on the table.
 | Triton | 2019+ | Block-level tiled programming model | NN kernels |
 | tinygrad | 2020+ | Beam search over discrete actions | General ML |
 
-### 5.3 TVM / Ansor Approach
+### 4.3 TVM / Ansor Approach
 
 **AutoTVM**: define a search template with knobs (tile sizes, unroll factors,
 vectorization widths). Use ML cost model (XGBoost) to predict performance.
@@ -483,7 +269,7 @@ with up to 3.8× speedup over hand-tuned libraries.
 Key insight: **separate the structure from the parameters**. Enumerate a
 small number of structural choices, then search within each.
 
-### 5.4 Triton's Approach
+### 4.4 Triton's Approach
 
 Block-level programming: operations on parametric tiles (power-of-2 sized).
 Abstracts away:
@@ -498,7 +284,7 @@ Result: 2-10× easier to write vs CUDA, within 80-95% of expert CUDA perf.
 Recent advances (2025): ML-Triton adds multi-level tiling hints (workgroup →
 warp → intrinsic), enabling finer hardware matching.
 
-### 5.5 Equality Saturation
+### 4.5 Equality Saturation
 
 Alternative to phase-ordered optimization. Instead of applying rewrites
 sequentially (where order matters), explore **all rewrites simultaneously**:
@@ -515,7 +301,7 @@ sequential approaches.
 **Relevance to TinyHVM**: pattern-matching rewrite system is already close to
 this — could potentially adopt e-graph representation for optimization phase.
 
-### 5.6 Profile-Guided Optimization (PGO)
+### 4.6 Profile-Guided Optimization (PGO)
 
 Feed runtime profiling data back into the compiler:
 - **Instrumentation PGO**: 5-10% speedup (integer), up to 30% in hot loops
@@ -527,9 +313,9 @@ make things worse.
 
 ---
 
-## 6. Loop & Kernel Transformations Cookbook
+## 5. Loop & Kernel Transformations Cookbook
 
-### 6.1 Tiling (Blocking)
+### 5.1 Tiling (Blocking)
 
 Split loops into blocks that fit in cache:
 
@@ -552,7 +338,7 @@ for (int ii = 0; ii < N; ii += TILE)
 Optimal tile size depends on cache size. A tile of 2048 enables ~34% of
 computations to execute within one fused tile.
 
-### 6.2 Kernel Fusion
+### 5.2 Kernel Fusion
 
 Combine multiple passes into one kernel to eliminate intermediate memory traffic:
 
@@ -573,7 +359,7 @@ achieves 20-50% over unfused.
 **When NOT to fuse**: compute-bound kernels, fusion increases register pressure
 beyond occupancy threshold, kernels have incompatible parallelism.
 
-### 6.3 Vectorization
+### 5.3 Vectorization
 
 Use SIMD/simdgroup operations instead of scalar loops:
 
@@ -591,7 +377,7 @@ float sum = dot(va, vb);
 Metal vector widths: float4 (preferred), half8. On Apple Silicon, SIMD shuffle
 is 256 B/cycle — prefer `simd_shuffle` over threadgroup memory.
 
-### 6.4 Loop Unrolling
+### 5.4 Loop Unrolling
 
 Trade code size for fewer branches and better ILP:
 
@@ -609,7 +395,7 @@ acc = acc0 + acc1 + acc2 + acc3;
 
 Tinygrad's beam search explores unroll factors of `[0, 4, 7]` (0 = full unroll).
 
-### 6.5 Data Layout Transformation
+### 5.5 Data Layout Transformation
 
 Row-major vs column-major matters enormously for access patterns:
 
@@ -622,7 +408,7 @@ Row-major vs column-major matters enormously for access patterns:
 For GEMM: transpose one operand so both inner loops have stride-1 access.
 tinygrad's SWAP optimization permutes axes for this reason.
 
-### 6.6 Specialization
+### 5.6 Specialization
 
 Generate different kernel variants for different cases:
 
@@ -642,11 +428,11 @@ specialization parameters.
 
 ---
 
-## 7. What Consistently Works
+## 6. What Consistently Works
 
 Distilled from all sources — principles that reliably produce speedups:
 
-### 7.1 Universally True
+### 6.1 Universally True
 
 1. **Measure before optimizing** — profile first, always
 2. **Reduce data movement** — memory bandwidth is the bottleneck 90% of the time
@@ -656,7 +442,7 @@ Distilled from all sources — principles that reliably produce speedups:
 6. **Cache results** — avoid recomputation (reduce_memo, compiler caches)
 7. **Minimize allocations** — reuse buffers, pool memory
 
-### 7.2 Almost Always True
+### 6.2 Almost Always True
 
 8. **Tile for cache** — block loops to fit working set in L1/L2
 9. **Sequential access patterns** — stride-1 access enables prefetcher
@@ -665,7 +451,7 @@ Distilled from all sources — principles that reliably produce speedups:
     compiler optimization, fewer cache misses)
 12. **Automate the search** — humans are bad at predicting what's fast
 
-### 7.3 Context-Dependent
+### 6.3 Context-Dependent
 
 13. **Increase occupancy** — helps if latency-bound, hurts if register-pressure-bound
 14. **Use shared memory** — helps NVIDIA (explicit L1), may not help Apple Silicon
@@ -674,7 +460,7 @@ Distilled from all sources — principles that reliably produce speedups:
 16. **Quantize precision** — free speedup on Apple (fp16 = fp32 throughput),
     meaningful on NVIDIA (2× fp16 vs fp32)
 
-### 7.4 Common Pitfalls
+### 6.4 Common Pitfalls
 
 - **Optimizing the wrong thing** — the slow kernel isn't always where you think
 - **Premature optimization** — get correct first, then profile, then optimize
@@ -685,9 +471,9 @@ Distilled from all sources — principles that reliably produce speedups:
 
 ---
 
-## 8. Applied Strategy for TinyHVM
+## 7. Applied Strategy for TinyHVM
 
-### 8.1 Current Optimization Stack
+### 7.1 Current Optimization Stack
 
 TinyHVM's JIT already does:
 - Per-leaf stride/shape specialization (inline index expressions)
@@ -695,7 +481,7 @@ TinyHVM's JIT already does:
 - GPU buffer reuse via pool
 - Kernel fusion for elementwise chains
 
-### 8.2 Next-Level Opportunities
+### 7.2 Next-Level Opportunities
 
 **From tinygrad — adopt:**
 1. **Beam search over kernel configs** — axis types, tile sizes, unroll factors
@@ -717,7 +503,7 @@ TinyHVM's JIT already does:
 3. **Hardware counter profiling** — cache misses, occupancy, bandwidth util
 4. **Regression testing** — detect performance regressions in CI
 
-### 8.3 Concrete Next Steps
+### 7.3 Concrete Next Steps
 
 **Immediate (use what we have):**
 - Add `DEBUG=2`-style per-kernel timing to TinyHVM
@@ -737,7 +523,7 @@ TinyHVM's JIT already does:
 
 ---
 
-## 9. Key References
+## 8. Key References
 
 ### Foundational
 - MIT 6.172 Performance Engineering (Leiserson) — ocw.mit.edu

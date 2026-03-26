@@ -1,6 +1,10 @@
 # Shape Tracking Design
 
-How TinyHVM handles tensor shapes, strides, views, and broadcasting. Inspired by tinygrad's ShapeTracker but implemented in C with the interaction net model.
+How TinyHVM handles tensor shapes, strides, views, and broadcasting. Inspired by
+tinygrad's ShapeTracker but implemented in C with the interaction net model.
+
+> For comprehensive tinygrad internals (architecture, releases, ShapeTracker
+> implementation details, beam search, device backends), see **tinygrad_reference.md**.
 
 ## Tinygrad's Approach (What We're Learning From)
 

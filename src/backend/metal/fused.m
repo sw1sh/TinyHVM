@@ -321,3 +321,213 @@ void metal_dispatch_fused(u32 out_buf, u32 *input_bufs, u32 n_inputs,
     u64 psizes[] = { sizeof(u32), sizeof(u32) };
     dispatch_1d(pipe, bufs, n_inputs + 1, params, psizes, 2, out_numel);
 }
+
+// ============================================================
+// Multi-dimensional dispatch codegen (tinygrad-style)
+// No integer divisions — coordinates from hardware grid position.
+// ============================================================
+
+// Cache for multi-dim kernels (separate from fused cache)
+#define MDIM_CACHE_SIZE 128
+static struct { u64 key; id<MTLComputePipelineState> pipe; } mdim_cache[MDIM_CACHE_SIZE];
+static u32 mdim_cache_count = 0;
+
+// Hash for multi-dim kernel: includes op, output shape, all input strides
+static u64 mdim_hash(u32 uop, const View *dv, const View *av, const View *bv) {
+    u64 h = 0xcbf29ce484222325ULL;
+    h ^= uop; h *= 0x100000001b3ULL;
+    for (u32 d = 0; d < dv->shape.rank; d++) {
+        h ^= dv->shape.dims[d]; h *= 0x100000001b3ULL;
+    }
+    for (u32 d = 0; d < av->shape.rank; d++) {
+        h ^= (u64)(u32)av->strides[d]; h *= 0x100000001b3ULL;
+    }
+    h ^= (u64)av->offset; h *= 0x100000001b3ULL;
+    if (bv) {
+        for (u32 d = 0; d < bv->shape.rank; d++) {
+            h ^= (u64)(u32)bv->strides[d]; h *= 0x100000001b3ULL;
+        }
+        h ^= (u64)bv->offset; h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static const char *uop_to_op(u32 uop) {
+    switch(uop) {
+        case UOP_ADD: return "+"; case UOP_SUB: return "-";
+        case UOP_MUL: return "*"; case UOP_DIV: return "/";
+        default: return "+";
+    }
+}
+
+// Generate a tinygrad-style kernel for binary op with any stride pattern.
+// Uses 3D grid: collapse output dims into (inner, mid, outer).
+// Each input's physical index = sum(coord[d] * stride[d]) — multiplies only.
+static id<MTLComputePipelineState> get_mdim_binary_pipe(
+    u32 uop, const View *dv, const View *av, const View *bv,
+    u32 *grid_w, u32 *grid_h, u32 *grid_d,
+    u32 *tg_w, u32 *tg_h, u32 *tg_d) {
+
+    u64 key = mdim_hash(uop, dv, av, bv);
+    for (u32 i = 0; i < mdim_cache_count && i < MDIM_CACHE_SIZE; i++)
+        if (mdim_cache[i].key == key) {
+            // Recompute grid dims (same for same key)
+            goto compute_grid;
+        }
+
+    {
+        u32 rank = dv->shape.rank;
+        NSMutableString *src = [NSMutableString stringWithCapacity:2048];
+        [src appendString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
+        [src appendFormat:@"kernel void mdim_bin(\n"
+            "  device float *out [[buffer(0)]],\n"
+            "  device const float *a [[buffer(1)]],\n"
+            "  device const float *b [[buffer(2)]],\n"
+            "  uint3 gid [[thread_position_in_grid]])\n{\n"];
+
+        // Collapse dims into 3 groups: outer, mid, inner
+        // inner = last dims, mid = middle, outer = first dims
+        // Goal: each group is one gid component
+        u32 inner = 1, mid = 1, outer = 1;
+        u32 inner_start = rank; // dims in inner group: [inner_start, rank)
+
+        // Inner group: rightmost dims up to ~256 elements
+        for (int d = (int)rank - 1; d >= 0; d--) {
+            if (inner * dv->shape.dims[d] <= 1024) {
+                inner *= dv->shape.dims[d];
+                inner_start = (u32)d;
+            } else break;
+        }
+        // Mid group: next dims
+        u32 mid_start = inner_start;
+        for (int d = (int)inner_start - 1; d >= 0; d--) {
+            if (mid * dv->shape.dims[d] <= 65535) {
+                mid *= dv->shape.dims[d];
+                mid_start = (u32)d;
+            } else break;
+        }
+        // Outer: remaining
+        for (u32 d = 0; d < mid_start; d++) outer *= dv->shape.dims[d];
+
+        [src appendFormat:@"  uint inner_idx = gid.x; // [0, %u)\n", inner];
+        [src appendFormat:@"  uint mid_idx = gid.y;   // [0, %u)\n", mid];
+        [src appendFormat:@"  uint outer_idx = gid.z; // [0, %u)\n", outer];
+        [src appendFormat:@"  if (inner_idx >= %uu || mid_idx >= %uu || outer_idx >= %uu) return;\n",
+            inner, mid, outer];
+
+        // Decompose each group into per-dim coordinates using multiplies only
+        // (since the dim sizes are compile-time constants, Metal compiler optimizes)
+        [src appendString:@"  // Decompose coordinates\n"];
+
+        // For each dim, compute: coord[d] = (group_idx / divisor) % shape[d]
+        // divisor = product of dims below d within the group
+        // Since these are compile-time constants, compiler optimizes to shifts/masks
+        for (u32 d = 0; d < rank; d++) {
+            const char *group;
+            u32 group_start, group_end;
+            if (d < mid_start) { group = "outer_idx"; group_start = 0; group_end = mid_start; }
+            else if (d < inner_start) { group = "mid_idx"; group_start = mid_start; group_end = inner_start; }
+            else { group = "inner_idx"; group_start = inner_start; group_end = rank; }
+
+            u32 divisor = 1;
+            for (u32 dd = d + 1; dd < group_end; dd++) divisor *= dv->shape.dims[dd];
+
+            if (divisor == 1 && dv->shape.dims[d] == 1) {
+                [src appendFormat:@"  uint c%u = 0;\n", d];
+            } else if (divisor == 1) {
+                [src appendFormat:@"  uint c%u = %s %% %uu;\n", d, group, dv->shape.dims[d]];
+            } else {
+                [src appendFormat:@"  uint c%u = (%s / %uu) %% %uu;\n", d, group, divisor, dv->shape.dims[d]];
+            }
+        }
+
+        // Compute physical index for each input: sum(c[d] * stride[d]) + offset
+        // Stride=0 dims contribute nothing (broadcast)
+        for (int inp = 0; inp < 2; inp++) {
+            const View *v = (inp == 0) ? av : bv;
+            const char *name = (inp == 0) ? "a" : "b";
+            [src appendFormat:@"  uint %s_idx = %d", name, v->offset];
+            for (u32 d = 0; d < rank; d++) {
+                if (v->strides[d] != 0) {
+                    if (v->strides[d] == 1)
+                        [src appendFormat:@" + c%u", d];
+                    else
+                        [src appendFormat:@" + c%u * %du", d, v->strides[d]];
+                }
+            }
+            [src appendString:@";\n"];
+        }
+
+        // Output flat index: outer * (mid*inner) + mid * inner + inner
+        [src appendFormat:@"  uint out_idx = outer_idx * %uu + mid_idx * %uu + inner_idx;\n",
+            mid * inner, inner];
+
+        // The op
+        if (uop == UOP_CMP) {
+            [src appendString:@"  out[out_idx] = a[a_idx] > b[b_idx] ? 1.0f : 0.0f;\n"];
+        } else if (uop == UOP_MAX) {
+            [src appendString:@"  out[out_idx] = max(a[a_idx], b[b_idx]);\n"];
+        } else {
+            [src appendFormat:@"  out[out_idx] = a[a_idx] %s b[b_idx];\n", uop_to_op(uop)];
+        }
+
+        [src appendString:@"}\n"];
+
+        NSError *err = nil;
+        id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
+        if (!lib) { NSLog(@"mdim codegen error: %@\n%@", err, src); return nil; }
+        id<MTLComputePipelineState> pipe = [mtl_dev newComputePipelineStateWithFunction:
+            [lib newFunctionWithName:@"mdim_bin"] error:&err];
+        if (!pipe) { NSLog(@"mdim pipeline error: %@", err); return nil; }
+
+        u32 slot = mdim_cache_count < MDIM_CACHE_SIZE ?
+            mdim_cache_count++ : (mdim_cache_count++ % MDIM_CACHE_SIZE);
+        mdim_cache[slot].key = key;
+        mdim_cache[slot].pipe = pipe;
+    }
+
+compute_grid:;
+    // Compute grid dimensions
+    u32 rank = dv->shape.rank;
+    u32 inner_s = rank, mid_s = 0;
+    *grid_w = 1; *grid_h = 1; *grid_d = 1;
+    for (int d = (int)rank - 1; d >= 0; d--) {
+        if (*grid_w * dv->shape.dims[d] <= 1024) { *grid_w *= dv->shape.dims[d]; inner_s = (u32)d; }
+        else break;
+    }
+    for (int d = (int)inner_s - 1; d >= 0; d--) {
+        if (*grid_h * dv->shape.dims[d] <= 65535) { *grid_h *= dv->shape.dims[d]; mid_s = (u32)d; }
+        else break;
+    }
+    for (u32 d = 0; d < mid_s; d++) *grid_d *= dv->shape.dims[d];
+
+    // Threadgroup: use 256 threads (Metal sweet spot)
+    *tg_w = MIN(*grid_w, 256u);
+    *tg_h = 1; *tg_d = 1;
+
+    // Return the cached pipe
+    for (u32 i = 0; i < mdim_cache_count && i < MDIM_CACHE_SIZE; i++)
+        if (mdim_cache[i].key == mdim_hash(uop, dv, av, bv))
+            return mdim_cache[i].pipe;
+    return nil;
+}
+
+// Dispatch a multi-dim binary kernel
+void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
+                                 u32 a_buf, const View *av,
+                                 u32 b_buf, const View *bv) {
+    u32 gw, gh, gd, tw, th, td;
+    id<MTLComputePipelineState> pipe = get_mdim_binary_pipe(uop, dv, av, bv,
+                                                              &gw, &gh, &gd, &tw, &th, &td);
+    if (!pipe) return;
+
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:pipe];
+    [enc setBuffer:metal_pool.bufs[dst] offset:0 atIndex:0];
+    [enc setBuffer:metal_pool.bufs[a_buf] offset:0 atIndex:1];
+    [enc setBuffer:metal_pool.bufs[b_buf] offset:0 atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(gw, gh, gd)
+       threadsPerThreadgroup:MTLSizeMake(tw, th, td)];
+    batch_dirty = 1;
+    total_dispatches++;
+}

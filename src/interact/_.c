@@ -609,7 +609,20 @@ inet_step:
                         // we must materialize before reshape. Otherwise the new view's
                         // contiguous strides will index beyond the 1-element buffer.
                         new_view = view_reshape(ma->view, ns);
-                        if (!new_view.contiguous) {
+                        // view_reshape returns contiguous=0 for:
+                        // 1. Valid non-contiguous (stride-0 preserved) — NO contiguify needed
+                        // 2. Failed reshape (fake strides) — contiguify required
+                        // Distinguish: if source had stride-0 and result has stride-0, it's case 1.
+                        int needs_materialize = !new_view.contiguous;
+                        if (needs_materialize) {
+                            int has_stride0 = 0, src_has_stride0 = 0;
+                            for (u32 d2 = 0; d2 < ns.rank; d2++)
+                                if (ns.dims[d2] > 1 && new_view.strides[d2] == 0) has_stride0 = 1;
+                            for (u32 d2 = 0; d2 < ma->view.shape.rank; d2++)
+                                if (ma->view.shape.dims[d2] > 1 && ma->view.strides[d2] == 0) src_has_stride0 = 1;
+                            if (src_has_stride0 && has_stride0) needs_materialize = 0; // valid non-contiguous
+                        }
+                        if (needs_materialize) {
                             // Materialize non-contiguous view to contiguous buffer
                             u32 numel = ma->view.numel;
                             u32 orig_a_id = a_id;

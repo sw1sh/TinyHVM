@@ -679,3 +679,50 @@ kernel void fast_cmp(device float *dst [[buffer(0)]],
     if (i >= n) return;
     dst[i] = a[i] > b[i] ? 1.0f : 0.0f;
 }
+
+// ============================================================
+// Float4 vectorized fast kernels — 4x throughput for contiguous
+// ============================================================
+
+kernel void fast4_add(device float4 *dst [[buffer(0)]],
+                      device const float4 *a [[buffer(1)]],
+                      device const float4 *b [[buffer(2)]],
+                      constant uint &n4 [[buffer(3)]],
+                      uint i [[thread_position_in_grid]]) {
+    if (i >= n4) return;
+    dst[i] = a[i] + b[i];
+}
+
+kernel void fast4_sub(device float4 *dst [[buffer(0)]],
+                      device const float4 *a [[buffer(1)]],
+                      device const float4 *b [[buffer(2)]],
+                      constant uint &n4 [[buffer(3)]],
+                      uint i [[thread_position_in_grid]]) {
+    if (i >= n4) return;
+    dst[i] = a[i] - b[i];
+}
+
+kernel void fast4_mul(device float4 *dst [[buffer(0)]],
+                      device const float4 *a [[buffer(1)]],
+                      device const float4 *b [[buffer(2)]],
+                      constant uint &n4 [[buffer(3)]],
+                      uint i [[thread_position_in_grid]]) {
+    if (i >= n4) return;
+    dst[i] = a[i] * b[i];
+}
+
+kernel void fast4_neg(device float4 *dst [[buffer(0)]],
+                      device const float4 *a [[buffer(1)]],
+                      constant uint &n4 [[buffer(2)]],
+                      uint i [[thread_position_in_grid]]) {
+    if (i >= n4) return;
+    dst[i] = -a[i];
+}
+
+kernel void fast4_relu(device float4 *dst [[buffer(0)]],
+                       device const float4 *a [[buffer(1)]],
+                       constant uint &n4 [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= n4) return;
+    dst[i] = max(a[i], float4(0.0f));
+}

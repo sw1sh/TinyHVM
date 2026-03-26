@@ -22,6 +22,9 @@ static id<MTLComputePipelineState> pipe_maxpool2d_fwd, pipe_maxpool2d_bwd;
 // Fast contiguous kernels (no ViewParams overhead)
 static id<MTLComputePipelineState> fpipe_add, fpipe_sub, fpipe_mul, fpipe_div, fpipe_max, fpipe_cmp;
 static id<MTLComputePipelineState> fpipe_neg, fpipe_relu, fpipe_exp, fpipe_log, fpipe_sqrt;
+// Float4 vectorized (4x throughput)
+static id<MTLComputePipelineState> f4pipe_add, f4pipe_sub, f4pipe_mul;
+static id<MTLComputePipelineState> f4pipe_neg, f4pipe_relu;
 static id<MTLComputePipelineState> pipe_relu_bwd;
 static id<MTLComputePipelineState> pipe_matrix_transpose, pipe_zero_fill, pipe_pad;
 
@@ -154,6 +157,11 @@ static int metal_init(void) {
     fpipe_exp  = make_pipe(@"fast_exp");
     fpipe_log  = make_pipe(@"fast_log");
     fpipe_sqrt = make_pipe(@"fast_sqrt");
+    f4pipe_add  = make_pipe(@"fast4_add");
+    f4pipe_sub  = make_pipe(@"fast4_sub");
+    f4pipe_mul  = make_pipe(@"fast4_mul");
+    f4pipe_neg  = make_pipe(@"fast4_neg");
+    f4pipe_relu = make_pipe(@"fast4_relu");
 
     memset(&metal_pool, 0, sizeof(metal_pool));
     metal_pool.count = 1;

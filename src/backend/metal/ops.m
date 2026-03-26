@@ -27,7 +27,26 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
     u64 t0 = thvm_prof_tick();
 
     if (is_fast_view(sv)) {
-        // Fast path: direct indexing
+        u32 n = dv->numel;
+        // Float4 vectorized path (4x throughput)
+        if ((n % 4) == 0) {
+            id<MTLComputePipelineState> f4p = nil;
+            switch (uop) {
+                case UOP_NEG:  f4p = f4pipe_neg;  break;
+                case UOP_RELU: f4p = f4pipe_relu; break;
+                default: break;
+            }
+            if (f4p) {
+                u32 n4 = n / 4;
+                id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+                const void *params[] = { &n4 };
+                u64 psizes[] = { sizeof(u32) };
+                dispatch_1d(f4p, bufs, 2, params, psizes, 1, n4);
+                thvm_prof_record(uop, t0);
+                return;
+            }
+        }
+        // Scalar fast path
         id<MTLComputePipelineState> fpipe = nil;
         switch (uop) {
             case UOP_NEG:  fpipe = fpipe_neg;  break;
@@ -38,7 +57,6 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
             default: break;
         }
         if (fpipe) {
-            u32 n = dv->numel;
             id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
             const void *params[] = { &n };
             u64 psizes[] = { sizeof(u32) };
@@ -84,6 +102,26 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
     // Fast path: both inputs contiguous, same numel
     if (is_fast_view(av) && is_fast_view(bv) && av->numel == bv->numel) {
         u32 n = dv->numel;
+        // Float4 vectorized (4x throughput)
+        if ((n % 4) == 0) {
+            id<MTLComputePipelineState> f4p = nil;
+            switch (uop) {
+                case UOP_ADD: f4p = f4pipe_add; break;
+                case UOP_MUL: f4p = f4pipe_mul; break;
+                case UOP_SUB: f4p = f4pipe_sub; break;
+                default: break;
+            }
+            if (f4p) {
+                u32 n4 = n / 4;
+                id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
+                const void *params[] = { &n4 };
+                u64 psizes[] = { sizeof(u32) };
+                dispatch_1d(f4p, bufs, 3, params, psizes, 1, n4);
+                thvm_prof_record(uop, t0);
+                return;
+            }
+        }
+        // Scalar fast path
         id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
         const void *params[] = { &n };
         u64 psizes[] = { sizeof(u32) };

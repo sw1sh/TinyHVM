@@ -448,10 +448,7 @@ inet_step:
                             u32 orig_a_id = a_id;
                             u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
                             #ifdef __APPLE__
-                            // CPU fallback for masked views — Metal codegen works for
-                            // simple masks but has indexing issues for multi-layer conv
-                            // backward PADs. TODO: fix Metal codegen for all mask shapes.
-                            if (ctx->backend == &metal_backend && !ma->view.has_mask) {
+                            if (ctx->backend == &metal_backend) {
                                 metal_contiguify(ctx->tensors[mat_id].buf_id, numel,
                                                  ma->buf_id, &ma->view);
                             } else

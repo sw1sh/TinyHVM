@@ -370,7 +370,7 @@ void metal_dispatch_kernel(u32 out_buf, u32 out_numel,
     }
     for (u32 d = 0; d < mid_start; d++) outer *= out_shape[d];
 
-    // Float4 check (must match codegen)
+    // Float4 check (MUST match codegen exactly — mismatch = wrong dispatch grid)
     int use_f4 = (inner % 4 == 0) && (out_rank > 0) && (out_shape[out_rank-1] % 4 == 0);
     if (use_f4) {
         for (u32 i = 0; i < n_leaves; i++) {
@@ -379,6 +379,9 @@ void metal_dispatch_kernel(u32 out_buf, u32 out_numel,
         }
     }
     if (has_reduce) use_f4 = 0;
+    // Masked views: codegen disables f4 for per-element mask checks
+    for (u32 i = 0; i < n_leaves; i++)
+        if (leaf_views[i]->has_mask) { use_f4 = 0; break; }
 
     u32 gw = use_f4 ? inner / 4 : inner;
     u32 tw = MIN(gw, 256u);

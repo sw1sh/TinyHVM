@@ -300,7 +300,58 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                   if (!is_reduce_ax[d] && ew_view.shape.dims[d] > 1) seen_nonreduce_after = 1;
               }
             }
-            if (!trailing) return reduce_id(ctx, t); // non-trailing → can't fuse
+            if (!trailing) {
+                // Non-trailing: SUM(MUL(a,b)) → metal_mul_reduce_sum(a,b,axes)
+                #ifdef __APPLE__
+                if (n_ops == 1 && n_leaves == 2 && ctx->backend == &metal_backend &&
+                    ops[0].uop == UOP_MUL) {
+                    // Resolve lazy leaves
+                    for (u32 li = 0; li < n_leaves; li++) {
+                        if (!LEAF_IS_LAZY(leaf_ids[li])) continue;
+                        Term lt = fuse_leaf_terms[li];
+                        Term rd = thvm_reduce(ctx, lt);
+                        if (term_tag(rd)!=TAG_TEN) return reduce_id(ctx, t);
+                        leaf_ids[li]=(u32)term_val(rd);
+                        leaf_views[li]=&ctx->tensors[leaf_ids[li]].view;
+                    }
+                    // Compute output shape
+                    for (u32 i2=0;i2<n_axes;i2++){int ax=(int)axes_f[i2];
+                        if(ax>=0&&ax<(int)ew_view.shape.rank){reduce_dim*=ew_view.shape.dims[ax];out_view.shape.dims[ax]=1;}}
+                    out_view.numel=ew_view.numel/reduce_dim;
+                    u32 dst_id=tensor_create(ctx,out_view.shape,DTYPE_F32);
+                    u32 rn2=0; u32 rd2[MAX_DIM],rsa[MAX_DIM],rsb[MAX_DIM];
+                    for(u32 d=0;d<ew_view.shape.rank;d++){if(is_reduce_ax[d]){
+                        rd2[rn2]=ew_view.shape.dims[d];
+                        rsa[rn2]=(u32)(leaf_views[0]->strides[d]>0?leaf_views[0]->strides[d]:0);
+                        rsb[rn2]=(u32)(leaf_views[1]->strides[d]>0?leaf_views[1]->strides[d]:0);
+                        rn2++;}}
+                    metal_mul_reduce_sum(ctx->tensors[dst_id].buf_id,out_view.numel,
+                        ctx->tensors[leaf_ids[0]].buf_id,leaf_views[0],
+                        ctx->tensors[leaf_ids[1]].buf_id,leaf_views[1],
+                        &ctx->tensors[dst_id].view,rn2,rd2,rsa,rsb);
+                    ctx->itrs++;
+                    // Handle RESHAPE wrapper if present
+                    if (term_tag(reshape_term) != TAG_ERA) {
+                        u64 rs_loc=term_val(reshape_term);
+                        Term shp_t=heap_read(ctx,rs_loc+1);
+                        if(term_tag(shp_t)==TAG_TEN){
+                            TensorMeta *mp=&ctx->tensors[(u32)term_val(shp_t)];
+                            Shape ns={.rank=mp->view.numel}; f32 df[MAX_DIM];
+                            const f32 *cf=mp->host_ptr;
+                            if(cf) memcpy(df,cf,ns.rank*4); else META_READ(ctx,mp->buf_id,df,ns.rank*4);
+                            for(u32 j=0;j<ns.rank;j++) ns.dims[j]=(u32)df[j];
+                            u32 rs_id=ctx->tensor_count++;
+                            ctx->tensors[rs_id]=ctx->tensors[dst_id];
+                            ctx->tensors[rs_id].view=view_reshape(ctx->tensors[dst_id].view,ns);
+                            ctx->tensors[rs_id].host_ptr=NULL;
+                            dst_id=rs_id;
+                        }
+                    }
+                    return dst_id;
+                }
+                #endif
+                return reduce_id(ctx, t);
+            }
             for (u32 i = 0; i < n_axes; i++) {
                 int ax = (int)axes_f[i];
                 if (ax >= 0 && ax < (int)ew_view.shape.rank) {

@@ -205,7 +205,14 @@ inet_step:
                                 thvm_op(ctx, UOP_CMP, max_bc, at));
                             UN_GRAD(thvm_op(ctx, UOP_MUL, thvm_expand(ctx, gy, ma->view.shape), mask));
                         }
-                        case UOP_RESHAPE: UN_GRAD(thvm_reshape(ctx, gy, ma->view.shape));
+                        case UOP_RESHAPE: {
+                            // Force lazy reshape in backward: keeps the chain composable.
+                            Shape rs = ma->view.shape;
+                            f32 dims[MAX_DIM];
+                            for (u32 j = 0; j < rs.rank; j++) dims[j] = (f32)rs.dims[j];
+                            Term shape_t = thvm_tensor(ctx, dims, SHAPE(rs.rank));
+                            UN_GRAD(thvm_op(ctx, UOP_RESHAPE, gy, shape_t));
+                        }
                         case UOP_EXPAND:
                             UN_GRAD(sum_to_shape(ctx, gy, my->view.shape, ma->view.shape));
                         case UOP_PERMUTE: {
@@ -215,7 +222,15 @@ inet_step:
                             u32 inv[MAX_DIM];
                             for (u32 j = 0; j < rank; j++) inv[(u32)af[j]] = j;
                             free(af);
-                            UN_GRAD(thvm_permute(ctx, gy, inv, rank));
+                            // Force lazy permute: keeps the chain composable by the fuser.
+                            // Eager permute creates non-contiguous TAG_TEN that forces
+                            // downstream RESHAPEs to materialize (contiguify dispatch).
+                            // Lazy permute stays TAG_TOP → fuser composes it into the
+                            // consumer's kernel → zero extra dispatches.
+                            f32 inv_f[MAX_DIM];
+                            for (u32 j = 0; j < rank; j++) inv_f[j] = (f32)inv[j];
+                            Term inv_t = thvm_tensor(ctx, inv_f, SHAPE(rank));
+                            UN_GRAD(thvm_op(ctx, UOP_PERMUTE, gy, inv_t));
                         }
                         case UOP_PAD: {
                             TensorMeta *mp = &ctx->tensors[bid];

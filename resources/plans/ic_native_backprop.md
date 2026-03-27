@@ -111,12 +111,21 @@ in a SINGLE backward walk (x=ERA triggers multi-target mode in GRAD handler).
 - 2-conv CNN: 342→83 dispatches (4.1× reduction), 1000→130ms (7.7× faster)
 - Verified: exact match against per-param thvm_grad on both MLP and CNN
 
-### Tinygrad comparison (1-layer CNN + CE, BS=32, Metal)
+### Tinygrad comparison (Metal)
 
+1-layer CNN (Conv(1,8,3)→ReLU→Flatten→Linear, BS=32):
 | Metric | TinyHVM | Tinygrad | Ratio |
 |---|---|---|---|
 | Dispatches | 63 | ~26 | 2.4× |
-| Time/step (warm) | 10-13ms | 8-9ms | **1.3×** |
+| Time/step | 10-13ms | 8-9ms | **1.3×** |
+
+2-layer CNN (Conv→ReLU→Conv→ReLU→Flatten→Linear, BS=64):
+| Metric | TinyHVM | Tinygrad | Ratio |
+|---|---|---|---|
+| Dispatches | 94 | ~26 | 3.6× |
+| Time/step | 128ms | 25ms | 5.1× |
+| Accuracy (100 steps) | **84.1%** | **84.0%** | **=** |
+| Gradient diff | < 8.3e-7 | — | exact |
 
 ### What needs work
 

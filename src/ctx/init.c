@@ -51,8 +51,13 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
     if (ctx->backend && ctx->backend->pool_reset)
         ctx->backend->pool_reset(keep);
     ctx->tensor_count = keep;
-    ctx->heap_pos = 1;  // reset heap (keep weight terms as raw IDs)
-    ctx->heap[0] = term_era();  // sentinel
+    ctx->heap_pos = 1;
+    ctx->heap[0] = term_era();
+    // Clear DUP state on persistent tensors (heap was reset)
+    for (u32 i = 0; i < keep; i++) {
+        ctx->tensors[i].last_use_loc = 0;
+        ctx->tensors[i].dup_loc = 0;
+    }
 }
 
 Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {
@@ -89,11 +94,45 @@ static int is_ew_single(Term t) {
     return (term_tag(t) == TAG_TOP && is_elementwise(term_ext(t)));
 }
 
-Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
-    // TODO: inject FUSE nodes at elementwise → non-elementwise boundary
-    // Disabled until multi-op backward provenance is implemented.
+// Enforce linearity: if a TAG_TEN with requires_grad is used again, auto-DUP.
+// Returns the term to place in the heap (original or DP1 of a new DUP).
+static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
+    if (term_tag(t) != TAG_TEN) return t;
+    u32 tid = (u32)term_val(t);
+    if (tid >= ctx->tensor_count || !ctx->tensors[tid].requires_grad) return t;
+    if (ctx->tensors[tid].creator_op) return t; // only DUP leaf params, not intermediates
+    TensorMeta *m = &ctx->tensors[tid];
+    if (!m->last_use_loc) {
+        m->last_use_loc = dest_loc + 1;
+        return t;
+    }
+    // Second+ use: insert DUP
+    u64 dup_loc;
+    if (!m->dup_loc) {
+        // First DUP for this tensor
+        dup_loc = heap_alloc(ctx, 2);
+        heap_set(ctx, dup_loc, t);
+        heap_set(ctx, dup_loc + 1, term_era()); // grad accumulator
+        m->dup_loc = dup_loc;
+        // Patch first use
+        heap_set(ctx, m->last_use_loc - 1, term_new(TAG_DP0, 0, dup_loc));
+    } else {
+        // Already DUPed: chain — DUP the DP1
+        dup_loc = heap_alloc(ctx, 2);
+        // The "value" for this new DUP is the previous DUP's DP1
+        heap_set(ctx, dup_loc, term_new(TAG_DP1, 0, m->dup_loc));
+        heap_set(ctx, dup_loc + 1, term_era());
+        // Patch previous last_use to DP0 of new DUP
+        heap_set(ctx, m->last_use_loc - 1, term_new(TAG_DP0, 0, dup_loc));
+    }
+    m->last_use_loc = dest_loc + 1;
+    return term_new(TAG_DP1, 0, dup_loc);
+}
 
+Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
     u64 loc = heap_alloc(ctx, 2);
+    a = linear_use(ctx, a, loc);
+    b = linear_use(ctx, b, loc + 1);
     heap_set(ctx, loc, a);
     heap_set(ctx, loc + 1, b);
 

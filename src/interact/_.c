@@ -117,6 +117,35 @@ inet_step:
                         u64 _l = heap_alloc(ctx, 3); \
                         heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
                         term_new(TAG_TOP, UOP_GRAD, _l); })
+                    // DUP-aware GRAD: if tensor has a DUP, route gradient through it.
+                    // First arrival: create ADD(da, _hole_) at DUP grad slot.
+                    //   The _hole_ is a heap slot that the 2nd path will fill.
+                    //   Continue backward with the lazy ADD as gy.
+                    // Second arrival: fill the hole. The ADD resolves naturally.
+                    #define GRAD3_DUP(tid_, da_, x_) ({ \
+                        u64 _dl = ctx->tensors[tid_].dup_loc; \
+                        Term _r; \
+                        if (!_dl) { _r = GRAD3(term_ten(tid_, ctx->tensors[tid_].dtype), da_, x_); } \
+                        else { \
+                            Term _slot = heap_read(ctx, _dl + 1); \
+                            if (term_tag(_slot) == TAG_ERA) { \
+                                /* First arrival: create ADD(da, hole) at dup grad slot */ \
+                                u64 _al = heap_alloc(ctx, 2); \
+                                heap_set(ctx, _al, da_); \
+                                heap_set(ctx, _al + 1, term_era()); /* hole for 2nd path */ \
+                                Term _add = term_new(TAG_TOP, UOP_ADD, _al); \
+                                heap_set(ctx, _dl + 1, _add); /* store ADD at dup grad slot */ \
+                                /* Continue backward with lazy ADD as gy */ \
+                                _r = GRAD3(term_ten(tid_, ctx->tensors[tid_].dtype), _add, x_); \
+                            } else { \
+                                /* Second arrival: fill the hole, clear DUP for reuse */ \
+                                u64 _al2 = term_val(_slot); \
+                                heap_set(ctx, _al2 + 1, da_); \
+                                heap_set(ctx, _dl + 1, term_era()); /* reset for next GRAD */ \
+                                _r = term_era(); \
+                            } \
+                        } \
+                        _r; })
                     // Combine two gradient branches — skip ERA (no-path) operands.
                     // Single live branch → GRAD_STEP (iterative, no depth increase).
                     // Both live → RETURN_REDUCED (must reduce both, adds depth).
@@ -134,11 +163,11 @@ inet_step:
                             Term ga = term_era(), gb = term_era();
                             if (a_reaches) {
                                 Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
-                                ga = GRAD3(at,da,x);
+                                ga = GRAD3_DUP(aid,da,x);
                             }
                             if (b_reaches) {
                                 Term db = sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape);
-                                gb = GRAD3(bt,db,x);
+                                gb = GRAD3_DUP(bid,db,x);
                             }
                             GRAD_COMBINE(ga, gb);
                         }
@@ -146,7 +175,7 @@ inet_step:
                             Term ga = term_era(), gb = term_era();
                             if (a_reaches) {
                                 Term da = sum_to_shape(ctx, gy, my->view.shape, ma->view.shape);
-                                ga = GRAD3(at,da,x);
+                                ga = GRAD3_DUP(aid,da,x);
                             }
                             if (b_reaches) {
                                 Term neg = thvm_op(ctx, UOP_NEG,
@@ -160,12 +189,12 @@ inet_step:
                             if (a_reaches) {
                                 Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt),
                                                        my->view.shape, ma->view.shape);
-                                ga = GRAD3(at,da,x);
+                                ga = GRAD3_DUP(aid,da,x);
                             }
                             if (b_reaches) {
                                 Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at),
                                                        my->view.shape, mb_p->view.shape);
-                                gb = GRAD3(bt,db,x);
+                                gb = GRAD3_DUP(bid,db,x);
                             }
                             GRAD_COMBINE(ga, gb);
                         }
@@ -174,30 +203,36 @@ inet_step:
                             if (a_reaches) {
                                 u32 bt_id = tensor_transpose_2d(ctx, bid);
                                 Term da = thvm_op(ctx, UOP_MM, gy, term_ten(bt_id, mb_p->dtype));
-                                ga = GRAD3(at,da,x);
+                                ga = GRAD3_DUP(aid,da,x);
                             }
                             if (b_reaches) {
                                 u32 at_id = tensor_transpose_2d(ctx, aid);
                                 Term db = thvm_op(ctx, UOP_MM, term_ten(at_id, ma->dtype), gy);
-                                gb = GRAD3(bt,db,x);
+                                gb = GRAD3_DUP(bid,db,x);
                             }
                             GRAD_COMBINE(ga, gb);
                         }
+                        // Unary DUP-aware: if GRAD3_DUP returns ERA (2nd DUP arrival), propagate ERA
+                        #define GRAD_STEP_DUP(tid_, da_, x_) do { \
+                            Term _g = GRAD3_DUP(tid_, da_, x_); \
+                            if (term_tag(_g) == TAG_ERA) RETURN_REDUCED(term_era()); \
+                            GRAD_STEP(_g); \
+                        } while(0)
                         case UOP_RELU: {
                             f32 z = 0.0f;
                             Term mask = thvm_op(ctx, UOP_CMP, at, thvm_tensor(ctx, &z, SHAPE(1)));
-                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, mask), x));
+                            GRAD_STEP_DUP(aid, thvm_op(ctx, UOP_MUL, gy, mask), x);
                         }
                         case UOP_NEG:
-                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_NEG, gy, term_era()), x));
+                            GRAD_STEP_DUP(aid, thvm_op(ctx, UOP_NEG, gy, term_era()), x);
                         case UOP_EXP:
-                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_MUL, gy, y), x));
+                            GRAD_STEP_DUP(aid, thvm_op(ctx, UOP_MUL, gy, y), x);
                         case UOP_LOG:
-                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, at), x));
+                            GRAD_STEP_DUP(aid, thvm_op(ctx, UOP_DIV, gy, at), x);
                         case UOP_SQRT: {
                             f32 two = 2.0f;
                             Term denom = thvm_op(ctx, UOP_MUL, thvm_tensor(ctx, &two, SHAPE(1)), y);
-                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_DIV, gy, denom), x));
+                            GRAD_STEP_DUP(aid, thvm_op(ctx, UOP_DIV, gy, denom), x);
                         }
                         case UOP_DIV: {
                             Term da = thvm_op(ctx, UOP_DIV, gy, bt);
@@ -205,10 +240,9 @@ inet_step:
                             Term db = thvm_op(ctx, UOP_DIV,
                                 thvm_op(ctx, UOP_MUL, ng, at),
                                 thvm_op(ctx, UOP_MUL, bt, bt));
-                            { Term _a = GRAD3(at,da,x), _b = GRAD3(bt,db,x); GRAD_COMBINE(_a, _b); }
+                            { Term _a = GRAD3_DUP(aid,da,x), _b = GRAD3_DUP(bid,db,x); GRAD_COMBINE(_a, _b); }
                         }
                         case UOP_MAX: {
-                            // mask = (a > b): gradient flows to a where a was the max
                             Term mask = thvm_op(ctx, UOP_CMP, at, bt);
                             Term da = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, mask),
                                                    my->view.shape, ma->view.shape);
@@ -216,49 +250,37 @@ inet_step:
                             Term inv = thvm_op(ctx, UOP_SUB, thvm_tensor(ctx, &one, SHAPE(1)), mask);
                             Term db = sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, inv),
                                                    my->view.shape, mb_p->view.shape);
-                            { Term _a = GRAD3(at,da,x), _b = GRAD3(bt,db,x); GRAD_COMBINE(_a, _b); }
+                            { Term _a = GRAD3_DUP(aid,da,x), _b = GRAD3_DUP(bid,db,x); GRAD_COMBINE(_a, _b); }
                         }
                         case UOP_FUSING: {
-                            // General FUSING backward: re-reduce the original unfused subnet
-                            // with provenance recording, then GRAD through the result.
                             u64 orig_loc = ctx->tensors[y_id].fusing_loc;
                             u32 orig_uop = ctx->tensors[y_id].fusing_uop;
-
                             u8 saved_nf = ctx->no_fuse;
-                            ctx->no_fuse = 1; // prevent re-fusing the same pattern
-
+                            ctx->no_fuse = 1;
                             Term orig = term_new(TAG_TOP, orig_uop, orig_loc);
                             Term unfused = thvm_reduce(ctx, orig);
-
                             ctx->no_fuse = saved_nf;
-
-                            // GRAD through the unfused result
-                            GRAD_STEP(GRAD3(unfused, gy, x));
+                            GRAD_STEP(GRAD3(unfused, gy, x)); // FUSING: no DUP (unfused is fresh)
                         }
                         case UOP_SUM: {
-                            // SUM backward: expand gy to input shape.
-                            // expand needs TAG_TEN (rank must match), so reduce gy first.
                             Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
                             Term g = thvm_expand(ctx, gy_r, ma->view.shape);
-                            GRAD_STEP(GRAD3(at, g, x));
+                            GRAD_STEP_DUP(aid, g, x);
                         }
-
                         case UOP_RMAX: {
                             Term max_bc = thvm_expand(ctx,
                                 thvm_reshape(ctx, y, my->view.shape), ma->view.shape);
-                            // mask = 1 where input >= max (CMP is strict >, so invert)
                             f32 one = 1.0f;
                             Term mask = thvm_op(ctx, UOP_SUB,
                                 thvm_tensor(ctx, &one, SHAPE(1)),
                                 thvm_op(ctx, UOP_CMP, max_bc, at));
                             Term gbc = thvm_expand(ctx, gy, ma->view.shape);
-                            GRAD_STEP(GRAD3(at, thvm_op(ctx, UOP_MUL, gbc, mask), x));
+                            GRAD_STEP_DUP(aid, thvm_op(ctx, UOP_MUL, gbc, mask), x);
                         }
                         case UOP_RESHAPE:
-                            GRAD_STEP(GRAD3(at, thvm_reshape(ctx, gy, ma->view.shape), x));
+                            GRAD_STEP_DUP(aid, thvm_reshape(ctx, gy, ma->view.shape), x);
                         case UOP_EXPAND:
-                            GRAD_STEP(GRAD3(at,
-                                sum_to_shape(ctx, gy, my->view.shape, ma->view.shape), x));
+                            GRAD_STEP_DUP(aid, sum_to_shape(ctx, gy, my->view.shape, ma->view.shape), x);
                         case UOP_PERMUTE: {
                             u32 rank = ctx->tensors[bid].view.numel;
                             f32 *af = malloc(rank * sizeof(f32));
@@ -266,7 +288,7 @@ inet_step:
                             u32 inv[MAX_DIM];
                             for (u32 j = 0; j < rank; j++) inv[(u32)af[j]] = j;
                             free(af);
-                            GRAD_STEP(GRAD3(at, thvm_permute(ctx, gy, inv, rank), x));
+                            GRAD_STEP_DUP(aid, thvm_permute(ctx, gy, inv, rank), x);
                         }
                         case UOP_PAD: {
                             TensorMeta *mp = &ctx->tensors[bid];
@@ -276,7 +298,7 @@ inet_step:
                             u32 sp[MAX_DIM*2];
                             for (u32 j=0;j<nd;j++){sp[j*2]=(u32)pf[j*2];sp[j*2+1]=(u32)pf[j*2]+ma->view.shape.dims[j];}
                             free(pf);
-                            GRAD_STEP(GRAD3(at, thvm_shrink(ctx, gy, sp, nd), x));
+                            GRAD_STEP_DUP(aid, thvm_shrink(ctx, gy, sp, nd), x);
                         }
                         case UOP_SHRINK: {
                             TensorMeta *ms2 = &ctx->tensors[bid];
@@ -286,7 +308,7 @@ inet_step:
                             u32 pp[MAX_DIM*2];
                             for (u32 j=0;j<nd;j++){pp[j*2]=(u32)sf[j*2];pp[j*2+1]=ma->view.shape.dims[j]-(u32)sf[j*2+1];}
                             free(sf);
-                            GRAD_STEP(GRAD3(at, thvm_pad(ctx, gy, pp, nd), x));
+                            GRAD_STEP_DUP(aid, thvm_pad(ctx, gy, pp, nd), x);
                         }
                         default: {
                             // Unknown op → zero
@@ -295,6 +317,8 @@ inet_step:
                         }
                     }
                     #undef GRAD3
+                    #undef GRAD3_DUP
+                    #undef GRAD_STEP_DUP
                     #undef GRAD_COMBINE
                 }
                 // y is not TAG_TEN (still lazy or ERA) → reduce y first, then retry
@@ -945,25 +969,33 @@ inet_step:
         // Fire the rule: link to the chosen branch, continue loop.
         case TAG_DP0: {
             u64 loc = term_val(t);
-            Term sup = thvm_reduce(ctx, heap_read(ctx, loc));  // reduce the sup (not tail)
-            if (term_tag(sup) == TAG_SUP) {
+            Term val = thvm_reduce(ctx, heap_read(ctx, loc));
+            if (term_tag(val) == TAG_SUP) {
                 ctx->itrs++;
-                t = heap_read(ctx, term_val(sup));  // link to left branch
+                t = heap_read(ctx, term_val(val));
                 goto inet_step;
             }
-            heap_set(ctx, loc, sup);
+            if (term_tag(val) == TAG_TEN) { // DUP passthrough: both copies see same tensor
+                heap_set(ctx, loc, val);
+                return val;
+            }
+            heap_set(ctx, loc, val);
             return t;
         }
 
         case TAG_DP1: {
             u64 loc = term_val(t);
-            Term sup = thvm_reduce(ctx, heap_read(ctx, loc));
-            if (term_tag(sup) == TAG_SUP) {
+            Term val = thvm_reduce(ctx, heap_read(ctx, loc));
+            if (term_tag(val) == TAG_SUP) {
                 ctx->itrs++;
-                t = heap_read(ctx, term_val(sup) + 1);  // link to right branch
+                t = heap_read(ctx, term_val(val) + 1);
                 goto inet_step;
             }
-            heap_set(ctx, loc, sup);
+            if (term_tag(val) == TAG_TEN) {
+                heap_set(ctx, loc, val);
+                return val;
+            }
+            heap_set(ctx, loc, val);
             return t;
         }
 

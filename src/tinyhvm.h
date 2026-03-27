@@ -403,6 +403,8 @@ typedef struct {
     u8          requires_grad;
     u32         creator_op; // UOP that created this tensor
     u32         src_ids[2]; // input tensor ids (for backward rules + REACHES traversal)
+    u64         dup_loc;    // heap location of DUP node (0 = not DUPed)
+    u64         last_use_loc; // heap slot where this tensor was last placed (0 = unused)
 
     // Fusion metadata (only when creator_op == UOP_FUSING)
     u64         fusing_loc; // heap loc of the original subnet root TAG_TOP
@@ -525,6 +527,7 @@ Term     thvm_app(TinyHVM *ctx, Term fun, Term arg);         // allocate APP nod
 u32      thvm_define(TinyHVM *ctx, Term body);               // register def, return name id
 Term     thvm_ref(TinyHVM *ctx, u32 name);                   // TAG_REF(name)
 Term     thvm_sup(TinyHVM *ctx, Term a, Term b);             // TAG_SUP(a, b)
+void     thvm_dup(TinyHVM *ctx, Term z, Term *out0, Term *out1); // linear DUP → DP0, DP1
 
 // Inet ops
 Term     thvm_where(TinyHVM *ctx, Term cond, Term then_t, Term else_t);

@@ -138,13 +138,13 @@ static int run_mlp(MNISTData *data) {
     // ONE program, ONE reduce
     f32 sb = 0.0f;
     Term SB_ten = thvm_tensor(ctx, &sb, SHAPE(1));
-    f32 ns = (f32)n_batches;
+    f32 ns = 10.0f;
     Term NS_ten = thvm_tensor(ctx, &ns, SHAPE(1));
 
     Term program = mnist_train_program(ctx,
         W1, B1, W2, B2, X_all, Y_all, LR, INV_N,
         MASK_S, MASK_E, FIXED_X, MASK_S, MASK_E, FIXED_Y,
-        BS_ten, NS_ten, SB_ten, BS, H, (int)n_batches);
+        BS_ten, NS_ten, SB_ten, BS, H, 10);
 
     printf("  reducing %u-step inet (1 epoch, BS=%u)...\n", n_batches, BS);
     @autoreleasepool {
@@ -160,9 +160,16 @@ static int run_mlp(MNISTData *data) {
     for (u32 b = 0; b < tb; b++) {
         u32 off = b * test_bs;
         Term X = thvm_tensor(ctx, &data->test_images[off * 784], SHAPE(test_bs, 784));
-        Term z1 = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1), B1);
+        Term z1 = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1),
+                         thvm_expand(ctx, B1, SHAPE(test_bs, H)));
         Term h  = thvm_op(ctx, UOP_RELU, z1, term_era());
-        Term out = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2), B2));
+        Term hs = thvm_reshape(ctx,
+            thvm_op(ctx, UOP_SUM, thvm_reshape(ctx, h, SHAPE(test_bs * H)), term_era()),
+            SHAPE(1, 1));
+        Term out = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD,
+            thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
+                         thvm_expand(ctx, B2, SHAPE(test_bs, 10))),
+            thvm_expand(ctx, hs, SHAPE(test_bs, 10))));
         f32 *od = thvm_to_host(ctx, out);
         for (u32 i = 0; i < test_bs; i++) {
             u32 pred = 0; f32 mx = od[i * 10];

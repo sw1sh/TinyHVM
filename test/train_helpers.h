@@ -154,12 +154,18 @@ static Term mnist_train_program(TinyHVM *ctx,
     Term X = thvm_op(ctx, UOP_SHRINK, X_all, pairs_x);
     Term Y = thvm_op(ctx, UOP_SHRINK, Y_all, pairs_y);
 
-    // Forward: h = relu(X @ W1 + B1), out = h @ W2 + B2
+    // Forward: h = relu(X@W1+B1), out = h@W2 + B2 + skip(h)
+    // h used TWICE: in MM and in skip — tests DUP / gradient accumulation
     Term z1  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1),
                        thvm_expand(ctx, B1, SHAPE(batch_size, hidden_dim)));
     Term h   = thvm_op(ctx, UOP_RELU, z1, term_era());
-    Term out = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
-                       thvm_expand(ctx, B2, SHAPE(batch_size, 10)));
+    Term h_skip = thvm_reshape(ctx,
+        thvm_op(ctx, UOP_SUM, thvm_reshape(ctx, h, SHAPE(batch_size * hidden_dim)), term_era()),
+        SHAPE(1, 1));
+    Term out = thvm_op(ctx, UOP_ADD,
+        thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
+                       thvm_expand(ctx, B2, SHAPE(batch_size, 10))),
+        thvm_expand(ctx, h_skip, SHAPE(batch_size, 10)));
 
     // Cross-entropy loss: -mean(sum(Y * log(softmax(out)), axis=1))
     // Softmax: max → sub → exp → sum → div

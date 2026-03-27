@@ -430,13 +430,12 @@ inet_step:
                         // we must materialize before reshape. Otherwise the new view's
                         // contiguous strides will index beyond the 1-element buffer.
                         new_view = view_reshape(ma->view, ns);
-                        // Materialize for:
-                        // 1. Masked views (PAD backward) — mask data lost in reshape
-                        // 2. Failed reshapes — view_reshape couldn't compute valid strides
-                        //    (returns contiguous-pattern strides but contiguous=0)
-                        // Don't materialize valid non-contiguous views — kernel handles them.
-                        int needs_materialize = ma->view.has_mask;
-                        if (!needs_materialize && !new_view.contiguous) {
+                        // Materialize only for failed reshapes (invalid strides).
+                        // Masked views with valid strides (from PAD on permuted
+                        // gradients) are handled by the codegen inline — the fuser
+                        // propagates masks through view composition.
+                        int needs_materialize = 0;
+                        if (!new_view.contiguous) {
                             // Check if view_reshape produced fallback (contiguous-pattern) strides
                             // This indicates a failed merge-split — strides don't match data layout
                             int looks_contiguous = 1;

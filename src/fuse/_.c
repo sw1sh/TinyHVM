@@ -118,6 +118,34 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 if (dense) nv = *base; // non-aliasable: keep physical view
             }
         }
+        // Propagate mask from base to composed view.
+        // PERMUTE: rearrange mask_begin/mask_end by axes
+        // EXPAND: keep mask on non-expanded dims
+        // RESHAPE: already handled by view_reshape (for contiguous strides)
+        if (base->has_mask && !nv.has_mask) {
+            if (uop == UOP_PERMUTE) {
+                nv.has_mask = 1;
+                for (u32 j = 0; j < rank; j++) {
+                    nv.mask_begin[j] = base->mask_begin[(u32)pf[j]];
+                    nv.mask_end[j] = base->mask_end[(u32)pf[j]];
+                }
+            } else if (uop == UOP_EXPAND) {
+                nv.has_mask = 1;
+                for (u32 j = 0; j < rank; j++) {
+                    if (j < base->shape.rank) {
+                        nv.mask_begin[j] = base->mask_begin[j];
+                        nv.mask_end[j] = (base->shape.dims[j] == 1 && (u32)pf[j] > 1) ?
+                            (u32)pf[j] : base->mask_end[j]; // expanded dims: full range
+                    } else {
+                        nv.mask_begin[j] = 0;
+                        nv.mask_end[j] = (u32)pf[j];
+                    }
+                }
+            }
+            // RESHAPE: view_reshape already propagated mask for contiguous case.
+            // For non-contiguous + mask: the fuser shouldn't reach here
+            // (view_reshape returns fallback → needs_materialize → contiguify).
+        }
         // Always create a NEW leaf for composed views (no dedup —
         // the composed view differs from the base leaf's view)
         if (*n_leaves >= FUSE_MAX_LEAVES) return -1;

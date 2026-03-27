@@ -17,23 +17,17 @@ static View view_reshape(View v, Shape new_shape) {
   assert(new_numel == v.numel && "reshape: numel mismatch");
 
   if (v.has_mask) {
-    // Try to propagate mask through reshape.
-    // This works when both old and new shapes have the same element order
-    // (both contiguous or compatible stride pattern). The mask bounds
-    // transform through the same merge-split as the strides.
-    // For now: only handle the case where the source is contiguous-strided
-    // (the mask was applied to a contiguous buffer via PAD).
-    // This avoids materialization for the common SHRINK backward → PAD → RESHAPE pattern.
-
-    // Check if strides are contiguous (ignoring mask)
+    // Masked views: only propagate mask for contiguous strides.
+    // Non-contiguous masked views (from PAD on permuted gradients) need
+    // materialization — the mask-to-stride interaction is too complex
+    // for the merge-split algorithm to handle correctly.
     int src_contig = 1;
-    i32 exp = 1;
+    i32 exp2 = 1;
     for (int i = (int)v.shape.rank - 1; i >= 0; i--) {
-      if (v.shape.dims[i] > 1 && v.strides[i] != exp) { src_contig = 0; break; }
-      exp *= (i32)v.shape.dims[i];
+      if (v.shape.dims[i] > 1 && v.strides[i] != exp2) { src_contig = 0; break; }
+      exp2 *= (i32)v.shape.dims[i];
     }
     if (!src_contig) {
-      // Non-contiguous masked view — must materialize
       View r = {0};
       r.shape = new_shape; r.numel = new_numel; r.offset = v.offset;
       for (u32 i = 0; i < new_shape.rank; i++) {
@@ -44,55 +38,7 @@ static View view_reshape(View v, Shape new_shape) {
       r.contiguous = 0;
       return r;
     }
-    // Contiguous masked view: reshape strides + propagate mask bounds.
-    // Flatten the mask to a 1D range [flat_begin, flat_end), then
-    // decompose into new shape's mask_begin/mask_end.
-    // This works because contiguous layout means flat index = physical index.
-    View r = {0};
-    r.shape = new_shape; r.numel = new_numel; r.offset = v.offset;
-    r.has_mask = 1;
-    // Compute contiguous strides for new shape
-    for (u32 i = 0; i < new_shape.rank; i++) {
-      i32 st = 1;
-      for (u32 j = i + 1; j < new_shape.rank; j++) st *= (i32)new_shape.dims[j];
-      r.strides[i] = st;
-    }
-    r.contiguous = 1; // contiguous with mask
-    // Propagate mask: for each new dim, find the corresponding old dim's mask
-    // Simple case: if old and new dims align (merge/split), propagate bounds.
-    // Complex case: fall back to full range (no masking on that dim).
-    // For the common pad-then-reshape case: old mask_end on last dims maps
-    // to new mask_end on the corresponding flattened/split dims.
-    for (u32 i = 0; i < new_shape.rank; i++) {
-      r.mask_begin[i] = 0;
-      r.mask_end[i] = new_shape.dims[i];
-    }
-    // Walk old dims and new dims simultaneously (merge-split) to map mask bounds
-    u32 oi = 0, ni = 0;
-    u32 old_prod = 1, new_prod = 1;
-    while (oi < v.shape.rank && ni < new_shape.rank) {
-      // Skip size-1 dims
-      if (v.shape.dims[oi] == 1) { oi++; continue; }
-      if (new_shape.dims[ni] == 1) { ni++; continue; }
-      if (old_prod == 1 && new_prod == 1) {
-        // Start of a new group: match dims
-        old_prod = v.shape.dims[oi];
-        new_prod = new_shape.dims[ni];
-      }
-      if (old_prod == new_prod) {
-        // 1:1 mapping — propagate mask directly
-        if (old_prod == v.shape.dims[oi] && new_prod == new_shape.dims[ni]) {
-          r.mask_begin[ni] = v.mask_begin[oi];
-          r.mask_end[ni] = v.mask_end[oi];
-        }
-        oi++; ni++; old_prod = 1; new_prod = 1;
-      } else if (old_prod < new_prod) {
-        oi++; if (oi < v.shape.rank) old_prod *= v.shape.dims[oi];
-      } else {
-        ni++; if (ni < new_shape.rank) new_prod *= new_shape.dims[ni];
-      }
-    }
-    return r;
+    // Contiguous masked: fall through to merge-split, propagate mask at end.
   }
 
   // Merge-split algorithm: walk old and new shapes simultaneously.
@@ -214,5 +160,40 @@ static View view_reshape(View v, Shape new_shape) {
     }
     r.contiguous = 0;
   }
+
+  // Propagate mask from source to reshaped view (if source was masked).
+  // Walk old/new non-trivial dims in parallel and map 1:1 mask bounds.
+  // Dims that merged/split get full range (conservative but correct).
+  if (v.has_mask && reshapable) {
+    r.has_mask = 1;
+    // Initialize all dims to full range
+    for (u32 i = 0; i < new_shape.rank; i++) {
+      r.mask_begin[i] = 0;
+      r.mask_end[i] = new_shape.dims[i];
+    }
+    // Map 1:1 dims: walk old and new non-trivial dims
+    u32 oi2 = 0, ni2 = 0;
+    while (oi2 < on && ni2 < nn) {
+      if (od[oi2] == nd[ni2]) {
+        // Same size: direct mask mapping
+        // Find original dim index for oi2
+        u32 orig_d = 0, cnt = 0;
+        for (u32 d = 0; d < v.shape.rank; d++)
+          if (v.shape.dims[d] > 1) { if (cnt == oi2) { orig_d = d; break; } cnt++; }
+        r.mask_begin[new_dim_map[ni2]] = v.mask_begin[orig_d];
+        r.mask_end[new_dim_map[ni2]] = v.mask_end[orig_d];
+        oi2++; ni2++;
+      } else {
+        // Merged or split: skip both (keep full range = conservative)
+        u32 op = od[oi2], np2 = nd[ni2];
+        while (op != np2) {
+          if (op < np2) { oi2++; if (oi2 < on) op *= od[oi2]; else break; }
+          else { ni2++; if (ni2 < nn) np2 *= nd[ni2]; else break; }
+        }
+        oi2++; ni2++;
+      }
+    }
+  }
+
   return r;
 }

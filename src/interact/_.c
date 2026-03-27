@@ -721,16 +721,12 @@ inet_step:
 
                     #ifdef __APPLE__
                     if (uop == UOP_SUM && ctx->backend == &metal_backend) {
-                        // GPU path: mul_reduce_sum(input, ones=1.0, reduce_axes)
-                        // Allocate ones_buf each time (freed by pool_reset, reused from free_list)
                         f32 one_val = 1.0f;
                         u32 ones_buf = ctx->backend->buf_alloc(sizeof(f32));
                         ctx->backend->buf_write(ones_buf, &one_val, sizeof(f32));
-                        // ones view: same rank as output, all strides=0 (broadcast scalar)
                         View ones_v = md->view;
                         for (u32 d = 0; d < ones_v.shape.rank; d++) ones_v.strides[d] = 0;
-                        ones_v.offset = 0;
-                        ones_v.contiguous = 0;
+                        ones_v.offset = 0; ones_v.contiguous = 0;
                         metal_mul_reduce_sum(
                             md->buf_id, out_numel,
                             ma->buf_id, &ma->view,

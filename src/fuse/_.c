@@ -54,11 +54,25 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
     u32 uop = term_ext(t);
 
     // View ops: walk through, compose view onto leaf.
-    // Only when the input is already TAG_TEN (no speculative deep walking).
-    if ((uop == UOP_EXPAND || uop == UOP_PERMUTE || uop == UOP_RESHAPE) &&
-        term_tag(heap_read(ctx, term_val(t))) == TAG_TEN) {
+    // Works for both TAG_TEN inputs (compose view) and TAG_TOP inputs (treat as leaf).
+    if (uop == UOP_EXPAND || uop == UOP_PERMUTE || uop == UOP_RESHAPE) {
         u64 loc = term_val(t);
-        int inner = fuse_walk_inner(ctx, heap_read(ctx, loc), ops, n_ops, leaf_ids, leaf_views, n_leaves);
+        Term view_input = heap_read(ctx, loc);
+        // If input is TAG_TOP (lazy), treat the VIEW(TAG_TOP) as a lazy leaf.
+        // The TAG_TOP will be reduced before the fused kernel runs, producing
+        // a TAG_TEN that the view's strides/shape correctly reference.
+        if (term_tag(view_input) != TAG_TEN) {
+            // Use shape tracking to get the VIEW output shape for the leaf
+            const View *sv = st_get(loc);
+            if (!sv) return -1;
+            if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
+            u32 idx = (*n_leaves)++;
+            leaf_ids[idx] = ~0u; // sentinel: lazy leaf (will be resolved during reduce)
+            leaf_views[idx] = sv;
+            fuse_leaf_terms[idx] = t; // store the VIEW(TAG_TOP) term
+            return (int)(WALK_LEAF_BASE + idx);
+        }
+        int inner = fuse_walk_inner(ctx, view_input, ops, n_ops, leaf_ids, leaf_views, n_leaves);
         if (inner < 0) return -1;
         if (inner >= (int)(WALK_LEAF_BASE * 2)) return -1;
         u32 leaf_idx = inner - WALK_LEAF_BASE;
@@ -286,10 +300,18 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
     u32 out_numel = out_view.numel;
 
-    // Lazy leaves: can't dispatch yet (leaves not reduced to TAG_TEN).
-    // Fall back to normal reduction — the trampoline reduces leaves
-    // depth-first, then the rewrite rules catch the chain again.
-    if (has_lazy) return reduce_id(ctx, t);
+    // Lazy leaves: reduce them now so the fused kernel can dispatch.
+    if (has_lazy) {
+        for (u32 i = 0; i < n_leaves; i++) {
+            if (!LEAF_IS_LAZY(leaf_ids[i])) continue;
+            Term lt = fuse_leaf_terms[i];
+            Term reduced = thvm_reduce(ctx, lt);
+            if (term_tag(reduced) != TAG_TEN) return reduce_id(ctx, t);
+            u32 tid = (u32)term_val(reduced);
+            leaf_ids[i] = tid;
+            leaf_views[i] = &ctx->tensors[tid].view;
+        }
+    }
 
     // ── Immediate dispatch (all leaves TAG_TEN) ─────────────────
     u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);

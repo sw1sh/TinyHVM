@@ -236,6 +236,9 @@ This is the foundation of:
 
 The idea: represent the entire search space as a superposition, let interaction rules explore it in parallel. When a solution is found, collapse the SUP to extract it.
 
+> For deep analysis of SupGen/NeoGen and how superposition-based search could
+> replace BEAM search for kernel optimization, see **[supgen_kernel_search.md](supgen_kernel_search.md)**.
+
 ---
 
 ## 5. GPU Architecture

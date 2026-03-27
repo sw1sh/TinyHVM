@@ -300,18 +300,10 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
     u32 out_numel = out_view.numel;
 
-    // Lazy leaves: reduce them now so the fused kernel can dispatch.
-    if (has_lazy) {
-        for (u32 i = 0; i < n_leaves; i++) {
-            if (!LEAF_IS_LAZY(leaf_ids[i])) continue;
-            Term lt = fuse_leaf_terms[i];
-            Term reduced = thvm_reduce(ctx, lt);
-            if (term_tag(reduced) != TAG_TEN) return reduce_id(ctx, t);
-            u32 tid = (u32)term_val(reduced);
-            leaf_ids[i] = tid;
-            leaf_views[i] = &ctx->tensors[tid].view;
-        }
-    }
+    // Lazy leaves: fall back to normal reduction.
+    // The trampoline reduces lazy leaves depth-first, then the rewrite
+    // rules catch the chain again with all-TAG_TEN leaves.
+    if (has_lazy) return reduce_id(ctx, t);
 
     // ── Immediate dispatch (all leaves TAG_TEN) ─────────────────
     u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);

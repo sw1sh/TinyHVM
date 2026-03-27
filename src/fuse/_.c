@@ -300,12 +300,80 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
     u32 out_numel = out_view.numel;
 
-    // Lazy leaves: fall back to normal reduction.
-    // Nested lazy leaf resolution corrupts the outer fuse's heap state
-    // because thvm_reduce modifies heap slots that the outer fuse references.
-    // The trampoline reduces lazy leaves depth-first, then the rewrite
-    // rules catch the chain again with all-TAG_TEN leaves.
-    if (has_lazy) return reduce_id(ctx, t);
+    // Lazy leaves: reduce them FIRST, then re-walk the graph.
+    // We can't resolve lazy leaves in-place because thvm_reduce modifies
+    // the heap, invalidating the fuse's collected ops/leaf data.
+    // Two-phase: reduce → re-walk (graph is now all-TAG_TEN) → dispatch.
+    if (has_lazy) {
+        // Phase 1: reduce all lazy leaves
+        for (u32 i = 0; i < n_leaves; i++) {
+            if (!LEAF_IS_LAZY(leaf_ids[i])) continue;
+            Term lt = fuse_leaf_terms[i];
+            thvm_reduce(ctx, lt); // reduces in-place, updates heap
+        }
+        // Phase 2: re-walk the graph (now all leaves should be TAG_TEN)
+        n_ops = 0; n_leaves = 0;
+        int walk2 = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
+        if (walk2 < 0) return reduce_id(ctx, t);
+        fuse_remap(ops, n_ops, n_leaves);
+        // Check for any remaining lazy leaves (shouldn't happen)
+        for (u32 i = 0; i < n_leaves; i++)
+            if (LEAF_IS_LAZY(leaf_ids[i])) return reduce_id(ctx, t);
+        // Recompute output shape from fresh leaf data
+        leaf_used[0] = 0; // reset
+        memset(leaf_used, 0, sizeof(leaf_used));
+        for (u32 i = 0; i < n_ops; i++) {
+            if (ops[i].arg_a < n_leaves) leaf_used[ops[i].arg_a] = 1;
+            if (ops[i].arg_b < n_leaves) leaf_used[ops[i].arg_b] = 1;
+        }
+        ew_view = (View){0}; ew_init = 0;
+        for (u32 i = 0; i < n_leaves; i++) {
+            if (!leaf_used[i]) continue;
+            if (!ew_init) { ew_view = *leaf_views[i]; ew_init = 1; continue; }
+            View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
+            if (!view_broadcast(&ew_view, leaf_views[i], &av_bc, &bv_bc, bc_shape, &bc_ndim))
+                return reduce_id(ctx, t);
+            ew_view = view_create(shape_of(bc_shape, bc_ndim));
+        }
+        if (!ew_init) return reduce_id(ctx, t);
+        // Recompute reduce
+        out_view = ew_view; reduce_dim = 1;
+        if (has_reduce) {
+            u64 sloc = term_val(sum_term);
+            Term saxes = heap_read(ctx, sloc + 1);
+            if (term_tag(saxes) == TAG_TEN) {
+                u32 axid = (u32)term_val(saxes);
+                TensorMeta *axt = &ctx->tensors[axid];
+                u32 nax = axt->view.numel;
+                f32 axf[MAX_DIM];
+                META_READ(ctx, axt->buf_id, axf, nax * sizeof(f32));
+                // Trailing check
+                u8 ira[MAX_DIM] = {0};
+                for (u32 i2 = 0; i2 < nax; i2++) ira[(int)axf[i2]] = 1;
+                int trailing = 1;
+                { int snr = 0;
+                  for (int d = (int)ew_view.shape.rank-1; d>=0; d--) {
+                      if (ira[d] && snr) { trailing=0; break; }
+                      if (!ira[d] && ew_view.shape.dims[d]>1) snr=1;
+                  }
+                }
+                if (!trailing) return reduce_id(ctx, t);
+                for (u32 i2 = 0; i2 < nax; i2++) {
+                    int ax = (int)axf[i2];
+                    if (ax>=0 && ax<(int)ew_view.shape.rank) {
+                        reduce_dim *= ew_view.shape.dims[ax];
+                        out_view.shape.dims[ax] = 1;
+                    }
+                }
+                out_view.numel = ew_view.numel / reduce_dim;
+            } else {
+                for (int d=(int)ew_view.shape.rank-1;d>=0;d--) {
+                    if (ew_view.shape.dims[d]>1) { reduce_dim=ew_view.shape.dims[d]; out_view.shape.dims[d]=1; out_view.numel=ew_view.numel/reduce_dim; break; }
+                }
+            }
+        }
+        out_numel = out_view.numel;
+    }
 
     // ── Immediate dispatch (all leaves TAG_TEN) ─────────────────
     u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);

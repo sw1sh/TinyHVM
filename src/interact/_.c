@@ -427,20 +427,22 @@ inet_step:
                         // we must materialize before reshape. Otherwise the new view's
                         // contiguous strides will index beyond the 1-element buffer.
                         new_view = view_reshape(ma->view, ns);
-                        // view_reshape returns contiguous=0 for:
-                        // 1. Valid non-contiguous (stride-0 preserved) — NO contiguify needed
-                        // 2. Failed reshape (fake strides) — contiguify required
-                        // Distinguish: if source had stride-0 and result has stride-0, it's case 1.
-                        // Masked views (from PAD) MUST be materialized before reshape —
-                        // view_reshape drops the mask, causing wrong data.
-                        int needs_materialize = ma->view.has_mask || !new_view.contiguous;
-                        if (needs_materialize && !ma->view.has_mask) {
-                            int has_stride0 = 0, src_has_stride0 = 0;
-                            for (u32 d2 = 0; d2 < ns.rank; d2++)
-                                if (ns.dims[d2] > 1 && new_view.strides[d2] == 0) has_stride0 = 1;
-                            for (u32 d2 = 0; d2 < ma->view.shape.rank; d2++)
-                                if (ma->view.shape.dims[d2] > 1 && ma->view.strides[d2] == 0) src_has_stride0 = 1;
-                            if (src_has_stride0 && has_stride0) needs_materialize = 0;
+                        // Materialize for:
+                        // 1. Masked views (PAD backward) — mask data lost in reshape
+                        // 2. Failed reshapes — view_reshape couldn't compute valid strides
+                        //    (returns contiguous-pattern strides but contiguous=0)
+                        // Don't materialize valid non-contiguous views — kernel handles them.
+                        int needs_materialize = ma->view.has_mask;
+                        if (!needs_materialize && !new_view.contiguous) {
+                            // Check if view_reshape produced fallback (contiguous-pattern) strides
+                            // This indicates a failed merge-split — strides don't match data layout
+                            int looks_contiguous = 1;
+                            i32 exp_st = 1;
+                            for (int d2 = (int)ns.rank - 1; d2 >= 0; d2--) {
+                                if (ns.dims[d2] > 1 && new_view.strides[d2] != exp_st) { looks_contiguous = 0; break; }
+                                exp_st *= (i32)ns.dims[d2];
+                            }
+                            if (looks_contiguous) needs_materialize = 1; // failed reshape fallback
                         }
                         if (needs_materialize) {
                             ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];

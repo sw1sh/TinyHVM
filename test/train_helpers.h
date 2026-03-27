@@ -159,13 +159,17 @@ static Term mnist_train_program(TinyHVM *ctx,
     Term z1  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1),
                        thvm_expand(ctx, B1, SHAPE(batch_size, hidden_dim)));
     Term h   = thvm_op(ctx, UOP_RELU, z1, term_era());
-    Term h_skip = thvm_reshape(ctx,
-        thvm_op(ctx, UOP_SUM, thvm_reshape(ctx, h, SHAPE(batch_size * hidden_dim)), term_era()),
-        SHAPE(1, 1));
+    // Skip: h used twice (MM + mean reduction). Mean keeps logits reasonable.
+    f32 inv_bh = 1.0f / (f32)(batch_size * hidden_dim);
+    Term h_mean = thvm_op(ctx, UOP_MUL,
+        thvm_reshape(ctx,
+            thvm_op(ctx, UOP_SUM, thvm_reshape(ctx, h, SHAPE(batch_size * hidden_dim)), term_era()),
+            SHAPE(1, 1)),
+        thvm_tensor(ctx, &inv_bh, SHAPE(1, 1)));
     Term out = thvm_op(ctx, UOP_ADD,
         thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
                        thvm_expand(ctx, B2, SHAPE(batch_size, 10))),
-        thvm_expand(ctx, h_skip, SHAPE(batch_size, 10)));
+        thvm_expand(ctx, h_mean, SHAPE(batch_size, 10)));
 
     // Cross-entropy loss: -mean(sum(Y * log(softmax(out)), axis=1))
     // Softmax: max → sub → exp → sum → div

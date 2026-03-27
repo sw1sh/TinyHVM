@@ -43,6 +43,7 @@ static void adam_step(TinyHVM *ctx, Adam *opt, u32 *grad_ids) {
     for (u32 i = 0; i < opt->n_params; i++) {
         u32 pid = opt->param_ids[i];
         u32 sz = opt->param_sizes[i];
+        if (grad_ids[i]) ENSURE(ctx, grad_ids[i]);
         ctx->backend->op_adam_step(
             ctx->tensors[pid].buf_id,
             ctx->tensors[grad_ids[i]].buf_id,

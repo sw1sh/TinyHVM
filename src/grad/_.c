@@ -40,6 +40,7 @@ static void backward_local(TinyHVM *ctx, u32 y_id, u32 gy_id, u32 *ga) {
     if (!cop) return;  // leaf — no backward
 
     u32 aid = my->src_ids[0], bid = my->src_ids[1];
+    ENSURE(ctx, gy_id); ENSURE(ctx, aid); if (bid) ENSURE(ctx, bid);
     TensorMeta *ma = &ctx->tensors[aid];
     Term gy = term_ten(gy_id, DTYPE_F32);
     Term at = term_ten(aid, ma->dtype);

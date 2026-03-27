@@ -6,6 +6,7 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t) {
     t = thvm_reduce(ctx, t);
     if (term_tag(t) != TAG_TEN) return NULL;
     u32 id = (u32)term_val(t);
+    ENSURE(ctx, id);
     TensorMeta *m = &ctx->tensors[id];
 
     if (m->view.contiguous) {

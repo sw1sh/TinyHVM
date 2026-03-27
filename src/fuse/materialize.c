@@ -24,6 +24,19 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
 
     // Lazy tensor (buf_id == 0): it's an op in the chain
     u32 uop = m->creator_op;
+
+    // View ops: materialize base, share its buffer
+    if (is_view_op(uop)) {
+        u32 base = m->src_ids[0];
+        if (base && ctx->tensors[base].buf_id == 0 && ctx->tensors[base].creator_op)
+            tensor_materialize(ctx, base);
+        if (base && ctx->tensors[base].buf_id != 0) {
+            m->buf_id = ctx->tensors[base].buf_id;
+            return -2; // special: buf_id set but not an op
+        }
+        return -1;
+    }
+
     if (!is_elementwise(uop)) return -1; // boundary — shouldn't be lazy
 
     // Recurse into inputs
@@ -38,33 +51,41 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
 
     if (*n_ops >= FUSE_MAX_OPS) return -1;
     u32 op_idx = (*n_ops)++;
-    // Leaf references use raw index, op references use n_leaves + op_idx
+    // Use FUSE_MAX_LEAVES as fixed offset for op indices so they don't shift
+    // as more leaves are added. Remapped to n_leaves-based indices after walk.
     ops[op_idx] = (FusedOp){
         .uop = uop,
         .arg_a = (u32)arg_a,
         .arg_b = is_binary(uop) ? (u32)arg_b : 0
     };
-    return (int)(*n_leaves + op_idx); // op var index
+    return (int)(FUSE_MAX_LEAVES + op_idx);
 }
 
 // Materialize a lazy tensor: compile + dispatch its provenance chain.
 // Allocates buffer, fills with computed data.
 static void tensor_materialize(TinyHVM *ctx, u32 tid) {
     TensorMeta *m = &ctx->tensors[tid];
-    if (m->buf_id != 0) return; // already materialized
+    if (m->buf_id != 0) return;
+    static int _mc = 0; _mc++;
 
     FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0;
     u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
 
     int result = materialize_walk(ctx, tid, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
+    if (m->buf_id != 0) return; // view op handler set buf_id directly
     if (result < 0 || n_ops == 0) {
-        // Can't fuse — allocate buffer and zero-fill
         m->buf_id = ctx->backend->buf_alloc(m->view.numel * sizeof(f32));
         return;
     }
 
-    // Remap: materialize_walk returns leaf indices directly (0..n_leaves-1)
-    // and op indices as n_leaves + op_idx. The codegen expects this format.
+    // Remap op indices: walk used FUSE_MAX_LEAVES as fixed offset to avoid
+    // shifting as leaves were added. Codegen expects n_leaves-based offsets.
+    for (u32 i = 0; i < n_ops; i++) {
+        if (ops[i].arg_a >= FUSE_MAX_LEAVES)
+            ops[i].arg_a = n_leaves + (ops[i].arg_a - FUSE_MAX_LEAVES);
+        if (ops[i].arg_b >= FUSE_MAX_LEAVES)
+            ops[i].arg_b = n_leaves + (ops[i].arg_b - FUSE_MAX_LEAVES);
+    }
 
     // Allocate output buffer
     m->buf_id = ctx->backend->buf_alloc(m->view.numel * sizeof(f32));

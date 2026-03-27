@@ -318,7 +318,7 @@ inet_step:
                     u32 dst_id = (u32)term_val(dst_r);
                     u32 src_id = (u32)term_val(src_t);
                     if (dst_id != src_id) {
-                        // Blit src into dst's buffer — GPU copy via contiguify
+                        ENSURE(ctx, src_id);
                         TensorMeta *md = &ctx->tensors[dst_id];
                         TensorMeta *ms = &ctx->tensors[src_id];
                         #ifdef __APPLE__
@@ -460,6 +460,7 @@ inet_step:
                 // b encodes the new shape/args as a tensor with shape data
                 u32 b_id = 0;
                 if (term_tag(b) == TAG_TEN) b_id = (u32)term_val(b);
+                if (b_id) { ENSURE(ctx, b_id); }
                 View new_view;
                 switch (uop) {
                     case UOP_RESHAPE: {
@@ -491,10 +492,10 @@ inet_step:
                         }
                         if (needs_materialize) {
                             // Materialize non-contiguous view to contiguous buffer
+                            ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];
                             u32 numel = ma->view.numel;
                             u32 orig_a_id = a_id;
                             u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
-
                             #ifdef __APPLE__
                             if (ctx->backend == &metal_backend) {
                                 // GPU path: strided copy via fused identity kernel
@@ -567,11 +568,12 @@ inet_step:
                     }
                     case UOP_SHRINK: {
                         // b is a 1D tensor: [start0, end0, start1, end1, ...]
+                        // Use full buf_read (not META_READ) — pairs may be GPU-computed
                         assert(b_id);
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 n_pairs = mb->view.numel;
                         f32 *pairs = malloc(n_pairs * sizeof(f32));
-                        META_READ(ctx, mb->buf_id, pairs, n_pairs * sizeof(f32));
+                        ctx->backend->buf_read(mb->buf_id, pairs, n_pairs * sizeof(f32));
                         u32 starts[MAX_DIM], ends[MAX_DIM];
                         for (u32 i = 0; i < n_pairs / 2; i++) {
                             starts[i] = (u32)pairs[i * 2];
@@ -697,6 +699,11 @@ inet_step:
                 }
             }
 
+            // Materialize lazy inputs before dispatch
+            if (!is_elementwise(uop) || md->view.numel > 2000000) {
+                ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];
+                if (b_id) { ENSURE(ctx, b_id); if (is_binary) mb = &ctx->tensors[b_id]; }
+            }
             // Dispatch
             if (uop == UOP_MM) {
                 u32 M = ma->view.shape.dims[0], K = ma->view.shape.dims[1], N = mb->view.shape.dims[1];

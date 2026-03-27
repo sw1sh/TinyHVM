@@ -42,24 +42,17 @@ static void top_decref_inputs(TinyHVM *ctx, u64 loc, u32 uop, Term result) {
     }
 }
 
-// Pre-allocated stack pool — each recursion level gets a slice.
-// GRAD backward through deep networks (CNN) causes O(chain_length) recursion
-// via RETURN_REDUCED in thvm_interact. Keep SLICE small to fit in TLS.
-#define REDUCE_SLICE 256
-#define REDUCE_MAX_DEPTH 512
-static _Thread_local Term reduce_pool[REDUCE_SLICE * REDUCE_MAX_DEPTH];  // 1MB TLS
-static _Thread_local int  reduce_depth = 0;
+// Stack for trampoline — malloc'd per call like original.
+#define FRAME_CAP 65536
 
 Term thvm_reduce(TinyHVM *ctx, Term root) {
-    int depth = reduce_depth++;
-    assert(depth < REDUCE_MAX_DEPTH);
-    Term *stk = &reduce_pool[depth * REDUCE_SLICE];
+    Term *stk = (Term *)malloc(FRAME_CAP * sizeof(Term));
     int  sp = 0;
 
     Term next = root;
     Term whnf;
 
-    #define PUSH(f_)  do { assert(sp < REDUCE_SLICE); stk[sp++] = (f_); } while(0)
+    #define PUSH(f_)  do { assert(sp < FRAME_CAP); stk[sp++] = (f_); } while(0)
 
   enter: {
     u8 tag = term_tag(next);
@@ -159,7 +152,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     // Stack empty — whnf is the result
   }
 
-    reduce_depth--;
+    free(stk);
     #undef PUSH
     return whnf;
 }

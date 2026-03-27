@@ -83,6 +83,8 @@ static u32 reduce_id(TinyHVM *ctx, Term t);
 static u32 fuse_or_reduce(TinyHVM *ctx, Term t);
 static int is_elementwise(u32 uop);
 static int is_binary(u32 uop);
+static void tensor_materialize(TinyHVM *ctx, u32 tid);
+#define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0&&c->tensors[t].creator_op)tensor_materialize(c,t);}while(0)
 
 // ── clone/ — deep-copy (ALO) for REF unfolding ──────────────────────────────
 #include "clone/_.c"
@@ -104,6 +106,7 @@ static int is_binary(u32 uop);
 
 // ── fuse/ — elementwise fusion (fuse_walk_inner, fuse_or_reduce) ─────────────
 #include "fuse/_.c"
+#include "fuse/materialize.c"
 
 // ── grad/ — thvm_grad, thvm_backward ─────────────────────────────────────────
 #include "grad/_.c"

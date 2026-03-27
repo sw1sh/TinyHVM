@@ -54,17 +54,16 @@ int main(void) {
     // Cross-entropy
     Term loss=cross_entropy_loss(ctx,out,data.train_labels,BS,10);
 
-    // GRAD
-    Term grads[4];
-    f32 zero=0; Term zt=thvm_tensor(ctx,&zero,SHAPE(1));
-    Term chain=term_era();
+    // GRAD — reduce each directly, clearing DUP state between walks
     Term params[]={W1,B1,W2,B2};
-    for(int i=3;i>=0;i--){
-        grads[i]=thvm_grad(ctx,loss,params[i]);
-        chain=thvm_app(ctx,thvm_assign(ctx,params[i],
-            thvm_op(ctx,UOP_SUB,params[i],thvm_op(ctx,UOP_MUL,zt,grads[i]))),chain);
+    Term grads[4];
+    for(u32 i=0;i<4;i++) {
+        // Clear all DUP grad slots before each walk
+        for(u32 j=0;j<ctx->tensor_count;j++)
+            if(ctx->tensors[j].dup_loc)
+                heap_set(ctx, ctx->tensors[j].dup_loc + 1, term_era());
+        grads[i]=thvm_reduce(ctx,thvm_grad(ctx,loss,params[i]));
     }
-    thvm_reduce(ctx,chain);
 
     printf("loss=%.6f\n",thvm_to_host(ctx,loss)[0]);
 

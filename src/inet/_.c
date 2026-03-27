@@ -28,9 +28,11 @@ Term thvm_sup(TinyHVM *ctx, Term a, Term b) {
 // Forward: both DP0/DP1 reduce to the value (passthrough).
 // Backward: GRAD deposits ADD node at loc+1 for the second path.
 void thvm_dup(TinyHVM *ctx, Term z, Term *out0, Term *out1) {
-    u64 loc = heap_alloc(ctx, 2);
+    u64 loc = heap_alloc(ctx, 4);
     heap_set(ctx, loc,     z);
-    heap_set(ctx, loc + 1, term_era());  // grad accumulator slot
+    heap_set(ctx, loc + 1, term_era());
+    heap_set(ctx, loc + 2, term_new(TAG_NUM, NUM_U32, 2));
+    heap_set(ctx, loc + 3, term_new(TAG_NUM, NUM_U32, 2));
     *out0 = term_new(TAG_DP0, 0, loc);
     *out1 = term_new(TAG_DP1, 0, loc);
     // Link tensor to its DUP node

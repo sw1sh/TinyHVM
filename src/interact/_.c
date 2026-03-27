@@ -76,14 +76,49 @@ inet_step:
                         u64 _l = heap_alloc(ctx, 3); \
                         heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
                         term_new(TAG_TOP, UOP_GRAD, _l); })
-                    // Pure inet: no REACHES, no GRAD_COMBINE, no GRAD_STEP.
-                    // Create GRAD nodes, return ADD. Trampoline handles ERA identity.
+                    // DUP-GRAD: route gradient through DUP accumulator.
+                    // Park first arrival, fire last (accumulate via ADD).
+                    // Prevents diamond double-counting at shared nodes.
+                    // Find DUP loc for a tensor ID (checks TensorMeta)
+                    #define FIND_DUP(tid_) (ctx->tensors[tid_].dup_loc)
+                    // DUP-GRAD with counter at dup_loc+2.
+                    // Each arrival: accumulate gradient, decrement counter.
+                    // When counter reaches 0: all contributions received, continue backward.
+                    #define GRAD3_DUP(tid_, da_, x_) ({ \
+                        Term _r; \
+                        u64 _dl = FIND_DUP(tid_); \
+                        if (!_dl) { \
+                            _r = GRAD3(term_ten(tid_, ctx->tensors[tid_].dtype), da_, x_); \
+                        } else { \
+                            /* Accumulate */ \
+                            Term _acc = heap_read(ctx, _dl + 1); \
+                            if (term_tag(_acc) == TAG_ERA) \
+                                heap_set(ctx, _dl + 1, da_); \
+                            else \
+                                heap_set(ctx, _dl + 1, thvm_reduce(ctx, \
+                                    thvm_op(ctx, UOP_ADD, _acc, da_))); \
+                            /* Decrement counter */ \
+                            u32 _cnt = term_as_u32(heap_read(ctx, _dl + 2)); \
+                            _cnt--; \
+                            heap_set(ctx, _dl + 2, term_new(TAG_NUM, NUM_U32, _cnt)); \
+                            if (_cnt > 0) { \
+                                _r = term_era(); \
+                            } else { \
+                                Term _total = heap_read(ctx, _dl + 1); \
+                                /* Reset for next walk */ \
+                                heap_set(ctx, _dl + 1, term_era()); \
+                                u32 _orig = term_as_u32(heap_read(ctx, _dl + 3)); \
+                                heap_set(ctx, _dl + 2, term_new(TAG_NUM, NUM_U32, _orig)); \
+                                _r = GRAD3(term_ten(tid_, ctx->tensors[tid_].dtype), _total, x_); \
+                            } \
+                        } \
+                        _r; })
                     #define BIN_GRAD(da_, db_) \
                         RETURN_REDUCED(thvm_op(ctx, UOP_ADD, \
-                            GRAD3(at, da_, x), \
-                            GRAD3(bt, db_, x)))
+                            GRAD3_DUP(aid, da_, x), \
+                            GRAD3_DUP(bid, db_, x)))
                     #define UN_GRAD(da_) \
-                        RETURN_REDUCED(GRAD3(at, da_, x))
+                        RETURN_REDUCED(GRAD3_DUP(aid, da_, x))
 
                     switch (cop) {
                         case UOP_ADD:
@@ -195,6 +230,7 @@ inet_step:
                         }
                     }
                     #undef GRAD3
+                    #undef GRAD3_DUP
                     #undef BIN_GRAD
                     #undef UN_GRAD
                 }
@@ -853,8 +889,12 @@ inet_step:
                 t = heap_read(ctx, term_val(val));
                 goto inet_step;
             }
-            if (term_tag(val) == TAG_TEN) { // DUP passthrough: both copies see same tensor
+            if (term_tag(val) == TAG_TEN) {
                 heap_set(ctx, loc, val);
+                // Propagate DUP loc to TensorMeta for GRAD handler
+                u32 tid = (u32)term_val(val);
+                if (tid < ctx->tensor_count)
+                    ctx->tensors[tid].dup_loc = loc;
                 return val;
             }
             heap_set(ctx, loc, val);
@@ -871,6 +911,9 @@ inet_step:
             }
             if (term_tag(val) == TAG_TEN) {
                 heap_set(ctx, loc, val);
+                u32 tid = (u32)term_val(val);
+                if (tid < ctx->tensor_count)
+                    ctx->tensors[tid].dup_loc = loc;
                 return val;
             }
             heap_set(ctx, loc, val);

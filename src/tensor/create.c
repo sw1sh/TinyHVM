@@ -8,6 +8,7 @@ static u32 tensor_create(TinyHVM *ctx, Shape s, u32 dtype) {
   memset(m, 0, sizeof(*m));
   m->dtype   = dtype;
   m->refcount = 1;
+  m->last_use_loc = (u64)-1;
   m->view    = view_create(s);
   if (ctx->backend) {
     u64 bytes = (u64)m->view.numel * dtype_size(dtype);
@@ -27,7 +28,8 @@ static u32 tensor_view_of(TinyHVM *ctx, u32 src_id, View new_view) {
   memset(m, 0, sizeof(*m));
   m->dtype    = ms->dtype;
   m->refcount = 1;
-  m->buf_id   = ms->buf_id;  // SHARE
+  m->last_use_loc = (u64)-1;
+  m->buf_id   = ms->buf_id;
   m->view     = new_view;
   return id;
 }

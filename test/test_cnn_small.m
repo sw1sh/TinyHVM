@@ -77,11 +77,21 @@ int main(int argc, char **argv) {
 
         f32 lr = 0.01f;
         Term lr_t = thvm_tensor(ctx, &lr, SHAPE(1));
+        // Reduce each GRAD independently, clearing DUP state between walks
+        Term grad_vals[N_PARAMS];
+        for (u32 i = 0; i < N_PARAMS; i++) {
+            // Clear DUP grad slots
+            for (u32 j = 0; j < ctx->tensor_count; j++)
+                if (ctx->tensors[j].dup_loc)
+                    heap_set(ctx, ctx->tensors[j].dup_loc + 1, term_era());
+            grad_vals[i] = thvm_reduce(ctx, thvm_grad(ctx, loss, params[i]));
+        }
+        // Then apply SGD updates
         Term chain = term_era();
         for (int i = N_PARAMS - 1; i >= 0; i--) {
-            Term g = thvm_grad(ctx, loss, params[i]);
+            if (term_tag(grad_vals[i]) != TAG_TEN) continue;
             Term new_p = thvm_op(ctx, UOP_SUB, params[i],
-                thvm_op(ctx, UOP_MUL, lr_t, g));
+                thvm_op(ctx, UOP_MUL, lr_t, grad_vals[i]));
             chain = thvm_app(ctx, thvm_assign(ctx, params[i], new_p), chain);
         }
         thvm_reduce(ctx, chain);

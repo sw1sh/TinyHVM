@@ -477,11 +477,6 @@ typedef struct {
     u8          dup_frozen; // reserved
     u8          in_grad;    // reserved
 
-    // Multi-target GRAD: when set, GRAD with x=ERA checks all params
-    Term       *grad_params;   // array of param TAG_TEN terms
-    Term       *grad_results;  // array to store gradient results
-    u32         grad_n_params; // number of params
-
     // Named definitions for TAG_REF (global def table)
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term
     u32         def_count;

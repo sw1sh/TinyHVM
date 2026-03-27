@@ -102,14 +102,29 @@ DUP was stripped for correctness verification, then restored as optimization:
 | Full CNN (14 params, BS=128) | — | too slow | needs optimization |
 | tinygrad reference | 26 | ~100ms | target |
 
-### Multi-target GRAD (`thvm_grad_all`)
+### Multi-target GRAD (`thvm_grad_multi`) — Pure IC
 
-`thvm_grad_all(ctx, loss, params, grads, n_params)` computes gradients for ALL params
-in a SINGLE backward walk (x=ERA triggers multi-target mode in GRAD handler).
+`thvm_grad_multi(ctx, loss, params, grad_slots, n_params)` returns a LAZY TERM that,
+when reduced, walks the provenance chain ONCE and deposits gradients via ASSIGN.
 
-- **Reduces O(N×D) to O(D)** for N params with chain depth D
-- 2-conv CNN: 342→83 dispatches (4.1× reduction), 1000→130ms (7.7× faster)
-- Verified: exact match against per-param thvm_grad on both MLP and CNN
+**No mutable context state.** The multi-target encoding is a TAG_CTR heap node:
+```
+heap[loc]     = N (count)
+heap[loc+1..] = param_0, slot_0, param_1, slot_1, ...
+```
+
+x = TAG_CTR(loc). When GRAD reaches a leaf matching param_i, it fires
+`APP(ASSIGN(slot_i, gy), ERA)` — the ASSIGN deposits, APP-TEN→ERA propagates.
+
+Usage: ONE `thvm_reduce` drives grad + SGD together:
+```c
+Term grad_term = thvm_grad_multi(ctx, loss, params, grad_slots, N);
+Term sgd_chain = ...; // reads from grad_slots
+thvm_reduce(ctx, thvm_app(ctx, grad_term, sgd_chain));
+```
+
+- Verified: exact match vs per-param thvm_grad on 2-layer CNN (all 6 params, zero diff)
+- 1-layer CNN: 66 dispatches, 11ms/step
 
 ### Tinygrad comparison (Metal)
 

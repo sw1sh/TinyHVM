@@ -41,9 +41,9 @@ inet_step:
                 Term x  = heap_read(ctx, loc + 2);
 
                 // Reduce x if lazy (trampoline only auto-reduces slots 0,1; slot 2 stays raw)
-                if (term_tag(x) != TAG_TEN && term_tag(x) != TAG_ERA) {
+                if (term_tag(x) != TAG_TEN && term_tag(x) != TAG_ERA && term_tag(x) != TAG_CTR) {
                     x = thvm_reduce(ctx, x);
-                    heap_set(ctx, loc + 2, x);  // cache for re-entries
+                    heap_set(ctx, loc + 2, x);
                 }
 
                 if (term_tag(y) == TAG_TEN) {
@@ -53,18 +53,19 @@ inet_step:
                     if (term_tag(x) == TAG_TEN && (u32)term_val(x) == y_id)
                         RETURN_REDUCED(thvm_reduce(ctx, gy));
 
-                    // Multi-target mode: x=ERA, check if y is any param
-                    if (term_tag(x) == TAG_ERA && ctx->grad_n_params > 0) {
-                        for (u32 _gi = 0; _gi < ctx->grad_n_params; _gi++) {
-                            if ((u32)term_val(ctx->grad_params[_gi]) == y_id) {
-                                // Found param! Accumulate gradient.
-                                Term prev = ctx->grad_results[_gi];
-                                if (term_tag(prev) == TAG_ERA)
-                                    ctx->grad_results[_gi] = thvm_reduce(ctx, gy);
-                                else
-                                    ctx->grad_results[_gi] = thvm_reduce(ctx,
-                                        thvm_op(ctx, UOP_ADD, prev, gy));
-                                RETURN_REDUCED(term_era());
+                    // Multi-target: x = TAG_CTR encoding (param, slot) pairs.
+                    // When y matches a param, deposit gy via ASSIGN into the slot.
+                    // APP(ASSIGN(slot, gy), ERA) fires the deposit and returns ERA.
+                    if (term_tag(x) == TAG_CTR) {
+                        u64 tgt_loc = term_val(x);
+                        u32 n_tgt = term_as_u32(heap_read(ctx, tgt_loc));
+                        for (u32 _gi = 0; _gi < n_tgt; _gi++) {
+                            Term p = heap_read(ctx, tgt_loc + 1 + 2*_gi);
+                            if (term_tag(p) == TAG_TEN && (u32)term_val(p) == y_id) {
+                                Term slot = heap_read(ctx, tgt_loc + 1 + 2*_gi + 1);
+                                // Deposit: ASSIGN(slot, gy) fires during reduce
+                                RETURN_REDUCED(thvm_app(ctx,
+                                    thvm_assign(ctx, slot, gy), term_era()));
                             }
                         }
                     }

@@ -78,20 +78,32 @@ int main(int argc, char **argv) {
             thvm_expand(ctx, thvm_reshape(ctx, lin_b, SHAPE(1, 10)), SHAPE(BS, 10)));
         Term loss = cross_entropy_loss(ctx, logits, by, BS, 10);
 
-        // Single backward for all params + SGD update
-        thvm_reduce(ctx, loss);
-        Term grads[N_PARAMS];
-        thvm_grad_all(ctx, loss, params, grads, N_PARAMS);
+        // Pure IC: ONE reduce drives grad + SGD.
+        // Grad slots: pre-allocated zero tensors for gradient deposits.
+        Term grad_slots[N_PARAMS];
+        u32 param_sizes[] = {8*1*3*3, 8, flat_f*10, 10};
+        for (int i = 0; i < N_PARAMS; i++) {
+            f32 *z = calloc(param_sizes[i], sizeof(f32));
+            grad_slots[i] = thvm_tensor(ctx, z, ctx->tensors[(u32)term_val(params[i])].view.shape);
+            free(z);
+        }
 
+        // grad_term: walks provenance once, deposits into grad_slots via ASSIGN
+        Term grad_term = thvm_grad_multi(ctx, loss, params, grad_slots, N_PARAMS);
+
+        // SGD chain: reads from grad_slots (filled by grad_term's ASSIGNs)
         f32 lr = 0.01f;
         Term lr_t = thvm_tensor(ctx, &lr, SHAPE(1));
-        Term chain = term_era();
+        Term sgd_chain = term_era();
         for (int i = N_PARAMS - 1; i >= 0; i--) {
             Term new_p = thvm_op(ctx, UOP_SUB, params[i],
-                thvm_op(ctx, UOP_MUL, lr_t, grads[i]));
-            chain = thvm_app(ctx, thvm_assign(ctx, params[i], new_p), chain);
+                thvm_op(ctx, UOP_MUL, lr_t, grad_slots[i]));
+            sgd_chain = thvm_app(ctx, thvm_assign(ctx, params[i], new_p), sgd_chain);
         }
-        thvm_reduce(ctx, chain);
+
+        // ONE reduce: APP(grad_term, sgd_chain)
+        // grad_term runs first (deposits), returns ERA. APP-ERA → sgd_chain runs.
+        thvm_reduce(ctx, thvm_app(ctx, grad_term, sgd_chain));
         f32 loss_val = thvm_to_host(ctx, loss)[0];
 
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);

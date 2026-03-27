@@ -268,74 +268,94 @@ static int run_cnn(MNISTData *data) {
     Term train_data = thvm_tensor(ctx, data->train_images,
         (Shape){.dims={data->n_train, 1, 28, 28}, .rank=4});
 
-    Adam opt = adam_init(ctx, 0.001f, n_params);
-    for (u32 i = 0; i < n_params; i++)
-        adam_add_param(ctx, &opt, i, (u32)term_val(params[i]), param_sizes[i]);
+    // Adam momentum as inet tensors
+    Term m_terms[n_params], v_terms[n_params];
+    for (u32 i = 0; i < n_params; i++) {
+        f32 *z = calloc(param_sizes[i], sizeof(f32));
+        m_terms[i] = thvm_tensor(ctx, z, ctx->tensors[(u32)term_val(params[i])].view.shape);
+        v_terms[i] = thvm_tensor(ctx, z, ctx->tensors[(u32)term_val(params[i])].view.shape);
+        free(z);
+    }
 
     u32 n_weights = ctx->tensor_count;
     u32 n_batches = data->n_train / BS;
     u32 n_steps = 70;
     f32 lr_max = 0.001f, lr_min = 0.0001f;
+    f32 beta1 = 0.9f, beta2 = 0.999f, eps_val = 1e-8f;
     printf("  %u params, %u steps, BS=%u\n\n", n_params, n_steps, BS);
 
     struct timespec train_start; clock_gettime(CLOCK_MONOTONIC, &train_start);
 
-    extern void jit_begin_capture(u32);
-    extern void jit_end_capture(void);
-    extern void jit_replay(void);
-
     for (u32 step = 0; step < n_steps; step++) {
       @autoreleasepool {
         f32 progress = (f32)step / (f32)n_steps;
-        opt.lr = lr_min + 0.5f * (lr_max - lr_min) * (1.0f + cosf(3.14159f * progress));
+        f32 lr = lr_min + 0.5f * (lr_max - lr_min) * (1.0f + cosf(3.14159f * progress));
+        f32 bc1 = 1.0f - powf(beta1, (f32)(step+1));
+        f32 bc2 = 1.0f - powf(beta2, (f32)(step+1));
         struct timespec t0_wall; clock_gettime(CLOCK_MONOTONIC, &t0_wall);
 
-        f32 loss_val;
+        if (ctx->backend->begin_batch) ctx->backend->begin_batch();
 
-        if (1) { // JIT disabled — all steps run normally
-            if (step == 0) jit_begin_capture(n_weights);
+        u32 bi = step % n_batches;
+        Term x = thvm_shrink(ctx, train_data,
+            (u32[]){bi*BS, (bi+1)*BS, 0, 1, 0, 28, 0, 28}, 4);
+        thvm_set_requires_grad(ctx, x);
+        u8 *by = &data->train_labels[bi * BS];
 
-            if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+        // Forward + loss (fully lazy)
+        Term logits = thvm_sequential(ctx, x, model, N_LAYERS, BS, 1);
+        Term loss = cross_entropy_loss(ctx, logits, by, BS, 10);
 
-            u32 bi = step % n_batches;
-            Term x = thvm_shrink(ctx, train_data,
-                (u32[]){bi*BS, (bi+1)*BS, 0, 1, 0, 28, 0, 28}, 4);
-            thvm_set_requires_grad(ctx, x);
-            u8 *by = &data->train_labels[bi * BS];
+        if (ctx->backend->end_batch) ctx->backend->end_batch();
 
-            Term logits = thvm_sequential(ctx, x, model, N_LAYERS, BS, 1);
-            Term loss = cross_entropy_loss(ctx, logits, by, BS, 10);
+        // Adam scalars
+        Term lr_t = thvm_tensor(ctx, &lr, SHAPE(1));
+        Term b1_t = thvm_tensor(ctx, &beta1, SHAPE(1));
+        f32 omb1 = 1.0f - beta1; Term omb1_t = thvm_tensor(ctx, &omb1, SHAPE(1));
+        Term b2_t = thvm_tensor(ctx, &beta2, SHAPE(1));
+        f32 omb2 = 1.0f - beta2; Term omb2_t = thvm_tensor(ctx, &omb2, SHAPE(1));
+        f32 inv_bc1 = 1.0f / bc1; Term inv_bc1_t = thvm_tensor(ctx, &inv_bc1, SHAPE(1));
+        f32 inv_bc2 = 1.0f / bc2; Term inv_bc2_t = thvm_tensor(ctx, &inv_bc2, SHAPE(1));
+        Term eps_t = thvm_tensor(ctx, &eps_val, SHAPE(1));
 
-            if (ctx->backend->end_batch) ctx->backend->end_batch();
-
-            Term loss_r = thvm_schedule(ctx, loss);  // lazy graph compiler (phase 1: passthrough)
-
-            Term grad_terms[n_params];
-            thvm_backward(ctx, loss_r, params, grad_terms, n_params);
-            u32 grad_ids[n_params];
-            for (u32 i = 0; i < n_params; i++)
-                grad_ids[i] = (term_tag(grad_terms[i]) == TAG_TEN) ? (u32)term_val(grad_terms[i]) : 0;
-
-            adam_step(ctx, &opt, grad_ids);
-
-            loss_val = thvm_to_host(ctx, loss_r)[0];
-            if (step == 0) jit_end_capture();
+        // Inet-native: GRAD + Adam UOps + ASSIGN per param
+        Term chain = term_era();
+        for (int i = (int)n_params - 1; i >= 0; i--) {
+            Term g = thvm_grad(ctx, loss, params[i]);
+            Term new_m = thvm_op(ctx, UOP_ADD,
+                thvm_op(ctx, UOP_MUL, b1_t, m_terms[i]),
+                thvm_op(ctx, UOP_MUL, omb1_t, g));
+            Term new_v = thvm_op(ctx, UOP_ADD,
+                thvm_op(ctx, UOP_MUL, b2_t, v_terms[i]),
+                thvm_op(ctx, UOP_MUL, omb2_t, thvm_op(ctx, UOP_MUL, g, g)));
+            Term m_hat = thvm_op(ctx, UOP_MUL, new_m, inv_bc1_t);
+            Term v_hat = thvm_op(ctx, UOP_MUL, new_v, inv_bc2_t);
+            Term update = thvm_op(ctx, UOP_MUL, lr_t,
+                thvm_op(ctx, UOP_DIV, m_hat,
+                    thvm_op(ctx, UOP_ADD,
+                        thvm_op(ctx, UOP_SQRT, v_hat, term_era()), eps_t)));
+            Term new_p = thvm_op(ctx, UOP_SUB, params[i], update);
+            chain = thvm_app(ctx, thvm_assign(ctx, params[i], new_p),
+                    thvm_app(ctx, thvm_assign(ctx, m_terms[i], new_m),
+                    thvm_app(ctx, thvm_assign(ctx, v_terms[i], new_v), chain)));
         }
 
-        extern u32 total_dispatches, bc2d_count;
-        extern double flush_total_ms;
-        extern u32 flush_count_total;
-        if (step == 0) { extern void print_dispatch_breakdown(void); print_dispatch_breakdown();
-            struct timespec now_; clock_gettime(CLOCK_MONOTONIC, &now_);
-            f32 wall_ = (f32)(now_.tv_sec - t0_wall.tv_sec)*1000.0f + (f32)(now_.tv_nsec - t0_wall.tv_nsec)/1e6f;
-            printf("    step 0: dispatches=%u (2d_bc=%u) gpu=%.0fms wall=%.0fms\n",
-                   total_dispatches, bc2d_count, flush_total_ms, wall_);
-            fflush(stdout);
-            total_dispatches = 0; flush_total_ms = 0; flush_count_total = 0;
-            fast_dispatch_count = 0; slow_dispatch_count = 0;
-        }
+        // ONE reduce: forward + GRAD interactions + Adam UOps + ASSIGNs
+        thvm_reduce(ctx, chain);
 
-        // Invalidate host caches so next step reads updated weights
+        f32 loss_val = thvm_to_host(ctx, loss)[0];
+
+        extern u32 total_dispatches;
+        if (step == 0 || step % 10 == 0 || step == n_steps - 1) {
+            struct timespec t1_wall; clock_gettime(CLOCK_MONOTONIC, &t1_wall);
+            f32 ms = (f32)(t1_wall.tv_sec - t0_wall.tv_sec)*1000.0f +
+                     (f32)(t1_wall.tv_nsec - t0_wall.tv_nsec)/1e6f;
+            printf("  step %3u/%u  loss=%.4f  lr=%.5f  dispatches=%u tensors=%u (%.0fms)\n",
+                   step, n_steps, loss_val, lr, total_dispatches, ctx->tensor_count, ms);
+        }
+        total_dispatches = 0;
+
+        // Invalidate host caches + clear DUP state
         for (u32 i = 0; i < n_params; i++) {
             u32 pid = (u32)term_val(params[i]);
             if (ctx->tensors[pid].host_ptr) {
@@ -343,13 +363,6 @@ static int run_cnn(MNISTData *data) {
                 ctx->tensors[pid].host_ptr = NULL;
             }
         }
-
-        struct timespec t1_wall; clock_gettime(CLOCK_MONOTONIC, &t1_wall);
-        f32 ms = (f32)(t1_wall.tv_sec - t0_wall.tv_sec)*1000.0f +
-                 (f32)(t1_wall.tv_nsec - t0_wall.tv_nsec)/1e6f;
-        if (step % 10 == 0 || step == n_steps - 1)
-            printf("  step %3u/%u  loss=%.4f  lr=%.5f  (%.0fms)\n",
-                   step, n_steps, loss_val, opt.lr, ms);
 
         thvm_reset(ctx, n_weights);
       }
@@ -385,7 +398,6 @@ static int run_cnn(MNISTData *data) {
     printf("  Eval: %.1fs  Total: %.1fs\n", eval_s, train_s + eval_s);
     printf("  %s: CNN accuracy %s 90%%\n", acc > 90 ? "PASS" : "FAIL", acc > 90 ? ">" : "<");
 
-    adam_free(&opt);
     thvm_free(ctx);
     return acc > 90 ? 0 : 1;
 }

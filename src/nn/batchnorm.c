@@ -19,19 +19,14 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
         Term inv_n = thvm_expand(ctx, thvm_tensor(ctx, &inv_count, SHAPE(1)), SHAPE(C));
         batch_mean = thvm_op(ctx, UOP_MUL, x_sum, inv_n);
 
-        // REDUCE batch_mean ONCE — all users share this reduced tensor.
-        // This prevents the IC term consumption issue where multiple reduces
-        // of the same lazy chain give different results.
-        batch_mean = thvm_reduce(ctx, batch_mean);
-
-        // Detach for variance (create leaf copy with no creator_op)
-        u32 mean_src = (u32)term_val(batch_mean);
-        u32 mean_det_id = ctx->tensor_count++;
-        ctx->tensors[mean_det_id] = ctx->tensors[mean_src];
-        ctx->tensors[mean_det_id].host_ptr = NULL;
-        ctx->tensors[mean_det_id].creator_op = 0;
-        ctx->tensors[mean_det_id].requires_grad = 0;
-        Term mean_det = term_ten(mean_det_id, DTYPE_F32);
+        // DUP batch_mean: one copy for variance, one for output normalization.
+        // No thvm_reduce — stays lazy. DUP ensures the computation runs once.
+        Term mean_for_var, mean_for_out;
+        thvm_dup(ctx, batch_mean, &mean_for_var, &mean_for_out);
+        // "Detach" the variance copy: wrap in a no-grad marker
+        // For now, just use the copy directly (GRAD will flow through both paths;
+        // the DUP accumulation handles it correctly).
+        Term mean_det = mean_for_var;
 
         // batch_var = ((x - detach(mean))^2).mean(axis=(0,2,3)) — LAZY
         Term md4 = thvm_expand(ctx, thvm_reshape(ctx, mean_det, SHAPE(1,C,1,1)),
@@ -43,18 +38,12 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
         Term y2s = thvm_reshape(ctx, thvm_op(ctx, UOP_SUM, y2f, term_era()), SHAPE(C));
         batch_var = thvm_op(ctx, UOP_MUL, y2s, inv_n);
 
-        // REDUCE batch_var ONCE
-        batch_var = thvm_reduce(ctx, batch_var);
+        // DUP batch_var: one copy for running stats, one for output normalization.
+        Term var_for_stats, var_for_out;
+        thvm_dup(ctx, batch_var, &var_for_stats, &var_for_out);
+        Term var_det = var_for_stats;
 
-        // Running stats assigns use the already-reduced (detached) values
         f32 mom = 0.1f, bessel = (f32)count / (f32)(count - 1);
-        // Detach for assigns: just copy the already-reduced tensors
-        u32 var_det_id = ctx->tensor_count++;
-        ctx->tensors[var_det_id] = ctx->tensors[(u32)term_val(batch_var)];
-        ctx->tensors[var_det_id].host_ptr = NULL;
-        ctx->tensors[var_det_id].creator_op = 0;
-        ctx->tensors[var_det_id].requires_grad = 0;
-        Term var_det = term_ten(var_det_id, DTYPE_F32);
 
         f32 omm = 1.0f - mom, mb = mom * bessel;
         Term new_rm = thvm_op(ctx, UOP_ADD,
@@ -66,13 +55,13 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
         Term assign_rm = thvm_assign(ctx, rmean, new_rm);
         Term assign_rv = thvm_assign(ctx, rvar, new_rv);
 
-        // Build output FIRST (uses live batch_mean and batch_var)
-        Term mean_bc = thvm_expand(ctx, thvm_reshape(ctx, batch_mean, SHAPE(1,C,1,1)),
+        // Output uses the DUP copies for mean and var
+        Term mean_bc = thvm_expand(ctx, thvm_reshape(ctx, mean_for_out, SHAPE(1,C,1,1)),
             (Shape){.dims={B,C,H,W},.rank=4});
         Term eps_bc = thvm_expand(ctx, thvm_tensor(ctx, &eps_val, SHAPE(1)), SHAPE(C));
         Term invstd = thvm_op(ctx, UOP_DIV,
             thvm_tensor(ctx, &(f32){1.0f}, SHAPE(1)),
-            thvm_op(ctx, UOP_SQRT, thvm_op(ctx, UOP_ADD, batch_var, eps_bc), term_era()));
+            thvm_op(ctx, UOP_SQRT, thvm_op(ctx, UOP_ADD, var_for_out, eps_bc), term_era()));
         Term invstd_bc = thvm_expand(ctx, thvm_reshape(ctx, invstd, SHAPE(1,C,1,1)),
             (Shape){.dims={B,C,H,W},.rank=4});
         Term gamma_bc = thvm_expand(ctx, thvm_reshape(ctx, gamma, SHAPE(1,C,1,1)),

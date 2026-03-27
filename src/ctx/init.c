@@ -100,7 +100,7 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
     if (term_tag(t) != TAG_TEN) return t;
     u32 tid = (u32)term_val(t);
     if (tid >= ctx->tensor_count || !ctx->tensors[tid].requires_grad) return t;
-    if (ctx->tensors[tid].creator_op) return t; // only DUP leaf params, not intermediates
+    if (ctx->tensors[tid].creator_op) return t; // only DUP leaf params — intermediates need a different approach
     TensorMeta *m = &ctx->tensors[tid];
     if (!m->last_use_loc) {
         m->last_use_loc = dest_loc + 1;

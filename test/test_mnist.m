@@ -91,7 +91,7 @@ static int run_mlp(MNISTData *data) {
 
     u32 BS = 128, H = 128;
     u32 n_batches = data->n_train / BS;
-    f32 lr_val = 0.1f;
+    f32 lr_val = 0.001f;
 
     TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
 

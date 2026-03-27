@@ -301,6 +301,8 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     u32 out_numel = out_view.numel;
 
     // Lazy leaves: fall back to normal reduction.
+    // Nested lazy leaf resolution corrupts the outer fuse's heap state
+    // because thvm_reduce modifies heap slots that the outer fuse references.
     // The trampoline reduces lazy leaves depth-first, then the rewrite
     // rules catch the chain again with all-TAG_TEN leaves.
     if (has_lazy) return reduce_id(ctx, t);

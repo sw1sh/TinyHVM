@@ -100,7 +100,6 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
     if (term_tag(t) != TAG_TEN) return t;
     u32 tid = (u32)term_val(t);
     if (tid >= ctx->tensor_count || !ctx->tensors[tid].requires_grad) return t;
-    if (ctx->tensors[tid].creator_op) return t; // only DUP leaf params — intermediates need a different approach
     TensorMeta *m = &ctx->tensors[tid];
     if (!m->last_use_loc) {
         m->last_use_loc = dest_loc + 1;
@@ -130,11 +129,13 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
 }
 
 Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
-    u64 loc = heap_alloc(ctx, 2);
+    u64 loc = heap_alloc(ctx, 4); // 0-1: args (trampoline overwrites), 2-3: shadow (preserved)
     a = linear_use(ctx, a, loc);
     b = linear_use(ctx, b, loc + 1);
     heap_set(ctx, loc, a);
     heap_set(ctx, loc + 1, b);
+    heap_set(ctx, loc + 2, a); // shadow copy — original DP0/DP1 terms preserved for GRAD
+    heap_set(ctx, loc + 3, b);
 
     // Shape tracking: eagerly compute and store output view.
     // View ops with metadata (RESHAPE, EXPAND, SHRINK, PAD, PERMUTE) store
@@ -294,7 +295,7 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
         if (!valid) goto lazy;
         // Reshape is valid as a view alias — same buffer, computed strides
         u32 id = ctx->tensor_count++;
-        ctx->tensors[id] = *m;
+        ctx->tensors[id] = *m; ctx->tensors[id].last_use_loc = 0; ctx->tensors[id].dup_loc = 0; ctx->tensors[id].creator_loc = 0;
         ctx->tensors[id].view = rv;
         ctx->tensors[id].host_ptr = NULL;
         ctx->tensors[id].creator_op = UOP_RESHAPE;
@@ -316,7 +317,7 @@ Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
         TensorMeta *m = &ctx->tensors[src_id];
         // Expand: set stride=0 where dim goes from 1→N
         u32 id = ctx->tensor_count++;
-        ctx->tensors[id] = *m;
+        ctx->tensors[id] = *m; ctx->tensors[id].last_use_loc = 0; ctx->tensors[id].dup_loc = 0; ctx->tensors[id].creator_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
         View *v = &ctx->tensors[id].view;
         if (v->shape.rank != new_shape.rank) {
@@ -354,7 +355,7 @@ Term thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank) {
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
         u32 id = ctx->tensor_count++;
-        ctx->tensors[id] = *m;
+        ctx->tensors[id] = *m; ctx->tensors[id].last_use_loc = 0; ctx->tensors[id].dup_loc = 0; ctx->tensors[id].creator_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
         ctx->tensors[id].view = view_permute(m->view, axes);
         ctx->tensors[id].creator_op = UOP_PERMUTE;
@@ -385,7 +386,7 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         }
         // Zero-copy: create view with mask
         u32 id = ctx->tensor_count++;
-        ctx->tensors[id] = *m;
+        ctx->tensors[id] = *m; ctx->tensors[id].last_use_loc = 0; ctx->tensors[id].dup_loc = 0; ctx->tensors[id].creator_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
         ctx->tensors[id].view = view_pad(m->view, pad_before, pad_after);
         ctx->tensors[id].creator_op = UOP_PAD;
@@ -418,7 +419,7 @@ Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         }
         // ns not needed — dims set directly on the view below
         u32 id = ctx->tensor_count++;
-        ctx->tensors[id] = *m;
+        ctx->tensors[id] = *m; ctx->tensors[id].last_use_loc = 0; ctx->tensors[id].dup_loc = 0; ctx->tensors[id].creator_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
         View *v = &ctx->tensors[id].view;
         for (u32 i = 0; i < ndim; i++) v->shape.dims[i] = new_dims[i];

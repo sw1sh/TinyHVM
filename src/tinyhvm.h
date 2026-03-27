@@ -404,6 +404,7 @@ typedef struct {
     u32         creator_op; // UOP that created this tensor
     u32         src_ids[2]; // input tensor ids (for backward rules + REACHES traversal)
     u64         dup_loc;    // heap location of DUP node (0 = not DUPed)
+    u64         creator_loc; // heap location of the TAG_TOP that created this tensor
     u64         last_use_loc; // heap slot where this tensor was last placed (0 = unused)
 
     // Fusion metadata (only when creator_op == UOP_FUSING)

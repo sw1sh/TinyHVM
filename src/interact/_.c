@@ -658,57 +658,14 @@ inet_step:
             u32 dst_id = tensor_create(ctx, shape_of(out_shape, out_ndim), ma->dtype);
             TensorMeta *md = &ctx->tensors[dst_id];
 
-            // Record provenance for autograd.
-            // Non-contiguous views (from pool repeat/expand chains) have virtual
-            // strides exceeding the physical buffer. GRAD uses provenance tensors
-            // directly in gradient formulas — they must be contiguous.
-            // Contiguify for provenance ONLY (don't change a_id/b_id for dispatch).
+            // Record provenance for autograd
             {
                 int needs = ma->requires_grad || (mb && mb->requires_grad);
                 if (needs) {
-                    u32 prov_a = a_id, prov_b = b_id;
-                    if (!ma->view.contiguous && ma->buf_id) {
-                        u32 n = ma->view.numel;
-                        u32 cid = tensor_create(ctx, ma->view.shape, ma->dtype);
-                        #ifdef __APPLE__
-                        if (ctx->backend == &metal_backend && !ma->view.has_mask)
-                            metal_contiguify(ctx->tensors[cid].buf_id, n, ma->buf_id, &ma->view);
-                        else
-                        #endif
-                        {
-                            f32 *tmp = thvm_to_host_view(ctx, ma->buf_id, &ma->view, n);
-                            ctx->backend->buf_write(ctx->tensors[cid].buf_id, tmp, (u64)n*sizeof(f32));
-                            free(tmp);
-                        }
-                        ctx->tensors[cid].requires_grad = ma->requires_grad;
-                        ctx->tensors[cid].creator_op = ma->creator_op;
-                        ctx->tensors[cid].src_ids[0] = ma->src_ids[0];
-                        ctx->tensors[cid].src_ids[1] = ma->src_ids[1];
-                        prov_a = cid;
-                    }
-                    if (is_binary && mb && !mb->view.contiguous && mb->buf_id) {
-                        u32 n = mb->view.numel;
-                        u32 cid = tensor_create(ctx, mb->view.shape, mb->dtype);
-                        #ifdef __APPLE__
-                        if (ctx->backend == &metal_backend && !mb->view.has_mask)
-                            metal_contiguify(ctx->tensors[cid].buf_id, n, mb->buf_id, &mb->view);
-                        else
-                        #endif
-                        {
-                            f32 *tmp = thvm_to_host_view(ctx, mb->buf_id, &mb->view, n);
-                            ctx->backend->buf_write(ctx->tensors[cid].buf_id, tmp, (u64)n*sizeof(f32));
-                            free(tmp);
-                        }
-                        ctx->tensors[cid].requires_grad = mb->requires_grad;
-                        ctx->tensors[cid].creator_op = mb->creator_op;
-                        ctx->tensors[cid].src_ids[0] = mb->src_ids[0];
-                        ctx->tensors[cid].src_ids[1] = mb->src_ids[1];
-                        prov_b = cid;
-                    }
                     md->requires_grad = 1;
                     md->creator_op = uop;
-                    md->src_ids[0] = prov_a;
-                    md->src_ids[1] = prov_b;
+                    md->src_ids[0] = a_id;
+                    md->src_ids[1] = b_id;
                     md->creator_loc = loc;
                 }
             }

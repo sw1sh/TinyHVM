@@ -127,8 +127,11 @@ inet_step:
                         RETURN_REDUCED(thvm_op(ctx, UOP_ADD, \
                             GRAD3_FWD(aid, da_, x), \
                             GRAD3_FWD(bid, db_, x)))
-                    #define UN_GRAD(da_) \
-                        RETURN_REDUCED(GRAD3_FWD(aid, da_, x))
+                    #define UN_GRAD(da_) do { \
+                        Term _ug = GRAD3_FWD(aid, da_, x); \
+                        if (term_tag(_ug) == TAG_TOP) GRAD_STEP(_ug); \
+                        RETURN_REDUCED(_ug); \
+                    } while(0)
 
                     switch (cop) {
                         case UOP_ADD:

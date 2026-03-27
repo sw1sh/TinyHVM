@@ -45,6 +45,11 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         fuse_leaf_terms[idx] = t;
         return (int)(WALK_LEAF_BASE + idx);
     }
+    // DP0/DP1: look through to the shared value in the DUP node
+    if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1) {
+        Term shared = heap_read(ctx, term_val(t));
+        return fuse_walk_inner(ctx, shared, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+    }
     if (term_tag(t) != TAG_TOP) return -1;
     u32 uop = term_ext(t);
 

@@ -24,7 +24,7 @@ typedef struct {
 // → dispatch fused reduce+elementwise kernel via fuse_or_reduce
 // ============================================================
 static Term rule_sum_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b) {
-    (void)b; (void)loc;
+    (void)b;
     if (term_tag(a) != TAG_TOP) return t;
     u32 child_uop = term_ext(a);
     if (!is_elementwise(child_uop) && !is_view_op(child_uop)) return t;

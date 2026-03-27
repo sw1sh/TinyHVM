@@ -86,6 +86,40 @@ static int is_binary(u32 uop);
 static void tensor_materialize(TinyHVM *ctx, u32 tid);
 #define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0&&c->tensors[t].creator_op)tensor_materialize(c,t);}while(0)
 
+// Backend-agnostic contiguify: copy non-contiguous view into fresh contiguous buffer
+#ifdef __APPLE__
+#define CONTIGUIFY_VIEW(ctx, dst, n, src, vp) \
+    do { if ((ctx)->backend == &metal_backend) metal_contiguify(dst, n, src, vp); \
+         else { /* CPU fallback */ \
+             f32 *_t = (f32*)thvm_to_host_view(ctx, src, vp, n); \
+             (ctx)->backend->buf_write(dst, _t, (u64)(n)*sizeof(f32)); free(_t); } } while(0)
+#else
+#define CONTIGUIFY_VIEW(ctx, dst, n, src, vp) \
+    do { f32 *_t = (f32*)thvm_to_host_view(ctx, src, vp, n); \
+         (ctx)->backend->buf_write(dst, _t, (u64)(n)*sizeof(f32)); free(_t); } while(0)
+#endif
+// Read strided view to contiguous host buffer
+static f32 *thvm_to_host_view(TinyHVM *ctx, u32 buf_id, const View *v, u32 numel) {
+    u32 max_idx = 0;
+    for (u32 d = 0; d < v->shape.rank; d++)
+        if (v->strides[d] > 0) max_idx += (v->shape.dims[d]-1) * (u32)v->strides[d];
+    max_idx += (v->offset > 0) ? (u32)v->offset : 0;
+    f32 *raw = malloc((max_idx+1)*sizeof(f32));
+    ctx->backend->buf_read(buf_id, raw, (u64)(max_idx+1)*sizeof(f32));
+    f32 *out = malloc(numel * sizeof(f32));
+    for (u32 flat = 0; flat < numel; flat++) {
+        u32 rem = flat; i32 idx = v->offset; int msk = 0;
+        for (int d = (int)v->shape.rank-1; d >= 0; d--) {
+            u32 c = rem % v->shape.dims[d]; rem /= v->shape.dims[d];
+            if (v->has_mask && (c < v->mask_begin[d] || c >= v->mask_end[d])) msk = 1;
+            idx += (i32)c * (v->strides[d] > 0 ? v->strides[d] : 0);
+        }
+        out[flat] = (msk || idx < 0 || (u32)idx > max_idx) ? 0.f : raw[(u32)idx];
+    }
+    free(raw);
+    return out;
+}
+
 // ── clone/ — deep-copy (ALO) for REF unfolding ──────────────────────────────
 #include "clone/_.c"
 
@@ -116,4 +150,7 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid);
 
 // ── schedule/ — lazy graph compiler ──────────────────────────────────────────
 #include "schedule/_.c"
+
+// ── debug/ — graph dump (DOT/JSON) ──────────────────────────────────────────
+#include "debug/dump.c"
 

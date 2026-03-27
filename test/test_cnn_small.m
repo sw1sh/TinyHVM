@@ -1,4 +1,6 @@
-// test_cnn_small.m — Minimal CNN test: 3 steps, BS=32, with explicit DUP
+// test_cnn_small.m — Small CNN: Conv(1,8,3)→ReLU→Flatten→Linear(8*26*26,10)
+// Per-step C loop with thvm_grad + SGD. Tests convergence + dispatch count.
+
 #include "../src/tinyhvm.c"
 #include "../src/backend/cpu/_.c"
 #ifdef __APPLE__
@@ -56,16 +58,17 @@ int main(int argc, char **argv) {
         (Shape){.dims={data.n_train, 1, 28, 28}, .rank=4});
 
     u32 n_weights = ctx->tensor_count;
+    u32 n_steps = 20;
 
-    for (u32 step = 0; step < 3; step++) {
+    for (u32 step = 0; step < n_steps; step++) {
         struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
 
+        u32 bi = step % (data.n_train / BS);
         Term x = thvm_shrink(ctx, train_data,
-            (u32[]){step*BS, (step+1)*BS, 0, 1, 0, 28, 0, 28}, 4);
+            (u32[]){bi*BS, (bi+1)*BS, 0, 1, 0, 28, 0, 28}, 4);
         thvm_set_requires_grad(ctx, x);
-        u8 *by = &data.train_labels[step * BS];
+        u8 *by = &data.train_labels[bi * BS];
 
-        // No DUP — direct (working baseline with GRAD3_DUP changes)
         u32 padding[] = {0,0,0,0}, stride[] = {1,1};
         Term h = thvm_conv2d(ctx, x, conv_w, conv_b, 1, stride, padding);
         h = thvm_op(ctx, UOP_RELU, h, term_era());
@@ -75,23 +78,17 @@ int main(int argc, char **argv) {
             thvm_expand(ctx, thvm_reshape(ctx, lin_b, SHAPE(1, 10)), SHAPE(BS, 10)));
         Term loss = cross_entropy_loss(ctx, logits, by, BS, 10);
 
+        // Single backward for all params + SGD update
+        thvm_reduce(ctx, loss);
+        Term grads[N_PARAMS];
+        thvm_grad_all(ctx, loss, params, grads, N_PARAMS);
+
         f32 lr = 0.01f;
         Term lr_t = thvm_tensor(ctx, &lr, SHAPE(1));
-        // Reduce each GRAD independently, clearing DUP state between walks
-        Term grad_vals[N_PARAMS];
-        for (u32 i = 0; i < N_PARAMS; i++) {
-            // Clear DUP grad slots
-            for (u32 j = 0; j < ctx->tensor_count; j++)
-                if (ctx->tensors[j].dup_loc)
-                    heap_set(ctx, ctx->tensors[j].dup_loc + 1, term_era());
-            grad_vals[i] = thvm_reduce(ctx, thvm_grad(ctx, loss, params[i]));
-        }
-        // Then apply SGD updates
         Term chain = term_era();
         for (int i = N_PARAMS - 1; i >= 0; i--) {
-            if (term_tag(grad_vals[i]) != TAG_TEN) continue;
             Term new_p = thvm_op(ctx, UOP_SUB, params[i],
-                thvm_op(ctx, UOP_MUL, lr_t, grad_vals[i]));
+                thvm_op(ctx, UOP_MUL, lr_t, grads[i]));
             chain = thvm_app(ctx, thvm_assign(ctx, params[i], new_p), chain);
         }
         thvm_reduce(ctx, chain);
@@ -101,13 +98,45 @@ int main(int argc, char **argv) {
         f32 ms = (f32)(t1.tv_sec-t0.tv_sec)*1000+(f32)(t1.tv_nsec-t0.tv_nsec)/1e6f;
 
         extern u32 total_dispatches;
-        printf("  step %u: loss=%.4f dispatches=%u tensors=%u heap=%llu (%.0fms)\n",
-               step, loss_val, total_dispatches, ctx->tensor_count,
-               (unsigned long long)ctx->heap_pos, ms);
+        if (step < 5 || step % 5 == 0 || step == n_steps - 1)
+            printf("  step %2u: loss=%.4f dispatches=%u tensors=%u heap=%llu (%.0fms)\n",
+                   step, loss_val, total_dispatches, ctx->tensor_count,
+                   (unsigned long long)ctx->heap_pos, ms);
         total_dispatches = 0;
 
+        // Invalidate host caches for updated params
+        for (u32 i = 0; i < N_PARAMS; i++) {
+            u32 pid = (u32)term_val(params[i]);
+            if (ctx->tensors[pid].host_ptr) {
+                free(ctx->tensors[pid].host_ptr);
+                ctx->tensors[pid].host_ptr = NULL;
+            }
+        }
         thvm_reset(ctx, n_weights);
     }
+
+    // Quick eval
+    printf("\n  Evaluating...\n");
+    Term test_data = thvm_tensor(ctx, data.test_images,
+        (Shape){.dims={data.n_test, 1, 28, 28}, .rank=4});
+    u32 eval_keep = ctx->tensor_count;
+    u32 correct = 0, tbs = 32, tb = data.n_test / tbs;
+    for (u32 b = 0; b < tb; b++) {
+        Term x = thvm_shrink(ctx, test_data,
+            (u32[]){b*tbs, (b+1)*tbs, 0, 1, 0, 28, 0, 28}, 4);
+        u32 padding[] = {0,0,0,0}, stride[] = {1,1};
+        Term h = thvm_conv2d(ctx, x, conv_w, conv_b, 1, stride, padding);
+        h = thvm_op(ctx, UOP_RELU, h, term_era());
+        h = thvm_reshape(ctx, h, SHAPE(tbs, flat_f));
+        Term logits = thvm_op(ctx, UOP_ADD,
+            thvm_op(ctx, UOP_MM, h, lin_w),
+            thvm_expand(ctx, thvm_reshape(ctx, lin_b, SHAPE(1, 10)), SHAPE(tbs, 10)));
+        f32 acc = thvm_eval_accuracy(ctx, logits, &data.test_labels[b*tbs], tbs, 10);
+        correct += (u32)(acc * (f32)tbs / 100.0f);
+        thvm_reset(ctx, eval_keep);
+    }
+    f32 acc = 100.0f * (f32)correct / (f32)(tb * tbs);
+    printf("  Test accuracy: %.1f%% (%u/%u)\n", acc, correct, tb*tbs);
 
     thvm_free(ctx);
     mnist_free(&data);

@@ -35,7 +35,7 @@ void thvm_free(TinyHVM *ctx) {
     free(ctx);
 }
 
-// Term usage table for DUP tracking (forward declaration for thvm_reset)
+// Forward declaration for term_use_table (used by thvm_reset and linear_use)
 #define TERM_USE_SIZE 4096
 static struct { Term term; u64 first_loc; u64 dup_loc; } term_use_table[TERM_USE_SIZE];
 
@@ -57,11 +57,9 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
     ctx->tensor_count = keep;
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();
-    // Clear DUP state
-    for (u32 i = 0; i < keep; i++) {
-        ctx->tensors[i].last_use_loc = (u64)-1;
-        ctx->tensors[i].dup_loc = 0;
-    }
+    ctx->dup_frozen = 0;
+    ctx->in_grad = 0;
+    for (u32 i = 0; i < keep; i++) ctx->tensors[i].dup_loc = 0;
     memset(term_use_table, 0, sizeof(term_use_table));
 }
 
@@ -84,6 +82,9 @@ Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {
 static const View *term_view(TinyHVM *ctx, Term t) {
     if (term_tag(t) == TAG_TEN) return &ctx->tensors[(u32)term_val(t)].view;
     if (term_tag(t) == TAG_TOP) return st_get(term_val(t));
+    // Look through DUP nodes: DP0/DP1 share a value at heap[dl+0]
+    if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1)
+        return term_view(ctx, heap_read(ctx, term_val(t)));
     return NULL;
 }
 
@@ -99,45 +100,37 @@ static int is_ew_single(Term t) {
     return (term_tag(t) == TAG_TOP && is_elementwise(term_ext(t)));
 }
 
-// Enforce linearity: if a grad-tracked term is used again, auto-DUP.
-
+// DUP tracking for TAG_TOP terms (lazy ops only, not TAG_TEN weights).
+// Prevents exponential GRAD walks at diamond fan-outs in the forward graph.
+// TAG_TEN is excluded because weight tensors appear in both forward and SGD chains,
+// but GRAD only walks forward provenance — counter would be wrong for TAG_TEN.
 static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
-    // Skip ERA and non-grad-tracked TAG_TEN
-    if (term_tag(t) == TAG_ERA || term_tag(t) == TAG_NUM) return t;
-    if (term_tag(t) == TAG_TEN) {
-        u32 tid = (u32)term_val(t);
-        if (tid >= ctx->tensor_count || !ctx->tensors[tid].requires_grad) return t;
-    }
-    // For TAG_TOP: check if it's in a requires_grad context
-    // (shape-tracked ops created by thvm_op always are if inputs were)
-    // Simplification: DUP all TAG_TOP and grad TAG_TEN that appear twice
+    // Only DUP lazy TAG_TOP terms (forward intermediates)
+    if (term_tag(t) != TAG_TOP) return t;
 
-    // Hash-based usage tracking
     u32 h = (u32)(t % TERM_USE_SIZE);
-    for (u32 i = 0; i < 8; i++) { // linear probe
+    for (u32 i = 0; i < 8; i++) {
         u32 idx = (h + i) % TERM_USE_SIZE;
         if (term_use_table[idx].term == 0) {
-            // Empty slot: first use
+            // First use: record
             term_use_table[idx].term = t;
             term_use_table[idx].first_loc = dest_loc;
             term_use_table[idx].dup_loc = 0;
             return t;
         }
         if (term_use_table[idx].term == t) {
-            // Found: second+ use
+            // Second+ use: create or reuse DUP node
             u64 dl = term_use_table[idx].dup_loc;
             if (!dl) {
+                // Create DUP: 4 slots (value, grad_accum, pending_count, original_count)
                 dl = heap_alloc(ctx, 4);
                 heap_set(ctx, dl, t);
                 heap_set(ctx, dl + 1, term_era());  // grad accumulator
-                heap_set(ctx, dl + 2, term_new(TAG_NUM, NUM_U32, 2)); // pending count
-                heap_set(ctx, dl + 3, term_new(TAG_NUM, NUM_U32, 2)); // original count
+                heap_set(ctx, dl + 2, term_new(TAG_NUM, NUM_U32, 2)); // pending
+                heap_set(ctx, dl + 3, term_new(TAG_NUM, NUM_U32, 2)); // original
                 term_use_table[idx].dup_loc = dl;
+                // Patch first use to DP0
                 heap_set(ctx, term_use_table[idx].first_loc, term_new(TAG_DP0, 0, dl));
-                if (term_tag(t) == TAG_TEN) {
-                    u32 tid2 = (u32)term_val(t);
-                    if (tid2 < ctx->tensor_count) ctx->tensors[tid2].dup_loc = dl;
-                }
             } else {
                 // 3rd+ use: increment counts
                 u32 c = term_as_u32(heap_read(ctx, dl + 2)) + 1;
@@ -147,7 +140,7 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
             return term_new(TAG_DP1, 0, dl);
         }
     }
-    return t; // table full, skip DUP
+    return t; // table full
 }
 
 Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
@@ -216,18 +209,7 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
                 out.contiguous = 0;
                 st_set(loc, &out); stored = 1;
             } else if ((uop == UOP_SUM || uop == UOP_RMAX)) {
-                if (!bf) {
-                    static int _snb=0;if(_snb<3){fprintf(stderr,"SUM_NO_BF: loc=%llu b_tag=%u bf=%p bn=%u\n",loc,term_tag(b),bf,bn);_snb++;}
-                }
                 if (bf) {
-                if (!va) {
-                    static int _sn=0; if(_sn<3){
-                        fprintf(stderr,"SUM_NO_VA: loc=%llu a_tag=%u",loc,term_tag(a));
-                        if(term_tag(a)==TAG_TOP) fprintf(stderr," a_uop=%s a_loc=%llu st=%s",
-                            uop_names[term_ext(a)], term_val(a), st_get(term_val(a))?"Y":"N");
-                        fprintf(stderr,"\n"); _sn++;
-                    }
-                }
                 if (!va) goto skip_sum;
                 // va available:
                 out = *va;
@@ -290,6 +272,9 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
         // Returns valid strides for contiguous, expanded (stride-0), and
         // compatible permuted views. Falls to lazy only when strides are
         // truly incompatible (mixed stride-0/non-zero, or non-contiguous merge).
+        // Masked views (from PAD) must be materialized before reshape —
+        // view_reshape drops the mask, causing wrong data downstream.
+        if (m->view.has_mask) goto lazy;
         View rv = view_reshape(m->view, new_shape);
         // view_reshape returns contiguous=0 in two cases:
         // 1. Reshapable but non-contiguous (stride-0 dims) — strides are valid
@@ -317,7 +302,7 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
         if (!valid) goto lazy;
         // Reshape is valid as a view alias — same buffer, computed strides
         u32 id = ctx->tensor_count++;
-        ctx->tensors[id] = *m; ctx->tensors[id].last_use_loc = (u64)-1; ctx->tensors[id].dup_loc = 0; ctx->tensors[id].creator_loc = 0;
+        ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0; ctx->tensors[id].dup_loc = 0;
         ctx->tensors[id].view = rv;
         ctx->tensors[id].host_ptr = NULL;
         ctx->tensors[id].creator_op = UOP_RESHAPE;
@@ -339,7 +324,7 @@ Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
         TensorMeta *m = &ctx->tensors[src_id];
         // Expand: set stride=0 where dim goes from 1→N
         u32 id = ctx->tensor_count++;
-        ctx->tensors[id] = *m; ctx->tensors[id].last_use_loc = (u64)-1; ctx->tensors[id].dup_loc = 0; ctx->tensors[id].creator_loc = 0;
+        ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0; ctx->tensors[id].dup_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
         View *v = &ctx->tensors[id].view;
         if (v->shape.rank != new_shape.rank) {
@@ -377,7 +362,7 @@ Term thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank) {
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
         u32 id = ctx->tensor_count++;
-        ctx->tensors[id] = *m; ctx->tensors[id].last_use_loc = (u64)-1; ctx->tensors[id].dup_loc = 0; ctx->tensors[id].creator_loc = 0;
+        ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0; ctx->tensors[id].dup_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
         ctx->tensors[id].view = view_permute(m->view, axes);
         ctx->tensors[id].creator_op = UOP_PERMUTE;
@@ -408,7 +393,7 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         }
         // Zero-copy: create view with mask
         u32 id = ctx->tensor_count++;
-        ctx->tensors[id] = *m; ctx->tensors[id].last_use_loc = (u64)-1; ctx->tensors[id].dup_loc = 0; ctx->tensors[id].creator_loc = 0;
+        ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0; ctx->tensors[id].dup_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
         ctx->tensors[id].view = view_pad(m->view, pad_before, pad_after);
         ctx->tensors[id].creator_op = UOP_PAD;
@@ -441,7 +426,7 @@ Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         }
         // ns not needed — dims set directly on the view below
         u32 id = ctx->tensor_count++;
-        ctx->tensors[id] = *m; ctx->tensors[id].last_use_loc = (u64)-1; ctx->tensors[id].dup_loc = 0; ctx->tensors[id].creator_loc = 0;
+        ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0; ctx->tensors[id].dup_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
         View *v = &ctx->tensors[id].view;
         for (u32 i = 0; i < ndim; i++) v->shape.dims[i] = new_dims[i];

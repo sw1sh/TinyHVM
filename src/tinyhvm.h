@@ -402,10 +402,9 @@ typedef struct {
     // Autograd provenance
     u8          requires_grad;
     u32         creator_op; // UOP that created this tensor
-    u32         src_ids[2]; // input tensor ids (for backward rules + REACHES traversal)
-    u64         dup_loc;    // heap location of DUP node (0 = not DUPed)
+    u32         src_ids[2]; // input tensor ids (for backward chain rule)
     u64         creator_loc; // heap location of the TAG_TOP that created this tensor
-    u64         last_use_loc; // heap slot where this tensor was last placed (0 = unused)
+    u64         dup_loc;    // heap location of DUP node (0 = not DUPed)
 
     // Fusion metadata (only when creator_op == UOP_FUSING)
     u64         fusing_loc; // heap loc of the original subnet root TAG_TOP
@@ -475,6 +474,13 @@ typedef struct {
     Backend *backend;
     u64         itrs;       // interaction count
     u8          no_fuse;    // 1 to skip fusion (used during GRAD subnet re-reduction)
+    u8          dup_frozen; // reserved
+    u8          in_grad;    // reserved
+
+    // Multi-target GRAD: when set, GRAD with x=ERA checks all params
+    Term       *grad_params;   // array of param TAG_TEN terms
+    Term       *grad_results;  // array to store gradient results
+    u32         grad_n_params; // number of params
 
     // Named definitions for TAG_REF (global def table)
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term

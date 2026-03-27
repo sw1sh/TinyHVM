@@ -45,7 +45,7 @@ static void top_decref_inputs(TinyHVM *ctx, u64 loc, u32 uop, Term result) {
 // Pre-allocated stack pool — each recursion level gets a slice.
 // 4096 frames per slice, 64 max nesting depth = 2MB TLS.
 #define REDUCE_SLICE 4096
-#define REDUCE_MAX_DEPTH 64
+#define REDUCE_MAX_DEPTH 256
 static _Thread_local Term reduce_pool[REDUCE_SLICE * REDUCE_MAX_DEPTH];
 static _Thread_local int  reduce_depth = 0;
 

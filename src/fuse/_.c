@@ -237,8 +237,23 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             u32 n_axes = axt->view.numel;
             f32 axes_f[MAX_DIM];
             META_READ(ctx, axt->buf_id, axes_f, n_axes * sizeof(f32));
-            // Collapse all reduce axes: they must be contiguous at the end
-            // (or we fall back). The codegen treats them as one flat reduce dim.
+            // The codegen treats reduce dims as one flat inner loop.
+            // This only works if reduce axes are TRAILING (contiguous at the end).
+            // Non-trailing reduce axes require permute — fall back to non-fused.
+            u8 is_reduce_ax[MAX_DIM] = {0};
+            for (u32 i = 0; i < n_axes; i++) {
+                int ax = (int)axes_f[i];
+                if (ax >= 0 && ax < (int)ew_view.shape.rank) is_reduce_ax[ax] = 1;
+            }
+            // Check trailing: all reduce axes must be at the end
+            int trailing = 1;
+            { int seen_nonreduce_after = 0;
+              for (int d = (int)ew_view.shape.rank - 1; d >= 0; d--) {
+                  if (is_reduce_ax[d] && seen_nonreduce_after) { trailing = 0; break; }
+                  if (!is_reduce_ax[d] && ew_view.shape.dims[d] > 1) seen_nonreduce_after = 1;
+              }
+            }
+            if (!trailing) return reduce_id(ctx, t); // non-trailing → can't fuse
             for (u32 i = 0; i < n_axes; i++) {
                 int ax = (int)axes_f[i];
                 if (ax >= 0 && ax < (int)ew_view.shape.rank) {

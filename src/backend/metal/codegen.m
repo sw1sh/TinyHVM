@@ -100,6 +100,9 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
         }
     }
     if (has_reduce) use_f4 = 0;  // reduce path doesn't vectorize (yet)
+    // Masked views need per-element mask check — can't use float4
+    for (u32 i = 0; i < n_leaves; i++)
+        if (leaf_views[i]->has_mask) { use_f4 = 0; break; }
 
     u32 inner_dispatch = use_f4 ? inner / 4 : inner;
 
@@ -173,6 +176,29 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
         }
     }
 
+    // Generate mask conditions for masked leaves (from PAD views)
+    // mask_begin[d]..mask_end[d] defines valid data range per dimension.
+    for (u32 li = 0; li < n_leaves; li++) {
+        const View *lv = leaf_views[li];
+        if (!lv->has_mask) continue;
+        // Generate: bool m{li} = (c0>=mb0 && c0<me0 && c1>=mb1 && ...);
+        [s appendFormat:@"  bool m%u=", li];
+        int first = 1;
+        for (u32 d = 0; d < lv->shape.rank && d < out_rank; d++) {
+            if (lv->mask_begin[d] == 0 && lv->mask_end[d] >= lv->shape.dims[d]) continue;
+            if (!first) [s appendString:@"&&"];
+            first = 0;
+            if (lv->mask_begin[d] > 0)
+                [s appendFormat:@"c%u>=%uu", d, lv->mask_begin[d]];
+            if (lv->mask_begin[d] > 0 && lv->mask_end[d] < lv->shape.dims[d])
+                [s appendString:@"&&"];
+            if (lv->mask_end[d] < lv->shape.dims[d])
+                [s appendFormat:@"c%u<%uu", d, lv->mask_end[d]];
+        }
+        if (first) [s appendString:@"true"]; // no constraints
+        [s appendString:@";\n"];
+    }
+
     // Read leaves
     NSString *idx_var = has_reduce ? @"ridx" : nil;
 
@@ -229,9 +255,12 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     } else {
         // Scalar reads
         for (u32 li = 0; li < n_leaves; li++) {
-            if (cg_leaf_is_flat(leaf_views[li], out_numel))
+            const View *lv = leaf_views[li];
+            if (cg_leaf_is_flat(lv, out_numel))
                 [s appendFormat:@"  uint fi%u=iz*%uu+iy*%uu+inner_base;\n  float t%u=in%u[fi%u];\n",
                     li, mid*inner, inner, li, li, li];
+            else if (lv->has_mask)
+                [s appendFormat:@"  float t%u=m%u?in%u[i%u]:0.f;\n", li, li, li, li];
             else
                 [s appendFormat:@"  float t%u=in%u[i%u];\n", li, li, li];
         }

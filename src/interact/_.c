@@ -48,15 +48,30 @@ inet_step:
 
                 if (term_tag(y) == TAG_TEN) {
                     u32 y_id = (u32)term_val(y);
-                    u32 x_id = (term_tag(x) == TAG_TEN) ? (u32)term_val(x) : ~0u;
 
                     // Base case: y == x → return grad_y
                     if (term_tag(x) == TAG_TEN && (u32)term_val(x) == y_id)
                         RETURN_REDUCED(thvm_reduce(ctx, gy));
 
+                    // Multi-target mode: x=ERA, check if y is any param
+                    if (term_tag(x) == TAG_ERA && ctx->grad_n_params > 0) {
+                        for (u32 _gi = 0; _gi < ctx->grad_n_params; _gi++) {
+                            if ((u32)term_val(ctx->grad_params[_gi]) == y_id) {
+                                // Found param! Accumulate gradient.
+                                Term prev = ctx->grad_results[_gi];
+                                if (term_tag(prev) == TAG_ERA)
+                                    ctx->grad_results[_gi] = thvm_reduce(ctx, gy);
+                                else
+                                    ctx->grad_results[_gi] = thvm_reduce(ctx,
+                                        thvm_op(ctx, UOP_ADD, prev, gy));
+                                RETURN_REDUCED(term_era());
+                            }
+                        }
+                    }
+
                     TensorMeta *my = &ctx->tensors[y_id];
 
-                    // Leaf (no provenance, not x) → ERA (no gradient path)
+                    // Leaf (no provenance, not target) → ERA
                     if (!my->creator_op) {
                         RETURN_REDUCED(term_era());
                     }
@@ -64,11 +79,14 @@ inet_step:
                     // DUP-op interaction via provenance
                     u32 cop = my->creator_op;
                     u32 aid = my->src_ids[0], bid = my->src_ids[1];
+
+                    ENSURE(ctx, aid);
                     TensorMeta *ma = &ctx->tensors[aid];
                     Term at = term_ten(aid, ma->dtype);
 
                     int is_bin = (cop==UOP_ADD||cop==UOP_SUB||cop==UOP_MUL||
                                   cop==UOP_DIV||cop==UOP_MAX||cop==UOP_MM||cop==UOP_CMP);
+                    if (is_bin) ENSURE(ctx, bid);
                     TensorMeta *mb_p = is_bin ? &ctx->tensors[bid] : NULL;
                     Term bt = is_bin ? term_ten(bid, mb_p->dtype) : term_era();
 
@@ -76,49 +94,38 @@ inet_step:
                         u64 _l = heap_alloc(ctx, 3); \
                         heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
                         term_new(TAG_TOP, UOP_GRAD, _l); })
-                    // DUP-GRAD: route gradient through DUP accumulator.
-                    // Park first arrival, fire last (accumulate via ADD).
-                    // Prevents diamond double-counting at shared nodes.
-                    // Find DUP loc for a tensor ID (checks TensorMeta)
-                    #define FIND_DUP(tid_) (ctx->tensors[tid_].dup_loc)
-                    // DUP-GRAD with counter at dup_loc+2.
-                    // Each arrival: accumulate gradient, decrement counter.
-                    // When counter reaches 0: all contributions received, continue backward.
-                    #define GRAD3_DUP(tid_, da_, x_) ({ \
-                        Term _r; \
-                        u64 _dl = FIND_DUP(tid_); \
+                    // DUP-GRAD accumulation: if tensor has dup_loc, accumulate
+                    // gradient at the DUP node. Park early arrivals (return ERA),
+                    // fire on last arrival (counter reaches 0).
+                    #define GRAD3_FWD(tid_, da_, x_) ({ \
+                        Term _r; u64 _dl = ctx->tensors[tid_].dup_loc; \
                         if (!_dl) { \
                             _r = GRAD3(term_ten(tid_, ctx->tensors[tid_].dtype), da_, x_); \
                         } else { \
-                            /* Accumulate */ \
                             Term _acc = heap_read(ctx, _dl + 1); \
                             if (term_tag(_acc) == TAG_ERA) \
                                 heap_set(ctx, _dl + 1, da_); \
                             else \
                                 heap_set(ctx, _dl + 1, thvm_reduce(ctx, \
                                     thvm_op(ctx, UOP_ADD, _acc, da_))); \
-                            /* Decrement counter */ \
                             u32 _cnt = term_as_u32(heap_read(ctx, _dl + 2)); \
                             _cnt--; \
                             heap_set(ctx, _dl + 2, term_new(TAG_NUM, NUM_U32, _cnt)); \
-                            if (_cnt > 0) { \
-                                _r = term_era(); \
-                            } else { \
+                            if (_cnt > 0) { _r = term_era(); } \
+                            else { \
                                 Term _total = heap_read(ctx, _dl + 1); \
-                                /* Reset for next walk */ \
                                 heap_set(ctx, _dl + 1, term_era()); \
                                 u32 _orig = term_as_u32(heap_read(ctx, _dl + 3)); \
                                 heap_set(ctx, _dl + 2, term_new(TAG_NUM, NUM_U32, _orig)); \
                                 _r = GRAD3(term_ten(tid_, ctx->tensors[tid_].dtype), _total, x_); \
                             } \
-                        } \
-                        _r; })
+                        } _r; })
                     #define BIN_GRAD(da_, db_) \
                         RETURN_REDUCED(thvm_op(ctx, UOP_ADD, \
-                            GRAD3_DUP(aid, da_, x), \
-                            GRAD3_DUP(bid, db_, x)))
+                            GRAD3_FWD(aid, da_, x), \
+                            GRAD3_FWD(bid, db_, x)))
                     #define UN_GRAD(da_) \
-                        RETURN_REDUCED(GRAD3_DUP(aid, da_, x))
+                        RETURN_REDUCED(GRAD3_FWD(aid, da_, x))
 
                     switch (cop) {
                         case UOP_ADD:
@@ -230,7 +237,7 @@ inet_step:
                         }
                     }
                     #undef GRAD3
-                    #undef GRAD3_DUP
+                    #undef GRAD3_FWD
                     #undef BIN_GRAD
                     #undef UN_GRAD
                 }
@@ -386,6 +393,9 @@ inet_step:
                     (void)a_ten; (void)b_ten;
                 }
             }
+            // ERA-TOP (Phase 0): any non-binary op with ERA arg0 → ERA
+            // Dead gradient branches self-eliminate through ERA propagation.
+            if (!is_binary && term_tag(a) == TAG_ERA) RETURN_REDUCED(term_era());
             if (term_tag(a) != TAG_TEN) return t;
             if (is_binary && term_tag(b) != TAG_TEN) return t;
 
@@ -418,24 +428,27 @@ inet_step:
                         // 1. Valid non-contiguous (stride-0 preserved) — NO contiguify needed
                         // 2. Failed reshape (fake strides) — contiguify required
                         // Distinguish: if source had stride-0 and result has stride-0, it's case 1.
-                        int needs_materialize = !new_view.contiguous;
-                        if (needs_materialize) {
+                        // Masked views (from PAD) MUST be materialized before reshape —
+                        // view_reshape drops the mask, causing wrong data.
+                        int needs_materialize = ma->view.has_mask || !new_view.contiguous;
+                        if (needs_materialize && !ma->view.has_mask) {
                             int has_stride0 = 0, src_has_stride0 = 0;
                             for (u32 d2 = 0; d2 < ns.rank; d2++)
                                 if (ns.dims[d2] > 1 && new_view.strides[d2] == 0) has_stride0 = 1;
                             for (u32 d2 = 0; d2 < ma->view.shape.rank; d2++)
                                 if (ma->view.shape.dims[d2] > 1 && ma->view.strides[d2] == 0) src_has_stride0 = 1;
-                            if (src_has_stride0 && has_stride0) needs_materialize = 0; // valid non-contiguous
+                            if (src_has_stride0 && has_stride0) needs_materialize = 0;
                         }
                         if (needs_materialize) {
-                            // Materialize non-contiguous view to contiguous buffer
                             ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];
                             u32 numel = ma->view.numel;
                             u32 orig_a_id = a_id;
                             u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
                             #ifdef __APPLE__
-                            if (ctx->backend == &metal_backend) {
-                                // GPU path: strided copy via fused identity kernel
+                            // Use GPU contiguify only for non-masked views.
+                            // Metal codegen mask support has a bug (float4/grouping issue).
+                            // Masked views use CPU fallback which correctly handles mask bounds.
+                            if (ctx->backend == &metal_backend && !ma->view.has_mask) {
                                 metal_contiguify(ctx->tensors[mat_id].buf_id, numel,
                                                  ma->buf_id, &ma->view);
                             } else
@@ -467,9 +480,11 @@ inet_step:
                                 free(src);
                             }
 
-                            // Record provenance for backward chain
-                            if (ctx->tensors[orig_a_id].requires_grad) {
-                                ctx->tensors[mat_id].requires_grad = 1;
+                            // Record provenance so GRAD can walk through materialized copies.
+                            // Must be unconditional — gradient tensors don't have requires_grad
+                            // but GRAD still needs to traverse their provenance chain.
+                            {
+                                ctx->tensors[mat_id].requires_grad = ctx->tensors[orig_a_id].requires_grad;
                                 ctx->tensors[mat_id].creator_op = UOP_RESHAPE;
                                 ctx->tensors[mat_id].src_ids[0] = orig_a_id;
                                 ctx->tensors[mat_id].src_ids[1] = b_id;
@@ -555,6 +570,21 @@ inet_step:
             }
 
             if (!ctx->backend) return t;
+
+            // ERA propagation for compute ops (Phase 0, ic_native_backprop.md):
+            // Dead GRAD branches produce ERA. These must be absorbed:
+            //   ADD(ERA, x) → x,  ADD(x, ERA) → x     (identity)
+            //   MUL(ERA, x) → ERA, SUB(ERA, x) → ERA   (annihilation)
+            //   Unary(ERA) → ERA                        (propagation)
+            if (term_tag(a) == TAG_ERA) {
+                if (!is_binary) RETURN_REDUCED(term_era());
+                if (uop == UOP_ADD) RETURN_REDUCED(b);
+                RETURN_REDUCED(term_era());
+            }
+            if (is_binary && term_tag(b) == TAG_ERA) {
+                if (uop == UOP_ADD || uop == UOP_SUB) RETURN_REDUCED(a);
+                RETURN_REDUCED(term_era());
+            }
 
             u32 b_id = is_binary ? (u32)term_val(b) : 0;
             TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
@@ -891,9 +921,8 @@ inet_step:
             }
             if (term_tag(val) == TAG_TEN) {
                 heap_set(ctx, loc, val);
-                // Propagate DUP loc to TensorMeta for GRAD handler
                 u32 tid = (u32)term_val(val);
-                if (tid < ctx->tensor_count)
+                if (tid < ctx->tensor_count && !ctx->tensors[tid].dup_loc)
                     ctx->tensors[tid].dup_loc = loc;
                 return val;
             }
@@ -912,7 +941,7 @@ inet_step:
             if (term_tag(val) == TAG_TEN) {
                 heap_set(ctx, loc, val);
                 u32 tid = (u32)term_val(val);
-                if (tid < ctx->tensor_count)
+                if (tid < ctx->tensor_count && !ctx->tensors[tid].dup_loc)
                     ctx->tensors[tid].dup_loc = loc;
                 return val;
             }

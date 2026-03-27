@@ -24,23 +24,13 @@ Term thvm_sup(TinyHVM *ctx, Term a, Term b) {
 }
 
 // DUP: split a linear term into two copies (DP0, DP1).
-// heap[loc] = value, heap[loc+1] = ERA (grad accumulator slot).
-// Forward: both DP0/DP1 reduce to the value (passthrough).
-// Backward: GRAD deposits ADD node at loc+1 for the second path.
+// heap[loc] = value. Both DP0/DP1 reduce to the value (passthrough).
+// Currently unused — DUP accumulation disabled (correctness-first design).
 void thvm_dup(TinyHVM *ctx, Term z, Term *out0, Term *out1) {
-    u64 loc = heap_alloc(ctx, 4);
-    heap_set(ctx, loc,     z);
-    heap_set(ctx, loc + 1, term_era());
-    heap_set(ctx, loc + 2, term_new(TAG_NUM, NUM_U32, 2));
-    heap_set(ctx, loc + 3, term_new(TAG_NUM, NUM_U32, 2));
+    u64 loc = heap_alloc(ctx, 1);
+    heap_set(ctx, loc, z);
     *out0 = term_new(TAG_DP0, 0, loc);
     *out1 = term_new(TAG_DP1, 0, loc);
-    // Link tensor to its DUP node
-    if (term_tag(z) == TAG_TEN) {
-        u32 tid = (u32)term_val(z);
-        if (tid < ctx->tensor_count)
-            ctx->tensors[tid].dup_loc = loc;
-    }
 }
 
 u32 thvm_define(TinyHVM *ctx, Term body) {

@@ -218,12 +218,9 @@ void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
                                FusedOp *ops, u32 n_ops,
                                int has_reduce, u32 reduce_dim,
                                const Shape *out_shape) {
-    // Unified codegen for non-reduce fused chains
+    // Unified codegen for non-reduce fused chains (handles masks via codegen)
     if (!has_reduce && n_leaves <= 16 && n_ops <= 32 && out_shape) {
-        int no_masks = 1;
-        for (u32 i = 0; i < n_leaves; i++)
-            if (leaf_views[i]->has_mask) { no_masks = 0; break; }
-        if (no_masks && out_shape->rank <= 8 && out_shape->rank > 0) {
+        if (out_shape->rank <= 8 && out_shape->rank > 0) {
             metal_dispatch_kernel(out_buf, out_numel, leaf_bufs, leaf_views, n_leaves,
                                    ops, n_ops, 0, 0, out_shape);
             return;

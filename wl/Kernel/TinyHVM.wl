@@ -130,7 +130,7 @@ $TinyHVMLibrary = With[{found = FindLibrary["TinyHVM"]},
     If[StringQ[found],
         found,
         FileNameJoin[{
-            DirectoryName[$InputFileName, 2],  (* up from Kernel/ to TinyHVM/ *)
+            DirectoryName[$InputFileName, 2],  (* up from Kernel/ to wl/ *)
             "LibraryResources", "MacOSX-ARM64",
             "TinyHVM.dylib"
         }]

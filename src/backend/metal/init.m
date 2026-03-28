@@ -134,7 +134,13 @@ static int metal_init(void) {
     mtl_queue = [mtl_dev newCommandQueue];
 
     NSError *err = nil;
-    NSString *path = [[NSBundle mainBundle] pathForResource:@"shaders" ofType:@"metallib"];
+    // Check override path (set by embedders like Python FFI)
+    NSString *path = nil;
+    const char *env_path = getenv("THVM_METALLIB");
+    if (env_path && env_path[0]) {
+        path = [NSString stringWithUTF8String:env_path];
+    }
+    if (!path) path = [[NSBundle mainBundle] pathForResource:@"shaders" ofType:@"metallib"];
     if (!path) {
         path = @"shaders.metallib";
     }

@@ -53,6 +53,7 @@ esac
 
 BUILD_TESTS=false
 BUILD_PACLET=false
+BUILD_PYTHON=false
 CLEAN=false
 
 if [ $# -eq 0 ]; then
@@ -63,11 +64,13 @@ for arg in "$@"; do
     case "$arg" in
         --clean)  CLEAN=true ;;
         --paclet) BUILD_PACLET=true ;;
-        --all)    BUILD_TESTS=true; BUILD_PACLET=true ;;
+        --python) BUILD_PYTHON=true ;;
+        --all)    BUILD_TESTS=true; BUILD_PACLET=true; BUILD_PYTHON=true ;;
         --help|-h)
-            echo "Usage: ./build.sh [--clean] [--paclet] [--all]"
+            echo "Usage: ./build.sh [--clean] [--paclet] [--python] [--all]"
             echo "  (no args)   Build test binaries to bin/"
             echo "  --paclet    Build WL paclet bridge (macOS Metal only)"
+            echo "  --python    Build Python shared library (libthvm)"
             echo "  --all       Build everything"
             echo "  --clean     Remove build artifacts"
             exit 0
@@ -82,7 +85,8 @@ if $CLEAN; then
     echo "=== Cleaning ==="
     rm -rf "${BIN}"
     rm -f shaders.metallib
-    rm -rf "${ROOT}/TinyHVM/LibraryResources/${PLATFORM}"
+    rm -rf "${ROOT}/wl/LibraryResources/${PLATFORM}"
+    rm -f "${ROOT}/py/tinyhvm/libthvm${DYLIB_EXT}"
     echo "  Done"
     exit 0
 fi
@@ -120,7 +124,7 @@ if $BUILD_PACLET; then
         exit 1
     fi
 
-    PACLET="${ROOT}/TinyHVM"
+    PACLET="${ROOT}/wl"
     LIB_DEST="${PACLET}/LibraryResources/${PLATFORM}"
     CSOURCE="${PACLET}/CSource"
 
@@ -165,4 +169,39 @@ if $BUILD_PACLET; then
     echo "  Built TinyHVM${DYLIB_EXT} ($(du -h "${LIB_DEST}/TinyHVM${DYLIB_EXT}" | cut -f1))"
 
     echo "=== Paclet ready at ${PACLET}/ ==="
+fi
+
+# ── Build Python shared library ───────────────────────────────────────
+
+if $BUILD_PYTHON; then
+    PY_CSRC="${ROOT}/py/csrc"
+    PY_LIB="${ROOT}/py/tinyhvm"
+
+    # Metal shaders (macOS only)
+    if [ "$OS" = "Darwin" ] && [ ! -f shaders.metallib ]; then
+        echo "=== Compiling Metal shaders ==="
+        xcrun -sdk macosx metal -c "${SRC}/shaders.metal" -o /tmp/thvm_shaders.air
+        xcrun -sdk macosx metallib /tmp/thvm_shaders.air -o shaders.metallib
+        rm -f /tmp/thvm_shaders.air
+    fi
+
+    echo "=== Compiling libthvm${DYLIB_EXT} (Python FFI) ==="
+    $CC $CFLAGS \
+        -I"${SRC}" \
+        $FRAMEWORKS \
+        -fPIC -dynamiclib \
+        -fvisibility=hidden \
+        -DDEVICE='"metal"' \
+        -o "${PY_LIB}/libthvm${DYLIB_EXT}" \
+        "${PY_CSRC}/libthvm.m"
+
+    codesign --force --sign - "${PY_LIB}/libthvm${DYLIB_EXT}"
+
+    # Copy metallib next to dylib so the runtime can find it
+    if [ -f shaders.metallib ]; then
+        cp shaders.metallib "${PY_LIB}/shaders.metallib"
+    fi
+
+    echo "  Built libthvm${DYLIB_EXT} ($(du -h "${PY_LIB}/libthvm${DYLIB_EXT}" | cut -f1))"
+    echo "=== Python library ready at ${PY_LIB}/ ==="
 fi

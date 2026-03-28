@@ -407,6 +407,14 @@ typedef struct {
 
 typedef struct Backend Backend;
 
+// Per-thread state for parallel reduction (work_stealing.md)
+typedef struct ThvmThread {
+    u32 tid;
+    u64 bank_start, bank_next, bank_end;  // heap bank
+    u32 tensor_start, tensor_next, tensor_end;  // tensor ID range
+    u64 itrs;
+} ThvmThread;
+
 typedef struct {
     u32         buf_id;     // GPU buffer handle
     u32         dtype;
@@ -529,6 +537,11 @@ typedef struct {
     // Step-limited reduction
     u32         step_budget;    // 0 = unlimited
     u32         steps_taken;
+
+    // Parallel reduction (work_stealing.md)
+    // threads[0] = main thread. When n_threads <= 1, parallel infra is bypassed.
+    struct ThvmThread threads[16];
+    u32         n_threads;     // 0 or 1 = single-threaded
 
 } TinyHVM;
 

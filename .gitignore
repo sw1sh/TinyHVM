@@ -53,3 +53,9 @@ py/tinyhvm/shaders.metallib
 .claude/worktrees/
 .claude/settings.json
 .claude/settings.json
+
+# Benchmark binaries
+/bench_*
+
+# Symlinked repos
+/C-ML

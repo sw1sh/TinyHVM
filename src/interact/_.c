@@ -834,6 +834,73 @@ inet_step:
                 }
             }
 
+            // View-through fusion: SUM(PERMUTE(ew_chain), axes)
+            // Walk through PERMUTE, permute leaf views to the PERMUTED index space,
+            // then fuse reduce+ew in one kernel. Correct because PERMUTE only
+            // rearranges strides — same data access, just different iteration order.
+            if (is_reduce && ma->buf_id == 0 && ma->creator_op == UOP_PERMUTE &&
+                ma->backend && ma->backend->dispatch_kernel_rs) {
+                u32 perm_base_id = ma->src_ids[0];
+                TensorMeta *perm_base = &ctx->tensors[perm_base_id];
+                u32 perm_tid = ma->src_ids[1];
+                if (perm_base->buf_id == 0 && perm_base->creator_op &&
+                    is_elementwise(perm_base->creator_op) && perm_tid) {
+                    ENSURE(ctx, perm_tid);
+                    TensorMeta *pt = &ctx->tensors[perm_tid];
+                    u32 rank = pt->view.numel;
+                    f32 pf[MAX_DIM]; META_READ(pt->backend, pt->buf_id, pf, rank * 4);
+                    u32 perm[MAX_DIM];
+                    for (u32 i = 0; i < rank; i++) perm[i] = (u32)pf[i];
+
+                    FusedOp fops[32]; u32 fn = 0, ftids[32];
+                    u32 flids[16]; const View *flvs[16]; u32 fnl = 0;
+                    int fr = materialize_walk(ctx, perm_base_id, fops, &fn, ftids, flids, flvs, &fnl);
+                    if (fr >= 0 && fn > 0) {
+                        // Permute all leaf views into the PERMUTED index space
+                        View pviews[16]; const View *pvptrs[16];
+                        for (u32 i = 0; i < fnl; i++) {
+                            pviews[i] = view_permute(*flvs[i], perm);
+                            pvptrs[i] = &pviews[i];
+                        }
+                        for (u32 i = 0; i < fn; i++) {
+                            if (fops[i].arg_a >= 16) fops[i].arg_a = fnl + (fops[i].arg_a - 16);
+                            if (fops[i].arg_b >= 16) fops[i].arg_b = fnl + (fops[i].arg_b - 16);
+                        }
+                        // ReduceSpec in PERMUTED space (no axis remapping)
+                        ReduceSpec ers = {0}; ers.reduce_type = uop;
+                        Term sum_arg_e = heap_read(ctx, loc + 1);
+                        if (term_tag(sum_arg_e) == TAG_TEN || term_tag(sum_arg_e) == TAG_TOP) {
+                            Term axes_e = thvm_reduce(ctx, sum_arg_e);
+                            if (term_tag(axes_e) == TAG_TEN) {
+                                u32 axid = (u32)term_val(axes_e); ENSURE(ctx, axid);
+                                TensorMeta *axt = &ctx->tensors[axid];
+                                f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
+                                for (u32 i = 0; i < axt->view.numel; i++) {
+                                    u32 ax = (u32)af[i]; if (ax < rank) ers.is_reduce[ax] = 1;
+                                }
+                            }
+                        } else {
+                            for (int d = (int)rank - 1; d >= 0; d--)
+                                if (ma->view.shape.dims[d] > 1) { ers.is_reduce[d] = 1; break; }
+                        }
+                        u32 sbufs[8], sops[8]; u32 ns = 0;
+                        for (u32 i = 0; i < fn && ns < 8; i++) {
+                            TensorMeta *sm = &ctx->tensors[ftids[i]];
+                            if (sm->buf_id != 0 && sm->defer_consumers > 0) {
+                                sbufs[ns] = sm->buf_id; sops[ns] = fnl + i; ns++;
+                            }
+                        }
+                        u32 fbufs[16];
+                        for (u32 i = 0; i < fnl; i++) fbufs[i] = ctx->tensors[flids[i]].buf_id;
+                        Shape pshape = ma->view.shape;
+                        perm_base->backend->dispatch_kernel_rs(md->buf_id, fbufs, pvptrs, fnl,
+                            fops, fn, &pshape, &ers, ns ? sbufs : NULL, ns ? sops : NULL, ns);
+                        ctx->itrs++;
+                        RETURN_REDUCED(term_ten(dst_id, ma->dtype));
+                    }
+                }
+            }
+
             // Eager reduce fusion: if reduce input is deferred ew, fuse at dispatch time.
             if (is_reduce && ma->buf_id == 0 && ma->creator_op &&
                 is_elementwise(ma->creator_op)) {

@@ -322,7 +322,9 @@ typedef struct { u32 B, C, H, W, OH, OW; } Pool2dParams;
 // Heap
 // ============================================================
 
+#ifndef HEAP_CAP
 #define HEAP_CAP (1ULL << 21)  // 2M terms = 16MB
+#endif
 
 // ============================================================
 // Tensor metadata

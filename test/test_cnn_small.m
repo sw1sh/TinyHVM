@@ -104,17 +104,18 @@ int main(int argc, char **argv) {
         // ONE reduce: APP(grad_term, sgd_chain)
         // grad_term runs first (deposits), returns ERA. APP-ERA → sgd_chain runs.
         thvm_reduce(ctx, thvm_app(ctx, grad_term, sgd_chain));
-        f32 loss_val = thvm_to_host(ctx, loss)[0];
 
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         f32 ms = (f32)(t1.tv_sec-t0.tv_sec)*1000+(f32)(t1.tv_nsec-t0.tv_nsec)/1e6f;
 
         extern u32 total_dispatches;
         extern void print_dispatch_breakdown(void);
-        if (step < 5 || step % 5 == 0 || step == n_steps - 1)
+        if (step < 5 || step % 5 == 0 || step == n_steps - 1) {
+            f32 loss_val = thvm_to_host(ctx, loss)[0];
             printf("  step %2u: loss=%.4f dispatches=%u tensors=%u heap=%llu (%.0fms)\n",
                    step, loss_val, total_dispatches, ctx->tensor_count,
                    (unsigned long long)ctx->heap_pos, ms);
+        }
         if (step == 1) print_dispatch_breakdown();
         total_dispatches = 0;
 

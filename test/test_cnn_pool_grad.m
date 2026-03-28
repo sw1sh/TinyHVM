@@ -75,11 +75,12 @@ int main(void) {
                 thvm_op(ctx,UOP_MUL,lr_t,gs[i]))),sgd);
         thvm_reduce(ctx,thvm_app(ctx,grad_term,sgd));
 
-        f32 lv=thvm_to_host(ctx,loss)[0];
         extern u32 total_dispatches;
         extern void print_dispatch_breakdown(void);
-        if(step<3||step%20==0||step==n_steps-1)
+        if(step<3||step%20==0||step==n_steps-1) {
+            f32 lv=thvm_to_host(ctx,loss)[0];
             printf("step %3u: loss=%.4f dispatches=%u\n",step,lv,total_dispatches);
+        }
         if(step==1) print_dispatch_breakdown();
         total_dispatches=0;
         for(u32 i=0;i<NP;i++){u32 pid=(u32)term_val(params[i]);

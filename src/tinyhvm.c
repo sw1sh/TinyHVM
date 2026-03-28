@@ -9,6 +9,10 @@
 #include <string.h>
 #include <assert.h>
 #include <math.h>
+#include <stdatomic.h>
+
+// Thread-local ID (0 = main thread). Set by worker init, read by heap_alloc/tensor_create.
+static _Thread_local u32 tl_thread_id = 0;
 
 // ── term/ — term packing/unpacking ───────────────────────────────────────────
 #include "term/new.c"
@@ -69,6 +73,9 @@ static int is_elementwise(u32 uop);
 static int is_binary(u32 uop);
 static void tensor_materialize(TinyHVM *ctx, u32 tid);
 static int  tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf, const ReduceSpec *rs);
+static int  materialize_walk(TinyHVM *ctx, u32 tid,
+                              FusedOp *ops, u32 *n_ops, u32 *op_tids,
+                              u32 *leaf_ids, const View **leaf_views, u32 *n_leaves);
 #define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0&&c->tensors[t].creator_op)tensor_materialize(c,t);}while(0)
 
 // Read strided view to contiguous host buffer

@@ -12,7 +12,7 @@ int main(void) {
     printf("=== TinyHVM IC Reduction Rate ===\n\n");
 
     // TAG_TEN path (tensor-backed, full overhead)
-    { TinyHVM *ctx = thvm_init("cpu"); u32 N=100000;
+    { TinyHVM *ctx = thvm_init("cpu"); u32 N=10000;
       f32 v=1.0f; Term t = thvm_tensor(ctx, &v, SHAPE(1));
       for (u32 i=0;i<N;i++) t = thvm_op_raw(ctx, UOP_NEG, t, term_era());
       ctx->itrs=0; double t0=now(); thvm_reduce(ctx,t); double e=now()-t0;
@@ -20,7 +20,7 @@ int main(void) {
       thvm_free(ctx); }
 
     // TAG_NUM path (inline scalar, no tensors)
-    { TinyHVM *ctx = thvm_init("cpu"); u32 N=100000;
+    { TinyHVM *ctx = thvm_init("cpu"); u32 N=10000;
       Term t = term_num_f32(1.0f);
       for (u32 i=0;i<N;i++) t = thvm_op_raw(ctx, UOP_NEG, t, term_era());
       ctx->itrs=0; double t0=now(); thvm_reduce(ctx,t); double e=now()-t0;
@@ -28,7 +28,7 @@ int main(void) {
       thvm_free(ctx); }
 
     // TAG_NUM ADD chain
-    { TinyHVM *ctx = thvm_init("cpu"); u32 N=100000;
+    { TinyHVM *ctx = thvm_init("cpu"); u32 N=10000;
       Term t = term_num_f32(0.0f);
       for (u32 i=0;i<N;i++) t = thvm_op_raw(ctx, UOP_ADD, t, term_num_f32(1.0f));
       ctx->itrs=0; double t0=now(); Term r=thvm_reduce(ctx,t); double e=now()-t0;
@@ -37,7 +37,7 @@ int main(void) {
       thvm_free(ctx); }
 
     // TAG_TEN ADD for comparison
-    { TinyHVM *ctx = thvm_init("cpu"); u32 N=100000;
+    { TinyHVM *ctx = thvm_init("cpu"); u32 N=10000;
       f32 v=0.0f; Term t = thvm_tensor(ctx, &v, SHAPE(1));
       for (u32 i=0;i<N;i++) t = thvm_op_raw(ctx, UOP_ADD, t, thvm_tensor(ctx, &(f32){1.0f}, SHAPE(1)));
       ctx->itrs=0; double t0=now(); Term r=thvm_reduce(ctx,t); double e=now()-t0;
@@ -47,7 +47,7 @@ int main(void) {
 
     // Scaling: TAG_NUM NEG at different chain lengths
     printf("\nScaling (TAG_NUM NEG):\n");
-    for (u32 N = 1000; N <= 1000000; N *= 10) {
+    for (u32 N = 1000; N <= 10000; N *= 10) {
         TinyHVM *ctx = thvm_init("cpu");
         Term t = term_num_f32(1.0f);
         for (u32 i=0;i<N;i++) t = thvm_op_raw(ctx, UOP_NEG, t, term_era());

@@ -1,9 +1,17 @@
 // tensor/create.c — tensor_create() / tensor_view_of()
 
 // Allocate a new tensor slot with a fresh GPU/CPU buffer.
+// When n_threads > 1: per-thread tensor ID range (zero contention).
 static u32 tensor_create(TinyHVM *ctx, Shape s, u32 dtype) {
-  assert(s.rank <= MAX_DIM && ctx->tensor_count < MAX_TENSORS);
-  u32         id = ctx->tensor_count++;
+  u32 id;
+  if (ctx->n_threads > 1) {
+    ThvmThread *ts = &ctx->threads[tl_thread_id];
+    id = ts->tensor_next++;
+    assert(id < ts->tensor_end && "thread tensor ID overflow");
+  } else {
+    assert(s.rank <= MAX_DIM && ctx->tensor_count < MAX_TENSORS);
+    id = ctx->tensor_count++;
+  }
   TensorMeta *m  = &ctx->tensors[id];
   memset(m, 0, sizeof(*m));
   m->dtype   = dtype;
@@ -21,8 +29,15 @@ static u32 tensor_create(TinyHVM *ctx, Shape s, u32 dtype) {
 
 // Create a view alias: shares the buffer, but has a different View.
 static u32 tensor_view_of(TinyHVM *ctx, u32 src_id, View new_view) {
-  assert(ctx->tensor_count < MAX_TENSORS);
-  u32         id  = ctx->tensor_count++;
+  u32 id;
+  if (ctx->n_threads > 1) {
+    ThvmThread *ts = &ctx->threads[tl_thread_id];
+    id = ts->tensor_next++;
+    assert(id < ts->tensor_end && "thread tensor ID overflow");
+  } else {
+    assert(ctx->tensor_count < MAX_TENSORS);
+    id = ctx->tensor_count++;
+  }
   TensorMeta *m   = &ctx->tensors[id];
   TensorMeta *ms  = &ctx->tensors[src_id];
   memset(m, 0, sizeof(*m));
@@ -34,14 +49,19 @@ static u32 tensor_view_of(TinyHVM *ctx, u32 src_id, View new_view) {
   return id;
 }
 
-// Refcount helpers for inet GC
+// Refcount helpers for inet GC.
+// When n_threads > 1: use atomic operations for safe cross-thread sharing.
 static inline void tensor_incref(TinyHVM *ctx, u32 id) {
-    ctx->tensors[id].refcount++;
+    if (ctx->n_threads > 1)
+        atomic_fetch_add((_Atomic(u32)*)&ctx->tensors[id].refcount, 1);
+    else
+        ctx->tensors[id].refcount++;
 }
 
 static inline void tensor_decref(TinyHVM *ctx, u32 id) {
-    TensorMeta *m = &ctx->tensors[id];
-    if (m->refcount > 0) m->refcount--;
+    if (ctx->n_threads > 1)
+        atomic_fetch_sub((_Atomic(u32)*)&ctx->tensors[id].refcount, 1);
+    else if (ctx->tensors[id].refcount > 0)
+        ctx->tensors[id].refcount--;
     // Buffer freeing deferred to thvm_reset — view-shared bufs make eager free unsafe.
-    (void)ctx;
 }

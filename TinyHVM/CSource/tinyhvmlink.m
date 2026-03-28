@@ -1168,6 +1168,21 @@ EXTERN_C DLLEXPORT int thvmHeapGraph(
     g_na_funcs->MNumericArray_new(MNumericArray_Type_Real64, 1, dims, &na);
     double *d = (double *)g_na_funcs->MNumericArray_getData(na);
 
+    // For TAG_TEN nodes, replace val (tid) with the WL term id
+    // by reverse-scanning g_terms[]. This makes labels match TTensor[id].
+    for (u32 i = 0; i < n_nodes; i++) {
+        if ((u32)nodes[i * 3] == TAG_TEN) {
+            u32 tid = (u32)nodes[i * 3 + 2];
+            for (u32 j = 1; j < g_term_cap; j++) {
+                if (g_terms[j] != 0 && term_tag(g_terms[j]) == TAG_TEN &&
+                    (u32)term_val(g_terms[j]) == tid) {
+                    nodes[i * 3 + 2] = (i32)j; // replace tid with WL id
+                    break;
+                }
+            }
+        }
+    }
+
     d[0] = (double)n_nodes;
     d[1] = (double)n_edges;
     for (u32 i = 0; i < n_nodes * 3; i++) d[2 + i] = (double)nodes[i];

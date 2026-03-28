@@ -24,7 +24,7 @@ opColor[op_String] := Switch[op,
     _, GrayLevel[0.7]
 ];
 
-TComputationGraph[t_TTerm, opts___?OptionQ] :=
+TComputationGraph[t_TTensor, opts___?OptionQ] :=
 Module[{id = t[[1]], visited = <||>, queue, edges = {}, labels = <||>,
         colors = <||>, cur, info, inp},
     queue = {id};

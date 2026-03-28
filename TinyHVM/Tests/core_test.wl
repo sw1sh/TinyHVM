@@ -27,7 +27,7 @@ check["TTensorCount starts at 0", TTensorCount[], 0];
 (* ── Tensor creation ─────────────────────────────────────── *)
 Print["\n--- Tensor creation ---"];
 t1 = TCreate[{1., 2., 3., 4.}, {2, 2}];
-checkTrue["TCreate returns TTerm", MatchQ[t1, _TTerm]];
+checkTrue["TCreate returns TTensor", MatchQ[t1, _TTensor]];
 check["TDimensions", TDimensions[t1], {2, 2}];
 check["TTensorCount after create", TTensorCount[], 1];
 
@@ -41,7 +41,7 @@ check["TGet roundtrip [4]", data[[4]], 4.];
 Print["\n--- Elementwise ops ---"];
 t2 = TCreate[{10., 20., 30., 40.}, {2, 2}];
 tAdd = TOp["Add"][t1, t2];
-checkTrue["TOp Add returns TTerm", MatchQ[tAdd, _TTerm]];
+checkTrue["TOp Add returns TTensor", MatchQ[tAdd, _TTensor]];
 addResult = Normal[TGet[TReduce[tAdd]]];
 check["Add result [1]", addResult[[1]], 11.];
 check["Add result [4]", addResult[[4]], 44.];
@@ -85,7 +85,7 @@ check["Permute (transpose) [2]", permResult[[2]], 3.];
 (* ── Interaction net primitives ──────────────────────────── *)
 Print["\n--- Inet primitives ---"];
 (* Build: (λx. x) applied to t1 — should reduce to t1 *)
-{lam, var} = TLam[t1];
+{lam, var} = TLam[ToTTerm[t1]];
 checkTrue["TLam returns pair", Length[{lam, var}] == 2];
 
 appTerm = TApp[lam, t2];

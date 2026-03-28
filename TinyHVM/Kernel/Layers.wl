@@ -154,14 +154,14 @@ TNet[specs_List, inputShape_List] := Module[{layers = {}, shape = inputShape, re
 ];
 
 (* Accessors *)
-TForward[TNet[assoc_Association], x_TTerm] := assoc["Forward"][x];
-TForward[layer_TLayer, x_TTerm] := First[layer]["Forward"][x];
+TForward[TNet[assoc_Association], x_TTensor] := assoc["Forward"][x];
+TForward[layer_TLayer, x_TTensor] := First[layer]["Forward"][x];
 TParams[TNet[assoc_Association]] := assoc["Params"];
 TParams[layer_TLayer] := First[layer]["Params"];
 
 (* ── Loss functions ─────────────────────────────────────────────────────── *)
 
-TCrossEntropyLoss[logits_TTerm, oneHot_TTerm] :=
+TCrossEntropyLoss[logits_TTensor, oneHot_TTensor] :=
 Module[{dims, bs, nc, xmax, shifted, e, esum, probs, eps, clamped, lp, masked},
     dims = TDimensions[logits];
     bs = dims[[1]]; nc = dims[[2]];
@@ -182,14 +182,14 @@ Module[{dims, bs, nc, xmax, shifted, e, esum, probs, eps, clamped, lp, masked},
 
 (* ── SGD + training step ─────────────────────────────────────────────── *)
 
-TSGD[params_List, gradSlots_List, lrTen_TTerm] :=
+TSGD[params_List, gradSlots_List, lrTen_TTensor] :=
     Fold[TApp[TAssign[params[[#2]],
         TOp["Sub"][params[[#2]], TOp["Mul"][lrTen, gradSlots[[#2]]]]], #1] &,
         TCreate[{0.}, {1}],
         Reverse[Range[Length[params]]]
     ];
 
-TTrainStep[params_List, loss_TTerm, lr_?NumericQ] :=
+TTrainStep[params_List, loss_TTensor, lr_?NumericQ] :=
 Module[{n = Length[params], gradSlots, gradTerm, lrTen, sgdChain, lossVal},
     gradSlots = Table[
         TCreate[ConstantArray[0., Times @@ TDimensions[params[[i]]]],

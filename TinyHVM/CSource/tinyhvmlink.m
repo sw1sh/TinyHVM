@@ -117,14 +117,14 @@ EXTERN_C DLLEXPORT int thvmInit(
             chdir(dir);
         }
 
-        g_ctx = thvm_init(thvm_device(device));
+        g_ctx = thvm_init(device);
 
         // Restore working directory
         chdir(saved_cwd);
     } else
 #endif
     {
-        g_ctx = thvm_init(thvm_device(device));
+        g_ctx = thvm_init(device);
     }
 
     // Init term map
@@ -1051,5 +1051,94 @@ EXTERN_C DLLEXPORT int thvmProfileData(
     d[idx++] = (double)p->cpu_write_cnt;
 
     MArgument_setMNumericArray(res, out);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmViewInfo[termId] → NumericArray[Real64]
+// Layout: [rank, dims..., strides..., offset, numel, contiguous, has_mask, mask_begin..., mask_end...]
+EXTERN_C DLLEXPORT int thvmViewInfo(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint term_id = MArgument_getInteger(args[0]);
+    Term t = get_term(term_id);
+    const View *v = NULL;
+
+    if (term_tag(t) == TAG_TEN) {
+        v = &g_ctx->tensors[(u32)term_val(t)].view;
+    } else if (term_tag(t) == TAG_TOP) {
+        v = st_get(term_val(t));
+    }
+    if (!v) return LIBRARY_FUNCTION_ERROR;
+
+    u32 r = v->shape.rank;
+    // rank + dims[r] + strides[r] + offset + numel + contiguous + has_mask + mask_begin[r] + mask_end[r]
+    mint len = 1 + r + r + 4 + (v->has_mask ? 2*r : 0);
+    mint dims[1] = {len};
+    MNumericArray out;
+    int err = g_na_funcs->MNumericArray_new(MNumericArray_Type_Real64, 1, dims, &out);
+    if (err) return LIBRARY_FUNCTION_ERROR;
+    double *d = (double *)g_na_funcs->MNumericArray_getData(out);
+
+    int idx = 0;
+    d[idx++] = (double)r;
+    for (u32 i = 0; i < r; i++) d[idx++] = (double)v->shape.dims[i];
+    for (u32 i = 0; i < r; i++) d[idx++] = (double)v->strides[i];
+    d[idx++] = (double)v->offset;
+    d[idx++] = (double)v->numel;
+    d[idx++] = (double)v->contiguous;
+    d[idx++] = (double)v->has_mask;
+    if (v->has_mask) {
+        for (u32 i = 0; i < r; i++) d[idx++] = (double)v->mask_begin[i];
+        for (u32 i = 0; i < r; i++) d[idx++] = (double)v->mask_end[i];
+    }
+
+    MArgument_setMNumericArray(res, out);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmTensorDevice[termId] → Integer (device index: 0=cpu, 1=metal)
+EXTERN_C DLLEXPORT int thvmTensorDevice(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint term_id = MArgument_getInteger(args[0]);
+    Term t = get_term(term_id);
+    if (term_tag(t) != TAG_TEN) {
+        MArgument_setInteger(res, -1);
+        return LIBRARY_NO_ERROR;
+    }
+
+    u32 tid = (u32)term_val(t);
+    Backend *be = g_ctx->tensors[tid].backend;
+    for (u32 i = 0; i < g_ctx->n_backends; i++) {
+        if (g_ctx->backends[i] == be) {
+            MArgument_setInteger(res, (mint)i);
+            return LIBRARY_NO_ERROR;
+        }
+    }
+    MArgument_setInteger(res, -1);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmToDevice[outId, termId, deviceIdx] → Void
+EXTERN_C DLLEXPORT int thvmToDevice(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc; (void)res;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint out_id = MArgument_getInteger(args[0]);
+    mint term_id = MArgument_getInteger(args[1]);
+    mint dev_idx = MArgument_getInteger(args[2]);
+    ensure_term_cap(out_id);
+
+    Term t = get_term(term_id);
+    Term result = thvm_to_device(g_ctx, t, (u32)dev_idx);
+    set_term(out_id, result);
     return LIBRARY_NO_ERROR;
 }

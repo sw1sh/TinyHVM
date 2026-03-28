@@ -46,6 +46,14 @@ void metal_buf_copy(u32 dst_buf, u32 src_buf, u64 nbytes) {
                     size:nbytes];
     [blit endEncoding];
     batch_dirty = 1;
+    if (jit.state == JIT_CAPTURE && jit.n_cmds < JIT_MAX_CMDS) {
+        JITCmd *cmd = &jit.cmds[jit.n_cmds++];
+        memset(cmd, 0, sizeof(*cmd));
+        cmd->is_blit = 1;
+        cmd->blit_dst_slot = jit_slot_for_buf(dst_buf);
+        cmd->blit_src_slot = jit_slot_for_buf(src_buf);
+        cmd->blit_size = nbytes;
+    }
 }
 
 static void metal_begin_batch(void) {

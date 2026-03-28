@@ -56,6 +56,10 @@ typedef struct {
     u8 params[JIT_MAX_PARAMS]; u32 param_sizes[8]; u32 n_params;
     u32 grid[3]; u32 tg[3]; u8 is_mps;
     u32 mps_m, mps_k, mps_n, mps_dst_slot, mps_a_slot, mps_b_slot;
+    u8 mps_trans_a, mps_trans_b;
+    u32 mps_phys_a_rows, mps_phys_a_cols, mps_phys_b_rows, mps_phys_b_cols;
+    // Blit copy
+    u8 is_blit; u32 blit_dst_slot, blit_src_slot; u64 blit_size;
 } JITCmd;
 
 typedef struct {
@@ -73,9 +77,10 @@ typedef struct {
 static JITState jit = {0};
 
 // JIT function forward declarations (implementation in jit.m)
+static u32  jit_slot_for_buf(u32 buf_id);
 static void jit_record_dispatch_1d(id<MTLComputePipelineState>, id<MTLBuffer>*, u32,
                                      const void**, u64*, u32, u32,u32,u32, u32,u32,u32);
-static void jit_record_mps(u32, u32, u32, u32, u32, u32);
+static void jit_record_mps(u32, u32, u32, u32, u32, u32, BOOL, BOOL, u32, u32, u32, u32);
 
 // Free-list for buffer reuse
 #define MAX_FREE_BUFS 512

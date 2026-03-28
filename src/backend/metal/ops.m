@@ -315,7 +315,8 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
 
     [mm encodeToCommandBuffer:batch_cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
     batch_dirty = 1; total_dispatches++; dc[DC_MM]++;
-    if (jit.state == JIT_CAPTURE) jit_record_mps(dst, buf_a_id, buf_b_id, M, K, N);
+    if (jit.state == JIT_CAPTURE) jit_record_mps(dst, buf_a_id, buf_b_id, M, K, N,
+        transposeA, transposeB, phys_a_rows, phys_a_cols, phys_b_rows, phys_b_cols);
     thvm_prof_record(UOP_MM, t0);
 }
 

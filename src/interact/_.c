@@ -456,6 +456,29 @@ inet_step:
                 heap_set(ctx, loc + 1, b);
             }
 
+            // TAG_NUM fast path: inline scalar compute without tensors/buffers.
+            // ~5ns per interaction vs ~30ns with tensor_create + buf ops.
+            if (term_tag(a) == TAG_NUM && !is_movement && !is_reduce && uop != UOP_MM) {
+                f32 va = term_as_f32(a);
+                f32 vb = (is_binary && term_tag(b) == TAG_NUM) ? term_as_f32(b) : 0;
+                f32 vr;
+                if (is_binary && term_tag(b) != TAG_NUM) goto num_skip;
+                switch (uop) {
+                    case UOP_ADD: vr=va+vb; break; case UOP_SUB: vr=va-vb; break;
+                    case UOP_MUL: vr=va*vb; break; case UOP_DIV: vr=vb!=0?va/vb:0; break;
+                    case UOP_NEG: vr=-va; break;   case UOP_RELU: vr=va>0?va:0; break;
+                    case UOP_EXP: vr=__builtin_expf(va); break;
+                    case UOP_LOG: vr=__builtin_logf(va); break;
+                    case UOP_SQRT: vr=__builtin_sqrtf(va); break;
+                    case UOP_MAX: vr=va>vb?va:vb; break;
+                    case UOP_CMP: vr=va>vb?1.f:0.f; break;
+                    default: goto num_skip;
+                }
+                ctx->itrs++;
+                RETURN_REDUCED(term_num_f32(vr));
+            }
+            num_skip:
+
             // ERA-as-identity for grad domain: ADD/SUB/MUL/DIV with ERA operands
             // ADD(ERA,x)→x, ADD(x,ERA)→x, ADD(ERA,ERA)→ERA, MUL(*,ERA)→ERA
             if (is_binary) {

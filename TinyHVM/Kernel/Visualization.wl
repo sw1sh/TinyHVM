@@ -1,54 +1,82 @@
 (* Visualization.wl — Graph visualization and profiling for TinyHVM *)
 (* Get'd from TinyHVM.wl inside Begin["`Private`"]. All public symbols declared there. *)
 
-(* ── Computation graph ──────────────────────────────────────────────────── *)
+(* ── Inet graph from C heap ───────────────────────────────────────────── *)
 
-$TGraphTrace = False;
-$TGraph = <||>;
+(* Tag names for display *)
+$tagName = <|0 -> "APP", 1 -> "LAM", 2 -> "VAR", 3 -> "SUP",
+    4 -> "DP0", 5 -> "DP1", 6 -> "ERA", 7 -> "NUM", 8 -> "REF",
+    9 -> "OP2", 10 -> "TEN", 11 -> "TOP", 12 -> "CTR"|>;
 
-recordNode[id_, op_, inputs_List] := If[$TGraphTrace,
-    $TGraph[id] = <|"Op" -> op, "Inputs" -> inputs|>
-];
+(* Tag colors for vertices *)
+$tagColor = <|
+    0  -> RGBColor[0.63, 0.28, 0.64],   (* APP — purple *)
+    1  -> RGBColor[0.63, 0.28, 0.64],   (* LAM — purple *)
+    2  -> GrayLevel[0.7],               (* VAR — gray *)
+    3  -> RGBColor[0.85, 0.33, 0.10],   (* SUP — orange *)
+    4  -> RGBColor[0.85, 0.33, 0.10],   (* DP0 — orange *)
+    5  -> RGBColor[0.85, 0.33, 0.10],   (* DP1 — orange *)
+    6  -> GrayLevel[0.5],               (* ERA — dark gray *)
+    7  -> GrayLevel[0.6],               (* NUM — gray *)
+    8  -> RGBColor[0.44, 0.74, 0.27],   (* REF — green *)
+    9  -> RGBColor[0.93, 0.49, 0.19],   (* OP2 — orange *)
+    10 -> RGBColor[0.2, 0.6, 0.9],      (* TEN — blue *)
+    11 -> RGBColor[0.93, 0.49, 0.19],   (* TOP — orange *)
+    12 -> GrayLevel[0.6]                (* CTR — gray *)
+|>;
 
-TGraphReset[] := ($TGraph = <||>);
-
-opColor[op_String] := Switch[op,
-    "Tensor", RGBColor[0.2, 0.6, 0.9],
-    "Add" | "Mul" | "Sub" | "Div" | "Max", RGBColor[0.93, 0.49, 0.19],
-    "Neg" | "Exp" | "Log" | "Relu" | "Sqrt", RGBColor[0.44, 0.74, 0.27],
-    "Sum" | "RMax", RGBColor[0.84, 0.24, 0.24],
-    "MatMul", RGBColor[0.63, 0.28, 0.64],
-    "Conv2D" | "MaxPool2D", RGBColor[0.20, 0.44, 0.69],
-    "Reshape" | "Expand" | "Permute" | "Pad" | "Shrink", GrayLevel[0.6],
-    "Grad" | "GradMulti", RGBColor[0.85, 0.33, 0.10],
-    _, GrayLevel[0.7]
-];
-
-TComputationGraph[t_TTensor, opts___?OptionQ] :=
-Module[{id = t[[1]], visited = <||>, queue, edges = {}, labels = <||>,
-        colors = <||>, cur, info, inp},
-    queue = {id};
-    While[queue =!= {},
-        cur = First[queue]; queue = Rest[queue];
-        If[!KeyExistsQ[visited, cur],
-            visited[cur] = True;
-            If[KeyExistsQ[$TGraph, cur],
-                info = $TGraph[cur];
-                labels[cur] = info["Op"];
-                colors[cur] = opColor[info["Op"]];
-                Do[AppendTo[edges, inp -> cur];
-                   If[!KeyExistsQ[visited, inp], AppendTo[queue, inp]],
-                   {inp, info["Inputs"]}],
-                labels[cur] = "T" <> ToString[cur];
-                colors[cur] = opColor["Tensor"]
+(* Build label for a graph node *)
+iNodeLabel[tag_, ext_, val_] := Switch[tag,
+    10, (* TEN *)
+        Module[{dims = Quiet[TDimensions[TTensor[val]]]},
+            If[ListQ[dims],
+                "T" <> ToString[val] <> "\n" <> ToString[dims],
+                "T" <> ToString[val]
             ]
-        ]
+        ],
+    11, (* TOP *)
+        If[KeyExistsQ[$uopName, ext], $uopName[ext], "UOp" <> ToString[ext]],
+    7,  (* NUM *) "NUM",
+    6,  (* ERA *) "\[FilledSmallCircle]",
+    8,  (* REF *) "REF",
+    _, Lookup[$tagName, tag, "?"]
+];
+
+TINetGraph[t_TTensor, opts___?OptionQ] := TINetGraph[ToTTerm[t], opts];
+TINetGraph[t_TTerm, opts___?OptionQ] := Module[
+    {ds, nodesRaw, edgesRaw, nNodes, nEdges, verts, edges, labels, colors, i,
+     tag, ext, val},
+    loadLibrary[];
+    ds = thvmHeapGraphFn[t[[1]]];
+    nodesRaw = Normal[ds["Nodes"]];
+    edgesRaw = Normal[ds["Edges"]];
+    nNodes = Length[nodesRaw] / 3;
+    nEdges = Length[edgesRaw] / 2;
+
+    (* Build vertices with labels and colors *)
+    verts = Range[nNodes] - 1; (* 0-indexed *)
+    labels = <||>;
+    colors = <||>;
+    Do[
+        tag = nodesRaw[[3 i - 2]];
+        ext = nodesRaw[[3 i - 1]];
+        val = nodesRaw[[3 i]];
+        labels[i - 1] = iNodeLabel[tag, ext, val];
+        colors[i - 1] = Lookup[$tagColor, tag, GrayLevel[0.7]],
+        {i, nNodes}
     ];
-    Graph[Keys[visited], edges,
+
+    (* Build edges *)
+    edges = Table[
+        edgesRaw[[2 j - 1]] -> edgesRaw[[2 j]],
+        {j, nEdges}
+    ];
+
+    Graph[verts, edges,
         VertexLabels -> Normal[labels],
         VertexStyle -> Normal[colors],
         VertexSize -> 0.6,
-        VertexLabelStyle -> Directive[10, Bold],
+        VertexLabelStyle -> Directive[9, Bold],
         GraphLayout -> {"LayeredDigraphEmbedding", "Orientation" -> Left},
         EdgeStyle -> GrayLevel[0.5],
         ImageSize -> Medium,

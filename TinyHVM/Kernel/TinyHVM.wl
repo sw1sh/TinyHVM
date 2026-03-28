@@ -94,9 +94,7 @@ TTrainStep::usage = "TTrainStep[params, loss, lr] performs one gradient step, re
 
 (* ── Graph visualization ──────────────────────────────────────────────── *)
 
-TComputationGraph::usage = "TComputationGraph[term] returns a Graph of the computation DAG.";
-$TGraphTrace::usage = "Set to True to record computation graph edges.";
-TGraphReset::usage = "TGraphReset[] clears the recorded computation graph.";
+TINetGraph::usage = "TINetGraph[tensor|term] returns a Graph of the interaction net by walking the C heap.";
 
 (* ── Profiling ────────────────────────────────────────────────────────── *)
 
@@ -240,6 +238,7 @@ thvmProfileDataFn = None;
 thvmViewInfoFn = None;
 thvmTensorDeviceFn = None;
 thvmToDeviceFn = None;
+thvmHeapGraphFn = None;
 
 loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
     $libraryLoaded = True;
@@ -369,6 +368,10 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
         {Integer}, Integer];
     thvmToDeviceFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmToDevice",
         {Integer, Integer, Integer}, "Void"];
+
+    (* Heap graph visualization *)
+    thvmHeapGraphFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapGraph",
+        {Integer}, "DataStore"];
 ];
 
 (* ════════════════════════════════════════════════════════════════════════ *)
@@ -397,14 +400,12 @@ TCreate[data_List, shape_List] := Module[{na, out = allocId[]},
     loadLibrary[];
     na = NumericArray[N[Flatten[data]], "Real32"];
     thvmTensorFn[out, na, shape];
-    recordNode[out, "Tensor", {}];
     TTensor[out]
 ];
 
 TCreate[na_NumericArray, shape_List] := Module[{out = allocId[]},
     loadLibrary[];
     thvmTensorFn[out, na, shape];
-    recordNode[out, "Tensor", {}];
     TTensor[out]
 ];
 
@@ -519,7 +520,6 @@ TOp[op_String][a_TTensor, b_TTensor] /;
 Module[{out = allocId[]},
     loadLibrary[];
     thvmOpFn[out, $uopCode[op], a[[1]], b[[1]]];
-    recordNode[out, op, {a[[1]], b[[1]]}];
     TTensor[out]
 ];
 
@@ -531,7 +531,6 @@ TOp[op_String][a_TTensor] /; MemberQ[$unaryOps, op] :=
 Module[{out = allocId[]},
     loadLibrary[];
     thvmOpFn[out, $uopCode[op], a[[1]], 0];
-    recordNode[out, op, {a[[1]]}];
     TTensor[out]
 ];
 
@@ -542,21 +541,18 @@ Module[{out = allocId[]},
 TOp["Reshape"][t_TTensor, shape_List] := Module[{out = allocId[]},
     loadLibrary[];
     thvmReshapeFn[out, t[[1]], shape];
-    recordNode[out, "Reshape", {t[[1]]}];
     TTensor[out]
 ];
 
 TOp["Expand"][t_TTensor, shape_List] := Module[{out = allocId[]},
     loadLibrary[];
     thvmExpandFn[out, t[[1]], shape];
-    recordNode[out, "Expand", {t[[1]]}];
     TTensor[out]
 ];
 
 TOp["Permute"][t_TTensor, axes_List] := Module[{out = allocId[]},
     loadLibrary[];
     thvmPermuteFn[out, t[[1]], axes];
-    recordNode[out, "Permute", {t[[1]]}];
     TTensor[out]
 ];
 
@@ -575,7 +571,6 @@ TOp["Shrink"][t_TTensor, pairs_List] := Module[{out = allocId[]},
 TOp["Sum"][t_TTensor, axes_List] := Module[{out = allocId[]},
     loadLibrary[];
     thvmSumAxesFn[out, t[[1]], axes];
-    recordNode[out, "Sum", {t[[1]]}];
     TTensor[out]
 ];
 
@@ -684,7 +679,6 @@ TConv2d[x_TTensor, w_TTensor, b_TTensor, groups_Integer:1,
 Module[{out = allocId[]},
     loadLibrary[];
     thvmConv2dFn[out, x[[1]], w[[1]], b[[1]], groups, stride, padding];
-    recordNode[out, "Conv2D", {x[[1]], w[[1]], b[[1]]}];
     TTensor[out]
 ];
 

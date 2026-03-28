@@ -1142,3 +1142,47 @@ EXTERN_C DLLEXPORT int thvmToDevice(
     set_term(out_id, result);
     return LIBRARY_NO_ERROR;
 }
+
+// ── Heap graph visualization ──────────────────────────────────────────────────
+
+// thvmHeapGraph(termId) → {nodesNA, edgesNA}
+// nodesNA: Int32 NumericArray, [tag, ext, val_lo] × n_nodes (flattened)
+// edgesNA: Int32 NumericArray, [from, to] × n_edges (flattened)
+EXTERN_C DLLEXPORT int thvmHeapGraph(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint term_id = MArgument_getInteger(args[0]);
+    Term root = get_term(term_id);
+
+    i32 *nodes = NULL, *edges = NULL;
+    u32 n_nodes = 0, n_edges = 0;
+    thvm_heap_graph(g_ctx, root, &nodes, &n_nodes, &edges, &n_edges);
+
+    // Build result as a DataStore containing two NumericArrays
+    DataStore ds = libData->ioLibraryFunctions->createDataStore();
+
+    // Nodes NumericArray
+    MNumericArray na_nodes = NULL;
+    mint node_dims[1] = { (mint)(n_nodes * 3) };
+    g_na_funcs->MNumericArray_new(MNumericArray_Type_SInt32, 1, node_dims, &na_nodes);
+    i32 *nd = (i32 *)g_na_funcs->MNumericArray_getData(na_nodes);
+    if (n_nodes > 0) memcpy(nd, nodes, n_nodes * 3 * sizeof(i32));
+    libData->ioLibraryFunctions->DataStore_addMNumericArray(ds, "Nodes", na_nodes);
+
+    // Edges NumericArray
+    MNumericArray na_edges = NULL;
+    mint edge_dims[1] = { (mint)(n_edges * 2) };
+    g_na_funcs->MNumericArray_new(MNumericArray_Type_SInt32, 1, edge_dims, &na_edges);
+    i32 *ed = (i32 *)g_na_funcs->MNumericArray_getData(na_edges);
+    if (n_edges > 0) memcpy(ed, edges, n_edges * 2 * sizeof(i32));
+    libData->ioLibraryFunctions->DataStore_addMNumericArray(ds, "Edges", na_edges);
+
+    free(nodes);
+    free(edges);
+
+    MArgument_setDataStore(res, ds);
+    return LIBRARY_NO_ERROR;
+}

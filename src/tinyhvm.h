@@ -551,6 +551,11 @@ Term     thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank);
 // Print
 void     thvm_print_term(TinyHVM *ctx, Term t);
 
+// Heap graph (for visualization)
+void     thvm_heap_graph(TinyHVM *ctx, Term root,
+                         i32 **out_nodes, u32 *out_n_nodes,
+                         i32 **out_edges, u32 *out_n_edges);
+
 // Autograd
 void     thvm_set_requires_grad(TinyHVM *ctx, Term t);
 

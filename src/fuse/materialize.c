@@ -323,7 +323,27 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
             }
         }
 
-        if (reduce_type) tensor_materialize(ctx, m->src_ids[0]);
+        if (reduce_type) {
+            // Fusion failed (input pre-materialized). Dispatch standalone reduce.
+            ENSURE(ctx, m->src_ids[0]);
+            TensorMeta *ms = &ctx->tensors[m->src_ids[0]];
+            m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+            if (m->backend->dispatch_kernel_rs) {
+                ReduceSpec rs = {0}; rs.reduce_type = reduce_type;
+                Shape fs = ms->view.shape;
+                if (reduce_axes_id) {
+                    ENSURE(ctx, reduce_axes_id);
+                    TensorMeta *axt = &ctx->tensors[reduce_axes_id];
+                    f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
+                    for (u32 i=0;i<axt->view.numel;i++) { u32 ax=(u32)af[i]; if(ax<fs.rank) rs.is_reduce[ax]=1; }
+                } else {
+                    for (int d=(int)fs.rank-1;d>=0;d--) if(fs.dims[d]>1){rs.is_reduce[d]=1;break;}
+                }
+                u32 bufs[]={ms->buf_id}; const View *views[]={&ms->view};
+                m->backend->dispatch_kernel_rs(m->buf_id, bufs, views, 1, NULL, 0, &fs, &rs, NULL, NULL, 0);
+            }
+            return;
+        }
         m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
         return;
     }

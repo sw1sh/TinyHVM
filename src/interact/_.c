@@ -214,7 +214,6 @@ inet_step:
                             GRAD_RETURN(GRAD3(unfused, gy, x));
                         }
                         case UOP_SUM: {
-                            // For TAG_TEN: use directly. For lazy TAG_TOP: reduce to get view.
                             Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
                             gy_r = thvm_reshape(ctx, gy_r, my->view.shape);
                             UN_GRAD(thvm_expand(ctx, gy_r, ma->view.shape));

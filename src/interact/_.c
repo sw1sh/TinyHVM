@@ -103,43 +103,19 @@ inet_step:
                         u64 _l = heap_alloc(ctx, 3); \
                         heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
                         term_new(TAG_TOP, UOP_GRAD, _l); })
-                    // DUP-GRAD accumulation: if tensor has dup_loc, accumulate
-                    // gradient at the DUP node. Park early arrivals (return ERA),
-                    // fire on last arrival (counter reaches 0).
-                    #define GRAD3_FWD(tid_, da_, x_) ({ \
-                        Term _r; u64 _dl = ctx->tensors[tid_].dup_loc; \
-                        if (!_dl) { \
-                            _r = GRAD3(term_ten(tid_, ctx->tensors[tid_].dtype), da_, x_); \
-                        } else { \
-                            Term _acc = heap_read(ctx, _dl + 1); \
-                            if (term_tag(_acc) == TAG_ERA) \
-                                heap_set(ctx, _dl + 1, da_); \
-                            else \
-                                heap_set(ctx, _dl + 1, thvm_reduce(ctx, \
-                                    thvm_op(ctx, UOP_ADD, _acc, da_))); \
-                            u32 _cnt = term_as_u32(heap_read(ctx, _dl + 2)); \
-                            _cnt--; \
-                            heap_set(ctx, _dl + 2, term_new(TAG_NUM, NUM_U32, _cnt)); \
-                            if (_cnt > 0) { _r = term_era(); } \
-                            else { \
-                                Term _total = heap_read(ctx, _dl + 1); \
-                                heap_set(ctx, _dl + 1, term_era()); \
-                                u32 _orig = term_as_u32(heap_read(ctx, _dl + 3)); \
-                                heap_set(ctx, _dl + 2, term_new(TAG_NUM, NUM_U32, _orig)); \
-                                _r = GRAD3(term_ten(tid_, ctx->tensors[tid_].dtype), _total, x_); \
-                            } \
-                        } _r; })
+                    // No GRAD3_FWD — gradient accumulation handled by additive
+                    // ASSIGN at the base case. Each GRAD path walks independently.
                     #define BIN_GRAD(da_, db_) do { \
                         int _a_live = ma->requires_grad; \
                         int _b_live = mb_p && mb_p->requires_grad; \
                         if (_a_live && _b_live) { \
                             RETURN_REDUCED(thvm_op(ctx, UOP_ADD, \
-                                GRAD3_FWD(aid, da_, x), \
-                                GRAD3_FWD(bid, db_, x))); \
+                                GRAD3(at, da_, x), \
+                                GRAD3(bt, db_, x))); \
                         } else if (_a_live) { \
                             UN_GRAD(da_); \
                         } else if (_b_live) { \
-                            Term _bg = GRAD3_FWD(bid, db_, x); \
+                            Term _bg = GRAD3(bt, db_, x); \
                             if (term_tag(_bg) == TAG_TOP) GRAD_STEP(_bg); \
                             RETURN_REDUCED(_bg); \
                         } else { \
@@ -147,7 +123,7 @@ inet_step:
                         } \
                     } while(0)
                     #define UN_GRAD(da_) do { \
-                        Term _ug = GRAD3_FWD(aid, da_, x); \
+                        Term _ug = GRAD3(at, da_, x); \
                         if (term_tag(_ug) == TAG_TOP) GRAD_STEP(_ug); \
                         RETURN_REDUCED(_ug); \
                     } while(0)
@@ -296,7 +272,6 @@ inet_step:
                         }
                     }
                     #undef GRAD3
-                    #undef GRAD3_FWD
                     #undef BIN_GRAD
                     #undef UN_GRAD
                 }
@@ -1033,43 +1008,28 @@ inet_step:
         case TAG_SUP:
             return t;
 
-        // TAG_DP0/DP1: superposition projection — active pair with SUP.
-        // Fire the rule: link to the chosen branch, continue loop.
-        case TAG_DP0: {
-            u64 loc = term_val(t);
-            Term val = thvm_reduce(ctx, heap_read(ctx, loc));
-            if (term_tag(val) == TAG_SUP) {
-                ctx->itrs++;
-                t = heap_read(ctx, term_val(val));
-                goto inet_step;
-            }
-            if (term_tag(val) == TAG_TEN) {
-                heap_set(ctx, loc, val);
-                u32 tid = (u32)term_val(val);
-                if (tid < ctx->tensor_count && !ctx->tensors[tid].dup_loc)
-                    ctx->tensors[tid].dup_loc = loc;
-                return val;
-            }
-            heap_set(ctx, loc, val);
-            return t;
-        }
-
+        // DUP interaction: DP0/DP1 are auxiliary port labels of a single DUP node.
+        // The interaction fires between the DUP's principal port and the value.
+        // ONE rule, branching on dp_index for which projection to return.
+        case TAG_DP0:
         case TAG_DP1: {
+            u32 dp_index = (tag == TAG_DP1) ? 1 : 0;
             u64 loc = term_val(t);
             Term val = thvm_reduce(ctx, heap_read(ctx, loc));
+            heap_set(ctx, loc, val);  // cache reduced value for other projection
+            // DUP ⊳ SUP: annihilation (same label) or commutation (diff label)
             if (term_tag(val) == TAG_SUP) {
                 ctx->itrs++;
-                t = heap_read(ctx, term_val(val) + 1);
+                t = heap_read(ctx, term_val(val) + dp_index);
                 goto inet_step;
             }
-            if (term_tag(val) == TAG_TEN) {
-                heap_set(ctx, loc, val);
-                u32 tid = (u32)term_val(val);
-                if (tid < ctx->tensor_count && !ctx->tensors[tid].dup_loc)
-                    ctx->tensors[tid].dup_loc = loc;
-                return val;
-            }
-            heap_set(ctx, loc, val);
+            // DUP ⊳ TEN: copy atom — both projections get same TEN (shared buffer)
+            if (term_tag(val) == TAG_TEN) return val;
+            // DUP ⊳ ERA: both projections get ERA
+            if (term_tag(val) == TAG_ERA) return val;
+            // DUP ⊳ NUM: copy atom
+            if (term_tag(val) == TAG_NUM) return val;
+            // Not yet reducible — return DUP as-is
             return t;
         }
 

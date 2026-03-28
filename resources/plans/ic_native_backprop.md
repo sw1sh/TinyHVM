@@ -6,139 +6,255 @@ Everything is lazy reduction. `thvm_grad_multi(ctx, loss, params, grad_slots, n)
 a single TAG_TOP(UOP_GRAD) term. `thvm_reduce` drives the entire backward pass through
 interaction rules — no graph walks, no eager tape, no separate backward implementation.
 
-Sharing is inet-native: when a term is used in multiple positions, a DUP node (SUP/DP0/DP1)
-makes the sharing explicit. Gradient accumulation at fan-outs emerges from additive ASSIGN
-at the base case — no counters, no `dup_loc`, no `GRAD3_FWD`.
+Sharing is inet-native: when a term is used in multiple positions, a DUP node makes the
+sharing explicit. Gradient accumulation at fan-outs emerges from additive ASSIGN at the
+base case — no counters, no `dup_loc`, no `GRAD3_FWD`.
 
-## DUP: Optimal Sharing
+## Nodes, Ports, and Active Pairs
 
-### Inet Principle
+### Node Types and Ports
 
-Every wire connects exactly two ports. To use a value twice, create a DUP node:
+Every node has exactly **one principal (active) port** and zero or more auxiliary ports.
+Interactions fire **only** between two nodes whose principal ports are connected (an
+"active pair"). There are no "DP0 interactions" or "DP1 interactions" — DP0/DP1 are
+auxiliary-port labels of the DUP node, not separate interaction participants.
 
 ```
-Producer ──→ SUP(x) ──→ DP0 ──→ Consumer A
-                    └──→ DP1 ──→ Consumer B
+Node     Principal Port    Aux Ports          Domain
+────     ──────────────    ─────────          ──────
+APP      fun position      arg                λ-calculus
+LAM      binder            var, body          λ-calculus
+DUP      value             proj₀, proj₁      sharing
+SUP      consumer          branch₀, branch₁  sharing
+TEN      (leaf — no aux)                      tensor
+TOP      arg₀              arg₁, result       tensor ops
+ERA      (leaf — no aux)                      erasure
+NUM      (leaf — no aux)                      scalars
+REF      (leaf — unfolds)                     definitions
+CTR      (compound)        fields...          data
 ```
 
-The SUP holds a single shared value. DP0 and DP1 are projections. First projection to
-reduce forces the value and caches the result. Second projection reads the cache.
-This is **optimal sharing** — computation happens once, result is shared.
+### Active-Pair Interaction Rules
 
-### Construction: `linear_use` in `thvm_op`
+Following HVM4's interaction combinator model (Lafont '97), every rule is a pair of
+nodes linked through their principal ports. The notation `A ⊳ B` means "A's principal
+port is connected to B's principal port."
 
-When `thvm_op(ctx, op, a, b)` is called, each argument passes through `linear_use`:
+#### Lambda calculus
+
+```
+APP ⊳ LAM  (β-reduction)
+  (λx.body arg) → body[x ← arg]
+
+APP ⊳ SUP  (commutation)
+  (&L{f,g} a) → ! A &L = a; &L{(f A₀),(g A₁)}
+
+APP ⊳ ERA  (erasure)
+  (ERA a) → ERA
+```
+
+#### DUP interactions (all through DUP's principal port)
+
+The DUP node's principal port connects to the value being duplicated. The result
+wires copies to both auxiliary ports (proj₀ and proj₁).
+
+```
+DUP ⊳ SUP  (annihilation, same label)
+  ! X &L = &L{a,b} → X₀ ← a, X₁ ← b
+
+DUP ⊳ SUP  (commutation, different label)
+  ! X &L = &R{a,b} → ! A &L = a; ! B &L = b; X₀ ← &R{A₀,B₀}; X₁ ← &R{A₁,B₁}
+
+DUP ⊳ LAM  (commutation)
+  ! X &L = λx.f → X₀ ← λ$x0.G₀; X₁ ← λ$x1.G₁; x ← &L{$x0,$x1}; ! G &L = f
+
+DUP ⊳ NOD  (commutation — applies to TOP, CTR, any compound node)
+  ! X &L = T{a,b,...} → ! A &L = a; ! B &L = b; ...; X₀ ← T{A₀,B₀,...}; X₁ ← T{A₁,B₁,...}
+
+DUP ⊳ TEN  (copy atom — TEN is a leaf like NAM)
+  ! X &L = TEN(tid) → X₀ ← TEN(tid), X₁ ← TEN(tid)
+
+DUP ⊳ ERA  (erasure)
+  ! X &L = ERA → X₀ ← ERA, X₁ ← ERA
+
+DUP ⊳ NUM  (copy atom)
+  ! X &L = NUM(v) → X₀ ← NUM(v), X₁ ← NUM(v)
+```
+
+#### Tensor operations (TOP interactions)
+
+```
+TOP ⊳ TEN  (fire op — both args resolved)
+  TOP(uop, TEN(a), TEN(b)) → dispatch(uop, a, b) → TEN(result)
+
+TOP(GRAD) ⊳ TEN  (gradient chain rule)
+  GRAD(TEN(y), gy, x) → chain rule based on y.creator_op
+
+TOP(ASSIGN) ⊳ TEN  (gradient deposit — accumulative)
+  ASSIGN(TEN(slot), grad) → slot.buf = ADD(slot.buf, grad.buf); return TEN(slot)
+```
+
+### Why DP0/DP1 Are Not Interaction Nodes
+
+In the current code, `case TAG_DP0` and `case TAG_DP1` in `thvm_interact` define
+separate interaction handlers. This is structurally wrong:
+
+- DP0/DP1 are **auxiliary port labels**, not nodes. A DUP node has one principal
+  port (the value) and two aux ports labeled 0 and 1.
+- In the reducer, when a DP0 or DP1 term enters, it represents "I am a consumer
+  waiting for the DUP's principal port to resolve." The reducer should:
+  1. Push the DUP frame
+  2. Enter the value at the principal port
+  3. When the value reaches WHNF, fire the DUP ⊳ X rule
+  4. Return the appropriate projection (proj₀ or proj₁)
+
+The difference between DP0 and DP1 is **which result to return**, not which
+interaction rule to fire. One DUP ⊳ X rule, two possible results.
 
 ```c
-static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
-    // Apply to ALL terms (not just TAG_TOP)
-    if (term_tag(t) == TAG_ERA) return t;
+// Current (WRONG — two separate interaction handlers):
+case TAG_DP0: { ... if (TAG_SUP) take slot 0 ... }
+case TAG_DP1: { ... if (TAG_SUP) take slot 1 ... }
 
-    // Hash-probe the use table
-    if (first_use(t))   → record dest_loc, return t unchanged
-    if (second_use(t))  → create 1-slot DUP node, patch first site to DP0, return DP1
-    if (third_use(t)+)  → error/extend (binary tree of SUPs for N-way)
-}
+// Correct (ONE interaction rule, branch on projection):
+DUP ⊳ X:
+  fire the appropriate rule (DUP-SUP, DUP-TEN, DUP-NOD, ...)
+  return proj[dp_index]   // dp_index = 0 or 1
 ```
 
-Key differences from the old hack:
-- **Applies to all tags**, not just TAG_TOP. Weights (TAG_TEN) get DUPs too.
-- **1-slot DUP**, not 4-slot. No counters, no gradient accumulator slots.
-  `heap[dl] = shared_term`. That's it.
-- **No `dup_loc` in TensorMeta.** The DUP is inet structure, not metadata.
+## DUP: Optimal Sharing for Tensors
 
-### DUP Interactions
+### Construction
 
-```
-DP0-TEN: return TEN (share buffer, bump refcount)
-DP1-TEN: return TEN (same)
-DP0-TOP: reduce TOP → TEN, cache at heap[dl], return TEN
-DP1-TOP: read cached TEN from heap[dl], return TEN
-DP0-SUP: standard inet rule — take branch 0
-DP1-SUP: standard inet rule — take branch 1
-```
+When `thvm_op(ctx, op, a, b)` encounters the same term used in multiple positions,
+`linear_use` creates a DUP-SUP pair:
 
-For N-way sharing (3+ uses), build a balanced tree of binary SUPs:
-```
-x used 3 times → SUP(x, SUP(x, x))
-  DP0 → x (first consumer)
-  DP1 → SUP(x, x)
-        DP0 → x (second consumer)
-        DP1 → x (third consumer)
+```c
+// Second use of term t:
+u64 sup_loc = heap_alloc(ctx, 2);
+heap_set(ctx, sup_loc, t);       // branch 0
+heap_set(ctx, sup_loc + 1, t);   // branch 1
+Term sup = term_new(TAG_SUP, label, sup_loc);
+
+// Patch first consumer to DP0, return DP1 for second consumer
+heap_set(ctx, first_consumer_loc, term_new(TAG_DP0, label, sup_loc));
+return term_new(TAG_DP1, label, sup_loc);
 ```
 
-No counters needed. Binary tree of binary DUPs. Gradient combination mirrors
-the tree structure.
+The label `L` is fresh. Both SUP branches hold the same term `t`.
 
-## GRAD Interaction (src/interact/_.c)
+### Reduction: DUP ⊳ SUP (same label) = Annihilation
 
-```
-GRAD(y, gy, x):
-  if y == x:       base case → deposit gy via ASSIGN (additive)
-  if y == CTR:     multi-target → match params, deposit via ASSIGN
-  else:            chain rule → look up y.creator_op, produce new GRAD terms
-```
-
-Each backward rule creates lazy ops and new GRAD3 terms:
-- `UN_GRAD(da)`: unary → GRAD3(input, da, x) via GRAD_STEP (tail call)
-- `BIN_GRAD(da, db)`: binary → ADD(GRAD3(a, da, x), GRAD3(b, db, x))
-
-### GRAD Through DUP
-
-Old system: `GRAD3_FWD` reads `dup_loc`, maintains a counter, parks early arrivals,
-fires ADD on last arrival. This is imperative — not inet.
-
-New system: **additive ASSIGN at the base case.** Each GRAD path walks independently.
-When two paths reach the same target parameter, each deposits via ASSIGN. ASSIGN
-accumulates (ADDs to existing value):
+When the DUP's principal port connects to a SUP with matching label:
 
 ```
-ASSIGN(slot, grad):
-  existing = read(slot)
-  write(slot, ADD(existing, grad))
-  return ERA
+! X &L = &L{t, t}
+→ X₀ ← t (branch 0)
+  X₁ ← t (branch 1)
+```
+
+Both projections get the same term `t`. If `t` is lazy (TAG_TOP), each consumer
+reduces it independently. The key question: does this double-evaluate?
+
+### Sharing vs Double-Evaluation
+
+In a pure inet, terms are consumed by interactions — a lazy node can only fire
+once. In TinyHVM, terms are 64-bit values that can appear in multiple heap slots.
+If both SUP branches hold the same TAG_TOP term, reducing one overwrites the
+TOP's heap slots, so the second reduction sees already-resolved TEN args and
+re-fires the kernel — producing a duplicate tensor.
+
+**Solution: single-slot sharing node.** For tensor sharing (same-label SUP where
+both branches are identical), the SUP degenerates to a single slot:
+
+```
+heap[sup_loc] = t         // ONE shared slot
+DP0(sup_loc) → reduces heap[sup_loc], caches TEN result
+DP1(sup_loc) → reads cached TEN from heap[sup_loc]
+```
+
+This is the correct implementation of DUP ⊳ TEN: both projections get the same
+TEN. The first projection forces reduction (TOP → TEN), caches at `heap[sup_loc]`.
+The second projection finds TEN already there.
+
+This works because the DUP ⊳ SUP(same label) annihilation conceptually eliminates
+the SUP, and both projections access the same underlying value. The single-slot
+representation makes the caching automatic.
+
+### N-Way Sharing
+
+For 3+ uses, build a binary tree of DUP-SUP pairs (matching HVM4's DUP-NOD
+commutation pattern):
+
+```
+x used 3 times:
+  SUP_L1{x, SUP_L2{x, x}}
+  Consumer A ← DP0_L1
+  Consumer B ← DP0_L2 (from DP1_L1 → SUP_L2)
+  Consumer C ← DP1_L2 (from DP1_L1 → SUP_L2)
+```
+
+No counters. Binary tree of binary DUPs. Gradient combination mirrors the tree.
+
+## GRAD as Active-Port Interaction
+
+GRAD is a TOP node: `TOP(UOP_GRAD, y, gy, x)`. It fires through the standard
+TOP interaction mechanism — principal port is arg₀ (y).
+
+```
+GRAD ⊳ TEN(y):
+  if y == x:       base case → ASSIGN(slot, gy) (accumulative)
+  if y == CTR:     multi-target → match params, ASSIGN each
+  else:            chain rule → look up y.creator_op, produce GRAD terms
+```
+
+### Chain Rule via Interaction
+
+Each backward rule creates lazy TOP nodes and new GRAD terms:
+- **UN_GRAD(da)**: unary op → `GRAD(input, da, x)` via tail-call GRAD_STEP
+- **BIN_GRAD(da, db)**: binary op → `ADD(GRAD(a, da, x), GRAD(b, db, x))`
+
+### GRAD Through DUP: Additive ASSIGN
+
+When a tensor is DUP'd (used in multiple forward ops), each consumer creates an
+independent GRAD path. Both paths eventually reach the same target parameter and
+deposit via ASSIGN. ASSIGN is **accumulative**:
+
+```
+ASSIGN ⊳ TEN(slot):
+  existing = read(slot.buf)
+  write(slot.buf, ADD(existing, grad.buf))
+  return TEN(slot)
 ```
 
 Gradient slots are zero-initialized by `thvm_backward`. First ASSIGN writes the
-gradient. Second ASSIGN ADDs the second contribution. Order doesn't matter —
-ADD is commutative. No counters, no synchronization, no rendezvous.
-
-Example: `loss = f(g(x), h(x))` where x is DUP'd.
+gradient. Second ASSIGN ADDs its contribution. Order doesn't matter — ADD is
+commutative and associative.
 
 ```
-Forward:  SUP(x, x) → DP0 to g, DP1 to h
-          g(DP0) reduces, h(DP1) reduces — both get same TEN(x)
+Example: loss = MUL(ADD(x, y), x) — x is DUP'd
+
+Forward:  DUP(x) → DP0 to ADD.arg0, DP1 to MUL.arg1
+          DUP ⊳ SUP annihilates → both get TEN(x)
 
 Backward: GRAD(loss, 1, target)
-  → f backward: ADD(GRAD(g_out, da, target), GRAD(h_out, db, target))
-  → g backward: GRAD(x, grad_g, target) → ASSIGN(slot, grad_g)
-  → h backward: GRAD(x, grad_h, target) → ASSIGN(slot, grad_h)
+  MUL backward → BIN_GRAD:
+    ADD(GRAD(ADD_out, gy*x, target), GRAD(x, gy*ADD_out, target))
+  ADD backward → GRAD(x, da, target) → ASSIGN(slot, da)
+  x direct    → GRAD(x, db, target) → ASSIGN(slot, db)
 
-  ASSIGN #1: slot = 0 + grad_g = grad_g
-  ASSIGN #2: slot = grad_g + grad_h  ✓
+  ASSIGN #1: slot = 0 + da
+  ASSIGN #2: slot = da + db  ✓
 ```
 
-The ADD from BIN_GRAD evaluates both sides. Each side walks independently to x
-and deposits. The order of reduction determines which ASSIGN fires first, but
-the result is the same.
-
-### Why Counters Were Wrong
-
-The counter approach (`GRAD3_FWD`) was:
-1. Non-inet: imperative state mutation (decrement counter, park, fire on zero)
-2. Broken for TAG_TEN: excluded weights because "weights appear in both forward
-   and SGD chains" — but the real fix is additive ASSIGN, not exclusion
-3. Coupled to `linear_use`: gradient accumulation depended on the construction-time
-   DUP structure, not on inet interactions
-
-With additive ASSIGN, none of these problems exist. GRAD walks provenance.
-ASSIGN accumulates. DUP is just optimal sharing. Each concern is independent.
+No `GRAD3_FWD`. No `dup_loc`. No counters. Each GRAD path walks provenance
+independently. ASSIGN accumulates at the leaf.
 
 ## Key Properties
 
 1. **No backward_local.** ONE gradient implementation via IC interaction rules.
 
-2. **Lazy gy.** The trampoline fires GRAD without reducing arg1 (gy). Chain rule
+2. **Lazy gy.** The trampoline fires GRAD without reducing arg₁ (gy). Chain rule
    formulas wrap gy in new lazy ops, creating fusable chains. Only base case and
    deposit explicitly reduce gy.
 
@@ -155,43 +271,38 @@ ASSIGN accumulates. DUP is just optimal sharing. Each concern is independent.
 
 ## Integration with Fusion
 
-### Fuser Sees Through DUP
+### Fuser and DUP: Rewrite Rules See Through Sharing
 
-`fuse_walk_inner` in `src/fuse/_.c` already handles DP0/DP1:
-
-```c
-if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1) {
-    Term shared = heap_read(ctx, term_val(t));
-    return fuse_walk_inner(ctx, shared, ...);
-}
-```
-
-The fuser looks through DUP to the shared value. Leaf deduplication ensures
-the same tensor appears once in the kernel's buffer list. When both inputs
-to an op come from the same DUP'd tensor, the fused kernel binds the same
-buffer to both input slots — no data duplication.
-
-### DUP'd Lazy Intermediates
-
-When a DUP'd term is a lazy chain (TAG_TOP), the fuser can include the
-chain in the fused kernel with CSE:
+The fuser operates as a rewrite rule (fires in `rewrite_apply` before depth-first
+reduction). When it walks a TAG_TOP chain and encounters a DUP node at a leaf:
 
 ```
-z = ADD(x, y)           ← lazy
-w = MUL(DP0(z), DP1(z)) ← both args are the same lazy ADD
+fuse_walk encounters DP0/DP1 at a leaf position:
+  → follow DUP's principal port to shared value
+  → if value is TEN: standard leaf (dedup by tid)
+  → if value is TOP: extend fused chain through the shared op
+```
+
+When both inputs to a fused op come from the same DUP (same `sup_loc`), leaf
+deduplication binds the same buffer to both kernel input slots. The compiled
+kernel references one buffer twice — no data duplication.
+
+### DUP'd Lazy Intermediates → CSE in Codegen
+
+```
+z = ADD(x, y)           ← lazy TOP
+w = MUL(DP0(z), DP1(z)) ← both args share the same lazy ADD
 
 Fuser walks MUL:
-  arg0 = DP0 → look through → ADD(x, y) → walk → ops + leaves
-  arg1 = DP1 → look through → ADD(x, y) → same ops + leaves (dedup'd)
+  arg0 = DP0 → principal port → ADD(x, y) → ops + leaves
+  arg1 = DP1 → principal port → ADD(x, y) → same ops + leaves (dedup'd)
 
-Codegen: float t0 = in0[i] + in1[i];  // ADD computed once
-         float t1 = t0 * t0;           // MUL uses it twice
+Codegen: float t0 = in0[i] + in1[i];  // ADD computed once (CSE)
+         float t1 = t0 * t0;           // MUL uses register twice
 ```
 
-The leaf dedup mechanism (`leaf_ids[i] == tid` check) naturally handles this:
-both DUP branches resolve to the same leaves, producing the same leaf index.
-The codegen sees the same intermediate referenced twice → single register, used
-twice. This is CSE for free.
+Both DUP projections resolve to the same leaf tids, producing the same leaf
+indices. Codegen sees one intermediate referenced twice → single register.
 
 ### Backward Fusion
 
@@ -204,55 +315,44 @@ GRAD(ADD): ADD(da, db)  → deferred
 ENSURE at SUM → materialize_walk → fused 2-op kernel for MUL+ADD
 ```
 
-With DUP, two GRAD paths may create independent backward chains that share
-input tensors. Each chain fuses independently. The shared inputs are bound
-to the same buffer in both kernels. No special handling needed.
+Two GRAD paths from DUP'd forward intermediates create independent backward chains.
+Each fuses independently. Shared input tensors bind to the same buffer. No special
+handling beyond standard leaf dedup.
 
 ## Persistent Fused Graphs
 
-### The Opportunity
+### Cache Layer
 
-Each training step creates the same computation graph (same ops, same shapes,
-same sharing pattern). The fuser JIT-compiles Metal shaders each step. With
-persistence, compile once, replay with new buffer bindings:
+Each training step creates the same computation structure (same ops, same shapes,
+same DUP pattern). The fuser JIT-compiles Metal shaders each step. With a
+persistence cache, compile once, replay with new buffer bindings:
 
 ```
 Step 1: lazy graph → fuse → compile shader → cache (key = graph hash) → dispatch
-Step 2: same structure → hash matches → skip compile → rebind buffers → dispatch
+Step N: same structure → hash hit → skip compile → rebind buffers → dispatch
 ```
 
-### DUP in Persistent Graphs
+### DUP in the Graph Hash
 
-DUP nodes are deterministic structure — same model architecture produces the
-same sharing pattern every step. The persistent graph captures:
+DUP nodes are deterministic structure — same model architecture produces the same
+sharing pattern every step. The graph hash includes:
 
-1. **Op sequence**: the fused ops in order
+1. **Op sequence**: the fused ops in topological order
 2. **Leaf binding slots**: which buffer position maps to which input
-3. **DUP edges**: which slots share a buffer (from DUP'd inputs)
+3. **DUP edges**: which leaf slots share a buffer (detected via tid dedup)
 
 The compiled kernel is parameterized by buffer pointers. DUP means "same pointer
-for slots i and j." This is encoded in the dispatch table, not the kernel code.
+for slots i and j." Encoded in the dispatch table, not in kernel code.
 
-### What Changes per Step
+### Inet Reduction + Cache = No Conflict
 
-| Component | Step 1 | Step N |
-|-----------|--------|--------|
-| Lazy graph | Created fresh | Created fresh (same structure) |
-| DUP structure | Same | Same (deterministic) |
-| Fusion pattern | Computed | Cached (hash hit) |
-| Metal shader | Compiled | Reused |
-| Buffer bindings | Resolved | Resolved (new buffers, same layout) |
-
-### Interaction with `thvm_reduce`
-
-The persistent graph is NOT a replacement for inet reduction — it's a cache.
-`thvm_reduce` still walks the lazy graph via enter/apply. Rewrite rules still
-fire. But when a rewrite rule invokes `fuse_or_reduce`, the fuser checks the
-cache before compiling:
+The persistent graph is a **cache**, not a replacement for inet reduction.
+`thvm_reduce` still walks the lazy graph via enter/apply. Rewrite rules still fire.
+But `fuse_or_reduce` checks the cache before compiling:
 
 ```
 fuse_or_reduce(ctx, t):
-  hash = graph_hash(t)   // hash the TAG_TOP subtree structure
+  hash = graph_hash(t)        // hash the TAG_TOP subtree including DUP structure
   if cache[hash]:
     rebind_buffers(cache[hash], resolve_leaves(t))
     dispatch(cache[hash])
@@ -260,8 +360,8 @@ fuse_or_reduce(ctx, t):
     compile, cache, dispatch
 ```
 
-The DUP nodes are part of the hash — they affect leaf dedup and buffer binding.
-Same DUP pattern → same hash → cache hit.
+Fresh lazy graph each step. Same DUP pattern. Same hash. Cache hit. The inet
+model (terms consumed by interactions) is preserved — each step's terms are fresh.
 
 ## SUM Provenance
 
@@ -280,20 +380,21 @@ Verified at float32 precision:
 
 ## Implementation Changes (from current code)
 
-1. **`linear_use`**: Apply to ALL tags (remove `TAG_TOP` guard). Single-slot DUP
-   (remove counter slots 1-3). No `dup_loc` writes.
+1. **Unify DP0/DP1 interact**: Merge `case TAG_DP0` and `case TAG_DP1` into a
+   single DUP interaction that fires the appropriate rule (DUP ⊳ SUP, DUP ⊳ TEN,
+   DUP ⊳ NOD, DUP ⊳ ERA) and returns `proj[dp_index]`.
 
-2. **`GRAD3_FWD` macro**: Delete entirely. Replace with plain `GRAD3`.
+2. **`linear_use`**: Apply to ALL tags (remove `TAG_TOP` guard). Standard 2-slot
+   SUP with matching label. No counter slots. No `dup_loc` writes.
 
-3. **`BIN_GRAD` / `UN_GRAD`**: Use `GRAD3` directly instead of `GRAD3_FWD`.
+3. **`GRAD3_FWD` macro**: Delete entirely. Replace with plain `GRAD3`.
 
-4. **ASSIGN interaction**: Change from set to accumulate (`ADD(existing, new)`).
+4. **`BIN_GRAD` / `UN_GRAD`**: Use `GRAD3` directly instead of `GRAD3_FWD`.
+
+5. **ASSIGN interaction**: Change from set to accumulate (`ADD(existing, new)`).
    Grad slots zero-initialized by `thvm_backward` (already done).
 
-5. **`TensorMeta.dup_loc`**: Remove field. DUP is inet structure, not metadata.
-
-6. **DP0/DP1 interact**: Remove the `dup_loc` write (`ctx->tensors[tid].dup_loc = loc`).
-   DUP is transparent — just return the shared value.
+6. **`TensorMeta.dup_loc`**: Remove field. DUP is inet structure, not metadata.
 
 7. **N-way sharing**: Build binary SUP tree for 3+ uses.
    Current `linear_use` increments counter — replace with nested SUP.

@@ -41,7 +41,7 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
     if (arg_a < 0) return -1;
 
     int arg_b = -1;
-    if (is_binary(uop) && m->src_ids[1]) {
+    if (is_binary(uop)) {
         arg_b = materialize_walk(ctx, m->src_ids[1], ops, n_ops, op_tids, leaf_ids, leaf_views, n_leaves);
         if (arg_b == -2)
             arg_b = materialize_walk(ctx, m->src_ids[1], ops, n_ops, op_tids, leaf_ids, leaf_views, n_leaves);
@@ -134,6 +134,55 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
                                       ops, n_ops, &m->view.shape, NULL,
                                       side_bufs, side_ops, n_sides);
         }
+        return;
     }
     #endif
+
+    // CPU fallback: execute ops sequentially (no fusing)
+    // temp_bufs[0..n_leaves-1] = leaf buf_ids, [n_leaves..] = intermediate results
+    u32 temp_bufs[FUSE_MAX_LEAVES + FUSE_MAX_OPS];
+    const View *temp_views[FUSE_MAX_LEAVES + FUSE_MAX_OPS];
+    for (u32 i = 0; i < n_leaves; i++) {
+        temp_bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
+        temp_views[i] = &ctx->tensors[leaf_ids[i]].view;
+    }
+    for (u32 i = 0; i < n_ops; i++) {
+        u32 op_tid = op_tids[i];
+        TensorMeta *om = &ctx->tensors[op_tid];
+        // Allocate intermediate buffer if not the final output and not already allocated
+        u32 dst_buf;
+        if (op_tid == walk_tid) {
+            dst_buf = m->buf_id;
+        } else if (om->buf_id != 0) {
+            dst_buf = om->buf_id;
+        } else {
+            dst_buf = m->backend->buf_alloc(om->view.numel * sizeof(f32));
+            om->buf_id = dst_buf;
+        }
+        View dst_view = om->view;
+        u32 a_buf = temp_bufs[ops[i].arg_a];
+        const View *a_view = temp_views[ops[i].arg_a];
+        if (is_binary(ops[i].uop)) {
+            u32 b_buf = temp_bufs[ops[i].arg_b];
+            const View *b_view = temp_views[ops[i].arg_b];
+            // Broadcast views to match output shape for CPU strided indexing
+            View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
+            if (view_broadcast(a_view, b_view, &av_bc, &bv_bc, bc_shape, &bc_ndim))
+                m->backend->op_binary(ops[i].uop, dst_buf, &dst_view,
+                                      a_buf, &av_bc, b_buf, &bv_bc);
+            else
+                m->backend->op_binary(ops[i].uop, dst_buf, &dst_view,
+                                      a_buf, a_view, b_buf, b_view);
+        } else {
+            // For unary ops, input view might not match output shape.
+            // Use output shape with input strides for correct indexing.
+            View uv = *a_view;
+            uv.shape = dst_view.shape;
+            uv.numel = dst_view.numel;
+            m->backend->op_unary(ops[i].uop, dst_buf, &dst_view,
+                                 a_buf, &uv);
+        }
+        temp_bufs[n_leaves + i] = dst_buf;
+        temp_views[n_leaves + i] = &ctx->tensors[op_tid].view;
+    }
 }

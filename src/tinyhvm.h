@@ -408,7 +408,6 @@ typedef struct {
     u32         creator_op; // UOP that created this tensor
     u32         src_ids[2]; // input tensor ids (for backward chain rule)
     u64         creator_loc; // heap location of the TAG_TOP that created this tensor
-    u64         dup_loc;    // heap location of DUP node (0 = not DUPed)
 
     // Deferred dispatch: how many deferred ops consume this tensor as input.
     // When > 0 and buf_id == 0, a second consumer must materialize first.
@@ -489,8 +488,6 @@ typedef struct {
 
     u64         itrs;       // interaction count
     u8          no_fuse;    // 1 to skip fusion (used during GRAD subnet re-reduction)
-    u8          dup_frozen; // reserved
-    u8          in_grad;    // reserved
 
     // Named definitions for TAG_REF (global def table)
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term

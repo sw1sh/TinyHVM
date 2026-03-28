@@ -4,8 +4,20 @@
 // is driven by thvm_reduce through the UOP_GRAD interaction handler.
 
 Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
-    f32 one = 1.0f;
-    Term seed = thvm_tensor(ctx, &one, SHAPE(1));
+    // Seed = ones matching y's shape (not just scalar 1.0)
+    // MM backward needs gy to be rank-2, etc.
+    Shape seed_shape = SHAPE(1);
+    if (term_tag(y) == TAG_TEN) {
+        u32 y_id = (u32)term_val(y);
+        seed_shape = ctx->tensors[y_id].view.shape;
+    }
+    u32 numel = 1;
+    for (u32 i = 0; i < seed_shape.rank; i++) numel *= seed_shape.dims[i];
+    f32 *ones = malloc(numel * sizeof(f32));
+    for (u32 i = 0; i < numel; i++) ones[i] = 1.0f;
+    Term seed = thvm_tensor(ctx, ones, seed_shape);
+    free(ones);
+
     u64 loc = heap_alloc(ctx, 3);
     heap_set(ctx, loc,     y);
     heap_set(ctx, loc + 1, seed);
@@ -32,9 +44,19 @@ Term thvm_grad_multi(TinyHVM *ctx, Term loss, Term *params, Term *grad_slots, u3
         heap_set(ctx, tgt_loc + 1 + 2*i + 1, grad_slots[i]);
     }
     Term x_multi = term_new(TAG_CTR, 0, tgt_loc);
-    // Create lazy GRAD
-    f32 one = 1.0f;
-    Term seed = thvm_tensor(ctx, &one, SHAPE(1));
+    // Seed = ones matching loss shape (MM backward needs rank-2 gy, etc.)
+    Shape seed_shape = SHAPE(1);
+    if (term_tag(loss) == TAG_TEN) {
+        u32 loss_id = (u32)term_val(loss);
+        seed_shape = ctx->tensors[loss_id].view.shape;
+    }
+    u32 numel = 1;
+    for (u32 i = 0; i < seed_shape.rank; i++) numel *= seed_shape.dims[i];
+    f32 *ones = malloc(numel * sizeof(f32));
+    for (u32 i = 0; i < numel; i++) ones[i] = 1.0f;
+    Term seed = thvm_tensor(ctx, ones, seed_shape);
+    free(ones);
+
     u64 loc = heap_alloc(ctx, 3);
     heap_set(ctx, loc, loss);
     heap_set(ctx, loc + 1, seed);

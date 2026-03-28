@@ -410,6 +410,10 @@ typedef struct {
     u64         creator_loc; // heap location of the TAG_TOP that created this tensor
     u64         dup_loc;    // heap location of DUP node (0 = not DUPed)
 
+    // Deferred dispatch: how many deferred ops consume this tensor as input.
+    // When > 0 and buf_id == 0, a second consumer must materialize first.
+    u8          defer_consumers;
+
     // Fusion metadata (only when creator_op == UOP_FUSING)
     u64         fusing_loc; // heap loc of the original subnet root TAG_TOP
     u32         fusing_uop; // UOP of the subnet root (e.g. UOP_SUM)

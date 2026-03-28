@@ -86,7 +86,8 @@ static int cg_leaf_is_flat(const View *v, u32 target_numel) {
 static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                                     const View **leaf_views,
                                     const Shape *full_shape,
-                                    const ReduceSpec *reduce) {
+                                    const ReduceSpec *reduce,
+                                    const u32 *side_op_indices, u32 n_side_outputs) {
     u32 rank = full_shape->rank;
     if (rank == 0) rank = 1;
 
@@ -146,8 +147,12 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     [s appendString:@"#include <metal_stdlib>\nusing namespace metal;\n"];
     [s appendFormat:@"kernel void K(device float *out[[buffer(0)]],\n"];
+    // Side output buffers (shared intermediates)
+    for (u32 si = 0; si < n_side_outputs; si++)
+        [s appendFormat:@"  device float *side%u[[buffer(%u)]],\n", si, si + 1];
+    u32 buf_offset = 1 + n_side_outputs;
     for (u32 i = 0; i < n_leaves; i++)
-        [s appendFormat:@"  device const float *in%u[[buffer(%u)]],\n", i, i+1];
+        [s appendFormat:@"  device const float *in%u[[buffer(%u)]],\n", i, buf_offset + i];
     [s appendFormat:@"  uint3 gid[[thread_position_in_grid]])\n{\n"];
     [s appendFormat:@"  uint ix=gid.x,iy=gid.y,iz=gid.z;\n"];
     [s appendFormat:@"  if(ix>=%uu||iy>=%uu||iz>=%uu)return;\n",
@@ -360,28 +365,31 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             mid*inner, inner, last];
     }
 
+    // Side output writes (shared intermediates)
+    if (!has_reduce) { // side outputs only for non-reduce kernels
+        for (u32 si = 0; si < n_side_outputs; si++) {
+            u32 sid = side_op_indices[si]; // remapped op index = n_leaves + original_op_idx
+            [s appendFormat:@"  side%u[oi]=t%u;\n", si, sid];
+        }
+    }
+
     [s appendString:@"}\n"];
-    { static u32 _pk=0; if((n_ops>=2 || has_reduce) && ++_pk<=3) fprintf(stderr,
-        "KERNEL_RS(ops=%u leaves=%u out_n=%u red_n=%u rank=%u):\n%s\n",
-        n_ops, n_leaves, out_numel, has_reduce?reduce_numel:0, rank,
-        [s UTF8String]); }
     return s;
 }
 
 // ── Get or compile a cached kernel (new interface) ─────────────────
 static id<MTLComputePipelineState> cg_get_pipe_rs(
         const FusedOp *ops, u32 n_ops, u32 n_leaves, const View **leaf_views,
-        const Shape *full_shape, const ReduceSpec *reduce) {
+        const Shape *full_shape, const ReduceSpec *reduce,
+        const u32 *side_op_indices, u32 n_side_outputs) {
     u64 key = cg_hash_rs(ops, n_ops, n_leaves, leaf_views, full_shape, reduce);
+    for (u32 i = 0; i < n_side_outputs; i++) { key ^= side_op_indices[i]; key *= 0x100000001b3ULL; }
+    key ^= n_side_outputs; key *= 0x100000001b3ULL;
     for (u32 i = 0; i < cg_cache_count && i < CODEGEN_CACHE_SIZE; i++)
         if (cg_cache[i].key == key) return cg_cache[i].pipe;
 
     NSString *src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views,
-                                       full_shape, reduce);
-    static int _kp = 0;
-    if (_kp < 8) { fprintf(stderr, "JIT(ops=%u leaves=%u rank=%u reduce=%u):\n%s\n",
-        n_ops, n_leaves, full_shape->rank,
-        reduce?reduce->reduce_type:0, [src UTF8String]); _kp++; }
+                                       full_shape, reduce, side_op_indices, n_side_outputs);
     NSError *err;
     id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
     if (!lib) { NSLog(@"codegen error: %@\n%@", err, src); return nil; }
@@ -402,7 +410,8 @@ void metal_dispatch_kernel_rs(u32 out_buf,
                                u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
                                FusedOp *ops, u32 n_ops,
                                const Shape *full_shape,
-                               const ReduceSpec *reduce) {
+                               const ReduceSpec *reduce,
+                               u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs) {
     int has_reduce = reduce && reduce->reduce_type;
     u32 rank = full_shape->rank;
     if (rank == 0) rank = 1;
@@ -421,7 +430,8 @@ void metal_dispatch_kernel_rs(u32 out_buf,
     if (n_out == 0) { n_out = 1; out_shape[0] = 1; out_dims[0] = rank; }
 
     id<MTLComputePipelineState> pipe = cg_get_pipe_rs(ops, n_ops, n_leaves,
-                                                       leaf_views, full_shape, reduce);
+                                                       leaf_views, full_shape, reduce,
+                                                       side_op_indices, n_side_outputs);
     if (!pipe) return;
 
     // Collapse output dims into 3 groups (MUST match codegen)
@@ -460,8 +470,11 @@ void metal_dispatch_kernel_rs(u32 out_buf,
     id<MTLComputeCommandEncoder> enc = get_encoder();
     [enc setComputePipelineState:pipe];
     [enc setBuffer:metal_pool.bufs[out_buf] offset:0 atIndex:0];
+    for (u32 si = 0; si < n_side_outputs; si++)
+        [enc setBuffer:metal_pool.bufs[side_bufs[si]] offset:0 atIndex:si + 1];
+    u32 buf_off = 1 + n_side_outputs;
     for (u32 i = 0; i < n_leaves; i++)
-        [enc setBuffer:metal_pool.bufs[leaf_bufs[i]] offset:0 atIndex:i+1];
+        [enc setBuffer:metal_pool.bufs[leaf_bufs[i]] offset:0 atIndex:buf_off + i];
     [enc dispatchThreads:MTLSizeMake(gw, mid, outer)
        threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
     batch_dirty = 1;
@@ -504,7 +517,8 @@ static u64 cg_hash(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     return h;
 }
 
-// Old codegen (wrapper → delegates to codegen_kernel_rs)
+// Legacy wrapper — used by ops.m (unary/binary fast path) and metal_contiguify.
+// New code should use metal_dispatch_kernel_rs or metal_dispatch_fused_rs directly.
 static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                                   const View **leaf_views,
                                   u32 out_numel __attribute__((unused)),
@@ -533,9 +547,9 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                 if (prod == reduce_dim) break;
             }
         }
-        return codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views, &full, &rs);
+        return codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views, &full, &rs, NULL, 0);
     }
-    return codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views, &full, NULL);
+    return codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views, &full, NULL, NULL, 0);
 }
 
 // Old get_pipe (wrapper)
@@ -550,9 +564,6 @@ static id<MTLComputePipelineState> cg_get_pipe(const FusedOp *ops, u32 n_ops,
 
     NSString *src = codegen_kernel(ops, n_ops, n_leaves, leaf_views, out_numel,
                                      has_reduce, reduce_dim, out_shape_hint);
-    static int _kp2 = 0;
-    if (_kp2 < 8) { fprintf(stderr, "JIT_OLD(ops=%u leaves=%u out=%u):\n%s\n",
-        n_ops, n_leaves, out_numel, [src UTF8String]); _kp2++; }
     NSError *err;
     id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
     if (!lib) { NSLog(@"codegen error: %@\n%@", err, src); return nil; }
@@ -597,9 +608,9 @@ void metal_dispatch_kernel(u32 out_buf,
             }
         }
         metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, n_leaves,
-                                  ops, n_ops, &full, &rs);
+                                  ops, n_ops, &full, &rs, NULL, NULL, 0);
     } else {
         metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, n_leaves,
-                                  ops, n_ops, &full, NULL);
+                                  ops, n_ops, &full, NULL, NULL, NULL, 0);
     }
 }

@@ -5,7 +5,8 @@ void metal_dispatch_kernel_rs(u32 out_buf,
                                u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
                                FusedOp *ops, u32 n_ops,
                                const Shape *full_shape,
-                               const ReduceSpec *reduce);
+                               const ReduceSpec *reduce,
+                               u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs);
 
 typedef struct {
     uint32_t n_reduce;
@@ -220,25 +221,14 @@ void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view)
                            NULL, 0, 0, 0, &src_view->shape);
 }
 
-// Dispatch a fused elementwise kernel (old interface — kept for materialize.c).
-void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
-                               u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
-                               FusedOp *ops, u32 n_ops,
-                               int has_reduce, u32 reduce_dim,
-                               const Shape *out_shape) {
-    // All cases now go through unified codegen
-    metal_dispatch_kernel(out_buf, out_numel, leaf_bufs, leaf_views, n_leaves,
-                           ops, n_ops, has_reduce, reduce_dim, out_shape);
-}
-
-// Dispatch fused kernel with ReduceSpec (new interface — any axis config).
+// Dispatch fused kernel with ReduceSpec (any axis config, multi-output).
 void metal_dispatch_fused_rs(u32 out_buf,
                                u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
                                FusedOp *ops, u32 n_ops,
                                const Shape *full_shape,
                                const ReduceSpec *reduce) {
     metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, n_leaves,
-                              ops, n_ops, full_shape, reduce);
+                              ops, n_ops, full_shape, reduce, NULL, NULL, 0);
 }
 
 // ============================================================

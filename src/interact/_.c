@@ -89,8 +89,8 @@ inet_step:
                     u32 cop = my->creator_op;
                     u32 aid = my->src_ids[0], bid = my->src_ids[1];
 
-                    // DON'T ENSURE here — most backward formulas create lazy ops
-                    // that don't read data. ENSURE only where actually needed (RMAX, LOG, DIV).
+                    // Lazy ENSURE: backward formulas create lazy ops wrapping at/bt.
+                    // Only ENSURE where backward reads data: MM, RMAX, LOG, DIV, MAX.
                     TensorMeta *ma = &ctx->tensors[aid];
                     Term at = term_ten(aid, ma->dtype);
 
@@ -753,12 +753,8 @@ inet_step:
             // Elementwise ops: DEFER dispatch when BOTH inputs already have data.
             // Creates tensor with buf_id=0 — materialized later by ENSURE at
             // fusion boundaries. This fuses chains of backward ops into one kernel.
-            // Skip deferral if either input is lazy (buf_id=0) — let the rewrite
-            // rules handle those via SUM(elementwise_chain) fusion.
-            // Defer elementwise ops when BOTH inputs already have data.
-            // Chains of deferred ops get fused by tensor_materialize at boundaries.
-            // Skip deferral when inputs are lazy (buf_id=0 from view sharing or
-            // other deferred ops) — those chains are handled by rewrite rules.
+            // Defer elementwise: create tensor with buf_id=0, let tensor_materialize
+            // fuse chains at boundaries. Shared intermediates get multi-output kernels.
             if (is_elementwise(uop)) {
                 dst_id = ctx->tensor_count++;
                 md = &ctx->tensors[dst_id];
@@ -767,13 +763,15 @@ inet_step:
                 md->refcount = 1;
                 md->backend = ma->backend;
                 md->view = view_create(shape_of(out_shape, out_ndim));
-                // buf_id = 0: deferred. tensor_materialize will allocate + dispatch.
                 md->creator_op = uop;
                 md->src_ids[0] = a_id;
                 md->src_ids[1] = b_id;
                 md->creator_loc = loc;
                 int needs = ma->requires_grad || (mb && mb->requires_grad);
                 if (needs) md->requires_grad = 1;
+                // Track: mark inputs as consumed by a deferred op
+                if (a_id) ctx->tensors[a_id].defer_consumers++;
+                if (b_id) ctx->tensors[b_id].defer_consumers++;
                 ctx->itrs++;
                 RETURN_REDUCED(term_ten(dst_id, ma->dtype));
             }
@@ -793,8 +791,21 @@ inet_step:
                 }
             }
 
-            // Defer SUM/RMAX when input is deferred elementwise chain
-            // Defer SUM (not RMAX) when input is a deferred elementwise op
+            // Defer SUM when input is deferred, unshared, elementwise, with explicit axes.
+            // tensor_materialize fuses the reduce + elementwise chain into one kernel.
+            if (uop == UOP_SUM && ma->buf_id == 0 && ma->creator_op &&
+                is_elementwise(ma->creator_op) && ma->defer_consumers == 0 && b_id != 0) {
+                md->buf_id = 0;
+                md->creator_op = uop;
+                md->src_ids[0] = a_id;
+                md->src_ids[1] = b_id;
+                md->creator_loc = loc;
+                if (ma->requires_grad) md->requires_grad = 1;
+                ma->defer_consumers++;
+                ctx->itrs++;
+                RETURN_REDUCED(term_ten(dst_id, ma->dtype));
+            }
+
             // Materialize lazy inputs before dispatch
             {
                 ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];

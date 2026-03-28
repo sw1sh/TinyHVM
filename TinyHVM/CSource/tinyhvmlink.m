@@ -1145,13 +1145,13 @@ EXTERN_C DLLEXPORT int thvmToDevice(
 
 // ── Heap graph visualization ──────────────────────────────────────────────────
 
-// thvmHeapGraph(termId) → {nodesNA, edgesNA}
-// nodesNA: Int32 NumericArray, [tag, ext, val_lo] × n_nodes (flattened)
-// edgesNA: Int32 NumericArray, [from, to] × n_edges (flattened)
+// thvmHeapGraph(termId) → NumericArray (Real64)
+// Format: [n_nodes, n_edges, node_data[n_nodes*3], edge_data[n_edges*2]]
+// node_data = [tag, ext, val_lo] per node; edge_data = [from, to] per edge
 EXTERN_C DLLEXPORT int thvmHeapGraph(
     WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
 {
-    (void)argc;
+    (void)libData; (void)argc;
     if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
 
     mint term_id = MArgument_getInteger(args[0]);
@@ -1161,29 +1161,22 @@ EXTERN_C DLLEXPORT int thvmHeapGraph(
     u32 n_nodes = 0, n_edges = 0;
     thvm_heap_graph(g_ctx, root, &nodes, &n_nodes, &edges, &n_edges);
 
-    // Build result as a DataStore containing two NumericArrays
-    DataStore ds = libData->ioLibraryFunctions->createDataStore();
+    // Pack into single flat Real64 array: [n_nodes, n_edges, nodes..., edges...]
+    mint total = 2 + n_nodes * 3 + n_edges * 2;
+    mint dims[1] = { total };
+    MNumericArray na = NULL;
+    g_na_funcs->MNumericArray_new(MNumericArray_Type_Real64, 1, dims, &na);
+    double *d = (double *)g_na_funcs->MNumericArray_getData(na);
 
-    // Nodes NumericArray
-    MNumericArray na_nodes = NULL;
-    mint node_dims[1] = { (mint)(n_nodes * 3) };
-    g_na_funcs->MNumericArray_new(MNumericArray_Type_SInt32, 1, node_dims, &na_nodes);
-    i32 *nd = (i32 *)g_na_funcs->MNumericArray_getData(na_nodes);
-    if (n_nodes > 0) memcpy(nd, nodes, n_nodes * 3 * sizeof(i32));
-    libData->ioLibraryFunctions->DataStore_addMNumericArray(ds, "Nodes", na_nodes);
-
-    // Edges NumericArray
-    MNumericArray na_edges = NULL;
-    mint edge_dims[1] = { (mint)(n_edges * 2) };
-    g_na_funcs->MNumericArray_new(MNumericArray_Type_SInt32, 1, edge_dims, &na_edges);
-    i32 *ed = (i32 *)g_na_funcs->MNumericArray_getData(na_edges);
-    if (n_edges > 0) memcpy(ed, edges, n_edges * 2 * sizeof(i32));
-    libData->ioLibraryFunctions->DataStore_addMNumericArray(ds, "Edges", na_edges);
+    d[0] = (double)n_nodes;
+    d[1] = (double)n_edges;
+    for (u32 i = 0; i < n_nodes * 3; i++) d[2 + i] = (double)nodes[i];
+    for (u32 i = 0; i < n_edges * 2; i++) d[2 + n_nodes * 3 + i] = (double)edges[i];
 
     free(nodes);
     free(edges);
 
-    MArgument_setDataStore(res, ds);
+    MArgument_setMNumericArray(res, na);
     return LIBRARY_NO_ERROR;
 }
 
@@ -1209,26 +1202,26 @@ EXTERN_C DLLEXPORT int thvmTraceClear(
     return LIBRARY_NO_ERROR;
 }
 
-// thvmTraceData() → NumericArray (Int32)
+// thvmTraceData() → NumericArray (Real64)
 // Returns [before_tag, before_ext, after_tag, after_ext, rule_id] × n_traces
 EXTERN_C DLLEXPORT int thvmTraceData(
     WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
 {
-    (void)argc; (void)args;
+    (void)libData; (void)argc; (void)args;
     if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
 
     u32 n = g_ctx->trace_count;
     MNumericArray na = NULL;
     mint dims[1] = { (mint)(n * 5) };
-    g_na_funcs->MNumericArray_new(MNumericArray_Type_SInt32, 1, dims, &na);
-    i32 *data = (i32 *)g_na_funcs->MNumericArray_getData(na);
+    g_na_funcs->MNumericArray_new(MNumericArray_Type_Real64, 1, dims, &na);
+    double *data = (double *)g_na_funcs->MNumericArray_getData(na);
     for (u32 i = 0; i < n; i++) {
         struct InteractionTrace *tr = &g_ctx->trace_buf[i];
-        data[i * 5 + 0] = (i32)tr->before_tag;
-        data[i * 5 + 1] = (i32)tr->before_ext;
-        data[i * 5 + 2] = (i32)tr->after_tag;
-        data[i * 5 + 3] = (i32)tr->after_ext;
-        data[i * 5 + 4] = (i32)tr->rule_id;
+        data[i * 5 + 0] = (double)tr->before_tag;
+        data[i * 5 + 1] = (double)tr->before_ext;
+        data[i * 5 + 2] = (double)tr->after_tag;
+        data[i * 5 + 3] = (double)tr->after_ext;
+        data[i * 5 + 4] = (double)tr->rule_id;
     }
     MArgument_setMNumericArray(res, na);
     return LIBRARY_NO_ERROR;

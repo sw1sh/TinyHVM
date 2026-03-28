@@ -86,7 +86,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         f32 pf[MAX_DIM];
         const f32 *cached = (const f32 *)mp->host_ptr;
         if (cached) memcpy(pf, cached, rank * sizeof(f32));
-        else META_READ(ctx, mp->buf_id, pf, rank * sizeof(f32));
+        else META_READ(mp->backend, mp->buf_id, pf, rank * sizeof(f32));
 
         View nv = {0};
         if (uop == UOP_PERMUTE) {
@@ -295,7 +295,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             TensorMeta *axt = &ctx->tensors[ax_id];
             u32 n_axes = axt->view.numel;
             f32 axes_f[MAX_DIM];
-            META_READ(ctx, axt->buf_id, axes_f, n_axes * sizeof(f32));
+            META_READ(axt->backend, axt->buf_id, axes_f, n_axes * sizeof(f32));
             for (u32 i = 0; i < n_axes; i++) {
                 int ax = (int)axes_f[i];
                 if (ax >= 0 && ax < (int)ew_view.shape.rank) {
@@ -374,7 +374,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                 TensorMeta *axt = &ctx->tensors[axid];
                 u32 nax = axt->view.numel;
                 f32 axf[MAX_DIM];
-                META_READ(ctx, axt->buf_id, axf, nax * sizeof(f32));
+                META_READ(axt->backend, axt->buf_id, axf, nax * sizeof(f32));
                 for (u32 i2 = 0; i2 < nax; i2++) {
                     int ax = (int)axf[i2];
                     if (ax>=0 && ax<(int)ew_view.shape.rank) {
@@ -425,6 +425,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                 ctx->tensors[tid] = (TensorMeta){
                     .buf_id = 1, // placeholder — updated after dst_id created
                     .dtype = DTYPE_F32, .view = (i == n_ops - 1) ? ew_view : iv,
+                    .backend = ctx->tensors[var_tid[a_var]].backend,
                 };
                 ctx->tensors[tid].creator_op = ops[i].uop;
                 ctx->tensors[tid].src_ids[0] = var_tid[a_var];
@@ -473,6 +474,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                         .buf_id = ctx->tensors[dst_id].buf_id,
                         .dtype = DTYPE_F32,
                         .view = iv,
+                        .backend = ctx->tensors[dst_id].backend,
                     };
                 }
                 ctx->tensors[tid].creator_op = ops[i].uop;
@@ -489,7 +491,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
 
     fuse_fused_count++;
     #ifdef __APPLE__
-    if (ctx->backend == &metal_backend) {
+    if (ctx->tensors[dst_id].backend == &metal_backend) {
         u32 bufs[FUSE_MAX_LEAVES];
         for (u32 i = 0; i < n_leaves; i++) {
             ENSURE(ctx, leaf_ids[i]);
@@ -509,7 +511,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             TensorMeta *ms = &ctx->tensors[(u32)term_val(shape_t)];
             u32 rank = ms->view.numel;
             f32 dims_f[MAX_DIM];
-            META_READ(ctx, ms->buf_id, dims_f, rank * sizeof(f32));
+            META_READ(ms->backend, ms->buf_id, dims_f, rank * sizeof(f32));
             Shape ns = {.rank = rank};
             for (u32 i = 0; i < rank; i++) ns.dims[i] = (u32)dims_f[i];
             u32 rs_id = tensor_view_of(ctx, dst_id, view_create(ns));

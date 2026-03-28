@@ -100,7 +100,7 @@ static void thvm_dump_json(TinyHVM *ctx, const char *path) {
         // First few values (for debugging)
         if (m->buf_id && m->view.numel <= 16 && m->view.contiguous) {
             f32 vals[16];
-            ctx->backend->buf_read(m->buf_id, vals, m->view.numel * sizeof(f32));
+            m->backend->buf_read(m->buf_id, vals, m->view.numel * sizeof(f32));
             fprintf(f, ", \"vals\":[");
             for (u32 j = 0; j < m->view.numel; j++)
                 fprintf(f, "%s%.6g", j > 0 ? "," : "", vals[j]);

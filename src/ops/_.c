@@ -12,7 +12,7 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t) {
     if (m->view.contiguous) {
         // Contiguous: direct read
         if (!m->host_ptr) m->host_ptr = malloc((size_t)m->view.numel * dtype_size(m->dtype));
-        if (ctx->backend) ctx->backend->buf_read(m->buf_id, m->host_ptr,
+        if (m->backend) m->backend->buf_read(m->buf_id, m->host_ptr,
                                                   (u64)m->view.numel * dtype_size(m->dtype));
         return (f32 *)m->host_ptr;
     }
@@ -30,7 +30,7 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t) {
     if (src_numel == 0) src_numel = 1;
 
     f32 *src_buf = malloc((size_t)src_numel * sizeof(f32));
-    if (ctx->backend) ctx->backend->buf_read(m->buf_id, src_buf,
+    if (m->backend) m->backend->buf_read(m->buf_id, src_buf,
                                               (u64)src_numel * sizeof(f32));
 
     if (!m->host_ptr) m->host_ptr = malloc((size_t)m->view.numel * sizeof(f32));
@@ -54,6 +54,12 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t) {
     return dst;
 }
 
+// Lazy device transfer — creates a UOP_TODEVICE node, realized at reduce time
+Term thvm_to_device(TinyHVM *ctx, Term t, u32 device_idx) {
+    Term dev = thvm_scalar_u32(ctx, device_idx);
+    return thvm_op(ctx, UOP_TODEVICE, t, dev);
+}
+
 // ============================================================
 // autograd.c — Backward pass, gradient descent
 // ============================================================
@@ -65,7 +71,7 @@ static u32 tensor_fill(TinyHVM *ctx, Shape s, f32 val) {
     u32 n = m->view.numel;
     f32 *tmp = malloc(n * sizeof(f32));
     for (u32 i = 0; i < n; i++) tmp[i] = val;
-    if (ctx->backend) ctx->backend->buf_write(m->buf_id, tmp, (u64)n * dtype_size(DTYPE_F32));
+    if (m->backend) m->backend->buf_write(m->buf_id, tmp, (u64)n * dtype_size(DTYPE_F32));
     free(tmp);
     return id;
 }
@@ -161,9 +167,10 @@ Term thvm_argmax(TinyHVM *ctx, Term x, u32 rows, u32 cols) {
         preds[i] = best;
     }
     u32 id = ctx->tensor_count++;
-    u32 buf = ctx->backend->buf_alloc(rows * sizeof(u32));
-    ctx->tensors[id] = (TensorMeta){ .buf_id = buf, .dtype = DTYPE_U32, .view = view_create(SHAPE(rows)) };
-    ctx->backend->buf_write(buf, preds, rows * sizeof(u32));
+    Backend *be = ctx_default_backend(ctx);
+    u32 buf = be->buf_alloc(rows * sizeof(u32));
+    ctx->tensors[id] = (TensorMeta){ .buf_id = buf, .dtype = DTYPE_U32, .view = view_create(SHAPE(rows)), .backend = be };
+    be->buf_write(buf, preds, rows * sizeof(u32));
     free(preds);
     return term_ten(id, DTYPE_U32);
 }
@@ -182,9 +189,11 @@ f32 thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels, u32 n_sample
 }
 
 void thvm_profile_report(TinyHVM *ctx) {
-    if (ctx->backend && ctx->backend->profile_report) ctx->backend->profile_report();
+    for (u32 i = 0; i < ctx->n_backends; i++)
+        if (ctx->backends[i] && ctx->backends[i]->profile_report) ctx->backends[i]->profile_report();
 }
 void thvm_profile_reset(TinyHVM *ctx) {
-    if (ctx->backend && ctx->backend->profile_reset) ctx->backend->profile_reset();
+    for (u32 i = 0; i < ctx->n_backends; i++)
+        if (ctx->backends[i] && ctx->backends[i]->profile_reset) ctx->backends[i]->profile_reset();
 }
 

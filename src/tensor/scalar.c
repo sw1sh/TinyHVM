@@ -19,6 +19,6 @@ f32 thvm_scalar_val(TinyHVM *ctx, Term t) {
   assert(term_tag(t) == TAG_TEN);
   u32 _sid = (u32)term_val(t); ENSURE(ctx, _sid);
   f32 v;
-  ctx->backend->buf_read(ctx->tensors[_sid].buf_id, &v, sizeof(f32));
+  ctx->tensors[_sid].backend->buf_read(ctx->tensors[_sid].buf_id, &v, sizeof(f32));
   return v;
 }

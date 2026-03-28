@@ -9,9 +9,10 @@ static u32 tensor_create(TinyHVM *ctx, Shape s, u32 dtype) {
   m->dtype   = dtype;
   m->refcount = 1;
   m->view    = view_create(s);
-  if (ctx->backend) {
+  m->backend = ctx_default_backend(ctx);
+  if (m->backend) {
     u64 bytes = (u64)m->view.numel * dtype_size(dtype);
-    m->buf_id = ctx->backend->buf_alloc(bytes);
+    m->buf_id = m->backend->buf_alloc(bytes);
   }
   thvm_prof_tensor_created(0);
   thvm_prof_update_watermarks(ctx->tensor_count, ctx->heap_pos);
@@ -28,6 +29,7 @@ static u32 tensor_view_of(TinyHVM *ctx, u32 src_id, View new_view) {
   m->dtype    = ms->dtype;
   m->refcount = 1;
   m->buf_id   = ms->buf_id;
+  m->backend  = ms->backend;
   m->view     = new_view;
   return id;
 }

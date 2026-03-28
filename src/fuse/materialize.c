@@ -71,7 +71,7 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
     int result = materialize_walk(ctx, tid, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
     if (m->buf_id != 0) return;
     if (result < 0 || n_ops == 0) {
-        m->buf_id = ctx->backend->buf_alloc(m->view.numel * sizeof(f32));
+        m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
         return;
     }
 
@@ -82,10 +82,10 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
             ops[i].arg_b = n_leaves + (ops[i].arg_b - FUSE_MAX_LEAVES);
     }
 
-    m->buf_id = ctx->backend->buf_alloc(m->view.numel * sizeof(f32));
+    m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
 
     #ifdef __APPLE__
-    if (ctx->backend == &metal_backend) {
+    if (m->backend == &metal_backend) {
         u32 bufs[FUSE_MAX_LEAVES];
         for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
         metal_dispatch_fused_v2(m->buf_id, m->view.numel,

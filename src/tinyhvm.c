@@ -95,25 +95,26 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid);
 #define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0&&c->tensors[t].creator_op)tensor_materialize(c,t);}while(0)
 
 // Backend-agnostic contiguify: copy non-contiguous view into fresh contiguous buffer
+// be = Backend* to use for buffer ops
 #ifdef __APPLE__
-#define CONTIGUIFY_VIEW(ctx, dst, n, src, vp) \
-    do { if ((ctx)->backend == &metal_backend) metal_contiguify(dst, n, src, vp); \
+#define CONTIGUIFY_VIEW(be, dst, n, src, vp) \
+    do { if ((be) == &metal_backend) metal_contiguify(dst, n, src, vp); \
          else { /* CPU fallback */ \
-             f32 *_t = (f32*)thvm_to_host_view(ctx, src, vp, n); \
-             (ctx)->backend->buf_write(dst, _t, (u64)(n)*sizeof(f32)); free(_t); } } while(0)
+             f32 *_t = (f32*)thvm_to_host_view(be, src, vp, n); \
+             (be)->buf_write(dst, _t, (u64)(n)*sizeof(f32)); free(_t); } } while(0)
 #else
-#define CONTIGUIFY_VIEW(ctx, dst, n, src, vp) \
-    do { f32 *_t = (f32*)thvm_to_host_view(ctx, src, vp, n); \
-         (ctx)->backend->buf_write(dst, _t, (u64)(n)*sizeof(f32)); free(_t); } while(0)
+#define CONTIGUIFY_VIEW(be, dst, n, src, vp) \
+    do { f32 *_t = (f32*)thvm_to_host_view(be, src, vp, n); \
+         (be)->buf_write(dst, _t, (u64)(n)*sizeof(f32)); free(_t); } while(0)
 #endif
 // Read strided view to contiguous host buffer
-static f32 *thvm_to_host_view(TinyHVM *ctx, u32 buf_id, const View *v, u32 numel) {
+static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel) {
     u32 max_idx = 0;
     for (u32 d = 0; d < v->shape.rank; d++)
         if (v->strides[d] > 0) max_idx += (v->shape.dims[d]-1) * (u32)v->strides[d];
     max_idx += (v->offset > 0) ? (u32)v->offset : 0;
     f32 *raw = malloc((max_idx+1)*sizeof(f32));
-    ctx->backend->buf_read(buf_id, raw, (u64)(max_idx+1)*sizeof(f32));
+    be->buf_read(buf_id, raw, (u64)(max_idx+1)*sizeof(f32));
     f32 *out = malloc(numel * sizeof(f32));
     for (u32 flat = 0; flat < numel; flat++) {
         u32 rem = flat; i32 idx = v->offset; int msk = 0;
@@ -142,6 +143,7 @@ static f32 *thvm_to_host_view(TinyHVM *ctx, u32 buf_id, const View *v, u32 numel
 
 // ── ctx/ — init, free, device, reset, tensor, profiling ──────────────────────
 #include "ctx/init.c"
+#include "tensor/scalar.c"
 
 // ── ops/ — thvm_realize, supporting kernel functions ─────────────────────────
 #include "ops/_.c"

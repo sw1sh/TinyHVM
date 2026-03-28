@@ -1,4 +1,12 @@
-// nn/adam.c — Adam optimizer (via backend vtable)
+// nn/adam.c — Adam optimizer (via UOp composition + ASSIGN)
+//
+// Adam update expressed as lazy UOp graph:
+//   m = beta1 * m + (1 - beta1) * grad
+//   v = beta2 * v + (1 - beta2) * grad^2
+//   param -= lr * (m / bc1) / (sqrt(v / bc2) + eps)
+//
+// The fuser merges this into efficient kernels; ASSIGN blits results
+// back into the original param/m/v buffers.
 
 typedef struct {
     f32 lr, beta1, beta2, eps;
@@ -40,16 +48,44 @@ static void adam_step(TinyHVM *ctx, Adam *opt, u32 *grad_ids) {
     f32 bc1 = 1.0f - powf(opt->beta1, (f32)opt->t);
     f32 bc2 = 1.0f - powf(opt->beta2, (f32)opt->t);
 
+    Term t_beta1 = thvm_scalar(ctx, opt->beta1);
+    Term t_beta2 = thvm_scalar(ctx, opt->beta2);
+    Term t_1mb1  = thvm_scalar(ctx, 1.0f - opt->beta1);
+    Term t_1mb2  = thvm_scalar(ctx, 1.0f - opt->beta2);
+    Term t_lr    = thvm_scalar(ctx, opt->lr);
+    Term t_bc1   = thvm_scalar(ctx, bc1);
+    Term t_bc2   = thvm_scalar(ctx, bc2);
+    Term t_eps   = thvm_scalar(ctx, opt->eps);
+
     for (u32 i = 0; i < opt->n_params; i++) {
-        u32 pid = opt->param_ids[i];
-        u32 sz = opt->param_sizes[i];
         if (grad_ids[i]) ENSURE(ctx, grad_ids[i]);
-        ctx->backend->op_adam_step(
-            ctx->tensors[pid].buf_id,
-            ctx->tensors[grad_ids[i]].buf_id,
-            ctx->tensors[opt->m_bufs[i]].buf_id,
-            ctx->tensors[opt->v_bufs[i]].buf_id,
-            opt->lr, opt->beta1, opt->beta2, opt->eps, bc1, bc2, sz);
+
+        Term param = term_new(TAG_TEN, 0, opt->param_ids[i]);
+        Term grad  = term_new(TAG_TEN, 0, grad_ids[i]);
+        Term m     = term_new(TAG_TEN, 0, opt->m_bufs[i]);
+        Term v     = term_new(TAG_TEN, 0, opt->v_bufs[i]);
+
+        // m_new = beta1 * m + (1 - beta1) * grad
+        Term m_new = thvm_op(ctx, UOP_ADD,
+            thvm_op(ctx, UOP_MUL, t_beta1, m),
+            thvm_op(ctx, UOP_MUL, t_1mb1, grad));
+
+        // v_new = beta2 * v + (1 - beta2) * grad^2
+        Term v_new = thvm_op(ctx, UOP_ADD,
+            thvm_op(ctx, UOP_MUL, t_beta2, v),
+            thvm_op(ctx, UOP_MUL, t_1mb2, thvm_op(ctx, UOP_MUL, grad, grad)));
+
+        // param_new = param - lr * (m_new / bc1) / (sqrt(v_new / bc2) + eps)
+        Term m_hat = thvm_op(ctx, UOP_DIV, m_new, t_bc1);
+        Term v_hat = thvm_op(ctx, UOP_DIV, v_new, t_bc2);
+        Term denom = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_SQRT, v_hat, term_era()), t_eps);
+        Term step  = thvm_op(ctx, UOP_MUL, t_lr, thvm_op(ctx, UOP_DIV, m_hat, denom));
+        Term p_new = thvm_op(ctx, UOP_SUB, param, step);
+
+        // ASSIGN blits computed values back into original buffers
+        thvm_reduce(ctx, thvm_op(ctx, UOP_ASSIGN, m, m_new));
+        thvm_reduce(ctx, thvm_op(ctx, UOP_ASSIGN, v, v_new));
+        thvm_reduce(ctx, thvm_op(ctx, UOP_ASSIGN, param, p_new));
     }
 }
 

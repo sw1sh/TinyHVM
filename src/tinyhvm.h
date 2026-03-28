@@ -124,7 +124,8 @@ typedef u64 Term;
 #define UOP_LOG_PRINT 27  // print scalar tensor value, return tensor unchanged
 
 #define UOP_GRAD      28   // IC gradient: DUP-op interaction in the reducer
-#define UOP_COUNT     29
+#define UOP_TODEVICE  29   // lazy device transfer: TODEVICE(tensor, device_idx_scalar)
+#define UOP_COUNT     30
 
 // (LAYER_OP_POOL_GATHER and LAYER_OP_BATCHNORM removed — both are now
 // composed from standard UOps with standard backward rules.)
@@ -134,7 +135,7 @@ static const char *uop_names[] = {
     "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
     "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","FUSING","ASSIGN","WHERE",
-    "IFZ","LOG_PRINT","GRAD"
+    "IFZ","LOG_PRINT","GRAD","TODEVICE"
 };
 
 // ============================================================
@@ -392,12 +393,15 @@ static inline const View *st_get(u64 heap_loc) {
     return (st_keys[idx] == heap_loc + 1) ? &st_views[idx] : NULL;
 }
 
+typedef struct Backend Backend;
+
 typedef struct {
     u32         buf_id;     // GPU buffer handle
     u32         dtype;
     u32         refcount;
     View        view;
     void       *host_ptr;   // cached host copy
+    Backend    *backend;    // which backend owns this tensor's buffer
 
     // Autograd provenance
     u8          requires_grad;
@@ -412,66 +416,73 @@ typedef struct {
 
 } TensorMeta;
 
+// ============================================================
+// Interaction Trace (for single-step reduction debugging)
+// ============================================================
 
+struct InteractionTrace {
+    u64    before_loc;
+    u32    before_tag;
+    u32    before_ext;
+    u64    after_loc;
+    u32    after_tag;
+    u32    after_ext;
+    u32    rule_id;
+};
 
 // ============================================================
 // Backend Interface
 // ============================================================
 
-typedef struct {
+struct Backend {
+    // Lifecycle
     int   (*init)(void);
     void  (*shutdown)(void);
+
+    // Buffer management
     u32   (*buf_alloc)(u64 bytes);
     void  (*buf_free)(u32 id);
     void  (*buf_write)(u32 id, const void *data, u64 bytes);
     void  (*buf_read)(u32 id, void *out, u64 bytes);
-    // Strided ops — full View info for broadcasting/transpose
+
+    // UOp dispatch — the only compute primitives a backend must implement
     void  (*op_unary)(u32 uop, u32 dst, const View *dv,
                       u32 src, const View *sv);
     void  (*op_binary)(u32 uop, u32 dst, const View *dv,
                        u32 a, const View *av, u32 b, const View *bv);
     void  (*op_mm)(u32 dst, u32 a, const View *av, u32 b, const View *bv,
                    u32 M, u32 K, u32 N);
-    // Reduce op: reduce src along last axis into dst
-    // dst shape = src shape with last dim collapsed to 1
     void  (*op_reduce)(u32 uop, u32 dst, u32 dst_numel,
                        u32 src, u32 src_numel, u32 reduce_dim);
 
-    // CNN ops — used by layers.c, device-agnostic
-    void  (*op_im2col)(u32 dst, u32 src, Conv2dParams p);
-    void  (*op_col2im)(u32 dst, u32 src, Conv2dParams p);
-    void  (*op_nhwc_to_nchw)(u32 dst, u32 src, u32 B, u32 C, u32 H, u32 W);
-    void  (*op_nchw_to_nhwc)(u32 dst, u32 src, u32 B, u32 C, u32 H, u32 W);
-    void  (*op_bias_add)(u32 buf, u32 bias, u32 C, u32 n);
-    void  (*op_col_sum)(u32 dst, u32 src, u32 N, u32 C);
-    void  (*op_transpose)(u32 dst, u32 src, u32 M, u32 N);
-    void  (*op_maxpool_fwd)(u32 out, u32 mask, u32 src, u32 B, u32 C, u32 H, u32 W);
-    void  (*op_maxpool_bwd)(u32 dx, u32 dout, u32 mask, u32 B, u32 C, u32 H, u32 W);
-    void  (*op_relu_bwd)(u32 dx, u32 dout, u32 x, u32 n);
-    void  (*op_zero_fill)(u32 buf, u32 n);
-    void  (*op_adam_step)(u32 param, u32 grad, u32 m, u32 v,
-                          f32 lr, f32 beta1, f32 beta2, f32 eps, f32 bc1, f32 bc2, u32 n);
-
-    // Pool management: reset buffer pool to `keep` entries
+    // Pool management
     void  (*pool_reset)(u32 keep);
-    // Command buffer batching: accumulate GPU work without sync
+    // GPU batching
     void  (*begin_batch)(void);
     void  (*end_batch)(void);
-    // Profiling: kernel-level timing (like tinygrad's GlobalCounters)
+    // Profiling
     void  (*profile_report)(void);
     void  (*profile_reset)(void);
-} Backend;
+};
 
 // ============================================================
 // Context
 // ============================================================
+
+#define THVM_MAX_BACKENDS 4
+#define THVM_DEV_CPU   0
+#define THVM_DEV_METAL 1
 
 typedef struct {
     Term       *heap;
     u64         heap_pos;
     TensorMeta *tensors;
     u32         tensor_count;
-    Backend *backend;
+
+    Backend    *backends[THVM_MAX_BACKENDS]; // [0]=cpu, [1]=metal, ...
+    u32         n_backends;
+    u32         default_device;              // index into backends[]
+
     u64         itrs;       // interaction count
     u8          no_fuse;    // 1 to skip fusion (used during GRAD subnet re-reduction)
     u8          dup_frozen; // reserved
@@ -481,7 +492,23 @@ typedef struct {
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term
     u32         def_count;
 
+    // Interaction tracing (Phase 4)
+    struct InteractionTrace *trace_buf;
+    u32         trace_count;
+    u32         trace_cap;
+    u8          trace_enabled;
+
 } TinyHVM;
+
+// Per-tensor backend accessor
+static inline Backend *tensor_backend(TinyHVM *ctx, u32 tid) {
+    return ctx->tensors[tid].backend;
+}
+
+// Default backend for new tensor creation
+static inline Backend *ctx_default_backend(TinyHVM *ctx) {
+    return ctx->backends[ctx->default_device];
+}
 
 // ============================================================
 // API
@@ -499,13 +526,16 @@ static inline Term heap_read(TinyHVM *ctx, u64 loc);
 static inline void heap_set(TinyHVM *ctx, u64 loc, Term t);
 
 // Context
-Backend *thvm_device(const char *name);  // "cpu", "metal"
-TinyHVM *thvm_init(Backend *backend);
+TinyHVM *thvm_init(const char *default_device);  // "cpu", "metal" — inits all backends, sets default
 void     thvm_free(TinyHVM *ctx);
 void     thvm_reset(TinyHVM *ctx, u32 keep);  // free tensors above `keep`, reset heap
 
+// Device
+Term     thvm_to_device(TinyHVM *ctx, Term t, u32 device_idx);
+
 // Reduction
 Term     thvm_reduce(TinyHVM *ctx, Term t);
+Term     thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps);
 
 // Tensor API
 Term     thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s);
@@ -541,6 +571,10 @@ Term     thvm_log_print(TinyHVM *ctx, Term tensor);  // print scalar value, retu
 // Profiling (dispatches to backend->profile_report/reset)
 void     thvm_profile_report(TinyHVM *ctx);
 void     thvm_profile_reset(TinyHVM *ctx);
+
+// Interaction tracing
+void     thvm_trace_enable(TinyHVM *ctx, int enabled);
+void     thvm_trace_clear(TinyHVM *ctx);
 
 // ============================================================
 // Layer abstraction — sequential composition

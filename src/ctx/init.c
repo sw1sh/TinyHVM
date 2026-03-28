@@ -1,35 +1,50 @@
-Backend *thvm_device(const char *name) {
-    #ifdef __APPLE__
-    if (strcmp(name, "metal") == 0 || strcmp(name, "gpu") == 0)
-        return &metal_backend;
-    #endif
-    (void)name;
-    return &cpu_backend;
-}
-
-TinyHVM *thvm_init(Backend *backend) {
+TinyHVM *thvm_init(const char *default_device) {
     TinyHVM *ctx = calloc(1, sizeof(TinyHVM));
     ctx->tensors = calloc(MAX_TENSORS, sizeof(TensorMeta));
     ctx->heap = calloc(HEAP_CAP, sizeof(Term));
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();  // sentinel: prevent TAG_APP(0) self-loop
-    ctx->backend = backend;
-    if (backend && backend->init) backend->init();
+
+    // Always register CPU backend
+    ctx->backends[THVM_DEV_CPU] = &cpu_backend;
+    ctx->n_backends = 1;
+    ctx->default_device = THVM_DEV_CPU;
+    if (cpu_backend.init) cpu_backend.init();
+
+    // Register Metal backend if available and requested
+    #ifdef __APPLE__
+    if (strcmp(default_device, "metal") == 0 || strcmp(default_device, "gpu") == 0) {
+        ctx->backends[THVM_DEV_METAL] = &metal_backend;
+        ctx->n_backends = 2;
+        ctx->default_device = THVM_DEV_METAL;
+        if (metal_backend.init) metal_backend.init();
+    }
+    #else
+    (void)default_device;
+    #endif
+
+    // Allocate trace buffer
+    ctx->trace_cap = 1024;
+    ctx->trace_buf = calloc(ctx->trace_cap, sizeof(struct InteractionTrace));
+
     return ctx;
 }
 
 void thvm_free(TinyHVM *ctx) {
-    // Free GPU buffers first
-    if (ctx->backend) {
-        for (u32 i = 0; i < ctx->tensor_count; i++) {
-            if (ctx->tensors[i].buf_id)
-                ctx->backend->buf_free(ctx->tensors[i].buf_id);
-        }
+    // Free GPU buffers via each tensor's own backend
+    for (u32 i = 0; i < ctx->tensor_count; i++) {
+        if (ctx->tensors[i].buf_id && ctx->tensors[i].backend)
+            ctx->tensors[i].backend->buf_free(ctx->tensors[i].buf_id);
     }
-    if (ctx->backend && ctx->backend->shutdown) ctx->backend->shutdown();
+    // Shutdown all registered backends
+    for (u32 i = 0; i < ctx->n_backends; i++) {
+        if (ctx->backends[i] && ctx->backends[i]->shutdown)
+            ctx->backends[i]->shutdown();
+    }
     for (u32 i = 0; i < ctx->tensor_count; i++) {
         if (ctx->tensors[i].host_ptr) free(ctx->tensors[i].host_ptr);
     }
+    free(ctx->trace_buf);
     free(ctx->tensors);
     free(ctx->heap);
     free(ctx);
@@ -51,9 +66,11 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
         if (ctx->tensors[i].host_ptr) free(ctx->tensors[i].host_ptr);
         memset(&ctx->tensors[i], 0, sizeof(TensorMeta));
     }
-    // Reset backend buffer pool (frees GPU/CPU buffers above keep)
-    if (ctx->backend && ctx->backend->pool_reset)
-        ctx->backend->pool_reset(keep);
+    // Reset all backend buffer pools (frees GPU/CPU buffers above keep)
+    for (u32 bi = 0; bi < ctx->n_backends; bi++) {
+        if (ctx->backends[bi] && ctx->backends[bi]->pool_reset)
+            ctx->backends[bi]->pool_reset(keep);
+    }
     ctx->tensor_count = keep;
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();
@@ -69,8 +86,8 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
 Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {
     u32 id = tensor_create(ctx, s, DTYPE_F32);
     TensorMeta *m = &ctx->tensors[id];
-    if (ctx->backend && data) {
-        ctx->backend->buf_write(m->buf_id, data, (u64)m->view.numel * dtype_size(m->dtype));
+    if (m->backend && data) {
+        m->backend->buf_write(m->buf_id, data, (u64)m->view.numel * dtype_size(m->dtype));
     }
     // Cache host data for small metadata tensors (shapes, axes, permutations).
     // This allows shape tracking in thvm_op to read data without GPU buffer access.

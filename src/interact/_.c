@@ -1,13 +1,14 @@
 // Read small metadata (axes, shapes, pad specs) without GPU flush.
 // These are CPU-written and never GPU-modified.
+// be = Backend* that owns the buffer.
 #ifdef __APPLE__
-#define META_READ(ctx, buf_id, out, bytes) \
-    ((ctx)->backend == &metal_backend ? \
+#define META_READ(be, buf_id, out, bytes) \
+    ((be) == &metal_backend ? \
      metal_buf_read_nosync((buf_id), (out), (bytes)) : \
-     (ctx)->backend->buf_read((buf_id), (out), (bytes)))
+     (be)->buf_read((buf_id), (out), (bytes)))
 #else
-#define META_READ(ctx, buf_id, out, bytes) \
-    (ctx)->backend->buf_read((buf_id), (out), (bytes))
+#define META_READ(be, buf_id, out, bytes) \
+    (be)->buf_read((buf_id), (out), (bytes))
 #endif
 
 // Forward declarations (defined in rewrite/_.c, included after interact)
@@ -255,7 +256,7 @@ inet_step:
                         case UOP_PERMUTE: {
                             u32 rank = ctx->tensors[bid].view.numel;
                             f32 *af = malloc(rank * sizeof(f32));
-                            META_READ(ctx, ctx->tensors[bid].buf_id, af, rank*sizeof(f32));
+                            META_READ(ctx->tensors[bid].backend, ctx->tensors[bid].buf_id, af, rank*sizeof(f32));
                             u32 inv[MAX_DIM];
                             for (u32 j = 0; j < rank; j++) inv[(u32)af[j]] = j;
                             free(af);
@@ -273,7 +274,7 @@ inet_step:
                             TensorMeta *mp = &ctx->tensors[bid];
                             u32 nd = mp->view.numel / 2;
                             f32 *pf = malloc(mp->view.numel * sizeof(f32));
-                            META_READ(ctx, mp->buf_id, pf, mp->view.numel*sizeof(f32));
+                            META_READ(mp->backend, mp->buf_id, pf, mp->view.numel*sizeof(f32));
                             u32 sp[MAX_DIM*2];
                             for (u32 j=0;j<nd;j++){sp[j*2]=(u32)pf[j*2];sp[j*2+1]=(u32)pf[j*2]+ma->view.shape.dims[j];}
                             free(pf);
@@ -283,7 +284,7 @@ inet_step:
                             TensorMeta *ms2 = &ctx->tensors[bid];
                             u32 nd = ms2->view.numel / 2;
                             f32 *sf = malloc(ms2->view.numel * sizeof(f32));
-                            META_READ(ctx, ms2->buf_id, sf, ms2->view.numel*sizeof(f32));
+                            META_READ(ms2->backend, ms2->buf_id, sf, ms2->view.numel*sizeof(f32));
                             u32 pp[MAX_DIM*2];
                             for (u32 j=0;j<nd;j++){pp[j*2]=(u32)sf[j*2];pp[j*2+1]=ma->view.shape.dims[j]-(u32)sf[j*2+1];}
                             free(sf);
@@ -324,7 +325,7 @@ inet_step:
                         TensorMeta *md = &ctx->tensors[dst_id];
                         TensorMeta *ms = &ctx->tensors[src_id];
                         #ifdef __APPLE__
-                        if (ctx->backend == &metal_backend) {
+                        if (md->backend == &metal_backend) {
                             metal_contiguify(md->buf_id, md->view.numel,
                                              ms->buf_id, &ms->view);
                         } else
@@ -332,13 +333,46 @@ inet_step:
                         {
                             u64 nbytes = (u64)md->view.numel * sizeof(f32);
                             f32 *src_host = (f32 *)thvm_to_host(ctx, src_t);
-                            ctx->backend->buf_write(md->buf_id, src_host, nbytes);
+                            md->backend->buf_write(md->buf_id, src_host, nbytes);
                         }
                         if (md->host_ptr) { free(md->host_ptr); md->host_ptr = NULL; }
                         heap_set(ctx, loc + 1, dst_r);
                     }
                     ctx->itrs++;
                     RETURN_REDUCED(dst_r);
+                }
+                RETURN_REDUCED(term_era());
+            }
+
+            if (uop == UOP_TODEVICE) {
+                // UOP_TODEVICE(tensor, device_idx_scalar)
+                // Read tensor from source backend, write to target backend
+                Term src_t = thvm_reduce(ctx, heap_read(ctx, loc));
+                Term dev_t = thvm_reduce(ctx, heap_read(ctx, loc + 1));
+                if (term_tag(src_t) == TAG_TEN && term_tag(dev_t) == TAG_TEN) {
+                    u32 src_id = (u32)term_val(src_t);
+                    ENSURE(ctx, src_id);
+                    TensorMeta *ms = &ctx->tensors[src_id];
+                    u32 dev_id = (u32)term_val(dev_t); ENSURE(ctx, dev_id);
+                    f32 dev_f; ctx->tensors[dev_id].backend->buf_read(
+                        ctx->tensors[dev_id].buf_id, &dev_f, sizeof(f32));
+                    u32 dev_idx = (u32)dev_f;
+                    Backend *dst_be = ctx->backends[dev_idx];
+                    if (!dst_be || ms->backend == dst_be) {
+                        ctx->itrs++;
+                        RETURN_REDUCED(src_t); // no-op: same device or invalid
+                    }
+                    // Read to host, allocate on target device
+                    f32 *host = (f32 *)thvm_to_host(ctx, src_t);
+                    u32 new_id = tensor_create(ctx, ms->view.shape, ms->dtype);
+                    TensorMeta *mn = &ctx->tensors[new_id];
+                    mn->backend->buf_free(mn->buf_id);
+                    mn->backend = dst_be;
+                    mn->buf_id = dst_be->buf_alloc((u64)mn->view.numel * dtype_size(mn->dtype));
+                    dst_be->buf_write(mn->buf_id, host, (u64)mn->view.numel * dtype_size(mn->dtype));
+                    mn->requires_grad = ms->requires_grad;
+                    ctx->itrs++;
+                    RETURN_REDUCED(term_ten(new_id, mn->dtype));
                 }
                 RETURN_REDUCED(term_era());
             }
@@ -362,13 +396,13 @@ inet_step:
                 // Materialize all three
                 f32 *cp = malloc(n * sizeof(f32)), *ap = malloc(n * sizeof(f32)),
                     *bp = malloc(n * sizeof(f32)), *rp = malloc(n * sizeof(f32));
-                ctx->backend->buf_read(mc->buf_id, cp, n*sizeof(f32));
-                ctx->backend->buf_read(ma_w->buf_id, ap, n*sizeof(f32));
-                ctx->backend->buf_read(mb_w->buf_id, bp, n*sizeof(f32));
+                mc->backend->buf_read(mc->buf_id, cp, n*sizeof(f32));
+                ma_w->backend->buf_read(ma_w->buf_id, ap, n*sizeof(f32));
+                mb_w->backend->buf_read(mb_w->buf_id, bp, n*sizeof(f32));
                 for (u32 i = 0; i < n; i++) rp[i] = (cp[i] != 0.0f) ? ap[i] : bp[i];
                 free(cp); free(ap); free(bp);
                 u32 dst_wid = tensor_create(ctx, ma_w->view.shape, ma_w->dtype);
-                ctx->backend->buf_write(ctx->tensors[dst_wid].buf_id, rp, n*sizeof(f32));
+                ctx->tensors[dst_wid].backend->buf_write(ctx->tensors[dst_wid].buf_id, rp, n*sizeof(f32));
                 free(rp);
                 ctx->itrs++;
                 RETURN_REDUCED(term_ten(dst_wid, ma_w->dtype));
@@ -474,7 +508,7 @@ inet_step:
                         TensorMeta *mb = &ctx->tensors[b_id];
                         Shape ns = {.rank = mb->view.numel};
                         f32 *dims = malloc(ns.rank * sizeof(f32));
-                        META_READ(ctx, mb->buf_id, dims, ns.rank * sizeof(f32));
+                        META_READ(mb->backend, mb->buf_id, dims, ns.rank * sizeof(f32));
                         for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
                         free(dims);
 
@@ -504,7 +538,7 @@ inet_step:
                             u32 orig_a_id = a_id;
                             u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
                             #ifdef __APPLE__
-                            if (ctx->backend == &metal_backend) {
+                            if (ma->backend == &metal_backend) {
                                 metal_contiguify(ctx->tensors[mat_id].buf_id, numel,
                                                  ma->buf_id, &ma->view);
                             } else
@@ -519,7 +553,7 @@ inet_step:
                                 buf_bytes += 1;
                                 if (buf_bytes == 0) buf_bytes = 1;
                                 f32 *raw = malloc(buf_bytes * sizeof(f32));
-                                ctx->backend->buf_read(ma->buf_id, raw, buf_bytes * sizeof(f32));
+                                ma->backend->buf_read(ma->buf_id, raw, buf_bytes * sizeof(f32));
                                 for (u32 flat = 0; flat < numel; flat++) {
                                     u32 rem = flat; i32 idx = ma->view.offset;
                                     int msk = 0;
@@ -532,7 +566,7 @@ inet_step:
                                     src[flat] = (msk || idx < 0 || (u32)idx >= buf_bytes) ? 0.f : raw[(u32)idx];
                                 }
                                 free(raw);
-                                ctx->backend->buf_write(ctx->tensors[mat_id].buf_id, src, numel * sizeof(f32));
+                                ctx->tensors[mat_id].backend->buf_write(ctx->tensors[mat_id].buf_id, src, numel * sizeof(f32));
                                 free(src);
                             }
 
@@ -556,7 +590,7 @@ inet_step:
                         TensorMeta *mb = &ctx->tensors[b_id];
                         Shape ns = {.rank = mb->view.numel};
                         f32 *dims = malloc(ns.rank * sizeof(f32));
-                        META_READ(ctx, mb->buf_id, dims, ns.rank * sizeof(f32));
+                        META_READ(mb->backend, mb->buf_id, dims, ns.rank * sizeof(f32));
                         for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
                         free(dims);
                         new_view = view_expand(ma->view, ns);
@@ -567,7 +601,7 @@ inet_step:
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 rank = mb->view.numel;
                         f32 *axes_f = malloc(rank * sizeof(f32));
-                        META_READ(ctx, mb->buf_id, axes_f, rank * sizeof(f32));
+                        META_READ(mb->backend, mb->buf_id, axes_f, rank * sizeof(f32));
                         u32 axes[MAX_DIM];
                         for (u32 i = 0; i < rank; i++) axes[i] = (u32)axes_f[i];
                         free(axes_f);
@@ -581,7 +615,7 @@ inet_step:
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 n_pairs = mb->view.numel;
                         f32 *pairs = malloc(n_pairs * sizeof(f32));
-                        ctx->backend->buf_read(mb->buf_id, pairs, n_pairs * sizeof(f32));
+                        mb->backend->buf_read(mb->buf_id, pairs, n_pairs * sizeof(f32));
                         u32 starts[MAX_DIM], ends[MAX_DIM];
                         for (u32 i = 0; i < n_pairs / 2; i++) {
                             starts[i] = (u32)pairs[i * 2];
@@ -598,7 +632,7 @@ inet_step:
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 n_pairs = mb->view.numel;
                         f32 *pairs = malloc(n_pairs * sizeof(f32));
-                        META_READ(ctx, mb->buf_id, pairs, n_pairs * sizeof(f32));
+                        META_READ(mb->backend, mb->buf_id, pairs, n_pairs * sizeof(f32));
                         u32 pad_before[MAX_DIM], pad_after[MAX_DIM];
                         for (u32 i = 0; i < n_pairs / 2; i++) {
                             pad_before[i] = (u32)pairs[i * 2];
@@ -627,7 +661,7 @@ inet_step:
                 RETURN_REDUCED(term_ten(dst_id, ma->dtype));
             }
 
-            if (!ctx->backend) return t;
+            if (!ctx_default_backend(ctx)) return t;
 
             // ERA propagation for compute ops (Phase 0, ic_native_backprop.md):
             // Dead GRAD branches produce ERA. These must be absorbed:
@@ -674,7 +708,7 @@ inet_step:
                         TensorMeta *max_t = &ctx->tensors[ax_id];
                         u32 n_axes = max_t->view.numel;
                         f32 *axes_f = malloc(n_axes * sizeof(f32));
-                        META_READ(ctx, max_t->buf_id, axes_f, n_axes * sizeof(f32));
+                        META_READ(max_t->backend, max_t->buf_id, axes_f, n_axes * sizeof(f32));
                         for (u32 i = 0; i < n_axes; i++) {
                             u32 ax = (u32)axes_f[i];
                             out_shape[ax] = 1;
@@ -694,6 +728,9 @@ inet_step:
                     }
                 }
             } else if (is_binary) {
+                // Cross-device mismatch check
+                assert((!ma->backend || !mb->backend || ma->backend == mb->backend) &&
+                       "cross-device op: use thvm_to_device first");
                 // Binary: broadcast shapes
                 int ok = view_broadcast(&ma->view, &mb->view, &av_bc, &bv_bc, out_shape, &out_ndim);
                 if (!ok) {
@@ -728,6 +765,7 @@ inet_step:
                 memset(md, 0, sizeof(*md));
                 md->dtype = ma->dtype;
                 md->refcount = 1;
+                md->backend = ma->backend;
                 md->view = view_create(shape_of(out_shape, out_ndim));
                 // buf_id = 0: deferred. tensor_materialize will allocate + dispatch.
                 md->creator_op = uop;
@@ -756,6 +794,7 @@ inet_step:
             }
 
             // Defer SUM/RMAX when input is deferred elementwise chain
+            // Defer SUM (not RMAX) when input is a deferred elementwise op
             // Materialize lazy inputs before dispatch
             {
                 ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];
@@ -764,7 +803,7 @@ inet_step:
             // Dispatch
             if (uop == UOP_MM) {
                 u32 M = ma->view.shape.dims[0], K = ma->view.shape.dims[1], N = mb->view.shape.dims[1];
-                ctx->backend->op_mm(md->buf_id, ma->buf_id, &ma->view,
+                md->backend->op_mm(md->buf_id, ma->buf_id, &ma->view,
                                 mb->buf_id, &mb->view, M, K, N);
             } else if (is_reduce) {
                 // Check if explicit axes are provided
@@ -780,7 +819,7 @@ inet_step:
                         TensorMeta *axt = &ctx->tensors[ax_id];
                         n_explicit = axt->view.numel;
                         f32 *af = malloc(n_explicit * sizeof(f32));
-                        META_READ(ctx, axt->buf_id, af, n_explicit * sizeof(f32));
+                        META_READ(axt->backend, axt->buf_id, af, n_explicit * sizeof(f32));
                         for (u32 i = 0; i < n_explicit; i++) explicit_axes[i] = (u32)af[i];
                         free(af);
                     }
@@ -807,7 +846,7 @@ inet_step:
                     }
 
                     #ifdef __APPLE__
-                    if ((uop == UOP_SUM || uop == UOP_RMAX) && ctx->backend == &metal_backend) {
+                    if ((uop == UOP_SUM || uop == UOP_RMAX) && ma->backend == &metal_backend) {
                         // Multi-axis reduce via general codegen (handles any strides)
                         ReduceSpec rs2 = {0};
                         rs2.reduce_type = uop;
@@ -827,9 +866,9 @@ inet_step:
                             if (ma->view.strides[d] > 0)
                                 max_buf_idx += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
                         f32 *raw = malloc((max_buf_idx+1) * sizeof(f32));
-                        if (ctx->backend->end_batch) ctx->backend->end_batch();
-                        ctx->backend->buf_read(ma->buf_id, raw, (u64)(max_buf_idx+1)*sizeof(f32));
-                        if (ctx->backend->begin_batch) ctx->backend->begin_batch();
+                        if (ma->backend->end_batch) ma->backend->end_batch();
+                        ma->backend->buf_read(ma->buf_id, raw, (u64)(max_buf_idx+1)*sizeof(f32));
+                        if (ma->backend->begin_batch) ma->backend->begin_batch();
                         f32 *in_data = malloc(in_numel * sizeof(f32));
                         for (u32 flat = 0; flat < in_numel; flat++) {
                             u32 rem = flat, phys = (u32)ma->view.offset;
@@ -855,7 +894,7 @@ inet_step:
                             if (uop == UOP_SUM) out_data[of] += in_data[flat];
                             else if (in_data[flat] > out_data[of]) out_data[of] = in_data[flat];
                         }
-                        ctx->backend->buf_write(md->buf_id, out_data, out_numel * sizeof(f32));
+                        md->backend->buf_write(md->buf_id, out_data, out_numel * sizeof(f32));
                         free(in_data); free(out_data);
                     }
                 } else {
@@ -870,7 +909,7 @@ inet_step:
                     if (ra < 0) ra = (int)ma->view.shape.rank - 1;
 
                     #ifdef __APPLE__
-                    if (ctx->backend == &metal_backend) {
+                    if (ma->backend == &metal_backend) {
                         // All single-axis reduces via general codegen (handles any strides)
                         ReduceSpec rs = {0};
                         rs.reduce_type = uop;
@@ -888,8 +927,8 @@ inet_step:
                         if (!ma->view.contiguous) {
                             // CPU fallback: contiguify
                             #ifdef __APPLE__
-                            if (ctx->backend == &metal_backend) {
-                                use_buf = ctx->backend->buf_alloc(src_numel * sizeof(f32));
+                            if (ma->backend == &metal_backend) {
+                                use_buf = ma->backend->buf_alloc(src_numel * sizeof(f32));
                                 metal_contiguify(use_buf, src_numel, ma->buf_id, &ma->view);
                             } else
                             #endif
@@ -900,7 +939,7 @@ inet_step:
                                         max_buf_idx += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
                                 max_buf_idx += (ma->view.offset > 0) ? (u32)ma->view.offset : 0;
                                 f32 *raw = malloc((max_buf_idx+1) * sizeof(f32));
-                                ctx->backend->buf_read(ma->buf_id, raw, (u64)(max_buf_idx+1)*sizeof(f32));
+                                ma->backend->buf_read(ma->buf_id, raw, (u64)(max_buf_idx+1)*sizeof(f32));
                                 f32 *mat_src = malloc(src_numel * sizeof(f32));
                                 for (u32 flat = 0; flat < src_numel; flat++) {
                                     u32 rem = flat; i32 phys = ma->view.offset; int msk = 0;
@@ -912,22 +951,22 @@ inet_step:
                                     mat_src[flat] = (msk || phys < 0 || (u32)phys > max_buf_idx) ? 0.f : raw[(u32)phys];
                                 }
                                 free(raw);
-                                use_buf = ctx->backend->buf_alloc(src_numel * sizeof(f32));
-                                ctx->backend->buf_write(use_buf, mat_src, src_numel * sizeof(f32));
+                                use_buf = ma->backend->buf_alloc(src_numel * sizeof(f32));
+                                ma->backend->buf_write(use_buf, mat_src, src_numel * sizeof(f32));
                                 free(mat_src);
                             }
                         }
-                        ctx->backend->op_reduce(uop, md->buf_id, md->view.numel,
+                        md->backend->op_reduce(uop, md->buf_id, md->view.numel,
                                                 use_buf, src_numel, reduce_dim);
-                        if (use_buf != ma->buf_id) ctx->backend->buf_free(use_buf);
+                        if (use_buf != ma->buf_id) ma->backend->buf_free(use_buf);
                     }
                 }
             } else if (is_binary) {
-                ctx->backend->op_binary(uop, md->buf_id, &md->view,
+                md->backend->op_binary(uop, md->buf_id, &md->view,
                                     ma->buf_id, &av_bc,
                                     ctx->tensors[b_id].buf_id, &bv_bc);
             } else {
-                ctx->backend->op_unary(uop, md->buf_id, &md->view,
+                md->backend->op_unary(uop, md->buf_id, &md->view,
                                    ma->buf_id, &ma->view);
             }
 

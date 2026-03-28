@@ -35,7 +35,14 @@
       "Read(//Users/swish/src/TinyHVM/tinygrad/tinygrad/**)",
       "Read(//Users/swish/src/tinygrad/tinygrad/**)",
       "Read(//Users/swish/src/TinyHVM/tinygrad/tinygrad/uop/**)",
-      "Read(//Users/swish/src/tinygrad/tinygrad/uop/**)"
+      "Read(//Users/swish/src/tinygrad/tinygrad/uop/**)",
+      "Read(//Users/swish/src/wolfram/neuralnetworks/mlxlink/MLXLink/**)",
+      "Read(//Users/swish/src/wolfram/neuralnetworks/mlxlink/MLXLink/Kernel/**)",
+      "Read(//Users/swish/src/wolfram/neuralnetworks/mlxlink/**)",
+      "Read(//Users/swish/src/wolfram/neuralnetwork/mlxlink/MLXLink/Kernel/**)",
+      "Read(//Users/swish/src/wolfram/neuralnetworks/mlxlink/CPPSource/**)",
+      "Read(//Users/swish/Library/Wolfram/Paclets/Repository/MLXLink-0.1.0/**)",
+      "Read(//Users/swish/Library/Wolfram/Paclets/Repository/MLXLink-0.1.0/Kernel/**)"
     ]
   }
 }

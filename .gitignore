@@ -48,3 +48,5 @@ __pycache__/
 .agent/
 .agents/
 .claude/worktrees/
+.claude/settings.json
+.claude/settings.json

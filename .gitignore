@@ -60,3 +60,4 @@ test_bn_grad
 test_mnist_asan
 test_mnist_dbg
 bn_debug.log
+*.nb

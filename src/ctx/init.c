@@ -170,6 +170,15 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
     return t; // table full
 }
 
+// Fast path: skip linear_use + shape tracking. For internal backward ops
+// where sharing is managed explicitly (grad_cache, not DUP).
+Term thvm_op_raw(TinyHVM *ctx, u32 uop, Term a, Term b) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc, a);
+    heap_set(ctx, loc + 1, b);
+    return term_new(TAG_TOP, uop, loc);
+}
+
 Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
     u64 loc = heap_alloc(ctx, 4); // 0-1: args (trampoline overwrites), 2-3: shadow (preserved)
     a = linear_use(ctx, a, loc);

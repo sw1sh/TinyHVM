@@ -116,6 +116,8 @@ static RewriteRule rewrite_rules[] = {
 static Term rewrite_apply(TinyHVM *ctx, Term t) {
     if (rewrite_active) return t;
     if (term_tag(t) != TAG_TOP) return t;
+    // Skip rewrite rules when backend has no codegen (CPU) — fusion can't dispatch
+    if (!ctx_default_backend(ctx) || !ctx_default_backend(ctx)->dispatch_kernel_rs) return t;
     u32 uop = term_ext(t);
     u64 loc = term_val(t);
     Term a = heap_read(ctx, loc);

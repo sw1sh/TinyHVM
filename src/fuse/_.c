@@ -206,6 +206,9 @@ static u32 fuse_unfused_count = 0, fuse_fused_count = 0;
 
 static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     if (term_tag(t) != TAG_TOP) return reduce_id(ctx, t);
+    // Skip fusion when backend has no codegen (CPU) — avoids stack overflow in fuse_walk_inner
+    if (!ctx_default_backend(ctx) || !ctx_default_backend(ctx)->dispatch_kernel_rs)
+        return reduce_id(ctx, t);
     u32 top_uop = term_ext(t);
 
     // Pattern match: elementwise, SUM/RMAX(ew), RESHAPE(SUM/RMAX(ew))

@@ -50,21 +50,24 @@ static void top_decref_inputs(TinyHVM *ctx, u64 loc, u32 uop, Term result) {
 
 // Pre-allocated stack pool — each recursion level gets a slice.
 // 4096 frames per slice, 64 max nesting depth = 2MB TLS.
-#define REDUCE_SLICE 4096
+#define REDUCE_SLICE 131072  // 128K frames per depth level (1MB)
 #define REDUCE_MAX_DEPTH 256
-static _Thread_local Term reduce_pool[REDUCE_SLICE * REDUCE_MAX_DEPTH];
+static Term reduce_pool[REDUCE_SLICE * REDUCE_MAX_DEPTH]; // heap-allocated, not TLS
 static _Thread_local int  reduce_depth = 0;
 
 Term thvm_reduce(TinyHVM *ctx, Term root) {
     int depth = reduce_depth++;
-    assert(depth < REDUCE_MAX_DEPTH);
+    if (depth >= REDUCE_MAX_DEPTH) {
+        fprintf(stderr, "REDUCE_OVERFLOW: depth=%d tag=%u ext=%u\n", depth, term_tag(root), term_ext(root));
+        assert(0 && "reduce depth overflow");
+    }
     Term *stk = &reduce_pool[depth * REDUCE_SLICE];
     int  sp = 0;
 
     Term next = root;
     Term whnf;
 
-    #define PUSH(f_)  do { assert(sp < REDUCE_SLICE); stk[sp++] = (f_); } while(0)
+    #define PUSH(f_)  do { if (sp >= REDUCE_SLICE) { fprintf(stderr, "SP_OVERFLOW sp=%d depth=%d\n", sp, depth); fflush(stderr); assert(0); } stk[sp++] = (f_); } while(0)
     #define TRACE_STEP(before, result) do { \
         if (ctx->trace_enabled && ctx->trace_count < ctx->trace_cap) { \
             struct InteractionTrace *_tr = &ctx->trace_buf[ctx->trace_count++]; \

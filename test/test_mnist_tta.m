@@ -43,8 +43,8 @@ int main(void) {
 
     u32 max_epochs = 10;
     u32 total_steps = max_epochs * n_batches;
-    f32 lr_max = 0.003f, wd = 0.0001f;
-    u32 warmup = 100;
+    f32 lr_max = 0.005f, wd = 0.0001f;  // higher LR for larger batch
+    u32 warmup = 50;
 
     // Milestones
     f32 targets[] = {90.0f, 95.0f, 97.0f, 98.0f};

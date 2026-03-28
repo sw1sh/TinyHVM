@@ -1,86 +1,97 @@
-# Close the Gap: 76s → 20.5s Optimization Plan
+# Plan: Close the Dispatch Gap with C-ML
 
-## Current State
-- **76s total** (tinygrad: 20.5s) = **3.7× gap**
-- 251 dispatches/step at ~750ms GPU (tinygrad: 186 at 37ms)
-- 96.6% accuracy (matched)
+## Current State (2026-03-28)
 
-## Root Cause Breakdown
+| Architecture | TinyHVM | Tinygrad | C-ML target | Gap |
+|---|---|---|---|---|
+| 1-layer CNN | **46** disp, 6ms | 16, ~8ms | ~8 | 5.8× |
+| 2-conv+pool | **78** disp, 17ms | 33, 16ms | ~14 | 5.6× |
+| 4-conv+pool | **124** disp, 30ms | 45, 61ms | ~22 | 5.6× |
 
-The 750ms GPU time per step decomposes:
+TinyHVM is **matched or faster in wall time** than tinygrad for 2+ conv layers,
+despite 2-3× more dispatches. Per-kernel efficiency is high thanks to Metal
+command buffer batching and JIT codegen.
 
-| Category | Dispatches | Est. Time | Why Slow |
-|----------|-----------|-----------|----------|
-| mrs (mul_reduce_sum) | 38 | ~200ms | Serial inner loop, no parallel reduce, integer divisions per reduce iteration |
-| contiguify | 46 | ~150ms | Unnecessary GPU copies before reduce/mm/reshape — strided_idx identity kernel |
-| mdim binary | 37 | ~100ms | Already optimized; some still scalar (not float4 eligible) |
-| fused_v2 | 20 | ~80ms | strided_idx with 4-8 integer divisions per element per leaf |
-| bc2d | 24 | ~40ms | No float4, not fused with adjacent ops |
-| reduce | 12 | ~40ms | Serial inner loop, no parallel reduce |
-| adam | 14 | ~30ms | Scalar (no float4) |
-| f4_bin + fast + mm | 38 | ~30ms | Already fast |
-| other (conv helpers) | 22 | ~80ms | Inherent to im2col conv approach |
+## Completed Optimizations
 
-## Priority-Ordered Optimizations
+- [x] General codegen transpiler (any axis reduce, ReduceSpec)
+- [x] Deferred elementwise dispatch (tensor_materialize fuses chains)
+- [x] Multi-output kernels (shared intermediates as side buffers)
+- [x] Shared tensor detection (defer_consumers tracking)
+- [x] Lazy GRAD ENSURE (backward chains stay deferred longer)
+- [x] RELU backward uses output not input (safe in fused reduces)
+- [x] Deleted backward_local (pure IC gradient only)
+- [x] All reduces through general codegen (eliminate reduce/mrs categories)
+- [x] SUM deferral for unshared inputs
+- [x] rule_sum_fuse materializes deferred children
+- [x] Dead-branch skip in BIN_GRAD
 
-### P0: Parallel reduction in mul_reduce_sum (~35ms saved)
-**Files:** `shaders.metal`, `fused.m`
-**What:** The `mul_reduce_sum` kernel does `for (r=0; r<reduce_dim; r++) acc += a[idx]*b[idx]` in ONE thread per output element. For reduce_dim=784, that's 784 serial iterations.
-**Fix:** Use SIMD-width (32) parallel reduction: each thread in a SIMD group handles reduce_dim/32 elements, then `simd_sum()` across the group. For reduce_dim < 32, use direct serial (current). For reduce_dim >= 32, use `simd_sum`.
-**Also:** Specialize for single-axis reduce (n_reduce==1) to skip the multi-axis coordinate decomposition loop.
+## Remaining Dispatch Breakdown (78 for 2-conv+pool)
 
-### P1: Replace strided_idx in fused_v2 with mdim indexing (~10ms saved)
-**Files:** `fused.m` lines 72-153
-**What:** `fused_v2` kernels use generic `strided_idx` (integer division loop per leaf per element). The mdim codegen already solved this with compile-time coordinate decomposition.
-**Fix:** In `codegen_fused_v2`, use 3D dispatch with the same group collapsing as mdim. Decompose output coords once, then compute each leaf's physical index via multiply-only expressions. Add float4 when all leaves' innermost stride is 0 or 1.
+| Category | Count | Path to eliminate |
+|----------|-------|-------------------|
+| **MM** | 6 | Fused GEMM+bias+relu (Phase 5) |
+| **Contiguify** | ~15 | View composition in materialize (Phase 1) |
+| **Standalone reduce** | ~12 | SUM deferral for shared inputs (Phase 3) |
+| **Single-op deferred** | ~12 | Longer chains via shared-input fusion (Phase 2) |
+| **Fused ew/reduce** | ~33 | Already optimal |
 
-### P1: Strided reduce kernel — eliminate contiguify-before-reduce (~8ms, -12 dispatches)
-**Files:** `shaders.metal`, `interact/_.c` line 955
-**What:** Single-axis reduce on non-contiguous input does contiguify (1 dispatch) + reduce (1 dispatch). Two dispatches for one logical operation.
-**Fix:** Add `reduce_sum_strided` kernel that takes ViewParams and reads input via strided indexing directly. Or use `mul_reduce_sum(input, ones, axis)` which already handles ViewParams (partially implemented at interact/_.c:935-960).
+## Phase 1: Eliminate Contiguify (-10 dispatches → ~68)
 
-### P2: MPS transpose flags — eliminate contiguify-before-mm (~3ms, -4 dispatches)
-**Files:** `ops.m` lines 233-244
-**What:** Non-contiguous matmul inputs (transposed) get contiguified before MPS. But MPS supports `transposeLeft`/`transposeRight` natively.
-**Fix:** Detect when the non-contiguous view is a simple transpose (dims swapped, strides swapped). If so, pass the base buffer with transpose flag instead of contiguifying.
+**15 contiguify = 6 ASSIGN blits + 9 RESHAPE materializations.**
 
-### P2: Widen fusion scope in backward (~12ms, -20 dispatches)
-**Files:** `grad/_.c` `fuse_walk_inner` line 47
-**What:** `fuse_walk_inner` stops at TAG_TEN (materialized tensors). Adjacent ops that share a single consumer can't be fused.
-**Fix:** Track use-counts during backward. When a materialized tensor has exactly one consumer, include it in the fused chain. This lets chains like `t1=mul(a,b); t2=sub(t1,c); t3=mul(t2,d)` fuse into one dispatch even if t1 was materialized.
+### ASSIGN blits
+SGD `ASSIGN(param, new_val)` calls `metal_contiguify`. If src is contiguous
+(common after materialize), replace with `buf_copy` — zero dispatch overhead.
 
-### P2: Float4 for bc2d, adam, fused_v2 (~5ms)
-**Files:** `shaders.metal`, `optim.m`, `fused.m`
-**What:** These categories still use scalar (1 element/thread). Float4 gives 4× throughput for memory-bound ops.
-**Fix:** Add float4 variants: `add_bc_2d_f4`, `adam_step_f4`. For fused_v2, emit float4 reads when eligible (same check as mdim float4).
+### RESHAPE materialization
+Conv backward produces non-reshapable strides (PERMUTE → EXPAND → RESHAPE fails).
+Fix: compose views in materialize_walk like fuse_walk_inner does. The attempt
+earlier failed on SHRINK/PAD — need to handle those view types or treat them
+as leaf boundaries (current fuser behavior).
 
-### P3: MTLIndirectCommandBuffer for JIT replay (~5ms)
-**Files:** `jit.m`
-**What:** JIT replay re-encodes 251 dispatches via ObjC calls each step. An ICB encodes once and replays from GPU memory.
-**Fix:** After first replay, convert the command sequence to an ICB. Subsequent replays use `executeCommandsInBuffer:` — zero CPU encoding.
+## Phase 2: Longer Deferred Chains (-5 dispatches → ~63)
 
-## Expected Result
+12 single-op deferred chains break because the next consumer ENSUREs immediately.
+Fix: extend multi-output to let SUM/RMAX include deferred inputs as side outputs,
+so the deferred chain extends through the reduce boundary.
 
-| Optimization | Time Saved | Dispatches Saved |
-|-------------|-----------|-----------------|
-| P0: Parallel mrs | ~35ms | 0 |
-| P1: mdim fused_v2 | ~10ms | 0 |
-| P1: Strided reduce | ~8ms | -12 |
-| P2: MPS transpose | ~3ms | -4 |
-| P2: Wider fusion | ~12ms | -20 |
-| P2: Float4 everywhere | ~5ms | 0 |
-| P3: ICB JIT replay | ~5ms | 0 |
-| **Total** | **~78ms** | **-36** |
+## Phase 3: Fuse Reduce + Upstream Elementwise (-8 dispatches → ~55)
 
-From 750ms → ~670ms GPU per step, 251 → ~215 dispatches.
-Total wall time: ~76s → ~55-60s (tinygrad: 20.5s, gap: ~2.8×).
+12 standalone reduces have materialized inputs. The softmax diamond (EXP shared by
+SUM and DIV) blocks SUM deferral. Fix with multi-output: fused SUM(EXP) writes
+both reduced output and EXP intermediate. DIV reads the side buffer.
 
-## Remaining Gap After All Above
+Requires:
+1. Diamond detection in materialize path
+2. Side-output writes inside reduce loops (codegen change)
+3. Update DIV to read from side buffer instead of deferred tensor
 
-The ~2.8× gap after all optimizations comes from:
-1. **tinygrad's graph-level scheduling** — fuses entire conv (im2col+mul+sum) into single kernels
-2. **tinygrad's lazy evaluation** — never materializes intermediate buffers
-3. **tinygrad's TinyJit** — replays compiled graphs with zero Python/IC overhead
-4. **tinygrad's optimal tiling** — beam-searched thread/group sizes per kernel shape
+## Phase 4: Clean Legacy Paths (simplification, no dispatch change)
 
-Closing this requires TinyHVM to adopt a **lazy graph compiler** architecture (building the full computation graph before scheduling) rather than the current eager IC reducer. This is a fundamental architectural change.
+- Remove `metal_dispatch_kernel` old wrapper
+- Remove `codegen_kernel` / `cg_get_pipe` old wrappers
+- Remove `metal_mul_reduce_sum` (fully replaced)
+- Remove pre-compiled reduce kernels from ops.m
+- Remove `get_fused_pipe_v2` / `metal_codegen_fused` legacy codegen
+- Migrate ops.m single-op dispatch to use metal_dispatch_kernel_rs directly
+
+## Phase 5: MM Fusion (-6 dispatches → ~49)
+
+Matmul via MPS is unfused. Options:
+1. Custom tiled GEMM shader fusing bias_add + relu
+2. MPS activation post-processing
+3. Fuse bias_add into downstream elementwise (consumer fusion)
+
+## Theoretical Minimum (~20 dispatches)
+
+```
+Forward:  conv1(1) + pool1(1) + conv2(1) + pool2(1) + linear(1) + softmax+CE(3) = 8
+Backward: ~10 fused kernels (reduce+ew chains)                                  = 10
+SGD:      1-2 fused weight updates                                               = 2
+Total:    ~20 dispatches
+```
+
+With MPS matmul unfusable: 6 MM + 14 fused = 20.
+Current gap: 78/20 = 3.9×. Most remaining dispatches are contiguify (15)
+and standalone reduce (12) — both addressable with the phases above.

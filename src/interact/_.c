@@ -752,7 +752,7 @@ inet_step:
             // fusion boundaries. This fuses chains of backward ops into one kernel.
             // Defer elementwise: create tensor with buf_id=0, let tensor_materialize
             // fuse chains at boundaries. Shared intermediates get multi-output kernels.
-            if (is_elementwise(uop)) {
+            if (is_elementwise(uop) && ma->backend->dispatch_kernel_rs) {
                 dst_id = ctx->tensor_count++;
                 md = &ctx->tensors[dst_id];
                 memset(md, 0, sizeof(*md));

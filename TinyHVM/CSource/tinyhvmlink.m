@@ -1186,3 +1186,69 @@ EXTERN_C DLLEXPORT int thvmHeapGraph(
     MArgument_setDataStore(res, ds);
     return LIBRARY_NO_ERROR;
 }
+
+// ── Interaction tracing & step reduction ──────────────────────────────────────
+
+// thvmTraceEnable(enabled) → Void
+EXTERN_C DLLEXPORT int thvmTraceEnable(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc; (void)res;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+    thvm_trace_enable(g_ctx, (int)MArgument_getInteger(args[0]));
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmTraceClear() → Void
+EXTERN_C DLLEXPORT int thvmTraceClear(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc; (void)args; (void)res;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+    thvm_trace_clear(g_ctx);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmTraceData() → NumericArray (Int32)
+// Returns [before_tag, before_ext, after_tag, after_ext, rule_id] × n_traces
+EXTERN_C DLLEXPORT int thvmTraceData(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)argc; (void)args;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    u32 n = g_ctx->trace_count;
+    MNumericArray na = NULL;
+    mint dims[1] = { (mint)(n * 5) };
+    g_na_funcs->MNumericArray_new(MNumericArray_Type_SInt32, 1, dims, &na);
+    i32 *data = (i32 *)g_na_funcs->MNumericArray_getData(na);
+    for (u32 i = 0; i < n; i++) {
+        struct InteractionTrace *tr = &g_ctx->trace_buf[i];
+        data[i * 5 + 0] = (i32)tr->before_tag;
+        data[i * 5 + 1] = (i32)tr->before_ext;
+        data[i * 5 + 2] = (i32)tr->after_tag;
+        data[i * 5 + 3] = (i32)tr->after_ext;
+        data[i * 5 + 4] = (i32)tr->rule_id;
+    }
+    MArgument_setMNumericArray(res, na);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmReduceSteps(outId, termId, maxSteps) → Integer (steps taken)
+EXTERN_C DLLEXPORT int thvmReduceSteps(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint out_id = MArgument_getInteger(args[0]);
+    mint term_id = MArgument_getInteger(args[1]);
+    mint max_steps = MArgument_getInteger(args[2]);
+    ensure_term_cap(out_id);
+
+    Term t = get_term(term_id);
+    Term result = thvm_reduce_steps(g_ctx, t, (u32)max_steps);
+    set_term(out_id, result);
+    MArgument_setInteger(res, (mint)g_ctx->steps_taken);
+    return LIBRARY_NO_ERROR;
+}

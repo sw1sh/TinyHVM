@@ -65,6 +65,21 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     Term whnf;
 
     #define PUSH(f_)  do { assert(sp < REDUCE_SLICE); stk[sp++] = (f_); } while(0)
+    #define TRACE_STEP(before, result) do { \
+        if (ctx->trace_enabled && ctx->trace_count < ctx->trace_cap) { \
+            struct InteractionTrace *_tr = &ctx->trace_buf[ctx->trace_count++]; \
+            _tr->before_tag = term_tag(before); \
+            _tr->before_ext = term_ext(before); \
+            _tr->before_loc = term_val(before); \
+            _tr->after_tag = term_tag(result); \
+            _tr->after_ext = term_ext(result); \
+            _tr->after_loc = term_val(result); \
+            _tr->rule_id = term_tag(before); \
+        } \
+        if (ctx->step_budget > 0 && ++ctx->steps_taken >= ctx->step_budget) { \
+            reduce_depth--; return (result); \
+        } \
+    } while(0)
 
   enter: {
     u8 tag = term_tag(next);
@@ -91,6 +106,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     {
         Term r = thvm_interact(ctx, next);
         if (r == next) { whnf = next; goto apply; }  // combinator WNF or stuck
+        TRACE_STEP(next, r);
         next = r;
         goto enter;
     }
@@ -119,6 +135,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             if (term_ext(frame) == UOP_GRAD) {
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
+                TRACE_STEP(frame, r);
                 top_decref_inputs(ctx, loc, term_ext(frame), r);
                 next = r; goto enter;
             }
@@ -129,6 +146,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 // Both args ready — fire
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
+                TRACE_STEP(frame, r);
                 top_decref_inputs(ctx, loc, term_ext(frame), r);
                 next = r; goto enter;
             }
@@ -149,6 +167,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             Term top_frame = term_new(TAG_TOP, term_ext(frame), loc);
             Term r = thvm_interact(ctx, top_frame);
             if (r == top_frame) { whnf = top_frame; continue; }
+            TRACE_STEP(top_frame, r);
             top_decref_inputs(ctx, loc, term_ext(frame), r);
             next = r; goto enter;
         }
@@ -160,12 +179,14 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 heap_set(ctx, floc + 0, whnf);
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
+                TRACE_STEP(frame, r);
                 next = r; goto enter;
             }
             if (ftag == TAG_DP0 || ftag == TAG_DP1) {
                 heap_set(ctx, floc + 0, whnf);
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
+                TRACE_STEP(frame, r);
                 next = r; goto enter;
             }
             whnf = frame; continue;
@@ -176,7 +197,16 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
 
     reduce_depth--;
     #undef PUSH
+    #undef TRACE_STEP
     return whnf;
+}
+
+Term thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps) {
+    ctx->step_budget = max_steps;
+    ctx->steps_taken = 0;
+    Term result = thvm_reduce(ctx, t);
+    ctx->step_budget = 0;
+    return result;
 }
 
 // ============================================================

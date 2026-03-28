@@ -498,6 +498,10 @@ typedef struct {
     u32         trace_cap;
     u8          trace_enabled;
 
+    // Step-limited reduction
+    u32         step_budget;    // 0 = unlimited
+    u32         steps_taken;
+
 } TinyHVM;
 
 // Per-tensor backend accessor

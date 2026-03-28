@@ -197,3 +197,10 @@ void thvm_profile_reset(TinyHVM *ctx) {
         if (ctx->backends[i] && ctx->backends[i]->profile_reset) ctx->backends[i]->profile_reset();
 }
 
+// ============================================================
+// Interaction tracing
+// ============================================================
+
+void thvm_trace_enable(TinyHVM *ctx, int enabled) { ctx->trace_enabled = (u8)enabled; }
+void thvm_trace_clear(TinyHVM *ctx) { ctx->trace_count = 0; }
+

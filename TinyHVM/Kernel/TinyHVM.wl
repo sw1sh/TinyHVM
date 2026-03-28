@@ -96,6 +96,14 @@ TTrainStep::usage = "TTrainStep[params, loss, lr] performs one gradient step, re
 
 TINetGraph::usage = "TINetGraph[tensor|term] returns a Graph of the interaction net by walking the C heap.";
 
+(* ── Single-step reduction & tracing ──────────────────────────────────── *)
+
+TTraceEnable::usage = "TTraceEnable[] enables interaction tracing.";
+TTraceDisable::usage = "TTraceDisable[] disables interaction tracing.";
+TTraceClear::usage = "TTraceClear[] clears the trace buffer.";
+TTrace::usage = "TTrace[] returns a list of interaction trace records.";
+TReduceSteps::usage = "TReduceSteps[tensor, n] reduces at most n interactions, returns {result, stepsTaken}.";
+
 (* ── Profiling ────────────────────────────────────────────────────────── *)
 
 TProfileEnable::usage = "TProfileEnable[] enables UOp-level profiling.";
@@ -239,6 +247,10 @@ thvmViewInfoFn = None;
 thvmTensorDeviceFn = None;
 thvmToDeviceFn = None;
 thvmHeapGraphFn = None;
+thvmTraceEnableFn = None;
+thvmTraceClearFn = None;
+thvmTraceDataFn = None;
+thvmReduceStepsFn = None;
 
 loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
     $libraryLoaded = True;
@@ -372,6 +384,16 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
     (* Heap graph visualization *)
     thvmHeapGraphFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapGraph",
         {Integer}, "DataStore"];
+
+    (* Interaction tracing & step reduction *)
+    thvmTraceEnableFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmTraceEnable",
+        {Integer}, "Void"];
+    thvmTraceClearFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmTraceClear",
+        {}, "Void"];
+    thvmTraceDataFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmTraceData",
+        {}, LibraryDataType[NumericArray]];
+    thvmReduceStepsFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmReduceSteps",
+        {Integer, Integer, Integer}, Integer];
 ];
 
 (* ════════════════════════════════════════════════════════════════════════ *)
@@ -860,6 +882,35 @@ TTerm /: MakeBoxes[t:TTerm[id_Integer], StandardForm] := Module[
         Selectable -> False, Editable -> False, SelectWithContents -> True
     }
 ];
+
+(* ════════════════════════════════════════════════════════════════════════ *)
+(* Single-step reduction & tracing                                         *)
+(* ════════════════════════════════════════════════════════════════════════ *)
+
+TTraceEnable[]  := (loadLibrary[]; thvmTraceEnableFn[1]);
+TTraceDisable[] := (loadLibrary[]; thvmTraceEnableFn[0]);
+TTraceClear[]   := (loadLibrary[]; thvmTraceClearFn[]);
+
+TTrace[] := Module[{raw, n},
+    loadLibrary[];
+    raw = Normal[thvmTraceDataFn[]];
+    n = Length[raw] / 5;
+    Table[<|
+        "BeforeTag" -> Lookup[$tagName, raw[[5 i - 4]], "?"],
+        "BeforeExt" -> raw[[5 i - 3]],
+        "AfterTag"  -> Lookup[$tagName, raw[[5 i - 2]], "?"],
+        "AfterExt"  -> raw[[5 i - 1]],
+        "RuleId"    -> raw[[5 i]]
+    |>, {i, n}]
+];
+
+TReduceSteps[t_TTensor, n_Integer] := Module[{out = allocId[], steps, tag},
+    loadLibrary[];
+    steps = thvmReduceStepsFn[out, t[[1]], n];
+    tag = thvmTermTagFn[out];
+    {If[tag === 10 || tag === 11, TTensor[out], TTerm[out]], steps}
+];
+TReduceSteps[t_TTerm, n_Integer] := TReduceSteps[ToTTensor[t], n];
 
 (* ════════════════════════════════════════════════════════════════════════ *)
 (* Load subpackages                                                        *)

@@ -14,9 +14,9 @@ static Term cross_entropy_loss(TinyHVM *ctx, Term logits, u8 *labels, u32 B, u32
     free(oh);
 
     Term masked = thvm_op(ctx, UOP_MUL, one_hot, log_probs);
-    Term sum_c = thvm_sum_axes(ctx, masked, (u32[]){1}, 1);   // [B,C] → [B,1]
-    Term sum_b = thvm_sum_axes(ctx, sum_c, (u32[]){0}, 1);    // [B,1] → [1,1]
-    Term neg = thvm_op(ctx, UOP_NEG, sum_b, term_era());
+    // Multi-axis SUM: reduce both class and batch dims in one dispatch
+    Term sum_all = thvm_sum_axes(ctx, masked, (u32[]){0, 1}, 2);  // [B,C] → [1,1]
+    Term neg = thvm_op(ctx, UOP_NEG, sum_all, term_era());
 
     f32 inv_B = 1.0f / (f32)B;
     Term scale = thvm_tensor(ctx, &inv_B, SHAPE(1, 1));

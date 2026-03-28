@@ -298,6 +298,13 @@ Term thvm_sum_axes(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes) {
     return thvm_op(ctx, UOP_SUM, x, axes_t);
 }
 
+Term thvm_rmax_axes(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes) {
+    f32 axes_f[MAX_DIM];
+    for (u32 i = 0; i < n_axes; i++) axes_f[i] = (f32)axes[i];
+    Term axes_t = thvm_tensor(ctx, axes_f, SHAPE(n_axes));
+    return thvm_op(ctx, UOP_RMAX, x, axes_t);
+}
+
 // Movement ops: eager when input is TAG_TEN (zero GPU alloc, just view transform)
 // Falls back to lazy TOP with shape-tensor only for unreduced inputs.
 

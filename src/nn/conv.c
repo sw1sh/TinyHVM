@@ -274,15 +274,12 @@ Term thvm_maxpool2d(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_)
 
     // Single pool call — pooled shape: [BS, C, OY, OX, KH, KW]
     Term pool_t = thvm_pool(ctx, x, k, s, 2);
+    (void)kh; (void)kw2;
 
-    Term r1 = thvm_op(ctx, UOP_RMAX, pool_t, term_era());
-    // → [BS, C, OY, OX, KH, 1], squeeze:
-    r1 = thvm_reshape(ctx, r1, shape_of((u32[]){bs, c, oy, ox, kh}, 5));
-
-    Term r2 = thvm_op(ctx, UOP_RMAX, r1, term_era());
-    // → [BS, C, OY, OX, 1], squeeze:
-    (void)kw2;
-    return thvm_reshape(ctx, r2, shape_of((u32[]){bs, c, oy, ox}, 4));
+    // Multi-axis RMAX: reduce both KH (axis 4) and KW (axis 5) in one dispatch
+    Term r = thvm_rmax_axes(ctx, pool_t, (u32[]){4, 5}, 2);
+    // → [BS, C, OY, OX, 1, 1], squeeze to [BS, C, OY, OX]
+    return thvm_reshape(ctx, r, shape_of((u32[]){bs, c, oy, ox}, 4));
 }
 
 

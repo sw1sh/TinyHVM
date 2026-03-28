@@ -1,8 +1,6 @@
-// test_cnn_pool_grad.m — CNN with MaxPool gradient check vs numpy
-// Conv(1,8,3)→ReLU→MaxPool(2)→Conv(8,16,3)→ReLU→MaxPool(2)→Flatten→Linear
-// Input [BS,1,28,28] → Conv1 [BS,8,26,26] → Pool [BS,8,13,13]
-// → Conv2 [BS,16,11,11] → Pool [BS,16,5,5] → Flatten [BS,400] → Linear [BS,10]
-
+// test_4conv_pool.m — 4-conv CNN: Conv(1,8,3)→ReLU→Pool→Conv(8,16,3)→ReLU→Pool
+//   → Conv(16,32,3,p=1)→ReLU→Conv(32,32,3,p=1)→ReLU→Flatten→Linear(32*5*5,10)
+// BS=64, lr=0.001, 100 steps, MNIST
 #include "../src/tinyhvm.c"
 #include "../src/backend/cpu/_.c"
 #ifdef __APPLE__
@@ -30,16 +28,22 @@ int main(void) {
     TinyHVM *ctx = thvm_init(thvm_device("metal"));
     u32 BS = 64;
 
+    // 28→26→13→11→5 (after 2 pools)
+    // Conv3,4 with padding=1 keep spatial at 5x5
     Term cw1=make_w(ctx,(Shape){.dims={8,1,3,3},.rank=4},9);
     Term cb1=make_z(ctx,8);
     Term cw2=make_w(ctx,(Shape){.dims={16,8,3,3},.rank=4},72);
     Term cb2=make_z(ctx,16);
-    u32 flat_f=16*5*5;  // after two pools: 28→26→13→11→5
+    Term cw3=make_w(ctx,(Shape){.dims={32,16,3,3},.rank=4},144);
+    Term cb3=make_z(ctx,32);
+    Term cw4=make_w(ctx,(Shape){.dims={32,32,3,3},.rank=4},288);
+    Term cb4=make_z(ctx,32);
+    u32 flat_f=32*5*5;
     Term lw=make_w(ctx,SHAPE(flat_f,10),flat_f);
     Term lb=make_z(ctx,10);
 
-    #define NP 6
-    Term params[NP]={cw1,cb1,cw2,cb2,lw,lb};
+    #define NP 10
+    Term params[NP]={cw1,cb1,cw2,cb2,cw3,cb3,cw4,cb4,lw,lb};
     for(u32 i=0;i<NP;i++) thvm_set_requires_grad(ctx,params[i]);
     Term train_data=thvm_tensor(ctx,data.train_images,(Shape){.dims={data.n_train,1,28,28},.rank=4});
     u32 n_weights=ctx->tensor_count;
@@ -52,19 +56,25 @@ int main(void) {
         Term x=thvm_shrink(ctx,train_data,(u32[]){bi*BS,(bi+1)*BS,0,1,0,28,0,28},4);
         thvm_set_requires_grad(ctx,x);
         u32 p0[]={0,0,0,0},s1[]={1,1},k2[]={2,2},s2[]={2,2};
+        u32 p1[]={1,1,1,1}; // padding=1
         Term h=thvm_conv2d(ctx,x,cw1,cb1,1,s1,p0);
         h=thvm_op(ctx,UOP_RELU,h,term_era());
-        h=thvm_maxpool2d(ctx,h,k2,s2);  // [BS,8,13,13]
+        h=thvm_maxpool2d(ctx,h,k2,s2);           // [64,8,13,13]
         h=thvm_conv2d(ctx,h,cw2,cb2,1,s1,p0);
         h=thvm_op(ctx,UOP_RELU,h,term_era());
-        h=thvm_maxpool2d(ctx,h,k2,s2);  // [BS,16,5,5]
+        h=thvm_maxpool2d(ctx,h,k2,s2);           // [64,16,5,5]
+        h=thvm_conv2d(ctx,h,cw3,cb3,1,s1,p1);
+        h=thvm_op(ctx,UOP_RELU,h,term_era());    // [64,32,5,5]
+        h=thvm_conv2d(ctx,h,cw4,cb4,1,s1,p1);
+        h=thvm_op(ctx,UOP_RELU,h,term_era());    // [64,32,5,5]
         h=thvm_reshape(ctx,h,SHAPE(BS,flat_f));
         Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
         Term loss=cross_entropy_loss(ctx,logits,&data.train_labels[bi*BS],BS,10);
 
-        // Pure IC: grad slots + one reduce
-        Term gs[NP]; u32 psz[]={8*9,8,16*8*9,16,flat_f*10,10};
+        // IC gradient + SGD
+        u32 psz[]={72,8,1152,16,4608,32,9216,32,flat_f*10,10};
+        Term gs[NP];
         for(int i=0;i<NP;i++){f32*z=calloc(psz[i],4);
             gs[i]=thvm_tensor(ctx,z,ctx->tensors[(u32)term_val(params[i])].view.shape);free(z);}
         Term grad_term=thvm_grad_multi(ctx,loss,params,gs,NP);
@@ -98,12 +108,17 @@ int main(void) {
     for(u32 b=0;b<tb;b++){
         Term x=thvm_shrink(ctx,test_data,(u32[]){b*tbs,(b+1)*tbs,0,1,0,28,0,28},4);
         u32 p0[]={0,0,0,0},s1[]={1,1},k2[]={2,2},s2[]={2,2};
+        u32 p1[]={1,1,1,1};
         Term h=thvm_conv2d(ctx,x,cw1,cb1,1,s1,p0);
         h=thvm_op(ctx,UOP_RELU,h,term_era());
         h=thvm_maxpool2d(ctx,h,k2,s2);
         h=thvm_conv2d(ctx,h,cw2,cb2,1,s1,p0);
         h=thvm_op(ctx,UOP_RELU,h,term_era());
         h=thvm_maxpool2d(ctx,h,k2,s2);
+        h=thvm_conv2d(ctx,h,cw3,cb3,1,s1,p1);
+        h=thvm_op(ctx,UOP_RELU,h,term_era());
+        h=thvm_conv2d(ctx,h,cw4,cb4,1,s1,p1);
+        h=thvm_op(ctx,UOP_RELU,h,term_era());
         h=thvm_reshape(ctx,h,SHAPE(tbs,flat_f));
         Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(tbs,10)));
@@ -112,6 +127,6 @@ int main(void) {
         thvm_reset(ctx,ek);
     }
     printf("Test accuracy: %.1f%% (%u/%u)\n",100.0f*(f32)correct/(f32)(tb*tbs),correct,tb*tbs);
-    thvm_free(ctx); mnist_free(&data);
+    thvm_free(ctx);
     return 0;
 }

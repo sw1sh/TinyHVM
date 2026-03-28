@@ -480,6 +480,7 @@ typedef struct {
     // Named definitions for TAG_REF (global def table)
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term
     u32         def_count;
+
 } TinyHVM;
 
 // ============================================================
@@ -578,7 +579,6 @@ f32      thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
 // Returns a lazy Term — when reduced, computes ∂y/∂x.
 // Gradient ops go through thvm_op → get taped → grad(grad(f)) works.
 Term     thvm_grad(TinyHVM *ctx, Term y, Term x);
-void     thvm_backward(TinyHVM *ctx, Term loss, Term *params, Term *grads, u32 n_params);
 
 // Movement ops
 Term     thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim);

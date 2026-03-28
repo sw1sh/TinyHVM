@@ -114,6 +114,9 @@ static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target)
         // This happens when gy is a keepdims-reduced shape like [1,1] but
         // the target has more dims. Just reshape src to target if numel matches or is 1.
         // Generally this shouldn't happen in correct backward — but handle gracefully.
+        fprintf(stderr, "sum_to_shape RANK MISMATCH: src.rank=%u < target.rank=%u\n", src_shape.rank, target.rank);
+        // Abort to get stack trace
+        // assert(0 && "sum_to_shape rank mismatch");
         printf("sum_to_shape: src.rank=%u < target.rank=%u src=[", src_shape.rank, target.rank);
         for (u32 d=0;d<src_shape.rank;d++) printf("%u,",src_shape.dims[d]);
         printf("] target=[");

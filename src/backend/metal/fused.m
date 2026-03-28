@@ -1,5 +1,12 @@
 // metal/fused.m — Fused kernel dispatch: MUL+SUM, and general elementwise+reduce JIT
 
+// Forward declaration (defined in codegen.m, included after this file)
+void metal_dispatch_kernel_rs(u32 out_buf,
+                               u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+                               FusedOp *ops, u32 n_ops,
+                               const Shape *full_shape,
+                               const ReduceSpec *reduce);
+
 typedef struct {
     uint32_t n_reduce;
     uint32_t reduce_numel;
@@ -213,49 +220,25 @@ void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view)
                            NULL, 0, 0, 0, &src_view->shape);
 }
 
-// Dispatch a fused elementwise kernel.
-// leaf_bufs: buffer IDs for leaf inputs. leaf_views: View pointers for each.
-// ops: the fused op chain. Result goes to out_buf.
+// Dispatch a fused elementwise kernel (old interface — kept for materialize.c).
 void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
                                u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
                                FusedOp *ops, u32 n_ops,
                                int has_reduce, u32 reduce_dim,
                                const Shape *out_shape) {
-    // Unified codegen for non-reduce fused chains (handles masks via codegen)
-    if (!has_reduce && n_leaves <= 16 && n_ops <= 32 && out_shape) {
-        if (out_shape->rank <= 8 && out_shape->rank > 0) {
-            metal_dispatch_kernel(out_buf, out_numel, leaf_bufs, leaf_views, n_leaves,
-                                   ops, n_ops, 0, 0, out_shape);
-            return;
-        }
-    }
+    // All cases now go through unified codegen
+    metal_dispatch_kernel(out_buf, out_numel, leaf_bufs, leaf_views, n_leaves,
+                           ops, n_ops, has_reduce, reduce_dim, out_shape);
+}
 
-    // Legacy path for reduce, rank mismatch, or masks
-    id<MTLComputePipelineState> pipe = get_fused_pipe_v2(ops, n_ops, n_leaves, has_reduce);
-    if (!pipe) return;
-
-    id<MTLBuffer> bufs[16];
-    bufs[0] = metal_pool.bufs[out_buf];
-    for (u32 i = 0; i < n_leaves && i < 15; i++)
-        bufs[i + 1] = metal_pool.bufs[leaf_bufs[i]];
-
-    ViewParams vps[8];
-    const void *params[16];
-    u64 psizes[16];
-    for (u32 i = 0; i < n_leaves; i++) {
-        vps[i] = view_to_params(leaf_views[i]);
-        params[i] = &vps[i];
-        psizes[i] = sizeof(ViewParams);
-    }
-    params[n_leaves] = &out_numel;
-    psizes[n_leaves] = sizeof(u32);
-    if (has_reduce) {
-        params[n_leaves + 1] = &reduce_dim;
-        psizes[n_leaves + 1] = sizeof(u32);
-        dc_tag=DC_FUSED; dispatch_1d(pipe, bufs, n_leaves + 1, params, psizes, n_leaves + 2, out_numel);
-    } else {
-        dc_tag=DC_FUSED; dispatch_1d(pipe, bufs, n_leaves + 1, params, psizes, n_leaves + 1, out_numel);
-    }
+// Dispatch fused kernel with ReduceSpec (new interface — any axis config).
+void metal_dispatch_fused_rs(u32 out_buf,
+                               u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+                               FusedOp *ops, u32 n_ops,
+                               const Shape *full_shape,
+                               const ReduceSpec *reduce) {
+    metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, n_leaves,
+                              ops, n_ops, full_shape, reduce);
 }
 
 // ============================================================

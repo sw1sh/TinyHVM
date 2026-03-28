@@ -250,6 +250,16 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     u32 min_ops = (has_reduce || has_lazy) ? 1 : 2;
     if (n_ops < min_ops) return reduce_id(ctx, t);
 
+    // Fused reduce backward safety: most backward ops now use y (output) not at (input).
+    // Only DIV and MAX backward still need at from intermediates. Reject those in grad chains.
+    if (has_reduce && n_ops > 1) {
+        for (u32 i = 0; i < n_ops; i++) {
+            u32 u = ops[i].uop;
+            if (ops[i].arg_a >= n_leaves && (u == UOP_DIV || u == UOP_MAX || u == UOP_LOG))
+                return reduce_id(ctx, t);
+        }
+    }
+
     // Virtual intermediate tensors handle backward provenance —
     // each op in the chain gets a virtual tensor with correct creator_op
     // and src_ids, so standard GRAD rules trace through the fused chain.
@@ -271,10 +281,12 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
     if (!ew_init) return reduce_id(ctx, t);
 
-    // Reduce axes: read all axes, compute combined reduce dim.
-    // The codegen flattens all reduce dims into one reduce loop.
-    View out_view = ew_view; u32 reduce_dim = 1;
+    // Reduce axes: read all axes, build ReduceSpec for general codegen.
+    // No trailing-axis restriction — codegen handles any axis config.
+    View out_view = ew_view;
+    ReduceSpec rs = {0};
     if (has_reduce) {
+        rs.reduce_type = has_reduce;
         u64 sum_loc = term_val(sum_term);
         Term sum_axes = heap_read(ctx, sum_loc + 1);
         int found_axes = 0;
@@ -284,92 +296,27 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             u32 n_axes = axt->view.numel;
             f32 axes_f[MAX_DIM];
             META_READ(ctx, axt->buf_id, axes_f, n_axes * sizeof(f32));
-            // The codegen treats reduce dims as one flat inner loop.
-            // This only works if reduce axes are TRAILING (contiguous at the end).
-            // Non-trailing reduce axes require permute — fall back to non-fused.
-            u8 is_reduce_ax[MAX_DIM] = {0};
-            for (u32 i = 0; i < n_axes; i++) {
-                int ax = (int)axes_f[i];
-                if (ax >= 0 && ax < (int)ew_view.shape.rank) is_reduce_ax[ax] = 1;
-            }
-            // Check trailing: all reduce axes must be at the end
-            int trailing = 1;
-            { int seen_nonreduce_after = 0;
-              for (int d = (int)ew_view.shape.rank - 1; d >= 0; d--) {
-                  if (is_reduce_ax[d] && seen_nonreduce_after) { trailing = 0; break; }
-                  if (!is_reduce_ax[d] && ew_view.shape.dims[d] > 1) seen_nonreduce_after = 1;
-              }
-            }
-            if (!trailing) {
-                // Non-trailing: SUM(MUL(a,b)) → metal_mul_reduce_sum(a,b,axes)
-                #ifdef __APPLE__
-                if (n_ops == 1 && n_leaves == 2 && ctx->backend == &metal_backend &&
-                    ops[0].uop == UOP_MUL) {
-                    // Resolve lazy leaves
-                    for (u32 li = 0; li < n_leaves; li++) {
-                        if (!LEAF_IS_LAZY(leaf_ids[li])) continue;
-                        Term lt = fuse_leaf_terms[li];
-                        Term rd = thvm_reduce(ctx, lt);
-                        if (term_tag(rd)!=TAG_TEN) return reduce_id(ctx, t);
-                        leaf_ids[li]=(u32)term_val(rd);
-                        leaf_views[li]=&ctx->tensors[leaf_ids[li]].view;
-                    }
-                    // Compute output shape
-                    for (u32 i2=0;i2<n_axes;i2++){int ax=(int)axes_f[i2];
-                        if(ax>=0&&ax<(int)ew_view.shape.rank){reduce_dim*=ew_view.shape.dims[ax];out_view.shape.dims[ax]=1;}}
-                    out_view.numel=ew_view.numel/reduce_dim;
-                    u32 dst_id=tensor_create(ctx,out_view.shape,DTYPE_F32);
-                    u32 rn2=0; u32 rd2[MAX_DIM],rsa[MAX_DIM],rsb[MAX_DIM];
-                    for(u32 d=0;d<ew_view.shape.rank;d++){if(is_reduce_ax[d]){
-                        rd2[rn2]=ew_view.shape.dims[d];
-                        rsa[rn2]=(u32)(leaf_views[0]->strides[d]>0?leaf_views[0]->strides[d]:0);
-                        rsb[rn2]=(u32)(leaf_views[1]->strides[d]>0?leaf_views[1]->strides[d]:0);
-                        rn2++;}}
-                    metal_mul_reduce_sum(ctx->tensors[dst_id].buf_id,out_view.numel,
-                        ctx->tensors[leaf_ids[0]].buf_id,leaf_views[0],
-                        ctx->tensors[leaf_ids[1]].buf_id,leaf_views[1],
-                        &ctx->tensors[dst_id].view,rn2,rd2,rsa,rsb);
-                    ctx->itrs++;
-                    // Handle RESHAPE wrapper if present
-                    if (term_tag(reshape_term) != TAG_ERA) {
-                        u64 rs_loc=term_val(reshape_term);
-                        Term shp_t=heap_read(ctx,rs_loc+1);
-                        if(term_tag(shp_t)==TAG_TEN){
-                            TensorMeta *mp=&ctx->tensors[(u32)term_val(shp_t)];
-                            Shape ns={.rank=mp->view.numel}; f32 df[MAX_DIM];
-                            const f32 *cf=mp->host_ptr;
-                            if(cf) memcpy(df,cf,ns.rank*4); else META_READ(ctx,mp->buf_id,df,ns.rank*4);
-                            for(u32 j=0;j<ns.rank;j++) ns.dims[j]=(u32)df[j];
-                            u32 rs_id=ctx->tensor_count++;
-                            ctx->tensors[rs_id]=ctx->tensors[dst_id];
-                            ctx->tensors[rs_id].view=view_reshape(ctx->tensors[dst_id].view,ns);
-                            ctx->tensors[rs_id].host_ptr=NULL;
-                            dst_id=rs_id;
-                        }
-                    }
-                    return dst_id;
-                }
-                #endif
-                return reduce_id(ctx, t);
-            }
             for (u32 i = 0; i < n_axes; i++) {
                 int ax = (int)axes_f[i];
                 if (ax >= 0 && ax < (int)ew_view.shape.rank) {
-                    reduce_dim *= ew_view.shape.dims[ax];
+                    rs.is_reduce[ax] = 1;
                     out_view.shape.dims[ax] = 1;
                     found_axes = 1;
                 }
             }
-            if (found_axes)
-                out_view.numel = ew_view.numel / reduce_dim;
+            if (found_axes) {
+                out_view.numel = 1;
+                for (u32 d = 0; d < out_view.shape.rank; d++)
+                    out_view.numel *= out_view.shape.dims[d];
+            }
         }
         if (!found_axes) {
             // No explicit axes: reduce last non-1 dim
             for (int d = (int)ew_view.shape.rank - 1; d >= 0; d--) {
                 if (ew_view.shape.dims[d] > 1) {
-                    reduce_dim = ew_view.shape.dims[d];
+                    rs.is_reduce[d] = 1;
                     out_view.shape.dims[d] = 1;
-                    out_view.numel = ew_view.numel / reduce_dim;
+                    out_view.numel = ew_view.numel / ew_view.shape.dims[d];
                     found_axes = 1;
                     break;
                 }
@@ -415,9 +362,11 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             ew_view = view_create(shape_of(bc_shape, bc_ndim));
         }
         if (!ew_init) return reduce_id(ctx, t);
-        // Recompute reduce
-        out_view = ew_view; reduce_dim = 1;
+        // Recompute reduce (rebuild ReduceSpec, no trailing restriction)
+        out_view = ew_view;
+        memset(&rs, 0, sizeof(rs));
         if (has_reduce) {
+            rs.reduce_type = has_reduce;
             u64 sloc = term_val(sum_term);
             Term saxes = heap_read(ctx, sloc + 1);
             if (term_tag(saxes) == TAG_TEN) {
@@ -426,82 +375,115 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                 u32 nax = axt->view.numel;
                 f32 axf[MAX_DIM];
                 META_READ(ctx, axt->buf_id, axf, nax * sizeof(f32));
-                // Trailing check
-                u8 ira[MAX_DIM] = {0};
-                for (u32 i2 = 0; i2 < nax; i2++) ira[(int)axf[i2]] = 1;
-                int trailing = 1;
-                { int snr = 0;
-                  for (int d = (int)ew_view.shape.rank-1; d>=0; d--) {
-                      if (ira[d] && snr) { trailing=0; break; }
-                      if (!ira[d] && ew_view.shape.dims[d]>1) snr=1;
-                  }
-                }
-                if (!trailing) return reduce_id(ctx, t);
                 for (u32 i2 = 0; i2 < nax; i2++) {
                     int ax = (int)axf[i2];
                     if (ax>=0 && ax<(int)ew_view.shape.rank) {
-                        reduce_dim *= ew_view.shape.dims[ax];
+                        rs.is_reduce[ax] = 1;
                         out_view.shape.dims[ax] = 1;
                     }
                 }
-                out_view.numel = ew_view.numel / reduce_dim;
+                out_view.numel = 1;
+                for (u32 d = 0; d < out_view.shape.rank; d++)
+                    out_view.numel *= out_view.shape.dims[d];
             } else {
                 for (int d=(int)ew_view.shape.rank-1;d>=0;d--) {
-                    if (ew_view.shape.dims[d]>1) { reduce_dim=ew_view.shape.dims[d]; out_view.shape.dims[d]=1; out_view.numel=ew_view.numel/reduce_dim; break; }
+                    if (ew_view.shape.dims[d]>1) {
+                        rs.is_reduce[d] = 1;
+                        out_view.shape.dims[d] = 1;
+                        out_view.numel = ew_view.numel / ew_view.shape.dims[d];
+                        break;
+                    }
                 }
             }
         }
         out_numel = out_view.numel;
     }
 
-    // ── Immediate dispatch (all leaves TAG_TEN) ─────────────────
-    u32 dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
-
-    // Provenance: create virtual intermediate tensors for backward.
-    // Each intermediate gets the shape from the original lazy term's
-    // shape table entry (computed at graph construction time).
-    // Backward reads shapes (for sum_to_shape) not data from intermediates.
+    // ── Provenance + dispatch ─────────────────────────────────────
+    // For fused reduces: create virtual intermediates FIRST (lower IDs),
+    // then dst (higher ID). Virtual intermediates must have LOWER IDs
+    // than dst so backward tape walks (if any) visit them in correct order.
+    u32 dst_id;
     {
         u32 var_tid[FUSE_MAX_LEAVES + FUSE_MAX_OPS];
         for (u32 i = 0; i < n_leaves; i++) var_tid[i] = leaf_ids[i];
-
-        // Reconstruct the original term for each op to get its shape
-        // from the shape table. The terms are on the heap in the original
-        // lazy structure. We walk `ew_root` to find them.
-        // For simplicity: compute intermediate shapes from leaf shapes + ops.
-        for (u32 i = 0; i < n_ops; i++) {
-            u32 tid = (i == n_ops - 1) ? dst_id : ctx->tensor_count++;
-            // Compute intermediate shape from operand shapes
-            View iv;
-            u32 a_var = ops[i].arg_a, b_var = ops[i].arg_b;
-            View va_v = ctx->tensors[var_tid[a_var]].view;
-            if (is_binary(ops[i].uop)) {
-                View vb_v = ctx->tensors[var_tid[b_var]].view;
-                View av_bc, bv_bc; u32 bc_s[MAX_DIM], bc_n;
-                if (view_broadcast(&va_v, &vb_v, &av_bc, &bv_bc, bc_s, &bc_n))
-                    iv = view_create(shape_of(bc_s, bc_n));
-                else
-                    iv = va_v;
-            } else {
-                iv = va_v; // unary: output shape = input shape
-            }
-            if (tid != dst_id) {
+        if (has_reduce) {
+            // Create virtual intermediates FIRST (lower IDs)
+            u32 ew_last_id = 0;
+            for (u32 i = 0; i < n_ops; i++) {
+                u32 tid = ctx->tensor_count++;
+                u32 a_var = ops[i].arg_a, b_var = ops[i].arg_b;
+                View iv;
+                View va_v = ctx->tensors[var_tid[a_var]].view;
+                if (is_binary(ops[i].uop)) {
+                    View vb_v = ctx->tensors[var_tid[b_var]].view;
+                    View av_bc, bv_bc; u32 bc_s[MAX_DIM], bc_n;
+                    if (view_broadcast(&va_v, &vb_v, &av_bc, &bv_bc, bc_s, &bc_n))
+                        iv = view_create(shape_of(bc_s, bc_n));
+                    else iv = va_v;
+                } else iv = va_v;
                 ctx->tensors[tid] = (TensorMeta){
-                    .buf_id = ctx->tensors[dst_id].buf_id,
-                    .dtype = DTYPE_F32,
-                    .view = iv,
+                    .buf_id = 1, // placeholder — updated after dst_id created
+                    .dtype = DTYPE_F32, .view = (i == n_ops - 1) ? ew_view : iv,
                 };
-            } else {
-                // dst already has correct shape from tensor_create
+                ctx->tensors[tid].creator_op = ops[i].uop;
+                ctx->tensors[tid].src_ids[0] = var_tid[a_var];
+                ctx->tensors[tid].src_ids[1] = is_binary(ops[i].uop) ? var_tid[b_var] : 0;
+                if (ctx->tensors[var_tid[a_var]].requires_grad)
+                    ctx->tensors[tid].requires_grad = 1;
+                if (is_binary(ops[i].uop) && ctx->tensors[var_tid[b_var]].requires_grad)
+                    ctx->tensors[tid].requires_grad = 1;
+                var_tid[n_leaves + i] = tid;
+                ew_last_id = tid;
             }
-            ctx->tensors[tid].creator_op = ops[i].uop;
-            ctx->tensors[tid].src_ids[0] = var_tid[a_var];
-            ctx->tensors[tid].src_ids[1] = is_binary(ops[i].uop) ? var_tid[b_var] : 0;
-            if (ctx->tensors[var_tid[a_var]].requires_grad)
-                ctx->tensors[tid].requires_grad = 1;
-            if (is_binary(ops[i].uop) && ctx->tensors[var_tid[b_var]].requires_grad)
-                ctx->tensors[tid].requires_grad = 1;
-            var_tid[n_leaves + i] = tid;
+            // Create dst AFTER virtual intermediates (higher ID)
+            dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
+            // Fix buf_id on virtual intermediates to point to dst's buffer
+            for (u32 i = 0; i < n_ops; i++)
+                ctx->tensors[var_tid[n_leaves + i]].buf_id = ctx->tensors[dst_id].buf_id;
+            // dst = SUM/RMAX(ew_last_id, axes)
+            ctx->tensors[dst_id].creator_op = has_reduce;
+            ctx->tensors[dst_id].src_ids[0] = ew_last_id;
+            u64 sl = term_val(sum_term);
+            Term sa = heap_read(ctx, sl + 1);
+            if (term_tag(sa) == TAG_TEN)
+                ctx->tensors[dst_id].src_ids[1] = (u32)term_val(sa);
+            if (ctx->tensors[ew_last_id].requires_grad)
+                ctx->tensors[dst_id].requires_grad = 1;
+        } else {
+            dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
+            // Non-reduce: virtual intermediates with correct per-op provenance
+            for (u32 i = 0; i < n_ops; i++) {
+                u32 tid = (i == n_ops - 1) ? dst_id : ctx->tensor_count++;
+                View iv;
+                u32 a_var = ops[i].arg_a, b_var = ops[i].arg_b;
+                View va_v = ctx->tensors[var_tid[a_var]].view;
+                if (is_binary(ops[i].uop)) {
+                    View vb_v = ctx->tensors[var_tid[b_var]].view;
+                    View av_bc, bv_bc; u32 bc_s[MAX_DIM], bc_n;
+                    if (view_broadcast(&va_v, &vb_v, &av_bc, &bv_bc, bc_s, &bc_n))
+                        iv = view_create(shape_of(bc_s, bc_n));
+                    else
+                        iv = va_v;
+                } else {
+                    iv = va_v;
+                }
+                if (tid != dst_id) {
+                    ctx->tensors[tid] = (TensorMeta){
+                        .buf_id = ctx->tensors[dst_id].buf_id,
+                        .dtype = DTYPE_F32,
+                        .view = iv,
+                    };
+                }
+                ctx->tensors[tid].creator_op = ops[i].uop;
+                ctx->tensors[tid].src_ids[0] = var_tid[a_var];
+                ctx->tensors[tid].src_ids[1] = is_binary(ops[i].uop) ? var_tid[b_var] : 0;
+                if (ctx->tensors[var_tid[a_var]].requires_grad)
+                    ctx->tensors[tid].requires_grad = 1;
+                if (is_binary(ops[i].uop) && ctx->tensors[var_tid[b_var]].requires_grad)
+                    ctx->tensors[tid].requires_grad = 1;
+                var_tid[n_leaves + i] = tid;
+            }
         }
     }
 
@@ -513,9 +495,9 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             ENSURE(ctx, leaf_ids[i]);
             bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
         }
-        metal_dispatch_fused_v2(ctx->tensors[dst_id].buf_id, out_numel,
+        metal_dispatch_fused_rs(ctx->tensors[dst_id].buf_id,
                                   bufs, leaf_views, n_leaves, ops, n_ops,
-                                  has_reduce, reduce_dim, &ew_view.shape);
+                                  &ew_view.shape, has_reduce ? &rs : NULL);
     } else
     #endif
     { return reduce_id(ctx, t); }
@@ -531,6 +513,10 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             Shape ns = {.rank = rank};
             for (u32 i = 0; i < rank; i++) ns.dims[i] = (u32)dims_f[i];
             u32 rs_id = tensor_view_of(ctx, dst_id, view_create(ns));
+            // Propagate provenance + requires_grad for backward
+            ctx->tensors[rs_id].creator_op = UOP_RESHAPE;
+            ctx->tensors[rs_id].src_ids[0] = dst_id;
+            ctx->tensors[rs_id].requires_grad = ctx->tensors[dst_id].requires_grad;
             return rs_id;
         }
     }

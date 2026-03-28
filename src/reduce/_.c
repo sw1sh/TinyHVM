@@ -1,6 +1,12 @@
-// Forward declarations for fusion (defined in grad/_.c)
+// Forward declarations for fusion (defined in fuse/_.c)
 static int is_elementwise(u32 uop);
 static u32 fuse_or_reduce(TinyHVM *ctx, Term t);
+
+// Reduce a term to TAG_TEN and return its tensor ID (or ~0u on failure)
+static u32 reduce_id(TinyHVM *ctx, Term t) {
+    t = thvm_reduce(ctx, t);
+    return (term_tag(t) == TAG_TEN) ? (u32)term_val(t) : ~0u;
+}
 
 // Does this UOP allocate a fresh buffer (safe to decref inputs)?
 // Movement ops share the input buffer → NOT safe to decref.
@@ -105,8 +111,19 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
 
             // Check arg1: is it already ready?
             Term a1 = heap_read(ctx, loc + 1);
-            // Any WNF in arg1 slot is "ready" (TEN for tensors, NUM for axes, ERA for optional)
             u8 a1t2 = term_tag(a1);
+
+            // GRAD: fire with lazy gy (arg1) to keep backward chain lazy.
+            // Chain rule formulas just wrap gy in new lazy ops — no reduction needed.
+            // Base case / deposit explicitly reduce gy inside the GRAD handler.
+            if (term_ext(frame) == UOP_GRAD) {
+                Term r = thvm_interact(ctx, frame);
+                if (r == frame) { whnf = frame; continue; }
+                top_decref_inputs(ctx, loc, term_ext(frame), r);
+                next = r; goto enter;
+            }
+
+            // Any WNF in arg1 slot is "ready"
             if (a1t2 == TAG_TEN || a1t2 == TAG_ERA || a1t2 == TAG_NUM ||
                 a1t2 == TAG_LAM || a1t2 == TAG_SUP) {
                 // Both args ready — fire
@@ -115,9 +132,8 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 top_decref_inputs(ctx, loc, term_ext(frame), r);
                 next = r; goto enter;
             }
-            // arg1 not ready: push TOP1 sentinel frame (val=loc, ext=loc so we can find it),
-            // then enter arg1. When arg1 returns, TOP1 handler fires the rule.
-            PUSH(term_new(TAG_TOP1, (u8)term_ext(frame), loc));  // sentinel: "waiting for arg1"
+            // arg1 not ready: push TOP1 sentinel frame
+            PUSH(term_new(TAG_TOP1, (u8)term_ext(frame), loc));
             next = a1;
             goto enter;
         }

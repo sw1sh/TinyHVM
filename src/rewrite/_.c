@@ -24,10 +24,22 @@ typedef struct {
 // → dispatch fused reduce+elementwise kernel via fuse_or_reduce
 // ============================================================
 static Term rule_sum_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b) {
-    (void)b;
-    if (term_tag(a) != TAG_TOP) return t;
-    u32 child_uop = term_ext(a);
-    if (!is_elementwise(child_uop) && !is_view_op(child_uop)) return t;
+    (void)b; (void)loc;
+    if (term_tag(a) == TAG_TOP) {
+        u32 child_uop = term_ext(a);
+        if (!is_elementwise(child_uop) && !is_view_op(child_uop)) return t;
+    } else if (term_tag(a) == TAG_TEN) {
+        // Deferred child: materialize it (fuses the elementwise chain),
+        // then let the SUM dispatch normally on the materialized result.
+        u32 tid = (u32)term_val(a);
+        if (tid < ctx->tensor_count && ctx->tensors[tid].buf_id == 0 &&
+            ctx->tensors[tid].creator_op) {
+            tensor_materialize(ctx, tid);
+        }
+        return t; // SUM will dispatch normally on the now-materialized input
+    } else {
+        return t;
+    }
     rewrite_active = 1;
     u32 fid = fuse_or_reduce(ctx, t);
     rewrite_active = 0;

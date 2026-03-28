@@ -110,10 +110,12 @@ int main(int argc, char **argv) {
         f32 ms = (f32)(t1.tv_sec-t0.tv_sec)*1000+(f32)(t1.tv_nsec-t0.tv_nsec)/1e6f;
 
         extern u32 total_dispatches;
+        extern void print_dispatch_breakdown(void);
         if (step < 5 || step % 5 == 0 || step == n_steps - 1)
             printf("  step %2u: loss=%.4f dispatches=%u tensors=%u heap=%llu (%.0fms)\n",
                    step, loss_val, total_dispatches, ctx->tensor_count,
                    (unsigned long long)ctx->heap_pos, ms);
+        if (step == 1) print_dispatch_breakdown();
         total_dispatches = 0;
 
         // Invalidate host caches for updated params

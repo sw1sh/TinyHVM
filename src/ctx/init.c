@@ -59,6 +59,9 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
     ctx->heap[0] = term_era();
     ctx->dup_frozen = 0;
     ctx->in_grad = 0;
+    // Clear shape tracker — stale entries from old heap locs cause wrong
+    // view compositions after heap reuse.
+    memset(st_keys, 0, sizeof(st_keys));
     for (u32 i = 0; i < keep; i++) ctx->tensors[i].dup_loc = 0;
     memset(term_use_table, 0, sizeof(term_use_table));
 }

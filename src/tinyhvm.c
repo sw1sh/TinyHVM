@@ -52,6 +52,10 @@ static inline f32 term_as_f32(Term t) {
 }
 static inline u32 term_as_u32(Term t) { return (u32)term_val(t); }
 
+// ── Shared types (used by fuser + codegen, platform-independent) ──────────────
+typedef struct { u32 uop; u32 arg_a; u32 arg_b; } FusedOp;
+typedef struct { u8 is_reduce[MAX_DIM]; u32 reduce_type; } ReduceSpec;
+
 // ── Metal GPU forward declarations (defined in metal.m) ───────────────────────
 #ifdef __APPLE__
 extern void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
@@ -62,12 +66,16 @@ extern void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
                                  const u32 *reduce_dims,
                                  const u32 *reduce_strides_a,
                                  const u32 *reduce_strides_b);
-typedef struct { u32 uop; u32 arg_a; u32 arg_b; } FusedOp;
 extern void metal_dispatch_fused_v2(u32 out_buf, u32 out_numel,
                                      u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
                                      FusedOp *ops, u32 n_ops,
                                      int has_reduce, u32 reduce_dim,
                                      const Shape *out_shape);
+extern void metal_dispatch_fused_rs(u32 out_buf,
+                                     u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+                                     FusedOp *ops, u32 n_ops,
+                                     const Shape *full_shape,
+                                     const ReduceSpec *reduce);
 extern void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view);
 extern void metal_buf_read_nosync(u32 id, void *out, u64 bytes);
 extern Backend metal_backend;

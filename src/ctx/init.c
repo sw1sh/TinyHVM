@@ -173,10 +173,10 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
 Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
     u64 loc = heap_alloc(ctx, 4); // 0-1: args (trampoline overwrites), 2-3: shadow (preserved)
     a = linear_use(ctx, a, loc);
-    b = linear_use(ctx, b, loc + 1);
-    heap_set(ctx, loc, a);
+    heap_set(ctx, loc, a);              // write before second linear_use
+    b = linear_use(ctx, b, loc + 1);    // may patch heap[loc] to DP0
     heap_set(ctx, loc + 1, b);
-    heap_set(ctx, loc + 2, a); // shadow copy — original DP0/DP1 terms preserved for GRAD
+    heap_set(ctx, loc + 2, heap_read(ctx, loc)); // shadow: picks up DP0 patch
     heap_set(ctx, loc + 3, b);
 
     // Shape tracking: eagerly compute and store output view.

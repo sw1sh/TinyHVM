@@ -64,6 +64,106 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
     TensorMeta *m = &ctx->tensors[tid];
     if (m->buf_id != 0) return;
 
+    // Post-reduce fusion: if this deferred ew chain contains a deferred reduce
+    // (reachable via views), fuse pre-reduce ew → reduce → post-reduce ew in one kernel.
+    if (is_elementwise(m->creator_op) && m->backend->dispatch_kernel_rs) {
+        // Scan chain for a deferred reduce (follow src[0] through ew + views)
+        u32 reduce_tid = 0, reduce_input = 0;
+        u32 cur = tid;
+        for (u32 depth = 0; depth < 20; depth++) {
+            TensorMeta *cm = &ctx->tensors[cur];
+            if (cm->buf_id != 0) break;
+            if (cm->creator_op == UOP_SUM || cm->creator_op == UOP_RMAX) {
+                reduce_tid = cur; reduce_input = cm->src_ids[0]; break;
+            }
+            if (is_elementwise(cm->creator_op) || is_view_op(cm->creator_op))
+                cur = cm->src_ids[0];
+            else break;
+        }
+        if (reduce_tid && reduce_input &&
+            ctx->tensors[reduce_input].buf_id == 0 &&
+            is_elementwise(ctx->tensors[reduce_input].creator_op)) {
+            // Walk pre-reduce ew chain
+            FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0, op_tids[FUSE_MAX_OPS];
+            u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
+            int pre_res = materialize_walk(ctx, reduce_input, ops, &n_ops, op_tids,
+                                            leaf_ids, leaf_views, &n_leaves);
+            if (pre_res >= 0 && n_ops > 0) {
+                u32 pre_ops = n_ops, pre_leaves = n_leaves;
+                // Collect post-reduce ew ops (from reduce output to tid)
+                // Walk backward from tid, collecting ops above the reduce
+                u32 post_chain[16]; u32 pcn = 0;
+                cur = tid;
+                while (cur != reduce_tid && pcn < 16) {
+                    TensorMeta *cm = &ctx->tensors[cur];
+                    if (is_elementwise(cm->creator_op)) {
+                        post_chain[pcn++] = cur;
+                        cur = cm->src_ids[0]; // follow toward reduce
+                    } else if (is_view_op(cm->creator_op)) {
+                        cur = cm->src_ids[0]; // skip views
+                    } else break;
+                }
+                // Add post-reduce ops + leaves (reverse order: bottom-up)
+                u32 n_post_leaves = 0;
+                for (int pi = (int)pcn - 1; pi >= 0; pi--) {
+                    TensorMeta *pm = &ctx->tensors[post_chain[pi]];
+                    if (is_binary(pm->creator_op) && pm->src_ids[1]) {
+                        u32 other = pm->src_ids[1]; // non-chain input (e.g., bias)
+                        ENSURE(ctx, other);
+                        if (ctx->tensors[other].buf_id != 0 && n_leaves < FUSE_MAX_LEAVES) {
+                            leaf_ids[n_leaves] = other;
+                            leaf_views[n_leaves] = &ctx->tensors[other].view;
+                            ops[n_ops] = (FusedOp){ .uop = pm->creator_op, .arg_a = 0, .arg_b = n_leaves };
+                            op_tids[n_ops] = post_chain[pi];
+                            n_leaves++; n_post_leaves++; n_ops++;
+                        }
+                    } else {
+                        ops[n_ops] = (FusedOp){ .uop = pm->creator_op, .arg_a = 0, .arg_b = 0 };
+                        op_tids[n_ops] = post_chain[pi];
+                        n_ops++;
+                    }
+                }
+                if (n_ops > pre_ops) {
+                    // Remap pre-reduce op indices
+                    for (u32 i = 0; i < pre_ops; i++) {
+                        if (ops[i].arg_a >= FUSE_MAX_LEAVES) ops[i].arg_a = n_leaves + (ops[i].arg_a - FUSE_MAX_LEAVES);
+                        if (ops[i].arg_b >= FUSE_MAX_LEAVES) ops[i].arg_b = n_leaves + (ops[i].arg_b - FUSE_MAX_LEAVES);
+                    }
+                    // Side outputs for pre-reduce shared intermediates
+                    u32 side_bufs[8], side_ops[8]; u32 n_sides = 0;
+                    for (u32 i = 0; i < pre_ops && n_sides < 8; i++) {
+                        TensorMeta *sm = &ctx->tensors[op_tids[i]];
+                        if (sm->buf_id != 0 && sm->defer_consumers > 0) {
+                            side_bufs[n_sides] = sm->buf_id; side_ops[n_sides] = n_leaves + i; n_sides++;
+                        }
+                    }
+                    // Build ReduceSpec with post-reduce boundary
+                    TensorMeta *rm = &ctx->tensors[reduce_tid];
+                    ReduceSpec rs = {0};
+                    rs.reduce_type = rm->creator_op;
+                    rs.post_reduce_start = pre_ops;
+                    rs.n_post_leaves = n_post_leaves;
+                    u32 axes_id = rm->src_ids[1];
+                    Shape fs = ctx->tensors[reduce_input].view.shape;
+                    if (axes_id) {
+                        ENSURE(ctx, axes_id);
+                        TensorMeta *axt = &ctx->tensors[axes_id];
+                        f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
+                        for (u32 i=0;i<axt->view.numel;i++) { u32 ax=(u32)af[i]; if(ax<fs.rank) rs.is_reduce[ax]=1; }
+                    } else {
+                        for (int d=(int)fs.rank-1;d>=0;d--) if(fs.dims[d]>1){rs.is_reduce[d]=1;break;}
+                    }
+                    m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+                    u32 bufs[FUSE_MAX_LEAVES];
+                    for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
+                    m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+                        ops, n_ops, &fs, &rs, n_sides?side_bufs:NULL, n_sides?side_ops:NULL, n_sides);
+                    return;
+                }
+            }
+        }
+    }
+
     // Deferred reduce (SUM/RMAX): fuse reduce + elementwise input chain
     u32 reduce_type = 0, reduce_axes_id = 0, walk_tid = tid;
     if ((m->creator_op == UOP_SUM || m->creator_op == UOP_RMAX) && m->src_ids[0] &&
@@ -80,6 +180,149 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
     int result = materialize_walk(ctx, walk_tid, ops, &n_ops, op_tids, leaf_ids, leaf_views, &n_leaves);
     if (m->buf_id != 0) return;
     if (result < 0 || n_ops == 0) {
+        // Post-reduce fusion: if the walk failed because it hit a deferred reduce,
+        // try to fuse: pre-reduce ew → reduce → post-reduce ew in one kernel.
+        if (!reduce_type && is_elementwise(m->creator_op) && m->backend->dispatch_kernel_rs) {
+            // Scan for deferred reduce in the ew chain inputs
+            u32 post_tid = tid;  // the ew chain root
+            u32 reduce_tid = 0;
+            // Walk the deferred ew chain to find the reduce boundary
+            u32 cur = tid;
+            while (ctx->tensors[cur].buf_id == 0 && is_elementwise(ctx->tensors[cur].creator_op)) {
+                u32 s0 = ctx->tensors[cur].src_ids[0];
+                u32 s1 = ctx->tensors[cur].src_ids[1];
+                if (s0 && ctx->tensors[s0].buf_id == 0 &&
+                    (ctx->tensors[s0].creator_op == UOP_SUM || ctx->tensors[s0].creator_op == UOP_RMAX)) {
+                    reduce_tid = s0; break;
+                }
+                if (s1 && ctx->tensors[s1].buf_id == 0 &&
+                    (ctx->tensors[s1].creator_op == UOP_SUM || ctx->tensors[s1].creator_op == UOP_RMAX)) {
+                    reduce_tid = s1; break;
+                }
+                // Follow the deferred chain (first deferred input)
+                if (s0 && ctx->tensors[s0].buf_id == 0 && is_elementwise(ctx->tensors[s0].creator_op))
+                    cur = s0;
+                else break;
+            }
+
+            if (reduce_tid && ctx->tensors[reduce_tid].src_ids[0]) {
+                TensorMeta *rm = &ctx->tensors[reduce_tid];
+                u32 reduce_input = rm->src_ids[0];
+                // Walk the pre-reduce ew chain
+                if (ctx->tensors[reduce_input].buf_id == 0 &&
+                    is_elementwise(ctx->tensors[reduce_input].creator_op)) {
+                    n_ops = 0; n_leaves = 0;
+                    int pre_result = materialize_walk(ctx, reduce_input, ops, &n_ops, op_tids,
+                                                       leaf_ids, leaf_views, &n_leaves);
+                    if (pre_result >= 0 && n_ops > 0) {
+                        u32 pre_reduce_ops = n_ops;
+                        u32 pre_reduce_leaves = n_leaves;
+
+                        // Now add post-reduce ops (the ew chain from reduce output to tid)
+                        // Walk from tid backward, collecting ew ops until we hit reduce_tid
+                        // For simplicity: walk post-reduce chain iteratively
+                        u32 post_chain[16]; u32 pcn = 0;
+                        cur = tid;
+                        while (cur != reduce_tid && pcn < 16) {
+                            if (!is_elementwise(ctx->tensors[cur].creator_op)) break;
+                            post_chain[pcn++] = cur;
+                            // Follow toward reduce
+                            u32 s0 = ctx->tensors[cur].src_ids[0];
+                            if (s0 == reduce_tid || (s0 && ctx->tensors[s0].buf_id == 0 &&
+                                is_elementwise(ctx->tensors[s0].creator_op))) {
+                                cur = s0;
+                            } else break;
+                        }
+
+                        // Add post-reduce leaves (non-reduce inputs to post ops)
+                        u32 n_post_leaves = 0;
+                        for (int pi = (int)pcn - 1; pi >= 0; pi--) {
+                            u32 ptid = post_chain[pi];
+                            TensorMeta *pm = &ctx->tensors[ptid];
+                            // For binary post-ops: the non-reduce input is a leaf
+                            if (is_binary(pm->creator_op)) {
+                                u32 other = (pm->src_ids[0] == reduce_tid ||
+                                    (pm->src_ids[0] && ctx->tensors[pm->src_ids[0]].buf_id == 0 &&
+                                     is_elementwise(ctx->tensors[pm->src_ids[0]].creator_op)))
+                                    ? pm->src_ids[1] : pm->src_ids[0];
+                                if (other && ctx->tensors[other].buf_id == 0)
+                                    ENSURE(ctx, other);
+                                if (other && ctx->tensors[other].buf_id != 0 && n_leaves < FUSE_MAX_LEAVES) {
+                                    leaf_ids[n_leaves] = other;
+                                    leaf_views[n_leaves] = &ctx->tensors[other].view;
+                                    n_post_leaves++;
+                                    // Add post-reduce op
+                                    u32 acc_ref = n_leaves + pre_reduce_ops - 1; // last pre-reduce op = acc
+                                    if (pi == (int)pcn - 1) acc_ref = pre_reduce_leaves + pre_reduce_ops - 1;
+                                    ops[n_ops] = (FusedOp){
+                                        .uop = pm->creator_op,
+                                        .arg_a = acc_ref, // previous result (acc or last post op)
+                                        .arg_b = n_leaves
+                                    };
+                                    n_leaves++;
+                                    op_tids[n_ops] = ptid;
+                                    n_ops++;
+                                }
+                            } else {
+                                // Unary post-op
+                                u32 prev = (n_ops > pre_reduce_ops) ?
+                                    n_leaves + n_ops - 1 : pre_reduce_leaves + pre_reduce_ops - 1;
+                                ops[n_ops] = (FusedOp){ .uop = pm->creator_op, .arg_a = prev, .arg_b = 0 };
+                                op_tids[n_ops] = ptid;
+                                n_ops++;
+                            }
+                        }
+
+                        if (n_ops > pre_reduce_ops) {
+                            // Remap pre-reduce ops
+                            for (u32 i = 0; i < pre_reduce_ops; i++) {
+                                if (ops[i].arg_a >= FUSE_MAX_LEAVES) ops[i].arg_a = pre_reduce_leaves + (ops[i].arg_a - FUSE_MAX_LEAVES);
+                                if (ops[i].arg_b >= FUSE_MAX_LEAVES) ops[i].arg_b = pre_reduce_leaves + (ops[i].arg_b - FUSE_MAX_LEAVES);
+                            }
+                            // Remap post-reduce ops
+                            for (u32 i = pre_reduce_ops; i < n_ops; i++) {
+                                if (ops[i].arg_a >= FUSE_MAX_LEAVES) ops[i].arg_a = n_leaves + (ops[i].arg_a - FUSE_MAX_LEAVES);
+                                if (ops[i].arg_b >= FUSE_MAX_LEAVES) ops[i].arg_b = n_leaves + (ops[i].arg_b - FUSE_MAX_LEAVES);
+                            }
+
+                            // Build ReduceSpec with post-reduce
+                            ReduceSpec rs = {0};
+                            rs.reduce_type = rm->creator_op;
+                            rs.post_reduce_start = pre_reduce_ops;
+                            rs.n_post_leaves = n_post_leaves;
+                            u32 axes_id = rm->src_ids[1];
+                            Shape fs = ctx->tensors[reduce_input].view.shape;
+                            if (axes_id) {
+                                ENSURE(ctx, axes_id);
+                                TensorMeta *axt = &ctx->tensors[axes_id];
+                                f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
+                                for (u32 i=0;i<axt->view.numel;i++) { u32 ax=(u32)af[i]; if(ax<fs.rank) rs.is_reduce[ax]=1; }
+                            } else {
+                                for (int d=(int)fs.rank-1;d>=0;d--) if(fs.dims[d]>1){rs.is_reduce[d]=1;break;}
+                            }
+
+                            // Collect side outputs
+                            u32 side_bufs2[8], side_ops2[8]; u32 n_sides2 = 0;
+                            for (u32 i = 0; i < pre_reduce_ops && n_sides2 < 8; i++) {
+                                TensorMeta *sm = &ctx->tensors[op_tids[i]];
+                                if (sm->buf_id != 0 && sm->defer_consumers > 0) {
+                                    side_bufs2[n_sides2] = sm->buf_id; side_ops2[n_sides2] = pre_reduce_leaves + i; n_sides2++;
+                                }
+                            }
+
+                            m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+                            u32 bufs[FUSE_MAX_LEAVES];
+                            for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
+                            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+                                ops, n_ops, &fs, &rs,
+                                n_sides2 ? side_bufs2 : NULL, n_sides2 ? side_ops2 : NULL, n_sides2);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         if (reduce_type) tensor_materialize(ctx, m->src_ids[0]);
         m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
         return;
@@ -219,6 +462,7 @@ static int tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf,
     if (im->backend->dispatch_kernel_rs) {
         u32 bufs[FUSE_MAX_LEAVES];
         for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
+
         Shape full_shape = im->view.shape;
         im->backend->dispatch_kernel_rs(out_buf, bufs, leaf_views, n_leaves,
                                          ops, n_ops, &full_shape, rs,

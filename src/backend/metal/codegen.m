@@ -311,7 +311,10 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             }
         }
     } else {
-        for (u32 li = 0; li < n_leaves; li++) {
+        // Only read pre-reduce leaves inside the reduce loop; post-reduce leaves read after
+        u32 n_pre_leaves = (has_reduce && reduce->post_reduce_start > 0)
+            ? (n_leaves - reduce->n_post_leaves) : n_leaves;
+        for (u32 li = 0; li < n_pre_leaves; li++) {
             const View *lv = leaf_views[li];
             if (!has_reduce && cg_leaf_is_flat(lv, out_numel))
                 [s appendFormat:@"  uint fi%u=iz*%uu+iy*%uu+inner_base;\n  float t%u=in%u[fi%u];\n",
@@ -323,9 +326,10 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
         }
     }
 
-    // ── Op chain ───────────────────────────────────────────────
+    // ── Op chain (pre-reduce only; post-reduce emitted after the loop) ──
     NSString *ft = use_f4 ? @"float4" : @"float";
-    for (u32 i = 0; i < n_ops; i++) {
+    u32 n_pre_ops = (has_reduce && reduce->post_reduce_start > 0) ? reduce->post_reduce_start : n_ops;
+    for (u32 i = 0; i < n_pre_ops; i++) {
         u32 tid = n_leaves + i, a = ops[i].arg_a, b = ops[i].arg_b;
         switch (ops[i].uop) {
             case UOP_ADD:  [s appendFormat:@"%@%@ t%u=t%u+t%u;\n", indent, ft, tid, a, b]; break;
@@ -349,7 +353,7 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     }
 
     // ── Output write ───────────────────────────────────────────
-    u32 last = n_leaves + n_ops - 1;
+    u32 last = n_leaves + n_pre_ops - 1;
     if (has_reduce) {
         // Side outputs INSIDE reduce loop (before acc, while intermediates are live)
         if (n_side_outputs > 0) {
@@ -370,8 +374,62 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             [s appendFormat:@"    acc=max(acc,t%u);\n  }\n", last];
         else
             [s appendFormat:@"    acc+=t%u;\n  }\n", last];
-        [s appendFormat:@"  uint oi=iz*%uu+iy*%uu+inner_base;\n  out[oi]=acc;\n",
+        [s appendFormat:@"  uint oi=iz*%uu+iy*%uu+inner_base;\n",
             mid*inner, inner];
+
+        // Post-reduce ops: applied to acc using output (non-reduce) coordinates.
+        // Uses a separate variable namespace (p0, p1, ...) to avoid conflicts with
+        // pre-reduce t-variables that are scoped inside the reduce loop.
+        u32 prs = reduce->post_reduce_start;
+        if (prs > 0 && prs < n_ops) {
+            // Read post-reduce-only leaves using output coordinates
+            u32 post_leaf_base = n_leaves - reduce->n_post_leaves;
+            for (u32 pli = post_leaf_base; pli < n_leaves; pli++) {
+                const View *plv = leaf_views[pli];
+                [s appendString:@"  float pl"];
+                [s appendFormat:@"%u=in%u[", pli - post_leaf_base, pli];
+                // Coordinate-based index using non-reduce dims
+                int first = 1;
+                for (u32 oi2 = 0; oi2 < n_out; oi2++) {
+                    u32 dim = out_dims[oi2];
+                    if (dim < plv->shape.rank && plv->strides[dim] > 0) {
+                        if (!first) [s appendString:@"+"];
+                        [s appendFormat:@"c%u*%du", dim, plv->strides[dim]];
+                        first = 0;
+                    }
+                }
+                if (first) [s appendString:@"0"];
+                [s appendString:@"];\n"];
+            }
+            // Emit post-reduce chain: p0 = acc, p1 = f(p0, leaf), ...
+            for (u32 pi = prs; pi < n_ops; pi++) {
+                u32 pidx = pi - prs;
+                NSString *a_name = (pidx == 0) ? @"acc" : [NSString stringWithFormat:@"p%u", pidx - 1];
+                NSString *b_name = nil;
+                if (is_binary(ops[pi].uop)) {
+                    // arg_b should reference a post-reduce leaf
+                    u32 b = ops[pi].arg_b;
+                    if (b >= post_leaf_base && b < n_leaves)
+                        b_name = [NSString stringWithFormat:@"pl%u", b - post_leaf_base];
+                    else
+                        b_name = [NSString stringWithFormat:@"t%u", b]; // fallback
+                }
+                switch (ops[pi].uop) {
+                    case UOP_ADD:  [s appendFormat:@"  float p%u=%@+%@;\n", pidx, a_name, b_name]; break;
+                    case UOP_SUB:  [s appendFormat:@"  float p%u=%@-%@;\n", pidx, a_name, b_name]; break;
+                    case UOP_MUL:  [s appendFormat:@"  float p%u=%@*%@;\n", pidx, a_name, b_name]; break;
+                    case UOP_DIV:  [s appendFormat:@"  float p%u=%@/%@;\n", pidx, a_name, b_name]; break;
+                    case UOP_NEG:  [s appendFormat:@"  float p%u=-%@;\n", pidx, a_name]; break;
+                    case UOP_RELU: [s appendFormat:@"  float p%u=max(%@,0.f);\n", pidx, a_name]; break;
+                    case UOP_EXP:  [s appendFormat:@"  float p%u=exp(%@);\n", pidx, a_name]; break;
+                    case UOP_LOG:  [s appendFormat:@"  float p%u=log(%@);\n", pidx, a_name]; break;
+                    default:       [s appendFormat:@"  float p%u=%@;\n", pidx, a_name]; break;
+                }
+            }
+            [s appendFormat:@"  out[oi]=p%u;\n", n_ops - prs - 1];
+        } else {
+            [s appendFormat:@"  out[oi]=acc;\n"];
+        }
     } else if (use_f4) {
         [s appendFormat:@"  uint oi=iz*%uu+iy*%uu+inner_base;\n", mid*inner, inner];
         [s appendFormat:@"  *((device float4*)(out+oi))=t%u;\n", last];

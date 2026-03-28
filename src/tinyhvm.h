@@ -398,7 +398,12 @@ static inline const View *st_get(u64 heap_loc) {
 // ============================================================
 
 typedef struct { u32 uop; u32 arg_a; u32 arg_b; } FusedOp;
-typedef struct { u8 is_reduce[MAX_DIM]; u32 reduce_type; } ReduceSpec;
+typedef struct {
+    u8 is_reduce[MAX_DIM];
+    u32 reduce_type;
+    u32 post_reduce_start; // index into ops[] where post-reduce ops begin (0 = no post-reduce)
+    u32 n_post_leaves;     // number of post-reduce-only leaves (appended after pre-reduce leaves)
+} ReduceSpec;
 
 typedef struct Backend Backend;
 

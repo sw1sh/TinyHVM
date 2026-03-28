@@ -565,6 +565,13 @@ void     thvm_reset(TinyHVM *ctx, u32 keep);  // free tensors above `keep`, rese
 // Device
 Term     thvm_to_device(TinyHVM *ctx, Term t, u32 device_idx);
 
+// JIT capture/replay (Metal only — bypasses IC for repeated training steps)
+#ifdef __APPLE__
+void     jit_begin_capture(u32 n_persistent_bufs);
+void     jit_end_capture(void);
+void     jit_replay(void);
+#endif
+
 // Reduction
 Term     thvm_reduce(TinyHVM *ctx, Term t);
 Term     thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps);

@@ -18,7 +18,7 @@ int main(void) {
     MNISTData data = mnist_load("data");
     u32 BS = 4;  // small batch for tractable computation
     srand(42);
-    TinyHVM *ctx = thvm_init(thvm_device("metal"));
+    TinyHVM *ctx = thvm_init("metal");
 
     // Conv1: (1,4,3,3) — 36 params
     u32 cw1_n = 4*1*3*3;

@@ -18,7 +18,7 @@ int main(void) {
     MNISTData data = mnist_load("data");
     u32 BS = 128, H = 128;
     srand(12345);
-    TinyHVM *ctx = thvm_init(thvm_device("metal"));
+    TinyHVM *ctx = thvm_init("metal");
 
     f32 *w1d = malloc(784*H*4);
     for (u32 i=0;i<784*H;i++) w1d[i] = 0.001f*((f32)rand()/(f32)RAND_MAX*2-1);

@@ -16,7 +16,7 @@
 
 // ── Test 1: Fresh tensor has refcount 1 ──────────────────────
 static int test_initial_refcount(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 data[] = {1.0f, 2.0f, 3.0f};
     Term t = thvm_tensor(ctx, data, SHAPE(3));
     u32 id = (u32)term_val(t);
@@ -29,7 +29,7 @@ static int test_initial_refcount(void) {
 
 // ── Test 2: Clone increments refcount ────────────────────────
 static int test_clone_increments_refcount(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 data[] = {1.0f, 2.0f};
     Term t = thvm_tensor(ctx, data, SHAPE(2));
     u32 id = (u32)term_val(t);
@@ -48,7 +48,7 @@ static int test_clone_increments_refcount(void) {
 
 // ── Test 3: APP-TEN decrements refcount ──────────────────────
 static int test_app_ten_decrements_refcount(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 data[] = {42.0f};
     Term ten = thvm_tensor(ctx, data, SHAPE(1));
     u32 id = (u32)term_val(ten);
@@ -69,7 +69,7 @@ static int test_app_ten_decrements_refcount(void) {
 
 // ── Test 4: Clone + APP-TEN = net zero (rc goes 1→2→1) ──────
 static int test_clone_then_discard(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 data[] = {7.0f};
     Term ten = thvm_tensor(ctx, data, SHAPE(1));
     u32 id = (u32)term_val(ten);
@@ -93,7 +93,7 @@ static int test_clone_then_discard(void) {
 
 // ── Test 5: APP chain with multiple intermediate tensors ─────
 static int test_app_chain_frees_intermediates(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 d1[] = {1.0f}, d2[] = {2.0f}, d3[] = {3.0f};
     Term t1 = thvm_tensor(ctx, d1, SHAPE(1));
@@ -121,7 +121,7 @@ static int test_app_chain_frees_intermediates(void) {
 // ── Test 6: Recursive training tensor pressure ───────────────
 // Run 5 training steps, then check how many tensors were freed by GC.
 static int test_training_tensor_pressure(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 x_d[] = {0,0, 0,1, 1,0, 1,1};
     f32 y_d[] = {0, 1, 1, 0};

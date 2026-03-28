@@ -12,7 +12,7 @@
 
 int main(void) {
     srand(42);
-    TinyHVM *ctx = thvm_init(thvm_device("metal"));
+    TinyHVM *ctx = thvm_init("metal");
 
     // Input [2,1,6,6] — small but enough for conv+pool+conv
     u32 BS=2;

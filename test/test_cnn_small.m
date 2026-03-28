@@ -26,7 +26,7 @@ int main(int argc, char **argv) {
     MNISTData data = mnist_load("data");
     printf("  Train: %u, Test: %u\n\n", data.n_train, data.n_test);
 
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     u32 BS = 32;
 
     u32 cw_n = 8*1*3*3;

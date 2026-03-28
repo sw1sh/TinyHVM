@@ -32,7 +32,7 @@ static Term build_fwd(TinyHVM *ctx, f32 *xd, f32 *w1d, f32 *b1d,
 
 static void test_config(const char *name, u32 BS, u32 IH, u32 IW,
                           int use_relu, int use_pool) {
-    TinyHVM *ctx = thvm_init(thvm_device("metal"));
+    TinyHVM *ctx = thvm_init("metal");
     srand(42);
 
     u32 n = BS*IH*IW;

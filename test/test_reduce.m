@@ -32,7 +32,7 @@ static f32 *eval_v(TinyHVM *ctx, Term t, u32 *n) {
 // ── Sum tests ──────────────────────────────────────────────────
 
 static void test_sum_axis0(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {1,2,3, 4,5,6};
     Term t = thvm_tensor(ctx, d, SHAPE(2, 3));
     u32 ax[] = {0};
@@ -46,7 +46,7 @@ static void test_sum_axis0(void) {
 }
 
 static void test_sum_axis1(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {1,2,3, 4,5,6};
     Term t = thvm_tensor(ctx, d, SHAPE(2, 3));
     u32 ax[] = {1};
@@ -59,7 +59,7 @@ static void test_sum_axis1(void) {
 }
 
 static void test_sum_all(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {1,2,3, 4,5,6};
     Term t = thvm_tensor(ctx, d, SHAPE(2, 3));
     u32 ax[] = {0, 1};
@@ -71,7 +71,7 @@ static void test_sum_all(void) {
 }
 
 static void test_sum_3d(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[24]; for (int i = 0; i < 24; i++) d[i] = 1.f;
     Term t = thvm_tensor(ctx, d, SHAPE(2, 3, 4));
     u32 ax[] = {1};
@@ -87,7 +87,7 @@ static void test_sum_3d(void) {
 // ── Reduce max ─────────────────────────────────────────────────
 
 static void test_rmax(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {1,5,3, 4,2,6};
     Term t = thvm_tensor(ctx, d, SHAPE(2, 3));
     Term r = thvm_op(ctx, UOP_RMAX, t, term_era());
@@ -99,7 +99,7 @@ static void test_rmax(void) {
 }
 
 static void test_rmax_negative(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {-3, -1, -5, -2, -4, -1};
     Term t = thvm_tensor(ctx, d, SHAPE(2, 3));
     Term r = thvm_op(ctx, UOP_RMAX, t, term_era());
@@ -113,7 +113,7 @@ static void test_rmax_negative(void) {
 // ── Backward: reduce ───────────────────────────────────────────
 
 static void test_grad_sum(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {1, 2, 3, 4, 5, 6};
     Term t = thvm_tensor(ctx, d, SHAPE(2, 3));
     thvm_set_requires_grad(ctx, t);
@@ -132,7 +132,7 @@ static void test_grad_sum(void) {
 // ── Backward: softmax cross-entropy ────────────────────────────
 
 static void test_softmax_grad(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 xd[] = {2.f, 1.f, 0.1f};
     f32 yd[] = {1, 0, 0};
     Term x = thvm_tensor(ctx, xd, SHAPE(1, 3));
@@ -171,7 +171,7 @@ static void test_softmax_grad(void) {
 // ── Backward: MSE ──────────────────────────────────────────────
 
 static void test_mse_grad(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 pred[] = {1.f, 2.f, 3.f};
     f32 tgt[] = {1.5f, 2.5f, 2.0f};
     Term p = thvm_tensor(ctx, pred, SHAPE(1, 3));

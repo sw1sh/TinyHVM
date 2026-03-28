@@ -11,7 +11,7 @@ static void fill_rand(f32 *buf, u32 n, f32 scale) {
 
 int main() {
     srand(42);
-    TinyHVM *ctx = thvm_init(thvm_device("cpu"));
+    TinyHVM *ctx = thvm_init("cpu");
     u32 BS = 16, IN = 4, HID = 8, OUT = 2;
 
     // Weights

@@ -42,7 +42,7 @@ static void check(const char *name, const f32 *got, const f32 *exp, u32 n) {
 int main(void) {
     printf("test_reduce_fuse\n");
 
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     // ----------------------------------------------------------------
     // Known-value [4,3] tensors

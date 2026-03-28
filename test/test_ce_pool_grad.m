@@ -31,7 +31,7 @@ static f32 run_fwd(TinyHVM *ctx, f32 *xd, f32 *w1d, f32 *b1d, f32 *lwd, f32 *lbd
 
 int main(int argc, char **argv) {
     srand(42);
-    TinyHVM *ctx=thvm_init(thvm_device("metal"));
+    TinyHVM *ctx=thvm_init("metal");
     u32 BS=(argc>1)?(u32)atoi(argv[1]):2;
     u32 IH=(argc>2)?(u32)atoi(argv[2]):6, IW=IH;
     u32 OH=(IH-2)/2, OW=(IW-2)/2, flat_f=2*OH*OW, NC=4;

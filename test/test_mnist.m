@@ -93,7 +93,7 @@ static int run_mlp(MNISTData *data) {
     u32 n_batches = data->n_train / BS;
     f32 lr_val = 0.001f;
 
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     // Weights
     f32 *w1d = malloc(784 * H * sizeof(f32)); kaiming_init(w1d, 784, 784 * H);
@@ -198,7 +198,7 @@ static int run_mlp(MNISTData *data) {
 static int run_cnn(MNISTData *data) {
     printf("=== MNIST CNN — IC autograd (%s) ===\n\n", DEVICE);
 
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     // Try to load tinygrad-dumped weights for exact parity
     u32 wsize = 0;

@@ -12,7 +12,7 @@
 
 int main(void) {
     srand(42);
-    TinyHVM *ctx = thvm_init(thvm_device("metal"));
+    TinyHVM *ctx = thvm_init("metal");
     u32 BS = 2;
 
     f32 x_data[2*1*6*6];
@@ -42,11 +42,9 @@ int main(void) {
     h = thvm_maxpool2d(ctx, h, k2, s2);               // [2,2,2,2]
     Term out = thvm_conv2d(ctx, h, w2, b2, 1, s1, p0); // [2,4,2,2]
 
-    // Try cross-entropy loss
-    #include "../src/nn/datasets.c"
-    MNISTData _d = mnist_load("data");
-    Term loss = cross_entropy_loss(ctx, thvm_reshape(ctx, out, SHAPE(BS, 4*2*2)),
-        _d.train_labels, BS, 4*2*2);
+    // Simple SUM loss
+    u32 axes[] = {0,1,2,3};
+    Term loss = thvm_reshape(ctx, thvm_sum_axes(ctx, out, axes, 4), SHAPE(1));
 
     // IC-native gradient via thvm_grad_multi — both weights
     #define NP 2

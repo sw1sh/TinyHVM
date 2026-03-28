@@ -49,7 +49,7 @@ static f32 *eval_buf(TinyHVM *ctx, Term t, u32 *out_numel) {
 
 // Create a fresh ctx for each test
 static TinyHVM *fresh_ctx(void) {
-    return thvm_init(thvm_device(DEVICE));
+    return thvm_init(DEVICE);
 }
 
 // ── Forward-Only Tests ─────────────────────────────────────────

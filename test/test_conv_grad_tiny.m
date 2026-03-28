@@ -10,7 +10,7 @@
 #include <stdio.h>
 
 int main(void) {
-    TinyHVM *ctx = thvm_init(thvm_device("metal"));
+    TinyHVM *ctx = thvm_init("metal");
 
     // 4x4 input, sequential values
     f32 x_data[16]; for (int i=0;i<16;i++) x_data[i] = (f32)(i+1);

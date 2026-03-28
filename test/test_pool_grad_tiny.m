@@ -11,7 +11,7 @@
 #include <math.h>
 
 int main(void) {
-    TinyHVM *ctx = thvm_init(thvm_device("metal"));
+    TinyHVM *ctx = thvm_init("metal");
 
     // Test 1: standalone maxpool
     // Input: [1,1,4,4] = 16 elements, known values

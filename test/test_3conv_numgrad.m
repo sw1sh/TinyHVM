@@ -55,7 +55,7 @@ static f32 forward_loss(TinyHVM *ctx, f32 *x_data, u32 BS,
 int main(void) {
     srand(42);
     MNISTData data = mnist_load("data");
-    TinyHVM *ctx = thvm_init(thvm_device("metal"));
+    TinyHVM *ctx = thvm_init("metal");
     u32 BS = 4; // small batch for speed
 
     // Allocate weight arrays

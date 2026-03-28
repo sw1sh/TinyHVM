@@ -32,7 +32,7 @@ int main(int argc, char **argv) {
     printf("=== BobNet Benchmark (TinyHVM, %s) ===\n", dev);
     printf("    BS=%u, %u→%u→%u, %u steps\n\n", BS, IN, H, OUT, N_STEPS);
 
-    TinyHVM *ctx = thvm_init(thvm_device(dev));
+    TinyHVM *ctx = thvm_init(dev);
 
     // Weights
     f32 *w1d = malloc(IN * H * sizeof(f32));

@@ -37,7 +37,7 @@ static f32 run_fwd(TinyHVM *ctx, f32 *xd, u32 BS, f32 **wd, u8 *labels) {
 int main(void) {
     srand(42);
     MNISTData data=mnist_load("data");
-    TinyHVM *ctx=thvm_init(thvm_device("metal"));
+    TinyHVM *ctx=thvm_init("metal");
     u32 BS=4;
 
     u32 sizes[]={72,8,1152,16,4000,10};

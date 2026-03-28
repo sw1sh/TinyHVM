@@ -28,7 +28,7 @@ static Term make_z(TinyHVM *c, u32 n) { f32*z=calloc(n,4); Term t=thvm_tensor(c,
 int main(void) {
     srand(42);
     MNISTData data = mnist_load("data");
-    TinyHVM *ctx = thvm_init(thvm_device("metal"));
+    TinyHVM *ctx = thvm_init("metal");
     u32 BS = 64;
 
     // Layer 1: Conv(1,8,3,p=0)

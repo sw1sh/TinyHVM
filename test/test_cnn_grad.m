@@ -21,7 +21,7 @@
 int main(void) {
     srand(42);
     MNISTData data = mnist_load("data");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     u32 BS = 32;
 
     // ── Init weights (same as test_cnn_small.m) ──────────────────

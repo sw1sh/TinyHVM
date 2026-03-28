@@ -40,7 +40,7 @@ static f32 fwd_loss(TinyHVM *ctx, f32 *xd, u32 BS,
 int main(void) {
     srand(42);
     MNISTData data=mnist_load("data");
-    TinyHVM *ctx=thvm_init(thvm_device("metal"));
+    TinyHVM *ctx=thvm_init("metal");
     u32 BS=4;
 
     u32 sizes[]={72,8,1152,16,400*10,10};

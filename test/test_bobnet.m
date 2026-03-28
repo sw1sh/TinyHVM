@@ -83,7 +83,7 @@ static void sgd_step(TinyHVM *ctx, Term w, Term grad_reduced, f32 lr) {
 // ── Test 1: forward shape ──────────────────────────────────────
 
 static void test_forward_shape(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     u32 BS = 4, IN = 8, H = 16, OUT = 3;
     BobNet net = bobnet_init(ctx, IN, H, OUT);
     f32 xd[4 * 8]; randn_init(xd, BS * IN, 1.f);
@@ -98,7 +98,7 @@ static void test_forward_shape(void) {
 
 static void test_sgd_onestep(void) {
     srand(1337);
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     u32 BS = 4, IN = 8, H = 16, OUT = 3;
     BobNet net = bobnet_init(ctx, IN, H, OUT);
 
@@ -133,7 +133,7 @@ static void test_sgd_onestep(void) {
 
 static void test_sgd_multistep(void) {
     srand(42);
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     u32 BS = 8, IN = 8, H = 32, OUT = 4;
     BobNet net = bobnet_init(ctx, IN, H, OUT);
 
@@ -168,7 +168,7 @@ static void test_sgd_multistep(void) {
 
 static void test_gradient_health(void) {
     srand(1234);
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     u32 BS = 4, IN = 8, H = 16, OUT = 3;
     BobNet net = bobnet_init(ctx, IN, H, OUT);
 
@@ -202,7 +202,7 @@ static void test_gradient_health(void) {
 
 static void test_train_gc(void) {
     srand(99);
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     u32 BS = 4, IN = 8, H = 16, OUT = 3;
     BobNet net = bobnet_init(ctx, IN, H, OUT);
 

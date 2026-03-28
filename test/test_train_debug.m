@@ -6,7 +6,7 @@
 #include "train_helpers.h"
 
 int main(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 x_d[] = {0,0, 0,1, 1,0, 1,1};
     f32 y_d[] = {0, 1, 1, 0};

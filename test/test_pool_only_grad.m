@@ -39,7 +39,7 @@ static Term build_loss(TinyHVM *ctx, Term x) {
 }
 
 int main(void) {
-    TinyHVM *ctx = thvm_init(thvm_device("metal"));
+    TinyHVM *ctx = thvm_init("metal");
 
     // Input: [1,1,4,4] = 16 elements with values 1..16
     f32 x_data[16];

@@ -40,7 +40,7 @@ int main(void) {
     f32 *wp = wbin;
 
     MNISTData data = mnist_load("data");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     #define T(shape) ({ Term _t = thvm_tensor(ctx, wp, (shape)); \
         u32 _n=1; for(u32 _i=0;_i<(shape).rank;_i++) _n*=(shape).dims[_i]; wp+=_n; _t; })

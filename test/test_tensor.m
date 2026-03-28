@@ -37,7 +37,7 @@ static f32 eval_s(TinyHVM *ctx, Term t) {
 // ── 1. Shape metadata ──────────────────────────────────────────
 
 static void test_shape_after_reshape(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {1,2,3,4,5,6};
     Term t = thvm_tensor(ctx, d, SHAPE(6));
     u32 tid = (u32)term_val(t);
@@ -55,7 +55,7 @@ static void test_shape_after_reshape(void) {
 }
 
 static void test_shape_after_expand(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {1, 2, 3};
     Term t = thvm_tensor(ctx, d, SHAPE(1, 3));
     Term e = thvm_expand(ctx, t, SHAPE(4, 3));
@@ -70,7 +70,7 @@ static void test_shape_after_expand(void) {
 }
 
 static void test_numel(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[24]; for (int i = 0; i < 24; i++) d[i] = (f32)i;
     Term t = thvm_tensor(ctx, d, SHAPE(2, 3, 4));
     u32 tid = (u32)term_val(t);
@@ -83,7 +83,7 @@ static void test_numel(void) {
 // ── 2. Backward pass — simple chain ────────────────────────────
 
 static void test_backward_chain(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 xd[] = {1,0, 0,1};
     f32 wd[] = {0.5f, -0.3f, 0.2f, 0.4f};
     f32 bd[] = {0.1f, -0.1f};
@@ -124,7 +124,7 @@ static void test_backward_chain(void) {
 // ── 3. Diamond model gradient ──────────────────────────────────
 
 static void test_diamond_grad(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 ud[] = {1, 2}, vd[] = {3, 4}, wd[] = {5, 6};
     Term U = thvm_tensor(ctx, ud, SHAPE(1, 2));
     Term V = thvm_tensor(ctx, vd, SHAPE(1, 2));
@@ -166,7 +166,7 @@ static void test_diamond_grad(void) {
 // ── 4. Clone preserves values ──────────────────────────────────
 
 static void test_clone(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {1, 2, 3, 4};
     Term t = thvm_tensor(ctx, d, SHAPE(2, 2));
     // Clone by forcing a contiguous copy via add-0
@@ -190,7 +190,7 @@ static void test_clone(void) {
 // ── 5. Assign ──────────────────────────────────────────────────
 
 static void test_assign(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {1, 2, 3, 4};
     f32 upd[] = {10, 20, 30, 40};
     Term dst = thvm_tensor(ctx, d, SHAPE(4));
@@ -208,7 +208,7 @@ static void test_assign(void) {
 // ── 6. Requires_grad flag ──────────────────────────────────────
 
 static void test_requires_grad(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {1, 2};
     Term t = thvm_tensor(ctx, d, SHAPE(2));
     u32 tid = (u32)term_val(t);
@@ -222,7 +222,7 @@ static void test_requires_grad(void) {
 // ── 7. Refcount starts at 1 ───────────────────────────────────
 
 static void test_refcount(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {1};
     Term t = thvm_tensor(ctx, d, SHAPE(1));
     u32 tid = (u32)term_val(t);
@@ -234,7 +234,7 @@ static void test_refcount(void) {
 // ── 8. Backward through div ────────────────────────────────────
 
 static void test_grad_div(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 av[] = {6.f, 12.f}, bv[] = {2.f, 3.f};
     Term a = thvm_tensor(ctx, av, SHAPE(1, 2));
     Term b = thvm_tensor(ctx, bv, SHAPE(1, 2));
@@ -264,7 +264,7 @@ static void test_grad_div(void) {
 // ── 9. Backward through sub ────────────────────────────────────
 
 static void test_grad_sub(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 av[] = {5, 3}, bv[] = {2, 1};
     Term a = thvm_tensor(ctx, av, SHAPE(1, 2));
     Term b = thvm_tensor(ctx, bv, SHAPE(1, 2));
@@ -292,7 +292,7 @@ static void test_grad_sub(void) {
 // ── 10. Backward through sqrt ──────────────────────────────────
 
 static void test_grad_sqrt(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 av[] = {4.f, 9.f, 16.f};
     Term a = thvm_tensor(ctx, av, SHAPE(1, 3));
     thvm_set_requires_grad(ctx, a);

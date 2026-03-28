@@ -96,7 +96,7 @@ int main(void) {
     f32 rmean_data[2] = {0.0f, 0.0f};
     f32 rvar_data[2] = {1.0f, 1.0f};
 
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     Term x = thvm_tensor(ctx, x_data, (Shape){.dims={B,C,H,W},.rank=4});
     Term gamma_t = thvm_tensor(ctx, gamma_data, SHAPE(C));

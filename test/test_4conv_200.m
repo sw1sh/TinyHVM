@@ -47,7 +47,7 @@ int main(void) {
     for(u32 i=0;i<NP;i++) thvm_set_requires_grad(ctx,params[i]);
     Term train_data=thvm_tensor(ctx,data.train_images,(Shape){.dims={data.n_train,1,28,28},.rank=4});
     u32 n_weights=ctx->tensor_count;
-    u32 n_steps=100;
+    u32 n_steps=200;
 
     struct timespec t_start; clock_gettime(CLOCK_MONOTONIC,&t_start);
     for(u32 step=0;step<n_steps;step++){

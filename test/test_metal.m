@@ -32,7 +32,7 @@ static f32 *eval_v(TinyHVM *ctx, Term t, u32 *n) {
 // ── 1. Backend initializes correctly ───────────────────────────
 
 static void test_backend_init(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     assert(ctx != NULL);
     assert(ctx->backend != NULL);
     assert(ctx->backend->buf_alloc != NULL);
@@ -46,7 +46,7 @@ static void test_backend_init(void) {
 // ── 2. Buffer alloc + write + read roundtrip ───────────────────
 
 static void test_buf_roundtrip(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 data[] = {3.14f, 2.71f, 1.41f, 1.73f};
     u32 bid = ctx->backend->buf_alloc(4 * sizeof(f32));
     assert(bid > 0);
@@ -66,7 +66,7 @@ static void test_buf_roundtrip(void) {
 // ── 3. Tensor roundtrip through Metal ──────────────────────────
 
 static void test_tensor_roundtrip(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 data[] = {1, 2, 3, 4, 5, 6};
     Term t = thvm_tensor(ctx, data, SHAPE(2, 3));
     f32 *host = thvm_to_host(ctx, t);
@@ -80,7 +80,7 @@ static void test_tensor_roundtrip(void) {
 // ── 4. Metal ADD parity with expected values ───────────────────
 
 static void test_metal_add(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 a[] = {1, 2, 3, 4}, b[] = {10, 20, 30, 40};
     Term ta = thvm_tensor(ctx, a, SHAPE(4));
     Term tb = thvm_tensor(ctx, b, SHAPE(4));
@@ -97,7 +97,7 @@ static void test_metal_add(void) {
 // ── 5. Metal matmul ────────────────────────────────────────────
 
 static void test_metal_matmul(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 a[] = {1,2,3,4}, b[] = {5,6,7,8};
     Term ta = thvm_tensor(ctx, a, SHAPE(2, 2));
     Term tb = thvm_tensor(ctx, b, SHAPE(2, 2));
@@ -114,7 +114,7 @@ static void test_metal_matmul(void) {
 // ── 6. Metal exp/log roundtrip ─────────────────────────────────
 
 static void test_metal_exp_log(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 a[] = {1.f, 2.f, 3.f};
     Term ta = thvm_tensor(ctx, a, SHAPE(3));
     Term e = thvm_op(ctx, UOP_EXP, ta, term_era());
@@ -131,7 +131,7 @@ static void test_metal_exp_log(void) {
 // ── 7. Metal reduce sum ────────────────────────────────────────
 
 static void test_metal_sum(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 a[] = {1, 2, 3, 4, 5, 6};
     Term ta = thvm_tensor(ctx, a, SHAPE(2, 3));
     u32 ax[] = {0, 1};
@@ -145,7 +145,7 @@ static void test_metal_sum(void) {
 // ── 8. Metal backward — gradient through add ───────────────────
 
 static void test_metal_grad(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 a[] = {1, 2, 3}, b[] = {4, 5, 6};
     Term ta = thvm_tensor(ctx, a, SHAPE(1, 3));
     Term tb = thvm_tensor(ctx, b, SHAPE(1, 3));
@@ -172,7 +172,7 @@ static void test_metal_grad(void) {
 // ── 9. Batch command buffer ────────────────────────────────────
 
 static void test_batch_commands(void) {
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     if (ctx->backend->begin_batch) ctx->backend->begin_batch();
 
     f32 a[] = {1, 2, 3, 4};
@@ -203,7 +203,7 @@ static void test_cpu_metal_parity(void) {
     f32 b[] = {0.5f, 1.2f, -0.8f, 2.0f};
 
     // CPU result
-    TinyHVM *cpu_ctx = thvm_init(thvm_device("cpu"));
+    TinyHVM *cpu_ctx = thvm_init("cpu");
     Term ca = thvm_tensor(cpu_ctx, a, SHAPE(2, 2));
     Term cb = thvm_tensor(cpu_ctx, b, SHAPE(2, 2));
     Term cr = thvm_op(cpu_ctx, UOP_MM, ca, cb);
@@ -212,7 +212,7 @@ static void test_cpu_metal_parity(void) {
     thvm_free(cpu_ctx);
 
     // Metal result
-    TinyHVM *mtl_ctx = thvm_init(thvm_device("metal"));
+    TinyHVM *mtl_ctx = thvm_init("metal");
     Term ma = thvm_tensor(mtl_ctx, a, SHAPE(2, 2));
     Term mb = thvm_tensor(mtl_ctx, b, SHAPE(2, 2));
     Term mr = thvm_op(mtl_ctx, UOP_MM, ma, mb);

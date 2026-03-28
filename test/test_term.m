@@ -117,7 +117,7 @@ static void test_op2_reduce(void) {
 
 static void test_matmul_identity(void) {
     printf("test_matmul_identity:\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 x_d[] = {1,2,3,4}; u32 s[] = {2,2};
     f32 i_d[] = {1,0,0,1};
     Term x = thvm_tensor(ctx, x_d, shape_of(s, 2));
@@ -134,7 +134,7 @@ static void test_matmul_identity(void) {
 
 static void test_relu(void) {
     printf("test_relu:\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
     f32 d[] = {-1, 2, -3, 4}; u32 s[] = {1, 4};
     Term t = thvm_tensor(ctx, d, shape_of(s, 2));
     Term r = thvm_reduce(ctx, thvm_op(ctx, UOP_RELU, t, term_era()));
@@ -150,7 +150,7 @@ static void test_relu(void) {
 
 static void test_broadcast_add(void) {
     printf("test_broadcast_add:\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     // a = [[1,2,3],[4,5,6]] (2x3)
     f32 a_d[] = {1,2,3,4,5,6}; u32 sa[] = {2, 3};
@@ -176,7 +176,7 @@ static void test_broadcast_add(void) {
 
 static void test_broadcast_column(void) {
     printf("test_broadcast_column:\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     // a = [[1,2],[3,4]] (2x2)
     f32 a_d[] = {1,2,3,4}; u32 sa[] = {2, 2};
@@ -202,7 +202,7 @@ static void test_broadcast_column(void) {
 
 static void test_full_forward(void) {
     printf("test_full_forward (relu(mm(x,w)+b) with broadcast):\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 x_d[] = {1,2,3,4,5,6}; u32 xs[] = {2,3};
     f32 w_d[] = {0.1f,-0.2f, 0.3f,0.4f, -0.5f,0.6f}; u32 ws[] = {3,2};
@@ -234,7 +234,7 @@ static void test_full_forward(void) {
 
 static void test_grad_x2(void) {
     printf("test_grad_x2 (d(x^2)/dx = 2x at x=3):\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 x_d[] = {3.0f}; u32 xs[] = {1, 1};
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
@@ -255,7 +255,7 @@ static void test_grad_x2(void) {
 
 static void test_grad_add(void) {
     printf("test_grad_add (d(a+b)/da = 1):\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 a_d[] = {2.0f}; u32 s[] = {1, 1};
     f32 b_d[] = {5.0f};
@@ -279,7 +279,7 @@ static void test_grad_add(void) {
 
 static void test_grad_relu(void) {
     printf("test_grad_relu:\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 x_d[] = {-2.0f, 3.0f, -1.0f, 4.0f}; u32 xs[] = {1, 4};
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
@@ -303,7 +303,7 @@ static void test_grad_relu(void) {
 
 static void test_grad_mm(void) {
     printf("test_grad_mm (matmul gradient):\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 a_d[] = {1,2,3,4}; u32 s[] = {2, 2};
     f32 b_d[] = {5,6,7,8};
@@ -341,7 +341,7 @@ static void test_grad_mm(void) {
 
 static void test_grad_of_grad(void) {
     printf("test_grad_of_grad (d²(x³)/dx² = 6x at x=2 => 12):\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 x_d[] = {2.0f}; u32 xs[] = {1, 1};
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
@@ -371,7 +371,7 @@ static void test_grad_of_grad(void) {
 
 static void test_grad_sum(void) {
     printf("test_grad_sum (d(sum(x))/dx = ones):\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 x_d[] = {1,2,3,4,5,6}; u32 xs[] = {2, 3};
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
@@ -403,7 +403,7 @@ static void test_grad_sum(void) {
 
 static void test_grad_exp_log(void) {
     printf("test_grad_exp_log (d(exp(x))/dx = exp(x), d(log(x))/dx = 1/x):\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 x_d[] = {1.0f, 2.0f}; u32 xs[] = {1, 2};
     Term x = thvm_tensor(ctx, x_d, shape_of(xs, 2));
@@ -417,7 +417,7 @@ static void test_grad_exp_log(void) {
     ASSERT_NEAR(ge[1], expf(2.0f), 1e-3f, "d(exp(2))/dx = e^2");
 
     // log — fresh ctx to reset tape
-    TinyHVM *ctx2 = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx2 = thvm_init(DEVICE);
     f32 x2_d[] = {2.0f, 4.0f};
     Term x2 = thvm_tensor(ctx2, x2_d, shape_of(xs, 2));
     thvm_set_requires_grad(ctx2, x2);
@@ -437,7 +437,7 @@ static void test_grad_exp_log(void) {
 
 static void test_grad_div(void) {
     printf("test_grad_div (d(a/b)/da = 1/b, d(a/b)/db = -a/b^2):\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 a_d[] = {6.0f}; u32 s[] = {1, 1};
     f32 b_d[] = {3.0f};
@@ -463,7 +463,7 @@ static void test_grad_div(void) {
 
 static void test_grad_broadcast_expand(void) {
     printf("test_grad_broadcast_expand (gradient through expand+add):\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     // x:[2,3], b:[1,3] broadcast-added
     f32 x_d[] = {1,2,3,4,5,6}; u32 xs[] = {2, 3};
@@ -502,7 +502,7 @@ static void test_grad_broadcast_expand(void) {
 
 static void test_grad_chain(void) {
     printf("test_grad_chain (relu(mm(x,W)+b) → sum, full chain rule):\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     f32 x_d[] = {1,2,3,4}; u32 xs[] = {2, 2};
     f32 w_d[] = {0.5f, -0.5f, 0.5f, -0.5f}; u32 ws[] = {2, 2};
@@ -537,7 +537,7 @@ static void test_grad_chain(void) {
 
 static void test_grad_softmax_loss(void) {
     printf("test_grad_softmax_loss (log(softmax(x)) gradient):\n");
-    TinyHVM *ctx = thvm_init(thvm_device(DEVICE));
+    TinyHVM *ctx = thvm_init(DEVICE);
 
     // Simple 1-sample, 3-class logits
     f32 x_d[] = {2.0f, 1.0f, 0.1f}; u32 xs[] = {1, 3};

@@ -63,7 +63,7 @@ static Term lazy_forward(TinyHVM *ctx, Term x, Term W1, Term b1, Term W2, Term b
 static int test_inet_mlp(void) {
     srand(42);
 
-    TinyHVM *ctx = thvm_init(thvm_device("cpu"));
+    TinyHVM *ctx = thvm_init("cpu");
 
     // Init weights with small random values
     f32 w1_data[IN_DIM*H_DIM], b1_data[H_DIM];

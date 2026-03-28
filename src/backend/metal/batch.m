@@ -33,6 +33,21 @@ static id<MTLComputeCommandEncoder> get_encoder(void) {
     return batch_encoder;
 }
 
+// GPU-to-GPU buffer copy via blit encoder (zero compute dispatch overhead)
+void metal_buf_copy(u32 dst_buf, u32 src_buf, u64 nbytes) {
+    if (batch_encoder) {
+        [batch_encoder endEncoding];
+        batch_encoder = nil;
+    }
+    if (!batch_cmd) batch_cmd = [mtl_queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [batch_cmd blitCommandEncoder];
+    [blit copyFromBuffer:metal_pool.bufs[src_buf] sourceOffset:0
+                toBuffer:metal_pool.bufs[dst_buf] destinationOffset:0
+                    size:nbytes];
+    [blit endEncoding];
+    batch_dirty = 1;
+}
+
 static void metal_begin_batch(void) {
     batch_active = 1;
 }

@@ -52,33 +52,8 @@ static inline f32 term_as_f32(Term t) {
 }
 static inline u32 term_as_u32(Term t) { return (u32)term_val(t); }
 
-// ── Shared types (used by fuser + codegen, platform-independent) ──────────────
-typedef struct { u32 uop; u32 arg_a; u32 arg_b; } FusedOp;
-typedef struct { u8 is_reduce[MAX_DIM]; u32 reduce_type; } ReduceSpec;
-
-// ── Metal GPU forward declarations (defined in metal.m) ───────────────────────
+// Metal backend extern (only needed by ctx/init.c for registration)
 #ifdef __APPLE__
-extern void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
-                                 u32 a_buf, const View *av,
-                                 u32 b_buf, const View *bv,
-                                 const View *ov,
-                                 u32 n_reduce,
-                                 const u32 *reduce_dims,
-                                 const u32 *reduce_strides_a,
-                                 const u32 *reduce_strides_b);
-extern void metal_dispatch_fused_rs(u32 out_buf,
-                                     u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
-                                     FusedOp *ops, u32 n_ops,
-                                     const Shape *full_shape,
-                                     const ReduceSpec *reduce);
-extern void metal_dispatch_kernel_rs(u32 out_buf,
-                                      u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
-                                      FusedOp *ops, u32 n_ops,
-                                      const Shape *full_shape,
-                                      const ReduceSpec *reduce,
-                                      u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs);
-extern void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view);
-extern void metal_buf_read_nosync(u32 id, void *out, u64 bytes);
 extern Backend metal_backend;
 #endif
 
@@ -93,21 +68,9 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t);
 static int is_elementwise(u32 uop);
 static int is_binary(u32 uop);
 static void tensor_materialize(TinyHVM *ctx, u32 tid);
+static int  tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf, const ReduceSpec *rs);
 #define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0&&c->tensors[t].creator_op)tensor_materialize(c,t);}while(0)
 
-// Backend-agnostic contiguify: copy non-contiguous view into fresh contiguous buffer
-// be = Backend* to use for buffer ops
-#ifdef __APPLE__
-#define CONTIGUIFY_VIEW(be, dst, n, src, vp) \
-    do { if ((be) == &metal_backend) metal_contiguify(dst, n, src, vp); \
-         else { /* CPU fallback */ \
-             f32 *_t = (f32*)thvm_to_host_view(be, src, vp, n); \
-             (be)->buf_write(dst, _t, (u64)(n)*sizeof(f32)); free(_t); } } while(0)
-#else
-#define CONTIGUIFY_VIEW(be, dst, n, src, vp) \
-    do { f32 *_t = (f32*)thvm_to_host_view(be, src, vp, n); \
-         (be)->buf_write(dst, _t, (u64)(n)*sizeof(f32)); free(_t); } while(0)
-#endif
 // Read strided view to contiguous host buffer
 static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel) {
     u32 max_idx = 0;

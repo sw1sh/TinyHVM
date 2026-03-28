@@ -259,14 +259,26 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
                          u32 M, u32 K, u32 N) {
     u64 t0 = thvm_prof_tick();
 
+    // Detect simple transposes: shape=[R,C] strides=[1,R] (swapped from contiguous)
+    // Use MPS transpose flag instead of contiguifying.
+    BOOL transposeA = NO, transposeB = NO;
     u32 buf_a_id = a, buf_b_id = b;
-    if (!av->contiguous) {
+
+    if (!av->contiguous && av->shape.rank == 2 &&
+        av->strides[0] == 1 && av->strides[1] == (i32)av->shape.dims[0] && av->offset == 0) {
+        // A is transposed: physical layout is [K, M], MPS reads as [K, M]^T = [M, K]
+        transposeA = YES;
+    } else if (!av->contiguous) {
         u32 n = M * K;
         u32 tmp = metal_buf_alloc(n * sizeof(float));
         metal_contiguify(tmp, n, a, av);
         buf_a_id = tmp;
     }
-    if (!bv->contiguous) {
+
+    if (!bv->contiguous && bv->shape.rank == 2 &&
+        bv->strides[0] == 1 && bv->strides[1] == (i32)bv->shape.dims[0] && bv->offset == 0) {
+        transposeB = YES;
+    } else if (!bv->contiguous) {
         u32 n = K * N;
         u32 tmp = metal_buf_alloc(n * sizeof(float));
         metal_contiguify(tmp, n, b, bv);
@@ -276,12 +288,18 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
     if (batch_encoder) { [batch_encoder endEncoding]; batch_encoder = nil; }
     if (!batch_cmd) batch_cmd = [mtl_queue commandBuffer];
 
+    // MPS descriptors use physical (storage) layout, not logical layout
+    u32 phys_a_rows = transposeA ? K : M;
+    u32 phys_a_cols = transposeA ? M : K;
+    u32 phys_b_rows = transposeB ? N : K;
+    u32 phys_b_cols = transposeB ? K : N;
+
     MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
-        matrixDescriptorWithRows:M columns:K rowBytes:K*sizeof(float)
-        dataType:MPSDataTypeFloat32];
+        matrixDescriptorWithRows:phys_a_rows columns:phys_a_cols
+        rowBytes:phys_a_cols*sizeof(float) dataType:MPSDataTypeFloat32];
     MPSMatrixDescriptor *descB = [MPSMatrixDescriptor
-        matrixDescriptorWithRows:K columns:N rowBytes:N*sizeof(float)
-        dataType:MPSDataTypeFloat32];
+        matrixDescriptorWithRows:phys_b_rows columns:phys_b_cols
+        rowBytes:phys_b_cols*sizeof(float) dataType:MPSDataTypeFloat32];
     MPSMatrixDescriptor *descC = [MPSMatrixDescriptor
         matrixDescriptorWithRows:M columns:N rowBytes:N*sizeof(float)
         dataType:MPSDataTypeFloat32];
@@ -291,7 +309,7 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
     MPSMatrix *matC = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[dst] descriptor:descC];
 
     MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
-        initWithDevice:mtl_dev transposeLeft:NO transposeRight:NO
+        initWithDevice:mtl_dev transposeLeft:transposeA transposeRight:transposeB
         resultRows:M resultColumns:N interiorColumns:K
         alpha:1.0 beta:0.0];
 

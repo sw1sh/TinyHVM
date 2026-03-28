@@ -351,6 +351,21 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     // ── Output write ───────────────────────────────────────────
     u32 last = n_leaves + n_ops - 1;
     if (has_reduce) {
+        // Side outputs INSIDE reduce loop (before acc, while intermediates are live)
+        if (n_side_outputs > 0) {
+            [s appendString:@"    uint soi="];
+            u32 stride = 1;
+            for (int d = (int)rank - 1; d >= 0; d--) {
+                if (d < (int)rank - 1) [s appendString:@"+"];
+                [s appendFormat:@"c%u*%uu", d, stride];
+                stride *= full_shape->dims[d];
+            }
+            [s appendString:@";\n"];
+            for (u32 si = 0; si < n_side_outputs; si++) {
+                u32 sid = side_op_indices[si];
+                [s appendFormat:@"    side%u[soi]=t%u;\n", si, sid];
+            }
+        }
         if (reduce->reduce_type == UOP_RMAX)
             [s appendFormat:@"    acc=max(acc,t%u);\n  }\n", last];
         else
@@ -365,11 +380,14 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             mid*inner, inner, last];
     }
 
-    // Side output writes (shared intermediates)
-    if (!has_reduce) { // side outputs only for non-reduce kernels
+    // Side output writes for non-reduce kernels
+    if (!has_reduce) {
         for (u32 si = 0; si < n_side_outputs; si++) {
-            u32 sid = side_op_indices[si]; // remapped op index = n_leaves + original_op_idx
-            [s appendFormat:@"  side%u[oi]=t%u;\n", si, sid];
+            u32 sid = side_op_indices[si];
+            if (use_f4)
+                [s appendFormat:@"  *((device float4*)(side%u+oi))=t%u;\n", si, sid];
+            else
+                [s appendFormat:@"  side%u[oi]=t%u;\n", si, sid];
         }
     }
 
@@ -479,6 +497,7 @@ void metal_dispatch_kernel_rs(u32 out_buf,
        threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
     batch_dirty = 1;
     total_dispatches++;
+    dc[has_reduce ? DC_REDUCE : DC_FUSED]++;
 
     if (jit.state == JIT_CAPTURE) {
         id<MTLBuffer> bufs[17];

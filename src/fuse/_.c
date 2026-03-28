@@ -490,19 +490,17 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
 
     fuse_fused_count++;
-    #ifdef __APPLE__
-    if (ctx->tensors[dst_id].backend == &metal_backend) {
+    if (ctx->tensors[dst_id].backend->dispatch_kernel_rs) {
         u32 bufs[FUSE_MAX_LEAVES];
         for (u32 i = 0; i < n_leaves; i++) {
             ENSURE(ctx, leaf_ids[i]);
             bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
         }
-        metal_dispatch_fused_rs(ctx->tensors[dst_id].buf_id,
-                                  bufs, leaf_views, n_leaves, ops, n_ops,
-                                  &ew_view.shape, has_reduce ? &rs : NULL);
-    } else
-    #endif
-    { return reduce_id(ctx, t); }
+        ctx->tensors[dst_id].backend->dispatch_kernel_rs(
+            ctx->tensors[dst_id].buf_id,
+            bufs, leaf_views, n_leaves, ops, n_ops,
+            &ew_view.shape, has_reduce ? &rs : NULL, NULL, NULL, 0);
+    } else { return reduce_id(ctx, t); }
 
     if (has_reduce && term_tag(reshape_term) != TAG_ERA) {
         u64 rs_loc = term_val(reshape_term);

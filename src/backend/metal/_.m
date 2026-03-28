@@ -12,6 +12,11 @@
 #include "batch.m"    // command batching (uses mtl_queue from init)
 #include "pool.m"     // buffer pool (uses mtl_dev, batch_dirty from above)
 #include "dispatch.m" // GPU dispatch helpers
+// Forward declarations for cross-file references within the Metal backend
+static void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view);
+static void metal_dispatch_kernel(u32 dst_buf, u32 dst_numel,
+    u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+    FusedOp *ops, u32 n_ops, int has_reduce, u32 reduce_dim, const Shape *full_shape);
 #include "ops.m"      // unary, binary, matmul, reduce
 #include "conv.m"     // CNN/layout ops
 #include "optim.m"    // optimizer/pooling GPU kernels
@@ -31,6 +36,10 @@ Backend metal_backend = {
     .op_binary = metal_op_binary,
     .op_mm     = metal_op_mm,
     .op_reduce = metal_op_reduce,
+    .dispatch_kernel_rs = metal_dispatch_kernel_rs,
+    .contiguify         = metal_contiguify,
+    .buf_copy           = metal_buf_copy,
+    .buf_read_nosync    = metal_buf_read_nosync,
     .pool_reset = metal_pool_reset,
     .begin_batch = metal_begin_batch,
     .end_batch   = metal_end_batch,

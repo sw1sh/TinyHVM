@@ -64,12 +64,12 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
     TensorMeta *m = &ctx->tensors[tid];
     if (m->buf_id != 0) return;
 
-    // Deferred SUM: fuse reduce + elementwise input chain
+    // Deferred reduce (SUM/RMAX): fuse reduce + elementwise input chain
     u32 reduce_type = 0, reduce_axes_id = 0, walk_tid = tid;
-    if (m->creator_op == UOP_SUM && m->src_ids[0] &&
+    if ((m->creator_op == UOP_SUM || m->creator_op == UOP_RMAX) && m->src_ids[0] &&
         ctx->tensors[m->src_ids[0]].buf_id == 0 &&
         is_elementwise(ctx->tensors[m->src_ids[0]].creator_op)) {
-        reduce_type = UOP_SUM;
+        reduce_type = m->creator_op;
         reduce_axes_id = m->src_ids[1];
         walk_tid = m->src_ids[0];
     }
@@ -104,8 +104,7 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
         }
     }
 
-    #ifdef __APPLE__
-    if (m->backend == &metal_backend) {
+    if (m->backend->dispatch_kernel_rs) {
         u32 bufs[FUSE_MAX_LEAVES];
         for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
 
@@ -125,18 +124,17 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
                 for (int d = (int)full_shape.rank - 1; d >= 0; d--)
                     if (full_shape.dims[d] > 1) { rs.is_reduce[d] = 1; break; }
             }
-            // TODO: side outputs for fused reduce kernels (reduce writes differ)
-            metal_dispatch_fused_rs(m->buf_id, bufs, leaf_views, n_leaves,
-                                     ops, n_ops, &full_shape, &rs);
+            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+                                            ops, n_ops, &full_shape, &rs,
+                                            n_sides ? side_bufs : NULL,
+                                            n_sides ? side_ops : NULL, n_sides);
         } else {
-            // Multi-output dispatch: main output + side outputs in ONE kernel
-            metal_dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
-                                      ops, n_ops, &m->view.shape, NULL,
-                                      side_bufs, side_ops, n_sides);
+            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+                                            ops, n_ops, &m->view.shape, NULL,
+                                            side_bufs, side_ops, n_sides);
         }
         return;
     }
-    #endif
 
     // CPU fallback: execute ops sequentially (no fusing)
     // temp_bufs[0..n_leaves-1] = leaf buf_ids, [n_leaves..] = intermediate results
@@ -185,4 +183,48 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
         temp_bufs[n_leaves + i] = dst_buf;
         temp_views[n_leaves + i] = &ctx->tensors[op_tid].view;
     }
+}
+
+// Eager reduce fusion: walk deferred ew chain at `input_tid`, dispatch fused reduce+ew
+// into `out_buf`. Returns 1 if dispatched, 0 if fusion not possible.
+static int tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf,
+                                      const ReduceSpec *rs) {
+    TensorMeta *im = &ctx->tensors[input_tid];
+    if (im->buf_id != 0 || !is_elementwise(im->creator_op)) return 0;
+
+    FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0, op_tids[FUSE_MAX_OPS];
+    u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
+
+    int result = materialize_walk(ctx, input_tid, ops, &n_ops, op_tids,
+                                   leaf_ids, leaf_views, &n_leaves);
+    if (result < 0 || n_ops == 0) return 0;
+
+    // Remap op indices
+    for (u32 i = 0; i < n_ops; i++) {
+        if (ops[i].arg_a >= FUSE_MAX_LEAVES) ops[i].arg_a = n_leaves + (ops[i].arg_a - FUSE_MAX_LEAVES);
+        if (ops[i].arg_b >= FUSE_MAX_LEAVES) ops[i].arg_b = n_leaves + (ops[i].arg_b - FUSE_MAX_LEAVES);
+    }
+
+    // Collect side outputs (shared intermediates)
+    u32 side_bufs[8], side_ops[8]; u32 n_sides = 0;
+    for (u32 i = 0; i < n_ops && n_sides < 8; i++) {
+        TensorMeta *sm = &ctx->tensors[op_tids[i]];
+        if (sm->buf_id != 0 && sm->defer_consumers > 0) {
+            side_bufs[n_sides] = sm->buf_id;
+            side_ops[n_sides] = n_leaves + i;
+            n_sides++;
+        }
+    }
+
+    if (im->backend->dispatch_kernel_rs) {
+        u32 bufs[FUSE_MAX_LEAVES];
+        for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
+        Shape full_shape = im->view.shape;
+        im->backend->dispatch_kernel_rs(out_buf, bufs, leaf_views, n_leaves,
+                                         ops, n_ops, &full_shape, rs,
+                                         n_sides ? side_bufs : NULL,
+                                         n_sides ? side_ops : NULL, n_sides);
+        return 1;
+    }
+    return 0;
 }

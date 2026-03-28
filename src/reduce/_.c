@@ -258,9 +258,6 @@ void thvm_print_term(TinyHVM *ctx, Term t) {
 // api.c — High-level tensor API
 // ============================================================
 
-// Device registry — both backends are always linked in.
+// Device registry
 extern Backend cpu_backend;
-#ifdef __APPLE__
-extern Backend metal_backend;
-#endif
 

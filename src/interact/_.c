@@ -1,15 +1,9 @@
 // Read small metadata (axes, shapes, pad specs) without GPU flush.
-// These are CPU-written and never GPU-modified.
-// be = Backend* that owns the buffer.
-#ifdef __APPLE__
+// Uses buf_read_nosync if the backend supports it (avoids pipeline stall).
 #define META_READ(be, buf_id, out, bytes) \
-    ((be) == &metal_backend ? \
-     metal_buf_read_nosync((buf_id), (out), (bytes)) : \
+    ((be)->buf_read_nosync ? \
+     (be)->buf_read_nosync((buf_id), (out), (bytes)) : \
      (be)->buf_read((buf_id), (out), (bytes)))
-#else
-#define META_READ(be, buf_id, out, bytes) \
-    (be)->buf_read((buf_id), (out), (bytes))
-#endif
 
 // Forward declarations (defined in rewrite/_.c, included after interact)
 static int is_view_op(u32 uop);
@@ -42,6 +36,7 @@ inet_step:
             // GRAD(y, grad_y, x) = "given ∂L/∂y = grad_y, compute ∂L/∂x"
             // No reduce — everything lazy. The chain rule produces new TOP nodes.
             if (uop == UOP_GRAD) {
+                #define GRAD_RETURN RETURN_REDUCED
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
                 Term x  = heap_read(ctx, loc + 2);
@@ -56,12 +51,12 @@ inet_step:
                     u32 y_id = (u32)term_val(y);
 
                     // Base case: y == x → return grad_y
-                    if (term_tag(x) == TAG_TEN && (u32)term_val(x) == y_id)
-                        RETURN_REDUCED(thvm_reduce(ctx, gy));
+                    if (term_tag(x) == TAG_TEN && (u32)term_val(x) == y_id) {
+                        GRAD_RETURN(thvm_reduce(ctx, gy));
+                    }
 
                     // Multi-target: x = TAG_CTR encoding (param, slot) pairs.
                     // When y matches a param, deposit gy via ASSIGN into the slot.
-                    // APP(ASSIGN(slot, gy), ERA) fires the deposit and returns ERA.
                     if (term_tag(x) == TAG_CTR) {
                         u64 tgt_loc = term_val(x);
                         u32 n_tgt = term_as_u32(heap_read(ctx, tgt_loc));
@@ -69,10 +64,8 @@ inet_step:
                             Term p = heap_read(ctx, tgt_loc + 1 + 2*_gi);
                             if (term_tag(p) == TAG_TEN && (u32)term_val(p) == y_id) {
                                 Term slot = heap_read(ctx, tgt_loc + 1 + 2*_gi + 1);
-                                // Accumulate: ASSIGN(slot, ADD(slot, gy))
-                                // Handles multiple paths reaching same param.
                                 Term accum = thvm_op(ctx, UOP_ADD, slot, gy);
-                                RETURN_REDUCED(thvm_app(ctx,
+                                GRAD_RETURN(thvm_app(ctx,
                                     thvm_assign(ctx, slot, accum), term_era()));
                             }
                         }
@@ -82,7 +75,26 @@ inet_step:
 
                     // Leaf (no provenance, not target) → ERA
                     if (!my->creator_op) {
-                        RETURN_REDUCED(term_era());
+                            GRAD_RETURN(term_era());
+                    }
+
+                    // Shared tensor: multiple GRAD visits expected (diamond in DAG).
+                    // Park gy, accumulate across visits, walk once with combined gy.
+                    if (my->grad_refs > 1) {
+                        my->grad_refs--;
+                        if (my->grad_cache) {
+                            my->grad_cache = (Term)(u64)thvm_op(ctx, UOP_ADD,
+                                (Term)my->grad_cache, gy);
+                        } else {
+                            my->grad_cache = (Term)(u64)gy;
+                        }
+                        GRAD_RETURN(term_era());
+                    }
+                    // Last (or only) visit: combine with any parked gradient
+                    if (my->grad_cache) {
+                        gy = thvm_op(ctx, UOP_ADD, (Term)my->grad_cache, gy);
+                        heap_set(ctx, loc + 1, gy);
+                        my->grad_cache = 0;
                     }
 
                     // DUP-op interaction via provenance
@@ -109,7 +121,7 @@ inet_step:
                         int _a_live = ma->requires_grad; \
                         int _b_live = mb_p && mb_p->requires_grad; \
                         if (_a_live && _b_live) { \
-                            RETURN_REDUCED(thvm_op(ctx, UOP_ADD, \
+                            GRAD_RETURN(thvm_op(ctx, UOP_ADD, \
                                 GRAD3(at, da_, x), \
                                 GRAD3(bt, db_, x))); \
                         } else if (_a_live) { \
@@ -117,15 +129,15 @@ inet_step:
                         } else if (_b_live) { \
                             Term _bg = GRAD3(bt, db_, x); \
                             if (term_tag(_bg) == TAG_TOP) GRAD_STEP(_bg); \
-                            RETURN_REDUCED(_bg); \
+                            GRAD_RETURN(_bg); \
                         } else { \
-                            RETURN_REDUCED(term_era()); \
+                            GRAD_RETURN(term_era()); \
                         } \
                     } while(0)
                     #define UN_GRAD(da_) do { \
                         Term _ug = GRAD3(at, da_, x); \
                         if (term_tag(_ug) == TAG_TOP) GRAD_STEP(_ug); \
-                        RETURN_REDUCED(_ug); \
+                        GRAD_RETURN(_ug); \
                     } while(0)
 
                     switch (cop) {
@@ -199,7 +211,7 @@ inet_step:
                             Term orig = term_new(TAG_TOP, orig_uop2, orig_loc2);
                             Term unfused = thvm_reduce(ctx, orig);
                             ctx->no_fuse = saved_nf;
-                            RETURN_REDUCED(GRAD3(unfused, gy, x));
+                            GRAD_RETURN(GRAD3(unfused, gy, x));
                         }
                         case UOP_SUM: {
                             Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
@@ -268,7 +280,7 @@ inet_step:
                         }
                         default: {
                             u32 zid = tensor_fill(ctx, my->view.shape, 0.0f);
-                            RETURN_REDUCED(term_ten(zid, my->dtype));
+                            GRAD_RETURN(term_ten(zid, my->dtype));
                         }
                     }
                     #undef GRAD3
@@ -281,12 +293,14 @@ inet_step:
                     heap_set(ctx, loc, yr);
                     return thvm_reduce(ctx, t); // retry with reduced y
                 }
-                RETURN_REDUCED(term_era());
+                GRAD_RETURN(term_era());
+                #undef GRAD_RETURN
             }
 
             // === Phase 3 inet ops ===
 
             if (uop == UOP_ASSIGN) {
+                    Term _dt=heap_read(ctx,loc); Term _st=heap_read(ctx,loc+1);
                 // UOP_ASSIGN(dst, src) — reduce src, blit into dst's buffer in-place
                 Term dst_t = heap_read(ctx, loc);
                 Term src_raw = heap_read(ctx, loc + 1);
@@ -299,13 +313,14 @@ inet_step:
                         ENSURE(ctx, src_id);
                         TensorMeta *md = &ctx->tensors[dst_id];
                         TensorMeta *ms = &ctx->tensors[src_id];
-                        #ifdef __APPLE__
-                        if (md->backend == &metal_backend) {
-                            metal_contiguify(md->buf_id, md->view.numel,
-                                             ms->buf_id, &ms->view);
-                        } else
-                        #endif
-                        {
+                        if (md->backend->buf_copy && ms->view.contiguous &&
+                            ms->view.numel == md->view.numel) {
+                            md->backend->buf_copy(md->buf_id, ms->buf_id,
+                                (u64)md->view.numel * sizeof(f32));
+                        } else if (md->backend->contiguify) {
+                            md->backend->contiguify(md->buf_id, md->view.numel,
+                                                     ms->buf_id, &ms->view);
+                        } else {
                             u64 nbytes = (u64)md->view.numel * sizeof(f32);
                             f32 *src_host = (f32 *)thvm_to_host(ctx, src_t);
                             md->backend->buf_write(md->buf_id, src_host, nbytes);
@@ -512,13 +527,10 @@ inet_step:
                             u32 numel = ma->view.numel;
                             u32 orig_a_id = a_id;
                             u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
-                            #ifdef __APPLE__
-                            if (ma->backend == &metal_backend) {
-                                metal_contiguify(ctx->tensors[mat_id].buf_id, numel,
-                                                 ma->buf_id, &ma->view);
-                            } else
-                            #endif
-                            {
+                            if (ma->backend->contiguify) {
+                                ma->backend->contiguify(ctx->tensors[mat_id].buf_id, numel,
+                                                         ma->buf_id, &ma->view);
+                            } else {
                                 // CPU path: strided gather
                                 f32 *src = malloc(numel * sizeof(f32));
                                 u32 buf_bytes = (ma->view.offset > 0) ? (u32)ma->view.offset : 0;
@@ -653,7 +665,19 @@ inet_step:
                 RETURN_REDUCED(term_era());
             }
 
-            u32 b_id = is_binary ? (u32)term_val(b) : 0;
+            // For reduces, extract axes tensor ID to enable SUM deferral
+            u32 b_id = 0;
+            if (is_binary) {
+                b_id = (u32)term_val(b);
+            } else if (is_reduce) {
+                Term sum_arg = heap_read(ctx, loc + 1);
+                if (term_tag(sum_arg) == TAG_TEN)
+                    b_id = (u32)term_val(sum_arg);
+                else if (term_tag(sum_arg) == TAG_TOP) {
+                    sum_arg = thvm_reduce(ctx, sum_arg);
+                    if (term_tag(sum_arg) == TAG_TEN) b_id = (u32)term_val(sum_arg);
+                }
+            }
             TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
 
 
@@ -751,6 +775,28 @@ inet_step:
                 RETURN_REDUCED(term_ten(dst_id, ma->dtype));
             }
 
+            // Defer reduce when input is deferred, elementwise, unshared.
+            // Defer reduce when input is deferred, elementwise, unshared.
+            if (((uop == UOP_SUM && b_id != 0 && ma->view.shape.rank >= 4) || uop == UOP_RMAX) &&
+                ma->buf_id == 0 && ma->creator_op &&
+                is_elementwise(ma->creator_op) && ma->defer_consumers == 0) {
+                dst_id = ctx->tensor_count++;
+                md = &ctx->tensors[dst_id];
+                memset(md, 0, sizeof(*md));
+                md->dtype = ma->dtype;
+                md->refcount = 1;
+                md->backend = ma->backend;
+                md->view = view_create(shape_of(out_shape, out_ndim));
+                md->creator_op = uop;
+                md->src_ids[0] = a_id;
+                md->src_ids[1] = b_id;
+                md->creator_loc = loc;
+                if (ma->requires_grad) md->requires_grad = 1;
+                ma->defer_consumers++;
+                ctx->itrs++;
+                RETURN_REDUCED(term_ten(dst_id, ma->dtype));
+            }
+
             dst_id = tensor_create(ctx, shape_of(out_shape, out_ndim), ma->dtype);
             md = &ctx->tensors[dst_id];
 
@@ -766,19 +812,30 @@ inet_step:
                 }
             }
 
-            // Defer SUM when input is deferred, unshared, elementwise, with explicit axes.
-            // tensor_materialize fuses the reduce + elementwise chain into one kernel.
-            if (uop == UOP_SUM && ma->buf_id == 0 && ma->creator_op &&
-                is_elementwise(ma->creator_op) && ma->defer_consumers == 0 && b_id != 0) {
-                md->buf_id = 0;
-                md->creator_op = uop;
-                md->src_ids[0] = a_id;
-                md->src_ids[1] = b_id;
-                md->creator_loc = loc;
-                if (ma->requires_grad) md->requires_grad = 1;
-                ma->defer_consumers++;
-                ctx->itrs++;
-                RETURN_REDUCED(term_ten(dst_id, ma->dtype));
+            // Eager reduce fusion: if reduce input is deferred ew, fuse at dispatch time.
+            if (is_reduce && ma->buf_id == 0 && ma->creator_op &&
+                is_elementwise(ma->creator_op)) {
+                // Build ReduceSpec
+                ReduceSpec ers = {0}; ers.reduce_type = uop;
+                Term sum_arg_e = heap_read(ctx, loc + 1);
+                if (term_tag(sum_arg_e) == TAG_TEN || term_tag(sum_arg_e) == TAG_TOP) {
+                    Term axes_e = thvm_reduce(ctx, sum_arg_e);
+                    if (term_tag(axes_e) == TAG_TEN) {
+                        u32 axid = (u32)term_val(axes_e); ENSURE(ctx, axid);
+                        TensorMeta *axt = &ctx->tensors[axid];
+                        f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
+                        for (u32 i=0;i<axt->view.numel;i++) {
+                            u32 ax=(u32)af[i]; if(ax<ma->view.shape.rank) ers.is_reduce[ax]=1;
+                        }
+                    }
+                } else {
+                    for (int d=(int)ma->view.shape.rank-1;d>=0;d--)
+                        if(ma->view.shape.dims[d]>1){ers.is_reduce[d]=1;break;}
+                }
+                if (tensor_materialize_reduce(ctx, a_id, md->buf_id, &ers)) {
+                    ctx->itrs++;
+                    RETURN_REDUCED(term_ten(dst_id, ma->dtype));
+                }
             }
 
             // Materialize lazy inputs before dispatch
@@ -831,20 +888,16 @@ inet_step:
                         }
                     }
 
-                    #ifdef __APPLE__
-                    if ((uop == UOP_SUM || uop == UOP_RMAX) && ma->backend == &metal_backend) {
-                        // Multi-axis reduce via general codegen (handles any strides)
+                    if (ma->backend->dispatch_kernel_rs) {
                         ReduceSpec rs2 = {0};
                         rs2.reduce_type = uop;
                         for (u32 d = 0; d < rank; d++)
                             if (is_ra[d]) rs2.is_reduce[d] = 1;
                         u32 leaf_bufs2[] = { ma->buf_id };
                         const View *leaf_views2[] = { &ma->view };
-                        metal_dispatch_fused_rs(md->buf_id, leaf_bufs2, leaf_views2, 1,
-                                                NULL, 0, &ma->view.shape, &rs2);
-                    } else
-                    #endif
-                    {
+                        ma->backend->dispatch_kernel_rs(md->buf_id, leaf_bufs2, leaf_views2, 1,
+                                                         NULL, 0, &ma->view.shape, &rs2, NULL, NULL, 0);
+                    } else {
                         // CPU fallback: strided iteration
                         u32 in_numel = ma->view.numel;
                         u32 max_buf_idx = (u32)ma->view.offset;
@@ -894,31 +947,23 @@ inet_step:
                     }
                     if (ra < 0) ra = (int)ma->view.shape.rank - 1;
 
-                    #ifdef __APPLE__
-                    if (ma->backend == &metal_backend) {
-                        // All single-axis reduces via general codegen (handles any strides)
+                    if (ma->backend->dispatch_kernel_rs) {
                         ReduceSpec rs = {0};
                         rs.reduce_type = uop;
                         rs.is_reduce[ra] = 1;
                         u32 leaf_bufs[] = { ma->buf_id };
                         const View *leaf_views[] = { &ma->view };
-                        metal_dispatch_fused_rs(md->buf_id, leaf_bufs, leaf_views, 1,
-                                                NULL, 0, &ma->view.shape, &rs);
-                    } else
-                    #endif
-                    {
-                        // Contiguous: use pre-compiled reduce kernel
+                        ma->backend->dispatch_kernel_rs(md->buf_id, leaf_bufs, leaf_views, 1,
+                                                         NULL, 0, &ma->view.shape, &rs, NULL, NULL, 0);
+                    } else {
+                        // CPU: pre-compiled reduce kernel
                         u32 src_numel = ma->view.numel;
                         u32 use_buf = ma->buf_id;
                         if (!ma->view.contiguous) {
-                            // CPU fallback: contiguify
-                            #ifdef __APPLE__
-                            if (ma->backend == &metal_backend) {
+                            if (ma->backend->contiguify) {
                                 use_buf = ma->backend->buf_alloc(src_numel * sizeof(f32));
-                                metal_contiguify(use_buf, src_numel, ma->buf_id, &ma->view);
-                            } else
-                            #endif
-                            {
+                                ma->backend->contiguify(use_buf, src_numel, ma->buf_id, &ma->view);
+                            } else {
                                 u32 max_buf_idx = 0;
                                 for (u32 d = 0; d < ma->view.shape.rank; d++)
                                     if (ma->view.strides[d] > 0)

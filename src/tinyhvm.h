@@ -393,6 +393,13 @@ static inline const View *st_get(u64 heap_loc) {
     return (st_keys[idx] == heap_loc + 1) ? &st_views[idx] : NULL;
 }
 
+// ============================================================
+// Fused Op / ReduceSpec (used by fuser + codegen)
+// ============================================================
+
+typedef struct { u32 uop; u32 arg_a; u32 arg_b; } FusedOp;
+typedef struct { u8 is_reduce[MAX_DIM]; u32 reduce_type; } ReduceSpec;
+
 typedef struct Backend Backend;
 
 typedef struct {
@@ -410,8 +417,13 @@ typedef struct {
     u64         creator_loc; // heap location of the TAG_TOP that created this tensor
 
     // Deferred dispatch: how many deferred ops consume this tensor as input.
-    // When > 0 and buf_id == 0, a second consumer must materialize first.
     u8          defer_consumers;
+
+    // GRAD accumulator: for shared tensors (multiple consumers on loss path),
+    // grad_refs counts expected backward visits. grad_cache accumulates gy
+    // across visits. When grad_refs reaches 0, walk once with combined gy.
+    u16         grad_refs;   // expected GRAD visits remaining (0 = not shared)
+    Term        grad_cache;  // accumulated gy from prior visits (0 = empty)
 
     // Fusion metadata (only when creator_op == UOP_FUSING)
     u64         fusing_loc; // heap loc of the original subnet root TAG_TOP
@@ -457,6 +469,16 @@ struct Backend {
                    u32 M, u32 K, u32 N);
     void  (*op_reduce)(u32 uop, u32 dst, u32 dst_numel,
                        u32 src, u32 src_numel, u32 reduce_dim);
+
+    // Advanced dispatch (optional — NULL means unsupported, fall back to CPU)
+    void  (*dispatch_kernel_rs)(u32 out_buf,
+                                u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+                                FusedOp *ops, u32 n_ops,
+                                const Shape *full_shape, const ReduceSpec *reduce,
+                                u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs);
+    void  (*contiguify)(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view);
+    void  (*buf_copy)(u32 dst_buf, u32 src_buf, u64 nbytes);
+    void  (*buf_read_nosync)(u32 id, void *out, u64 bytes);
 
     // Pool management
     void  (*pool_reset)(u32 keep);

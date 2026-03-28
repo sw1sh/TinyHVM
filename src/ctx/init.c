@@ -4,6 +4,7 @@ TinyHVM *thvm_init(const char *default_device) {
     ctx->heap = calloc(HEAP_CAP, sizeof(Term));
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();  // sentinel: prevent TAG_APP(0) self-loop
+    ctx->tensor_count = 1;      // reserve tensor 0 as sentinel (0 = "no tensor")
 
     // Always register CPU backend
     ctx->backends[THVM_DEV_CPU] = &cpu_backend;
@@ -74,7 +75,12 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
         if (ctx->backends[bi] && ctx->backends[bi]->pool_reset)
             ctx->backends[bi]->pool_reset(keep);
     }
-    ctx->tensor_count = keep;
+    ctx->tensor_count = keep > 0 ? keep : 1; // keep sentinel at 0
+    // Clear grad_refs/grad_cache for preserved tensors (re-counted each step)
+    for (u32 i = 1; i < ctx->tensor_count; i++) {
+        ctx->tensors[i].grad_refs = 0;
+        ctx->tensors[i].grad_cache = 0;
+    }
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();
     // Clear shape tracker — stale entries from old heap locs cause wrong
@@ -251,6 +257,16 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
                 if (va->shape.dims[d] > 1) { out.shape.dims[d] = 1; break; }
             out = view_create(out.shape);
             st_set(loc, &out); stored = 1;
+        }
+
+        // MM: (M, K) @ (K, N) → (M, N)
+        if (!stored && uop == UOP_MM && va) {
+            const View *vb = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
+            if (vb) {
+                Shape os = {.rank = 2, .dims = {va->shape.dims[0], vb->shape.dims[1]}};
+                out = view_create(os);
+                st_set(loc, &out); stored = 1;
+            }
         }
 
         // Elementwise: broadcast if both views available, propagate if one

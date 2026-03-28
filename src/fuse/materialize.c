@@ -446,6 +446,21 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
         temp_bufs[n_leaves + i] = dst_buf;
         temp_views[n_leaves + i] = &ctx->tensors[op_tid].view;
     }
+
+    // CPU: if this was a deferred reduce, dispatch the reduce on the now-materialized input
+    if (reduce_type && n_ops > 0 && m->backend->op_reduce) {
+        // The ew chain was materialized above. walk_tid's buf_id should now be set.
+        TensorMeta *ms = &ctx->tensors[walk_tid];
+        if (ms->buf_id == 0 && n_leaves + n_ops > 0)
+            ms->buf_id = temp_bufs[n_leaves + n_ops - 1];
+        if (ms->buf_id != 0) {
+            u32 reduce_dim = 1;
+            for (int d = (int)ms->view.shape.rank - 1; d >= 0; d--)
+                if (ms->view.shape.dims[d] > 1) { reduce_dim = ms->view.shape.dims[d]; break; }
+            m->backend->op_reduce(reduce_type, m->buf_id, m->view.numel,
+                                   ms->buf_id, ms->view.numel, reduce_dim);
+        }
+    }
 }
 
 // Eager reduce fusion: walk deferred ew chain at `input_tid`, dispatch fused reduce+ew

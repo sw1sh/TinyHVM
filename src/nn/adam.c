@@ -37,13 +37,17 @@ static Adam adam_init(TinyHVM *ctx, f32 lr, u32 n_params) {
 static void adam_add_param(TinyHVM *ctx, Adam *opt, u32 idx, u32 param_id, u32 size) {
     opt->param_ids[idx] = param_id;
     opt->param_sizes[idx] = size;
+    // m/v must match param shape for broadcast compatibility
+    Shape ps = ctx->tensors[param_id].view.shape;
     f32 *zeros = calloc(size, sizeof(f32));
-    opt->m_bufs[idx] = tensor_from(ctx, zeros, SHAPE(size));
-    opt->v_bufs[idx] = tensor_from(ctx, zeros, SHAPE(size));
+    opt->m_bufs[idx] = tensor_from(ctx, zeros, ps);
+    opt->v_bufs[idx] = tensor_from(ctx, zeros, ps);
     free(zeros);
 }
 
-static void adam_step(TinyHVM *ctx, Adam *opt, u32 *grad_ids) {
+// Build lazy Adam update chain — returns a Term to reduce (like SGD).
+// Caller does: thvm_reduce(ctx, adam_step_lazy(ctx, &opt, grad_ids));
+static Term adam_step_lazy(TinyHVM *ctx, Adam *opt, u32 *grad_ids) {
     opt->t++;
     f32 bc1 = 1.0f - powf(opt->beta1, (f32)opt->t);
     f32 bc2 = 1.0f - powf(opt->beta2, (f32)opt->t);
@@ -57,9 +61,8 @@ static void adam_step(TinyHVM *ctx, Adam *opt, u32 *grad_ids) {
     Term t_bc2   = thvm_scalar(ctx, bc2);
     Term t_eps   = thvm_scalar(ctx, opt->eps);
 
-    for (u32 i = 0; i < opt->n_params; i++) {
-        if (grad_ids[i]) ENSURE(ctx, grad_ids[i]);
-
+    Term chain = term_era();
+    for (int i = (int)opt->n_params - 1; i >= 0; i--) {
         Term param = term_new(TAG_TEN, 0, opt->param_ids[i]);
         Term grad  = term_new(TAG_TEN, 0, grad_ids[i]);
         Term m     = term_new(TAG_TEN, 0, opt->m_bufs[i]);
@@ -82,11 +85,12 @@ static void adam_step(TinyHVM *ctx, Adam *opt, u32 *grad_ids) {
         Term step  = thvm_op(ctx, UOP_MUL, t_lr, thvm_op(ctx, UOP_DIV, m_hat, denom));
         Term p_new = thvm_op(ctx, UOP_SUB, param, step);
 
-        // ASSIGN blits computed values back into original buffers
-        thvm_reduce(ctx, thvm_op(ctx, UOP_ASSIGN, m, m_new));
-        thvm_reduce(ctx, thvm_op(ctx, UOP_ASSIGN, v, v_new));
-        thvm_reduce(ctx, thvm_op(ctx, UOP_ASSIGN, param, p_new));
+        // Chain: ASSIGN m, v, param — sequenced via APP
+        chain = thvm_app(ctx, thvm_assign(ctx, m, m_new),
+                thvm_app(ctx, thvm_assign(ctx, v, v_new),
+                thvm_app(ctx, thvm_assign(ctx, param, p_new), chain)));
     }
+    return chain;
 }
 
 static void adam_free(Adam *opt) {

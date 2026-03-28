@@ -5,16 +5,6 @@ static u32 metal_buf_alloc(u64 bytes) {
     u32 id = metal_pool.count++;
     assert(id < MAX_BUFS);
 
-    // Fast path: reuse buffer at this slot from previous step (same layout)
-    if (metal_pool.bufs[id] && metal_pool.sizes[id] >= bytes) {
-        thvm_prof_buf_alloc(bytes);
-        return id;
-    }
-
-    // Release stale buffer if wrong size
-    if (metal_pool.bufs[id]) metal_pool.bufs[id] = nil;
-
-    // Check free list for a matching buffer
     u32 best_idx = UINT32_MAX;
     u64 best_size = UINT64_MAX;
     for (u32 i = 0; i < free_count; i++) {
@@ -82,8 +72,18 @@ static void metal_buf_read(u32 id, void *out, u64 bytes) {
 static void metal_pool_reset(u32 keep) {
     if (batch_dirty) metal_flush();
     u32 buf_keep = keep + 1;
-    // Keep buffers in their slots for reuse by next step (deterministic layout).
-    // metal_buf_alloc checks if the existing buffer at each ID fits.
-    // Only reset the count — no free-list dance, no ARC retain/release.
+    u32 n_free = metal_pool.count - buf_keep;
+    if (n_free == 0) return;
+
+    // Move to free list for reuse (no deallocation)
+    for (u32 i = buf_keep; i < metal_pool.count; i++) {
+        if (metal_pool.bufs[i] && free_count < MAX_FREE_BUFS) {
+            free_list[free_count].buf = metal_pool.bufs[i];
+            free_list[free_count].size = metal_pool.sizes[i];
+            free_count++;
+        }
+        metal_pool.bufs[i] = nil;
+        metal_pool.sizes[i] = 0;
+    }
     metal_pool.count = buf_keep;
 }

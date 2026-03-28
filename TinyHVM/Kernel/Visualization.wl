@@ -3,10 +3,7 @@
 
 (* ── Inet graph from C heap ───────────────────────────────────────────── *)
 
-(* Tag names for display *)
-$tagName = <|0 -> "APP", 1 -> "LAM", 2 -> "VAR", 3 -> "SUP",
-    4 -> "DP0", 5 -> "DP1", 6 -> "ERA", 7 -> "NUM", 8 -> "REF",
-    9 -> "OP2", 10 -> "TEN", 11 -> "TOP", 12 -> "CTR"|>;
+(* $tagName is defined in TinyHVM.wl — do not redefine here *)
 
 (* Tag colors for vertices *)
 $tagColor = <|
@@ -44,14 +41,14 @@ iNodeLabel[tag_, ext_, val_] := Switch[tag,
 
 TINetGraph[t_TTensor, opts___?OptionQ] := TINetGraph[ToTTerm[t], opts];
 TINetGraph[t_TTerm, opts___?OptionQ] := Module[
-    {ds, nodesRaw, edgesRaw, nNodes, nEdges, verts, edges, labels, colors, i,
+    {raw, nNodes, nEdges, nodesRaw, edgesRaw, verts, edges, labels, colors, i,
      tag, ext, val},
     loadLibrary[];
-    ds = thvmHeapGraphFn[t[[1]]];
-    nodesRaw = Normal[ds["Nodes"]];
-    edgesRaw = Normal[ds["Edges"]];
-    nNodes = Length[nodesRaw] / 3;
-    nEdges = Length[edgesRaw] / 2;
+    raw = Round[Normal[thvmHeapGraphFn[t[[1]]]]];
+    nNodes = raw[[1]];
+    nEdges = raw[[2]];
+    nodesRaw = raw[[3 ;; 2 + nNodes * 3]];
+    edgesRaw = raw[[3 + nNodes * 3 ;; 2 + nNodes * 3 + nEdges * 2]];
 
     (* Build vertices with labels and colors *)
     verts = Range[nNodes] - 1; (* 0-indexed *)

@@ -383,7 +383,7 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
 
     (* Heap graph visualization *)
     thvmHeapGraphFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapGraph",
-        {Integer}, "DataStore"];
+        {Integer}, LibraryDataType[NumericArray]];
 
     (* Interaction tracing & step reduction *)
     thvmTraceEnableFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmTraceEnable",
@@ -521,15 +521,17 @@ TToDevice[t_TTensor, device_String] := Module[{out = allocId[], devIdx},
 ];
 
 (* ════════════════════════════════════════════════════════════════════════ *)
-(* TTensor property access via Part UpValues                               *)
+(* TTensor property access via SubValues                                   *)
 (* ════════════════════════════════════════════════════════════════════════ *)
 
-TTensor /: TTensor[id_][["Shape"]]        := TDimensions[TTensor[id]];
-TTensor /: TTensor[id_][["Device"]]       := TDevice[TTensor[id]];
-TTensor /: TTensor[id_][["View"]]         := TView[TTensor[id]];
-TTensor /: TTensor[id_][["Materialized"]] := TTermTag[TTensor[id]] === "Ten";
-TTensor /: TTensor[id_][["Lazy"]]         := TTermTag[TTensor[id]] === "Top";
-TTensor /: TTensor[id_][["Op"]]           := With[{tag = TTermTag[TTensor[id]]},
+TTensor[id_Integer]["Shape"]        := TDimensions[TTensor[id]];
+TTensor[id_Integer]["Device"]       := TDevice[TTensor[id]];
+TTensor[id_Integer]["DType"]        := TDType[TTensor[id]];
+TTensor[id_Integer]["View"]         := TView[TTensor[id]];
+TTensor[id_Integer]["Contiguous"]   := TView[TTensor[id]]["Contiguous"];
+TTensor[id_Integer]["Materialized"] := TTermTag[TTensor[id]] === "Ten";
+TTensor[id_Integer]["Lazy"]         := TTermTag[TTensor[id]] === "Top";
+TTensor[id_Integer]["Op"]           := With[{tag = TTermTag[TTensor[id]]},
     If[tag === "Top", Lookup[$uopName, TTermExt[TTensor[id]], "Unknown"], None]
 ];
 
@@ -757,15 +759,15 @@ TLamSetBody[lam_TTerm, body_TTerm] := (loadLibrary[]; thvmLamSetBodyFn[lam[[1]],
 (* UpValues — natural WL syntax on TTensor                                 *)
 (* ════════════════════════════════════════════════════════════════════════ *)
 
-TTensor /: Plus[a_TTensor, b_TTensor] := TOp["Add"][a, b];
+TTensor /: Plus[a_TTensor, b_TTensor]  := TOp["Add"][a, b];
 TTensor /: Times[a_TTensor, b_TTensor] := TOp["Mul"][a, b];
-TTensor /: Subtract[a_TTensor, b_TTensor] := TOp["Sub"][a, b];
-TTensor /: Dot[a_TTensor, b_TTensor] := TOp["MatMul"][a, b];
-TTensor /: Divide[a_TTensor, b_TTensor] := TOp["Div"][a, b];
-TTensor /: Sqrt[t_TTensor] := TOp["Sqrt"][t];
-TTensor /: Exp[t_TTensor] := TOp["Exp"][t];
-TTensor /: Log[t_TTensor] := TOp["Log"][t];
-TTensor /: Minus[t_TTensor] := TOp["Neg"][t];
+TTensor /: Times[-1, t_TTensor]        := TOp["Neg"][t];
+TTensor /: Times[-1., t_TTensor]       := TOp["Neg"][t];
+TTensor /: Dot[a_TTensor, b_TTensor]   := TOp["MatMul"][a, b];
+TTensor /: Power[t_TTensor, Rational[1, 2]] := TOp["Sqrt"][t];
+TTensor /: Sqrt[t_TTensor]  := TOp["Sqrt"][t];
+TTensor /: Exp[t_TTensor]   := TOp["Exp"][t];
+TTensor /: Log[t_TTensor]   := TOp["Log"][t];
 
 (* ════════════════════════════════════════════════════════════════════════ *)
 (* Formatting — TTensor summary boxes                                      *)
@@ -893,7 +895,7 @@ TTraceClear[]   := (loadLibrary[]; thvmTraceClearFn[]);
 
 TTrace[] := Module[{raw, n},
     loadLibrary[];
-    raw = Normal[thvmTraceDataFn[]];
+    raw = Round[Normal[thvmTraceDataFn[]]];
     n = Length[raw] / 5;
     Table[<|
         "BeforeTag" -> Lookup[$tagName, raw[[5 i - 4]], "?"],

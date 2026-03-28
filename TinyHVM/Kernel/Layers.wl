@@ -82,22 +82,22 @@ iLayerOutputShape[TLayer[assoc_], shape_] := Switch[assoc["Type"],
 
 (* --- Unevaluated WL layer specs (NN framework not loaded) --- *)
 
-iCompileSpec[ConvolutionLayer[outC_Integer, {k_Integer, k2_Integer}], {inC_, h_, w_}] :=
+iCompileSpec[HoldPattern[ConvolutionLayer[outC_Integer, {k_Integer, k2_Integer}]], {inC_, h_, w_}] :=
     {TConvLayer[inC, outC, k], {outC, h - k + 1, w - k2 + 1}};
-iCompileSpec[ConvolutionLayer[outC_Integer, k_Integer], shape_] :=
+iCompileSpec[HoldPattern[ConvolutionLayer[outC_Integer, k_Integer]], shape_] :=
     iCompileSpec[ConvolutionLayer[outC, {k, k}], shape];
 
-iCompileSpec[LinearLayer[outF_Integer], {inF_}] :=
+iCompileSpec[HoldPattern[LinearLayer[outF_Integer]], {inF_}] :=
     {TLinearLayer[inF, outF], {outF}};
 
-iCompileSpec[ElementwiseLayer[Ramp], shape_] := {TActivation["Relu"], shape};
-iCompileSpec[ElementwiseLayer["ReLU" | "Relu"], shape_] := {TActivation["Relu"], shape};
+iCompileSpec[HoldPattern[ElementwiseLayer[Ramp]], shape_] := {TActivation["Relu"], shape};
+iCompileSpec[HoldPattern[ElementwiseLayer["ReLU" | "Relu"]], shape_] := {TActivation["Relu"], shape};
 
-iCompileSpec[FlattenLayer[], shape_] := {TFlattenLayer[], {Times @@ shape}};
+iCompileSpec[HoldPattern[FlattenLayer[]], shape_] := {TFlattenLayer[], {Times @@ shape}};
 
-iCompileSpec[PoolingLayer[{k_Integer, k2_Integer}, ___], {c_, h_, w_}] :=
+iCompileSpec[HoldPattern[PoolingLayer[{k_Integer, k2_Integer}, ___]], {c_, h_, w_}] :=
     {TMaxPoolLayer[k], {c, Floor[h/k], Floor[w/k2]}};
-iCompileSpec[PoolingLayer[k_Integer, rest___], shape_] :=
+iCompileSpec[HoldPattern[PoolingLayer[k_Integer, rest___]], shape_] :=
     iCompileSpec[PoolingLayer[{k, k}, rest], shape];
 
 (* --- Evaluated WL layer objects (NN framework loaded) --- *)

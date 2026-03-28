@@ -1,63 +1,50 @@
-# TinyHVM build artifacts
+# Build outputs
+/bin/
 *.o
 *.dSYM/
-tinyhvm
-tinyhvm_cpu
-test_term
-test_reduce
-test_basic
+shaders.metallib
+
+# Compiled test binaries (root level, legacy)
+/test_*
+!/test/
+/tinyhvm
+/tinyhvm_cpu
+/debug_*
+/beautiful_mnist*
+
+# External repos (symlinked)
+/HVM/
+/HVM4/
+/tinygrad/
+/tinyspec/
+
+# Data
+/data/
 
 # OS
 .DS_Store
+Thumbs.db
 
-# AG / Antigravity
-.gemini/
-.agent/
-.agents/
+# Wolfram
+*.nb
+*.mx
+*.wl.bak
 
-# Temp / scratch
-/tmp/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp
 *.tmp
 *.swp
 *~
 
-# Symlinked reference repos (not tracked)
-/HVM
-/HVM4
-/tinygrad
-test_train
-test_metal
-shaders.metallib
-data/
-test_mnist
-test_mnist_cnn
-beautiful_mnist
-tinyspec/
-beautiful_mnist_debug
-test_mlp_grad
-test_mlp_cpu
-test_grad_check
-test_low_lr
+# Logs
+*.log
 
-# Debug/ASAN test binaries
-test_term_dbg
-test_term_asan*
-test_term_pre
-test_term_dbg
-test_train_dbg
-test_term_dbg
-test_mnist_cpu
-test_mnist_metal
-debug_cnn
-debug_grad
-test_mnist
-test/debug_*.m
-test/bench_*.m
-test/bench_*.py
-test/test_conv.m
+# AI agents
+.gemini/
+.agent/
+.agents/
 .claude/worktrees/
-test_bn_grad
-test_mnist_asan
-test_mnist_dbg
-bn_debug.log
-*.nb

@@ -2,6 +2,10 @@ CC      = clang
 CFLAGS  = -O2 -Wall -Wextra -std=c11
 FW      = -framework Metal -framework MetalPerformanceShaders \
           -framework Foundation -framework Accelerate
+BIN     = bin
+
+$(BIN):
+	mkdir -p $(BIN)
 
 # Metal shader compilation
 shaders.metallib: src/shaders.metal
@@ -9,23 +13,23 @@ shaders.metallib: src/shaders.metal
 	xcrun -sdk macosx metallib /tmp/shaders.air -o shaders.metallib
 
 # Tests — CPU (default DEVICE="cpu")
-test: test/test_term.m src/tinyhvm.c src/tinyhvm.h src/gpu_cpu.c src/gpu_metal.m
-	$(CC) $(CFLAGS) $(FW) -o test_term test/test_term.m && ./test_term
+test: $(BIN) test/test_term.m src/tinyhvm.c src/tinyhvm.h
+	$(CC) $(CFLAGS) $(FW) -o $(BIN)/test_term test/test_term.m && $(BIN)/test_term
 
-# Tests — Metal (override DEVICE)
-test_metal: shaders.metallib test/test_term.m src/tinyhvm.c src/tinyhvm.h src/gpu_cpu.c src/gpu_metal.m
-	$(CC) $(CFLAGS) $(FW) -DDEVICE='"metal"' -o test_term test/test_term.m && ./test_term
+# Tests — Metal
+test_metal: shaders.metallib $(BIN) test/test_term.m src/tinyhvm.c src/tinyhvm.h
+	$(CC) $(CFLAGS) $(FW) -DDEVICE='"metal"' -o $(BIN)/test_term test/test_term.m && $(BIN)/test_term
 
 # Training — CPU
-test_train: test/test_train.m src/tinyhvm.c src/tinyhvm.h src/gpu_cpu.c src/gpu_metal.m
-	$(CC) $(CFLAGS) $(FW) -o test_train test/test_train.m && ./test_train
+test_train: $(BIN) test/test_train.m src/tinyhvm.c src/tinyhvm.h
+	$(CC) $(CFLAGS) $(FW) -o $(BIN)/test_train test/test_train.m && $(BIN)/test_train
 
 # Training — Metal
-test_train_metal: shaders.metallib test/test_train.m src/tinyhvm.c src/tinyhvm.h src/gpu_cpu.c src/gpu_metal.m
-	$(CC) $(CFLAGS) $(FW) -DDEVICE='"metal"' -o test_train test/test_train.m && ./test_train
+test_train_metal: shaders.metallib $(BIN) test/test_train.m src/tinyhvm.c src/tinyhvm.h
+	$(CC) $(CFLAGS) $(FW) -DDEVICE='"metal"' -o $(BIN)/test_train test/test_train.m && $(BIN)/test_train
 
 clean:
-	rm -f test_term test_train shaders.metallib
+	rm -rf $(BIN) shaders.metallib
 	rm -rf *.dSYM
 
 .PHONY: test test_metal test_train test_train_metal clean

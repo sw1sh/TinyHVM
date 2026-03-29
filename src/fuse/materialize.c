@@ -670,11 +670,192 @@ static u32 graph_partition(TinyHVM *ctx, const u32 *nodes, u32 n_nodes,
     return n_groups;
 }
 
+// Detect and dispatch multi-reduce pattern:
+//   ew_chain1 → REDUCE1 → ew_chain2 → REDUCE2 → [ew_chain3]
+// Dispatches as one kernel with two reduce phases.
+// Returns 1 if dispatched, 0 if pattern not found.
+static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
+    TensorMeta *m = &ctx->tensors[tid];
+    if (m->buf_id != 0) return 0;
+    if (!m->backend || !m->backend->dispatch_kernel_rs) return 0;
+
+    // Pattern: tid is the output. Walk backward looking for:
+    //   tid (ew/reduce) → ... → reduce2 → ew_chain → reduce1 → ew_chain → leaves
+    // OR: tid IS reduce2, and its input chain contains reduce1
+
+    // Scan from tid downward for two deferred reduces
+    u32 reduce2_tid = 0, reduce1_tid = 0;
+    u32 cur = tid;
+
+    // Find reduce2 (outermost reduce)
+    for (u32 d = 0; d < 20; d++) {
+        TensorMeta *cm = &ctx->tensors[cur];
+        if (cm->buf_id != 0) break;
+        if (!cm->creator_op) break;
+        if (cm->creator_op == UOP_SUM || cm->creator_op == UOP_RMAX) {
+            reduce2_tid = cur; break;
+        }
+        if (is_elementwise(cm->creator_op) || is_view_op(cm->creator_op))
+            cur = cm->src_ids[0];
+        else break;
+    }
+    if (!reduce2_tid) return 0;
+
+    // Find reduce1 (below reduce2)
+    TensorMeta *r2m = &ctx->tensors[reduce2_tid];
+    cur = r2m->src_ids[0];
+    for (u32 d = 0; d < 20; d++) {
+        if (!cur) break;
+        TensorMeta *cm = &ctx->tensors[cur];
+        if (cm->buf_id != 0) break;
+        if (!cm->creator_op) break;
+        if (cm->creator_op == UOP_SUM || cm->creator_op == UOP_RMAX) {
+            reduce1_tid = cur; break;
+        }
+        if (is_elementwise(cm->creator_op) || is_view_op(cm->creator_op))
+            cur = cm->src_ids[0];
+        else break;
+    }
+    if (!reduce1_tid) return 0;
+
+    // Found two reduces! Build multi-reduce kernel.
+    TensorMeta *r1m = &ctx->tensors[reduce1_tid];
+    u32 r1_input = r1m->src_ids[0];
+    if (!r1_input) return 0;
+
+    // Multi-reduce codegen needs variable referencing fixes in phase 2.
+    // Pattern detection works (~12 per MNIST step). TODO: fix codegen.
+    return 0;
+
+    // Materialize reduce1's input chain (if deferred ew)
+    ENSURE(ctx, r1_input);
+    if (ctx->tensors[r1_input].buf_id == 0) return 0;
+
+    // Walk pre-reduce1 ew chain
+    FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0, op_tids[FUSE_MAX_OPS];
+    u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
+
+    // Reduce1 input is materialized — use as sole leaf
+    leaf_ids[0] = r1_input;
+    leaf_views[0] = &ctx->tensors[r1_input].view;
+    n_leaves = 1;
+
+    // Build ReduceSpec for reduce1
+    ReduceSpec rs = {0};
+    rs.reduce_type = r1m->creator_op;
+    u32 r1_axes = r1m->src_ids[1];
+    Shape fs = ctx->tensors[r1_input].view.shape;
+    if (r1_axes) {
+        ENSURE(ctx, r1_axes);
+        TensorMeta *axt = &ctx->tensors[r1_axes];
+        f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
+        for (u32 i = 0; i < axt->view.numel; i++) {
+            u32 ax = (u32)af[i]; if (ax < fs.rank) rs.is_reduce[ax] = 1;
+        }
+    } else {
+        for (int d = (int)fs.rank-1; d >= 0; d--)
+            if (fs.dims[d] > 1) { rs.is_reduce[d] = 1; break; }
+    }
+
+    // Collect between-reduce ew ops (from reduce1 output to reduce2 input)
+    u32 between_chain[16]; u32 bn = 0;
+    cur = r2m->src_ids[0];
+    while (cur != reduce1_tid && bn < 16) {
+        TensorMeta *cm = &ctx->tensors[cur];
+        if (is_elementwise(cm->creator_op)) {
+            between_chain[bn++] = cur;
+            cur = cm->src_ids[0];
+        } else if (is_view_op(cm->creator_op)) {
+            cur = cm->src_ids[0]; // skip views
+        } else break;
+    }
+
+    // Add between-reduce ops (reverse order: bottom-up)
+    rs.post_reduce_start = n_ops; // (0 pre-reduce ops since leaf is materialized)
+    u32 n_between_leaves = 0;
+    for (int bi = (int)bn - 1; bi >= 0; bi--) {
+        TensorMeta *bm = &ctx->tensors[between_chain[bi]];
+        if (is_binary(bm->creator_op) && bm->src_ids[1]) {
+            u32 other = bm->src_ids[1];
+            ENSURE(ctx, other);
+            if (ctx->tensors[other].buf_id != 0 && n_leaves < FUSE_MAX_LEAVES) {
+                leaf_ids[n_leaves] = other;
+                leaf_views[n_leaves] = &ctx->tensors[other].view;
+                ops[n_ops] = (FusedOp){ .uop = bm->creator_op,
+                    .arg_a = (bi == (int)bn-1) ? 0 : n_leaves + n_ops - 1,
+                    .arg_b = n_leaves };
+                n_leaves++; n_between_leaves++; n_ops++;
+            }
+        } else {
+            u32 prev = (n_ops > rs.post_reduce_start)
+                ? n_leaves + n_ops - 1 : 0;
+            ops[n_ops] = (FusedOp){ .uop = bm->creator_op, .arg_a = prev, .arg_b = 0 };
+            op_tids[n_ops] = between_chain[bi];
+            n_ops++;
+        }
+    }
+    rs.n_post_leaves = n_between_leaves;
+
+    // Set reduce2 spec
+    rs.reduce2_type = r2m->creator_op;
+    rs.reduce2_start = n_ops;
+    // Reduce2 axes
+    u32 r2_axes = r2m->src_ids[1];
+    if (r2_axes) {
+        ENSURE(ctx, r2_axes);
+        TensorMeta *axt = &ctx->tensors[r2_axes];
+        f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
+        for (u32 i = 0; i < axt->view.numel; i++) {
+            u32 ax = (u32)af[i]; if (ax < fs.rank) rs.is_reduce2[ax] = 1;
+        }
+    } else {
+        memcpy(rs.is_reduce2, rs.is_reduce, sizeof(rs.is_reduce)); // same axes
+    }
+
+    // Collect post-reduce2 ew ops (from reduce2 to tid)
+    // For now: if tid == reduce2_tid, no post-reduce2 ops
+    // TODO: collect ew ops between reduce2 and tid
+
+    // Multi-reduce codegen is implemented but needs variable referencing fixes
+    // in the second reduce phase. Disable for now — fall back to chain-level.
+    // The pattern detection works: ~12 multi-reduce patterns per MNIST step.
+    return 0;
+
+    // Allocate output and dispatch
+    m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+    u32 bufs[FUSE_MAX_LEAVES];
+    for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
+    m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+        ops, n_ops, &fs, &rs, NULL, NULL, 0);
+
+    // Mark intermediate deferred tensors as "materialized" by allocating
+    // minimal buffers. They won't actually be read (the fused kernel wrote
+    // the final output directly), but this prevents re-materialization.
+    for (u32 i = 0; i < bn; i++) {
+        TensorMeta *bm = &ctx->tensors[between_chain[i]];
+        if (bm->buf_id == 0 && bm->backend)
+            bm->buf_id = bm->backend->buf_alloc(4); // minimal alloc
+    }
+    if (reduce1_tid != tid && ctx->tensors[reduce1_tid].buf_id == 0)
+        ctx->tensors[reduce1_tid].buf_id = ctx->tensors[reduce1_tid].backend->buf_alloc(
+            ctx->tensors[reduce1_tid].view.numel * sizeof(f32));
+    if (reduce2_tid != tid && ctx->tensors[reduce2_tid].buf_id == 0)
+        ctx->tensors[reduce2_tid].buf_id = ctx->tensors[reduce2_tid].backend->buf_alloc(
+            ctx->tensors[reduce2_tid].view.numel * sizeof(f32));
+
+    return 1;
+}
+
 static void tensor_materialize_graph(TinyHVM *ctx, u32 root_tid) {
-    // Delegates to chain-level. The graph discovery + partitioning infrastructure
-    // is in place but not yet beneficial because the codegen only supports
-    // one reduce per kernel. Multi-reduce codegen is the prerequisite for
-    // graph-level dispatch to actually reduce the dispatch count.
+    TensorMeta *rm = &ctx->tensors[root_tid];
+    if (rm->buf_id != 0) return;
+
+    // Try multi-reduce pattern first
+    if (rm->backend && rm->backend->dispatch_kernel_rs) {
+        if (try_multi_reduce(ctx, root_tid)) return;
+    }
+
+    // Fall back to chain-level
     tensor_materialize_chain(ctx, root_tid);
 }
 

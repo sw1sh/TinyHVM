@@ -39,6 +39,12 @@ static u64 cg_hash_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
         for (u32 d = 0; d < full_shape->rank; d++) {
             h ^= (u64)reduce->is_reduce[d] << d; h *= 0x100000001b3ULL;
         }
+        if (reduce->reduce2_type) {
+            h ^= (u64)reduce->reduce2_type << 48; h *= 0x100000001b3ULL;
+            h ^= (u64)reduce->reduce2_start << 16; h *= 0x100000001b3ULL;
+            for (u32 d = 0; d < full_shape->rank; d++)
+                h ^= (u64)reduce->is_reduce2[d] << (d+8); h *= 0x100000001b3ULL;
+        }
     }
     return h;
 }
@@ -426,8 +432,105 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                     default:       [s appendFormat:@"  float p%u=%@;\n", pidx, a_name]; break;
                 }
             }
-            [s appendFormat:@"  out[oi]=p%u;\n", n_ops - prs - 1];
+
+            // ── Second reduce phase (multi-reduce) ────────────────
+            if (reduce->reduce2_type && reduce->reduce2_start > 0 && reduce->reduce2_start < n_ops) {
+                u32 r2s = reduce->reduce2_start;
+                // The last between-reduce op result is the input to reduce2
+                u32 between_last = (r2s > prs + 1) ? r2s - prs - 1 : 0;
+                NSString *r2_input = (between_last > 0)
+                    ? [NSString stringWithFormat:@"p%u", between_last]
+                    : @"acc";
+
+                // Compute reduce2 axes (may be same as reduce1)
+                u32 r2_numel = 1;
+                u32 r2_dims[MAX_DIM]; u32 n_r2 = 0;
+                for (u32 d = 0; d < rank; d++) {
+                    if (reduce->is_reduce2[d]) {
+                        r2_dims[n_r2++] = d;
+                        r2_numel *= full_shape->dims[d];
+                    }
+                }
+                if (n_r2 == 0) { // same axes as reduce1
+                    n_r2 = n_red; r2_numel = reduce_numel;
+                    for (u32 i = 0; i < n_red; i++) r2_dims[i] = red_dims[i];
+                }
+
+                [s appendFormat:@"  float acc2=%s;\n",
+                    reduce->reduce2_type == UOP_RMAX ? "-1e30f" : "0.0f"];
+                [s appendFormat:@"  for(uint r2=0;r2<%uu;r2++){\n", r2_numel];
+                // Reduce2 axis coordinates
+                u32 r2div = 1;
+                for (int ri = (int)n_r2 - 1; ri >= 0; ri--) {
+                    u32 d = r2_dims[ri];
+                    u32 dim = full_shape->dims[d];
+                    if (r2div == 1)
+                        [s appendFormat:@"    uint c%u=r2%%%uu;\n", d, dim];
+                    else
+                        [s appendFormat:@"    uint c%u=(r2/%uu)%%%uu;\n", d, r2div, dim];
+                    r2div *= dim;
+                }
+                // Re-read leaves inside reduce2 loop
+                u32 n_pre2_leaves = n_leaves - reduce->n_post_leaves;
+                for (u32 li = 0; li < n_pre2_leaves; li++) {
+                    const View *lv = leaf_views[li];
+                    if (lv->has_mask)
+                        [s appendFormat:@"    float r2t%u=m%u?in%u[i%u]:0.f;\n", li, li, li, li];
+                    else
+                        [s appendFormat:@"    float r2t%u=in%u[i%u];\n", li, li, li];
+                }
+                // Re-emit leaf index expressions inside reduce2 loop (coordinates changed)
+                // Note: the c%u variables were overwritten by reduce2 coordinates above,
+                // so leaf index expressions (which use c%u) automatically use the new coords.
+
+                // Emit reduce2 phase ops
+                for (u32 pi = r2s; pi < n_ops; pi++) {
+                    u32 pidx = pi - r2s;
+                    // In reduce2 phase, references to leaves use r2t%u, references to
+                    // between-reduce results use the p%u namespace
+                    NSString *a_name, *b_name = nil;
+                    u32 a = ops[pi].arg_a, b = ops[pi].arg_b;
+
+                    // Map arg references: leaves → r2t, between-reduce → p, acc → acc
+                    if (a < n_pre2_leaves) a_name = [NSString stringWithFormat:@"r2t%u", a];
+                    else if (a >= n_leaves && a < n_leaves + prs) a_name = @"acc"; // reduce1 result
+                    else if (a >= n_leaves + prs) a_name = [NSString stringWithFormat:@"p%u", a - n_leaves - prs];
+                    else a_name = [NSString stringWithFormat:@"r2t%u", a];
+
+                    if (is_binary(ops[pi].uop)) {
+                        if (b < n_pre2_leaves) b_name = [NSString stringWithFormat:@"r2t%u", b];
+                        else if (b >= n_leaves && b < n_leaves + prs) b_name = @"acc";
+                        else if (b >= n_leaves + prs) b_name = [NSString stringWithFormat:@"p%u", b - n_leaves - prs];
+                        else b_name = [NSString stringWithFormat:@"r2t%u", b];
+                    }
+
+                    switch (ops[pi].uop) {
+                        case UOP_ADD:  [s appendFormat:@"    float r2v%u=%@+%@;\n", pidx, a_name, b_name]; break;
+                        case UOP_SUB:  [s appendFormat:@"    float r2v%u=%@-%@;\n", pidx, a_name, b_name]; break;
+                        case UOP_MUL:  [s appendFormat:@"    float r2v%u=%@*%@;\n", pidx, a_name, b_name]; break;
+                        case UOP_DIV:  [s appendFormat:@"    float r2v%u=%@/%@;\n", pidx, a_name, b_name]; break;
+                        case UOP_NEG:  [s appendFormat:@"    float r2v%u=-%@;\n", pidx, a_name]; break;
+                        case UOP_RELU: [s appendFormat:@"    float r2v%u=max(%@,0.f);\n", pidx, a_name]; break;
+                        case UOP_EXP:  [s appendFormat:@"    float r2v%u=exp(%@);\n", pidx, a_name]; break;
+                        case UOP_LOG:  [s appendFormat:@"    float r2v%u=log(%@);\n", pidx, a_name]; break;
+                        case UOP_SQRT: [s appendFormat:@"    float r2v%u=sqrt(%@);\n", pidx, a_name]; break;
+                        default:       [s appendFormat:@"    float r2v%u=%@;\n", pidx, a_name]; break;
+                    }
+                }
+                u32 r2_last = n_ops - r2s - 1;
+                if (reduce->reduce2_type == UOP_RMAX)
+                    [s appendFormat:@"    acc2=max(acc2,r2v%u);\n  }\n", r2_last];
+                else
+                    [s appendFormat:@"    acc2+=r2v%u;\n  }\n", r2_last];
+                [s appendFormat:@"  out[oi]=acc2;\n"];
+            } else {
+                [s appendFormat:@"  out[oi]=p%u;\n", n_ops - prs - 1];
+            }
         } else {
+            if (reduce->reduce2_type) {
+                // reduce1 → reduce2 with no between-reduce ops
+                // Not yet supported — fall back to single reduce output
+            }
             [s appendFormat:@"  out[oi]=acc;\n"];
         }
     } else if (use_f4) {

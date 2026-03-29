@@ -414,6 +414,13 @@ typedef struct {
     u32 reduce_type;
     u32 post_reduce_start; // index into ops[] where post-reduce ops begin (0 = no post-reduce)
     u32 n_post_leaves;     // number of post-reduce-only leaves (appended after pre-reduce leaves)
+    // Multi-reduce: second reduce phase (0 = single reduce)
+    // Layout: ops[0..post_reduce_start-1] = pre-reduce1
+    //         ops[post_reduce_start..reduce2_start-1] = between-reduce ew
+    //         ops[reduce2_start..n_ops-1] = pre-reduce2 + post-reduce2
+    u32 reduce2_type;      // 0 = single reduce, else UOP_SUM/UOP_RMAX
+    u32 reduce2_start;     // first op index for reduce2 phase
+    u8 is_reduce2[MAX_DIM]; // reduce axes for phase 2 (may differ from phase 1)
 } ReduceSpec;
 
 typedef struct Backend Backend;

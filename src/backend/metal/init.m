@@ -52,7 +52,7 @@ static int                          batch_dirty;
 
 typedef struct {
     id<MTLComputePipelineState> pipe;
-    u32 buf_slots[16]; u32 n_bufs;
+    u32 buf_slots[24]; u32 n_bufs;
     u8 params[JIT_MAX_PARAMS]; u32 param_sizes[8]; u32 n_params;
     u32 grid[3]; u32 tg[3]; u8 is_mps;
     u32 mps_m, mps_k, mps_n, mps_dst_slot, mps_a_slot, mps_b_slot;
@@ -66,6 +66,11 @@ typedef struct {
     u64 alloc_size; u32 buf_id; u8 persistent;
 } JITSlot;
 
+// Small constant data saved during capture for ephemeral buffers
+#define JIT_MAX_CONST 512
+#define JIT_CONST_MAX_BYTES 1024  // save buffers up to 1KB
+typedef struct { u32 slot; u32 size; u8 data[1024]; } JITConst;
+
 typedef struct {
     JITCmd cmds[JIT_MAX_CMDS]; u32 n_cmds;
     JITSlot slots[JIT_MAX_SLOTS]; u32 n_slots;
@@ -73,12 +78,16 @@ typedef struct {
     enum { JIT_OFF, JIT_CAPTURE, JIT_REPLAY } state;
     u32 loss_slot;
     u8  ephemeral_ready;  // 1 after first replay allocates ephemeral buffers
+    // Constant data for ephemeral scalar buffers (CPU-written, no GPU command)
+    JITConst consts[JIT_MAX_CONST]; u32 n_consts;
 } JITState;
 
 static JITState jit = {0};
 
 // JIT function forward declarations (implementation in jit.m)
 static u32  jit_slot_for_buf(u32 buf_id);
+static void jit_record_dispatch_ids(id<MTLComputePipelineState>, u32*, u32,
+                                      const void**, u64*, u32, u32,u32,u32, u32,u32,u32);
 static void jit_record_dispatch_1d(id<MTLComputePipelineState>, id<MTLBuffer>*, u32,
                                      const void**, u64*, u32, u32,u32,u32, u32,u32,u32);
 static void jit_record_mps(u32, u32, u32, u32, u32, u32, BOOL, BOOL, u32, u32, u32, u32);

@@ -16,6 +16,8 @@ typedef struct {
     u32 *param_sizes;
     u32 *m_bufs;
     u32 *v_bufs;
+    // For JIT: tensor IDs of bias correction scalars (updated between replays)
+    u32 bc1_tid, bc2_tid;
 } Adam;
 
 static Adam adam_init(TinyHVM *ctx, f32 lr, u32 n_params) {
@@ -59,6 +61,8 @@ static Term adam_step_lazy(TinyHVM *ctx, Adam *opt, u32 *grad_ids) {
     Term t_lr    = thvm_scalar(ctx, opt->lr);
     Term t_bc1   = thvm_scalar(ctx, bc1);
     Term t_bc2   = thvm_scalar(ctx, bc2);
+    opt->bc1_tid = (u32)term_val(t_bc1);
+    opt->bc2_tid = (u32)term_val(t_bc2);
     Term t_eps   = thvm_scalar(ctx, opt->eps);
 
     Term chain = term_era();

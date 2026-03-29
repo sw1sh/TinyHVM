@@ -38,14 +38,25 @@ static void metal_buf_free(u32 id) {
 }
 
 static void metal_buf_write(u32 id, const void *data, u64 bytes) {
-    // Shared memory: CPU writes are visible to GPU.
-    // Only need to flush if writing to a buffer that GPU is currently reading.
-    // For newly allocated buffers (most common case during backward),
-    // no flush needed — GPU hasn't seen the buffer yet.
-    // TODO: track per-buffer GPU usage for precise flushing.
-    // For now, skip flush entirely — Metal shared memory is coherent on Apple Silicon.
     memcpy(metal_pool.bufs[id].contents, data, bytes);
     thvm_prof_buf_write(bytes);
+    // JIT: save CPU-written constant data for ephemeral buffers.
+    // Save by buf_id (slot mapping done later at jit_end_capture).
+    if (jit.state == JIT_CAPTURE && bytes <= JIT_CONST_MAX_BYTES &&
+        id >= jit.persistent_count && jit.n_consts < JIT_MAX_CONST) {
+        // Save FIRST write only (keyed by buf_id via slot field temporarily)
+        int already = 0;
+        for (u32 ci = 0; ci < jit.n_consts; ci++)
+            if (jit.consts[ci].slot == id) { already = 1; break; } // slot = buf_id temporarily
+        if (!already) {
+            JITConst *c = &jit.consts[jit.n_consts++];
+            c->slot = id; // TEMPORARY: buf_id, mapped to slot at end_capture
+            c->size = (u32)bytes;
+            memcpy(c->data, data, bytes);
+        }
+    }
+    if (0 && jit.state == JIT_CAPTURE && id >= jit.persistent_count) { // disabled
+    }
 }
 
 // Read without flushing — safe for CPU-written metadata that GPU hasn't touched.

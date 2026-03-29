@@ -37,19 +37,16 @@ void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
         rp.reduce_strides_b[i] = reduce_strides_b[i];
         rp.reduce_numel *= reduce_dims[i];
     }
-    id<MTLBuffer> mbufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a_buf], metal_pool.bufs[b_buf] };
+    u32 mrs_ids[] = {dst, a_buf, b_buf};
     const void *params[] = { &avp, &bvp, &ovp, &rp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams), sizeof(ViewParams), sizeof(MulReduceParams) };
 
     if (rp.reduce_numel >= 32) {
-        // Parallel path: one threadgroup (32 threads = 1 SIMD group) per output element
-        // Use dispatchThreads with total_threads = dst_numel * 32 so that exactly
-        // dst_numel threadgroups are created, each with 32 threads.
         u32 total_threads = dst_numel * 32;
         id<MTLComputeCommandEncoder> enc = get_encoder();
         [enc setComputePipelineState:pipe_mul_reduce_sum_parallel];
         for (u32 i = 0; i < 3; i++)
-            [enc setBuffer:mbufs[i] offset:0 atIndex:i];
+            [enc setBuffer:metal_pool.bufs[mrs_ids[i]] offset:0 atIndex:i];
         for (u32 i = 0; i < 4; i++)
             [enc setBytes:params[i] length:psizes[i] atIndex:3 + i];
         [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1)
@@ -58,11 +55,10 @@ void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
         total_dispatches++;
         dc[DC_MRS]++; dc_tag = DC_OTHER;
         if (jit.state == JIT_CAPTURE)
-            jit_record_dispatch_1d(pipe_mul_reduce_sum_parallel, mbufs, 3, params, psizes, 4,
+            jit_record_dispatch_ids(pipe_mul_reduce_sum_parallel, mrs_ids, 3, params, psizes, 4,
                                     total_threads, 1, 1, 32, 1, 1);
     } else {
-        // Small reduce: serial path (original kernel)
-        dc_tag=DC_MRS; dispatch_1d(pipe_mul_reduce_sum, mbufs, 3, params, psizes, 4, dst_numel);
+        dc_tag=DC_MRS; dispatch_1d_ids(pipe_mul_reduce_sum, mrs_ids, 3, params, psizes, 4, dst_numel);
     }
     thvm_prof_record(UOP_SUM, t0);
 }
@@ -314,13 +310,13 @@ void metal_dispatch_fused(u32 out_buf, u32 *input_bufs, u32 n_inputs,
                            u32 out_numel, u32 reduce_dim, u32 total_numel) {
     id<MTLComputePipelineState> pipe = get_fused_pipe(ops, n_ops, n_inputs, has_reduce);
     if (!pipe) return;
-    id<MTLBuffer> bufs[6];
-    bufs[0] = metal_pool.bufs[out_buf];
+    u32 ids[6];
+    ids[0] = out_buf;
     for (u32 i = 0; i < n_inputs; i++)
-        bufs[i + 1] = metal_pool.bufs[input_bufs[i]];
+        ids[i + 1] = input_bufs[i];
     const void *params[] = { &reduce_dim, &total_numel };
     u64 psizes[] = { sizeof(u32), sizeof(u32) };
-    dispatch_1d(pipe, bufs, n_inputs + 1, params, psizes, 2, out_numel);
+    dispatch_1d_ids(pipe, ids, n_inputs + 1, params, psizes, 2, out_numel);
 }
 
 // ============================================================
@@ -638,6 +634,10 @@ static int try_mdim_float4(u32 uop, u32 dst, const View *dv,
     [enc dispatchThreads:MTLSizeMake(gw, gh, gd) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
     batch_dirty = 1;
     dc[DC_MDIM]++; total_dispatches++;
+    if (jit.state == JIT_CAPTURE) {
+        u32 ids[] = {dst, a_buf, b_buf};
+        jit_record_dispatch_ids(pipe, ids, 3, NULL, NULL, 0, gw, gh, gd, tw, 1, 1);
+    }
     return 1;
 }
 
@@ -664,8 +664,8 @@ void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
     batch_dirty = 1;
     dc[DC_MDIM]++; total_dispatches++;
     if (jit.state == JIT_CAPTURE) {
-        id<MTLBuffer> bufs[] = {metal_pool.bufs[dst], metal_pool.bufs[a_buf], metal_pool.bufs[b_buf]};
-        jit_record_dispatch_1d(pipe, bufs, 3, NULL, NULL, 0, gw, gh, gd, tw, th, td);
+        u32 ids[] = {dst, a_buf, b_buf};
+        jit_record_dispatch_ids(pipe, ids, 3, NULL, NULL, 0, gw, gh, gd, tw, th, td);
     }
 }
 
@@ -771,6 +771,7 @@ dispatch_unary:;
         if (mdim_cache[i].key == h) { pipe = mdim_cache[i].pipe; break; }
     if (!pipe) return;
 
+    u32 un_ids[] = {dst, src_buf};
     id<MTLComputeCommandEncoder> enc = get_encoder();
     [enc setComputePipelineState:pipe];
     [enc setBuffer:metal_pool.bufs[dst] offset:0 atIndex:0];
@@ -779,4 +780,6 @@ dispatch_unary:;
     [enc dispatchThreads:MTLSizeMake(gw,gh,gd) threadsPerThreadgroup:MTLSizeMake(tw,1,1)];
     batch_dirty = 1;
     dc[DC_OTHER]++; total_dispatches++;
+    if (jit.state == JIT_CAPTURE)
+        jit_record_dispatch_ids(pipe, un_ids, 2, NULL, NULL, 0, gw, gh, gd, tw, 1, 1);
 }

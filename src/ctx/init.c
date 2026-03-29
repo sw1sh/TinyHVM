@@ -83,6 +83,7 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
     }
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();
+    ctx->prescan_done = 0; // reset for next backward pass
     // Clear shape tracker — stale entries from old heap locs cause wrong
     // view compositions after heap reuse.
     memset(st_keys, 0, sizeof(st_keys));

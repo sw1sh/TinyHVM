@@ -1139,6 +1139,16 @@ inet_step:
                 goto inet_step;
             }
 
+            // APP-BRI: (θx.body arg) → body[x ← arg]  (same beta rule as LAM)
+            if (term_tag(fun) == TAG_BRI) {
+                u64 bri_loc = term_val(fun);
+                Term arg = heap_read(ctx, loc + 1);
+                heap_set(ctx, bri_loc, arg);
+                ctx->itrs++;
+                t = heap_read(ctx, bri_loc + 1);
+                goto inet_step;
+            }
+
             // APP-LAM: beta reduction — (λx.body arg) → body[x ← arg]
             if (term_tag(fun) == TAG_LAM) {
                 u64 lam_loc = term_val(fun);
@@ -1266,6 +1276,54 @@ inet_step:
                 goto inet_step;
             }
 
+            // DUP ⊳ BRI: commutation — duplicate bridge (same as DUP-LAM but TAG_BRI)
+            if (term_tag(val) == TAG_BRI) {
+                u64 bri_loc = term_val(val);
+                Term body = heap_read(ctx, bri_loc + 1);
+                u64 bdup = heap_alloc(ctx, 1);
+                heap_set(ctx, bdup, body);
+                Term var0, var1;
+                Term bri0 = thvm_bri(ctx, &var0, term_new(TAG_DP0, dup_label, bdup));
+                Term bri1 = thvm_bri(ctx, &var1, term_new(TAG_DP1, dup_label, bdup));
+                u64 vsup = heap_alloc(ctx, 2);
+                heap_set(ctx, vsup + 0, var0);
+                heap_set(ctx, vsup + 1, var1);
+                heap_set(ctx, bri_loc, term_new(TAG_SUP, dup_label, vsup));
+                ctx->itrs++;
+                if (dp_index == 0) {
+                    heap_set(ctx, dup_loc, bri1);
+                    t = bri0;
+                } else {
+                    heap_set(ctx, dup_loc, bri0);
+                    t = bri1;
+                }
+                goto inet_step;
+            }
+
+            // DUP ⊳ ANN: dup through annotation — DUP both term and type
+            if (term_tag(val) == TAG_ANN) {
+                u64 ann_loc = term_val(val);
+                Term inner = heap_read(ctx, ann_loc);
+                Term type  = heap_read(ctx, ann_loc + 1);
+                u64 idup = heap_alloc(ctx, 1);
+                heap_set(ctx, idup, inner);
+                u64 tdup = heap_alloc(ctx, 1);
+                heap_set(ctx, tdup, type);
+                Term a0 = thvm_ann(ctx, term_new(TAG_DP0, dup_label, idup),
+                                        term_new(TAG_DP0, dup_label, tdup));
+                Term a1 = thvm_ann(ctx, term_new(TAG_DP1, dup_label, idup),
+                                        term_new(TAG_DP1, dup_label, tdup));
+                ctx->itrs++;
+                if (dp_index == 0) {
+                    heap_set(ctx, dup_loc, a1);
+                    t = a0;
+                } else {
+                    heap_set(ctx, dup_loc, a0);
+                    t = a1;
+                }
+                goto inet_step;
+            }
+
             // DUP ⊳ atoms: copy (both projections get same value)
             if (term_tag(val) == TAG_TEN) return val;
             if (term_tag(val) == TAG_ERA) return val;
@@ -1364,6 +1422,58 @@ inet_step:
             Term sub = heap_read(ctx, loc);
             if (term_is_sub(sub)) return t;
             return thvm_reduce(ctx, sub);
+        }
+
+        // TAG_BRI: bridge — returned as-is until applied (WNF, like LAM)
+        case TAG_BRI:
+            return t;
+
+        // TAG_ANN: annotation — transparent, strip and return inner term
+        case TAG_ANN: {
+            u64 loc = term_val(t);
+            ctx->itrs++;
+            t = heap_read(ctx, loc);  // the term (slot 0)
+            goto inet_step;
+        }
+
+        // TAG_DSU: dynamic SUP — reduce label_expr to NUM, then create normal SUP
+        case TAG_DSU: {
+            u64 loc = term_val(t);
+            Term label_expr = thvm_reduce(ctx, heap_read(ctx, loc));
+            heap_set(ctx, loc, label_expr);
+            if (term_tag(label_expr) != TAG_NUM) return t;  // not ready
+            u32 label = term_as_u32(label_expr);
+            Term a = heap_read(ctx, loc + 1);
+            Term b = heap_read(ctx, loc + 2);
+            ctx->itrs++;
+            t = thvm_sup(ctx, label, a, b);
+            goto inet_step;
+        }
+
+        // TAG_DDU: dynamic DUP — reduce label_expr to NUM, then dup val, apply bod
+        case TAG_DDU: {
+            u64 loc = term_val(t);
+            Term label_expr = thvm_reduce(ctx, heap_read(ctx, loc));
+            heap_set(ctx, loc, label_expr);
+            if (term_tag(label_expr) != TAG_NUM) return t;  // not ready
+            u32 label = term_as_u32(label_expr);
+            Term val = heap_read(ctx, loc + 1);
+            Term bod = heap_read(ctx, loc + 2);
+            // DUP val with dynamic label
+            Term dp0, dp1;
+            thvm_dup(ctx, label, val, &dp0, &dp1);
+            ctx->itrs++;
+            // Apply bod to both copies: APP(APP(bod, dp0), dp1)
+            t = thvm_app(ctx, thvm_app(ctx, bod, dp0), dp1);
+            goto inet_step;
+        }
+
+        // TAG_INC: priority wrapper — transparent during normal reduction
+        case TAG_INC: {
+            u64 loc = term_val(t);
+            ctx->itrs++;
+            t = heap_read(ctx, loc);
+            goto inet_step;
         }
 
         default:

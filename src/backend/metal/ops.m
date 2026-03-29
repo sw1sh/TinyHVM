@@ -59,10 +59,10 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
             }
             if (f4p) {
                 u32 n4 = n / 4;
-                id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+                u32 ids[] = {dst, src};
                 const void *params[] = { &n4 };
                 u64 psizes[] = { sizeof(u32) };
-                dispatch_1d(f4p, bufs, 2, params, psizes, 1, n4);
+                dispatch_1d_ids(f4p, ids, 2, params, psizes, 1, n4);
                 thvm_prof_record(uop, t0);
                 return;
             }
@@ -78,10 +78,10 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
             default: break;
         }
         if (fpipe) {
-            id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+            u32 ids[] = {dst, src};
             const void *params[] = { &n };
             u64 psizes[] = { sizeof(u32) };
-            dispatch_1d(fpipe, bufs, 2, params, psizes, 1, n);
+            dispatch_1d_ids(fpipe, ids, 2, params, psizes, 1, n);
             thvm_prof_record(uop, t0);
             return;
         }
@@ -99,10 +99,10 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
     }
     ViewParams dvp = view_to_params(dv);
     ViewParams svp = view_to_params(sv);
-    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+    u32 ids[] = {dst, src};
     const void *params[] = { &dvp, &svp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams) };
-    dc_tag=DC_SLOW_UN; dispatch_1d(pipe, bufs, 2, params, psizes, 2, dv->numel);
+    dc_tag=DC_SLOW_UN; dispatch_1d_ids(pipe, ids, 2, params, psizes, 2, dv->numel);
     thvm_prof_record(uop, t0);
 }
 
@@ -148,19 +148,19 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
             }
             if (f4p) {
                 u32 n4 = n / 4;
-                id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
+                u32 ids[] = {dst, a, b};
                 const void *params[] = { &n4 };
                 u64 psizes[] = { sizeof(u32) };
-                dc_tag=DC_F4_BIN; dispatch_1d(f4p, bufs, 3, params, psizes, 1, n4);
+                dc_tag=DC_F4_BIN; dispatch_1d_ids(f4p, ids, 3, params, psizes, 1, n4);
                 thvm_prof_record(uop, t0);
                 return;
             }
         }
         // Scalar fast path
-        id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
+        u32 ids[] = {dst, a, b};
         const void *params[] = { &n };
         u64 psizes[] = { sizeof(u32) };
-        dc_tag=DC_FAST_BIN; dispatch_1d(fpipe, bufs, 3, params, psizes, 1, n);
+        dc_tag=DC_FAST_BIN; dispatch_1d_ids(fpipe, ids, 3, params, psizes, 1, n);
         thvm_prof_record(uop, t0);
         return;
     }
@@ -212,11 +212,20 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
                     }
                 }
                 if (bc_pipe) {
-                    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[contig_buf], metal_pool.bufs[bcast_buf] };
+                    u32 ids[] = {dst, contig_buf, bcast_buf};
                     const void *params[] = { &n_spatial, &n_bc, &C_dim };
                     u64 psizes[] = { sizeof(u32), sizeof(u32), sizeof(u32) };
                     bc2d_count++;
-                    dc_tag=DC_BC2D; dispatch_2d(bc_pipe, bufs, 3, params, psizes, 3, n_spatial, n_bc);
+                    // dispatch_2d still uses legacy path — convert inline
+                    id<MTLComputeCommandEncoder> enc = get_encoder();
+                    [enc setComputePipelineState:bc_pipe];
+                    for(u32 ii=0;ii<3;ii++) [enc setBuffer:metal_pool.bufs[ids[ii]] offset:0 atIndex:ii];
+                    for(u32 ii=0;ii<3;ii++) [enc setBytes:params[ii] length:psizes[ii] atIndex:3+ii];
+                    NSUInteger tpg=bc_pipe.maxTotalThreadsPerThreadgroup;
+                    NSUInteger tw=MIN(32,n_spatial),th=MIN(tpg/tw,(NSUInteger)n_bc);
+                    [enc dispatchThreads:MTLSizeMake(n_spatial,n_bc,1) threadsPerThreadgroup:MTLSizeMake(tw,th,1)];
+                    batch_dirty=1;total_dispatches++;dc[DC_BC2D]++;dc_tag=DC_OTHER;
+                    if(jit.state==JIT_CAPTURE) jit_record_dispatch_ids(bc_pipe,ids,3,params,psizes,3,n_spatial,n_bc,1,(u32)tw,(u32)th,1);
                     thvm_prof_record(uop, t0);
                     return;
                 }
@@ -247,10 +256,10 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
     ViewParams dvp = view_to_params(dv);
     ViewParams avp = view_to_params(av);
     ViewParams bvp = view_to_params(bv);
-    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[a], metal_pool.bufs[b] };
+    u32 ids[] = {dst, a, b};
     const void *params[] = { &dvp, &avp, &bvp };
     u64 psizes[] = { sizeof(ViewParams), sizeof(ViewParams), sizeof(ViewParams) };
-    dc_tag=DC_SLOW_BIN; dispatch_1d(pipe, bufs, 3, params, psizes, 3, dv->numel);
+    dc_tag=DC_SLOW_BIN; dispatch_1d_ids(pipe, ids, 3, params, psizes, 3, dv->numel);
     thvm_prof_record(uop, t0);
     } // end legacy fallback
 }
@@ -315,8 +324,19 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
 
     [mm encodeToCommandBuffer:batch_cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
     batch_dirty = 1; total_dispatches++; dc[DC_MM]++;
-    if (jit.state == JIT_CAPTURE) jit_record_mps(dst, buf_a_id, buf_b_id, M, K, N,
-        transposeA, transposeB, phys_a_rows, phys_a_cols, phys_b_rows, phys_b_cols);
+    if (jit.state == JIT_CAPTURE) {
+        {extern int jit_debug_replay; extern double jit_cap_sums[];
+        if (jit_debug_replay == 5) {
+            metal_flush();
+            f32 *od = (f32*)metal_pool.bufs[dst].contents;
+            u32 nf = M * N;
+            double s = 0;
+            for (u32 j = 0; j < nf && j < 100000; j++) s += fabs(od[j]);
+            jit_cap_sums[jit.n_cmds] = s;
+        }}
+        jit_record_mps(dst, buf_a_id, buf_b_id, M, K, N,
+            transposeA, transposeB, phys_a_rows, phys_a_cols, phys_b_rows, phys_b_cols);
+    }
     thvm_prof_record(UOP_MM, t0);
 }
 
@@ -339,12 +359,19 @@ static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
             [enc setBuffer:metal_pool.bufs[dst] offset:0 atIndex:0];
             [enc setBuffer:metal_pool.bufs[src] offset:0 atIndex:1];
             [enc setBytes:&reduce_dim length:sizeof(u32) atIndex:2];
-            // One threadgroup of 32 per output element
             [enc dispatchThreadgroups:MTLSizeMake(dst_numel, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             batch_dirty = 1;
             total_dispatches++;
             dc[DC_REDUCE]++;
+            if (jit.state == JIT_CAPTURE) {
+                u32 ids[] = {dst, src};
+                const void *p[] = {&reduce_dim};
+                u64 ps[] = {sizeof(u32)};
+                // dispatchThreadgroups(N,1,1) tpg(32,1,1) = N*32 total threads
+                jit_record_dispatch_ids(par_pipe, ids, 2, p, ps, 1,
+                                        dst_numel * 32, 1, 1, 32, 1, 1);
+            }
             thvm_prof_record(uop, t0);
             return;
         }
@@ -358,9 +385,9 @@ static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
         default: return;
     }
 
-    id<MTLBuffer> bufs[] = { metal_pool.bufs[dst], metal_pool.bufs[src] };
+    u32 rids[] = {dst, src};
     const void *params[] = { &reduce_dim };
     u64 psizes[] = { sizeof(u32) };
-    dc_tag=DC_REDUCE; dispatch_1d(pipe, bufs, 2, params, psizes, 1, dst_numel);
+    dc_tag=DC_REDUCE; dispatch_1d_ids(pipe, rids, 2, params, psizes, 1, dst_numel);
     thvm_prof_record(uop, t0);
 }

@@ -72,7 +72,16 @@ typedef u64 Term;
 #define TAG_TOP  11  // Tensor op node (lazy): EXT = uop code
 #define TAG_CTR  12  // Constructor (for multi-arg nodes)
 
-#define TAG_COUNT 13
+// ICC (Interaction Calculus of Constructions):
+#define TAG_BRI  13  // Bridge: θx.body (dual of lambda, contra-variant binding)
+#define TAG_ANN  14  // Annotation: {term : type} (transparent — strips during reduce)
+
+// Dynamic labels + priority:
+#define TAG_DSU  15  // Dynamic SUP: &(label_expr){a, b}. Heap: [label_expr, a, b]
+#define TAG_DDU  16  // Dynamic DUP: !&(label_expr){val, bod}. Heap: [label_expr, val, bod]
+#define TAG_INC  17  // Priority wrapper: transparent to reduce, lower priority in collapse
+
+#define TAG_COUNT 18
 
 // ============================================================
 // UOps — Minimal tensor operations (tinygrad-inspired)
@@ -627,6 +636,24 @@ Term     thvm_ref(TinyHVM *ctx, u32 name);                   // TAG_REF(name)
 Term     thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b);   // TAG_SUP with label
 void     thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1); // DUP with label
 u32      thvm_fresh_label(TinyHVM *ctx);                     // allocate next label
+
+// ICC: Bridge + Annotation
+Term     thvm_bri(TinyHVM *ctx, Term *var_out, Term body);   // θx.body (dual of lambda)
+Term     thvm_ann(TinyHVM *ctx, Term term, Term type);       // {term : type}
+
+// Dynamic labels + priority
+Term     thvm_dsu(TinyHVM *ctx, Term label_expr, Term a, Term b);  // dynamic SUP
+Term     thvm_ddu(TinyHVM *ctx, Term label_expr, Term val, Term bod); // dynamic DUP
+Term     thvm_inc(TinyHVM *ctx, Term term);                  // priority wrapper
+
+// Collapse: extract all branches from a superposed term
+typedef struct {
+    Term   *terms;   // flat array of leaf terms
+    u32     count;
+    u32     cap;
+} CollapseResult;
+CollapseResult thvm_collapse(TinyHVM *ctx, Term t);
+void           thvm_collapse_free(CollapseResult *cr);
 
 // Inet ops
 Term     thvm_where(TinyHVM *ctx, Term cond, Term then_t, Term else_t);

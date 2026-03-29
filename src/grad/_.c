@@ -42,7 +42,8 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
 // A tensor with N consumers on the loss path gets N GRAD visits.
 // When N > 1, the GRAD handler parks gradients and walks once with combined gy.
 static void grad_prescan(TinyHVM *ctx, Term loss) {
-    // Force loss reduction to establish provenance before scanning
+    // When called from GRAD handler, loss is already TAG_TEN (reduced by trampoline).
+    // When called eagerly (legacy), it may be TAG_TOP → reduce it first.
     if (term_tag(loss) != TAG_TEN) loss = thvm_reduce(ctx, loss);
     if (term_tag(loss) != TAG_TEN) return;
     u32 loss_id = (u32)term_val(loss);
@@ -80,8 +81,9 @@ static void grad_prescan(TinyHVM *ctx, Term loss) {
 }
 
 Term thvm_grad_multi(TinyHVM *ctx, Term loss, Term *params, Term *grad_slots, u32 n_params) {
-    // Pre-scan: count backward refs for gradient accumulation
-    grad_prescan(ctx, loss);
+    // grad_prescan is deferred to the GRAD handler at reduction time.
+    // This ensures the forward pass (required to establish provenance)
+    // runs inside the JIT capture window.
 
     // Encode targets as CTR
     u64 tgt_loc = heap_alloc(ctx, 1 + 2 * n_params);
@@ -96,6 +98,9 @@ Term thvm_grad_multi(TinyHVM *ctx, Term loss, Term *params, Term *grad_slots, u3
     if (term_tag(loss) == TAG_TEN) {
         u32 loss_id = (u32)term_val(loss);
         seed_shape = ctx->tensors[loss_id].view.shape;
+    } else if (term_tag(loss) == TAG_TOP) {
+        const View *lv = st_get(term_val(loss));
+        if (lv) seed_shape = lv->shape;
     }
     u32 numel = 1;
     for (u32 i = 0; i < seed_shape.rank; i++) numel *= seed_shape.dims[i];

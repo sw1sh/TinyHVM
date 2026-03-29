@@ -9,6 +9,40 @@ enum { DC_FAST_UN=0, DC_FAST_BIN, DC_F4_UN, DC_F4_BIN, DC_BC2D, DC_MDIM,
 static u32 dc[DC_MAX] = {0};
 static u32 dc_tag = DC_OTHER;  // set before dispatch
 
+// Core dispatch using buf_ids (preferred — avoids MTLBuffer pointer aliasing)
+static void dispatch_1d_ids(id<MTLComputePipelineState> pipe,
+                            u32 *buf_ids, u32 n_bufs,
+                            const void **params, u64 *param_sizes, u32 n_params,
+                            u32 numel) {
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:pipe];
+    for (u32 i = 0; i < n_bufs; i++)
+        [enc setBuffer:metal_pool.bufs[buf_ids[i]] offset:0 atIndex:i];
+    for (u32 i = 0; i < n_params; i++)
+        [enc setBytes:params[i] length:param_sizes[i] atIndex:n_bufs + i];
+    NSUInteger tpg = MIN(pipe.maxTotalThreadsPerThreadgroup, (NSUInteger)numel);
+    [enc dispatchThreads:MTLSizeMake(numel, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    batch_dirty = 1;
+    total_dispatches++;
+    dc[dc_tag]++; dc_tag = DC_OTHER;
+    if (jit.state == JIT_CAPTURE) {
+        // Per-command capture sum recording
+        {extern int jit_debug_replay; extern double jit_cap_sums[];
+        if (jit_debug_replay == 5) {
+            metal_flush();
+            f32 *od = (f32*)metal_pool.bufs[buf_ids[0]].contents;
+            u32 nf = numel;
+            double s = 0;
+            for (u32 j = 0; j < nf && j < 100000; j++) s += fabs(od[j]);
+            jit_cap_sums[jit.n_cmds] = s;
+        }}
+        jit_record_dispatch_ids(pipe, buf_ids, n_bufs, params, param_sizes, n_params,
+                                numel, 1, 1, (u32)tpg, 1, 1);
+    }
+}
+
+// Legacy dispatch using MTLBuffer pointers (for callers not yet converted)
 static void dispatch_1d(id<MTLComputePipelineState> pipe,
                         id<MTLBuffer> *bufs, u32 n_bufs,
                         const void **params, u64 *param_sizes, u32 n_params,

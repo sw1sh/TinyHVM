@@ -74,3 +74,12 @@ Term thvm_log_print(TinyHVM *ctx, Term tensor) {
     heap_set(ctx, loc + 1, term_era());
     return term_new(TAG_TOP, UOP_LOG_PRINT, loc);
 }
+
+// OP2: binary integer operation on TAG_NUM values.
+// opr: 0=add, 1=sub, 2=mul, 3=div, 4=eq, 5=mod
+Term thvm_op2(TinyHVM *ctx, u32 opr, Term x, Term y) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     x);
+    heap_set(ctx, loc + 1, y);
+    return term_new(TAG_OP2, opr, loc);
+}

@@ -78,6 +78,8 @@ static int  materialize_walk(TinyHVM *ctx, u32 tid,
                               u32 *leaf_ids, const View **leaf_views, u32 *n_leaves);
 Term thvm_op2(TinyHVM *ctx, u32 opr, Term x, Term y);
 Term thvm_op_raw(TinyHVM *ctx, u32 uop, Term a, Term b);
+Term thvm_sup(TinyHVM *ctx, Term a, Term b);
+Term thvm_app(TinyHVM *ctx, Term fun, Term arg);
 #define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0&&c->tensors[t].creator_op)tensor_materialize(c,t);}while(0)
 
 // Read strided view to contiguous host buffer

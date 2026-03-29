@@ -41,8 +41,11 @@ iNodeLabel[tag_, ext_, val_] := Switch[tag,
 
 TINetGraph[t_TTensor, opts___?OptionQ] := TINetGraph[ToTTerm[t], opts];
 TINetGraph[t_TTerm, opts___?OptionQ] := Module[
-    {raw, nNodes, nEdges, nodesRaw, edgesRaw, verts, edges, labels, colors, i,
-     tag, ext, val},
+    {raw, nNodes, nEdges, nodesRaw, edgesRaw,
+     tags, exts, vals, i, j, tag, ext, val,
+     dupGroups, rep, nodeMap, keptNodes,
+     verts, edges, labels, colors, elabels,
+     src, dst, mSrc, mDst, portLabel, edge, seen},
     loadLibrary[];
     raw = Round[Normal[thvmHeapGraphFn[t[[1]]]]];
     nNodes = raw[[1]];
@@ -50,32 +53,62 @@ TINetGraph[t_TTerm, opts___?OptionQ] := Module[
     nodesRaw = raw[[3 ;; 2 + nNodes * 3]];
     edgesRaw = raw[[3 + nNodes * 3 ;; 2 + nNodes * 3 + nEdges * 2]];
 
-    (* Build vertices with labels and colors *)
-    verts = Range[nNodes] - 1; (* 0-indexed *)
-    labels = <||>;
-    colors = <||>;
-    Do[
-        tag = nodesRaw[[3 i - 2]];
-        ext = nodesRaw[[3 i - 1]];
-        val = nodesRaw[[3 i]];
-        labels[i - 1] = iNodeLabel[tag, ext, val];
-        colors[i - 1] = Lookup[$tagColor, tag, GrayLevel[0.7]],
-        {i, nNodes}
-    ];
+    (* Extract per-node data *)
+    tags = Table[nodesRaw[[3 i - 2]], {i, nNodes}];
+    exts = Table[nodesRaw[[3 i - 1]], {i, nNodes}];
+    vals = Table[nodesRaw[[3 i]], {i, nNodes}];
 
-    (* Build edges *)
-    edges = Table[
-        edgesRaw[[2 j - 1]] -> edgesRaw[[2 j]],
-        {j, nEdges}
-    ];
+    (* Group DP0/DP1 nodes by val (dup_loc) — merge into single DUP vertex *)
+    dupGroups = <||>;
+    Do[If[tags[[i]] == 4 || tags[[i]] == 5,
+        val = vals[[i]];
+        If[KeyExistsQ[dupGroups, val],
+            AppendTo[dupGroups[val], i - 1],
+            dupGroups[val] = {i - 1}]],
+        {i, nNodes}];
 
-    Graph[verts, edges,
+    (* Build node remapping: DP nodes -> first representative *)
+    nodeMap = Association[Table[i -> i, {i, 0, nNodes - 1}]];
+    Do[rep = First[group]; Do[nodeMap[n] = rep, {n, group}],
+        {group, Values[dupGroups]}];
+    keptNodes = DeleteDuplicates[Values[nodeMap]];
+
+    (* Build labels and colors for kept nodes *)
+    labels = <||>; colors = <||>;
+    Do[tag = tags[[idx + 1]]; ext = exts[[idx + 1]]; val = vals[[idx + 1]];
+        If[tag == 4 || tag == 5,
+            labels[idx] = "Dup"; colors[idx] = RGBColor[0.85, 0.33, 0.10],
+            labels[idx] = iNodeLabel[tag, ext, val];
+            colors[idx] = Lookup[$tagColor, tag, GrayLevel[0.7]]],
+        {idx, keptNodes}];
+
+    (* Build edges with port labels, remapping and deduplicating *)
+    edges = {}; elabels = <||>; seen = <||>;
+    Do[src = edgesRaw[[2 j - 1]]; dst = edgesRaw[[2 j]];
+        mSrc = nodeMap[src]; mDst = nodeMap[dst];
+        If[mSrc =!= mDst,
+            If[tags[[src + 1]] == 4 || tags[[src + 1]] == 5,
+                (* Edge from DP node: labeled multi-edge from merged DUP *)
+                portLabel = If[tags[[src + 1]] == 4, "dp0", "dp1"];
+                edge = DirectedEdge[mSrc, mDst, portLabel];
+                If[!KeyExistsQ[seen, edge],
+                    seen[edge] = True; AppendTo[edges, edge];
+                    elabels[edge] = Placed[portLabel, {0.5, {0, -1.5}}]],
+                (* Regular edge: dedup by endpoints *)
+                If[!KeyExistsQ[seen, {mSrc, mDst}],
+                    seen[{mSrc, mDst}] = True;
+                    AppendTo[edges, DirectedEdge[mSrc, mDst]]]]],
+        {j, nEdges}];
+
+    Graph[keptNodes, edges,
         VertexLabels -> Normal[labels],
         VertexStyle -> Normal[colors],
         VertexSize -> 0.6,
         VertexLabelStyle -> Directive[9, Bold],
         GraphLayout -> {"LayeredDigraphEmbedding", "Orientation" -> Left},
         EdgeStyle -> GrayLevel[0.5],
+        EdgeLabels -> Normal[elabels],
+        EdgeLabelStyle -> Directive[8, Italic, GrayLevel[0.3]],
         ImageSize -> Medium,
         opts
     ]

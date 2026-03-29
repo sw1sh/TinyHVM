@@ -596,6 +596,55 @@ EXTERN_C DLLEXPORT int thvmDup(
     return LIBRARY_NO_ERROR;
 }
 
+// thvmNum[outId, value] → Void — create TAG_NUM integer term
+EXTERN_C DLLEXPORT int thvmNum(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc; (void)res;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint out_id = MArgument_getInteger(args[0]);
+    mint value  = MArgument_getInteger(args[1]);
+
+    set_term(out_id, term_num_u32((u32)value));
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmOp2[outId, opr, xId, yId] → Void — create TAG_OP2 binary int op
+EXTERN_C DLLEXPORT int thvmOp2(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc; (void)res;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint out_id = MArgument_getInteger(args[0]);
+    mint opr    = MArgument_getInteger(args[1]);
+    mint x_id   = MArgument_getInteger(args[2]);
+    mint y_id   = MArgument_getInteger(args[3]);
+
+    Term result = thvm_op2(g_ctx, (u32)opr, get_term(x_id), get_term(y_id));
+    set_term(out_id, result);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmNumValue[id] → Integer — extract u32 value from TAG_NUM term
+EXTERN_C DLLEXPORT int thvmNumValue(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint id = MArgument_getInteger(args[0]);
+    Term t = get_term(id);
+
+    if (term_tag(t) != TAG_NUM) {
+        MArgument_setInteger(res, -1);
+        return LIBRARY_NO_ERROR;
+    }
+    MArgument_setInteger(res, (mint)term_as_u32(t));
+    return LIBRARY_NO_ERROR;
+}
+
 // thvmDefine[bodyId] → Integer (name)
 EXTERN_C DLLEXPORT int thvmDefine(
     WolframLibraryData libData, mint argc, MArgument *args, MArgument res)

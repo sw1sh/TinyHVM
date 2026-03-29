@@ -50,6 +50,11 @@ TSup::usage = "TSup[a, b] creates a superposition term.";
 TDup::usage = "TDup[z] duplicates a term. Returns {TTerm[dp0], TTerm[dp1]}.";
 TDefine::usage = "TDefine[body] registers a named definition. Returns the name (Integer).";
 TRef::usage = "TRef[name] creates a reference to a named definition.";
+TNum::usage = "TNum[n] creates an integer term (TAG_NUM). n must be a non-negative integer.";
+TOp2::usage = "TOp2[op, x, y] creates a binary integer operation (TAG_OP2). op: \"Add\", \"Sub\", \"Mul\", \"Div\", \"Eq\", \"Mod\".";
+TNumValue::usage = "TNumValue[term] extracts the integer value from a reduced TAG_NUM term.";
+TSupValues::usage = "TSupValues[term] recursively extracts all branches from a nested SUP tree into a flat list.";
+TSupNumValues::usage = "TSupNumValues[term] extracts all SUP branches as integer values.";
 
 (* ── Autograd ───────────────────────────────────────────────────────────── *)
 
@@ -91,6 +96,12 @@ TParams::usage = "TParams[net] returns flat list of all trainable parameters.";
 TCrossEntropyLoss::usage = "TCrossEntropyLoss[logits, oneHot] computes cross-entropy loss.";
 TSGD::usage = "TSGD[params, gradSlots, lrTen] builds an SGD update chain.";
 TTrainStep::usage = "TTrainStep[params, loss, lr] performs one gradient step, returns loss value.";
+
+(* ── Net compilation ──────────────────────────────────────────────────── *)
+
+TCompileNet::usage = "TCompileNet[net, inputShape] converts a WL NetChain/NetGraph to a TNet with fresh weights. Use \"ImportWeights\"->True to transfer trained weights.";
+TBuildTrainLoop::usage = "TBuildTrainLoop[net, xBatch, yOneHot, nSteps, lr] builds a single inet term that trains for nSteps on a fixed batch. One TReduce drives the entire loop.";
+TEvalAccuracy::usage = "TEvalAccuracy[net, testImages, testLabels] evaluates classification accuracy on test data.";
 
 (* ── Graph visualization ──────────────────────────────────────────────── *)
 
@@ -180,7 +191,7 @@ $uopName = <|
 |>;
 
 (* Unary ops (second arg = ERA) *)
-$unaryOps = {"Neg", "Exp", "Log", "Relu", "Sqrt", "Cast"};
+$unaryOps = {"Neg", "Exp", "Log", "Relu", "Sqrt", "Cast", "RMax", "LogPrint"};
 
 (* ── Conversion between TTerm and TTensor ──────────────────────────────── *)
 
@@ -219,6 +230,9 @@ thvmLamFn = None;
 thvmAppFn = None;
 thvmSupFn = None;
 thvmDupFn = None;
+thvmNumFn = None;
+thvmOp2Fn = None;
+thvmNumValueFn = None;
 thvmDefineFn = None;
 thvmRefFn = None;
 thvmWhereFn = None;
@@ -312,6 +326,12 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
         {Integer, Integer, Integer}, "Void"];
     thvmDupFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmDup",
         {Integer, Integer, Integer}, "Void"];
+    thvmNumFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmNum",
+        {Integer, Integer}, "Void"];
+    thvmOp2Fn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmOp2",
+        {Integer, Integer, Integer, Integer}, "Void"];
+    thvmNumValueFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmNumValue",
+        {Integer}, Integer];
     thvmDefineFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmDefine",
         {Integer}, Integer];
     thvmRefFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmRef",
@@ -608,6 +628,18 @@ TLam[body_TTerm] := Module[{lamId = allocId[], varId = allocId[]},
     {TTerm[lamId], TTerm[varId]}
 ];
 
+(* Pure function form: TLam[var |-> body_using_var] *)
+TLam[f_Function] := Module[{lam, var, body},
+    {lam, var} = TLamOpen[];
+    body = f[var];
+    If[!MatchQ[body, _TTerm],
+        Message[TLam::badret, body]; Return[$Failed]];
+    TLamSetBody[lam, body];
+    lam
+];
+TLam::badret = "Lambda body must return TTerm, got `1`.";
+
+
 TApp[fun_TTerm, arg_TTerm] := Module[{out = allocId[]},
     loadLibrary[];
     thvmAppFn[out, fun[[1]], arg[[1]]];
@@ -629,6 +661,39 @@ TDup[z_TTerm] := Module[{dp0 = allocId[], dp1 = allocId[]},
     thvmDupFn[z[[1]], dp0, dp1];
     {TTerm[dp0], TTerm[dp1]}
 ];
+
+TNum[n_Integer] := Module[{out = allocId[]},
+    loadLibrary[];
+    thvmNumFn[out, n];
+    TTerm[out]
+];
+
+$op2Code = <|"Add" -> 0, "Sub" -> 1, "Mul" -> 2, "Div" -> 3, "Eq" -> 4, "Mod" -> 5|>;
+
+TOp2[op_String, x_TTerm, y_TTerm] /; KeyExistsQ[$op2Code, op] :=
+Module[{out = allocId[]},
+    loadLibrary[];
+    thvmOp2Fn[out, $op2Code[op], x[[1]], y[[1]]];
+    TTerm[out]
+];
+
+TNumValue[TTerm[id_Integer]] := (loadLibrary[]; thvmNumValueFn[id]);
+
+(* Recursively extract all branches from a nested SUP tree *)
+TSupValues[t_TTerm] := Module[{reduced, tag},
+    reduced = TReduce[t];
+    tag = TTermTag[reduced];
+    If[tag === "Sup",
+        Module[{dp0, dp1},
+            {dp0, dp1} = TDup[reduced];
+            Join[TSupValues[dp0], TSupValues[dp1]]
+        ],
+        {reduced}
+    ]
+];
+
+(* Extract SUP branches as integer values *)
+TSupNumValues[t_TTerm] := TNumValue /@ TSupValues[t];
 
 TDefine[body_TTerm] := (loadLibrary[]; thvmDefineFn[body[[1]]]);
 
@@ -655,6 +720,12 @@ TAssign[dst_TTensor, src_TTensor] := Module[{out = allocId[]},
 ];
 
 TIfz[counter_TTensor, zeroCase_TTensor, succLam_TTerm] := Module[{out = allocId[]},
+    loadLibrary[];
+    thvmIfzFn[out, counter[[1]], zeroCase[[1]], succLam[[1]]];
+    TTensor[out]
+];
+(* TTerm overloads — lambda variables are TTerm, not TTensor *)
+TIfz[counter_TTerm, zeroCase_TTensor, succLam_TTerm] := Module[{out = allocId[]},
     loadLibrary[];
     thvmIfzFn[out, counter[[1]], zeroCase[[1]], succLam[[1]]];
     TTensor[out]
@@ -754,6 +825,7 @@ TLamOpen[] := Module[{lamId = allocId[], varId = allocId[]},
 ];
 
 TLamSetBody[lam_TTerm, body_TTerm] := (loadLibrary[]; thvmLamSetBodyFn[lam[[1]], body[[1]]];);
+TLamSetBody[lam_TTerm, body_TTensor] := TLamSetBody[lam, ToTTerm[body]];
 
 (* ════════════════════════════════════════════════════════════════════════ *)
 (* UpValues — natural WL syntax on TTensor                                 *)
@@ -920,6 +992,7 @@ TReduceSteps[t_TTerm, n_Integer] := TReduceSteps[ToTTensor[t], n];
 
 Get[FileNameJoin[{DirectoryName[$InputFileName], "Visualization.wl"}]];
 Get[FileNameJoin[{DirectoryName[$InputFileName], "Layers.wl"}]];
+Get[FileNameJoin[{DirectoryName[$InputFileName], "NetCompile.wl"}]];
 
 End[];
 EndPackage[];

@@ -100,33 +100,32 @@ iCompileSpec[HoldPattern[PoolingLayer[{k_Integer, k2_Integer}, ___]], {c_, h_, w
 iCompileSpec[HoldPattern[PoolingLayer[k_Integer, rest___]], shape_] :=
     iCompileSpec[PoolingLayer[{k, k}, rest], shape];
 
-(* --- Evaluated WL layer objects (NN framework loaded) --- *)
+(* --- Evaluated WL layer objects (atomic — extract via Information) --- *)
 
-iCompileSpec[spec_ConvolutionLayer, {inC_, h_, w_}] :=
-    With[{outC = Quiet[spec["OutputChannels"]], k = Quiet[spec["KernelSize"]]},
-        {TConvLayer[inC, outC, k[[1]]], {outC, h - k[[1]] + 1, w - k[[2]] + 1}} /;
-            IntegerQ[outC] && ListQ[k]
-    ];
+iCompileSpec[spec_ConvolutionLayer, {inC_, h_, w_}] := Module[{outC, k},
+    {outC, k} = Replace[Quiet[Information[spec, "InputForm"]],
+        HoldForm[ConvolutionLayer[oc_, ks_, ___]] :> {oc, ks}];
+    If[IntegerQ[k], k = {k, k}];
+    {TConvLayer[inC, outC, k[[1]]], {outC, h - k[[1]] + 1, w - k[[2]] + 1}}
+];
 
-iCompileSpec[spec_LinearLayer, {inF_}] :=
-    With[{raw = Quiet[spec["OutputSize"]]},
-        Module[{outF = raw},
-            If[ListQ[outF], outF = First[outF]];
-            {TLinearLayer[inF, outF], {outF}} /; IntegerQ[outF]
-        ]
-    ];
+iCompileSpec[spec_LinearLayer, {inF_}] := Module[{outF},
+    outF = Replace[Quiet[Information[spec, "InputForm"]],
+        HoldForm[LinearLayer[out_, ___]] :> out];
+    If[ListQ[outF], outF = First[outF]];
+    {TLinearLayer[inF, outF], {outF}}
+];
 
 iCompileSpec[_ElementwiseLayer, shape_] := {TActivation["Relu"], shape};
 
 iCompileSpec[_FlattenLayer, shape_] := {TFlattenLayer[], {Times @@ shape}};
 
-iCompileSpec[spec_PoolingLayer, {c_, h_, w_}] :=
-    With[{k = Quiet[spec["KernelSize"]]},
-        Module[{kk = k},
-            If[IntegerQ[kk], kk = {kk, kk}];
-            {TMaxPoolLayer[kk[[1]]], {c, Floor[h/kk[[1]]], Floor[w/kk[[2]]]}} /; ListQ[kk]
-        ]
-    ];
+iCompileSpec[spec_PoolingLayer, {c_, h_, w_}] := Module[{k},
+    k = Replace[Quiet[Information[spec, "InputForm"]],
+        HoldForm[PoolingLayer[ks_, ___]] :> ks];
+    If[IntegerQ[k], k = {k, k}];
+    {TMaxPoolLayer[k[[1]]], {c, Floor[h/k[[1]]], Floor[w/k[[2]]]}}
+];
 
 (* --- TLayer passthrough --- *)
 

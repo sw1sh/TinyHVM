@@ -34,7 +34,7 @@ static u32 tag_arity(u32 tag, u32 ext) {
         case TAG_APP: return 2;
         case TAG_LAM: return 2; // var + body
         case TAG_SUP: return 2;
-        case TAG_DP0: case TAG_DP1: return 2;
+        case TAG_DP0: case TAG_DP1: return 1; // 1-slot DUP: only heap[val]
         case TAG_OP2: return 2;
         case TAG_TOP:
             if (ext == UOP_WHERE) return 3;
@@ -88,11 +88,11 @@ void thvm_heap_graph(TinyHVM *ctx, Term root,
         nodes[nn * 3 + 2] = (i32)(val & 0xFFFFFFFF);
         nn++;
 
-        // Add edge from parent
+        // Add edge: data flows child -> parent
         if (pidx != ~0u) {
             if (ne >= max_e) { max_e *= 2; edges = (i32 *)realloc(edges, max_e * 2 * sizeof(i32)); }
-            edges[ne * 2 + 0] = (i32)pidx;
-            edges[ne * 2 + 1] = (i32)my_idx;
+            edges[ne * 2 + 0] = (i32)my_idx;
+            edges[ne * 2 + 1] = (i32)pidx;
             ne++;
         }
 
@@ -120,8 +120,8 @@ void thvm_heap_graph(TinyHVM *ctx, Term root,
                     u32 jval = (u32)nodes[j * 3 + 2];
                     if (jtag == term_tag(child) && jval == (u32)(term_val(child) & 0xFFFFFFFF)) {
                         if (ne >= max_e) { max_e *= 2; edges = (i32 *)realloc(edges, max_e * 2 * sizeof(i32)); }
-                        edges[ne * 2 + 0] = (i32)my_idx;
-                        edges[ne * 2 + 1] = (i32)j;
+                        edges[ne * 2 + 0] = (i32)j;
+                        edges[ne * 2 + 1] = (i32)my_idx;
                         ne++;
                         break;
                     }

@@ -42,7 +42,11 @@
       "Read(//Users/swish/src/wolfram/neuralnetwork/mlxlink/MLXLink/Kernel/**)",
       "Read(//Users/swish/src/wolfram/neuralnetworks/mlxlink/CPPSource/**)",
       "Read(//Users/swish/Library/Wolfram/Paclets/Repository/MLXLink-0.1.0/**)",
-      "Read(//Users/swish/Library/Wolfram/Paclets/Repository/MLXLink-0.1.0/Kernel/**)"
+      "Read(//Users/swish/Library/Wolfram/Paclets/Repository/MLXLink-0.1.0/Kernel/**)",
+      "Read(//Users/swish/src/TinyHVM/tinygrad/test/**)",
+      "Read(//Users/swish/src/tinygrad/test/**)",
+      "Read(//Users/swish/.claude/**)",
+      "mcp__WolframNotebook__WolframLanguageEvaluator"
     ]
   }
 }

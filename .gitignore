@@ -17,6 +17,7 @@ shaders.metallib
 /HVM4/
 /tinygrad/
 /tinyspec/
+/C-ML
 
 # Data
 /data/
@@ -56,6 +57,3 @@ py/tinyhvm/shaders.metallib
 
 # Benchmark binaries
 /bench_*
-
-# Symlinked repos
-/C-ML

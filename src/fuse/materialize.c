@@ -61,7 +61,11 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
     return (int)(FUSE_MAX_LEAVES + op_idx);
 }
 
-static void tensor_materialize(TinyHVM *ctx, u32 tid) {
+// Forward declaration for graph-level materialize
+static void tensor_materialize_graph(TinyHVM *ctx, u32 tid);
+
+// Chain-level materialize (original implementation)
+static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
     TensorMeta *m = &ctx->tensors[tid];
     if (m->buf_id != 0) return;
 
@@ -547,4 +551,136 @@ static int tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf,
         return 1;
     }
     return 0;
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Graph-level materialize: walk entire deferred subgraph, partition
+// into optimal fusion groups, dispatch all at once.
+// ════════════════════════════════════════════════════════════════════
+
+#define GMAX 512  // max deferred nodes in subgraph
+
+// Discover all deferred tensors reachable from root via src_ids.
+// Returns count of discovered deferred nodes (not including leaves).
+static u32 graph_discover(TinyHVM *ctx, u32 root, u32 *nodes, u32 *n_nodes) {
+    u32 stk[GMAX], sp = 0;
+    stk[sp++] = root;
+    *n_nodes = 0;
+    // Simple visited check via temporary flag (reuse creator_loc as mark)
+    // We'll clear it after discovery.
+    u32 visited[GMAX]; u32 nv = 0;
+
+    while (sp > 0 && *n_nodes < GMAX) {
+        u32 tid = stk[--sp];
+        if (!tid) continue;
+        TensorMeta *m = &ctx->tensors[tid];
+        if (m->buf_id != 0) continue;  // already materialized = leaf
+        if (!m->creator_op) continue;   // raw tensor
+
+        // Check if already visited
+        int found = 0;
+        for (u32 i = 0; i < nv; i++) if (visited[i] == tid) { found = 1; break; }
+        if (found) continue;
+        visited[nv++] = tid;
+
+        // View ops: transparent — follow through without adding as a node
+        if (is_view_op(m->creator_op)) {
+            if (m->src_ids[0] && sp < GMAX) stk[sp++] = m->src_ids[0];
+            continue;
+        }
+
+        nodes[(*n_nodes)++] = tid;
+
+        // Follow deferred inputs
+        if (m->src_ids[0] && sp < GMAX) stk[sp++] = m->src_ids[0];
+        if (m->src_ids[1] && sp < GMAX) stk[sp++] = m->src_ids[1];
+    }
+    return *n_nodes;
+}
+
+// Partition nodes into fusion groups. Returns number of groups.
+// group_of[i] = group ID for nodes[i]. group_root[g] = output tid of group g.
+static u32 graph_partition(TinyHVM *ctx, const u32 *nodes, u32 n_nodes,
+                           u32 *group_of, u32 *group_root, u8 *group_has_reduce) {
+    u32 n_groups = 0;
+
+    // Process in reverse order (deepest first = inputs before outputs).
+    // Each node joins the group of its first deferred consumer, or starts a new group.
+    // Reduce nodes always start a new group boundary.
+
+    // First pass: assign groups bottom-up
+    for (u32 i = 0; i < n_nodes; i++) group_of[i] = ~0u;
+
+    // Build a node-id → index lookup (for finding consumers)
+    // Walk from last to first (inputs before outputs in discovery order)
+    for (int i = (int)n_nodes - 1; i >= 0; i--) {
+        u32 tid = nodes[i];
+        TensorMeta *m = &ctx->tensors[tid];
+
+        // MM always its own group
+        if (m->creator_op == UOP_MM) {
+            group_of[i] = n_groups;
+            group_root[n_groups] = tid;
+            group_has_reduce[n_groups] = 0;
+            n_groups++;
+            continue;
+        }
+
+        int is_red = (m->creator_op == UOP_SUM || m->creator_op == UOP_RMAX);
+
+        // Find which group our consumer belongs to
+        u32 consumer_group = ~0u;
+        for (u32 j = 0; j < n_nodes; j++) {
+            if (j == (u32)i) continue;
+            TensorMeta *cm = &ctx->tensors[nodes[j]];
+            // Follow through view ops to find the actual consumer
+            u32 check = nodes[j];
+            while (is_view_op(ctx->tensors[check].creator_op))
+                check = ctx->tensors[check].src_ids[0];
+            if (ctx->tensors[check].src_ids[0] == tid ||
+                ctx->tensors[check].src_ids[1] == tid) {
+                if (group_of[j] != ~0u) { consumer_group = group_of[j]; break; }
+            }
+            (void)cm;
+        }
+
+        if (consumer_group != ~0u && !is_red && !group_has_reduce[consumer_group]) {
+            // Can join consumer's group (no reduce conflict)
+            group_of[i] = consumer_group;
+        } else if (consumer_group != ~0u && is_red && !group_has_reduce[consumer_group]) {
+            // Reduce can join consumer's group (as the group's reduce)
+            group_of[i] = consumer_group;
+            group_has_reduce[consumer_group] = m->creator_op;
+        } else {
+            // Start new group
+            group_of[i] = n_groups;
+            group_root[n_groups] = tid;
+            group_has_reduce[n_groups] = is_red ? m->creator_op : 0;
+            n_groups++;
+        }
+    }
+
+    // Update group roots: the root should be the node closest to the output
+    for (u32 g = 0; g < n_groups; g++) group_root[g] = 0;
+    for (u32 i = 0; i < n_nodes; i++) {
+        u32 g = group_of[i];
+        if (g < n_groups) group_root[g] = nodes[i]; // last (closest to output) wins
+    }
+
+    return n_groups;
+}
+
+static void tensor_materialize_graph(TinyHVM *ctx, u32 root_tid) {
+    // Delegates to chain-level. The graph discovery + partitioning infrastructure
+    // is in place but not yet beneficial because the codegen only supports
+    // one reduce per kernel. Multi-reduce codegen is the prerequisite for
+    // graph-level dispatch to actually reduce the dispatch count.
+    tensor_materialize_chain(ctx, root_tid);
+}
+
+// Entry point — tries graph-level, falls back to chain-level
+static void tensor_materialize(TinyHVM *ctx, u32 tid) {
+    TensorMeta *m = &ctx->tensors[tid];
+    if (m->buf_id != 0) return;
+    tensor_materialize_graph(ctx, tid);
 }

@@ -72,6 +72,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t);
 static int is_elementwise(u32 uop);
 static int is_binary(u32 uop);
 static void tensor_materialize(TinyHVM *ctx, u32 tid);
+static void tensor_materialize_chain(TinyHVM *ctx, u32 tid);
 static int  tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf, const ReduceSpec *rs);
 static int  materialize_walk(TinyHVM *ctx, u32 tid,
                               FusedOp *ops, u32 *n_ops, u32 *op_tids,

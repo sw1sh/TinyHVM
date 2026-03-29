@@ -526,6 +526,7 @@ typedef struct {
     u64         itrs;       // interaction count
     u8          no_fuse;    // 1 to skip fusion (used during GRAD subnet re-reduction)
     u8          no_dup;     // 1 to skip linear_use DUP (used inside GRAD handler)
+    u8          prescan_done; // 1 after grad_prescan runs for current backward pass
 
     // Named definitions for TAG_REF (global def table)
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term
@@ -545,6 +546,9 @@ typedef struct {
     // threads[0] = main thread. When n_threads <= 1, parallel infra is bypassed.
     struct ThvmThread threads[16];
     u32         n_threads;     // 0 or 1 = single-threaded
+
+    // SUP/DUP labels — monotonic counter, only incremented at construction time
+    u32         next_sup_label;
 
 } TinyHVM;
 
@@ -620,8 +624,9 @@ Term     thvm_lam(TinyHVM *ctx, Term *var_out, Term body);   // allocate LAM nod
 Term     thvm_app(TinyHVM *ctx, Term fun, Term arg);         // allocate APP node
 u32      thvm_define(TinyHVM *ctx, Term body);               // register def, return name id
 Term     thvm_ref(TinyHVM *ctx, u32 name);                   // TAG_REF(name)
-Term     thvm_sup(TinyHVM *ctx, Term a, Term b);             // TAG_SUP(a, b)
-void     thvm_dup(TinyHVM *ctx, Term z, Term *out0, Term *out1); // linear DUP → DP0, DP1
+Term     thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b);   // TAG_SUP with label
+void     thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1); // DUP with label
+u32      thvm_fresh_label(TinyHVM *ctx);                     // allocate next label
 
 // Inet ops
 Term     thvm_where(TinyHVM *ctx, Term cond, Term then_t, Term else_t);

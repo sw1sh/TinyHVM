@@ -560,7 +560,7 @@ EXTERN_C DLLEXPORT int thvmApp(
     return LIBRARY_NO_ERROR;
 }
 
-// thvmSup[outId, aId, bId] → Void
+// thvmSup[outId, label, aId, bId] → Void
 EXTERN_C DLLEXPORT int thvmSup(
     WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
 {
@@ -568,31 +568,44 @@ EXTERN_C DLLEXPORT int thvmSup(
     if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
 
     mint out_id = MArgument_getInteger(args[0]);
-    mint a_id   = MArgument_getInteger(args[1]);
-    mint b_id   = MArgument_getInteger(args[2]);
+    mint label  = MArgument_getInteger(args[1]);
+    mint a_id   = MArgument_getInteger(args[2]);
+    mint b_id   = MArgument_getInteger(args[3]);
 
-    Term result = thvm_sup(g_ctx, get_term(a_id), get_term(b_id));
+    Term result = thvm_sup(g_ctx, (u32)label, get_term(a_id), get_term(b_id));
     set_term(out_id, result);
 
     return LIBRARY_NO_ERROR;
 }
 
-// thvmDup[zId, out0Id, out1Id] → Void
+// thvmDup[label, zId, out0Id, out1Id] → Void
 EXTERN_C DLLEXPORT int thvmDup(
     WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
 {
     (void)libData; (void)argc; (void)res;
     if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
 
-    mint z_id    = MArgument_getInteger(args[0]);
-    mint out0_id = MArgument_getInteger(args[1]);
-    mint out1_id = MArgument_getInteger(args[2]);
+    mint label   = MArgument_getInteger(args[0]);
+    mint z_id    = MArgument_getInteger(args[1]);
+    mint out0_id = MArgument_getInteger(args[2]);
+    mint out1_id = MArgument_getInteger(args[3]);
 
     Term out0, out1;
-    thvm_dup(g_ctx, get_term(z_id), &out0, &out1);
+    thvm_dup(g_ctx, (u32)label, get_term(z_id), &out0, &out1);
     set_term(out0_id, out0);
     set_term(out1_id, out1);
 
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmFreshLabel[] → Integer
+EXTERN_C DLLEXPORT int thvmFreshLabel(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc; (void)args;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    MArgument_setInteger(res, (mint)thvm_fresh_label(g_ctx));
     return LIBRARY_NO_ERROR;
 }
 

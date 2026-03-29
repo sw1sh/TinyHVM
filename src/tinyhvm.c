@@ -78,8 +78,9 @@ static int  materialize_walk(TinyHVM *ctx, u32 tid,
                               u32 *leaf_ids, const View **leaf_views, u32 *n_leaves);
 Term thvm_op2(TinyHVM *ctx, u32 opr, Term x, Term y);
 Term thvm_op_raw(TinyHVM *ctx, u32 uop, Term a, Term b);
-Term thvm_sup(TinyHVM *ctx, Term a, Term b);
+Term thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b);
 Term thvm_app(TinyHVM *ctx, Term fun, Term arg);
+u32  thvm_fresh_label(TinyHVM *ctx);
 #define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0&&c->tensors[t].creator_op)tensor_materialize(c,t);}while(0)
 
 // Read strided view to contiguous host buffer
@@ -106,6 +107,9 @@ static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel)
 
 // ── clone/ — deep-copy (ALO) for REF unfolding ──────────────────────────────
 #include "clone/_.c"
+
+// Forward declaration (defined in grad/_.c, used by interact/_.c)
+static void grad_prescan(TinyHVM *ctx, Term loss);
 
 // ── interact/ — one interaction rule per active pair ─────────────────────────
 #include "interact/_.c"

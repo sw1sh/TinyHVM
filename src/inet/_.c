@@ -16,21 +16,27 @@ Term thvm_app(TinyHVM *ctx, Term fun, Term arg) {
     return term_new(TAG_APP, 0, loc);
 }
 
-Term thvm_sup(TinyHVM *ctx, Term a, Term b) {
+Term thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc,     a);
     heap_set(ctx, loc + 1, b);
-    return term_new(TAG_SUP, 0, loc);
+    return term_new(TAG_SUP, label, loc);
 }
 
-// DUP: split a linear term into two copies (DP0, DP1).
-// heap[loc] = value. Both DP0/DP1 reduce to the value (passthrough).
-// Currently unused — DUP accumulation disabled (correctness-first design).
-void thvm_dup(TinyHVM *ctx, Term z, Term *out0, Term *out1) {
+// DUP: split a term into two projections (DP0, DP1) with a label.
+// heap[loc] = value. DP0/DP1 reduce the value, then fire DUP interaction rules.
+// Label determines annihilation (same label SUP) vs commutation (different label).
+void thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1) {
     u64 loc = heap_alloc(ctx, 1);
     heap_set(ctx, loc, z);
-    *out0 = term_new(TAG_DP0, 0, loc);
-    *out1 = term_new(TAG_DP1, 0, loc);
+    *out0 = term_new(TAG_DP0, label, loc);
+    *out1 = term_new(TAG_DP1, label, loc);
+}
+
+// Allocate a fresh label (monotonic counter). Only call at search-space construction
+// time — interaction rules propagate existing labels, never create fresh ones.
+u32 thvm_fresh_label(TinyHVM *ctx) {
+    return ctx->next_sup_label++;
 }
 
 u32 thvm_define(TinyHVM *ctx, Term body) {

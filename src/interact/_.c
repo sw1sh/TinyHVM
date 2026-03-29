@@ -59,6 +59,14 @@ inet_step:
                     heap_set(ctx, loc + 2, x);
                 }
 
+                // Deferred grad_prescan: run ONCE when forward provenance is ready.
+                // Only the top-level GRAD needs prescan; recursive GRAD3s reuse the counts.
+                if (term_tag(x) == TAG_CTR && term_tag(y) == TAG_TEN &&
+                    !ctx->prescan_done) {
+                    grad_prescan(ctx, y);
+                    ctx->prescan_done = 1;
+                }
+
                 if (term_tag(y) == TAG_TEN) {
                     u32 y_id = (u32)term_val(y);
 
@@ -1106,28 +1114,48 @@ inet_step:
             RETURN_REDUCED(term_ten(dst_id, ma->dtype));
         }
 
-        // TAG_APP: beta reduction — APP(LAM(x, body), arg) → body[x ← arg]
-        // Rule fires as an active pair: APP + LAM → relink ports, continue loop.
+        // TAG_APP: beta reduction + APP-SUP distribution
         case TAG_APP: {
             u64 loc = term_val(t);
-            Term fun = thvm_reduce(ctx, heap_read(ctx, loc));  // reduce fun (not tail)
+            Term fun = thvm_reduce(ctx, heap_read(ctx, loc));
             heap_set(ctx, loc, fun);
+
+            // APP-SUP (fun position): (&L{f0,f1} arg) → !&L{a0,a1}=arg; &L{(f0 a0),(f1 a1)}
+            if (term_tag(fun) == TAG_SUP) {
+                u32 lab = term_ext(fun);
+                u64 sup_loc = term_val(fun);
+                Term f0 = heap_read(ctx, sup_loc + 0);
+                Term f1 = heap_read(ctx, sup_loc + 1);
+                Term arg = heap_read(ctx, loc + 1);
+                // Clone arg with the SUP's label
+                u64 dup_loc = heap_alloc(ctx, 1);
+                heap_set(ctx, dup_loc, arg);
+                Term arg0 = term_new(TAG_DP0, lab, dup_loc);
+                Term arg1 = term_new(TAG_DP1, lab, dup_loc);
+                ctx->itrs++;
+                t = thvm_sup(ctx, lab,
+                    thvm_app(ctx, f0, arg0),
+                    thvm_app(ctx, f1, arg1));
+                goto inet_step;
+            }
+
+            // APP-LAM: beta reduction — (λx.body arg) → body[x ← arg]
             if (term_tag(fun) == TAG_LAM) {
                 u64 lam_loc = term_val(fun);
                 Term arg = heap_read(ctx, loc + 1);
                 heap_set(ctx, lam_loc, arg);      // link: write arg at var slot
                 ctx->itrs++;
-                t = heap_read(ctx, lam_loc + 1);  // body is the next term to reduce
-                goto inet_step;                   // loop — no recursive call
+                t = heap_read(ctx, lam_loc + 1);  // body
+                goto inet_step;
             }
-            // APP-TEN: APP(TEN, x) → x — tensor in function pos, discard and return arg
-            // Enables sequencing: APP(ASSIGN(...), continuation) forces ASSIGN, then continues.
+            // APP-TEN: discard tensor, return arg (sequencing)
             if (term_tag(fun) == TAG_TEN) {
                 tensor_decref(ctx, (u32)term_val(fun));
                 ctx->itrs++;
                 t = heap_read(ctx, loc + 1);
                 goto inet_step;
             }
+            // APP-ERA: erasure propagation
             if (term_tag(fun) == TAG_ERA) {
                 ctx->itrs++;
                 t = heap_read(ctx, loc + 1);
@@ -1155,26 +1183,119 @@ inet_step:
             return t;
 
         // DUP interaction: DP0/DP1 are auxiliary port labels of a single DUP node.
-        // The interaction fires between the DUP's principal port and the value.
         // ONE rule, branching on dp_index for which projection to return.
+        // Label in EXT field: same label SUP → annihilate, different → commute.
         case TAG_DP0:
         case TAG_DP1: {
             u32 dp_index = (tag == TAG_DP1) ? 1 : 0;
-            u64 loc = term_val(t);
-            Term val = thvm_reduce(ctx, heap_read(ctx, loc));
-            heap_set(ctx, loc, val);  // cache reduced value for other projection
-            // DUP ⊳ SUP: annihilation (same label) or commutation (diff label)
+            u32 dup_label = term_ext(t);
+            u64 dup_loc = term_val(t);
+            Term val = thvm_reduce(ctx, heap_read(ctx, dup_loc));
+            heap_set(ctx, dup_loc, val);
+
+            // DUP ⊳ SUP
             if (term_tag(val) == TAG_SUP) {
+                u32 sup_label = term_ext(val);
+                u64 sup_loc = term_val(val);
                 ctx->itrs++;
-                t = heap_read(ctx, term_val(val) + dp_index);
+
+                if (dup_label == sup_label) {
+                    // ANNIHILATION: same label — project directly
+                    Term tm0 = heap_read(ctx, sup_loc + 0);
+                    Term tm1 = heap_read(ctx, sup_loc + 1);
+                    if (dp_index == 0) {
+                        heap_set(ctx, dup_loc, tm1); // other projection gets tm1
+                        t = tm0;
+                    } else {
+                        heap_set(ctx, dup_loc, tm0); // other projection gets tm0
+                        t = tm1;
+                    }
+                    goto inet_step;
+                } else {
+                    // COMMUTATION: different label — pass through, preserve both labels
+                    Term a = heap_read(ctx, sup_loc + 0);
+                    Term b = heap_read(ctx, sup_loc + 1);
+                    // Reuse sup_loc for du0, alloc new for du1
+                    u64 du0 = sup_loc;  // a is already at sup_loc
+                    u64 du1 = heap_alloc(ctx, 1);
+                    heap_set(ctx, du1, b);
+                    // Create 2 new SUPs with the ORIGINAL sup_label
+                    u64 su0 = heap_alloc(ctx, 2);
+                    u64 su1 = heap_alloc(ctx, 2);
+                    heap_set(ctx, su0 + 0, term_new(TAG_DP0, dup_label, du0));
+                    heap_set(ctx, su0 + 1, term_new(TAG_DP0, dup_label, du1));
+                    heap_set(ctx, su1 + 0, term_new(TAG_DP1, dup_label, du0));
+                    heap_set(ctx, su1 + 1, term_new(TAG_DP1, dup_label, du1));
+                    Term new_sup0 = term_new(TAG_SUP, sup_label, su0);
+                    Term new_sup1 = term_new(TAG_SUP, sup_label, su1);
+                    if (dp_index == 0) {
+                        heap_set(ctx, dup_loc, new_sup1);
+                        t = new_sup0;
+                    } else {
+                        heap_set(ctx, dup_loc, new_sup0);
+                        t = new_sup1;
+                    }
+                    goto inet_step;
+                }
+            }
+
+            // DUP ⊳ LAM: commutation — duplicate lambda
+            if (term_tag(val) == TAG_LAM) {
+                u64 lam_loc = term_val(val);
+                Term body = heap_read(ctx, lam_loc + 1);
+                // Clone body with DUP label (single shared slot)
+                u64 bdup = heap_alloc(ctx, 1);
+                heap_set(ctx, bdup, body);
+                // Create two fresh lambdas
+                Term var0, var1;
+                Term lam0 = thvm_lam(ctx, &var0, term_new(TAG_DP0, dup_label, bdup));
+                Term lam1 = thvm_lam(ctx, &var1, term_new(TAG_DP1, dup_label, bdup));
+                // Original var gets SUP of new vars (with dup_label)
+                u64 vsup = heap_alloc(ctx, 2);
+                heap_set(ctx, vsup + 0, var0);
+                heap_set(ctx, vsup + 1, var1);
+                heap_set(ctx, lam_loc, term_new(TAG_SUP, dup_label, vsup));
+                ctx->itrs++;
+                if (dp_index == 0) {
+                    heap_set(ctx, dup_loc, lam1);
+                    t = lam0;
+                } else {
+                    heap_set(ctx, dup_loc, lam0);
+                    t = lam1;
+                }
                 goto inet_step;
             }
-            // DUP ⊳ TEN: copy atom — both projections get same TEN (shared buffer)
+
+            // DUP ⊳ atoms: copy (both projections get same value)
             if (term_tag(val) == TAG_TEN) return val;
-            // DUP ⊳ ERA: both projections get ERA
             if (term_tag(val) == TAG_ERA) return val;
-            // DUP ⊳ NUM: copy atom
             if (term_tag(val) == TAG_NUM) return val;
+
+            // DUP ⊳ OP2/TOP/CTR: generic compound node duplication (DUP-NOD)
+            if (term_tag(val) == TAG_OP2 || term_tag(val) == TAG_APP) {
+                u64 val_loc = term_val(val);
+                u64 r0 = heap_alloc(ctx, 2);
+                u64 r1 = heap_alloc(ctx, 2);
+                for (u32 i = 0; i < 2; i++) {
+                    Term child = heap_read(ctx, val_loc + i);
+                    u64 cdup = heap_alloc(ctx, 1);
+                    heap_set(ctx, cdup, child);
+                    heap_set(ctx, r0 + i, term_new(TAG_DP0, dup_label, cdup));
+                    heap_set(ctx, r1 + i, term_new(TAG_DP1, dup_label, cdup));
+                }
+                Term n0 = term_new(term_tag(val), term_ext(val), r0);
+                Term n1 = term_new(term_tag(val), term_ext(val), r1);
+                ctx->itrs++;
+                if (dp_index == 0) {
+                    heap_set(ctx, dup_loc, n1);
+                    t = n0;
+                } else {
+                    heap_set(ctx, dup_loc, n0);
+                    t = n1;
+                }
+                goto inet_step;
+            }
+
             // Not yet reducible — return DUP as-is
             return t;
         }
@@ -1185,8 +1306,42 @@ inet_step:
             u32 opr = term_ext(t);
             Term x = thvm_reduce(ctx, heap_read(ctx, loc));
             heap_set(ctx, loc, x);
+
+            // OP2-SUP (left): OP2(opr, &L{x0,x1}, y) → &L{OP2(opr,x0,y0), OP2(opr,x1,y1)}
+            if (term_tag(x) == TAG_SUP) {
+                u32 lab = term_ext(x);
+                u64 sup_loc = term_val(x);
+                Term x0 = heap_read(ctx, sup_loc + 0);
+                Term x1 = heap_read(ctx, sup_loc + 1);
+                Term y = heap_read(ctx, loc + 1);
+                // Clone y with SUP's label
+                u64 dup_loc = heap_alloc(ctx, 1);
+                heap_set(ctx, dup_loc, y);
+                Term y0 = term_new(TAG_DP0, lab, dup_loc);
+                Term y1 = term_new(TAG_DP1, lab, dup_loc);
+                ctx->itrs++;
+                t = thvm_sup(ctx, lab,
+                    thvm_op2(ctx, opr, x0, y0),
+                    thvm_op2(ctx, opr, x1, y1));
+                goto inet_step;
+            }
+
             Term y = thvm_reduce(ctx, heap_read(ctx, loc + 1));
             heap_set(ctx, loc + 1, y);
+
+            // OP2-SUP (right): x is already NUM (atom), just reuse — no DUP needed
+            if (term_tag(y) == TAG_SUP) {
+                u32 lab = term_ext(y);
+                u64 sup_loc = term_val(y);
+                Term y0 = heap_read(ctx, sup_loc + 0);
+                Term y1 = heap_read(ctx, sup_loc + 1);
+                ctx->itrs++;
+                t = thvm_sup(ctx, lab,
+                    thvm_op2(ctx, opr, x, y0),
+                    thvm_op2(ctx, opr, x, y1));
+                goto inet_step;
+            }
+
             if (term_tag(x) == TAG_NUM && term_tag(y) == TAG_NUM) {
                 u32 xv = term_as_u32(x), yv = term_as_u32(y), r;
                 switch (opr) {
@@ -1194,6 +1349,8 @@ inet_step:
                     case 1: r = xv - yv; break;
                     case 2: r = xv * yv; break;
                     case 3: r = yv ? xv / yv : 0; break;
+                    case 4: r = (xv == yv) ? 1 : 0; break;  // EQ
+                    case 5: r = yv ? xv % yv : 0; break;     // MOD
                     default: r = 0;
                 }
                 ctx->itrs++;

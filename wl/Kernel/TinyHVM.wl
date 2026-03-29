@@ -46,8 +46,9 @@ TInteractionCount::usage = "TInteractionCount[] returns the total interaction co
 
 TLam::usage = "TLam[body] creates a lambda term. Returns {TTerm[lamId], TTerm[varId]}.";
 TApp::usage = "TApp[fun, arg] creates an application term.";
-TSup::usage = "TSup[a, b] creates a superposition term.";
-TDup::usage = "TDup[z] duplicates a term. Returns {TTerm[dp0], TTerm[dp1]}.";
+TSup::usage = "TSup[a, b] creates a superposition with a fresh label. TSup[label, a, b] uses an explicit label.";
+TDup::usage = "TDup[z] duplicates a term with a fresh label. TDup[label, z] uses an explicit label. Returns {TTerm[dp0], TTerm[dp1]}.";
+TFreshLabel::usage = "TFreshLabel[] allocates a fresh SUP/DUP label (monotonic counter).";
 TDefine::usage = "TDefine[body] registers a named definition. Returns the name (Integer).";
 TRef::usage = "TRef[name] creates a reference to a named definition.";
 TNum::usage = "TNum[n] creates an integer term (TAG_NUM). n must be a non-negative integer.";
@@ -230,6 +231,7 @@ thvmLamFn = None;
 thvmAppFn = None;
 thvmSupFn = None;
 thvmDupFn = None;
+thvmFreshLabelFn = None;
 thvmNumFn = None;
 thvmOp2Fn = None;
 thvmNumValueFn = None;
@@ -323,9 +325,11 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
     thvmAppFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmApp",
         {Integer, Integer, Integer}, "Void"];
     thvmSupFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmSup",
-        {Integer, Integer, Integer}, "Void"];
+        {Integer, Integer, Integer, Integer}, "Void"];
     thvmDupFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmDup",
-        {Integer, Integer, Integer}, "Void"];
+        {Integer, Integer, Integer, Integer}, "Void"];
+    thvmFreshLabelFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmFreshLabel",
+        {}, Integer];
     thvmNumFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmNum",
         {Integer, Integer}, "Void"];
     thvmOp2Fn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmOp2",
@@ -650,15 +654,21 @@ TApp[fun_TTensor, arg_TTensor] := TApp[ToTTerm[fun], ToTTerm[arg]];
 TApp[fun_TTensor, arg_TTerm]   := TApp[ToTTerm[fun], arg];
 TApp[fun_TTerm, arg_TTensor]   := TApp[fun, ToTTerm[arg]];
 
-TSup[a_TTerm, b_TTerm] := Module[{out = allocId[]},
+(* TSup[a, b] — fresh label; TSup[label, a, b] — explicit label *)
+TSup[a_TTerm, b_TTerm] := TSup[TFreshLabel[], a, b];
+TSup[label_Integer, a_TTerm, b_TTerm] := Module[{out = allocId[]},
     loadLibrary[];
-    thvmSupFn[out, a[[1]], b[[1]]];
+    thvmSupFn[out, label, a[[1]], b[[1]]];
     TTerm[out]
 ];
 
-TDup[z_TTerm] := Module[{dp0 = allocId[], dp1 = allocId[]},
+TFreshLabel[] := (loadLibrary[]; thvmFreshLabelFn[]);
+
+(* TDup[z] — fresh label; TDup[label, z] — explicit label *)
+TDup[z_TTerm] := TDup[TFreshLabel[], z];
+TDup[label_Integer, z_TTerm] := Module[{dp0 = allocId[], dp1 = allocId[]},
     loadLibrary[];
-    thvmDupFn[z[[1]], dp0, dp1];
+    thvmDupFn[label, z[[1]], dp0, dp1];
     {TTerm[dp0], TTerm[dp1]}
 ];
 

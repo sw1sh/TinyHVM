@@ -889,7 +889,7 @@ inet_step:
 
             // Defer reduce when input is deferred, elementwise, unshared.
             // Only when backend has codegen (dispatch_kernel_rs) for fused reduce+ew.
-            if (((uop == UOP_SUM && b_id != 0 && ma->view.shape.rank >= 4) || uop == UOP_RMAX) &&
+            if (((uop == UOP_SUM && b_id != 0) || uop == UOP_RMAX) &&
                 ma->buf_id == 0 && ma->creator_op &&
                 is_elementwise(ma->creator_op) && ma->defer_consumers == 0 &&
                 ma->backend->dispatch_kernel_rs) {

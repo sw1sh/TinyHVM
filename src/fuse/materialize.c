@@ -701,33 +701,48 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
     }
     if (!reduce2_tid) return 0;
 
-    // Find reduce1 (below reduce2)
+    // Find reduce1 (below reduce2) — scan both branches of binary ops
     TensorMeta *r2m = &ctx->tensors[reduce2_tid];
-    cur = r2m->src_ids[0];
-    for (u32 d = 0; d < 20; d++) {
-        if (!cur) break;
-        TensorMeta *cm = &ctx->tensors[cur];
-        if (cm->buf_id != 0) break;
-        if (!cm->creator_op) break;
-        if (cm->creator_op == UOP_SUM || cm->creator_op == UOP_RMAX) {
-            reduce1_tid = cur; break;
+    {
+        u32 stk[32]; u32 sn = 0;
+        if (r2m->src_ids[0]) stk[sn++] = r2m->src_ids[0];
+        while (sn > 0 && !reduce1_tid) {
+            cur = stk[--sn];
+            if (!cur) continue;
+            TensorMeta *cm = &ctx->tensors[cur];
+            if (cm->buf_id != 0) continue;
+            if (!cm->creator_op) continue;
+            if (cm->creator_op == UOP_SUM || cm->creator_op == UOP_RMAX) {
+                reduce1_tid = cur; break;
+            }
+            if (is_elementwise(cm->creator_op) || is_view_op(cm->creator_op)) {
+                if (cm->src_ids[0] && sn < 30) stk[sn++] = cm->src_ids[0];
+                if (cm->src_ids[1] && sn < 30) stk[sn++] = cm->src_ids[1];
+            }
         }
-        if (is_elementwise(cm->creator_op) || is_view_op(cm->creator_op))
-            cur = cm->src_ids[0];
-        else break;
     }
     if (!reduce1_tid) return 0;
 
-    // Found two reduces! Build multi-reduce kernel.
+    // Found two reduces! Verify axes match BEFORE any side effects.
     TensorMeta *r1m = &ctx->tensors[reduce1_tid];
     u32 r1_input = r1m->src_ids[0];
     if (!r1_input) return 0;
 
-    // Multi-reduce codegen needs variable referencing fixes in phase 2.
-    // Pattern detection works (~12 per MNIST step). TODO: fix codegen.
-    return 0;
+    // Check axes compatibility via host_ptr (no ENSURE needed for small axes tensors)
+    {
+        u32 r1a = r1m->src_ids[1], r2a = r2m->src_ids[1];
+        if (r1a && r2a) {
+            const f32 *r1f = tensor_host_f32(ctx, r1a);
+            const f32 *r2f = tensor_host_f32(ctx, r2a);
+            if (!r1f || !r2f) return 0; // can't read axes without ENSURE
+            u32 n1 = ctx->tensors[r1a].view.numel, n2 = ctx->tensors[r2a].view.numel;
+            if (n1 != n2) return 0;
+            for (u32 i = 0; i < n1; i++)
+                if ((u32)r1f[i] != (u32)r2f[i]) return 0;
+        } else if (r1a != r2a) return 0; // one has axes, other doesn't
+    }
 
-    // Materialize reduce1's input chain (if deferred ew)
+    // Axes match! Now safe to materialize.
     ENSURE(ctx, r1_input);
     if (ctx->tensors[r1_input].buf_id == 0) return 0;
 
@@ -757,7 +772,9 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
             if (fs.dims[d] > 1) { rs.is_reduce[d] = 1; break; }
     }
 
-    // Collect between-reduce ew ops (from reduce1 output to reduce2 input)
+    // Collect ops between reduce1 and reduce2 (the "pre-reduce2" chain).
+    // These ops reference BOTH acc (reduce1 result) AND reduce-varying leaves,
+    // so they go INSIDE the reduce2 loop, not between the loops.
     u32 between_chain[16]; u32 bn = 0;
     cur = r2m->src_ids[0];
     while (cur != reduce1_tid && bn < 16) {
@@ -766,39 +783,63 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
             between_chain[bn++] = cur;
             cur = cm->src_ids[0];
         } else if (is_view_op(cm->creator_op)) {
-            cur = cm->src_ids[0]; // skip views
+            cur = cm->src_ids[0];
         } else break;
     }
 
-    // Add between-reduce ops (reverse order: bottom-up)
-    rs.post_reduce_start = n_ops; // (0 pre-reduce ops since leaf is materialized)
-    u32 n_between_leaves = 0;
+    // No between-loop ops (reduce1 feeds directly into reduce2's inner ops).
+    // post_reduce_start = 0 means reduce1 has no pre-reduce ew ops.
+    rs.post_reduce_start = 0;
+    rs.n_post_leaves = 0;
+
+    // Build reduce2 phase ops from between_chain (goes inside reduce2 loop)
+    rs.reduce2_type = r2m->creator_op;
+    rs.reduce2_start = 0; // all ops are inside reduce2 loop
+
+    // Add between-chain ops as reduce2 ops (reverse order: bottom→top)
     for (int bi = (int)bn - 1; bi >= 0; bi--) {
         TensorMeta *bm = &ctx->tensors[between_chain[bi]];
-        if (is_binary(bm->creator_op) && bm->src_ids[1]) {
-            u32 other = bm->src_ids[1];
-            ENSURE(ctx, other);
-            if (ctx->tensors[other].buf_id != 0 && n_leaves < FUSE_MAX_LEAVES) {
-                leaf_ids[n_leaves] = other;
-                leaf_views[n_leaves] = &ctx->tensors[other].view;
-                ops[n_ops] = (FusedOp){ .uop = bm->creator_op,
-                    .arg_a = (bi == (int)bn-1) ? 0 : n_leaves + n_ops - 1,
-                    .arg_b = n_leaves };
-                n_leaves++; n_between_leaves++; n_ops++;
-            }
+        if (n_ops >= FUSE_MAX_OPS) return 0;
+        u32 a_ref, b_ref = 0;
+        // arg_a: follow src_ids[0] — either a leaf or a previous op
+        u32 a_src = bm->src_ids[0];
+        if (a_src == reduce1_tid) {
+            // References reduce1 result — codegen maps this to "acc"
+            a_ref = n_leaves; // special: codegen treats >= n_leaves as "acc" ref
         } else {
-            u32 prev = (n_ops > rs.post_reduce_start)
-                ? n_leaves + n_ops - 1 : 0;
-            ops[n_ops] = (FusedOp){ .uop = bm->creator_op, .arg_a = prev, .arg_b = 0 };
-            op_tids[n_ops] = between_chain[bi];
-            n_ops++;
+            // Check if it's a leaf
+            int found_leaf = -1;
+            for (u32 li = 0; li < n_leaves; li++)
+                if (leaf_ids[li] == a_src) { found_leaf = (int)li; break; }
+            if (found_leaf >= 0) a_ref = (u32)found_leaf;
+            else a_ref = n_leaves + n_ops - 1; // previous op
         }
+        // arg_b: second input (for binary ops)
+        if (is_binary(bm->creator_op)) {
+            u32 b_src = bm->src_ids[1];
+            if (b_src == between_chain[bi]) { b_ref = a_ref; } // self-ref (x*x)
+            else {
+                // Check if b_src is a leaf
+                int found_leaf = -1;
+                for (u32 li = 0; li < n_leaves; li++)
+                    if (leaf_ids[li] == b_src) { found_leaf = (int)li; break; }
+                if (found_leaf >= 0) b_ref = (u32)found_leaf;
+                else if (b_src == reduce1_tid) b_ref = n_leaves;
+                else {
+                    // b_src is another between-chain op — find it
+                    ENSURE(ctx, b_src);
+                    if (ctx->tensors[b_src].buf_id != 0 && n_leaves < FUSE_MAX_LEAVES) {
+                        leaf_ids[n_leaves] = b_src;
+                        leaf_views[n_leaves] = &ctx->tensors[b_src].view;
+                        b_ref = n_leaves++;
+                    } else b_ref = a_ref; // fallback
+                }
+            }
+        }
+        ops[n_ops] = (FusedOp){ .uop = bm->creator_op, .arg_a = a_ref, .arg_b = b_ref };
+        op_tids[n_ops] = between_chain[bi];
+        n_ops++;
     }
-    rs.n_post_leaves = n_between_leaves;
-
-    // Set reduce2 spec
-    rs.reduce2_type = r2m->creator_op;
-    rs.reduce2_start = n_ops;
     // Reduce2 axes
     u32 r2_axes = r2m->src_ids[1];
     if (r2_axes) {
@@ -812,14 +853,9 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
         memcpy(rs.is_reduce2, rs.is_reduce, sizeof(rs.is_reduce)); // same axes
     }
 
-    // Collect post-reduce2 ew ops (from reduce2 to tid)
-    // For now: if tid == reduce2_tid, no post-reduce2 ops
-    // TODO: collect ew ops between reduce2 and tid
-
-    // Multi-reduce codegen is implemented but needs variable referencing fixes
-    // in the second reduce phase. Disable for now — fall back to chain-level.
-    // The pattern detection works: ~12 multi-reduce patterns per MNIST step.
-    return 0;
+    // Verify reduce2 axes match reduce1 (required for shared loop structure)
+    if (memcmp(rs.is_reduce, rs.is_reduce2, sizeof(rs.is_reduce)) != 0)
+        return 0; // different axes — can't fuse into one loop
 
     // Allocate output and dispatch
     m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));

@@ -470,18 +470,42 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                         [s appendFormat:@"    uint c%u=(r2/%uu)%%%uu;\n", d, r2div, dim];
                     r2div *= dim;
                 }
-                // Re-read leaves inside reduce2 loop
+                // Re-compute leaf indices inside reduce2 loop (c%u changed by r2 decomp)
                 u32 n_pre2_leaves = n_leaves - reduce->n_post_leaves;
                 for (u32 li = 0; li < n_pre2_leaves; li++) {
                     const View *lv = leaf_views[li];
+                    // Coordinate-based index (same as path B above)
+                    if (lv->shape.rank == rank) {
+                        [s appendFormat:@"    uint r2i%u=%d", li, lv->offset];
+                        for (u32 d = 0; d < rank; d++) {
+                            if (lv->strides[d] == 0 || lv->shape.dims[d] == 1) continue;
+                            if (lv->strides[d] == 1) [s appendFormat:@"+c%u", d];
+                            else [s appendFormat:@"+c%u*%du", d, lv->strides[d]];
+                        }
+                        [s appendString:@";\n"];
+                    } else {
+                        // Fallback: flat index decomposition
+                        u32 fss[MAX_DIM];
+                        if (rank > 0) { fss[rank-1]=1; for(int d=(int)rank-2;d>=0;d--) fss[d]=fss[d+1]*full_shape->dims[d+1]; }
+                        [s appendFormat:@"    uint r2fi%u=", li];
+                        for (u32 d=0;d<rank;d++) { if(d>0)[s appendString:@"+"]; [s appendFormat:@"c%u*%uu",d,fss[d]]; }
+                        [s appendString:@";\n"];
+                        [s appendFormat:@"    uint r2i%u=%d", li, lv->offset];
+                        u32 ld=1;
+                        for(int d=(int)lv->shape.rank-1;d>=0;d--) {
+                            if(lv->strides[d]==0){ld*=lv->shape.dims[d];continue;}
+                            if(ld==1&&lv->strides[d]==1) [s appendFormat:@"+(r2fi%u%%%uu)",li,lv->shape.dims[d]];
+                            else if(ld==1) [s appendFormat:@"+(r2fi%u%%%uu)*%du",li,lv->shape.dims[d],lv->strides[d]];
+                            else [s appendFormat:@"+((r2fi%u/%uu)%%%uu)*%du",li,ld,lv->shape.dims[d],lv->strides[d]];
+                            ld*=lv->shape.dims[d];
+                        }
+                        [s appendString:@";\n"];
+                    }
                     if (lv->has_mask)
-                        [s appendFormat:@"    float r2t%u=m%u?in%u[i%u]:0.f;\n", li, li, li, li];
+                        [s appendFormat:@"    float r2t%u=m%u?in%u[r2i%u]:0.f;\n", li, li, li, li];
                     else
-                        [s appendFormat:@"    float r2t%u=in%u[i%u];\n", li, li, li];
+                        [s appendFormat:@"    float r2t%u=in%u[r2i%u];\n", li, li, li];
                 }
-                // Re-emit leaf index expressions inside reduce2 loop (coordinates changed)
-                // Note: the c%u variables were overwritten by reduce2 coordinates above,
-                // so leaf index expressions (which use c%u) automatically use the new coords.
 
                 // Emit reduce2 phase ops
                 for (u32 pi = r2s; pi < n_ops; pi++) {
@@ -526,11 +550,74 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             } else {
                 [s appendFormat:@"  out[oi]=p%u;\n", n_ops - prs - 1];
             }
-        } else {
-            if (reduce->reduce2_type) {
-                // reduce1 → reduce2 with no between-reduce ops
-                // Not yet supported — fall back to single reduce output
+        } else if (reduce->reduce2_type && reduce->reduce2_start < n_ops) {
+            // reduce1 → reduce2 directly (no between-reduce ew ops)
+            // All ops are inside reduce2 loop, referencing acc and leaves
+            u32 r2s = reduce->reduce2_start;
+            u32 r2_numel = 1;
+            u32 r2_dims[MAX_DIM]; u32 n_r2 = 0;
+            for (u32 d = 0; d < rank; d++) {
+                if (reduce->is_reduce2[d]) { r2_dims[n_r2++] = d; r2_numel *= full_shape->dims[d]; }
             }
+            if (n_r2 == 0) { n_r2 = n_red; r2_numel = reduce_numel;
+                for (u32 i = 0; i < n_red; i++) r2_dims[i] = red_dims[i]; }
+
+            [s appendFormat:@"  float acc2=%s;\n",
+                reduce->reduce2_type == UOP_RMAX ? "-1e30f" : "0.0f"];
+            [s appendFormat:@"  for(uint r2=0;r2<%uu;r2++){\n", r2_numel];
+            u32 r2div = 1;
+            for (int ri = (int)n_r2 - 1; ri >= 0; ri--) {
+                u32 d = r2_dims[ri]; u32 dim = full_shape->dims[d];
+                if (r2div == 1) [s appendFormat:@"    uint c%u=r2%%%uu;\n", d, dim];
+                else [s appendFormat:@"    uint c%u=(r2/%uu)%%%uu;\n", d, r2div, dim];
+                r2div *= dim;
+            }
+            // Re-compute leaf indices + read leaves
+            u32 n_pre2_leaves = n_leaves - reduce->n_post_leaves;
+            for (u32 li = 0; li < n_pre2_leaves; li++) {
+                const View *lv = leaf_views[li];
+                if (lv->shape.rank == rank) {
+                    [s appendFormat:@"    uint r2i%u=%d", li, lv->offset];
+                    for (u32 d = 0; d < rank; d++) {
+                        if (lv->strides[d] == 0 || lv->shape.dims[d] == 1) continue;
+                        if (lv->strides[d] == 1) [s appendFormat:@"+c%u", d];
+                        else [s appendFormat:@"+c%u*%du", d, lv->strides[d]];
+                    }
+                    [s appendString:@";\n"];
+                } else {
+                    [s appendFormat:@"    uint r2i%u=0;\n", li]; // fallback
+                }
+                [s appendFormat:@"    float r2t%u=in%u[r2i%u];\n", li, li, li];
+            }
+            // Emit reduce2 ops
+            for (u32 pi = r2s; pi < n_ops; pi++) {
+                u32 pidx = pi - r2s, a = ops[pi].arg_a, b = ops[pi].arg_b;
+                NSString *a_name = (a < n_pre2_leaves) ? [NSString stringWithFormat:@"r2t%u", a]
+                    : (a == n_leaves) ? @"acc" : [NSString stringWithFormat:@"r2v%u", a - n_leaves - 1];
+                NSString *b_name = nil;
+                if (is_binary(ops[pi].uop)) {
+                    b_name = (b < n_pre2_leaves) ? [NSString stringWithFormat:@"r2t%u", b]
+                        : (b == n_leaves) ? @"acc" : [NSString stringWithFormat:@"r2v%u", b - n_leaves - 1];
+                }
+                switch (ops[pi].uop) {
+                    case UOP_ADD:  [s appendFormat:@"    float r2v%u=%@+%@;\n", pidx, a_name, b_name]; break;
+                    case UOP_SUB:  [s appendFormat:@"    float r2v%u=%@-%@;\n", pidx, a_name, b_name]; break;
+                    case UOP_MUL:  [s appendFormat:@"    float r2v%u=%@*%@;\n", pidx, a_name, b_name]; break;
+                    case UOP_DIV:  [s appendFormat:@"    float r2v%u=%@/%@;\n", pidx, a_name, b_name]; break;
+                    case UOP_NEG:  [s appendFormat:@"    float r2v%u=-%@;\n", pidx, a_name]; break;
+                    case UOP_EXP:  [s appendFormat:@"    float r2v%u=exp(%@);\n", pidx, a_name]; break;
+                    case UOP_LOG:  [s appendFormat:@"    float r2v%u=log(%@);\n", pidx, a_name]; break;
+                    case UOP_SQRT: [s appendFormat:@"    float r2v%u=sqrt(%@);\n", pidx, a_name]; break;
+                    default:       [s appendFormat:@"    float r2v%u=%@;\n", pidx, a_name]; break;
+                }
+            }
+            u32 r2_last = n_ops - r2s - 1;
+            if (reduce->reduce2_type == UOP_RMAX)
+                [s appendFormat:@"    acc2=max(acc2,r2v%u);\n  }\n", r2_last];
+            else
+                [s appendFormat:@"    acc2+=r2v%u;\n  }\n", r2_last];
+            [s appendFormat:@"  out[oi]=acc2;\n"];
+        } else {
             [s appendFormat:@"  out[oi]=acc;\n"];
         }
     } else if (use_f4) {

@@ -21,6 +21,10 @@ static void metal_flush(void) {
         batch_cmd = nil;
     }
     batch_dirty = 0;
+    // Drain pending_free — GPU is idle, safe to recycle these buffers
+    for (u32 i = 0; i < pending_free_count; i++)
+        metal_buf_free(pending_free[i]);
+    pending_free_count = 0;
 }
 
 static id<MTLComputeCommandEncoder> get_encoder(void) {

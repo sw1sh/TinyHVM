@@ -46,6 +46,8 @@ static u32 tensor_view_of(TinyHVM *ctx, u32 src_id, View new_view) {
   m->buf_id   = ms->buf_id;
   m->backend  = ms->backend;
   m->view     = new_view;
+  if (m->buf_id && m->backend && m->backend->buf_incref)
+      m->backend->buf_incref(m->buf_id);
   return id;
 }
 
@@ -63,5 +65,8 @@ static inline void tensor_decref(TinyHVM *ctx, u32 id) {
         atomic_fetch_sub((_Atomic(u32)*)&ctx->tensors[id].refcount, 1);
     else if (ctx->tensors[id].refcount > 0)
         ctx->tensors[id].refcount--;
-    // Buffer freeing deferred to thvm_reset — view-shared bufs make eager free unsafe.
+    // Buffer freeing uses buf_refcount infrastructure but is NOT triggered here.
+    // Tensor metadata (buf_id, src_ids) is still accessed by ASSIGN/GRAD/materialize
+    // handlers after inet refcount reaches 0. Buffer release happens in thvm_reset
+    // via pool_reset (bulk) or via explicit buf_decref at safe points.
 }

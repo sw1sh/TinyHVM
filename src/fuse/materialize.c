@@ -28,6 +28,8 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
             tensor_materialize(ctx, base);
         if (base && ctx->tensors[base].buf_id != 0) {
             m->buf_id = ctx->tensors[base].buf_id;
+            if (m->backend && m->backend->buf_incref)
+                m->backend->buf_incref(m->buf_id);
             return -2;
         }
         return -1;

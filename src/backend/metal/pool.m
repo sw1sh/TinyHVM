@@ -23,8 +23,23 @@ static u32 metal_buf_alloc(u64 bytes) {
                                                    options:MTLResourceStorageModeShared];
         metal_pool.sizes[id] = bytes;
     }
+    buf_refcount[id] = 1;
     thvm_prof_buf_alloc(bytes);
     return id;
+}
+
+static void metal_buf_incref(u32 id) {
+    if (id == 0) return;
+    buf_refcount[id]++;
+}
+
+static void metal_buf_decref(u32 id) {
+    if (id == 0) return;
+    assert(buf_refcount[id] > 0 && "buf_decref on zero refcount");
+    if (--buf_refcount[id] == 0) {
+        if (pending_free_count < PENDING_FREE_CAP)
+            pending_free[pending_free_count++] = id;
+    }
 }
 
 static void metal_buf_free(u32 id) {
@@ -96,6 +111,9 @@ static void metal_pool_reset(u32 keep) {
         }
         metal_pool.bufs[i] = nil;
         metal_pool.sizes[i] = 0;
+        buf_refcount[i] = 0;
     }
+    // Clear pending_free — all ephemeral buffers already moved to free_list above
+    pending_free_count = 0;
     metal_pool.count = buf_keep;
 }

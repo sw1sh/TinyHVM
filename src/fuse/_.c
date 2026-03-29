@@ -453,6 +453,8 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                         ctx->tensors[itid].view.numel * sizeof(f32));
                 } else {
                     ctx->tensors[itid].buf_id = ctx->tensors[dst_id].buf_id;
+                    if (ctx->tensors[dst_id].backend && ctx->tensors[dst_id].backend->buf_incref)
+                        ctx->tensors[dst_id].backend->buf_incref(ctx->tensors[dst_id].buf_id);
                 }
             }
             // dst = SUM/RMAX(ew_last_id, axes)
@@ -490,6 +492,8 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                         needs_rg = 1;
                     if (needs_rg)
                         ibuf = ctx->tensors[dst_id].backend->buf_alloc(iv.numel * sizeof(f32));
+                    else if (ctx->tensors[dst_id].backend && ctx->tensors[dst_id].backend->buf_incref)
+                        ctx->tensors[dst_id].backend->buf_incref(ibuf);
                     ctx->tensors[tid] = (TensorMeta){
                         .buf_id = ibuf,
                         .dtype = DTYPE_F32,

@@ -66,9 +66,13 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
         thvm_prof_global.heap_at_reset = ctx->heap_pos;
     }
     // Sum bytes being freed for memory tracking
+    // Decref shared buffers before pool_reset — ensures correct per-buffer freeing
     for (u32 i = keep; i < ctx->tensor_count; i++) {
-        if (ctx->tensors[i].host_ptr) free(ctx->tensors[i].host_ptr);
-        memset(&ctx->tensors[i], 0, sizeof(TensorMeta));
+        TensorMeta *m = &ctx->tensors[i];
+        if (m->buf_id && m->backend && m->backend->buf_decref)
+            m->backend->buf_decref(m->buf_id);
+        if (m->host_ptr) free(m->host_ptr);
+        memset(m, 0, sizeof(TensorMeta));
     }
     // Reset all backend buffer pools (frees GPU/CPU buffers above keep)
     for (u32 bi = 0; bi < ctx->n_backends; bi++) {
@@ -359,8 +363,11 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
         ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0;
         ctx->tensors[id].view = rv;
         ctx->tensors[id].host_ptr = NULL;
+        ctx->tensors[id].refcount = 1;
         ctx->tensors[id].creator_op = UOP_RESHAPE;
         ctx->tensors[id].src_ids[0] = src_id;
+        if (m->buf_id && m->backend && m->backend->buf_incref)
+            m->backend->buf_incref(m->buf_id);
         if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
@@ -380,6 +387,9 @@ Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
         u32 id = ctx->tensor_count++;
         ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
+        ctx->tensors[id].refcount = 1;
+        if (m->buf_id && m->backend && m->backend->buf_incref)
+            m->backend->buf_incref(m->buf_id);
         View *v = &ctx->tensors[id].view;
         if (v->shape.rank != new_shape.rank) {
             fprintf(stderr, "expand rank mismatch: tensor %u has rank %u, target rank %u\n"
@@ -418,6 +428,9 @@ Term thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank) {
         u32 id = ctx->tensor_count++;
         ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
+        ctx->tensors[id].refcount = 1;
+        if (m->buf_id && m->backend && m->backend->buf_incref)
+            m->backend->buf_incref(m->buf_id);
         ctx->tensors[id].view = view_permute(m->view, axes);
         ctx->tensors[id].creator_op = UOP_PERMUTE;
         ctx->tensors[id].src_ids[0] = src_id;
@@ -449,6 +462,9 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         u32 id = ctx->tensor_count++;
         ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
+        ctx->tensors[id].refcount = 1;
+        if (m->buf_id && m->backend && m->backend->buf_incref)
+            m->backend->buf_incref(m->buf_id);
         ctx->tensors[id].view = view_pad(m->view, pad_before, pad_after);
         ctx->tensors[id].creator_op = UOP_PAD;
         ctx->tensors[id].src_ids[0] = src_id;
@@ -482,6 +498,9 @@ Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         u32 id = ctx->tensor_count++;
         ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
+        ctx->tensors[id].refcount = 1;
+        if (m->buf_id && m->backend && m->backend->buf_incref)
+            m->backend->buf_incref(m->buf_id);
         View *v = &ctx->tensors[id].view;
         for (u32 i = 0; i < ndim; i++) v->shape.dims[i] = new_dims[i];
         v->offset = offset;

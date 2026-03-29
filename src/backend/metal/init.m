@@ -100,6 +100,14 @@ static struct {
 } free_list[MAX_FREE_BUFS];
 static u32 free_count = 0;
 
+// Buffer-level refcounting — tracks how many tensors share each buf_id.
+// When refcount→0, the buf_id is enqueued to pending_free (not freed immediately
+// because GPU may still be reading it). Drained in metal_flush after GPU sync.
+static u32 buf_refcount[MAX_BUFS];
+#define PENDING_FREE_CAP 4096
+static u32 pending_free[PENDING_FREE_CAP];
+static u32 pending_free_count = 0;
+
 // ViewParams (must match shaders.metal)
 typedef struct {
     int32_t  strides[8];
@@ -139,8 +147,9 @@ static id<MTLComputePipelineState> make_pipe(NSString *name) {
     return ps;
 }
 
-// Forward declaration (defined in batch.m)
+// Forward declarations (defined in batch.m / pool.m)
 static void metal_flush(void);
+static void metal_buf_free(u32 id);
 
 static int metal_init(void) {
     thvm_prof_init();

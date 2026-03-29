@@ -332,7 +332,7 @@ typedef struct { u32 B, C, H, W, OH, OW; } Pool2dParams;
 // ============================================================
 
 #ifndef HEAP_CAP
-#define HEAP_CAP (1ULL << 21)  // 2M terms = 16MB
+#define HEAP_CAP (1ULL << 25)  // 32M terms = 256MB
 #endif
 
 // ============================================================
@@ -481,6 +481,8 @@ struct Backend {
     // Buffer management
     u32   (*buf_alloc)(u64 bytes);
     void  (*buf_free)(u32 id);
+    void  (*buf_incref)(u32 id);   // increment buffer-level refcount (shared views)
+    void  (*buf_decref)(u32 id);   // decrement; enqueues free when refcount→0
     void  (*buf_write)(u32 id, const void *data, u64 bytes);
     void  (*buf_read)(u32 id, void *out, u64 bytes);
 
@@ -658,6 +660,14 @@ typedef struct {
 } CollapseResult;
 CollapseResult thvm_collapse(TinyHVM *ctx, Term t);
 void           thvm_collapse_free(CollapseResult *cr);
+CollapseResult thvm_collapse_par(TinyHVM *ctx, Term t, u32 n_threads);
+
+// Grouped collapse: each result carries its (label, branch) path
+typedef struct { u32 label; u8 branch; } LabelChoice;
+typedef struct { Term term; LabelChoice *path; u32 path_len; } GroupedLeaf;
+typedef struct { GroupedLeaf *leaves; u32 count; u32 cap; } GroupedCollapseResult;
+GroupedCollapseResult thvm_collapse_grouped(TinyHVM *ctx, Term t);
+void thvm_collapse_grouped_free(GroupedCollapseResult *gr);
 
 // Inet ops
 Term     thvm_where(TinyHVM *ctx, Term cond, Term then_t, Term else_t);

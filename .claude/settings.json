@@ -46,7 +46,8 @@
       "Read(//Users/swish/src/TinyHVM/tinygrad/test/**)",
       "Read(//Users/swish/src/tinygrad/test/**)",
       "Read(//Users/swish/.claude/**)",
-      "mcp__WolframNotebook__WolframLanguageEvaluator"
+      "mcp__WolframNotebook__WolframLanguageEvaluator",
+      "mcp__WolframNotebook__ReadNotebook"
     ]
   }
 }

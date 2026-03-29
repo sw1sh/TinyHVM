@@ -420,7 +420,7 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
 (* Context lifecycle                                                       *)
 (* ════════════════════════════════════════════════════════════════════════ *)
 
-TInit[device_String:"metal"] := Module[{ok},
+TInit[device_String:"cpu"] := Module[{ok},
     loadLibrary[];
     If[FileExistsQ[$metallibPath],
         thvmSetMetallibPathFn[$metallibPath]

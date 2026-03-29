@@ -90,16 +90,16 @@ int main(void) {
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
         Term loss=cross_entropy_loss(ctx,logits,&data.train_labels[bi*BS],BS,10);
 
-        // Gradient + Adam
+        // Gradient + BN assigns (reduced via IC graph)
         Term gs[NP];
         for(int i=0;i<NP;i++){f32*z=calloc(psz[i],4);
             gs[i]=thvm_tensor(ctx,z,ctx->tensors[(u32)term_val(params[i])].view.shape);free(z);}
         Term grad_term=thvm_grad_multi(ctx,loss,params,gs,NP);
         u32 gids[NP]; for(u32 i=0;i<NP;i++) gids[i]=(u32)term_val(gs[i]);
-        Term adam_chain=adam_step_lazy(ctx,&opt,gids);
-        // Chain: grad deposits → BN running stat updates → Adam updates
         Term bn_assigns=thvm_app(ctx,bn1.assigns,bn2.assigns);
-        thvm_reduce(ctx,thvm_app(ctx,grad_term,thvm_app(ctx,bn_assigns,adam_chain)));
+        thvm_reduce(ctx,thvm_app(ctx,grad_term,bn_assigns));
+        // Adam: direct GPU kernel (14 dispatches instead of ~42 fused)
+        adam_step_direct(ctx,&opt,gids);
 
         if(step<3||step%20==0||step==n_steps-1){
             f32 lv=thvm_to_host(ctx,loss)[0];

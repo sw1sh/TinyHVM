@@ -503,6 +503,10 @@ struct Backend {
     void  (*contiguify)(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view);
     void  (*buf_copy)(u32 dst_buf, u32 src_buf, u64 nbytes);
     void  (*buf_read_nosync)(u32 id, void *out, u64 bytes);
+    // Optimized optimizer kernel (optional — NULL means use IC graph)
+    void  (*adam_step)(u32 param, u32 grad, u32 m, u32 v,
+                       f32 lr, f32 beta1, f32 beta2, f32 eps,
+                       f32 bc1, f32 bc2, u32 n);
 
     // Pool management
     void  (*pool_reset)(u32 keep);

@@ -97,6 +97,26 @@ static Term adam_step_lazy(TinyHVM *ctx, Adam *opt, u32 *grad_ids) {
     return chain;
 }
 
+// Direct Adam step using specialized GPU kernel (bypasses IC graph).
+// Much faster: 14 dispatches instead of ~42 fused codegen kernels.
+// Requires grad accumulators to already contain computed gradients.
+static void adam_step_direct(TinyHVM *ctx, Adam *opt, u32 *grad_ids) {
+    opt->t++;
+    f32 bc1 = 1.0f - powf(opt->beta1, (f32)opt->t);
+    f32 bc2 = 1.0f - powf(opt->beta2, (f32)opt->t);
+    Backend *be = ctx_default_backend(ctx);
+    if (!be || !be->adam_step) return; // fallback: use adam_step_lazy
+    for (u32 i = 0; i < opt->n_params; i++) {
+        be->adam_step(
+            ctx->tensors[opt->param_ids[i]].buf_id,
+            ctx->tensors[grad_ids[i]].buf_id,
+            ctx->tensors[opt->m_bufs[i]].buf_id,
+            ctx->tensors[opt->v_bufs[i]].buf_id,
+            opt->lr, opt->beta1, opt->beta2, opt->eps,
+            bc1, bc2, opt->param_sizes[i]);
+    }
+}
+
 static void adam_free(Adam *opt) {
     free(opt->param_ids); free(opt->param_sizes);
     free(opt->m_bufs); free(opt->v_bufs);

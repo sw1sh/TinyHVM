@@ -40,6 +40,7 @@ Backend metal_backend = {
     .contiguify         = metal_contiguify,
     .buf_copy           = metal_buf_copy,
     .buf_read_nosync    = metal_buf_read_nosync,
+    .adam_step           = metal_op_adam_step,
     .pool_reset = metal_pool_reset,
     .begin_batch = metal_begin_batch,
     .end_batch   = metal_end_batch,

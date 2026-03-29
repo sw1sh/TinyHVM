@@ -55,8 +55,6 @@ static void metal_buf_write(u32 id, const void *data, u64 bytes) {
             memcpy(c->data, data, bytes);
         }
     }
-    if (0 && jit.state == JIT_CAPTURE && id >= jit.persistent_count) { // disabled
-    }
 }
 
 // Read without flushing — safe for CPU-written metadata that GPU hasn't touched.

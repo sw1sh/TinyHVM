@@ -26,20 +26,9 @@ static void dispatch_1d_ids(id<MTLComputePipelineState> pipe,
     batch_dirty = 1;
     total_dispatches++;
     dc[dc_tag]++; dc_tag = DC_OTHER;
-    if (jit.state == JIT_CAPTURE) {
-        // Per-command capture sum recording
-        {extern int jit_debug_replay; extern double jit_cap_sums[];
-        if (jit_debug_replay == 5) {
-            metal_flush();
-            f32 *od = (f32*)metal_pool.bufs[buf_ids[0]].contents;
-            u32 nf = numel;
-            double s = 0;
-            for (u32 j = 0; j < nf && j < 100000; j++) s += fabs(od[j]);
-            jit_cap_sums[jit.n_cmds] = s;
-        }}
+    if (jit.state == JIT_CAPTURE)
         jit_record_dispatch_ids(pipe, buf_ids, n_bufs, params, param_sizes, n_params,
                                 numel, 1, 1, (u32)tpg, 1, 1);
-    }
 }
 
 // Legacy dispatch using MTLBuffer pointers (for callers not yet converted)

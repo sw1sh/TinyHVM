@@ -558,22 +558,6 @@ void metal_dispatch_kernel_rs(u32 out_buf,
     total_dispatches++;
     dc[has_reduce ? DC_REDUCE : DC_FUSED]++;
 
-    // JIT capture: record per-command output sum for divergence detection
-    // Per-command capture sum (for debugging capture vs replay divergence)
-    {extern int jit_debug_replay; extern double jit_cap_sums[];
-    if (jit.state == JIT_CAPTURE && jit_debug_replay == 5) {
-        if (jit.n_cmds >= 20 && jit.n_cmds <= 25)
-            fprintf(stderr, "  [CODEGEN-CAP] cmd %u: out=%u n_side=%u n_leaves=%u total_bufs=%u\n",
-                    jit.n_cmds, out_buf, n_side_outputs, n_leaves, 1+n_side_outputs+n_leaves);
-        metal_flush();
-        f32 *od = (f32*)metal_pool.bufs[out_buf].contents;
-        u32 nf = (u32)(metal_pool.sizes[out_buf] / 4);
-        double s = 0;
-        for (u32 j = 0; j < nf && j < 100000; j++) s += fabs(od[j]);
-        jit_cap_sums[jit.n_cmds] = s;
-        if (jit.n_cmds == 22) fprintf(stderr, "  [CAP22] sum=%.6f n=%u [%.8f,%.8f]\n", s, nf, od[0], nf>1?od[1]:0);
-    }}
-
     if (jit.state == JIT_CAPTURE) {
         u32 ids[24];
         ids[0] = out_buf;

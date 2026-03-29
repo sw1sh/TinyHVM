@@ -584,6 +584,7 @@ Term     thvm_to_device(TinyHVM *ctx, Term t, u32 device_idx);
 #ifdef __APPLE__
 void     jit_begin_capture(u32 n_persistent_bufs);
 void     jit_end_capture(void);
+void     jit_flush(void);
 void     jit_replay(void);
 #endif
 

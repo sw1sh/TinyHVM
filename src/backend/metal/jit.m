@@ -78,10 +78,18 @@ void jit_end_capture(void) {
             jit.n_cmds, jit.n_slots, jit.persistent_count);
 }
 
+// Flush previous replay's GPU work — call BEFORE overwriting shared buffers.
+void jit_flush(void) {
+    if (batch_dirty) metal_flush();
+}
+
 void jit_replay(void) {
-    // Allocate ephemeral buffers (reuse from pool)
-    for (u32 i = jit.persistent_count; i < jit.n_slots; i++) {
-        jit.slots[i].buf_id = metal_buf_alloc(jit.slots[i].alloc_size);
+    // Allocate ephemeral buffers ONCE — reuse across replays.
+    if (!jit.ephemeral_ready) {
+        for (u32 i = jit.persistent_count; i < jit.n_slots; i++) {
+            jit.slots[i].buf_id = metal_buf_alloc(jit.slots[i].alloc_size);
+        }
+        jit.ephemeral_ready = 1;
     }
 
     // Encode all commands
@@ -129,9 +137,5 @@ void jit_replay(void) {
         }
     }
     total_dispatches += jit.n_cmds;
-
-    // Free ephemeral buffers (return to pool)
-    for (u32 i = jit.persistent_count; i < jit.n_slots; i++) {
-        metal_buf_free(jit.slots[i].buf_id);
-    }
+    // Ephemeral buffers kept alive — freed by jit_end_capture or program exit.
 }

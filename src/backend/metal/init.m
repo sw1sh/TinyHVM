@@ -72,6 +72,7 @@ typedef struct {
     u32 persistent_count;
     enum { JIT_OFF, JIT_CAPTURE, JIT_REPLAY } state;
     u32 loss_slot;
+    u8  ephemeral_ready;  // 1 after first replay allocates ephemeral buffers
 } JITState;
 
 static JITState jit = {0};

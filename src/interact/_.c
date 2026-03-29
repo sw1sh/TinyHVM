@@ -36,7 +36,19 @@ inet_step:
             // GRAD(y, grad_y, x) = "given ∂L/∂y = grad_y, compute ∂L/∂x"
             // No reduce — everything lazy. The chain rule produces new TOP nodes.
             if (uop == UOP_GRAD) {
-                #define GRAD_RETURN RETURN_REDUCED
+                // Disable rewrite fusion during backward: let deferred chains grow
+                // longer. Without this, rewrite_apply materializes each backward
+                // formula immediately (1 dispatch per formula = 82 dispatches).
+                // With this, deferred chains accumulate and tensor_materialize
+                // fuses them into fewer, larger kernels at ENSURE boundaries.
+                u8 _saved_nf = ctx->no_fuse;
+                ctx->no_fuse = 1;
+                #define GRAD_RETURN(r) do { \
+                    Term _gr = (r); \
+                    if (term_tag(_gr) == TAG_TOP) _gr = thvm_reduce(ctx, _gr); \
+                    ctx->no_fuse = _saved_nf; \
+                    return _gr; \
+                } while(0)
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
                 Term x  = heap_read(ctx, loc + 2);

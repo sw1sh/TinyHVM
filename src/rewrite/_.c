@@ -115,6 +115,7 @@ static RewriteRule rewrite_rules[] = {
 // Try all matching rewrite rules. Returns rewritten term, or t if none matched.
 static Term rewrite_apply(TinyHVM *ctx, Term t) {
     if (rewrite_active) return t;
+    if (ctx->no_fuse) return t;
     if (term_tag(t) != TAG_TOP) return t;
     // Skip rewrite rules when backend has no codegen (CPU) — fusion can't dispatch
     if (!ctx_default_backend(ctx) || !ctx_default_backend(ctx)->dispatch_kernel_rs) return t;

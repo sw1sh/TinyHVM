@@ -67,6 +67,32 @@ inet_step:
                     ctx->prescan_done = 1;
                 }
 
+                // GRAD-SUP: gradient through superposition
+                // GRAD(&L{y0,y1}, gy, x) → &L{GRAD(y0, DP0_L(gy), DP0_L(x)), ...}
+                if (term_tag(y) == TAG_SUP) {
+                    u32 lab = term_ext(y);
+                    u64 sup_loc = term_val(y);
+                    Term y0 = heap_read(ctx, sup_loc + 0);
+                    Term y1 = heap_read(ctx, sup_loc + 1);
+                    u64 gy_dup = heap_alloc(ctx, 1);
+                    heap_set(ctx, gy_dup, gy);
+                    u64 x_dup = heap_alloc(ctx, 1);
+                    heap_set(ctx, x_dup, x);
+                    // Inline GRAD3 (macro not yet in scope)
+                    u64 _l0 = heap_alloc(ctx, 3);
+                    heap_set(ctx, _l0, y0);
+                    heap_set(ctx, _l0+1, term_new(TAG_DP0, lab, gy_dup));
+                    heap_set(ctx, _l0+2, term_new(TAG_DP0, lab, x_dup));
+                    u64 _l1 = heap_alloc(ctx, 3);
+                    heap_set(ctx, _l1, y1);
+                    heap_set(ctx, _l1+1, term_new(TAG_DP1, lab, gy_dup));
+                    heap_set(ctx, _l1+2, term_new(TAG_DP1, lab, x_dup));
+                    ctx->itrs++;
+                    GRAD_RETURN(thvm_sup(ctx, lab,
+                        term_new(TAG_TOP, UOP_GRAD, _l0),
+                        term_new(TAG_TOP, UOP_GRAD, _l1)));
+                }
+
                 if (term_tag(y) == TAG_TEN) {
                     u32 y_id = (u32)term_val(y);
 

@@ -344,10 +344,42 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
             }
             return;
         }
+        // Walk failed: scan for deferred non-ew ops blocking the chain.
+        // Materialize them (deepest first), then retry the walk.
+        {
+            u32 to_mat[16]; u32 n_mat = 0;
+            u32 stk[32]; u32 sn = 0;
+            if (m->src_ids[0]) stk[sn++] = m->src_ids[0];
+            if (m->src_ids[1]) stk[sn++] = m->src_ids[1];
+            while (sn > 0 && n_mat < 16) {
+                u32 s = stk[--sn];
+                TensorMeta *sm = &ctx->tensors[s];
+                if (sm->buf_id != 0 || !sm->creator_op) continue;
+                if (is_elementwise(sm->creator_op) || is_view_op(sm->creator_op)) {
+                    if (sm->src_ids[0] && sn < 30) stk[sn++] = sm->src_ids[0];
+                    if (sm->src_ids[1] && sn < 30) stk[sn++] = sm->src_ids[1];
+                } else {
+                    to_mat[n_mat++] = s;
+                    if (sm->src_ids[0] && sn < 30) stk[sn++] = sm->src_ids[0];
+                    if (sm->src_ids[1] && sn < 30) stk[sn++] = sm->src_ids[1];
+                }
+            }
+            for (int i = (int)n_mat - 1; i >= 0; i--)
+                if (ctx->tensors[to_mat[i]].buf_id == 0)
+                    tensor_materialize(ctx, to_mat[i]);
+            if (n_mat > 0) {
+                n_ops = 0; n_leaves = 0;
+                result = materialize_walk(ctx, walk_tid, ops, &n_ops, op_tids,
+                                           leaf_ids, leaf_views, &n_leaves);
+                if (m->buf_id != 0) return;
+                if (result >= 0 && n_ops > 0) goto dispatch_chain;
+            }
+        }
         m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
         return;
     }
 
+dispatch_chain:
     // Remap op indices
     for (u32 i = 0; i < n_ops; i++) {
         if (ops[i].arg_a >= FUSE_MAX_LEAVES) ops[i].arg_a = n_leaves + (ops[i].arg_a - FUSE_MAX_LEAVES);

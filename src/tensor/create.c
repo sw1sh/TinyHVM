@@ -68,5 +68,23 @@ static inline void tensor_decref(TinyHVM *ctx, u32 id) {
     // Buffer freeing uses buf_refcount infrastructure but is NOT triggered here.
     // Tensor metadata (buf_id, src_ids) is still accessed by ASSIGN/GRAD/materialize
     // handlers after inet refcount reaches 0. Buffer release happens in thvm_reset
-    // via pool_reset (bulk) or via explicit buf_decref at safe points.
+    // via pool_reset (bulk) or via tensor_release at ERA-absorption safe points.
+}
+
+// ERA-safe release: decref tensor AND release buffer when refcount reaches 0.
+// ONLY safe when the tensor is genuinely dead — no backward walk, no ASSIGN,
+// no src_ids traversal will reach it. This is true for ERA-discarded tensors:
+// when ERA absorbs a tensor in a dead gradient branch, the gradient signal is
+// dead and no GRAD handler will ever traverse this tensor's metadata.
+static inline void tensor_release(TinyHVM *ctx, u32 id) {
+    TensorMeta *m = &ctx->tensors[id];
+    u32 prev;
+    if (ctx->n_threads > 1)
+        prev = atomic_fetch_sub((_Atomic(u32)*)&m->refcount, 1);
+    else {
+        prev = m->refcount;
+        if (prev > 0) m->refcount = prev - 1;
+    }
+    if (prev == 1 && m->buf_id && m->backend && m->backend->buf_decref)
+        m->backend->buf_decref(m->buf_id);
 }

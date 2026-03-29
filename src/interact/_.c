@@ -559,6 +559,8 @@ inet_step:
 
             // ERA-as-identity for grad domain: ADD/SUB/MUL/DIV with ERA operands
             // ADD(ERA,x)→x, ADD(x,ERA)→x, ADD(ERA,ERA)→ERA, MUL(*,ERA)→ERA
+            // tensor_release: ERA-discarded tensors are genuinely dead — no GRAD
+            // handler will traverse them (gradient signal is dead).
             if (is_binary) {
                 Term b_check = heap_read(ctx, loc + 1);
                 u8 at = term_tag(a), bt2 = term_tag(b_check);
@@ -567,10 +569,17 @@ inet_step:
                 if (a_era || b_era) {
                     // Both ERA → ERA
                     if (a_era && b_era) RETURN_REDUCED(term_era());
-                    // ERA+TEN or TEN+ERA
+                    // ERA+TEN or TEN+ERA: identity returns the survivor
                     if (uop == UOP_ADD) RETURN_REDUCED(a_era ? b_check : a);
-                    if (uop == UOP_SUB) RETURN_REDUCED(a_era ? term_era() : a); // ERA-x=ERA, x-ERA=x
-                    if (uop == UOP_MUL || uop == UOP_DIV) RETURN_REDUCED(term_era());
+                    if (uop == UOP_SUB) {
+                        if (a_era && b_ten) tensor_release(ctx, (u32)term_val(b_check));
+                        RETURN_REDUCED(a_era ? term_era() : a);
+                    }
+                    if (uop == UOP_MUL || uop == UOP_DIV) {
+                        if (!a_era && a_ten) tensor_release(ctx, (u32)term_val(a));
+                        if (!b_era && b_ten) tensor_release(ctx, (u32)term_val(b_check));
+                        RETURN_REDUCED(term_era());
+                    }
                     (void)a_ten; (void)b_ten;
                 }
             }

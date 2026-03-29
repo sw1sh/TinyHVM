@@ -525,6 +525,7 @@ typedef struct {
 
     u64         itrs;       // interaction count
     u8          no_fuse;    // 1 to skip fusion (used during GRAD subnet re-reduction)
+    u8          no_dup;     // 1 to skip linear_use DUP (used inside GRAD handler)
 
     // Named definitions for TAG_REF (global def table)
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term

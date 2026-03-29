@@ -105,9 +105,10 @@ int main(void) {
             f32 lv=thvm_to_host(ctx,loss)[0];
             printf("  step %3u: loss=%5.2f (%.1fs)\n",step,lv,now_s()-t0);
         }
-        extern u32 total_dispatches;total_dispatches=0;
-        for(u32 i=0;i<NP;i++){u32 pid=(u32)term_val(params[i]);
-            if(ctx->tensors[pid].host_ptr){free(ctx->tensors[pid].host_ptr);ctx->tensors[pid].host_ptr=NULL;}}
+        extern u32 total_dispatches;
+        extern u32 total_dispatches;
+        total_dispatches=0;
+        // Don't free host_ptr — shape data is still valid after Adam updates
         thvm_reset(ctx,nw);
     }}
 

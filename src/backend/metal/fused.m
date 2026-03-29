@@ -209,7 +209,8 @@ static id<MTLComputePipelineState> get_fused_pipe_v2(const FusedOp *ops, u32 n_o
 void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view) {
     // Flush pending GPU commands before contiguify — ensures source buffer
     // data from previous operations is visible to the contiguify kernel.
-    if (batch_dirty) metal_flush();
+    // No flush needed: Metal guarantees sequential execution within a command buffer.
+    // The source data was written by a previous dispatch in the same batch.
     u32 leaf_bufs[] = { src_buf };
     const View *leaf_views[] = { src_view };
     dc_tag = DC_CONTIGUIFY;

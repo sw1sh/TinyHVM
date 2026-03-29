@@ -79,7 +79,7 @@ static void metal_buf_read(u32 id, void *out, u64 bytes) {
 }
 
 static void metal_pool_reset(u32 keep) {
-    if (batch_dirty) metal_flush();
+    if (batch_dirty) metal_flush(); // needed: can't free GPU-active buffers
     u32 buf_keep = keep + 1;
     u32 n_free = metal_pool.count - buf_keep;
     if (n_free == 0) return;

@@ -66,7 +66,10 @@ void metal_buf_read_nosync(u32 id, void *out, u64 bytes) {
 }
 
 static void metal_buf_read(u32 id, void *out, u64 bytes) {
-    if (batch_dirty) metal_flush();
+    if (batch_dirty) {
+        // GPU sync needed: reading data that may have been GPU-written
+        metal_flush();
+    }
     u64 actual = metal_pool.sizes[id];
     if (bytes > actual) {
         // Read what we can, zero the rest (view strides may exceed buffer for broadcasts)

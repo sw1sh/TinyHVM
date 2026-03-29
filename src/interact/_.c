@@ -638,18 +638,22 @@ inet_step:
                     }
                     case UOP_SHRINK: {
                         // b is a 1D tensor: [start0, end0, start1, end1, ...]
-                        // Use full buf_read (not META_READ) — pairs may be GPU-computed
                         assert(b_id);
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 n_pairs = mb->view.numel;
-                        f32 *pairs = malloc(n_pairs * sizeof(f32));
-                        mb->backend->buf_read(mb->buf_id, pairs, n_pairs * sizeof(f32));
+                        f32 *pairs;
+                        if (mb->host_ptr && n_pairs <= MAX_DIM * 2) {
+                            pairs = (f32*)mb->host_ptr; // CPU-cached, no GPU flush
+                        } else {
+                            pairs = malloc(n_pairs * sizeof(f32));
+                            mb->backend->buf_read(mb->buf_id, pairs, n_pairs * sizeof(f32));
+                        }
                         u32 starts[MAX_DIM], ends[MAX_DIM];
                         for (u32 i = 0; i < n_pairs / 2; i++) {
                             starts[i] = (u32)pairs[i * 2];
                             ends[i]   = (u32)pairs[i * 2 + 1];
                         }
-                        free(pairs);
+                        if (pairs != (f32*)mb->host_ptr) free(pairs);
                         new_view = view_shrink(ma->view, starts, ends);
                         break;
                     }

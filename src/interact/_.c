@@ -476,6 +476,38 @@ inet_step:
                 heap_set(ctx, loc + 1, b);
             }
 
+            // === TOP-SUP: distribute tensor op across superposition ===
+            // TOP(op, &L{a0,a1}, b) → &L{TOP(op,a0,DP0_L(b)), TOP(op,a1,DP1_L(b))}
+            if (term_tag(a) == TAG_SUP) {
+                u32 lab = term_ext(a);
+                u64 sup_loc = term_val(a);
+                Term a0 = heap_read(ctx, sup_loc + 0);
+                Term a1 = heap_read(ctx, sup_loc + 1);
+                Term b0 = b, b1 = b;
+                if (is_binary || is_movement) {
+                    // DUP the other arg with the SUP's label
+                    u64 dup_loc = heap_alloc(ctx, 1);
+                    heap_set(ctx, dup_loc, b);
+                    b0 = term_new(TAG_DP0, lab, dup_loc);
+                    b1 = term_new(TAG_DP1, lab, dup_loc);
+                }
+                ctx->itrs++;
+                RETURN_REDUCED(thvm_sup(ctx, lab,
+                    thvm_op_raw(ctx, uop, a0, b0),
+                    thvm_op_raw(ctx, uop, a1, b1)));
+            }
+            if (term_tag(b) == TAG_SUP && (is_binary || is_movement)) {
+                u32 lab = term_ext(b);
+                u64 sup_loc = term_val(b);
+                Term b0 = heap_read(ctx, sup_loc + 0);
+                Term b1 = heap_read(ctx, sup_loc + 1);
+                // a is already reduced (TEN/NUM/ERA) — atoms copy freely
+                ctx->itrs++;
+                RETURN_REDUCED(thvm_sup(ctx, lab,
+                    thvm_op_raw(ctx, uop, a, b0),
+                    thvm_op_raw(ctx, uop, a, b1)));
+            }
+
             // TAG_NUM fast path: inline scalar compute without tensors/buffers.
             // ~5ns per interaction vs ~30ns with tensor_create + buf ops.
             if (term_tag(a) == TAG_NUM && !is_movement && !is_reduce && uop != UOP_MM) {

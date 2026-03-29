@@ -388,11 +388,18 @@ dispatch_chain:
 
     m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
 
-    // Collect side outputs (shared intermediates with allocated buffers)
+    // Allocate side output buffers for grad-needed intermediates (not walk_tid)
+    for (u32 i = 0; i < n_ops; i++) {
+        TensorMeta *sm = &ctx->tensors[op_tids[i]];
+        if (sm->requires_grad && sm->buf_id == 0 && op_tids[i] != walk_tid)
+            sm->buf_id = sm->backend->buf_alloc(sm->view.numel * sizeof(f32));
+    }
+
+    // Collect side outputs (shared intermediates + grad-needed with own buffers)
     u32 side_bufs[8]; u32 side_ops[8]; u32 n_sides = 0;
     for (u32 i = 0; i < n_ops && n_sides < 8; i++) {
         TensorMeta *sm = &ctx->tensors[op_tids[i]];
-        if (sm->buf_id != 0 && sm->defer_consumers > 0 && op_tids[i] != walk_tid) {
+        if (sm->buf_id != 0 && (sm->defer_consumers > 0 || sm->requires_grad) && op_tids[i] != walk_tid) {
             side_bufs[n_sides] = sm->buf_id;
             side_ops[n_sides] = n_leaves + i; // remapped op index
             n_sides++;

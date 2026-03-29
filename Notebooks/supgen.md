@@ -301,9 +301,14 @@ f = TLam[x |-> TOp2["Add", x, c]];
 (* Evaluate all 64 candidates at x=10 *)
 allResults = SearchEval[f, 10];
 Print["All outputs: ", allResults]
+(* Expected: {10, 11, 12, ..., 73} *)
+
+(* Build a fresh lambda for the find (terms are linear — used once) *)
+c2 = SearchSpace[Range[0, 63]];
+f2 = TLam[x |-> TOp2["Add", x, c2]];
 
 (* Find which c gives f(10) = 42 *)
-matches = SearchFind[f, 10, 42];
+matches = SearchFind[f2, 10, 42];
 solution = FirstPosition[matches, 1][[1]] - 1
 Print["Solution: c = ", solution]
 (* Expected: c = 32 *)

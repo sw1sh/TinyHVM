@@ -23,6 +23,8 @@
 | `kolmolang.hvml` | `41d3c07d...` | 2 | Kolmogorov complexity language in HVM |
 | `spine.hs` | `b7683b20...` | 0 | Spine-form evaluator (Haskell) |
 | `flattener.hs` | `1a7c87e9...` | 0 | Flattener (Haskell, IC-related) |
+| `icc_spec.md` | `c360b392...` | — | **ICC** — Interaction Calculus of Constructions (bridges, annotations, type encodings) |
+| `icc_type_checker.ts` | `dd291148...` | — | ITT-flavored CoC type checker (TS, uses Slf/Ann instead of Bri/Ann) |
 
 ## HigherOrderCO Key Repos
 
@@ -34,6 +36,8 @@
 | [HVM1](https://github.com/HigherOrderCO/HVM1) | Rust | — | — | Original 2022 prototype |
 | [Bend](https://github.com/HigherOrderCO/Bend) | Rust | 19.2k | Jun 3, 2025 | Massively parallel high-level language |
 | [Kind](https://github.com/HigherOrderCO/Kind) | Haskell | 3.7k | Jan 22, 2025 | Proof language |
+| [ICC](https://github.com/VictorTaelin/interaction-calculus-of-constructions) | TS/HVM | — | 2024-25 | **Interaction Calculus of Constructions** — bridges, dependent types |
+| [ITT](https://github.com/VictorTaelin/Interaction-Type-Theory) | — | — | — | Predecessor to ICC — decay/coherence formulation |
 | [bench](https://github.com/HigherOrderCO/bench) | TypeScript | 5 | Mar 18, 2026 | HVM/Bend benchmarks |
 
 ## Workspace Symlinks

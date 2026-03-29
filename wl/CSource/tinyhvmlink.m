@@ -609,6 +609,114 @@ EXTERN_C DLLEXPORT int thvmFreshLabel(
     return LIBRARY_NO_ERROR;
 }
 
+// thvmBri[outId, bodyId] → Integer (var term id stored at outId+1)
+EXTERN_C DLLEXPORT int thvmBri(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint out_id  = MArgument_getInteger(args[0]);
+    mint body_id = MArgument_getInteger(args[1]);
+
+    Term var;
+    Term result = thvm_bri(g_ctx, &var, get_term(body_id));
+    set_term(out_id, result);
+    set_term(out_id + 1, var);
+    MArgument_setInteger(res, out_id + 1);
+
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmAnn[outId, termId, typeId] → Void
+EXTERN_C DLLEXPORT int thvmAnn(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc; (void)res;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint out_id  = MArgument_getInteger(args[0]);
+    mint term_id = MArgument_getInteger(args[1]);
+    mint type_id = MArgument_getInteger(args[2]);
+
+    Term result = thvm_ann(g_ctx, get_term(term_id), get_term(type_id));
+    set_term(out_id, result);
+
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmDsu[outId, labelExprId, aId, bId] → Void
+EXTERN_C DLLEXPORT int thvmDsu(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc; (void)res;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint out_id      = MArgument_getInteger(args[0]);
+    mint label_id    = MArgument_getInteger(args[1]);
+    mint a_id        = MArgument_getInteger(args[2]);
+    mint b_id        = MArgument_getInteger(args[3]);
+
+    Term result = thvm_dsu(g_ctx, get_term(label_id), get_term(a_id), get_term(b_id));
+    set_term(out_id, result);
+
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmDdu[outId, labelExprId, valId, bodId] → Void
+EXTERN_C DLLEXPORT int thvmDdu(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc; (void)res;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint out_id   = MArgument_getInteger(args[0]);
+    mint label_id = MArgument_getInteger(args[1]);
+    mint val_id   = MArgument_getInteger(args[2]);
+    mint bod_id   = MArgument_getInteger(args[3]);
+
+    Term result = thvm_ddu(g_ctx, get_term(label_id), get_term(val_id), get_term(bod_id));
+    set_term(out_id, result);
+
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmInc[outId, termId] → Void
+EXTERN_C DLLEXPORT int thvmInc(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc; (void)res;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint out_id  = MArgument_getInteger(args[0]);
+    mint term_id = MArgument_getInteger(args[1]);
+
+    Term result = thvm_inc(g_ctx, get_term(term_id));
+    set_term(out_id, result);
+
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmCollapse[termId, baseOutId] → Integer (count of collapsed leaves)
+EXTERN_C DLLEXPORT int thvmCollapse(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint term_id = MArgument_getInteger(args[0]);
+    mint base_id = MArgument_getInteger(args[1]);
+
+    CollapseResult cr = thvm_collapse(g_ctx, get_term(term_id));
+    for (u32 i = 0; i < cr.count; i++) {
+        set_term(base_id + (mint)i, cr.terms[i]);
+    }
+    MArgument_setInteger(res, (mint)cr.count);
+    thvm_collapse_free(&cr);
+
+    return LIBRARY_NO_ERROR;
+}
+
 // thvmNum[outId, value] → Void — create TAG_NUM integer term
 EXTERN_C DLLEXPORT int thvmNum(
     WolframLibraryData libData, mint argc, MArgument *args, MArgument res)

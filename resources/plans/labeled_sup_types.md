@@ -1,17 +1,12 @@
 # Labeled SUP/DUP + Types for Interaction Net Search
 
-## Status: PLANNING
+## Status: Phases 1-5 DONE, Phase 6 next
 
 ## Motivation
 
-TinyHVM's SUP/DUP pairs are currently **unlabeled** — EXT field hardcoded to 0 in both
-`thvm_sup` and `thvm_dup`. All DUP-SUP interactions unconditionally annihilate (take branch
-by index). This prevents:
-
-1. **Nested search spaces** — two overlapping SUPs clobber each other without labels
-2. **Collapse monad** — label-aware extraction (pairwise vs Cartesian) impossible
-3. **Type-directed pruning** — no mechanism to prune superposed branches by type constraints
-4. **Correct duplication through SUPs** — `DUP_L(SUP_M(...))` with L≠M must commute, not annihilate
+Build a complete HVM4-compatible interaction calculus in TinyHVM, then layer tensor
+calculus on top. Pure IC semantics first (labeled SUP/DUP, collapse, ICC types,
+dynamic labels), tensor-specific distribution rules second (TOP-SUP, GRAD-SUP, FUSED-SUP).
 
 ---
 
@@ -529,9 +524,161 @@ Not needed yet in TinyHVM (no MAT/SWI), but worth noting for future constructors
 
 ---
 
-## Phase 3: TOP-SUP Distribution (tensor ops + superpositions)
+## Phase 3: Collapse Function
 
-### 3a. When a lazy tensor op encounters SUP
+### 3a. Implementation strategy
+
+TinyHVM's collapse needs two phases:
+
+1. **`thvm_collapse_step(ctx, term)`**: Reduce to WHNF. If result is SUP, lift it to
+   the root. If result is a compound node whose child is SUP, lift the child SUP.
+   Return the outermost SUP.
+
+2. **`thvm_collapse(ctx, term)`**: Iterate `collapse_step`, collecting all branches.
+   Use a priority queue keyed by label for breadth-first exploration.
+
+### 3b. Priority queue and INC
+
+HVM4 uses INC nodes to control collapse ordering. A term wrapped in INC gets lower
+priority in the queue → explored later. This enables search strategies:
+
+```wolfram
+(* Prefer simpler programs: wrap complex branches in INC *)
+TSup[label, simple_program, TInc[complex_program]]
+```
+
+### 3c. Label-aware bind (for WL interface)
+
+The WL-level Collapse can be implemented purely in Wolfram:
+
+```wolfram
+TCollapse[term_] := Module[{whnf = TReduce[term]},
+  If[TTag[whnf] === "SUP",
+    {lab, a, b} = TSupFields[whnf];
+    Join[TCollapse[a], TCollapse[b]],
+    {whnf}
+  ]
+]
+```
+
+For pairwise semantics, the more complex path-tracking bind is needed.
+Start with simple DFS flattening, add path-tracking as needed.
+
+---
+
+## Phase 4: BRI/ANN — ICC Bridge/Annotation
+
+### 4a. Bridge and Annotation nodes
+
+```c
+#define TAG_BRI 14   // Bridge: θx. term (dual of lambda)
+#define TAG_ANN 15   // Annotation: {term : type}
+```
+
+Heap layout identical to LAM/APP:
+- BRI: `heap[loc] = var_slot, heap[loc+1] = body`
+- ANN: `heap[loc] = term, heap[loc+1] = type`
+
+### 4b. ICC type encodings
+
+```
+Fun A B = θf. λx. {(f {x:A}) : B}           -- simple function type
+All A B = θf. λx. {(f {x:A}) : (B x)}       -- dependent function (Pi)
+Ind A B = θf. λx. {(f {x:A}) : (B f x)}     -- inductive/self type
+Sig A B = θp. {(p {p.0:A} {p.1:(B p.0)})}   -- dependent pair (Sigma)
+```
+
+### 4c. Interaction rules
+
+Bridge is the dual of lambda — variable flows in the opposite direction:
+
+```
+APP-BRI:  (θx.f a)           → x ← a; f     (same as APP-LAM but contra-variant)
+DUP-BRI:  !&L{r,s} = θx.f   → r←θx0.f0; s←θx1.f1; x←&L{x0,x1}; !&L{f0,f1}=f
+DUP-ANN:  !&L{r,s} = {t:T}  → r←{t0:T0}; s←{t1:T1}; !&L{t0,t1}=t; !&L{T0,T1}=T
+```
+
+Annotation reduces by checking `term` against `type`. Failed checks → ERA (branch pruned).
+This is type checking as interaction net reduction — no separate type checker.
+
+### 4d. Type checking = reduction
+
+When `{term : type}` reduces, the annotation checks that `term` conforms to `type`.
+For function types, checking domain/codomain. For tensor types (Phase 6), shape/dtype.
+Failed checks reduce to ERA → branch pruned from superposition.
+
+### 4e. Practical staging
+
+Before full ICC, lightweight type guards using existing IC:
+
+```wolfram
+(* Shape guard: pass through if shape matches, ERA otherwise *)
+TShapeGuard[t_, shape_] :=
+  TIfZ[TShapeEq[TShape[t], shape], t, TEra[]]
+
+(* Dtype guard *)
+TDtypeGuard[t_, dtype_] :=
+  TIfZ[TDtypeEq[TDtype[t], dtype], t, TEra[]]
+```
+
+Full ICC (TAG_BRI, TAG_ANN) adds composability — guards work for simple cases.
+
+---
+
+## Phase 5: DSU/DDU + INC — Dynamic Labels and Priority
+
+### 5a. DSU/DDU — Dynamic (runtime-computed) labels
+
+For computed search spaces where labels depend on data:
+
+```c
+#define TAG_DSU 16   // Dynamic SUP: &(label_expr){a, b}
+#define TAG_DDU 17   // Dynamic DUP: !&(label_expr){x} = val; bod
+```
+
+Reduce `label_expr` to NUM, then create normal SUP/DUP:
+
+```c
+// DSU: &(label_expr){a, b} — reduce label_expr to NUM, then make SUP
+fn Term wnf_dsu_num(Term lab_num, Term a, Term b) {
+    u32 lab = term_val(lab_num);
+    return term_new_sup(lab, a, b);
+}
+
+// DDU: !&(label_expr){x} = val; bod — reduce label_expr, then clone
+fn Term wnf_ddu_num(Term lab_num, Term val, Term bod) {
+    u32 lab = term_val(lab_num);
+    Copy V = term_clone(lab, val);
+    return APP(APP(bod, V.k0), V.k1);
+}
+```
+
+This enables:
+
+```wolfram
+(* Generate search space programmatically *)
+MakeSearch[n_] := Fold[
+  TSup[TNum[#2], ...] &,    (* each level gets label = its index *)
+  candidates,
+  Range[n]
+]
+```
+
+### 5b. INC — Priority control for collapse
+
+```c
+#define TAG_INC 18   // Priority wrapper: decreases priority in collapse queue
+```
+
+INC is transparent to all interaction rules except collapse. During collapse,
+INC-wrapped branches get lower priority → explored later. Enables search strategies:
+prefer simpler programs, depth-limited search, beam search, etc.
+
+---
+
+## Phase 6: TOP-SUP Distribution (tensor ops + superpositions)
+
+### 6a. When a lazy tensor op encounters SUP
 
 Following DUP-NOD pattern: distribute the op across both SUP branches, DUP the other
 arguments with the SUP's label.
@@ -540,7 +687,7 @@ arguments with the SUP's label.
 TOP(ADD, &L{a,b}, c) → &L{TOP(ADD, a, DP0_L(c)), TOP(ADD, b, DP1_L(c))}
 ```
 
-### 3b. Implementation: add to TAG_TOP handler
+### 6b. Implementation: add to TAG_TOP handler
 
 After reducing arguments to WHNF, before dispatch:
 
@@ -570,7 +717,7 @@ if (term_tag(a_term) == TAG_SUP) {
 // Same for second arg...
 ```
 
-### 3c. Shape constraint as early pruning
+### 6c. Shape constraint as early pruning
 
 Before distributing, optionally check ShapeTracker for both branches:
 
@@ -586,21 +733,11 @@ if (term_tag(a0) == TAG_TEN && term_tag(a1) == TAG_TEN) {
 
 This is the first "type-directed" pruning — shapes ARE types.
 
-### 3d. FUSED-SUP: fusion boundary at SUP
-
-When `materialize_walk` encounters TAG_SUP during tree traversal:
-- **Stop fusion** at the SUP boundary
-- Treat each SUP branch as an independent leaf
-- Each branch gets its own fused kernel
-
-This is HVM4's Strategy A. Strategy B (fusing across branches) would require codegen
-to emit two output buffers from one kernel — complex, future work.
-
 ---
 
-## Phase 4: GRAD-SUP Interaction
+## Phase 7: GRAD-SUP Interaction
 
-### 4a. Gradient through superposition
+### 7a. Gradient through superposition
 
 When GRAD walks provenance and hits a result that came from a SUP distribution:
 
@@ -612,7 +749,7 @@ Forward: TOP(ADD, &L{a,b}, c) distributed to → &L{ADD(a,c0), ADD(b,c1)}
 GRAD follows provenance per-branch. No special SUP handling needed in the GRAD handler
 itself — each materialized tensor has its own `creator_op` and `src_ids`.
 
-### 4b. What if GRAD's target tensor `y` is itself a SUP?
+### 7b. What if GRAD's target tensor `y` is itself a SUP?
 
 This shouldn't happen in practice: GRAD fires after reducing `y` to TAG_TEN.
 If a SUP survives to GRAD entry, it means the forward pass didn't fully distribute.
@@ -636,7 +773,7 @@ if (term_tag(y_term) == TAG_SUP) {
 }
 ```
 
-### 4c. Architecture search with gradients
+### 7c. Architecture search with gradients
 
 With labeled SUP/DUP, you can superpose different model architectures and train them
 simultaneously. Each architecture gets correct gradients because:
@@ -652,113 +789,23 @@ accumulate correctly.
 
 ---
 
-## Phase 5: Collapse Function
+## Phase 8: FUSED-SUP (fusion boundary at SUP)
 
-### 5a. Implementation strategy
+### 8a. Fusion stops at SUP boundary
 
-TinyHVM's collapse needs two phases:
+When `materialize_walk` encounters TAG_SUP during tree traversal:
+- **Stop fusion** at the SUP boundary
+- Treat each SUP branch as an independent leaf
+- Each branch gets its own fused kernel
 
-1. **`thvm_collapse_step(ctx, term)`**: Reduce to WHNF. If result is SUP, lift it to
-   the root. If result is a compound node whose child is SUP, lift the child SUP.
-   Return the outermost SUP.
+This is HVM4's Strategy A. Strategy B (fusing across branches) would require codegen
+to emit two output buffers from one kernel — complex, future work.
 
-2. **`thvm_collapse(ctx, term)`**: Iterate `collapse_step`, collecting all branches.
-   Use a priority queue keyed by label for breadth-first exploration.
+### 8b. Per-branch kernel dispatch
 
-### 5b. Priority queue and INC
-
-HVM4 uses INC nodes to control collapse ordering. A term wrapped in INC gets lower
-priority in the queue → explored later. This enables search strategies:
-
-```wolfram
-(* Prefer simpler programs: wrap complex branches in INC *)
-TSup[label, simple_program, TInc[complex_program]]
-```
-
-### 5c. Label-aware bind (for WL interface)
-
-The WL-level Collapse can be implemented purely in Wolfram:
-
-```wolfram
-TCollapse[term_] := Module[{whnf = TReduce[term]},
-  If[TTag[whnf] === "SUP",
-    {lab, a, b} = TSupFields[whnf];
-    Join[TCollapse[a], TCollapse[b]],
-    {whnf}
-  ]
-]
-```
-
-For pairwise semantics, the more complex path-tracking bind is needed.
-Start with simple DFS flattening, add path-tracking as needed.
-
----
-
-## Phase 6: Types via ICC Bridge/Annotation
-
-### 6a. Bridge and Annotation nodes
-
-```c
-#define TAG_BRI 14   // Bridge: θx. term (dual of lambda)
-#define TAG_ANN 15   // Annotation: {term : type}
-```
-
-Heap layout identical to LAM/APP:
-- BRI: `heap[loc] = var_slot, heap[loc+1] = body`
-- ANN: `heap[loc] = term, heap[loc+1] = type`
-
-### 6b. ICC type encodings
-
-```
-Fun A B = θf. λx. {(f {x:A}) : B}           -- simple function type
-All A B = θf. λx. {(f {x:A}) : (B x)}       -- dependent function (Pi)
-Ind A B = θf. λx. {(f {x:A}) : (B f x)}     -- inductive/self type
-Sig A B = θp. {(p {p.0:A} {p.1:(B p.0)})}   -- dependent pair (Sigma)
-```
-
-### 6c. Type checking = reduction
-
-When `{term : type}` reduces, the annotation checks that `term` conforms to `type`.
-For tensor types, this means shape/dtype checking. For function types, this means
-checking domain/codomain. Failed checks reduce to ERA → branch pruned.
-
-### 6d. Practical staging
-
-Before full ICC, implement lightweight type guards using existing IC:
-
-```wolfram
-(* Shape guard: pass through if shape matches, ERA otherwise *)
-TShapeGuard[t_, shape_] :=
-  TIfZ[TShapeEq[TShape[t], shape], t, TEra[]]
-
-(* Dtype guard *)
-TDtypeGuard[t_, dtype_] :=
-  TIfZ[TDtypeEq[TDtype[t], dtype], t, TEra[]]
-```
-
-Full ICC (TAG_BRI, TAG_ANN) added later when the guard approach hits limits.
-
----
-
-## Phase 7: DSU/DDU — Dynamic Labels (future)
-
-For computed search spaces where labels depend on data:
-
-```c
-#define TAG_DSU 16   // Dynamic SUP: &(label_expr){a, b}
-#define TAG_DDU 17   // Dynamic DUP: !&(label_expr){x} = val; bod
-```
-
-Reduce `label_expr` to NUM, then create normal SUP/DUP. This enables:
-
-```wolfram
-(* Generate search space programmatically *)
-MakeSearch[n_] := Fold[
-  TSup[TNum[#2], ...] &,    (* each level gets label = its index *)
-  candidates,
-  Range[n]
-]
-```
+Each SUP branch materializes independently → separate fused kernels. The collapse
+function (Phase 3) extracts individual branches before materialization, so each
+branch is a normal tensor expression tree that the existing fuser handles unchanged.
 
 ---
 
@@ -794,14 +841,16 @@ and constrain across all three dimensions simultaneously.
 
 ## Implementation Order
 
-1. **Phase 1** — Labeled SUP/DUP + DUP-SUP annihilation/commutation + DUP-NOD
-2. **Phase 2** — APP-SUP, OP2-SUP distribution (following HVM4 exactly)
-3. **Phase 3** — TOP-SUP distribution + shape pruning
-4. **Phase 5** — Collapse function (simple DFS first, PQ later)
-5. **Phase 4** — GRAD-SUP (defensive, mostly gets it free from TOP-SUP distribution)
-6. **Phase 6** — Type guards via TIfZ (pragmatic, no new tags)
-7. **Phase 7** — DSU/DDU, INC, full ICC (as needed)
+### Pure HVM semantics (interaction calculus — no tensor changes)
 
-Phases 1-2 are pure interaction calculus (no tensor changes).
-Phases 3-5 connect SUP to the tensor + collapse system.
-Phases 6-7 add type-theoretic and dynamic features.
+1. **Phase 1** ✅ — Labeled SUP/DUP + DUP-SUP annihilation/commutation + DUP-NOD
+2. **Phase 2** ✅ — APP-SUP, OP2-SUP distribution (following HVM4 exactly)
+3. **Phase 3** ✅ — Collapse function (DFS), CollapseResult API
+4. **Phase 4** ✅ — BRI/ANN — ICC Bridge/Annotation nodes, APP-BRI, DUP-BRI, DUP-ANN
+5. **Phase 5** ✅ — DSU/DDU + INC — dynamic labels, priority wrapper (INC transparent for now)
+
+### Tensor calculus (SUP meets lazy tensor ops, gradients, fusion)
+
+6. **Phase 6** — TOP-SUP distribution + shape pruning (type guards via TIfZ)
+7. **Phase 7** — GRAD-SUP (defensive — mostly free from TOP-SUP distribution)
+8. **Phase 8** — FUSED-SUP (fusion boundary at SUP, per-branch kernels)

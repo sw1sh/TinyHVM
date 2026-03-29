@@ -54,6 +54,21 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs) {
             return term_new(TAG_LAM, term_ext(t), new_loc);
         }
 
+        // ── BRI: bridge (same layout as LAM — 2 slots with var reloc)
+        case TAG_BRI: {
+            u64 old_loc = term_val(t);
+            u64 new_loc = heap_alloc(ctx, 2);
+            assert(*n_relocs < CLONE_MAX_RELOC);
+            relocs[*n_relocs] = (Reloc){ old_loc, new_loc };
+            (*n_relocs)++;
+            Term var = term_new(TAG_VAR, 0, new_loc);
+            heap_set(ctx, new_loc, term_set_sub(var));
+            heap_set(ctx, new_loc + 1,
+                     term_clone_r(ctx, heap_read(ctx, old_loc + 1),
+                                  relocs, n_relocs));
+            return term_new(TAG_BRI, term_ext(t), new_loc);
+        }
+
         // ── APP: 2 slots (fun, arg) ──────────────────────────────
         case TAG_APP: {
             u64 old_loc = term_val(t);
@@ -89,6 +104,41 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs) {
                      term_clone_r(ctx, heap_read(ctx, old_loc),
                                   relocs, n_relocs));
             return term_new(tag, term_ext(t), new_loc);
+        }
+
+        // ── ANN: 2 slots (term, type) ─────────────────────────────
+        case TAG_ANN: {
+            u64 old_loc = term_val(t);
+            u64 new_loc = heap_alloc(ctx, 2);
+            heap_set(ctx, new_loc,
+                     term_clone_r(ctx, heap_read(ctx, old_loc),
+                                  relocs, n_relocs));
+            heap_set(ctx, new_loc + 1,
+                     term_clone_r(ctx, heap_read(ctx, old_loc + 1),
+                                  relocs, n_relocs));
+            return term_new(TAG_ANN, term_ext(t), new_loc);
+        }
+
+        // ── DSU/DDU: 3 slots ─────────────────────────────────────
+        case TAG_DSU:
+        case TAG_DDU: {
+            u64 old_loc = term_val(t);
+            u64 new_loc = heap_alloc(ctx, 3);
+            for (u32 i = 0; i < 3; i++)
+                heap_set(ctx, new_loc + i,
+                         term_clone_r(ctx, heap_read(ctx, old_loc + i),
+                                      relocs, n_relocs));
+            return term_new(tag, term_ext(t), new_loc);
+        }
+
+        // ── INC: 1 slot ──────────────────────────────────────────
+        case TAG_INC: {
+            u64 old_loc = term_val(t);
+            u64 new_loc = heap_alloc(ctx, 1);
+            heap_set(ctx, new_loc,
+                     term_clone_r(ctx, heap_read(ctx, old_loc),
+                                  relocs, n_relocs));
+            return term_new(TAG_INC, term_ext(t), new_loc);
         }
 
         // ── OP2: 2 slots (x, y) ─────────────────────────────────

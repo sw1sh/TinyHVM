@@ -81,6 +81,76 @@ Term thvm_log_print(TinyHVM *ctx, Term tensor) {
     return term_new(TAG_TOP, UOP_LOG_PRINT, loc);
 }
 
+// BRI: bridge (dual of lambda — contra-variant binding for ICC types)
+Term thvm_bri(TinyHVM *ctx, Term *var_out, Term body) {
+    u64 loc = heap_alloc(ctx, 2);
+    Term var = term_new(TAG_VAR, 0, loc);
+    heap_set(ctx, loc,     term_set_sub(var));
+    heap_set(ctx, loc + 1, body);
+    if (var_out) *var_out = var;
+    return term_new(TAG_BRI, 0, loc);
+}
+
+// ANN: annotation {term : type}
+Term thvm_ann(TinyHVM *ctx, Term term, Term type) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     term);
+    heap_set(ctx, loc + 1, type);
+    return term_new(TAG_ANN, 0, loc);
+}
+
+// DSU: dynamic superposition — label is an expression reduced at interaction time
+Term thvm_dsu(TinyHVM *ctx, Term label_expr, Term a, Term b) {
+    u64 loc = heap_alloc(ctx, 3);
+    heap_set(ctx, loc,     label_expr);
+    heap_set(ctx, loc + 1, a);
+    heap_set(ctx, loc + 2, b);
+    return term_new(TAG_DSU, 0, loc);
+}
+
+// DDU: dynamic dup — label is an expression, reduces then clones val
+Term thvm_ddu(TinyHVM *ctx, Term label_expr, Term val, Term bod) {
+    u64 loc = heap_alloc(ctx, 3);
+    heap_set(ctx, loc,     label_expr);
+    heap_set(ctx, loc + 1, val);
+    heap_set(ctx, loc + 2, bod);
+    return term_new(TAG_DDU, 0, loc);
+}
+
+// INC: priority wrapper — transparent to reduce, lower priority in collapse
+Term thvm_inc(TinyHVM *ctx, Term term) {
+    u64 loc = heap_alloc(ctx, 1);
+    heap_set(ctx, loc, term);
+    return term_new(TAG_INC, 0, loc);
+}
+
+// Collapse: DFS that extracts all SUP branches into a flat array
+static void collapse_dfs(TinyHVM *ctx, Term t, CollapseResult *cr) {
+    Term reduced = thvm_reduce(ctx, t);
+    if (term_tag(reduced) == TAG_SUP) {
+        u64 loc = term_val(reduced);
+        collapse_dfs(ctx, heap_read(ctx, loc + 0), cr);
+        collapse_dfs(ctx, heap_read(ctx, loc + 1), cr);
+    } else {
+        if (cr->count >= cr->cap) {
+            cr->cap = cr->cap ? cr->cap * 2 : 16;
+            cr->terms = realloc(cr->terms, cr->cap * sizeof(Term));
+        }
+        cr->terms[cr->count++] = reduced;
+    }
+}
+
+CollapseResult thvm_collapse(TinyHVM *ctx, Term t) {
+    CollapseResult cr = {NULL, 0, 0};
+    collapse_dfs(ctx, t, &cr);
+    return cr;
+}
+
+void thvm_collapse_free(CollapseResult *cr) {
+    if (cr->terms) { free(cr->terms); cr->terms = NULL; }
+    cr->count = cr->cap = 0;
+}
+
 // OP2: binary integer operation on TAG_NUM values.
 // opr: 0=add, 1=sub, 2=mul, 3=div, 4=eq, 5=mod
 Term thvm_op2(TinyHVM *ctx, u32 opr, Term x, Term y) {

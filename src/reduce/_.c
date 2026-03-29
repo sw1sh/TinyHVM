@@ -89,7 +89,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
 
     // Already WNF atoms → go directly to apply
     if (tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
-        tag == TAG_LAM || tag == TAG_SUP) { whnf = next; goto apply; }
+        tag == TAG_LAM || tag == TAG_SUP || tag == TAG_BRI) { whnf = next; goto apply; }
 
     // TAG_TOP: try declarative rewrite rules first (fusion, etc.).
     // If no rule matches, reduce args depth-first then fire interact.
@@ -218,7 +218,8 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps) {
 
 static const char *tag_names[] = {
     "APP", "LAM", "VAR", "SUP", "DP0", "DP1", "ERA",
-    "NUM", "REF", "OP2", "TEN", "TOP", "CTR"
+    "NUM", "REF", "OP2", "TEN", "TOP", "CTR",
+    "BRI", "ANN", "DSU", "DDU", "INC"
 };
 
 // uop_names now in tinyhvm.h
@@ -249,6 +250,24 @@ void thvm_print_term(TinyHVM *ctx, Term t) {
         case TAG_TOP:
             if (term_ext(t) < UOP_COUNT) printf("(%s @%llu)", uop_names[term_ext(t)], (unsigned long long)term_val(t));
             else printf("(uop=%u @%llu)", term_ext(t), (unsigned long long)term_val(t));
+            break;
+        case TAG_SUP:
+            printf("(lab=%u @%llu)", term_ext(t), (unsigned long long)term_val(t));
+            break;
+        case TAG_BRI:
+            printf("(θ @%llu)", (unsigned long long)term_val(t));
+            break;
+        case TAG_ANN:
+            printf("({:} @%llu)", (unsigned long long)term_val(t));
+            break;
+        case TAG_DSU:
+            printf("(&dyn @%llu)", (unsigned long long)term_val(t));
+            break;
+        case TAG_DDU:
+            printf("(!&dyn @%llu)", (unsigned long long)term_val(t));
+            break;
+        case TAG_INC:
+            printf("(↓ @%llu)", (unsigned long long)term_val(t));
             break;
         default:
             if (term_val(t) || term_ext(t))

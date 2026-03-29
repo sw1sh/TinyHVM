@@ -57,6 +57,13 @@ TNumValue::usage = "TNumValue[term] extracts the integer value from a reduced TA
 TSupValues::usage = "TSupValues[term] recursively extracts all branches from a nested SUP tree into a flat list.";
 TSupNumValues::usage = "TSupNumValues[term] extracts all SUP branches as integer values.";
 
+TBri::usage = "TBri[body] creates a bridge term (θx.body, dual of lambda). Returns {TTerm[briId], TTerm[varId]}.";
+TAnn::usage = "TAnn[term, type] creates an annotation term {term : type}. Transparent during reduction.";
+TDsu::usage = "TDsu[labelExpr, a, b] creates a dynamic SUP. Label is an expression reduced at interaction time.";
+TDdu::usage = "TDdu[labelExpr, val, bod] creates a dynamic DUP. Label is an expression, bod receives both copies.";
+TInc::usage = "TInc[term] creates a priority wrapper. Transparent to reduce, lower priority in collapse.";
+TCollapse::usage = "TCollapse[term] extracts all branches from a superposed term into a flat list.";
+
 (* ── Autograd ───────────────────────────────────────────────────────────── *)
 
 TSetRequiresGrad::usage = "TSetRequiresGrad[tensor] marks a tensor for gradient tracking.";
@@ -174,7 +181,9 @@ $tagName = <|
     0 -> "App", 1 -> "Lam", 2 -> "Var", 3 -> "Sup",
     4 -> "Dp0", 5 -> "Dp1", 6 -> "Era",
     7 -> "Num", 8 -> "Ref", 9 -> "Op2",
-    10 -> "Ten", 11 -> "Top", 12 -> "Ctr"
+    10 -> "Ten", 11 -> "Top", 12 -> "Ctr",
+    13 -> "Bri", 14 -> "Ann",
+    15 -> "Dsu", 16 -> "Ddu", 17 -> "Inc"
 |>;
 
 (* Device index → string name *)
@@ -232,6 +241,12 @@ thvmAppFn = None;
 thvmSupFn = None;
 thvmDupFn = None;
 thvmFreshLabelFn = None;
+thvmBriFn = None;
+thvmAnnFn = None;
+thvmDsuFn = None;
+thvmDduFn = None;
+thvmIncFn = None;
+thvmCollapseFn = None;
 thvmNumFn = None;
 thvmOp2Fn = None;
 thvmNumValueFn = None;
@@ -330,6 +345,18 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
         {Integer, Integer, Integer, Integer}, "Void"];
     thvmFreshLabelFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmFreshLabel",
         {}, Integer];
+    thvmBriFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmBri",
+        {Integer, Integer}, Integer];
+    thvmAnnFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmAnn",
+        {Integer, Integer, Integer}, "Void"];
+    thvmDsuFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmDsu",
+        {Integer, Integer, Integer, Integer}, "Void"];
+    thvmDduFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmDdu",
+        {Integer, Integer, Integer, Integer}, "Void"];
+    thvmIncFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmInc",
+        {Integer, Integer}, "Void"];
+    thvmCollapseFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmCollapse",
+        {Integer, Integer}, Integer];
     thvmNumFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmNum",
         {Integer, Integer}, "Void"];
     thvmOp2Fn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmOp2",
@@ -672,6 +699,62 @@ TDup[label_Integer, z_TTerm] := Module[{dp0 = allocId[], dp1 = allocId[]},
     {TTerm[dp0], TTerm[dp1]}
 ];
 
+(* TBri[body] — create bridge (θx.body), returns {TTerm[bri], TTerm[var]} *)
+TBri[body_TTerm] := Module[{out = allocId[], varId},
+    loadLibrary[];
+    varId = thvmBriFn[out, body[[1]]];
+    {TTerm[out], TTerm[varId]}
+];
+
+(* Pure function form: TBri[var |-> body_using_var] — same pattern as TLam *)
+TBri[f_Function] := Module[{bri, var, body},
+    {bri, var} = TBri[TNum[0]];  (* placeholder body *)
+    body = f[var];
+    If[!MatchQ[body, _TTerm],
+        Message[TBri::badret, body]; Return[$Failed]];
+    TLamSetBody[bri, body];  (* BRI has same heap layout as LAM *)
+    bri
+];
+TBri::badret = "Bridge body must return TTerm, got `1`.";
+
+(* TAnn[term, type] — create annotation {term : type} *)
+TAnn[term_TTerm, type_TTerm] := Module[{out = allocId[]},
+    loadLibrary[];
+    thvmAnnFn[out, term[[1]], type[[1]]];
+    TTerm[out]
+];
+
+(* TDsu[labelExpr, a, b] — dynamic SUP (label is an expression) *)
+TDsu[label_TTerm, a_TTerm, b_TTerm] := Module[{out = allocId[]},
+    loadLibrary[];
+    thvmDsuFn[out, label[[1]], a[[1]], b[[1]]];
+    TTerm[out]
+];
+
+(* TDdu[labelExpr, val, bod] — dynamic DUP (label is an expression) *)
+TDdu[label_TTerm, val_TTerm, bod_TTerm] := Module[{out = allocId[]},
+    loadLibrary[];
+    thvmDduFn[out, label[[1]], val[[1]], bod[[1]]];
+    TTerm[out]
+];
+
+(* TInc[term] — priority wrapper (transparent to reduce, lower priority in collapse) *)
+TInc[term_TTerm] := Module[{out = allocId[]},
+    loadLibrary[];
+    thvmIncFn[out, term[[1]]];
+    TTerm[out]
+];
+
+(* TCollapse[term] — extract all branches from a superposed term as a flat list *)
+TCollapse[t_TTerm] := Module[{base, count},
+    loadLibrary[];
+    base = allocId[];
+    (* Reserve block of IDs for collapsed leaves *)
+    $nextId += 255;
+    count = thvmCollapseFn[t[[1]], base];
+    Table[TTerm[base + i], {i, 0, count - 1}]
+];
+
 TNum[n_Integer] := Module[{out = allocId[]},
     loadLibrary[];
     thvmNumFn[out, n];
@@ -689,18 +772,9 @@ Module[{out = allocId[]},
 
 TNumValue[TTerm[id_Integer]] := (loadLibrary[]; thvmNumValueFn[id]);
 
-(* Recursively extract all branches from a nested SUP tree *)
-TSupValues[t_TTerm] := Module[{reduced, tag},
-    reduced = TReduce[t];
-    tag = TTermTag[reduced];
-    If[tag === "Sup",
-        Module[{dp0, dp1},
-            {dp0, dp1} = TDup[reduced];
-            Join[TSupValues[dp0], TSupValues[dp1]]
-        ],
-        {reduced}
-    ]
-];
+(* Recursively extract all branches from a nested SUP tree.
+   Delegates to TCollapse (C-side) which uses correct labels for DUP-SUP annihilation. *)
+TSupValues[t_TTerm] := TCollapse[t];
 
 (* Extract SUP branches as integer values *)
 TSupNumValues[t_TTerm] := TNumValue /@ TSupValues[t];

@@ -119,7 +119,7 @@ TSupNumValues[check]
 
 ```wolfram
 (* Build search space: c ∈ {0..7} as a nested SUP tree *)
-cSpace = Fold[TSup, TNum[7], Reverse @ Table[TNum[i], {i, 0, 6}]];
+cSpace = Fold[TSup[#2, #1]&, TNum[7], Reverse @ Table[TNum[i], {i, 0, 6}]];
 
 (* Verify: all 8 values present *)
 TSupNumValues[cSpace]
@@ -156,8 +156,8 @@ Position[matches, 1] - 1
 
 ```wolfram
 (* Build 2D search space *)
-aSpace = Fold[TSup, TNum[3], Reverse @ Table[TNum[i], {i, 0, 2}]];
-bSpace = Fold[TSup, TNum[3], Reverse @ Table[TNum[i], {i, 0, 2}]];
+aSpace = Fold[TSup[#2, #1]&, TNum[3], Reverse @ Table[TNum[i], {i, 0, 2}]];
+bSpace = Fold[TSup[#2, #1]&, TNum[3], Reverse @ Table[TNum[i], {i, 0, 2}]];
 
 (* Candidate function: f(x) = a*x + b *)
 f = TLam[x |-> TOp2["Add", TOp2["Mul", aSpace, x], bSpace]];
@@ -173,8 +173,8 @@ c1 = TSupNumValues[check1]
 ```wolfram
 (* Build fresh search space for second constraint *)
 (* (Each TApp consumes the lambda — rebuild for constraint 2) *)
-aSpace2 = Fold[TSup, TNum[3], Reverse @ Table[TNum[i], {i, 0, 2}]];
-bSpace2 = Fold[TSup, TNum[3], Reverse @ Table[TNum[i], {i, 0, 2}]];
+aSpace2 = Fold[TSup[#2, #1]&, TNum[3], Reverse @ Table[TNum[i], {i, 0, 2}]];
+bSpace2 = Fold[TSup[#2, #1]&, TNum[3], Reverse @ Table[TNum[i], {i, 0, 2}]];
 
 g = TLam[x |-> TOp2["Add", TOp2["Mul", aSpace2, x], bSpace2]];
 
@@ -208,7 +208,7 @@ The power of superpositions is **computation sharing**. When multiple candidates
 TInit["metal"];
 i0 = TInteractionCount[];
 
-c = Fold[TSup, TNum[7], Reverse @ Table[TNum[i], {i, 0, 6}]];
+c = Fold[TSup[#2, #1]&, TNum[7], Reverse @ Table[TNum[i], {i, 0, 6}]];
 f = TLam[x |-> TOp2["Add", x, c]];
 result = TApp[f, TNum[2]];
 reduced = TReduce[result];
@@ -276,7 +276,7 @@ Let's wrap the search pattern into reusable combinators.
 
 ```wolfram
 (* SearchSpace: list → nested SUP *)
-SearchSpace[values_List] := Fold[TSup, TNum[Last[values]],
+SearchSpace[values_List] := Fold[TSup[#2, #1]&, TNum[Last[values]],
     Reverse @ Most[TNum /@ values]];
 
 (* SearchEval: apply superposed function to input, get all results *)

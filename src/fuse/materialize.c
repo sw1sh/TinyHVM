@@ -53,9 +53,8 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
     ops[op_idx] = (FusedOp){ .uop = uop, .arg_a = (u32)arg_a, .arg_b = is_binary(uop) ? (u32)arg_b : 0 };
     op_tids[op_idx] = tid;
 
-    // Shared intermediate: allocate side output buffer
-    if (m->defer_consumers > 0 && m->buf_id == 0)
-        m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+    // NOTE: side output buffer allocation moved to tensor_materialize
+    // (after walk succeeds) to avoid zombie buffers from failed walks.
 
     return (int)(FUSE_MAX_LEAVES + op_idx);
 }
@@ -388,10 +387,11 @@ dispatch_chain:
 
     m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
 
-    // Allocate side output buffers for grad-needed intermediates (not walk_tid)
+    // Allocate side output buffers for shared/grad-needed intermediates (not walk_tid).
+    // Moved here from materialize_walk to avoid zombie buffers from failed walks.
     for (u32 i = 0; i < n_ops; i++) {
         TensorMeta *sm = &ctx->tensors[op_tids[i]];
-        if (sm->requires_grad && sm->buf_id == 0 && op_tids[i] != walk_tid)
+        if ((sm->defer_consumers > 0 || sm->requires_grad) && sm->buf_id == 0 && op_tids[i] != walk_tid)
             sm->buf_id = sm->backend->buf_alloc(sm->view.numel * sizeof(f32));
     }
 

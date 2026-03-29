@@ -407,6 +407,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     // then dst (higher ID). Virtual intermediates must have LOWER IDs
     // than dst so backward tape walks (if any) visit them in correct order.
     u32 dst_id;
+    u32 fuse_side_bufs[8], fuse_side_ops[8]; u32 fuse_n_sides = 0;
     {
         u32 var_tid[FUSE_MAX_LEAVES + FUSE_MAX_OPS];
         for (u32 i = 0; i < n_leaves; i++) var_tid[i] = leaf_ids[i];
@@ -442,9 +443,18 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             }
             // Create dst AFTER virtual intermediates (higher ID)
             dst_id = tensor_create(ctx, out_view.shape, DTYPE_F32);
-            // Fix buf_id on virtual intermediates to point to dst's buffer
-            for (u32 i = 0; i < n_ops; i++)
-                ctx->tensors[var_tid[n_leaves + i]].buf_id = ctx->tensors[dst_id].buf_id;
+            // Fix buf_id on virtual intermediates to point to dst's buffer.
+            // EXCEPT: intermediates with requires_grad need their own buffers
+            // so the GRAD handler can read their individual values for backward.
+            for (u32 i = 0; i < n_ops; i++) {
+                u32 itid = var_tid[n_leaves + i];
+                if (ctx->tensors[itid].requires_grad) {
+                    ctx->tensors[itid].buf_id = ctx->tensors[itid].backend->buf_alloc(
+                        ctx->tensors[itid].view.numel * sizeof(f32));
+                } else {
+                    ctx->tensors[itid].buf_id = ctx->tensors[dst_id].buf_id;
+                }
+            }
             // dst = SUM/RMAX(ew_last_id, axes)
             ctx->tensors[dst_id].creator_op = has_reduce;
             ctx->tensors[dst_id].src_ids[0] = ew_last_id;
@@ -473,8 +483,15 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                     iv = va_v;
                 }
                 if (tid != dst_id) {
+                    u32 ibuf = ctx->tensors[dst_id].buf_id;
+                    // Intermediates with requires_grad need own buffer for backward
+                    int needs_rg = ctx->tensors[var_tid[a_var]].requires_grad;
+                    if (is_binary(ops[i].uop) && ctx->tensors[var_tid[b_var]].requires_grad)
+                        needs_rg = 1;
+                    if (needs_rg)
+                        ibuf = ctx->tensors[dst_id].backend->buf_alloc(iv.numel * sizeof(f32));
                     ctx->tensors[tid] = (TensorMeta){
-                        .buf_id = ctx->tensors[dst_id].buf_id,
+                        .buf_id = ibuf,
                         .dtype = DTYPE_F32,
                         .view = iv,
                         .backend = ctx->tensors[dst_id].backend,
@@ -490,6 +507,16 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                 var_tid[n_leaves + i] = tid;
             }
         }
+        // Collect side outputs: intermediates with requires_grad and own buffer
+        for (u32 i = 0; i < n_ops && fuse_n_sides < 8; i++) {
+            u32 itid = var_tid[n_leaves + i];
+            if (itid != dst_id && ctx->tensors[itid].requires_grad &&
+                ctx->tensors[itid].buf_id != ctx->tensors[dst_id].buf_id) {
+                fuse_side_bufs[fuse_n_sides] = ctx->tensors[itid].buf_id;
+                fuse_side_ops[fuse_n_sides] = n_leaves + i;
+                fuse_n_sides++;
+            }
+        }
     }
 
     fuse_fused_count++;
@@ -502,7 +529,9 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         ctx->tensors[dst_id].backend->dispatch_kernel_rs(
             ctx->tensors[dst_id].buf_id,
             bufs, leaf_views, n_leaves, ops, n_ops,
-            &ew_view.shape, has_reduce ? &rs : NULL, NULL, NULL, 0);
+            &ew_view.shape, has_reduce ? &rs : NULL,
+            fuse_n_sides ? fuse_side_bufs : NULL,
+            fuse_n_sides ? fuse_side_ops : NULL, fuse_n_sides);
     } else { return reduce_id(ctx, t); }
 
     if (has_reduce && term_tag(reshape_term) != TAG_ERA) {

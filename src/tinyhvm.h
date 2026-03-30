@@ -475,6 +475,15 @@ typedef struct {
     u64         fusing_loc; // heap loc of the original subnet root TAG_TOP
     u32         fusing_uop; // UOP of the subnet root (e.g. UOP_SUM)
 
+    // Conv backward metadata: enables specialized MPS matmul backward
+    // instead of generic 8-dim unfuse+contiguify. Set by thvm_conv2d.
+    u32         conv_input_id;  // input tensor before pool/pad (for im2col)
+    u32         conv_weight_id; // weight tensor
+    u16         conv_groups;
+    u8          conv_KH, conv_KW;
+    u8          conv_stride[2];
+    u8          conv_padding[4];
+
 } TensorMeta;
 
 // ============================================================

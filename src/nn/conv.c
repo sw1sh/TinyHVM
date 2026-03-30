@@ -428,6 +428,20 @@ Term thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
     // → [BS, groups, rcout, OY, OX, 1, 1, 1]
     Term out = thvm_reshape(ctx, summed, shape_of((u32[]){bs, cout, oy, ox}, 4));
 
+    // Record conv info for specialized backward (avoids 8-dim contiguify chain).
+    // The FUSING tensor inherits this when the rewrite rules fuse the chain.
+    if (term_tag(out) == TAG_TEN) {
+        u32 out_id = (u32)term_val(out);
+        TensorMeta *om = &ctx->tensors[out_id];
+        om->conv_input_id = (term_tag(padded) == TAG_TEN) ? (u32)term_val(padded) : 0;
+        om->conv_weight_id = (term_tag(w) == TAG_TEN) ? (u32)term_val(w) : 0;
+        om->conv_groups = (u16)groups;
+        om->conv_KH = (u8)KH; om->conv_KW = (u8)KW;
+        om->conv_stride[0] = (u8)stride_[0]; om->conv_stride[1] = (u8)stride_[1];
+        om->conv_padding[0] = (u8)padding_[0]; om->conv_padding[1] = (u8)padding_[1];
+        om->conv_padding[2] = (u8)padding_[2]; om->conv_padding[3] = (u8)padding_[3];
+    }
+
     // Add bias
     if (term_tag(bias) != TAG_ERA) {
         Term b_rs = thvm_reshape(ctx, bias, shape_of((u32[]){1, cout, 1, 1}, 4));

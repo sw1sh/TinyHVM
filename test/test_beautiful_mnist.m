@@ -15,7 +15,8 @@
 #include <math.h>
 #include <time.h>
 
-static Term mkw(TinyHVM*c,Shape s,u32 fi){u32 n=1;for(u32 i=0;i<s.rank;i++)n*=s.dims[i];f32*d=malloc(n*4);f32 b=sqrtf(2.f/(f32)fi);for(u32 i=0;i<n;i++)d[i]=b*((f32)rand()/(f32)RAND_MAX*2-1)*.5f;Term t=thvm_tensor(c,d,s);free(d);return t;}
+// tinygrad init: uniform(-1/sqrt(fan_in), 1/sqrt(fan_in))
+static Term mkw(TinyHVM*c,Shape s,u32 fi){u32 n=1;for(u32 i=0;i<s.rank;i++)n*=s.dims[i];f32*d=malloc(n*4);f32 b=1.f/sqrtf((f32)fi);for(u32 i=0;i<n;i++)d[i]=b*((f32)rand()/(f32)RAND_MAX*2-1);Term t=thvm_tensor(c,d,s);free(d);return t;}
 static Term mkz(TinyHVM*c,u32 n){f32*z=calloc(n,4);Term t=thvm_tensor(c,z,SHAPE(n));free(z);return t;}
 static Term mkones(TinyHVM*c,u32 n){f32*o=malloc(n*4);for(u32 i=0;i<n;i++)o[i]=1.f;Term t=thvm_tensor(c,o,SHAPE(n));free(o);return t;}
 static double now_s(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
@@ -23,8 +24,8 @@ static double now_s(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);re
 int main(void) {
     srand(42); MNISTData data=mnist_load("data");
     TinyHVM*ctx=thvm_init("metal");
-    u32 BS=64; // Start safe, tinygrad uses 512
-    u32 n_steps=2000;
+    u32 BS=128; // tinygrad uses 512
+    u32 n_steps=500;
 
     // Model: beautiful_mnist architecture
     // Conv1: (1→32, 5×5), Conv2: (32→32, 5×5), BN1(32), Pool(2×2)
@@ -44,7 +45,7 @@ int main(void) {
     Term params[NP]={cw1,cb1,cw2,cb2,cw3,cb3,cw4,cb4,bn1_g,bn1_b,bn2_g,bn2_b,lw,lb};
     u32 psz[NP]={32*25,32, 32*32*25,32, 64*32*9,64, 64*64*9,64, 32,32, 64,64, ff*10,10};
     for(u32 i=0;i<NP;i++) thvm_set_requires_grad(ctx,params[i]);
-    Adam opt=adam_init(ctx,0.0003f,NP);
+    Adam opt=adam_init(ctx,0.0005f,NP);
     for(u32 i=0;i<NP;i++) adam_add_param(ctx,&opt,i,(u32)term_val(params[i]),psz[i]);
 
     Term td=thvm_tensor(ctx,data.train_images,(Shape){.dims={data.n_train,1,28,28},.rank=4});

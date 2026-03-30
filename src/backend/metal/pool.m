@@ -8,7 +8,13 @@ static u64 metal_bytes_total = 0;
 // Tracks in-use bytes (excludes free list). This is what the budget guards.
 static u64 metal_bytes_inuse = 0;
 
-#define METAL_MEM_BUDGET (8ULL * 1024 * 1024 * 1024) // 8GB hard limit
+// Buffer lifetime tracking for mid-step reuse.
+// Buffers whose last_use + 2 < dispatch_counter can be safely reused
+// (Metal guarantees sequential execution within command buffer).
+static u32 buf_last_use[MAX_BUFS];
+static u32 dispatch_counter = 0;
+
+#define METAL_MEM_BUDGET (16ULL * 1024 * 1024 * 1024) // 16GB hard limit
 
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);
@@ -19,6 +25,7 @@ static u32 metal_buf_alloc(u64 bytes) {
         exit(1);
     }
 
+    // 1. Check free list first (from pool_reset)
     u32 best_idx = UINT32_MAX;
     u64 best_size = UINT64_MAX;
     for (u32 i = 0; i < free_count; i++) {
@@ -32,8 +39,40 @@ static u32 metal_buf_alloc(u64 bytes) {
         metal_pool.bufs[id] = free_list[best_idx].buf;
         metal_pool.sizes[id] = free_list[best_idx].size;
         free_list[best_idx] = free_list[--free_count];
-        // Buffer already allocated — just moves from free list to pool
         metal_bytes_inuse += metal_pool.sizes[id];
+    } else if (bytes >= 1024*1024 && dispatch_counter > 2) {
+        // 2. For large allocs: try to reclaim a "dead" buffer from the pool.
+        // A buffer is reclaimable if it was last used as a dispatch leaf
+        // at least 2 dispatches ago (GPU guarantees sequential execution,
+        // so the reader has completed). Size must be compatible.
+        u32 reuse_id = 0;
+        u64 reuse_size = UINT64_MAX;
+        u32 keep = (id > 64) ? id - 64 : 1; // only scan recent buffers
+        for (u32 i = keep; i < id; i++) {
+            if (!metal_pool.bufs[i]) continue;
+            u64 sz = metal_pool.sizes[i];
+            if (sz < bytes || sz > bytes * 2) continue;
+            if (buf_last_use[i] == 0) continue; // never used as leaf
+            if (buf_last_use[i] + 2 > dispatch_counter) continue; // too recent
+            if (sz < reuse_size) { reuse_id = i; reuse_size = sz; }
+        }
+        if (reuse_id) {
+            // Steal the Metal buffer from the old slot
+            metal_pool.bufs[id] = metal_pool.bufs[reuse_id];
+            metal_pool.sizes[id] = metal_pool.sizes[reuse_id];
+            metal_pool.bufs[reuse_id] = nil;
+            u64 old_size = metal_pool.sizes[reuse_id];
+            metal_pool.sizes[reuse_id] = 0;
+            buf_refcount[reuse_id] = 0;
+            buf_last_use[reuse_id] = 0;
+            // inuse stays same (stolen, not new)
+        } else {
+            metal_pool.bufs[id] = [mtl_dev newBufferWithLength:bytes
+                                                       options:MTLResourceStorageModeShared];
+            metal_pool.sizes[id] = bytes;
+            metal_bytes_total += bytes;
+            metal_bytes_inuse += bytes;
+        }
     } else {
         metal_pool.bufs[id] = [mtl_dev newBufferWithLength:bytes
                                                    options:MTLResourceStorageModeShared];
@@ -171,6 +210,8 @@ static void metal_pool_reset(u32 keep) {
     }
     // Clear pending_free — all ephemeral buffers already moved to free_list above
     pending_free_count = 0;
+    dispatch_counter = 0;
+    memset(buf_last_use, 0, sizeof(buf_last_use));
     metal_pool.count = buf_keep;
 }
 
@@ -182,8 +223,14 @@ static void metal_pool_set_persistent(u32 max_persistent_buf) {
 // Called after fused kernel dispatch with leaf buf_ids that may be reclaimable.
 // Flushes GPU if there are pending_free buffers above a memory threshold.
 static void metal_mem_checkpoint(u32 *leaf_buf_ids, u32 n_leaves) {
-    // Flush if memory pressure is high and there are buffers to reclaim.
-    // pending_free is populated by tensor_release (ERA-driven) and buf_decref.
+    dispatch_counter++;
+    // Mark leaf buffers with their last-use dispatch number
+    for (u32 i = 0; i < n_leaves; i++) {
+        u32 bid = leaf_buf_ids[i];
+        if (bid && bid < MAX_BUFS)
+            buf_last_use[bid] = dispatch_counter;
+    }
+    // Flush if memory pressure is high and there are buffers to reclaim
     if (pending_free_count > 0 && metal_bytes_inuse > 2ULL * 1024 * 1024 * 1024)
         metal_flush();
 }

@@ -43,4 +43,55 @@ bench("matmul [64,784]×[784,128]", 3, 50, lambda: a@b)
 x = Tensor.rand(65536); w = Tensor.rand(65536); b = Tensor.rand(65536)
 bench("fused_mul_add [65536]", 3, 50, lambda: x*w+b)
 
+
+# === FUSION COUNTING ===
+print("\n--- Fusion Tests (kernel count per pattern) ---")
+print(f"{'Pattern':<40s} {'Kernels':>8s}")
+print("─"*50)
+
+def count_kernels(setup_fn, run_fn):
+    """Count kernels for run_fn only, not setup."""
+    tensors = setup_fn()
+    for t in tensors:
+        if isinstance(t, Tensor): t.realize()
+    GlobalCounters.reset()
+    run_fn(*tensors).realize()
+    return GlobalCounters.kernel_count
+
+# F1: x+y
+k = count_kernels(lambda: (Tensor.rand(1024).realize(), Tensor.rand(1024).realize()),
+                  lambda a,b: a+b)
+print(f"{'x + y [1024]':<40s} {k:8d}")
+
+# F2: relu(x*w+b)
+k = count_kernels(lambda: (Tensor.rand(1024).realize(), Tensor.rand(1024).realize(), Tensor.rand(1024).realize()),
+                  lambda x,w,b: (x*w+b).relu())
+print(f"{'relu(x*w+b) [1024]':<40s} {k:8d}")
+
+# F3: sum(x*w+b)
+k = count_kernels(lambda: (Tensor.rand(1024).realize(), Tensor.rand(1024).realize(), Tensor.rand(1024).realize()),
+                  lambda x,w,b: (x*w+b).sum())
+print(f"{'sum(x*w+b) [1024→1]':<40s} {k:8d}")
+
+# F4: relu(mm(x,w)+b)
+k = count_kernels(lambda: (Tensor.rand(64,32).realize(), Tensor.rand(32,16).realize(), Tensor.rand(16).realize()),
+                  lambda x,w,b: (x@w+b).relu())
+print(f"{'relu(mm(x,w)+b)':<40s} {k:8d}")
+
+# F5: sum(relu(mm(x,w)+b))
+k = count_kernels(lambda: (Tensor.rand(64,32).realize(), Tensor.rand(32,16).realize(), Tensor.rand(16).realize()),
+                  lambda x,w,b: (x@w+b).relu().sum())
+print(f"{'sum(relu(mm(x,w)+b))':<40s} {k:8d}")
+
+# F6: backward through sum(relu(mm+b))
+x = Tensor.rand(64,32, requires_grad=True).realize()
+w = Tensor.rand(32,16, requires_grad=True).realize()
+b = Tensor.rand(16, requires_grad=True).realize()
+GlobalCounters.reset()
+loss = (x@w+b).relu().sum()
+loss.backward()
+Tensor.realize(x.grad, w.grad, b.grad)
+k = GlobalCounters.kernel_count
+print(f"{'backward(sum(relu(mm+b)))':<40s} {k:8d}")
+
 print()

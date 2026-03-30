@@ -132,6 +132,94 @@ int main(void) {
         free(x);free(w);free(b);
     }
 
+    // === FUSION COUNTING ===
+    printf("\n--- Fusion Tests (kernel count per pattern) ---\n");
+    printf("%-40s %8s\n", "Pattern", "Kernels");
+    printf("─────────────────────────────────────────────────\n");
+
+    // F1: x+y (single ew)
+    {
+        extern u32 total_dispatches;
+        f32 *a=calloc(1024,4),*b=calloc(1024,4);
+        Term ta=thvm_tensor(ctx,a,SHAPE(1024)),tb=thvm_tensor(ctx,b,SHAPE(1024));
+        total_dispatches=0;
+        Term r=thvm_reduce(ctx,thvm_op(ctx,UOP_ADD,ta,tb));
+        thvm_to_host(ctx,r); // force materialization
+        printf("%-40s %8u  (tinygrad: 1)\n", "x + y [1024]", total_dispatches);
+        thvm_reset(ctx,keep); free(a);free(b);
+    }
+    // F2: relu(x*w+b) (3-op chain)
+    {
+        extern u32 total_dispatches;
+        u32 N=1024;
+        f32 *x=calloc(N,4),*w=calloc(N,4),*b=calloc(N,4);
+        Term tx=thvm_tensor(ctx,x,SHAPE(N)),tw=thvm_tensor(ctx,w,SHAPE(N)),tb=thvm_tensor(ctx,b,SHAPE(N));
+        total_dispatches=0;
+        Term r=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MUL,tx,tw),tb),term_era());
+        r=thvm_reduce(ctx,r); thvm_to_host(ctx,r);
+        printf("%-40s %8u  (tinygrad: 1)\n", "relu(x*w+b) [1024]", total_dispatches);
+        thvm_reset(ctx,keep); free(x);free(w);free(b);
+    }
+    // F3: sum(x*w+b) (ew + reduce)
+    {
+        extern u32 total_dispatches;
+        u32 N=1024;
+        f32 *x=calloc(N,4),*w=calloc(N,4),*b=calloc(N,4);
+        Term tx=thvm_tensor(ctx,x,SHAPE(N)),tw=thvm_tensor(ctx,w,SHAPE(N)),tb=thvm_tensor(ctx,b,SHAPE(N));
+        total_dispatches=0;
+        Term ew=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MUL,tx,tw),tb);
+        Term r=thvm_sum_axes(ctx,ew,(u32[]){0},1);
+        r=thvm_reduce(ctx,r); thvm_to_host(ctx,r);
+        printf("%-40s %8u  (tinygrad: 1)\n", "sum(x*w+b) [1024→1]", total_dispatches);
+        thvm_reset(ctx,keep); free(x);free(w);free(b);
+    }
+    // F4: relu(mm(x,w)+b) — the tinygrad 1-kernel test
+    {
+        extern u32 total_dispatches;
+        u32 M=64,K=32,N=16;
+        f32 *x=calloc(M*K,4),*w=calloc(K*N,4),*b=calloc(N,4);
+        Term tx=thvm_tensor(ctx,x,SHAPE(M,K)),tw=thvm_tensor(ctx,w,SHAPE(K,N)),tb=thvm_tensor(ctx,b,SHAPE(N));
+        total_dispatches=0;
+        Term mm=thvm_op(ctx,UOP_MM,tx,tw);
+        Term bias=thvm_expand(ctx,thvm_reshape(ctx,tb,SHAPE(1,N)),SHAPE(M,N));
+        Term out=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,mm,bias),term_era());
+        thvm_reduce(ctx,out);
+        printf("%-40s %8u  (tinygrad: 1)\n", "relu(mm(x,w)+b)", total_dispatches);
+        thvm_reset(ctx,keep); free(x);free(w);free(b);
+    }
+    // F5: sum(relu(mm(x,w)+b)) — forward + reduce
+    {
+        extern u32 total_dispatches;
+        u32 M=64,K=32,N=16;
+        f32 *x=calloc(M*K,4),*w=calloc(K*N,4),*b=calloc(N,4);
+        Term tx=thvm_tensor(ctx,x,SHAPE(M,K)),tw=thvm_tensor(ctx,w,SHAPE(K,N)),tb=thvm_tensor(ctx,b,SHAPE(N));
+        total_dispatches=0;
+        Term mm=thvm_op(ctx,UOP_MM,tx,tw);
+        Term bias=thvm_expand(ctx,thvm_reshape(ctx,tb,SHAPE(1,N)),SHAPE(M,N));
+        Term fwd=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,mm,bias),term_era());
+        Term loss=thvm_sum_axes(ctx,fwd,(u32[]){0,1},2);
+        thvm_reduce(ctx,loss);
+        printf("%-40s %8u  (tinygrad: 2)\n", "sum(relu(mm(x,w)+b))", total_dispatches);
+        thvm_reset(ctx,keep); free(x);free(w);free(b);
+    }
+    // F6: backward through sum(relu(mm(x,w)+b)) — grad wrt w
+    {
+        extern u32 total_dispatches;
+        u32 M=64,K=32,N=16;
+        f32 *x=calloc(M*K,4),*w=calloc(K*N,4),*b=calloc(N,4);
+        Term tx=thvm_tensor(ctx,x,SHAPE(M,K)),tw=thvm_tensor(ctx,w,SHAPE(K,N)),tb=thvm_tensor(ctx,b,SHAPE(N));
+        thvm_set_requires_grad(ctx,tw);
+        Term mm=thvm_op(ctx,UOP_MM,tx,tw);
+        Term bias=thvm_expand(ctx,thvm_reshape(ctx,tb,SHAPE(1,N)),SHAPE(M,N));
+        Term fwd=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,mm,bias),term_era());
+        Term loss=thvm_sum_axes(ctx,fwd,(u32[]){0,1},2);
+        total_dispatches=0;
+        Term grad=thvm_grad(ctx,loss,tw);
+        thvm_reduce(ctx,grad);
+        printf("%-40s %8u  (tinygrad: ~5)\n", "backward(sum(relu(mm+b))) wrt w", total_dispatches);
+        thvm_reset(ctx,keep); free(x);free(w);free(b);
+    }
+
     printf("\n");
     thvm_profile_kernels_summary();
     thvm_free(ctx);

@@ -23,8 +23,8 @@ static double now_s(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);re
 int main(void) {
     srand(42); MNISTData data=mnist_load("data");
     TinyHVM*ctx=thvm_init("metal");
-    u32 BS=128; // Start safe, tinygrad uses 512
-    u32 n_steps=70;
+    u32 BS=64; // Start safe, tinygrad uses 512
+    u32 n_steps=300;
 
     // Model: beautiful_mnist architecture
     // Conv1: (1→32, 5×5), Conv2: (32→32, 5×5), BN1(32), Pool(2×2)
@@ -44,7 +44,7 @@ int main(void) {
     Term params[NP]={cw1,cb1,cw2,cb2,cw3,cb3,cw4,cb4,bn1_g,bn1_b,bn2_g,bn2_b,lw,lb};
     u32 psz[NP]={32*25,32, 32*32*25,32, 64*32*9,64, 64*64*9,64, 32,32, 64,64, ff*10,10};
     for(u32 i=0;i<NP;i++) thvm_set_requires_grad(ctx,params[i]);
-    Adam opt=adam_init(ctx,0.001f,NP);
+    Adam opt=adam_init(ctx,0.0003f,NP);
     for(u32 i=0;i<NP;i++) adam_add_param(ctx,&opt,i,(u32)term_val(params[i]),psz[i]);
 
     Term td=thvm_tensor(ctx,data.train_images,(Shape){.dims={data.n_train,1,28,28},.rank=4});

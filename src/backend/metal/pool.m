@@ -8,7 +8,7 @@ static u64 metal_bytes_total = 0;
 // Tracks in-use bytes (excludes free list). This is what the budget guards.
 static u64 metal_bytes_inuse = 0;
 
-#define METAL_MEM_BUDGET (2ULL * 1024 * 1024 * 1024) // 2GB hard limit
+#define METAL_MEM_BUDGET (8ULL * 1024 * 1024 * 1024) // 8GB hard limit
 
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);

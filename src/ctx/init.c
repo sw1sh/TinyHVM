@@ -193,6 +193,8 @@ Term thvm_op_raw(TinyHVM *ctx, u32 uop, Term a, Term b) {
 }
 
 Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
+    // MM decomposition moved to interact handler (preserves creator_op for GRAD).
+
     u64 loc = heap_alloc(ctx, 4); // 0-1: args (trampoline overwrites), 2-3: shadow (preserved)
     a = linear_use(ctx, a, loc);
     heap_set(ctx, loc, a);              // write before second linear_use

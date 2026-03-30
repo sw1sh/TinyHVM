@@ -663,6 +663,7 @@ inet_step:
                 if (term_tag(b) == TAG_TEN) b_id = (u32)term_val(b);
                 if (b_id) { ENSURE(ctx, b_id); }
                 View new_view;
+                int needs_materialize = 0;
                 switch (uop) {
                     case UOP_RESHAPE: {
                         // b is a 1D tensor whose elements are the new dims
@@ -812,7 +813,14 @@ inet_step:
                 }
                 // Let buf_id=0 propagate from deferred bases through views.
                 // tensor_materialize handles the full chain at real boundaries.
+                u32 contiguify_buf = 0; // set if RESHAPE created a contiguify buffer
+                if (uop == UOP_RESHAPE && needs_materialize && ma->buf_id)
+                    contiguify_buf = ma->buf_id;
                 u32 dst_id = tensor_view_of(ctx, a_id, new_view);
+                // Release contiguify source's extra reference: view_of now holds
+                // the sole needed reference. This enables mid-step buffer stealing.
+                if (contiguify_buf && ma->backend->buf_decref)
+                    ma->backend->buf_decref(contiguify_buf);
                 // Always record provenance (needed for materialize + backward)
                 {
                     TensorMeta *md = &ctx->tensors[dst_id];

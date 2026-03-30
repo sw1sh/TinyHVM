@@ -14,7 +14,7 @@ static u64 metal_bytes_inuse = 0;
 static u32 buf_last_use[MAX_BUFS];
 static u32 dispatch_counter = 0;
 
-#define METAL_MEM_BUDGET (16ULL * 1024 * 1024 * 1024) // 16GB hard limit
+#define METAL_MEM_BUDGET (8ULL * 1024 * 1024 * 1024) // 8GB hard limit
 
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);
@@ -47,13 +47,13 @@ static u32 metal_buf_alloc(u64 bytes) {
         // so the reader has completed). Size must be compatible.
         u32 reuse_id = 0;
         u64 reuse_size = UINT64_MAX;
-        u32 keep = (id > 64) ? id - 64 : 1; // only scan recent buffers
+        u32 keep = 1; // scan all live buffers for reuse
         for (u32 i = keep; i < id; i++) {
             if (!metal_pool.bufs[i]) continue;
             u64 sz = metal_pool.sizes[i];
             if (sz < bytes || sz > bytes * 2) continue;
             if (buf_last_use[i] == 0) continue; // never used as leaf
-            if (buf_last_use[i] + 2 > dispatch_counter) continue; // too recent
+            if (buf_last_use[i] + 1 >= dispatch_counter) continue; // too recent
             if (sz < reuse_size) { reuse_id = i; reuse_size = sz; }
         }
         if (reuse_id) {

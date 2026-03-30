@@ -325,6 +325,12 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
     [mm encodeToCommandBuffer:batch_cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
     batch_dirty = 1; buf_cpu_only[dst] = 0; total_dispatches++; dc[DC_MM]++;
     profiled_dispatch(M*N, (u64)M*K*N*2, (u64)(M*K+K*N+M*N)*4, "matmul_mps");
+    // Mark contiguify temps as used so mid-step steal can reclaim them.
+    // Metal sequential execution: any future dispatch reusing this buffer
+    // executes after this matmul completes.
+    dispatch_counter++;
+    if (buf_a_id != a) buf_last_use[buf_a_id] = dispatch_counter;
+    if (buf_b_id != b) buf_last_use[buf_b_id] = dispatch_counter;
     if (jit.state == JIT_CAPTURE)
         jit_record_mps(dst, buf_a_id, buf_b_id, M, K, N,
             transposeA, transposeB, phys_a_rows, phys_a_cols, phys_b_rows, phys_b_cols);

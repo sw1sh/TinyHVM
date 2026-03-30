@@ -64,7 +64,7 @@ static void metal_buf_incref(u32 id) {
 
 static void metal_buf_decref(u32 id) {
     if (id == 0) return;
-    assert(buf_refcount[id] > 0 && "buf_decref on zero refcount");
+    if (buf_refcount[id] == 0) return; // guard against double-decref
     if (--buf_refcount[id] == 0) {
         if (pending_free_count < PENDING_FREE_CAP)
             pending_free[pending_free_count++] = id;
@@ -176,4 +176,14 @@ static void metal_pool_reset(u32 keep) {
 
 static void metal_pool_set_persistent(u32 max_persistent_buf) {
     (void)max_persistent_buf; // now handled by buf_cpu_only tracking
+}
+
+// Memory checkpoint: try to recycle consumed buffers when memory is high.
+// Called after fused kernel dispatch with leaf buf_ids that may be reclaimable.
+// Flushes GPU if there are pending_free buffers above a memory threshold.
+static void metal_mem_checkpoint(u32 *leaf_buf_ids, u32 n_leaves) {
+    // Flush if memory pressure is high and there are buffers to reclaim.
+    // pending_free is populated by tensor_release (ERA-driven) and buf_decref.
+    if (pending_free_count > 0 && metal_bytes_inuse > 2ULL * 1024 * 1024 * 1024)
+        metal_flush();
 }

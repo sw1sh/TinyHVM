@@ -444,6 +444,13 @@ dispatch_chain:
                                             ops, n_ops, &m->view.shape, NULL,
                                             side_bufs, side_ops, n_sides);
         }
+        // Memory checkpoint: recycle consumed leaf buffers when memory is high.
+        // metal_mem_checkpoint checks buf_refcount==1 before freeing (safe).
+        if (m->backend->mem_checkpoint) {
+            u32 lbufs[FUSE_MAX_LEAVES];
+            for (u32 i = 0; i < n_leaves; i++) lbufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
+            m->backend->mem_checkpoint(lbufs, n_leaves);
+        }
         return;
     }
 

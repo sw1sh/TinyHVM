@@ -2,9 +2,12 @@
 """bench_ops.py — Side-by-side kernel benchmarks (tinygrad)
 Run with: DEBUG=2 python3 test/bench_ops.py
 Compare output with: THVM_DEBUG=2 bin/bench_ops
+
+For beautiful_mnist kernel breakdown:
+  DEBUG=2 python3 test/bench_ops.py --beautiful
 """
 from tinygrad import Tensor, GlobalCounters, Device
-import time
+import time, sys
 
 def bench(label, n_warmup, n_iter, fn):
     # Warmup
@@ -20,6 +23,43 @@ def bench(label, n_warmup, n_iter, fn):
     print(f"{label:30s} {total_ms:7.2f}ms/{n_iter}  ({total_ms/n_iter*1000:.2f}us/iter)"
           f"  kernels={GlobalCounters.kernel_count}  GPU={GlobalCounters.time_sum_s*1e3:.2f}ms")
     GlobalCounters.reset()
+
+if "--beautiful" in sys.argv:
+    # beautiful_mnist kernel breakdown (warm step)
+    from tinygrad import nn, TinyJit
+    from tinygrad.nn.datasets import mnist
+    class Model:
+      def __init__(self):
+        self.layers = [nn.Conv2d(1,32,5),Tensor.relu,nn.Conv2d(32,32,5),Tensor.relu,
+          nn.BatchNorm(32),Tensor.max_pool2d,nn.Conv2d(32,64,3),Tensor.relu,
+          nn.Conv2d(64,64,3),Tensor.relu,nn.BatchNorm(64),Tensor.max_pool2d,
+          lambda x:x.flatten(1),nn.Linear(576,10)]
+      def __call__(self,x): return x.sequential(self.layers)
+    X_train,Y_train,_,_=mnist()
+    model=Model(); opt=nn.optim.Adam(nn.state.get_parameters(model))
+    @Tensor.train()
+    def step():
+        opt.zero_grad()
+        s=Tensor.randint(512,high=X_train.shape[0])
+        loss=model(X_train[s]).sparse_categorical_crossentropy(Y_train[s]).backward()
+        return loss.realize(*opt.schedule_step())
+    # warmup 2 steps
+    for _ in range(2): step()
+    # profile step 2
+    GlobalCounters.reset()
+    t0=time.perf_counter()
+    loss=step()
+    t1=time.perf_counter()
+    lv=loss.item()
+    t2=time.perf_counter()
+    print(f"=== tinygrad beautiful_mnist (BS=512, warm step) ===")
+    print(f"  Step:    {(t1-t0)*1e3:.1f}ms")
+    print(f"  Read:    {(t2-t1)*1e3:.1f}ms")
+    print(f"  Total:   {(t2-t0)*1e3:.1f}ms")
+    print(f"  Kernels: {GlobalCounters.kernel_count}")
+    print(f"  GPU:     {GlobalCounters.time_sum_s*1e3:.1f}ms")
+    print(f"  Params:  {sum(p.numel() for p in nn.state.get_parameters(model))}")
+    sys.exit(0)
 
 print("=== tinygrad Op Benchmarks ===\n")
 

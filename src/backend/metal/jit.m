@@ -1,6 +1,7 @@
 // metal/jit.m — JIT capture/replay for training loops
 // Records GPU dispatch sequence on step 0, replays for steps 1+.
 // JITState, JITCmd, JITSlot defined in init.m.
+static u32 jit_orig_buf_ids[JIT_MAX_SLOTS]; // capture-time buf_ids (for tensor update)
 
 static u32 jit_slot_for_buf(u32 buf_id) {
     for (u32 i = 0; i < jit.n_slots; i++)
@@ -138,10 +139,30 @@ void jit_end_capture(void) {
             }
         }
 
-        // Also mark const-written slots as first_use=0 (alive from start)
+        // Mark const-written slots as first_use=0 (alive from start)
         for (u32 ci = 0; ci < jit.n_consts; ci++) {
             u32 s = jit.consts[ci].slot;
             first_use[s] = 0;
+        }
+
+        // Detect "input" slots: read by a command but never written (output)
+        // by any command. These are externally written (CPU memset/memcpy
+        // between replays) and must be first_use=0 to prevent sharing.
+        // Convention: buf_slots[0] is the output, rest are inputs.
+        u8 gpu_written[JIT_MAX_SLOTS]; memset(gpu_written, 0, jit.n_slots);
+        for (u32 ci = 0; ci < jit.n_cmds; ci++) {
+            JITCmd *cmd = &jit.cmds[ci];
+            if (cmd->is_blit) {
+                gpu_written[cmd->blit_dst_slot] = 1;
+            } else if (cmd->is_mps) {
+                gpu_written[cmd->mps_dst_slot] = 1;
+            } else if (cmd->n_bufs > 0) {
+                gpu_written[cmd->buf_slots[0]] = 1; // first buf = output
+            }
+        }
+        for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+            if (!gpu_written[s] && first_use[s] != UINT32_MAX)
+                first_use[s] = 0; // externally written → alive from start
         }
 
         // Greedy planner: assign physical buffer indices to ephemeral slots.
@@ -221,9 +242,12 @@ void jit_end_capture(void) {
         for (u32 p = 0; p < next_plan; p++)
             new_mem += plan_buf_size[p];
 
-        // Save plan: overload buf_id with plan_assignment for replay
+        // Save original buf_ids before overwriting with plan_assignment
         for (u32 s = jit.persistent_count; s < jit.n_slots; s++)
-            jit.slots[s].buf_id = plan_assignment[s]; // will be resolved at replay
+            jit_orig_buf_ids[s] = jit.slots[s].buf_id;
+        // Overload buf_id with plan_assignment for replay
+        for (u32 s = jit.persistent_count; s < jit.n_slots; s++)
+            jit.slots[s].buf_id = plan_assignment[s];
 
         fprintf(stderr, "JIT captured %u cmds, %u slots (%u persistent), %u consts\n",
                 jit.n_cmds, jit.n_slots, jit.persistent_count, jit.n_consts);
@@ -235,16 +259,44 @@ void jit_end_capture(void) {
     }
 }
 
+// Resolve capture-time buf_id to replay-time buf_id.
+// Call AFTER jit_replay (or after first replay allocates ephemeral buffers).
+u32 jit_resolve_buf(u32 capture_buf_id) {
+    if (!jit.ephemeral_ready) return capture_buf_id;
+    for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+        if (jit_orig_buf_ids[s] == capture_buf_id)
+            return jit.slots[s].buf_id;
+    }
+    return capture_buf_id; // persistent or not found
+}
+
+// Update ALL tensor buf_ids for ephemeral slots (call once after first replay)
+void jit_update_tensor_bufs(TinyHVM *ctx) {
+    if (!jit.ephemeral_ready) return;
+    // Loop over ALL tensors (including ephemeral ones beyond tensor_count,
+    // which were created during capture but freed by thvm_reset)
+    u32 max_tid = ctx->tensor_count;
+    for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+        u32 old_bid = jit_orig_buf_ids[s];
+        u32 new_bid = jit.slots[s].buf_id;
+        if (old_bid == new_bid) continue;
+        u32 scan_end = (max_tid + 2000 < MAX_TENSORS) ? max_tid + 2000 : MAX_TENSORS;
+        for (u32 t = 0; t < scan_end; t++) {
+            if (ctx->tensors[t].buf_id == old_bid)
+                ctx->tensors[t].buf_id = new_bid;
+        }
+    }
+}
+
 // Flush previous replay's GPU work — call BEFORE overwriting shared buffers.
 void jit_flush(void) {
     if (batch_dirty) metal_flush();
 }
 
-void jit_replay(void) {
-    // Allocate planned physical buffers ONCE — reuse across replays.
-    // The memory planner assigned plan_idx to each slot. Multiple slots
-    // can share the same plan_idx (non-overlapping lifetimes).
-    if (!jit.ephemeral_ready) {
+// Allocate ephemeral buffers without executing any commands.
+// Call once after jit_end_capture, before any replay.
+void jit_alloc_ephemeral(void) {
+    if (jit.ephemeral_ready) return;
         // Find max plan_idx to know how many physical buffers needed
         u32 max_plan = 0;
         for (u32 i = jit.persistent_count; i < jit.n_slots; i++) {
@@ -260,6 +312,7 @@ void jit_replay(void) {
                 if (jit.slots[s].buf_id == p && jit.slots[s].alloc_size > max_sz)
                     max_sz = jit.slots[s].alloc_size;
             }
+            if (max_sz == 0) max_sz = 4; // avoid zero-size alloc
             plan_bufs[p] = metal_buf_alloc(max_sz);
         }
         // Resolve slot buf_ids: each slot gets the buf_id of its plan_idx
@@ -270,9 +323,12 @@ void jit_replay(void) {
             else
                 jit.slots[s].buf_id = metal_buf_alloc(jit.slots[s].alloc_size); // fallback
         }
-        jit.ephemeral_ready = 1;
-    }
-    // Restore constant data (CPU-written values not produced by GPU commands)
+}
+
+void jit_replay(void) {
+    if (!jit.ephemeral_ready) jit_alloc_ephemeral();
+
+    // Restore constant data
     for (u32 ci = 0; ci < jit.n_consts; ci++) {
         u32 bid = jit.slots[jit.consts[ci].slot].buf_id;
         memcpy(BUF_CONTENTS(bid), jit.consts[ci].data, jit.consts[ci].size);

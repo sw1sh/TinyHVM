@@ -51,7 +51,7 @@ static u32 metal_buf_alloc(u64 bytes) {
     }
 
     // 0. Heap alloc: ALL large buffers from MTLHeap on step 1+
-    if (mem_plan_active && bytes >= PLAN_MIN_BYTES && mem_plan_heap) {
+    if (0 && mem_plan_active && bytes >= PLAN_MIN_BYTES && mem_plan_heap) {
         if (mem_plan_cursor < mem_plan_count) mem_plan_cursor++;
         metal_pool.bufs[id] = [mem_plan_heap newBufferWithLength:bytes
                                                          options:MTLResourceStorageModeShared];
@@ -235,7 +235,7 @@ static void metal_pool_reset(u32 keep) {
     // ── Build index-based reuse plan from this step's profile ──
     // No MTLBuffer pointers stored — just indices. On step 1+, reuse
     // is resolved by looking up the earlier alloc's buf_id at runtime.
-    if (plan_alloc_count > 0 && !mem_plan_active) {
+    if (0 && plan_alloc_count > 0 && !mem_plan_active) {
         mem_plan_count = plan_alloc_count;
         // For each alloc, find the earliest dead alloc with compatible size
         // "Dead" = buf_last_use is set and < all buf_last_use of allocs between them

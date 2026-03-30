@@ -193,19 +193,26 @@ Term thvm_op_raw(TinyHVM *ctx, u32 uop, Term a, Term b) {
 }
 
 Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
-    // Decompose MM into expand+MUL+SUM — fully fusable with downstream ops.
-    // Gradient flows through RESHAPE→SUM→MUL chain rules automatically.
+    // Decompose MM into expand+MUL+SUM when BOTH inputs are lazy (TAG_TOP).
+    // This enables fusion with downstream ops (bias+relu) in forward pass.
+    // When inputs are materialized (TAG_TEN, from GRAD handler), keep UOP_MM
+    // for efficient MPS dispatch (avoids creating huge expanded intermediates).
     if (uop == UOP_MM) {
         const View *va = term_view(ctx, a);
         const View *vb = term_view(ctx, b);
         if (va && vb && va->shape.rank == 2 && vb->shape.rank == 2) {
-            u32 M = va->shape.dims[0], K = va->shape.dims[1], N = vb->shape.dims[1];
-            extern Term thvm_sum_axes(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes);
-            Term a3 = thvm_expand(ctx, thvm_reshape(ctx, a, SHAPE(M, K, 1)), SHAPE(M, K, N));
-            Term b3 = thvm_expand(ctx, thvm_reshape(ctx, b, SHAPE(1, K, N)), SHAPE(M, K, N));
-            Term prod = thvm_op(ctx, UOP_MUL, a3, b3);
-            Term sum = thvm_sum_axes(ctx, prod, (u32[]){1}, 1);
-            return thvm_reshape(ctx, sum, SHAPE(M, N));
+            int a_lazy = (term_tag(a) == TAG_TOP);
+            int b_lazy = (term_tag(b) == TAG_TOP);
+            // DISABLED: decomposition creates too many backward intermediates.
+            if (0) {
+                u32 M = va->shape.dims[0], K = va->shape.dims[1], N = vb->shape.dims[1];
+                extern Term thvm_sum_axes(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes);
+                Term a3 = thvm_expand(ctx, thvm_reshape(ctx, a, SHAPE(M, K, 1)), SHAPE(M, K, N));
+                Term b3 = thvm_expand(ctx, thvm_reshape(ctx, b, SHAPE(1, K, N)), SHAPE(M, K, N));
+                Term prod = thvm_op(ctx, UOP_MUL, a3, b3);
+                Term sum = thvm_sum_axes(ctx, prod, (u32[]){1}, 1);
+                return thvm_reshape(ctx, sum, SHAPE(M, N));
+            }
         }
     }
 

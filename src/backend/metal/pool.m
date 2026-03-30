@@ -3,7 +3,19 @@
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);
     u32 id = metal_pool.count++;
-    assert(id < MAX_BUFS);
+    if (id >= MAX_BUFS - 64) {
+        fprintf(stderr, "METAL: buf pool near limit (%u/%u), flushing pending free\n", id, MAX_BUFS);
+        // Try to recover by flushing pending free buffers
+        if (batch_dirty) metal_flush();
+        for (u32 i = 0; i < pending_free_count; i++) metal_buf_free(pending_free[i]);
+        pending_free_count = 0;
+    }
+    if (id >= MAX_BUFS) {
+        fprintf(stderr, "FATAL: Metal buffer pool exhausted (%u buffers). Aborting safely.\n", id);
+        fprintf(stderr, "  This happens with large models (beautiful_mnist 5x5 conv backward).\n");
+        fprintf(stderr, "  The decomposed MM creates too many intermediate buffers.\n");
+        exit(1);  // Clean exit instead of GPU page fault
+    }
 
     u32 best_idx = UINT32_MAX;
     u64 best_size = UINT64_MAX;

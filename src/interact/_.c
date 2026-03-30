@@ -153,7 +153,7 @@ inet_step:
                     Term at = term_ten(aid, ma->dtype);
 
                     int is_bin = (cop==UOP_ADD||cop==UOP_SUB||cop==UOP_MUL||
-                                  cop==UOP_DIV||cop==UOP_MAX||cop==UOP_CMP);
+                                  cop==UOP_DIV||cop==UOP_MAX||cop==UOP_MM||cop==UOP_CMP);
                     TensorMeta *mb_p = is_bin ? &ctx->tensors[bid] : NULL;
                     Term bt = is_bin ? term_ten(bid, mb_p->dtype) : term_era();
 
@@ -200,8 +200,16 @@ inet_step:
                             BIN_GRAD(
                                 sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt), my->view.shape, ma->view.shape),
                                 sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at), my->view.shape, mb_p->view.shape));
-                        // UOP_MM: removed — decomposed at thvm_op time into
-                        // expand+MUL+SUM. Gradient flows through chain rules.
+                        case UOP_MM: {
+                            // Backward MMs use MPS (inputs materialized by ENSURE above)
+                            ENSURE(ctx, aid); ENSURE(ctx, bid);
+                            ma = &ctx->tensors[aid]; mb_p = &ctx->tensors[bid];
+                            u32 bt_id = tensor_transpose_2d(ctx, bid);
+                            u32 at_id = tensor_transpose_2d(ctx, aid);
+                            BIN_GRAD(
+                                thvm_op(ctx, UOP_MM, gy, term_ten(bt_id, mb_p->dtype)),
+                                thvm_op(ctx, UOP_MM, term_ten(at_id, ma->dtype), gy));
+                        }
                         case UOP_RELU: {
                             // Use y (output) not at (input) for mask: y>0 iff at>0
                             // This allows RELU to appear in fused reduce chains
@@ -487,7 +495,7 @@ inet_step:
             Term a = heap_read(ctx, loc);
             heap_set(ctx, loc, a);
 
-            int is_binary = (uop >= UOP_ADD && uop <= UOP_SUB);
+            int is_binary = (uop >= UOP_ADD && uop <= UOP_SUB) || uop == UOP_MM;
             int is_reduce = (uop == UOP_SUM || uop == UOP_RMAX);
             Term b = term_era();
             if (is_binary || is_movement) {
@@ -529,7 +537,7 @@ inet_step:
 
             // TAG_NUM fast path: inline scalar compute without tensors/buffers.
             // ~5ns per interaction vs ~30ns with tensor_create + buf ops.
-            if (term_tag(a) == TAG_NUM && !is_movement && !is_reduce) {
+            if (term_tag(a) == TAG_NUM && !is_movement && !is_reduce && uop != UOP_MM) {
                 f32 va = term_as_f32(a);
                 f32 vb = (is_binary && term_tag(b) == TAG_NUM) ? term_as_f32(b) : 0;
                 f32 vr;
@@ -791,8 +799,14 @@ inet_step:
             u32 out_ndim;
             View av_bc, bv_bc;  // broadcast views
 
-            // UOP_MM: decomposed at thvm_op time, never reaches interact.
-            if (is_reduce) {
+            if (uop == UOP_MM) {
+                // matmul: [M,K] x [K,N] → [M,N]
+                assert(ma->view.shape.rank == 2 && mb->view.shape.rank == 2);
+                assert(ma->view.shape.dims[1] == mb->view.shape.dims[0]);
+                out_shape[0] = ma->view.shape.dims[0];
+                out_shape[1] = mb->view.shape.dims[1];
+                out_ndim = 2;
+            } else if (is_reduce) {
                 // Reduce: check if explicit axes are provided (from thvm_sum_axes)
                 out_ndim = ma->view.shape.rank;
                 for (u32 i = 0; i < out_ndim; i++) out_shape[i] = ma->view.shape.dims[i];
@@ -1011,8 +1025,13 @@ inet_step:
                 if (b_id) { ENSURE(ctx, b_id); if (is_binary) mb = &ctx->tensors[b_id]; }
             }
             // Dispatch
-            // UOP_MM: no longer reaches here — decomposed at thvm_op time.
-            if (is_reduce) {
+            if (uop == UOP_MM) {
+                // MPS matmul for materialized inputs (backward MMs from GRAD handler).
+                // Forward MMs are decomposed at thvm_op time when inputs are lazy.
+                u32 M = ma->view.shape.dims[0], K = ma->view.shape.dims[1], N = mb->view.shape.dims[1];
+                md->backend->op_mm(md->buf_id, ma->buf_id, &ma->view,
+                                mb->buf_id, &mb->view, M, K, N);
+            } else if (is_reduce) {
                 // Check if explicit axes are provided
                 Term sum_arg2 = heap_read(ctx, loc + 1);
                 int has_explicit_axes = (term_tag(sum_arg2) == TAG_TOP || term_tag(sum_arg2) == TAG_TEN);

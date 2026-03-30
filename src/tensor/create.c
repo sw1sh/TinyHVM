@@ -9,7 +9,11 @@ static u32 tensor_create(TinyHVM *ctx, Shape s, u32 dtype) {
     id = ts->tensor_next++;
     assert(id < ts->tensor_end && "thread tensor ID overflow");
   } else {
-    assert(s.rank <= MAX_DIM && ctx->tensor_count < MAX_TENSORS);
+    if (ctx->tensor_count >= MAX_TENSORS - 64) {
+        fprintf(stderr, "FATAL: Tensor pool near limit (%u/%u). Aborting safely.\n", ctx->tensor_count, MAX_TENSORS);
+        exit(1);
+    }
+    assert(s.rank <= MAX_DIM);
     id = ctx->tensor_count++;
   }
   TensorMeta *m  = &ctx->tensors[id];

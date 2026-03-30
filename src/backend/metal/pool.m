@@ -17,6 +17,25 @@ static u32 dispatch_counter = 0;
 // When remaining_uses reaches 0, the buffer is truly dead and can be stolen.
 static u16 buf_remaining_uses[MAX_BUFS];
 
+// ── Step-Level Memory Planner ──────────────────────────────────
+// Learn buffer lifetimes from step 0, plan reuse for step 1+.
+// Neural net training repeats the same graph every step.
+// Similar to JIT: record on first pass, optimize on replay.
+#define PLAN_MIN_BYTES (512 * 1024)  // plan buffers >= 512KB
+#define MAX_PLAN_ENTRIES 2048
+
+static struct {
+    id<MTLBuffer> buf;  // retained MTLBuffer for reuse
+    u64 size;
+} mem_plan[MAX_PLAN_ENTRIES];
+static u32 mem_plan_count = 0;
+static u32 mem_plan_cursor = 0;  // advances during step 1+
+static int mem_plan_active = 0;  // 1 = plan ready for this step
+
+// Recording: track large alloc sequence + lifetimes during step 0
+static u32 plan_alloc_ids[MAX_PLAN_ENTRIES]; // buf_ids in alloc order
+static u32 plan_alloc_count = 0;
+
 #define METAL_MEM_BUDGET (4ULL * 1024 * 1024 * 1024) // 4GB hard limit
 
 static u32 metal_buf_alloc(u64 bytes) {
@@ -28,64 +47,53 @@ static u32 metal_buf_alloc(u64 bytes) {
         exit(1);
     }
 
-    // 1. Check free list first (from pool_reset)
-    u32 best_idx = UINT32_MAX;
-    u64 best_size = UINT64_MAX;
-    for (u32 i = 0; i < free_count; i++) {
-        u64 sz = free_list[i].size;
-        if (sz >= bytes && sz <= bytes * 2 && sz < best_size) {
-            best_idx = i;
-            best_size = sz;
+    // 0. Memory plan reuse (step 1+): use pre-planned buffer
+    if (0 && mem_plan_active && bytes >= PLAN_MIN_BYTES && mem_plan_cursor < mem_plan_count) {
+        u32 c = mem_plan_cursor++;
+        if (mem_plan[c].buf && mem_plan[c].size >= bytes && mem_plan[c].size <= bytes * 2) {
+            metal_pool.bufs[id] = mem_plan[c].buf;
+            metal_pool.sizes[id] = mem_plan[c].size;
+            static u32 plan_use_n = 0;
+            if (plan_use_n < 3) { plan_use_n++;
+                fprintf(stderr, "  PLAN_USE[%u]: buf=%u %.1fMB (plan %.1fMB)\n",
+                    c, id, (double)bytes/1e6, (double)mem_plan[c].size/1e6);
+            }
+            goto done;
+        }
+        // Size mismatch — fall through to normal alloc
+    }
+
+    // 1. Free list (from pool_reset)
+    {
+        u32 best_idx = UINT32_MAX;
+        u64 best_size = UINT64_MAX;
+        for (u32 i = 0; i < free_count; i++) {
+            u64 sz = free_list[i].size;
+            if (sz >= bytes && sz <= bytes * 2 && sz < best_size) {
+                best_idx = i;
+                best_size = sz;
+            }
+        }
+        if (best_idx != UINT32_MAX) {
+            metal_pool.bufs[id] = free_list[best_idx].buf;
+            metal_pool.sizes[id] = free_list[best_idx].size;
+            free_list[best_idx] = free_list[--free_count];
+            metal_bytes_inuse += metal_pool.sizes[id];
+            goto done;
         }
     }
-    if (best_idx != UINT32_MAX) {
-        metal_pool.bufs[id] = free_list[best_idx].buf;
-        metal_pool.sizes[id] = free_list[best_idx].size;
-        free_list[best_idx] = free_list[--free_count];
-        metal_bytes_inuse += metal_pool.sizes[id];
-    } else if (bytes >= 1024*1024 && dispatch_counter > 2) {
-        // 2. For large allocs: try to reclaim a "dead" buffer from the pool.
-        // A buffer is reclaimable if it was last used as a dispatch leaf
-        // at least 2 dispatches ago (GPU guarantees sequential execution,
-        // so the reader has completed). Size must be compatible.
-        u32 reuse_id = 0;
-        u64 reuse_size = UINT64_MAX;
-        u32 keep = 1; // scan all live buffers for reuse
-        for (u32 i = keep; i < id; i++) {
-            if (!metal_pool.bufs[i]) continue;
-            u64 sz = metal_pool.sizes[i];
-            if (sz < bytes || sz > bytes * 2) continue;
-            if (buf_remaining_uses[i] > 0) continue; // pre-scan marked as still needed
-            if (buf_last_use[i] > 0 && buf_last_use[i] + 1 >= dispatch_counter) continue;
-            // For buffers with last_use==0: only steal if old enough that prescans
-            // have covered all potential consumers (buffer created 200+ slots ago)
-            if (buf_last_use[i] == 0 && i + 200 > id) continue;
-            if (sz < reuse_size) { reuse_id = i; reuse_size = sz; }
-        }
-        if (reuse_id) {
-            // Steal the Metal buffer from the old slot
-            metal_pool.bufs[id] = metal_pool.bufs[reuse_id];
-            metal_pool.sizes[id] = metal_pool.sizes[reuse_id];
-            metal_pool.bufs[reuse_id] = nil;
-            u64 old_size = metal_pool.sizes[reuse_id];
-            metal_pool.sizes[reuse_id] = 0;
-            buf_refcount[reuse_id] = 0;
-            buf_last_use[reuse_id] = 0;
-            // inuse stays same (stolen, not new)
-        } else {
-            metal_pool.bufs[id] = [mtl_dev newBufferWithLength:bytes
-                                                       options:MTLResourceStorageModeShared];
-            metal_pool.sizes[id] = bytes;
-            metal_bytes_total += bytes;
-            metal_bytes_inuse += bytes;
-        }
-    } else {
-        metal_pool.bufs[id] = [mtl_dev newBufferWithLength:bytes
-                                                   options:MTLResourceStorageModeShared];
-        metal_pool.sizes[id] = bytes;
-        metal_bytes_total += bytes;
-        metal_bytes_inuse += bytes;
-    }
+
+    // 2. Fresh allocation
+    metal_pool.bufs[id] = [mtl_dev newBufferWithLength:bytes
+                                               options:MTLResourceStorageModeShared];
+    metal_pool.sizes[id] = bytes;
+    metal_bytes_total += bytes;
+    metal_bytes_inuse += bytes;
+
+done:
+    // Record large allocs for planning
+    if (bytes >= PLAN_MIN_BYTES && !mem_plan_active && plan_alloc_count < MAX_PLAN_ENTRIES)
+        plan_alloc_ids[plan_alloc_count++] = id;
 
     // Budget guard — check after allocation so we report accurate numbers
     if (metal_bytes_inuse > METAL_MEM_BUDGET) {
@@ -188,24 +196,103 @@ static void metal_buf_read(u32 id, void *out, u64 bytes) {
 }
 
 static void metal_pool_reset(u32 keep) {
-    if (batch_dirty) metal_flush(); // needed: can't free GPU-active buffers
+    if (batch_dirty) metal_flush();
     u32 buf_keep = keep + 1;
-    // (buf_cpu_only tracking replaces persistent_buf_count approach)
     u32 n_free = metal_pool.count - buf_keep;
-    if (n_free == 0) return;
+    if (n_free == 0) goto reset_counters;
 
-    // Move to free list for reuse (no deallocation)
+    // ── Build memory plan from this step's allocation profile ──
+    // For each recorded large alloc, check if any EARLIER alloc's buffer
+    // can be reused (earlier alloc dead before this alloc happens).
+    // "Dead" = buf_last_use[earlier] is set AND < buf_last_use of intervening allocs.
+    if (plan_alloc_count > 0 && !mem_plan_active) {
+        // Greedy reuse: maintain a pool of free'd MTLBuffers keyed by size.
+        // Process allocs in order. After each alloc, check if its buffer dies
+        // before the next alloc — if so, add to the free pool.
+        struct { id<MTLBuffer> buf; u64 size; } fpool[64];
+        u32 fpool_n = 0;
+
+        mem_plan_count = 0;
+        for (u32 a = 0; a < plan_alloc_count && mem_plan_count < MAX_PLAN_ENTRIES; a++) {
+            u32 bid = plan_alloc_ids[a];
+            u64 bsz = metal_pool.sizes[bid];
+
+            // Release dead buffers from earlier allocs into the free pool
+            for (u32 p = 0; p < a; p++) {
+                u32 pbid = plan_alloc_ids[p];
+                if (!pbid || !metal_pool.bufs[pbid]) continue;
+                u32 pdeath = buf_last_use[pbid];
+                if (pdeath == 0) continue; // never used as leaf — unclear lifetime
+                // Buffer p is dead if no alloc between p+1 and a reads from it
+                // (i.e., pdeath < the smallest buf_last_use of allocs p+1..a-1 OR
+                //  pdeath < dispatch_counter at alloc a's time).
+                // Simplification: if pdeath <= buf_last_use[bid], p died before a was used.
+                // But we don't know a's "birth dispatch". Use: pdeath < dispatch of a.
+                // Since allocs are ordered, a reasonable check: pdeath is "old".
+                // Actually, just check if it's already in fpool:
+                int in_fp = 0;
+                for (u32 f = 0; f < fpool_n; f++)
+                    if (fpool[f].buf == metal_pool.bufs[pbid]) { in_fp = 1; break; }
+                if (in_fp) continue;
+                // Add if death was before current alloc's index (conservative)
+                // Use dispatch order: if pdeath < alloc-a-related dispatches
+                // Simplest: just add ALL dead buffers from before a
+                if (fpool_n < 64) {
+                    fpool[fpool_n].buf = metal_pool.bufs[pbid];
+                    fpool[fpool_n].size = metal_pool.sizes[pbid];
+                    fpool_n++;
+                }
+            }
+
+            // Find match in free pool
+            int found = -1;
+            for (u32 f = 0; f < fpool_n; f++) {
+                if (fpool[f].buf && fpool[f].size >= bsz && fpool[f].size <= bsz * 4) {
+                    found = (int)f; break;
+                }
+            }
+            if (found >= 0) {
+                mem_plan[mem_plan_count].buf = fpool[found].buf;
+                mem_plan[mem_plan_count].size = fpool[found].size;
+                fpool[found] = fpool[--fpool_n]; // remove from pool
+            } else {
+                mem_plan[mem_plan_count].buf = nil; // no reuse — allocate fresh
+                mem_plan[mem_plan_count].size = 0;
+            }
+            mem_plan_count++;
+        }
+
+        u32 reuse_count = 0;
+        for (u32 i = 0; i < mem_plan_count; i++)
+            if (mem_plan[i].buf) reuse_count++;
+        u64 plan_bytes = 0;
+        for (u32 i = 0; i < mem_plan_count; i++)
+            if (mem_plan[i].buf) plan_bytes += mem_plan[i].size;
+        if (reuse_count > 0)
+            fprintf(stderr, "MEM_PLAN: %u allocs, %u reused (%.0fMB retained)\n",
+                    mem_plan_count, reuse_count, (double)plan_bytes/1e6);
+    }
+
+    // Move ephemeral buffers to free list, but RETAIN plan-reuse buffers
     for (u32 i = buf_keep; i < metal_pool.count; i++) {
         u64 sz = metal_pool.sizes[i];
         if (sz <= metal_bytes_inuse) metal_bytes_inuse -= sz;
         else metal_bytes_inuse = 0;
-        // Metal memory stays allocated — metal_bytes_total unchanged
+        // Check if retained by memory plan
+        int in_plan = 0;
+        for (u32 p = 0; p < mem_plan_count && !in_plan; p++)
+            if (mem_plan[p].buf == metal_pool.bufs[i]) in_plan = 1;
+        if (in_plan) {
+            metal_pool.bufs[i] = nil;
+            metal_pool.sizes[i] = 0;
+            buf_refcount[i] = 0;
+            continue; // plan retains the MTLBuffer
+        }
         if (metal_pool.bufs[i] && free_count < MAX_FREE_BUFS) {
             free_list[free_count].buf = metal_pool.bufs[i];
             free_list[free_count].size = sz;
             free_count++;
         } else if (metal_pool.bufs[i]) {
-            // Free list full — actually release
             [metal_pool.bufs[i] release];
             if (sz <= metal_bytes_total) metal_bytes_total -= sz;
             else metal_bytes_total = 0;
@@ -214,12 +301,18 @@ static void metal_pool_reset(u32 keep) {
         metal_pool.sizes[i] = 0;
         buf_refcount[i] = 0;
     }
-    // Clear pending_free — all ephemeral buffers already moved to free_list above
+
+reset_counters:
     pending_free_count = 0;
     dispatch_counter = 0;
     memset(buf_last_use, 0, sizeof(buf_last_use));
     memset(buf_remaining_uses, 0, sizeof(buf_remaining_uses));
     metal_pool.count = buf_keep;
+
+    // Activate plan for next step
+    mem_plan_active = (mem_plan_count > 0);
+    mem_plan_cursor = 0;
+    plan_alloc_count = 0;
 }
 
 static void metal_pool_set_persistent(u32 max_persistent_buf) {

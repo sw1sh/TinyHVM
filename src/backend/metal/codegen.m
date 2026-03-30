@@ -657,7 +657,7 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
     NSString *src;
     // UOp IR path: build IR → render MSL (when THVM_UOP=1 and no side outputs)
     static int _use_uop = -1;
-    if (_use_uop < 0) _use_uop = getenv("THVM_UOP") != NULL;
+    if (_use_uop < 0) _use_uop = getenv("THVM_NO_UOP") == NULL; // UOp on by default
     int has_reduce_r = reduce && reduce->reduce_type;
     _last_compiled_uop = 0;
     if (_use_uop && n_side_outputs == 0) {

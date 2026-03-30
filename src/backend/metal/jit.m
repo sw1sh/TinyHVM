@@ -297,6 +297,7 @@ void jit_flush(void) {
 // Call once after jit_end_capture, before any replay.
 void jit_alloc_ephemeral(void) {
     if (jit.ephemeral_ready) return;
+    jit.ephemeral_ready = 1; // set BEFORE alloc to prevent re-entry
         // Find max plan_idx to know how many physical buffers needed
         u32 max_plan = 0;
         for (u32 i = jit.persistent_count; i < jit.n_slots; i++) {

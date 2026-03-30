@@ -193,7 +193,21 @@ Term thvm_op_raw(TinyHVM *ctx, u32 uop, Term a, Term b) {
 }
 
 Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
-    // MM decomposition moved to interact handler (preserves creator_op for GRAD).
+    // Decompose MM into expand+MUL+SUM — fully fusable with downstream ops.
+    // Gradient flows through RESHAPE→SUM→MUL chain rules automatically.
+    if (uop == UOP_MM) {
+        const View *va = term_view(ctx, a);
+        const View *vb = term_view(ctx, b);
+        if (va && vb && va->shape.rank == 2 && vb->shape.rank == 2) {
+            u32 M = va->shape.dims[0], K = va->shape.dims[1], N = vb->shape.dims[1];
+            extern Term thvm_sum_axes(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes);
+            Term a3 = thvm_expand(ctx, thvm_reshape(ctx, a, SHAPE(M, K, 1)), SHAPE(M, K, N));
+            Term b3 = thvm_expand(ctx, thvm_reshape(ctx, b, SHAPE(1, K, N)), SHAPE(M, K, N));
+            Term prod = thvm_op(ctx, UOP_MUL, a3, b3);
+            Term sum = thvm_sum_axes(ctx, prod, (u32[]){1}, 1);
+            return thvm_reshape(ctx, sum, SHAPE(M, N));
+        }
+    }
 
     u64 loc = heap_alloc(ctx, 4); // 0-1: args (trampoline overwrites), 2-3: shadow (preserved)
     a = linear_use(ctx, a, loc);

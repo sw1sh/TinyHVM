@@ -418,6 +418,20 @@ static NSString *uop_render_msl(const UOpKernel *k) {
                         if (lv->mask_end[d] < lv->shape.dims[d])
                             [s appendFormat:@"v%u<%uu", cv, lv->mask_end[d]];
                     }
+                    // Compound masks: begin <= c_a * stride_a + c_b < end
+                    for (u32 cm = 0; cm < lv->n_compound_masks; cm++) {
+                        u32 da = lv->compound_masks[cm].dim_a;
+                        u32 db = lv->compound_masks[cm].dim_b;
+                        i32 sa = lv->compound_masks[cm].stride_a;
+                        u32 mb = lv->compound_masks[cm].begin;
+                        u32 me = lv->compound_masks[cm].end;
+                        u32 ca = k->coord_uop[da], cb = k->coord_uop[db];
+                        if (!first) [s appendString:@"&&"];
+                        first = 0;
+                        // Emit: (c_a * stride_a + c_b) >= begin && (c_a * stride_a + c_b) < end
+                        [s appendFormat:@"(v%u*%d+v%u)>=%uu&&(v%u*%d+v%u)<%uu",
+                            ca, sa, cb, mb, ca, sa, cb, me];
+                    }
                     if (first) [s appendString:@"true"];
                     [s appendFormat:@")?buf%u[v%u]:0.f;\n", op->imm.u, op->arg[0]];
                 } else {

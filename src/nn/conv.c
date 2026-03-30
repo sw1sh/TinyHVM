@@ -86,9 +86,125 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
             // The codegen sees the pool view's strides. The mask must be on
             // the padded spatial dims, which are the inner dims of the pool.
             //
-            // For now: if input has mask, fall back to the repeat-based path
-            // which correctly materializes the mask through contiguify.
-            if (vx->has_mask) goto pool_fallback;
+            // Propagate pad mask: for each spatial dim, the validity condition
+            // is pad_begin <= oy*s + kh*d < pad_end. We encode this as a mask
+            // on the KERNEL dim with begin/end derived from the pad bounds.
+            // The codegen checks mask_begin[d] <= c_d < mask_end[d] per dim.
+            // For the output dim: always valid (full range).
+            // For the kernel dim: conservatively valid, but we add the compound
+            // check by setting mask on a "virtual" basis.
+            //
+            // Actually: the mask check needs to be on the COMPOSED coordinate.
+            // The View mask system checks per-dim only. For compound checks,
+            // we rely on the buffer offset going out of range — the PAD view
+            // originally stored has_mask with begin/end on the spatial dim.
+            // Since the pool view SHARES the padded buffer, and the strides
+            // map (oy, kh) to the padded spatial index, the codegen will
+            // compute index = oy*s + kh which may land in the padding zone.
+            // The original PAD mask on the padded tensor checked this.
+            //
+            // But the pool view is a NEW tensor with its OWN view. The mask
+            // must be on the pool view's dims. Set has_mask=1 and encode
+            // the pad bounds on the kernel dims:
+            //   kh valid when: pad_begin <= oy*stride_oy/stride_kh + kh < pad_end
+            // This can't be per-dim. So encode as: the pool view itself is
+            // unmasked, but the BUFFER has padding zeros outside [begin,end).
+            //
+            // If the original PAD used offset to shift the view start into
+            // the valid region, the pool view inherits that offset. Elements
+            // where oy*s+kh lands in the padding zone read from memory that
+            // was initialized to 0 by the PAD (via mask→0.0f in codegen).
+            //
+            // The correct solution: set has_mask on the pool view with
+            // the mask checking the compound condition. Extend View to
+            // support compound masks, or just pass the pad bounds through.
+            //
+            // Pragmatic: the mask check IS the condition
+            //   mask_begin_spatial <= oy*s + kh < mask_end_spatial
+            // We can't express this per-dim. BUT: the offset-based access
+            // naturally returns 0 if the PAD created a zero-filled buffer.
+            // PAD in TinyHVM uses has_mask (NOT zero-fill). So we NEED the mask.
+            //
+            // Simplest correct fix: DON'T set has_mask on pool view.
+            // Instead, check: does the PAD use offset to make the valid
+            // region start at element 0? If so, pool strides work without mask.
+            // Pad mask propagation: the padded input has mask_begin/mask_end on
+            // spatial dims. For the pool view, validity is:
+            //   mask_begin_H <= oy*s + kh < mask_end_H
+            //   mask_begin_W <= ox*s + kw < mask_end_W
+            // Express this as per-dim masks using the PAD bounds:
+            //   For oy dim: begin = ceil((pad_begin_H) / s), but this loses the kh dependency
+            // Instead: set has_mask=1 on pool view. Store pad bounds in mask_begin/mask_end
+            // for the kernel dims. The codegen checks c_d >= begin && c_d < end per dim.
+            // For the OUTPUT dims (oy, ox): full range [0, o).
+            // For the KERNEL dims (kh, kw): the mask is a PROXY — the codegen
+            // computes the composed index (c_oy*s + c_kh) and checks against pad bounds.
+            //
+            // Encode: mask_begin[kh_dim] = mask_begin_H of padded input
+            //         mask_end[kh_dim] = mask_end_H of padded input
+            // The codegen generates: c_kh >= begin && c_kh < end — WRONG (ignores oy*s).
+            //
+            // True fix: extend the codegen's mask check for pool views to use
+            // compound coordinates. For now, the pool view inherits has_mask
+            // and stores the original pad bounds. The codegen already generates
+            // the index as offset + c_oy*stride_oy + c_kh*stride_kh. When this
+            // index is negative or past buffer end, the mask must catch it.
+            //
+            // ACTUAL solution: use the PAD's mask bounds as-is. The pool view's
+            // coordinates (oy, kh) map to the padded spatial coordinate via
+            // c_spatial = oy*s + kh. The PAD mask checks c_spatial in [begin, end).
+            // We replicate this by NOT decomposing the spatial dim — the mask stays
+            // on the original spatial coordinate.
+            //
+            // But the pool view has SEPARATE oy and kh dims, not a single spatial dim.
+            // The codegen needs to CHECK: is (c_oy * s + c_kh) within the valid range?
+            //
+            // Implementation: set has_mask=1 on pool view. For each spatial pair (j):
+            //   mask_begin[oy_dim] = 0; mask_end[oy_dim] = o_j  (always valid per-dim)
+            //   mask_begin[kh_dim] = 0; mask_end[kh_dim] = k_j  (always valid per-dim)
+            // Then add compound mask info: pool_mask_spatial_begin/end per spatial dim.
+            // The codegen generates the compound check.
+            //
+            // Simpler: just use the existing mask system but set it so that
+            // the check on kh is pad_begin <= kh < pad_end. For kh=0, this means
+            // pad_begin must be 0. For pad=1, mask_begin[kh]=1 → kh=0 is MASKED.
+            // kh=1,2 are valid. oy=0: spatial = 0+kh. kh=1 → spatial=1 ✓ (pad_begin=1).
+            //
+            // This IS correct for s=1! When s=1, c_spatial = c_oy + c_kh.
+            // mask_begin[kh] = pad_begin_H means kh >= pad_begin_H.
+            // Combined: spatial = oy + kh >= oy + pad_begin_H >= pad_begin_H ✓
+            // But also need: spatial < pad_end. oy + kh < pad_end → kh < pad_end - oy.
+            // This depends on oy → per-dim mask on kh ALONE is too conservative.
+            //
+            // For s=1, d=1: set mask_begin[kh]=pad_begin, mask_end[kh]=pad_end.
+            // Then per-dim check: pad_begin <= kh < pad_end.
+            // Combined: spatial = oy + kh, and oy in [0, o).
+            // When oy=0, kh must be in [pad_begin, pad_end) for validity.
+            // When oy=1, kh must be in [pad_begin-1, pad_end-1) for spatial validity.
+            // But per-dim check is [pad_begin, pad_end) regardless of oy → CONSERVATIVE.
+            // Some valid (oy=1, kh=0) where spatial=1 >= pad_begin=1 ✓ but kh=0 < pad_begin=1 → masked → reads 0.
+            // This is WRONG — valid data masked to 0. Loses information.
+            //
+            // So per-dim masks DON'T work. Must extend codegen.
+            // For now: fallback for padded inputs.
+            if (vx->has_mask) {
+                // Compound mask: validity is begin <= c_oy*s + c_kh < end per spatial dim.
+                ov.has_mask = 1;
+                // Per-dim masks: full range (compound check handles validity)
+                for (u32 d = 0; d < out_rank; d++) {
+                    ov.mask_begin[d] = 0;
+                    ov.mask_end[d] = out_shape.dims[d];
+                }
+                // Compound masks for each spatial dim
+                ov.n_compound_masks = (u8)n_spatial;
+                for (u32 j = 0; j < n_spatial && j < 2; j++) {
+                    ov.compound_masks[j].dim_a = (u8)(bd + j);              // output dim (oy/ox)
+                    ov.compound_masks[j].dim_b = (u8)(bd + n_spatial + j);  // kernel dim (kh/kw)
+                    ov.compound_masks[j].stride_a = (i32)s_[j];            // stride multiplier
+                    ov.compound_masks[j].begin = vx->mask_begin[bd + j];   // pad begin
+                    ov.compound_masks[j].end = vx->mask_end[bd + j];       // pad end
+                }
+            }
 
             u32 vid = tensor_view_of(ctx, src_id, ov);
             ctx->tensors[vid].creator_op = UOP_RESHAPE; // view provenance

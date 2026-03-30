@@ -380,6 +380,11 @@ typedef struct {
     u8  has_mask;           // 1 if view has a per-dim valid region mask
     u32 mask_begin[MAX_DIM]; // per-dim start of valid region
     u32 mask_end[MAX_DIM];   // per-dim end of valid region
+    // Compound masks: validity checks on linear combinations of coordinates.
+    // Used by pool views where validity is: begin <= c_a*s + c_b < end.
+    // n_compound_masks=0 means no compound masks (backward compat).
+    u8  n_compound_masks;
+    struct { u8 dim_a, dim_b; i32 stride_a; u32 begin, end; } compound_masks[2]; // max 2 spatial dims
 } View;
 
 // ============================================================

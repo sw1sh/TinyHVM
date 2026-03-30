@@ -4,7 +4,7 @@ static int _last_compiled_uop = 0; // set by cg_get_pipe_rs when UOp path used
 // Replaces FusedOp[] + ReduceSpec with a single linear SSA IR
 // that naturally supports multi-reduce, multi-output, and complex indexing.
 
-#define KOP_MAX 128
+#define KOP_MAX 512
 
 typedef enum {
     KOP_NOOP = 0,
@@ -21,6 +21,7 @@ typedef enum {
     KOP_IDX,     // index arithmetic: result = arg[0]*imm.u + arg[1]  (multiply-add)
     KOP_MOD,     // modulo: result = arg[0] % imm.u
     KOP_DIV,     // integer div: result = arg[0] / imm.u
+    KOP_MASK,    // conditional: result = arg[0] ? arg[1] : 0.0f  (mask for PAD views)
 } KOpType;
 
 typedef struct {
@@ -35,9 +36,13 @@ typedef struct {
 typedef struct {
     UOp ops[KOP_MAX];
     u32 n_ops;
-    u32 n_bufs;      // number of buffers (out + side_outputs + leaves)
-    u32 grid[3];     // dispatch grid
-    u32 tg[3];       // threadgroup size
+    u32 n_bufs;
+    u32 n_leaves;
+    const View *leaf_views[32];
+    u32 coord_uop[MAX_DIM]; // UOp id for coordinate of each dim (for mask rendering)
+    u32 rank;
+    u32 grid[3];
+    u32 tg[3];
 } UOpKernel;
 
 // ── Build UOp kernel from FusedOp[] + ReduceSpec (compatibility layer) ──
@@ -57,11 +62,83 @@ static u32 uop_emit_f(UOpKernel *k, KOpType type, u32 a0, u32 a1, u32 a2, f32 im
     return id;
 }
 
+// Build mask condition for a leaf view (returns 0 if no mask needed, else UOp id for bool).
+// The mask checks if coordinates are within [mask_begin, mask_end) for each dim.
+static u32 uop_build_mask(UOpKernel *k, const View *v, u32 *coords, u32 rank) {
+    if (!v->has_mask) return 0;
+    u32 cond = 0; // 0 = no mask ops emitted yet
+    for (u32 d = 0; d < v->shape.rank && d < rank; d++) {
+        if (v->mask_begin[d] == 0 && v->mask_end[d] >= v->shape.dims[d]) continue;
+        // Check: coords[d] >= begin && coords[d] < end
+        // Emit as: (coords[d] - begin) < (end - begin) [unsigned comparison trick]
+        // Simpler: emit explicit comparisons and AND them
+        // For MSL we just emit inline — rendered as ternary in KOP_MASK
+        // Store mask params in the imm field (pack begin/end)
+        // Actually, let's just generate the mask in the renderer by examining the view
+        cond = 1; // mark that mask is needed
+    }
+    return cond;
+}
+
 // Build index expression for a leaf view using coordinates.
 // coords[d] = UOp id for coordinate d (uint). Returns UOp id for the flat index (uint).
-static u32 uop_build_index(UOpKernel *k, const View *v, u32 *coords, u32 rank) {
+static u32 uop_build_index(UOpKernel *k, const View *v, u32 *coords, u32 rank,
+                            const Shape *full_shape) {
     // Offset may be negative (e.g., shrink views). Use signed→uint wrapping.
     u32 idx = uop_emit(k, KOP_CONST_U, 0, 0, 0, (u32)(i32)v->offset);
+
+    // Check if coordinate-based indexing is safe (Path B check from old codegen)
+    int coord_ok = (v->shape.rank == rank);
+    if (coord_ok) {
+        for (u32 d = 0; d < rank; d++) {
+            if (v->shape.dims[d] != full_shape->dims[d] &&
+                v->strides[d] != 0 && v->shape.dims[d] != 1)
+                { coord_ok = 0; break; }
+        }
+    }
+
+    // Path C: need flat-index decomposition (rank mismatch or incompatible dims)
+    if (!coord_ok) {
+        // Compute flat full-shape index from all coordinates
+        u32 flat_strides[MAX_DIM];
+        if (rank > 0) {
+            flat_strides[rank - 1] = 1;
+            for (int d = (int)rank - 2; d >= 0; d--)
+                flat_strides[d] = flat_strides[d + 1] * full_shape->dims[d + 1];
+        }
+        // fi = sum(coords[d] * flat_strides[d])
+        u32 fi = uop_emit(k, KOP_CONST_U, 0, 0, 0, 0);
+        for (u32 d = 0; d < rank; d++) {
+            if (flat_strides[d] == 1)
+                fi = uop_emit(k, KOP_IDX, fi, coords[d], 0, 1); // fi + coords[d]
+            else {
+                u32 term = uop_emit(k, KOP_IDX, coords[d], 0, 0, flat_strides[d]);
+                fi = uop_emit(k, KOP_IDX, fi, term, 0, 1);
+            }
+        }
+        // Decompose fi through leaf's own shape
+        u32 leaf_idx = uop_emit(k, KOP_CONST_U, 0, 0, 0, (u32)(i32)v->offset);
+        u32 leaf_div = 1;
+        for (int d = (int)v->shape.rank - 1; d >= 0; d--) {
+            if (v->strides[d] == 0) { leaf_div *= v->shape.dims[d]; continue; }
+            // coord_d = (fi / leaf_div) % dim
+            u32 cd;
+            if (leaf_div == 1) cd = uop_emit(k, KOP_MOD, fi, 0, 0, v->shape.dims[d]);
+            else {
+                u32 div = uop_emit(k, KOP_DIV, fi, 0, 0, leaf_div);
+                cd = uop_emit(k, KOP_MOD, div, 0, 0, v->shape.dims[d]);
+            }
+            // leaf_idx += cd * stride
+            if (v->strides[d] == 1)
+                leaf_idx = uop_emit(k, KOP_IDX, leaf_idx, cd, 0, 1);
+            else {
+                u32 term = uop_emit(k, KOP_IDX, cd, 0, 0, (u32)v->strides[d]);
+                leaf_idx = uop_emit(k, KOP_IDX, leaf_idx, term, 0, 1);
+            }
+            leaf_div *= v->shape.dims[d];
+        }
+        return leaf_idx;
+    }
 
     for (u32 d = 0; d < rank && d < v->shape.rank; d++) {
         if (v->strides[d] == 0 || v->shape.dims[d] == 1) continue;
@@ -121,6 +198,8 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
     k->grid[0] = inner; k->grid[1] = mid; k->grid[2] = outer;
     k->tg[2] = 1;
     k->n_bufs = 1 + n_leaves;
+    k->n_leaves = n_leaves;
+    for (u32 i = 0; i < n_leaves && i < 32; i++) k->leaf_views[i] = leaf_views[i];
 
     // GID for output position
     u32 gid = uop_emit(k, KOP_GID, 0, 0, 0, 0);
@@ -139,11 +218,15 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
         }
     }
 
+    // Store coord UOp ids + rank for mask rendering
+    k->rank = rank;
+    memcpy(k->coord_uop, coords, sizeof(coords));
+
     if (!has_reduce) {
         // Pure elementwise: load leaves, apply ops, store
         u32 vals[UOP_MAX]; // val[i] = UOp for FusedOp output i
         for (u32 li = 0; li < n_leaves; li++) {
-            u32 idx = uop_build_index(k, leaf_views[li], coords, rank);
+            u32 idx = uop_build_index(k, leaf_views[li], coords, rank, full_shape);
             vals[li] = uop_emit(k, KOP_LOAD, idx, 0, 0, 1 + li); // buf 0=out, 1..=leaves
         }
         for (u32 i = 0; i < n_ops; i++) {
@@ -171,7 +254,7 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
     // Load leaves + apply pre-reduce ops (inside loop)
     u32 vals[UOP_MAX];
     for (u32 li = 0; li < n_leaves; li++) {
-        u32 idx = uop_build_index(k, leaf_views[li], coords, rank);
+        u32 idx = uop_build_index(k, leaf_views[li], coords, rank, full_shape);
         vals[li] = uop_emit(k, KOP_LOAD, idx, 0, 0, 1 + li);
     }
     u32 pre_ops = (reduce->post_reduce_start > 0) ? reduce->post_reduce_start : n_ops;
@@ -193,7 +276,7 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
 
         // Re-load post-reduce-only leaves with output coordinates
         for (u32 pli = post_leaf_base; pli < n_leaves; pli++) {
-            u32 pidx = uop_build_index(k, leaf_views[pli], coords, rank);
+            u32 pidx = uop_build_index(k, leaf_views[pli], coords, rank, full_shape);
             vals[pli] = uop_emit(k, KOP_LOAD, pidx, 0, 0, 1 + pli);
         }
 
@@ -231,7 +314,7 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
 
         // Re-load leaves inside loop
         for (u32 li = 0; li < n_leaves; li++) {
-            u32 idx = uop_build_index(k, leaf_views[li], coords, rank);
+            u32 idx = uop_build_index(k, leaf_views[li], coords, rank, full_shape);
             vals[li] = uop_emit(k, KOP_LOAD, idx, 0, 0, 1 + li);
         }
         // Phase 2 ops (reference acc via result variable)
@@ -293,8 +376,30 @@ static NSString *uop_render_msl(const UOpKernel *k) {
                 else
                     [s appendFormat:@"%@uint v%u=v%u*%uu+v%u;\n", indent, i,
                         op->arg[0], op->imm.u, op->arg[1]]; break;
-            case KOP_LOAD:
-                [s appendFormat:@"%@float v%u=buf%u[v%u];\n", indent, i, op->imm.u, op->arg[0]]; break;
+            case KOP_LOAD: {
+                u32 leaf_idx = op->imm.u - 1; // buf 0=out, 1+=leaves
+                if (leaf_idx < k->n_leaves && k->leaf_views[leaf_idx]->has_mask) {
+                    const View *lv = k->leaf_views[leaf_idx];
+                    [s appendFormat:@"%@float v%u=(", indent, i];
+                    int first = 1;
+                    for (u32 d = 0; d < lv->shape.rank && d < k->rank; d++) {
+                        if (lv->mask_begin[d] == 0 && lv->mask_end[d] >= lv->shape.dims[d]) continue;
+                        u32 cv = k->coord_uop[d]; // UOp id for coordinate d
+                        if (!first) [s appendString:@"&&"];
+                        first = 0;
+                        if (lv->mask_begin[d] > 0)
+                            [s appendFormat:@"v%u>=%uu", cv, lv->mask_begin[d]];
+                        if (lv->mask_begin[d] > 0 && lv->mask_end[d] < lv->shape.dims[d])
+                            [s appendString:@"&&"];
+                        if (lv->mask_end[d] < lv->shape.dims[d])
+                            [s appendFormat:@"v%u<%uu", cv, lv->mask_end[d]];
+                    }
+                    if (first) [s appendString:@"true"];
+                    [s appendFormat:@")?buf%u[v%u]:0.f;\n", op->imm.u, op->arg[0]];
+                } else {
+                    [s appendFormat:@"%@float v%u=buf%u[v%u];\n", indent, i, op->imm.u, op->arg[0]];
+                }
+            } break;
             case KOP_STORE:
                 [s appendFormat:@"%@buf0[v%u]=v%u;\n", indent, op->arg[0], op->arg[1]]; break;
             case KOP_ALU: {

@@ -12,6 +12,7 @@
 #include "batch.m"    // command batching (uses mtl_queue from init)
 #include "pool.m"     // buffer pool (uses mtl_dev, batch_dirty from above)
 #include "dispatch.m" // GPU dispatch helpers
+#include "profile_kernel.m" // per-kernel profiling (must be before ops/codegen)
 // Forward declarations for cross-file references within the Metal backend
 static void metal_contiguify(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view);
 static void metal_dispatch_kernel(u32 dst_buf, u32 dst_numel,

@@ -783,10 +783,19 @@ void metal_dispatch_kernel_rs(u32 out_buf,
            threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
     }
     batch_dirty = 1;
-    buf_cpu_only[out_buf] = 0; // GPU writes to output
+    buf_cpu_only[out_buf] = 0;
     for (u32 si = 0; si < n_side_outputs; si++) buf_cpu_only[side_bufs[si]] = 0;
     total_dispatches++;
     dc[has_reduce ? DC_REDUCE : DC_FUSED]++;
+
+    // Per-kernel profiling (THVM_DEBUG>=2)
+    { u64 ops_est = (u64)out_numel * (n_ops > 0 ? n_ops : 1);
+      u64 mem_est = (u64)(out_numel + n_leaves * out_numel) * 4;
+      if (has_reduce) { u32 rn=1; for(u32 d=0;d<rank;d++) if(reduce->is_reduce[d]) rn*=full_shape->dims[d];
+          ops_est = (u64)out_numel * rn * (n_ops > 0 ? n_ops : 1);
+          mem_est = (u64)(out_numel * rn * n_leaves + out_numel) * 4; }
+      profiled_dispatch(out_numel, ops_est, mem_est,
+          has_reduce ? "fused_reduce" : (n_ops > 0 ? "fused_ew" : "copy")); }
 
     if (jit.state == JIT_CAPTURE) {
         u32 ids[24];

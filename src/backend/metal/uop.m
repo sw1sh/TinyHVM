@@ -242,8 +242,9 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
     }
 
     // Reduce kernel: GROUP_REDUCE for large reduce dims (tinygrad pattern)
+    // tinygrad uses LOCAL_SIZE=32 with 4x upcast, but only for large reduces
     u32 LOCAL_SIZE = 256;
-    int use_gr = (reduce_numel >= LOCAL_SIZE) && (reduce->post_reduce_start == 0)
+    int use_gr = (reduce_numel >= 256) && (reduce->post_reduce_start == 0)
                  && (reduce->reduce2_type == 0);
     if (use_gr) {
         k->local_size = LOCAL_SIZE;

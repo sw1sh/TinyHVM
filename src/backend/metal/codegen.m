@@ -6,7 +6,7 @@
 // typedef struct { u8 is_reduce[MAX_DIM]; u32 reduce_type; } ReduceSpec;
 
 #define CODEGEN_CACHE_SIZE 256
-static struct { u64 key; id<MTLComputePipelineState> pipe; } cg_cache[CODEGEN_CACHE_SIZE];
+static struct { u64 key; id<MTLComputePipelineState> pipe; u8 is_uop; } cg_cache[CODEGEN_CACHE_SIZE];
 static u32 cg_cache_count = 0;
 
 // ── Hash: op chain + leaf patterns + full shape + reduce spec ──────
@@ -652,18 +652,20 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
     for (u32 i = 0; i < n_side_outputs; i++) { key ^= side_op_indices[i]; key *= 0x100000001b3ULL; }
     key ^= n_side_outputs; key *= 0x100000001b3ULL;
     for (u32 i = 0; i < cg_cache_count && i < CODEGEN_CACHE_SIZE; i++)
-        if (cg_cache[i].key == key) return cg_cache[i].pipe;
+        if (cg_cache[i].key == key) { _last_compiled_uop = cg_cache[i].is_uop; return cg_cache[i].pipe; }
 
     NSString *src;
     // UOp IR path: build IR → render MSL (when THVM_UOP=1 and no side outputs)
     static int _use_uop = -1;
     if (_use_uop < 0) _use_uop = getenv("THVM_UOP") != NULL;
     int has_reduce_r = reduce && reduce->reduce_type;
+    _last_compiled_uop = 0;
     if (_use_uop && n_side_outputs == 0) {
         UOpKernel uk;
-        if (uop_from_fused(&uk, ops, n_ops, n_leaves, leaf_views, full_shape, reduce))
+        if (uop_from_fused(&uk, ops, n_ops, n_leaves, leaf_views, full_shape, reduce)) {
             src = uop_render_msl(&uk);
-        else
+            _last_compiled_uop = 1;
+        } else
             src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views,
                                      full_shape, reduce, side_op_indices, n_side_outputs);
     } else {
@@ -689,6 +691,7 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
         cg_cache_count++ : (cg_cache_count++ % CODEGEN_CACHE_SIZE);
     cg_cache[slot].key = key;
     cg_cache[slot].pipe = pipe;
+    cg_cache[slot].is_uop = _last_compiled_uop;
     return pipe;
 }
 
@@ -735,8 +738,9 @@ void metal_dispatch_kernel_rs(u32 out_buf,
     }
     for (u32 i = 0; i < mid_start; i++) outer *= out_shape[i];
 
-    // Float4 check (MUST match codegen)
-    int use_f4 = !has_reduce && (inner % 4 == 0) && n_out > 0;
+    // Float4 check (MUST match codegen).
+    // UOp kernels are scalar — skip float4 grid reduction for them.
+    int use_f4 = !_last_compiled_uop && !has_reduce && (inner % 4 == 0) && n_out > 0;
     if (use_f4 && out_dims[n_out - 1] < rank) {
         if (full_shape->dims[out_dims[n_out - 1]] % 4 != 0) use_f4 = 0;
     }

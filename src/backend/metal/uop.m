@@ -1,4 +1,5 @@
 // metal/uop.m — Micro-operation IR for kernel codegen
+static int _last_compiled_uop = 0; // set by cg_get_pipe_rs when UOp path used
 // Backend-agnostic kernel representation, rendered to MSL.
 // Replaces FusedOp[] + ReduceSpec with a single linear SSA IR
 // that naturally supports multi-reduce, multi-output, and complex indexing.
@@ -115,8 +116,11 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
         else break;
     }
     for (u32 i = 0; i < mid_start; i++) outer *= out_shape[i];
+    // UOp kernel is scalar — dispatch must NOT use float4 grid reduction.
+    // Grid: (inner, mid, outer) without float4 division.
     k->grid[0] = inner; k->grid[1] = mid; k->grid[2] = outer;
-    k->n_bufs = 1 + n_leaves; // out + leaves
+    k->tg[2] = 1;
+    k->n_bufs = 1 + n_leaves;
 
     // GID for output position
     u32 gid = uop_emit(k, KOP_GID, 0, 0, 0, 0);

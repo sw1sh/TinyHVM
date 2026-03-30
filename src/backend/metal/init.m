@@ -93,7 +93,7 @@ static void jit_record_dispatch_1d(id<MTLComputePipelineState>, id<MTLBuffer>*, 
 static void jit_record_mps(u32, u32, u32, u32, u32, u32, BOOL, BOOL, u32, u32, u32, u32);
 
 // Free-list for buffer reuse
-#define MAX_FREE_BUFS 512
+#define MAX_FREE_BUFS 2048
 static struct {
     id<MTLBuffer> buf;
     u64           size;

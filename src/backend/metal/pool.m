@@ -255,7 +255,7 @@ static void metal_pool_reset(u32 keep) {
                 u32 pd = buf_last_use[pbid];
                 // If last_use==0 (consumed via view alias, not tracked),
                 // assume dead if old enough (50+ allocs ago in step 0)
-                if (pd == 0 && a - p < 50) continue;
+                if (pd == 0 && a - p < 10) continue;
                 if (pd > 0 && pd >= a_birth) continue;
                 alloc_in_use[p] = 0;
                 if (fpool_n < 64) fpool[fpool_n++] = (i32)p;
@@ -302,20 +302,26 @@ static void metal_pool_reset(u32 keep) {
             }
         }
 
-        // Create Metal heap sized to fit all simultaneously-alive regions
-        if (next_offset > mem_plan_heap_size) {
+        // Compute total alloc bytes (not just peak simultaneous)
+        u64 total_alloc = 0;
+        for (u32 a = 0; a < plan_alloc_count; a++)
+            total_alloc += ALIGN_4K(metal_pool.sizes[plan_alloc_ids[a]]);
+
+        // Size heap for total allocation (Metal auto-reclaims released regions)
+        u64 heap_size = total_alloc > next_offset * 2 ? total_alloc : next_offset * 2;
+        if (heap_size > mem_plan_heap_size) {
             MTLHeapDescriptor *desc = [[MTLHeapDescriptor alloc] init];
-            desc.size = next_offset + next_offset / 4; // 25% for alignment overhead
+            desc.size = heap_size;
             desc.storageMode = MTLStorageModeShared;
             desc.hazardTrackingMode = MTLHazardTrackingModeTracked;
             mem_plan_heap = [mtl_dev newHeapWithDescriptor:desc];
-            mem_plan_heap_size = next_offset;
+            mem_plan_heap_size = heap_size;
         }
 
         if (reuse_count > 0)
-            fprintf(stderr, "MEM_PLAN: %u allocs, %u reused, big_buf=%.1fMB (was %.1fMB)\n",
+            fprintf(stderr, "MEM_PLAN: %u allocs, %u reused, peak=%.0fMB total=%.0fMB heap=%.0fMB\n",
                 mem_plan_count, reuse_count, (double)next_offset/1e6,
-                (double)(plan_alloc_count * ALIGN_4K(metal_pool.sizes[plan_alloc_ids[0]]))/1e6);
+                (double)total_alloc/1e6, (double)heap_size/1e6);
     }
 
     // If plan is active, release large free list entries (heap replaces them)
@@ -336,14 +342,15 @@ static void metal_pool_reset(u32 keep) {
     // Heap-backed buffers just get nil'd (heap manages their memory).
     for (u32 i = buf_keep; i < metal_pool.count; i++) {
         u64 sz = metal_pool.sizes[i];
-        if (sz <= metal_bytes_inuse) metal_bytes_inuse -= sz;
-        else metal_bytes_inuse = 0;
-        // Heap-backed buffers: just nil the slot (heap auto-reclaims)
+        // Heap-backed: just nil (heap reclaims). Don't subtract from inuse
+        // (heap allocs never incremented it).
         if (mem_plan_heap && metal_pool.bufs[i] &&
             metal_pool.bufs[i].heap == mem_plan_heap) {
             metal_pool.bufs[i] = nil; metal_pool.sizes[i] = 0;
             buf_refcount[i] = 0; buf_offset[i] = 0; continue;
         }
+        if (sz <= metal_bytes_inuse) metal_bytes_inuse -= sz;
+        else metal_bytes_inuse = 0;
         if (metal_pool.bufs[i]) {
             // When plan is active, release large buffers (heap replaces them)
             int skip_free = (mem_plan_count > 0 && sz >= PLAN_MIN_BYTES);
@@ -373,9 +380,6 @@ reset_counters:
     mem_plan_active = (mem_plan_count > 0);
     mem_plan_cursor = 0;
     plan_alloc_count = 0;
-    fprintf(stderr, "RESET: inuse=%.0fMB total=%.0fMB free=%u bufs=%u plan=%d\n",
-        (double)metal_bytes_inuse/1e6, (double)metal_bytes_total/1e6,
-        free_count, buf_keep, mem_plan_active);
 }
 
 static void metal_pool_set_persistent(u32 max_persistent_buf) {

@@ -25,7 +25,7 @@ int main(void) {
     srand(42); MNISTData data=mnist_load("data");
     TinyHVM*ctx=thvm_init("metal");
     u32 BS=128; // tinygrad uses 512
-    u32 n_steps=3;
+    u32 n_steps=70;
 
     // Model: beautiful_mnist architecture
     // Conv1: (1→32, 5×5), Conv2: (32→32, 5×5), BN1(32), Pool(2×2)

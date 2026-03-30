@@ -1,5 +1,6 @@
 // metal/uop.m — Micro-operation IR for kernel codegen
-static int _last_compiled_uop = 0; // set by cg_get_pipe_rs when UOp path used
+static int _last_compiled_uop = 0;
+static int _last_local_size = 0; // GROUP_REDUCE threadgroup size (0 = no group reduce) // set by cg_get_pipe_rs when UOp path used
 // Backend-agnostic kernel representation, rendered to MSL.
 // Replaces FusedOp[] + ReduceSpec with a single linear SSA IR
 // that naturally supports multi-reduce, multi-output, and complex indexing.
@@ -43,6 +44,8 @@ typedef struct {
     u32 rank;
     u32 grid[3];
     u32 tg[3];
+    u32 local_size;      // threads per threadgroup for GROUP_REDUCE (0 = no group reduce)
+    u32 reduce_numel;    // total reduce elements (for stride loop)
 } UOpKernel;
 
 // ── Build UOp kernel from FusedOp[] + ReduceSpec (compatibility layer) ──
@@ -238,9 +241,20 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
         return 1;
     }
 
-    // Reduce kernel: accumulate over reduce dims
+    // Reduce kernel: GROUP_REDUCE for large reduce dims (tinygrad pattern)
+    u32 LOCAL_SIZE = 256;
+    int use_gr = (reduce_numel >= LOCAL_SIZE) && (reduce->post_reduce_start == 0)
+                 && (reduce->reduce2_type == 0);
+    if (use_gr) {
+        k->local_size = LOCAL_SIZE;
+        k->reduce_numel = reduce_numel;
+        k->grid[0] = out_numel; k->grid[1] = 1; k->grid[2] = 1;
+    }
+
     f32 init = (reduce->reduce_type == UOP_RMAX) ? -1e30f : 0.0f;
     u32 acc = uop_emit_f(k, KOP_ACC_INIT, 0, 0, 0, init);
+    // GROUP_REDUCE: strided loop (r = lid; r < N; r += LOCAL_SIZE)
+    // Sequential: standard loop (r = 0; r < N; r++)
     u32 range = uop_emit(k, KOP_RANGE, 0, 0, 0, reduce_numel);
 
     // Decompose range var into reduce coordinates
@@ -344,11 +358,20 @@ static NSString *uop_render_msl(const UOpKernel *k) {
     [s appendFormat:@"kernel void K(device float *buf0[[buffer(0)]]"];
     for (u32 i = 1; i < k->n_bufs; i++)
         [s appendFormat:@",\n  device const float *buf%u[[buffer(%u)]]", i, i];
-    [s appendString:@",\n  uint3 _gid[[thread_position_in_grid]])\n{\n"];
-    u32 total = k->grid[0] * k->grid[1] * k->grid[2];
-    [s appendFormat:@"  uint gid_x=_gid.z*%uu+_gid.y*%uu+_gid.x;\n",
-        k->grid[1] * k->grid[0], k->grid[0]];
-    [s appendFormat:@"  if(gid_x>=%uu)return;\n", total];
+    if (k->local_size > 0) {
+        // GROUP_REDUCE: threadgroup position + local thread id
+        [s appendString:@",\n  uint3 _gid[[threadgroup_position_in_grid]]"];
+        [s appendFormat:@",\n  uint _lid[[thread_index_in_threadgroup]])\n{\n"];
+        [s appendFormat:@"  threadgroup float _shared[%uu];\n", k->local_size];
+        [s appendFormat:@"  uint gid_x=_gid.x;\n"];
+        [s appendFormat:@"  if(gid_x>=%uu)return;\n", k->grid[0]];
+    } else {
+        [s appendString:@",\n  uint3 _gid[[thread_position_in_grid]])\n{\n"];
+        u32 total = k->grid[0] * k->grid[1] * k->grid[2];
+        [s appendFormat:@"  uint gid_x=_gid.z*%uu+_gid.y*%uu+_gid.x;\n",
+            k->grid[1] * k->grid[0], k->grid[0]];
+        [s appendFormat:@"  if(gid_x>=%uu)return;\n", total];
+    }
 
     int depth = 1;
 
@@ -401,7 +424,20 @@ static NSString *uop_render_msl(const UOpKernel *k) {
                 }
             } break;
             case KOP_STORE:
-                [s appendFormat:@"%@buf0[v%u]=v%u;\n", indent, op->arg[0], op->arg[1]]; break;
+                if (k->local_size > 0) {
+                    // GROUP_REDUCE: write partial to shared, barrier, tree reduce, thread 0 writes
+                    [s appendFormat:@"  _shared[_lid]=v%u;\n", op->arg[1]];
+                    [s appendString:@"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"];
+                    u32 ls = k->local_size;
+                    for (u32 s2 = ls/2; s2 > 0; s2 >>= 1) {
+                        [s appendFormat:@"  if(_lid<%uu)_shared[_lid]+=_shared[_lid+%uu];\n", s2, s2];
+                        [s appendString:@"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"];
+                    }
+                    [s appendFormat:@"  if(_lid==0)buf0[v%u]=_shared[0];\n", op->arg[0]];
+                } else {
+                    [s appendFormat:@"%@buf0[v%u]=v%u;\n", indent, op->arg[0], op->arg[1]];
+                }
+                break;
             case KOP_ALU: {
                 u32 a = op->arg[0], b = op->arg[1];
                 switch (op->imm.u) {
@@ -422,8 +458,14 @@ static NSString *uop_render_msl(const UOpKernel *k) {
             case KOP_ACC_INIT:
                 [s appendFormat:@"%@float v%u=%.1ff;\n", indent, i, op->imm.f]; break;
             case KOP_RANGE:
-                [s appendFormat:@"%@for(uint v%u=0;v%u<%uu;v%u++){\n",
-                    indent, i, i, op->imm.u, i];
+                if (k->local_size > 0 && depth == 1) {
+                    // GROUP_REDUCE: strided loop from lid
+                    [s appendFormat:@"%@for(uint v%u=_lid;v%u<%uu;v%u+=%uu){\n",
+                        indent, i, i, op->imm.u, i, k->local_size];
+                } else {
+                    [s appendFormat:@"%@for(uint v%u=0;v%u<%uu;v%u++){\n",
+                        indent, i, i, op->imm.u, i];
+                }
                 depth++; break;
             case KOP_ENDRANGE:
                 depth--;

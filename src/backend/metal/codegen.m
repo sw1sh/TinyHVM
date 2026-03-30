@@ -6,7 +6,7 @@
 // typedef struct { u8 is_reduce[MAX_DIM]; u32 reduce_type; } ReduceSpec;
 
 #define CODEGEN_CACHE_SIZE 256
-static struct { u64 key; id<MTLComputePipelineState> pipe; u8 is_uop; } cg_cache[CODEGEN_CACHE_SIZE];
+static struct { u64 key; id<MTLComputePipelineState> pipe; u8 is_uop; u8 group_reduce; u32 local_size; } cg_cache[CODEGEN_CACHE_SIZE];
 static u32 cg_cache_count = 0;
 
 // ── Hash: op chain + leaf patterns + full shape + reduce spec ──────
@@ -652,7 +652,11 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
     for (u32 i = 0; i < n_side_outputs; i++) { key ^= side_op_indices[i]; key *= 0x100000001b3ULL; }
     key ^= n_side_outputs; key *= 0x100000001b3ULL;
     for (u32 i = 0; i < cg_cache_count && i < CODEGEN_CACHE_SIZE; i++)
-        if (cg_cache[i].key == key) { _last_compiled_uop = cg_cache[i].is_uop; return cg_cache[i].pipe; }
+        if (cg_cache[i].key == key) {
+            _last_compiled_uop = cg_cache[i].is_uop;
+            _last_local_size = cg_cache[i].group_reduce ? (int)cg_cache[i].local_size : 0;
+            return cg_cache[i].pipe;
+        }
 
     NSString *src;
     // UOp IR path: build IR → render MSL (when THVM_UOP=1 and no side outputs)
@@ -660,11 +664,13 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
     if (_use_uop < 0) _use_uop = getenv("THVM_NO_UOP") == NULL; // UOp on by default
     int has_reduce_r = reduce && reduce->reduce_type;
     _last_compiled_uop = 0;
+    _last_local_size = 0;
     if (_use_uop && n_side_outputs == 0) {
-        UOpKernel uk;
+        static UOpKernel uk; // static: avoid 10KB stack allocation in recursive calls
         if (uop_from_fused(&uk, ops, n_ops, n_leaves, leaf_views, full_shape, reduce)) {
             src = uop_render_msl(&uk);
             _last_compiled_uop = 1;
+            _last_local_size = (int)uk.local_size;
         } else
             src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views,
                                      full_shape, reduce, side_op_indices, n_side_outputs);
@@ -692,6 +698,8 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
     cg_cache[slot].key = key;
     cg_cache[slot].pipe = pipe;
     cg_cache[slot].is_uop = _last_compiled_uop;
+    cg_cache[slot].group_reduce = (_last_local_size > 0);
+    cg_cache[slot].local_size = (u32)_last_local_size;
     return pipe;
 }
 
@@ -766,8 +774,14 @@ void metal_dispatch_kernel_rs(u32 out_buf,
     u32 buf_off = 1 + n_side_outputs;
     for (u32 i = 0; i < n_leaves; i++)
         [enc setBuffer:metal_pool.bufs[leaf_bufs[i]] offset:0 atIndex:buf_off + i];
-    [enc dispatchThreads:MTLSizeMake(gw, mid, outer)
-       threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    if (_last_local_size > 0) {
+        // GROUP_REDUCE: dispatch threadgroups with explicit local size
+        [enc dispatchThreadgroups:MTLSizeMake(out_numel, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake((u32)_last_local_size, 1, 1)];
+    } else {
+        [enc dispatchThreads:MTLSizeMake(gw, mid, outer)
+           threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    }
     batch_dirty = 1;
     buf_cpu_only[out_buf] = 0; // GPU writes to output
     for (u32 si = 0; si < n_side_outputs; si++) buf_cpu_only[side_bufs[si]] = 0;

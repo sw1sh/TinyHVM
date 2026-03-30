@@ -1,19 +1,17 @@
 // metal/pool.m — Metal buffer pool functions (state in init.m)
 
-static u64 metal_bytes_allocated = 0;
-#define METAL_MEM_BUDGET (512ULL * 1024 * 1024) // 512MB hard limit
+// Tracks total Metal buffer bytes currently allocated (pool + free list).
+// Only changes on newBufferWithLength (up) and actual buffer release (down).
+// Free list reuse doesn't change this — the Metal memory is still committed.
+static u64 metal_bytes_total = 0;
+
+// Tracks in-use bytes (excludes free list). This is what the budget guards.
+static u64 metal_bytes_inuse = 0;
+
+#define METAL_MEM_BUDGET (2ULL * 1024 * 1024 * 1024) // 2GB hard limit
 
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);
-
-    // Memory budget guard — prevents OOM / GPU page fault
-    metal_bytes_allocated += bytes;
-    if (metal_bytes_allocated > METAL_MEM_BUDGET) {
-        fprintf(stderr, "FATAL: GPU memory budget exceeded (%.0fMB / %.0fMB). Aborting safely.\n",
-            (double)metal_bytes_allocated / 1e6, (double)METAL_MEM_BUDGET / 1e6);
-        fprintf(stderr, "  Allocation request: %.0fMB. Buffers: %u.\n", (double)bytes / 1e6, metal_pool.count);
-        exit(1);
-    }
 
     u32 id = metal_pool.count++;
     if (id >= MAX_BUFS) {
@@ -34,11 +32,25 @@ static u32 metal_buf_alloc(u64 bytes) {
         metal_pool.bufs[id] = free_list[best_idx].buf;
         metal_pool.sizes[id] = free_list[best_idx].size;
         free_list[best_idx] = free_list[--free_count];
+        // Buffer already allocated — just moves from free list to pool
+        metal_bytes_inuse += metal_pool.sizes[id];
     } else {
         metal_pool.bufs[id] = [mtl_dev newBufferWithLength:bytes
                                                    options:MTLResourceStorageModeShared];
         metal_pool.sizes[id] = bytes;
+        metal_bytes_total += bytes;
+        metal_bytes_inuse += bytes;
     }
+
+    // Budget guard — check after allocation so we report accurate numbers
+    if (metal_bytes_inuse > METAL_MEM_BUDGET) {
+        fprintf(stderr, "FATAL: GPU memory budget exceeded (%.0fMB in-use / %.0fMB budget). Aborting safely.\n",
+            (double)metal_bytes_inuse / 1e6, (double)METAL_MEM_BUDGET / 1e6);
+        fprintf(stderr, "  Allocation: %.1fMB. Total Metal: %.0fMB. Buffers: %u. Free list: %u.\n",
+            (double)bytes / 1e6, (double)metal_bytes_total / 1e6, metal_pool.count, free_count);
+        exit(1);
+    }
+
     buf_refcount[id] = 1;
     buf_cpu_only[id] = 0;
     thvm_prof_buf_alloc(bytes);
@@ -60,14 +72,19 @@ static void metal_buf_decref(u32 id) {
 }
 
 static void metal_buf_free(u32 id) {
-    if (metal_pool.sizes[id] <= metal_bytes_allocated)
-        metal_bytes_allocated -= metal_pool.sizes[id];
-    else
-        metal_bytes_allocated = 0;
+    u64 sz = metal_pool.sizes[id];
+    if (sz <= metal_bytes_inuse) metal_bytes_inuse -= sz;
+    else metal_bytes_inuse = 0;
     if (metal_pool.bufs[id] && free_count < MAX_FREE_BUFS) {
         free_list[free_count].buf = metal_pool.bufs[id];
-        free_list[free_count].size = metal_pool.sizes[id];
+        free_list[free_count].size = sz;
         free_count++;
+        // Metal memory stays allocated (in free list) — metal_bytes_total unchanged
+    } else if (metal_pool.bufs[id]) {
+        // Free list full — actually release Metal buffer
+        [metal_pool.bufs[id] release];
+        if (sz <= metal_bytes_total) metal_bytes_total -= sz;
+        else metal_bytes_total = 0;
     }
     metal_pool.bufs[id] = nil;
     metal_pool.sizes[id] = 0;
@@ -134,10 +151,19 @@ static void metal_pool_reset(u32 keep) {
 
     // Move to free list for reuse (no deallocation)
     for (u32 i = buf_keep; i < metal_pool.count; i++) {
+        u64 sz = metal_pool.sizes[i];
+        if (sz <= metal_bytes_inuse) metal_bytes_inuse -= sz;
+        else metal_bytes_inuse = 0;
+        // Metal memory stays allocated — metal_bytes_total unchanged
         if (metal_pool.bufs[i] && free_count < MAX_FREE_BUFS) {
             free_list[free_count].buf = metal_pool.bufs[i];
-            free_list[free_count].size = metal_pool.sizes[i];
+            free_list[free_count].size = sz;
             free_count++;
+        } else if (metal_pool.bufs[i]) {
+            // Free list full — actually release
+            [metal_pool.bufs[i] release];
+            if (sz <= metal_bytes_total) metal_bytes_total -= sz;
+            else metal_bytes_total = 0;
         }
         metal_pool.bufs[i] = nil;
         metal_pool.sizes[i] = 0;

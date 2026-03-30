@@ -1,20 +1,24 @@
 // metal/pool.m — Metal buffer pool functions (state in init.m)
 
+static u64 metal_bytes_allocated = 0;
+#define METAL_MEM_BUDGET (512ULL * 1024 * 1024) // 512MB hard limit
+
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);
-    u32 id = metal_pool.count++;
-    if (id >= MAX_BUFS - 64) {
-        fprintf(stderr, "METAL: buf pool near limit (%u/%u), flushing pending free\n", id, MAX_BUFS);
-        // Try to recover by flushing pending free buffers
-        if (batch_dirty) metal_flush();
-        for (u32 i = 0; i < pending_free_count; i++) metal_buf_free(pending_free[i]);
-        pending_free_count = 0;
+
+    // Memory budget guard — prevents OOM / GPU page fault
+    metal_bytes_allocated += bytes;
+    if (metal_bytes_allocated > METAL_MEM_BUDGET) {
+        fprintf(stderr, "FATAL: GPU memory budget exceeded (%.0fMB / %.0fMB). Aborting safely.\n",
+            (double)metal_bytes_allocated / 1e6, (double)METAL_MEM_BUDGET / 1e6);
+        fprintf(stderr, "  Allocation request: %.0fMB. Buffers: %u.\n", (double)bytes / 1e6, metal_pool.count);
+        exit(1);
     }
+
+    u32 id = metal_pool.count++;
     if (id >= MAX_BUFS) {
         fprintf(stderr, "FATAL: Metal buffer pool exhausted (%u buffers). Aborting safely.\n", id);
-        fprintf(stderr, "  This happens with large models (beautiful_mnist 5x5 conv backward).\n");
-        fprintf(stderr, "  The decomposed MM creates too many intermediate buffers.\n");
-        exit(1);  // Clean exit instead of GPU page fault
+        exit(1);
     }
 
     u32 best_idx = UINT32_MAX;
@@ -56,6 +60,10 @@ static void metal_buf_decref(u32 id) {
 }
 
 static void metal_buf_free(u32 id) {
+    if (metal_pool.sizes[id] <= metal_bytes_allocated)
+        metal_bytes_allocated -= metal_pool.sizes[id];
+    else
+        metal_bytes_allocated = 0;
     if (metal_pool.bufs[id] && free_count < MAX_FREE_BUFS) {
         free_list[free_count].buf = metal_pool.bufs[id];
         free_list[free_count].size = metal_pool.sizes[id];

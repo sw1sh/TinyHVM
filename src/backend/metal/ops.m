@@ -219,7 +219,7 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
                     // dispatch_2d still uses legacy path — convert inline
                     id<MTLComputeCommandEncoder> enc = get_encoder();
                     [enc setComputePipelineState:bc_pipe];
-                    for(u32 ii=0;ii<3;ii++) [enc setBuffer:metal_pool.bufs[ids[ii]] offset:0 atIndex:ii];
+                    for(u32 ii=0;ii<3;ii++) [enc setBuffer:metal_pool.bufs[ids[ii]] offset:BUF_OFFSET(ids[ii]) atIndex:ii];
                     for(u32 ii=0;ii<3;ii++) [enc setBytes:params[ii] length:psizes[ii] atIndex:3+ii];
                     NSUInteger tpg=bc_pipe.maxTotalThreadsPerThreadgroup;
                     NSUInteger tw=MIN(32,n_spatial),th=MIN(tpg/tw,(NSUInteger)n_bc);
@@ -313,9 +313,9 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
         matrixDescriptorWithRows:M columns:N rowBytes:N*sizeof(float)
         dataType:MPSDataTypeFloat32];
 
-    MPSMatrix *matA = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[buf_a_id] descriptor:descA];
-    MPSMatrix *matB = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[buf_b_id] descriptor:descB];
-    MPSMatrix *matC = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[dst] descriptor:descC];
+    MPSMatrix *matA = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[buf_a_id] offset:BUF_OFFSET(buf_a_id) descriptor:descA];
+    MPSMatrix *matB = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[buf_b_id] offset:BUF_OFFSET(buf_b_id) descriptor:descB];
+    MPSMatrix *matC = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[dst] offset:BUF_OFFSET(dst) descriptor:descC];
 
     MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
         initWithDevice:mtl_dev transposeLeft:transposeA transposeRight:transposeB
@@ -353,8 +353,8 @@ static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
         if (par_pipe) {
             id<MTLComputeCommandEncoder> enc = get_encoder();
             [enc setComputePipelineState:par_pipe];
-            [enc setBuffer:metal_pool.bufs[dst] offset:0 atIndex:0];
-            [enc setBuffer:metal_pool.bufs[src] offset:0 atIndex:1];
+            [enc setBuffer:metal_pool.bufs[dst] offset:BUF_OFFSET(dst) atIndex:0];
+            [enc setBuffer:metal_pool.bufs[src] offset:BUF_OFFSET(src) atIndex:1];
             [enc setBytes:&reduce_dim length:sizeof(u32) atIndex:2];
             [enc dispatchThreadgroups:MTLSizeMake(dst_numel, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];

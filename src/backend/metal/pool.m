@@ -49,22 +49,23 @@ static u32 metal_buf_alloc(u64 bytes) {
         exit(1);
     }
 
-    // 0. Memory plan reuse (step 1+): reuse an earlier alloc's buffer
+    // 0. Memory plan: suballocation from a single large MTLBuffer.
+    // Each alloc gets a unique offset region — no memory overlap, no GPU conflicts.
     if (0 && mem_plan_active && bytes >= PLAN_MIN_BYTES && mem_plan_cursor < mem_plan_count) {
-        u32 c = mem_plan_cursor;
+        u32 c = mem_plan_cursor++;
         i32 reuse = mem_plan_reuse[c];
         if (reuse >= 0 && (u32)reuse < c) {
+            // Reuse: take the SAME offset as the dead alloc (different time, same region)
             u32 src_id = plan_step_bufs[reuse];
             if (src_id && metal_pool.bufs[src_id]) {
                 metal_pool.bufs[id] = metal_pool.bufs[src_id];
                 metal_pool.sizes[id] = metal_pool.sizes[src_id];
+                buf_offset[id] = buf_offset[src_id]; // same region, different time
                 plan_step_bufs[c] = id;
-                mem_plan_cursor++;
                 goto done;
             }
         }
-        plan_step_bufs[c] = 0; // will be set after normal alloc
-        mem_plan_cursor++;
+        plan_step_bufs[c] = 0; // set after normal alloc below
     }
 
     // 1. Free list (from pool_reset)
@@ -118,6 +119,7 @@ done:
 
     buf_refcount[id] = 1;
     buf_cpu_only[id] = 0;
+    buf_offset[id] = 0; // default: no offset (full buffer)
     thvm_prof_buf_alloc(bytes);
     return id;
 }
@@ -157,7 +159,7 @@ static void metal_buf_free(u32 id) {
 
 static void metal_buf_write(u32 id, const void *data, u64 bytes) {
     buf_cpu_only[id] = 1; // CPU wrote this — no GPU sync needed on read
-    memcpy(metal_pool.bufs[id].contents, data, bytes);
+    memcpy(BUF_CONTENTS(id), data, bytes);
     thvm_prof_buf_write(bytes);
     // JIT: save CPU-written constant data for ephemeral buffers.
     // Save by buf_id (slot mapping done later at jit_end_capture).
@@ -180,7 +182,7 @@ static void metal_buf_write(u32 id, const void *data, u64 bytes) {
 void metal_buf_read_nosync(u32 id, void *out, u64 bytes) {
     u64 actual = metal_pool.sizes[id];
     u64 n = bytes < actual ? bytes : actual;
-    memcpy(out, metal_pool.bufs[id].contents, n);
+    memcpy(out, BUF_CONTENTS(id), n);
     if (n < bytes) memset((char*)out + n, 0, bytes - n);
 }
 
@@ -199,10 +201,10 @@ static void metal_buf_read(u32 id, void *out, u64 bytes) {
     u64 actual = metal_pool.sizes[id];
     if (bytes > actual) {
         // Read what we can, zero the rest (view strides may exceed buffer for broadcasts)
-        memcpy(out, metal_pool.bufs[id].contents, actual);
+        memcpy(out, BUF_CONTENTS(id), actual);
         memset((char*)out + actual, 0, bytes - actual);
     } else {
-        memcpy(out, metal_pool.bufs[id].contents, bytes);
+        memcpy(out, BUF_CONTENTS(id), bytes);
     }
     thvm_prof_buf_read(bytes);
 }

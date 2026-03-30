@@ -46,7 +46,7 @@ void metal_mul_reduce_sum(u32 dst, u32 dst_numel,
         id<MTLComputeCommandEncoder> enc = get_encoder();
         [enc setComputePipelineState:pipe_mul_reduce_sum_parallel];
         for (u32 i = 0; i < 3; i++)
-            [enc setBuffer:metal_pool.bufs[mrs_ids[i]] offset:0 atIndex:i];
+            [enc setBuffer:metal_pool.bufs[mrs_ids[i]] offset:BUF_OFFSET(mrs_ids[i]) atIndex:i];
         for (u32 i = 0; i < 4; i++)
             [enc setBytes:params[i] length:psizes[i] atIndex:3 + i];
         [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1)
@@ -628,9 +628,9 @@ static int try_mdim_float4(u32 uop, u32 dst, const View *dv,
     u32 tw = MIN(gw, 256u);
     id<MTLComputeCommandEncoder> enc = get_encoder();
     [enc setComputePipelineState:pipe];
-    [enc setBuffer:metal_pool.bufs[dst] offset:0 atIndex:0];
-    [enc setBuffer:metal_pool.bufs[a_buf] offset:0 atIndex:1];
-    [enc setBuffer:metal_pool.bufs[b_buf] offset:0 atIndex:2];
+    [enc setBuffer:metal_pool.bufs[dst] offset:BUF_OFFSET(dst) atIndex:0];
+    [enc setBuffer:metal_pool.bufs[a_buf] offset:BUF_OFFSET(a_buf) atIndex:1];
+    [enc setBuffer:metal_pool.bufs[b_buf] offset:BUF_OFFSET(b_buf) atIndex:2];
     [enc dispatchThreads:MTLSizeMake(gw, gh, gd) threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
     batch_dirty = 1;
     dc[DC_MDIM]++; total_dispatches++;
@@ -656,9 +656,9 @@ void metal_dispatch_mdim_binary(u32 uop, u32 dst, const View *dv,
 
     id<MTLComputeCommandEncoder> enc = get_encoder();
     [enc setComputePipelineState:pipe];
-    [enc setBuffer:metal_pool.bufs[dst] offset:0 atIndex:0];
-    [enc setBuffer:metal_pool.bufs[a_buf] offset:0 atIndex:1];
-    [enc setBuffer:metal_pool.bufs[b_buf] offset:0 atIndex:2];
+    [enc setBuffer:metal_pool.bufs[dst] offset:BUF_OFFSET(dst) atIndex:0];
+    [enc setBuffer:metal_pool.bufs[a_buf] offset:BUF_OFFSET(a_buf) atIndex:1];
+    [enc setBuffer:metal_pool.bufs[b_buf] offset:BUF_OFFSET(b_buf) atIndex:2];
     [enc dispatchThreads:MTLSizeMake(gw, gh, gd)
        threadsPerThreadgroup:MTLSizeMake(tw, th, td)];
     batch_dirty = 1;
@@ -774,8 +774,8 @@ dispatch_unary:;
     u32 un_ids[] = {dst, src_buf};
     id<MTLComputeCommandEncoder> enc = get_encoder();
     [enc setComputePipelineState:pipe];
-    [enc setBuffer:metal_pool.bufs[dst] offset:0 atIndex:0];
-    [enc setBuffer:metal_pool.bufs[src_buf] offset:0 atIndex:1];
+    [enc setBuffer:metal_pool.bufs[dst] offset:BUF_OFFSET(dst) atIndex:0];
+    [enc setBuffer:metal_pool.bufs[src_buf] offset:BUF_OFFSET(src_buf) atIndex:1];
     u32 tw = MIN(gw, 256u);
     [enc dispatchThreads:MTLSizeMake(gw,gh,gd) threadsPerThreadgroup:MTLSizeMake(tw,1,1)];
     batch_dirty = 1;

@@ -780,12 +780,12 @@ void metal_dispatch_kernel_rs(u32 out_buf,
 
     id<MTLComputeCommandEncoder> enc = get_encoder();
     [enc setComputePipelineState:pipe];
-    [enc setBuffer:metal_pool.bufs[out_buf] offset:0 atIndex:0];
+    [enc setBuffer:metal_pool.bufs[out_buf] offset:BUF_OFFSET(out_buf) atIndex:0];
     for (u32 si = 0; si < n_side_outputs; si++)
-        [enc setBuffer:metal_pool.bufs[side_bufs[si]] offset:0 atIndex:si + 1];
+        [enc setBuffer:metal_pool.bufs[side_bufs[si]] offset:BUF_OFFSET(side_bufs[si]) atIndex:si + 1];
     u32 buf_off = 1 + n_side_outputs;
     for (u32 i = 0; i < n_leaves; i++)
-        [enc setBuffer:metal_pool.bufs[leaf_bufs[i]] offset:0 atIndex:buf_off + i];
+        [enc setBuffer:metal_pool.bufs[leaf_bufs[i]] offset:BUF_OFFSET(leaf_bufs[i]) atIndex:buf_off + i];
     if (_last_local_size > 0) {
         // GROUP_REDUCE: dispatch threadgroups with explicit local size
         [enc dispatchThreadgroups:MTLSizeMake(out_numel, 1, 1)

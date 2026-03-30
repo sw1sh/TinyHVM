@@ -45,8 +45,8 @@ void metal_buf_copy(u32 dst_buf, u32 src_buf, u64 nbytes) {
     }
     if (!batch_cmd) batch_cmd = [mtl_queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [batch_cmd blitCommandEncoder];
-    [blit copyFromBuffer:metal_pool.bufs[src_buf] sourceOffset:0
-                toBuffer:metal_pool.bufs[dst_buf] destinationOffset:0
+    [blit copyFromBuffer:metal_pool.bufs[src_buf] sourceOffset:BUF_OFFSET(src_buf)
+                toBuffer:metal_pool.bufs[dst_buf] destinationOffset:BUF_OFFSET(dst_buf)
                     size:nbytes];
     [blit endEncoding];
     batch_dirty = 1;

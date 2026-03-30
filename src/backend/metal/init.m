@@ -100,11 +100,16 @@ static struct {
 } free_list[MAX_FREE_BUFS];
 static u32 free_count = 0;
 
-// Buffer-level refcounting — tracks how many tensors share each buf_id.
-// When refcount→0, the buf_id is enqueued to pending_free (not freed immediately
-// because GPU may still be reading it). Drained in metal_flush after GPU sync.
+// Buffer-level refcounting
 static u32 buf_refcount[MAX_BUFS];
-static u8  buf_cpu_only[MAX_BUFS]; // 1 = only CPU-written, safe to read without GPU sync
+static u8  buf_cpu_only[MAX_BUFS];
+// Offset-based suballocation: each buf_id can have an offset within its MTLBuffer.
+// Used by the memory planner for region-based reuse within one large allocation.
+static u64 buf_offset[MAX_BUFS]; // byte offset within metal_pool.bufs[id]
+// Helper: get pointer to buffer contents at the correct offset
+#define BUF_CONTENTS(id) ((char*)metal_pool.bufs[id].contents + buf_offset[id])
+// Helper: get MTLBuffer offset for Metal API calls
+#define BUF_OFFSET(id) ((NSUInteger)buf_offset[id])
 #define PENDING_FREE_CAP 4096
 static u32 pending_free[PENDING_FREE_CAP];
 static u32 pending_free_count = 0;

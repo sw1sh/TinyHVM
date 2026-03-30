@@ -123,7 +123,7 @@ void jit_replay(void) {
     // Restore constant data (CPU-written values not produced by GPU commands)
     for (u32 ci = 0; ci < jit.n_consts; ci++) {
         u32 bid = jit.slots[jit.consts[ci].slot].buf_id;
-        memcpy(metal_pool.bufs[bid].contents, jit.consts[ci].data, jit.consts[ci].size);
+        memcpy(BUF_CONTENTS(bid), jit.consts[ci].data, jit.consts[ci].size);
     }
 
     // Encode all commands
@@ -135,8 +135,8 @@ void jit_replay(void) {
             u32 dst = jit.slots[cmd->blit_dst_slot].buf_id;
             u32 src = jit.slots[cmd->blit_src_slot].buf_id;
             id<MTLBlitCommandEncoder> blit = [batch_cmd blitCommandEncoder];
-            [blit copyFromBuffer:metal_pool.bufs[src] sourceOffset:0
-                        toBuffer:metal_pool.bufs[dst] destinationOffset:0
+            [blit copyFromBuffer:metal_pool.bufs[src] sourceOffset:BUF_OFFSET(src)
+                        toBuffer:metal_pool.bufs[dst] destinationOffset:BUF_OFFSET(dst)
                             size:cmd->blit_size];
             [blit endEncoding];
             batch_dirty = 1;
@@ -149,17 +149,19 @@ void jit_replay(void) {
             MPSMatrixDescriptor *dA = [MPSMatrixDescriptor matrixDescriptorWithRows:cmd->mps_phys_a_rows columns:cmd->mps_phys_a_cols rowBytes:cmd->mps_phys_a_cols*4 dataType:MPSDataTypeFloat32];
             MPSMatrixDescriptor *dB = [MPSMatrixDescriptor matrixDescriptorWithRows:cmd->mps_phys_b_rows columns:cmd->mps_phys_b_cols rowBytes:cmd->mps_phys_b_cols*4 dataType:MPSDataTypeFloat32];
             MPSMatrixDescriptor *dC = [MPSMatrixDescriptor matrixDescriptorWithRows:cmd->mps_m columns:cmd->mps_n rowBytes:cmd->mps_n*4 dataType:MPSDataTypeFloat32];
-            MPSMatrix *mA = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[a] descriptor:dA];
-            MPSMatrix *mB = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[b] descriptor:dB];
-            MPSMatrix *mC = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[dst] descriptor:dC];
+            MPSMatrix *mA = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[a] offset:BUF_OFFSET(a) descriptor:dA];
+            MPSMatrix *mB = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[b] offset:BUF_OFFSET(b) descriptor:dB];
+            MPSMatrix *mC = [[MPSMatrix alloc] initWithBuffer:metal_pool.bufs[dst] offset:BUF_OFFSET(dst) descriptor:dC];
             MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc] initWithDevice:mtl_dev transposeLeft:cmd->mps_trans_a transposeRight:cmd->mps_trans_b resultRows:cmd->mps_m resultColumns:cmd->mps_n interiorColumns:cmd->mps_k alpha:1.0 beta:0.0];
             [mm encodeToCommandBuffer:batch_cmd leftMatrix:mA rightMatrix:mB resultMatrix:mC];
             batch_dirty = 1;
         } else {
             id<MTLComputeCommandEncoder> enc = get_encoder();
             [enc setComputePipelineState:cmd->pipe];
-            for (u32 i = 0; i < cmd->n_bufs; i++)
-                [enc setBuffer:metal_pool.bufs[jit.slots[cmd->buf_slots[i]].buf_id] offset:0 atIndex:i];
+            for (u32 i = 0; i < cmd->n_bufs; i++) {
+                u32 _bid = jit.slots[cmd->buf_slots[i]].buf_id;
+                [enc setBuffer:metal_pool.bufs[_bid] offset:BUF_OFFSET(_bid) atIndex:i];
+            }
             u32 poff = 0;
             for (u32 i = 0; i < cmd->n_params; i++) {
                 [enc setBytes:cmd->params + poff length:cmd->param_sizes[i] atIndex:cmd->n_bufs + i];

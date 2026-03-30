@@ -745,6 +745,8 @@ void metal_dispatch_kernel_rs(u32 out_buf,
     [enc dispatchThreads:MTLSizeMake(gw, mid, outer)
        threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
     batch_dirty = 1;
+    buf_cpu_only[out_buf] = 0; // GPU writes to output
+    for (u32 si = 0; si < n_side_outputs; si++) buf_cpu_only[side_bufs[si]] = 0;
     total_dispatches++;
     dc[has_reduce ? DC_REDUCE : DC_FUSED]++;
 

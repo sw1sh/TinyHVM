@@ -24,6 +24,7 @@ static void dispatch_1d_ids(id<MTLComputePipelineState> pipe,
     [enc dispatchThreads:MTLSizeMake(numel, 1, 1)
        threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     batch_dirty = 1;
+    if (n_bufs > 0) buf_cpu_only[buf_ids[0]] = 0; // GPU writes to output buf
     total_dispatches++;
     dc[dc_tag]++; dc_tag = DC_OTHER;
     if (jit.state == JIT_CAPTURE)

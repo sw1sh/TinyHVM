@@ -24,6 +24,7 @@ static u32 metal_buf_alloc(u64 bytes) {
         metal_pool.sizes[id] = bytes;
     }
     buf_refcount[id] = 1;
+    buf_cpu_only[id] = 0;
     thvm_prof_buf_alloc(bytes);
     return id;
 }
@@ -53,6 +54,7 @@ static void metal_buf_free(u32 id) {
 }
 
 static void metal_buf_write(u32 id, const void *data, u64 bytes) {
+    buf_cpu_only[id] = 1; // CPU wrote this — no GPU sync needed on read
     memcpy(metal_pool.bufs[id].contents, data, bytes);
     thvm_prof_buf_write(bytes);
     // JIT: save CPU-written constant data for ephemeral buffers.
@@ -80,11 +82,13 @@ void metal_buf_read_nosync(u32 id, void *out, u64 bytes) {
     if (n < bytes) memset((char*)out + n, 0, bytes - n);
 }
 
-static u32 persistent_buf_count = 0; // set at first pool_reset
+static u8 buf_cpu_only[MAX_BUFS]; // 1 = only written by CPU, never GPU output
 
 static void metal_buf_read(u32 id, void *out, u64 bytes) {
     if (batch_dirty) {
-        if (persistent_buf_count > 0 && id < persistent_buf_count) {
+        if (buf_cpu_only[id]) {
+            // CPU-written buffer (axes, shapes, scalars from thvm_tensor).
+            // Never modified by GPU dispatches — safe to read without sync.
             metal_buf_read_nosync(id, out, bytes);
             return;
         }
@@ -104,7 +108,7 @@ static void metal_buf_read(u32 id, void *out, u64 bytes) {
 static void metal_pool_reset(u32 keep) {
     if (batch_dirty) metal_flush(); // needed: can't free GPU-active buffers
     u32 buf_keep = keep + 1;
-    // persistent_buf_count set by thvm_reset via pool_set_persistent
+    // (buf_cpu_only tracking replaces persistent_buf_count approach)
     u32 n_free = metal_pool.count - buf_keep;
     if (n_free == 0) return;
 
@@ -125,5 +129,5 @@ static void metal_pool_reset(u32 keep) {
 }
 
 static void metal_pool_set_persistent(u32 max_persistent_buf) {
-    persistent_buf_count = max_persistent_buf + 1;
+    (void)max_persistent_buf; // now handled by buf_cpu_only tracking
 }

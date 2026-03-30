@@ -323,7 +323,7 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
         alpha:1.0 beta:0.0];
 
     [mm encodeToCommandBuffer:batch_cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
-    batch_dirty = 1; total_dispatches++; dc[DC_MM]++;
+    batch_dirty = 1; buf_cpu_only[dst] = 0; total_dispatches++; dc[DC_MM]++;
     if (jit.state == JIT_CAPTURE)
         jit_record_mps(dst, buf_a_id, buf_b_id, M, K, N,
             transposeA, transposeB, phys_a_rows, phys_a_cols, phys_b_rows, phys_b_cols);

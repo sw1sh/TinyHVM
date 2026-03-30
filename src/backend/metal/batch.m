@@ -50,6 +50,7 @@ void metal_buf_copy(u32 dst_buf, u32 src_buf, u64 nbytes) {
                     size:nbytes];
     [blit endEncoding];
     batch_dirty = 1;
+    buf_cpu_only[dst_buf] = 0; // GPU wrote to dst
     if (jit.state == JIT_CAPTURE && jit.n_cmds < JIT_MAX_CMDS) {
         JITCmd *cmd = &jit.cmds[jit.n_cmds++];
         memset(cmd, 0, sizeof(*cmd));

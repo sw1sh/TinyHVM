@@ -104,6 +104,7 @@ static u32 free_count = 0;
 // When refcount→0, the buf_id is enqueued to pending_free (not freed immediately
 // because GPU may still be reading it). Drained in metal_flush after GPU sync.
 static u32 buf_refcount[MAX_BUFS];
+static u8  buf_cpu_only[MAX_BUFS]; // 1 = only CPU-written, safe to read without GPU sync
 #define PENDING_FREE_CAP 4096
 static u32 pending_free[PENDING_FREE_CAP];
 static u32 pending_free_count = 0;

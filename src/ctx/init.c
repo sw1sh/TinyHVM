@@ -74,10 +74,18 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
         if (m->host_ptr) free(m->host_ptr);
         memset(m, 0, sizeof(TensorMeta));
     }
+    // Compute max persistent buf_id from kept tensors
+    u32 max_persistent_buf = 0;
+    for (u32 i = 0; i < keep; i++)
+        if (ctx->tensors[i].buf_id > max_persistent_buf)
+            max_persistent_buf = ctx->tensors[i].buf_id;
+
     // Reset all backend buffer pools (frees GPU/CPU buffers above keep)
     for (u32 bi = 0; bi < ctx->n_backends; bi++) {
         if (ctx->backends[bi] && ctx->backends[bi]->pool_reset)
             ctx->backends[bi]->pool_reset(keep);
+        if (ctx->backends[bi] && ctx->backends[bi]->pool_set_persistent)
+            ctx->backends[bi]->pool_set_persistent(max_persistent_buf);
     }
     ctx->tensor_count = keep > 0 ? keep : 1; // keep sentinel at 0
     // Clear grad_refs/grad_cache for preserved tensors (re-counted each step)

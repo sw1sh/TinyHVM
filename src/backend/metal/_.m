@@ -44,6 +44,7 @@ Backend metal_backend = {
     .buf_read_nosync    = metal_buf_read_nosync,
     .adam_step           = metal_op_adam_step,
     .pool_reset = metal_pool_reset,
+    .pool_set_persistent = metal_pool_set_persistent,
     .begin_batch = metal_begin_batch,
     .end_batch   = metal_end_batch,
     .profile_report = metal_profile_report,

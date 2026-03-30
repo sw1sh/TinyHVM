@@ -80,9 +80,14 @@ void metal_buf_read_nosync(u32 id, void *out, u64 bytes) {
     if (n < bytes) memset((char*)out + n, 0, bytes - n);
 }
 
+static u32 persistent_buf_count = 0; // set at first pool_reset
+
 static void metal_buf_read(u32 id, void *out, u64 bytes) {
     if (batch_dirty) {
-        // flush: ensure GPU-written data is readable
+        if (persistent_buf_count > 0 && id < persistent_buf_count) {
+            metal_buf_read_nosync(id, out, bytes);
+            return;
+        }
         metal_flush();
     }
     u64 actual = metal_pool.sizes[id];
@@ -99,6 +104,7 @@ static void metal_buf_read(u32 id, void *out, u64 bytes) {
 static void metal_pool_reset(u32 keep) {
     if (batch_dirty) metal_flush(); // needed: can't free GPU-active buffers
     u32 buf_keep = keep + 1;
+    // persistent_buf_count set by thvm_reset via pool_set_persistent
     u32 n_free = metal_pool.count - buf_keep;
     if (n_free == 0) return;
 
@@ -116,4 +122,8 @@ static void metal_pool_reset(u32 keep) {
     // Clear pending_free — all ephemeral buffers already moved to free_list above
     pending_free_count = 0;
     metal_pool.count = buf_keep;
+}
+
+static void metal_pool_set_persistent(u32 max_persistent_buf) {
+    persistent_buf_count = max_persistent_buf + 1;
 }

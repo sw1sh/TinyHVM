@@ -519,6 +519,7 @@ struct Backend {
 
     // Pool management
     void  (*pool_reset)(u32 keep);
+    void  (*pool_set_persistent)(u32 max_buf); // mark bufs ≤ max_buf as persistent (skip flush on read)
     // GPU batching
     void  (*begin_batch)(void);
     void  (*end_batch)(void);

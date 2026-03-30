@@ -290,6 +290,18 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             if (lv->mask_end[d] < lv->shape.dims[d])
                 [s appendFormat:@"c%u<%uu", d, lv->mask_end[d]];
         }
+        // Compound masks: begin <= c_a * stride_a + c_b < end
+        for (u32 cm = 0; cm < lv->n_compound_masks; cm++) {
+            u32 da = lv->compound_masks[cm].dim_a;
+            u32 db = lv->compound_masks[cm].dim_b;
+            i32 sa = lv->compound_masks[cm].stride_a;
+            u32 mb = lv->compound_masks[cm].begin;
+            u32 me = lv->compound_masks[cm].end;
+            if (!first) [s appendString:@"&&"];
+            first = 0;
+            [s appendFormat:@"(c%u*%d+c%u)>=%uu&&(c%u*%d+c%u)<%uu",
+                da, sa, db, mb, da, sa, db, me];
+        }
         if (first) [s appendString:@"true"];
         [s appendString:@";\n"];
     }

@@ -32,7 +32,74 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
         o_[j] = (i_[j] - k_[j]) / s_[j] + 1;  // floor division for conv
     }
 
-    // Check if we need the complex path (k > s for any spatial dim)
+    // Direct stride computation for sliding window (no thvm_repeat needed).
+    // pool[..., o0, o1, k0, k1] = input[..., o0*s0+k0, o1*s1+k1]
+    // Strides: output dims use input_stride*s, kernel dims use input_stride*1.
+    // This is a single view alias — no expand, no contiguify.
+    if (term_tag(x) == TAG_TEN && n_spatial == 2) {
+        u32 src_id = (u32)term_val(x);
+        TensorMeta *m = &ctx->tensors[src_id];
+        if (m->buf_id != 0 || m->creator_op) {  // has buffer or is deferred view
+            // Build output shape: [batch..., o0, o1, k0, k1]
+            u32 out_rank = bd + n_spatial * 2;
+            Shape out_shape = {.rank = out_rank};
+            for (u32 j = 0; j < bd; j++) out_shape.dims[j] = vx->shape.dims[j];
+            for (u32 j = 0; j < n_spatial; j++) {
+                out_shape.dims[bd + j] = o_[j];               // output spatial
+                out_shape.dims[bd + n_spatial + j] = k_[j];   // kernel window
+            }
+
+            // Build strides from input view
+            View ov = {0};
+            ov.shape = out_shape;
+            ov.offset = vx->offset;
+            ov.numel = 1;
+            for (u32 j = 0; j < out_rank; j++) ov.numel *= out_shape.dims[j];
+
+            // Batch dims: same strides as input
+            for (u32 j = 0; j < bd; j++)
+                ov.strides[j] = vx->strides[j];
+
+            // Output spatial dims: stride = input_spatial_stride * pool_stride
+            for (u32 j = 0; j < n_spatial; j++)
+                ov.strides[bd + j] = vx->strides[bd + j] * (i32)s_[j];
+
+            // Kernel window dims: stride = input_spatial_stride * 1 (dilation=1)
+            for (u32 j = 0; j < n_spatial; j++)
+                ov.strides[bd + n_spatial + j] = vx->strides[bd + j];
+
+            ov.contiguous = 0;
+            // Mask propagation: the padded input's mask is per-dim on the
+            // original spatial dims. For the pool view, the mask needs to
+            // express which (oy,kh) combinations are valid — but this couples
+            // two dims and can't be expressed as independent per-dim masks.
+            // Solution: propagate the mask through the stride mapping.
+            // For padded spatial dim with valid range [begin,end):
+            //   output dim oy is valid for all oy (0..o-1) since oy*s+kh < padded_size
+            //   kernel dim kh is valid for all kh (0..k-1)
+            // The out-of-bounds access is handled by the original mask check:
+            //   the index oy*s+kh maps to the padded spatial dim, and the
+            //   mask on that dim checks [pad_before, pad_before+orig_size).
+            // So we DON'T set has_mask on the pool output — the leaf's mask
+            // handles it when the codegen generates index expressions.
+            // EXCEPT: the leaf view is now the pool view, not the padded view.
+            // The codegen sees the pool view's strides. The mask must be on
+            // the padded spatial dims, which are the inner dims of the pool.
+            //
+            // For now: if input has mask, fall back to the repeat-based path
+            // which correctly materializes the mask through contiguify.
+            if (vx->has_mask) goto pool_fallback;
+
+            u32 vid = tensor_view_of(ctx, src_id, ov);
+            ctx->tensors[vid].creator_op = UOP_RESHAPE; // view provenance
+            ctx->tensors[vid].src_ids[0] = src_id;
+            if (m->requires_grad) ctx->tensors[vid].requires_grad = 1;
+            return term_ten(vid, m->dtype);
+        }
+    }
+
+    // Fallback: original repeat-based path (also used for masked/padded inputs)
+pool_fallback:;
     int need_complex = 0;
     for (u32 j = 0; j < n_spatial; j++)
         if (k_[j] > s_[j]) need_complex = 1;

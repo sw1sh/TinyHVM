@@ -658,7 +658,8 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
     // UOp IR path: build IR → render MSL (when THVM_UOP=1 and no side outputs)
     static int _use_uop = -1;
     if (_use_uop < 0) _use_uop = getenv("THVM_UOP") != NULL;
-    if (_use_uop && n_side_outputs == 0) {
+    int has_reduce_r = reduce && reduce->reduce_type;
+    if (_use_uop && n_side_outputs == 0 && !has_reduce_r) {
         UOpKernel uk;
         if (uop_from_fused(&uk, ops, n_ops, n_leaves, leaf_views, full_shape, reduce))
             src = uop_render_msl(&uk);

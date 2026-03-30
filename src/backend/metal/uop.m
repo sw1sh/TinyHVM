@@ -101,9 +101,22 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
         }
     }
 
-    // Grid: output elements
-    k->grid[0] = out_numel; k->grid[1] = 1; k->grid[2] = 1;
-    k->tg[0] = MIN(256u, out_numel); k->tg[1] = 1; k->tg[2] = 1;
+    // Compute dispatch grid (must match metal_dispatch_kernel_rs)
+    u32 out_shape[MAX_DIM];
+    for (u32 i = 0; i < n_out; i++) out_shape[i] = full_shape->dims[out_dims[i]];
+    u32 inner = 1, mid = 1, outer = 1;
+    u32 inner_start = n_out;
+    for (int i = (int)n_out - 1; i >= 0; i--) {
+        if (inner * out_shape[i] <= 1024) { inner *= out_shape[i]; inner_start = (u32)i; }
+        else break;
+    }
+    u32 mid_start = inner_start;
+    for (int i = (int)inner_start - 1; i >= 0; i--) {
+        if (mid * out_shape[i] <= 65535) { mid *= out_shape[i]; mid_start = (u32)i; }
+        else break;
+    }
+    for (u32 i = 0; i < mid_start; i++) outer *= out_shape[i];
+    k->grid[0] = inner; k->grid[1] = mid; k->grid[2] = outer;
     k->n_bufs = 1 + n_leaves; // out + leaves
 
     // GID for output position
@@ -168,25 +181,35 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
                    reduce->reduce_type);
     uop_emit(k, KOP_ENDRANGE, range, 0, 0, 0);
 
-    // Post-reduce ops: execute OUTSIDE the reduce loop using acc result.
-    // ALL leaf references must be re-loaded since the in-loop loads are out of scope.
+    // Post-reduce ops: mirrors old codegen exactly.
+    // p0 = acc op leaf, p1 = p0 op leaf, ...
     u32 result = acc_init;
     if (reduce->post_reduce_start > 0 && reduce->post_reduce_start < n_ops) {
         u32 prs = reduce->post_reduce_start;
-        // Re-load ALL leaves with output-only coordinates
-        for (u32 li = 0; li < n_leaves; li++) {
-            u32 pidx = uop_build_index(k, leaf_views[li], coords, rank);
-            vals[li] = uop_emit(k, KOP_LOAD, pidx, 0, 0, 1 + li);
+        u32 post_leaf_base = n_leaves - reduce->n_post_leaves;
+
+        // Re-load post-reduce-only leaves with output coordinates
+        for (u32 pli = post_leaf_base; pli < n_leaves; pli++) {
+            u32 pidx = uop_build_index(k, leaf_views[pli], coords, rank);
+            vals[pli] = uop_emit(k, KOP_LOAD, pidx, 0, 0, 1 + pli);
         }
-        // Map the pre-reduce accumulator result
-        u32 n_pre = prs;
-        for (u32 i = 0; i < n_pre; i++)
-            vals[n_leaves + i] = acc_init; // any pre-reduce op ref → acc
+
+        // Emit post-reduce op chain (same as old codegen p0, p1, ...)
+        u32 prev = acc_init; // first op chains from accumulator
         for (u32 i = prs; i < n_ops; i++) {
-            u32 a = vals[ops[i].arg_a], b = vals[ops[i].arg_b];
-            vals[n_leaves + i] = uop_emit(k, KOP_ALU, a, b, 0, ops[i].uop);
+            u32 a = prev; // chain from previous result (or acc for first)
+            u32 b = 0;
+            if (is_binary(ops[i].uop)) {
+                u32 ob = ops[i].arg_b;
+                if (ob >= post_leaf_base && ob < n_leaves)
+                    b = vals[ob]; // post-reduce leaf
+                else
+                    b = acc_init; // fallback
+            }
+            prev = uop_emit(k, KOP_ALU, a, b, 0, ops[i].uop);
+            vals[n_leaves + i] = prev;
         }
-        result = vals[n_leaves + n_ops - 1];
+        result = prev;
     }
 
     // Second reduce phase (multi-reduce)
@@ -235,8 +258,11 @@ static NSString *uop_render_msl(const UOpKernel *k) {
     [s appendFormat:@"kernel void K(device float *buf0[[buffer(0)]]"];
     for (u32 i = 1; i < k->n_bufs; i++)
         [s appendFormat:@",\n  device const float *buf%u[[buffer(%u)]]", i, i];
-    [s appendString:@",\n  uint gid_x[[thread_position_in_grid]])\n{\n"];
-    [s appendFormat:@"  if(gid_x>=%uu)return;\n", k->grid[0]];
+    [s appendString:@",\n  uint3 _gid[[thread_position_in_grid]])\n{\n"];
+    u32 total = k->grid[0] * k->grid[1] * k->grid[2];
+    [s appendFormat:@"  uint gid_x=_gid.z*%uu+_gid.y*%uu+_gid.x;\n",
+        k->grid[1] * k->grid[0], k->grid[0]];
+    [s appendFormat:@"  if(gid_x>=%uu)return;\n", total];
 
     int depth = 1;
 

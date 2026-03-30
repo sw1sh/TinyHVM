@@ -17,7 +17,7 @@ static u32 dispatch_counter = 0;
 // When remaining_uses reaches 0, the buffer is truly dead and can be stolen.
 static u16 buf_remaining_uses[MAX_BUFS];
 
-#define METAL_MEM_BUDGET (6ULL * 1024 * 1024 * 1024) // 6GB hard limit
+#define METAL_MEM_BUDGET (4ULL * 1024 * 1024 * 1024) // 4GB hard limit
 
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);
@@ -56,8 +56,10 @@ static u32 metal_buf_alloc(u64 bytes) {
             u64 sz = metal_pool.sizes[i];
             if (sz < bytes || sz > bytes * 2) continue;
             if (buf_remaining_uses[i] > 0) continue; // pre-scan marked as still needed
-            if (buf_last_use[i] == 0) continue; // never used as leaf
-            if (buf_last_use[i] + 1 >= dispatch_counter) continue; // too recent
+            if (buf_last_use[i] > 0 && buf_last_use[i] + 1 >= dispatch_counter) continue;
+            // For buffers with last_use==0: only steal if old enough that prescans
+            // have covered all potential consumers (buffer created 200+ slots ago)
+            if (buf_last_use[i] == 0 && i + 200 > id) continue;
             if (sz < reuse_size) { reuse_id = i; reuse_size = sz; }
         }
         if (reuse_id) {
@@ -242,6 +244,6 @@ static void metal_mem_checkpoint(u32 *leaf_buf_ids, u32 n_leaves) {
         }
     }
     // Flush if memory pressure is high and there are buffers to reclaim
-    if (pending_free_count > 0 && metal_bytes_inuse > 2ULL * 1024 * 1024 * 1024)
+    if (pending_free_count > 0 && metal_bytes_inuse > 6ULL * 1024 * 1024 * 1024)
         metal_flush();
 }

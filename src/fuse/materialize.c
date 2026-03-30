@@ -17,9 +17,6 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
         u32 idx = (*n_leaves)++;
         leaf_ids[idx] = tid;
         leaf_views[idx] = &m->view;
-        // Pre-mark: this buffer will be consumed by a future dispatch
-        if (m->backend && m->backend->buf_mark_use)
-            m->backend->buf_mark_use(m->buf_id);
         return (int)idx;
     }
 
@@ -66,6 +63,44 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
 
 // Forward declaration for graph-level materialize
 static void tensor_materialize_graph(TinyHVM *ctx, u32 tid);
+
+// Pre-scan: walk all deferred tensors to count how many future dispatches
+// will read each materialized buffer. This enables safe mid-step buffer
+// stealing: a buffer is stealable when buf_remaining_uses reaches 0.
+// Runs once per step (before first dispatch).
+static u32 prescan_from = 0; // start of next scan range
+static void memory_prescan(TinyHVM *ctx) {
+    // Walk NEW ephemeral tensors (since last prescan). For each deferred
+    // tensor (buf_id==0), find which materialized buffers it references.
+    u32 start = prescan_from;
+    prescan_from = ctx->tensor_count;
+    for (u32 tid = start; tid < ctx->tensor_count; tid++) {
+        TensorMeta *m = &ctx->tensors[tid];
+        if (m->buf_id != 0) continue;     // already materialized
+        if (!m->creator_op) continue;      // no provenance
+        if (!is_elementwise(m->creator_op) &&
+            m->creator_op != UOP_SUM && m->creator_op != UOP_RMAX) continue;
+        // This deferred tensor will be materialized → its leaf bufs will be read.
+        // Walk src_ids to find leaf buf_ids (follow through ew + view ops).
+        u32 stk[32]; u32 sn = 0;
+        if (m->src_ids[0]) stk[sn++] = m->src_ids[0];
+        if (m->src_ids[1] && is_binary(m->creator_op)) stk[sn++] = m->src_ids[1];
+        while (sn > 0 && sn < 30) {
+            u32 s = stk[--sn];
+            TensorMeta *sm = &ctx->tensors[s];
+            if (sm->buf_id != 0) {
+                // Leaf: materialized buffer → mark as future use
+                if (sm->backend && sm->backend->buf_mark_use)
+                    sm->backend->buf_mark_use(sm->buf_id);
+                continue;
+            }
+            if (!sm->creator_op) continue;
+            if (sm->src_ids[0]) stk[sn++] = sm->src_ids[0];
+            if (sm->src_ids[1] && is_binary(sm->creator_op) && sn < 30)
+                stk[sn++] = sm->src_ids[1];
+        }
+    }
+}
 
 // Chain-level materialize (original implementation)
 static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
@@ -910,8 +945,17 @@ static void tensor_materialize_graph(TinyHVM *ctx, u32 root_tid) {
 }
 
 // Entry point — tries graph-level, falls back to chain-level
+static u32 prescan_tc = 0; // tensor_count at last prescan
+
 static void tensor_materialize(TinyHVM *ctx, u32 tid) {
     TensorMeta *m = &ctx->tensors[tid];
     if (m->buf_id != 0) return;
+    // Run memory prescan periodically to find newly deferred tensors.
+    // Reset scan state when tensor_count drops (pool_reset happened).
+    if (ctx->tensor_count < prescan_tc) { prescan_from = 0; prescan_tc = 0; }
+    if (ctx->tensor_count > prescan_tc + 20) {
+        memory_prescan(ctx);
+        prescan_tc = ctx->tensor_count;
+    }
     tensor_materialize_graph(ctx, tid);
 }

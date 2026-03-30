@@ -17,6 +17,9 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
         u32 idx = (*n_leaves)++;
         leaf_ids[idx] = tid;
         leaf_views[idx] = &m->view;
+        // Pre-mark: this buffer will be consumed by a future dispatch
+        if (m->backend && m->backend->buf_mark_use)
+            m->backend->buf_mark_use(m->buf_id);
         return (int)idx;
     }
 

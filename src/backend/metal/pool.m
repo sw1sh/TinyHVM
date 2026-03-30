@@ -13,8 +13,11 @@ static u64 metal_bytes_inuse = 0;
 // (Metal guarantees sequential execution within command buffer).
 static u32 buf_last_use[MAX_BUFS];
 static u32 dispatch_counter = 0;
+// Remaining dispatch uses for each buffer (set by pre-scan, decremented after dispatch).
+// When remaining_uses reaches 0, the buffer is truly dead and can be stolen.
+static u16 buf_remaining_uses[MAX_BUFS];
 
-#define METAL_MEM_BUDGET (8ULL * 1024 * 1024 * 1024) // 8GB hard limit
+#define METAL_MEM_BUDGET (6ULL * 1024 * 1024 * 1024) // 6GB hard limit
 
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);
@@ -52,6 +55,7 @@ static u32 metal_buf_alloc(u64 bytes) {
             if (!metal_pool.bufs[i]) continue;
             u64 sz = metal_pool.sizes[i];
             if (sz < bytes || sz > bytes * 2) continue;
+            if (buf_remaining_uses[i] > 0) continue; // pre-scan marked as still needed
             if (buf_last_use[i] == 0) continue; // never used as leaf
             if (buf_last_use[i] + 1 >= dispatch_counter) continue; // too recent
             if (sz < reuse_size) { reuse_id = i; reuse_size = sz; }
@@ -212,6 +216,7 @@ static void metal_pool_reset(u32 keep) {
     pending_free_count = 0;
     dispatch_counter = 0;
     memset(buf_last_use, 0, sizeof(buf_last_use));
+    memset(buf_remaining_uses, 0, sizeof(buf_remaining_uses));
     metal_pool.count = buf_keep;
 }
 
@@ -222,13 +227,19 @@ static void metal_pool_set_persistent(u32 max_persistent_buf) {
 // Memory checkpoint: try to recycle consumed buffers when memory is high.
 // Called after fused kernel dispatch with leaf buf_ids that may be reclaimable.
 // Flushes GPU if there are pending_free buffers above a memory threshold.
+// Pre-scan: mark buffer as having one more future dispatch use.
+static void metal_buf_mark_use(u32 id) {
+    if (id && id < MAX_BUFS) buf_remaining_uses[id]++;
+}
+
 static void metal_mem_checkpoint(u32 *leaf_buf_ids, u32 n_leaves) {
     dispatch_counter++;
-    // Mark leaf buffers with their last-use dispatch number
     for (u32 i = 0; i < n_leaves; i++) {
         u32 bid = leaf_buf_ids[i];
-        if (bid && bid < MAX_BUFS)
+        if (bid && bid < MAX_BUFS) {
             buf_last_use[bid] = dispatch_counter;
+            if (buf_remaining_uses[bid] > 0) buf_remaining_uses[bid]--;
+        }
     }
     // Flush if memory pressure is high and there are buffers to reclaim
     if (pending_free_count > 0 && metal_bytes_inuse > 2ULL * 1024 * 1024 * 1024)

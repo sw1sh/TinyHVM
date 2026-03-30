@@ -515,6 +515,7 @@ struct Backend {
     void  (*buf_incref)(u32 id);   // increment buffer-level refcount (shared views)
     void  (*buf_decref)(u32 id);   // decrement; enqueues free when refcount→0
     void  (*mem_checkpoint)(u32 *leaf_buf_ids, u32 n_leaves); // recycle consumed buffers
+    void  (*buf_mark_use)(u32 id); // pre-scan: mark buffer as having a future dispatch use
     void  (*buf_write)(u32 id, const void *data, u64 bytes);
     void  (*buf_read)(u32 id, void *out, u64 bytes);
 

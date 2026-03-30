@@ -611,25 +611,26 @@ inet_step:
                         for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
                         free(dims);
 
-                        // If input is non-contiguous (e.g. from expand with stride-0),
-                        // we must materialize before reshape. Otherwise the new view's
-                        // contiguous strides will index beyond the 1-element buffer.
-                        new_view = view_reshape(ma->view, ns);
+                        // Identity reshape: same shape → keep original view (no contiguify)
+                        int same_shape = (ma->view.shape.rank == ns.rank);
+                        if (same_shape)
+                            for (u32 d = 0; d < ns.rank; d++)
+                                if (ma->view.shape.dims[d] != ns.dims[d]) { same_shape = 0; break; }
+                        if (same_shape) {
+                            new_view = ma->view;
+                        } else {
+                            new_view = view_reshape(ma->view, ns);
+                        }
                         // Materialize only for failed reshapes (invalid strides).
-                        // Masked views with valid strides (from PAD on permuted
-                        // gradients) are handled by the codegen inline — the fuser
-                        // propagates masks through view composition.
                         int needs_materialize = 0;
-                        if (!new_view.contiguous) {
-                            // Check if view_reshape produced fallback (contiguous-pattern) strides
-                            // This indicates a failed merge-split — strides don't match data layout
+                        if (!same_shape && !new_view.contiguous) {
                             int looks_contiguous = 1;
                             i32 exp_st = 1;
                             for (int d2 = (int)ns.rank - 1; d2 >= 0; d2--) {
                                 if (ns.dims[d2] > 1 && new_view.strides[d2] != exp_st) { looks_contiguous = 0; break; }
                                 exp_st *= (i32)ns.dims[d2];
                             }
-                            if (looks_contiguous) needs_materialize = 1; // failed reshape fallback
+                            if (looks_contiguous) needs_materialize = 1;
                         }
                         if (needs_materialize) {
                             ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];

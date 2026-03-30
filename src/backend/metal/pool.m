@@ -39,7 +39,7 @@ static u32 plan_alloc_ids[MAX_PLAN_ENTRIES];
 static u32 plan_alloc_birth[MAX_PLAN_ENTRIES];
 static u32 plan_alloc_count = 0;
 
-#define METAL_MEM_BUDGET (4ULL * 1024 * 1024 * 1024) // 4GB hard limit
+#define METAL_MEM_BUDGET (8ULL * 1024 * 1024 * 1024) // 8GB hard limit
 
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);
@@ -50,11 +50,9 @@ static u32 metal_buf_alloc(u64 bytes) {
         exit(1);
     }
 
-    // 0. Memory plan: suballocation from ONE pre-allocated MTLBuffer.
-    // Each alloc gets a unique OFFSET — no region overlap at any given time.
-    if (mem_plan_active && bytes >= PLAN_MIN_BYTES &&
-        mem_plan_cursor < mem_plan_count && mem_plan_heap) {
-        mem_plan_cursor++;
+    // 0. Heap alloc: ALL large buffers from MTLHeap on step 1+
+    if (mem_plan_active && bytes >= PLAN_MIN_BYTES && mem_plan_heap) {
+        if (mem_plan_cursor < mem_plan_count) mem_plan_cursor++;
         metal_pool.bufs[id] = [mem_plan_heap newBufferWithLength:bytes
                                                          options:MTLResourceStorageModeShared];
         if (metal_pool.bufs[id]) {
@@ -64,8 +62,8 @@ static u32 metal_buf_alloc(u64 bytes) {
         }
     }
 
-    // 1. Free list (from pool_reset)
-    {
+    // 1. Free list (from pool_reset) — skip large buffers if plan is active
+    if (!(mem_plan_active && bytes >= PLAN_MIN_BYTES)) {
         u32 best_idx = UINT32_MAX;
         u64 best_size = UINT64_MAX;
         for (u32 i = 0; i < free_count; i++) {
@@ -84,7 +82,31 @@ static u32 metal_buf_alloc(u64 bytes) {
         }
     }
 
-    // 2. Fresh allocation
+    // 2. Mid-step steal (step 0, before plan exists)
+    if (!mem_plan_active && bytes >= 1024*1024 && dispatch_counter > 2) {
+        u32 reuse_id = 0;
+        u64 reuse_size = UINT64_MAX;
+        for (u32 i = 1; i < id; i++) {
+            if (!metal_pool.bufs[i]) continue;
+            u64 sz = metal_pool.sizes[i];
+            if (sz < bytes || sz > bytes * 2) continue;
+            if (buf_remaining_uses[i] > 0) continue;
+            if (buf_last_use[i] > 0 && buf_last_use[i] + 1 >= dispatch_counter) continue;
+            if (buf_last_use[i] == 0 && i + 200 > id) continue;
+            if (sz < reuse_size) { reuse_id = i; reuse_size = sz; }
+        }
+        if (reuse_id) {
+            metal_pool.bufs[id] = metal_pool.bufs[reuse_id];
+            metal_pool.sizes[id] = metal_pool.sizes[reuse_id];
+            metal_pool.bufs[reuse_id] = nil;
+            metal_pool.sizes[reuse_id] = 0;
+            buf_refcount[reuse_id] = 0;
+            buf_last_use[reuse_id] = 0;
+            goto done;
+        }
+    }
+
+    // 3. Fresh allocation
     metal_pool.bufs[id] = [mtl_dev newBufferWithLength:bytes
                                                options:MTLResourceStorageModeShared];
     metal_pool.sizes[id] = bytes;
@@ -231,8 +253,10 @@ static void metal_pool_reset(u32 keep) {
                 if (!alloc_in_use[p]) continue;
                 u32 pbid = plan_alloc_ids[p];
                 u32 pd = buf_last_use[pbid];
-                if (pd == 0) continue;         // never used — unknown lifetime
-                if (pd >= a_birth) continue;   // p still alive when a is born
+                // If last_use==0 (consumed via view alias, not tracked),
+                // assume dead if old enough (50+ allocs ago in step 0)
+                if (pd == 0 && a - p < 50) continue;
+                if (pd > 0 && pd >= a_birth) continue;
                 alloc_in_use[p] = 0;
                 if (fpool_n < 64) fpool[fpool_n++] = (i32)p;
             }
@@ -281,7 +305,7 @@ static void metal_pool_reset(u32 keep) {
         // Create Metal heap sized to fit all simultaneously-alive regions
         if (next_offset > mem_plan_heap_size) {
             MTLHeapDescriptor *desc = [[MTLHeapDescriptor alloc] init];
-            desc.size = next_offset * 2; // 2x for Metal alignment overhead
+            desc.size = next_offset + next_offset / 4; // 25% for alignment overhead
             desc.storageMode = MTLStorageModeShared;
             desc.hazardTrackingMode = MTLHazardTrackingModeTracked;
             mem_plan_heap = [mtl_dev newHeapWithDescriptor:desc];
@@ -292,6 +316,20 @@ static void metal_pool_reset(u32 keep) {
             fprintf(stderr, "MEM_PLAN: %u allocs, %u reused, big_buf=%.1fMB (was %.1fMB)\n",
                 mem_plan_count, reuse_count, (double)next_offset/1e6,
                 (double)(plan_alloc_count * ALIGN_4K(metal_pool.sizes[plan_alloc_ids[0]]))/1e6);
+    }
+
+    // If plan is active, release large free list entries (heap replaces them)
+    if (mem_plan_count > 0) {
+        u32 new_fc = 0;
+        for (u32 f = 0; f < free_count; f++) {
+            if (free_list[f].size >= PLAN_MIN_BYTES) {
+                // Large buffer — release, heap will handle it
+                free_list[f].buf = nil; // ARC releases
+            } else {
+                free_list[new_fc++] = free_list[f]; // keep small buffers
+            }
+        }
+        free_count = new_fc;
     }
 
     // Move ephemeral buffers to free list.
@@ -307,10 +345,16 @@ static void metal_pool_reset(u32 keep) {
             buf_refcount[i] = 0; buf_offset[i] = 0; continue;
         }
         if (metal_pool.bufs[i]) {
-            if (free_count < MAX_FREE_BUFS) {
+            // When plan is active, release large buffers (heap replaces them)
+            int skip_free = (mem_plan_count > 0 && sz >= PLAN_MIN_BYTES);
+            if (!skip_free && free_count < MAX_FREE_BUFS) {
                 free_list[free_count].buf = metal_pool.bufs[i];
                 free_list[free_count].size = sz;
                 free_count++;
+            } else {
+                // Buffer released (ARC handles Metal dealloc on nil)
+                if (sz <= metal_bytes_total) metal_bytes_total -= sz;
+                else metal_bytes_total = 0;
             }
         }
         metal_pool.bufs[i] = nil;
@@ -329,6 +373,9 @@ reset_counters:
     mem_plan_active = (mem_plan_count > 0);
     mem_plan_cursor = 0;
     plan_alloc_count = 0;
+    fprintf(stderr, "RESET: inuse=%.0fMB total=%.0fMB free=%u bufs=%u plan=%d\n",
+        (double)metal_bytes_inuse/1e6, (double)metal_bytes_total/1e6,
+        free_count, buf_keep, mem_plan_active);
 }
 
 static void metal_pool_set_persistent(u32 max_persistent_buf) {
@@ -350,9 +397,17 @@ static void metal_mem_checkpoint(u32 *leaf_buf_ids, u32 n_leaves) {
         if (bid && bid < MAX_BUFS) {
             buf_last_use[bid] = dispatch_counter;
             if (buf_remaining_uses[bid] > 0) buf_remaining_uses[bid]--;
+            // Heap-backed: release consumed buffers back to heap immediately.
+            // Metal's heap auto-reclaims the region for future allocs.
+            // Safe: Metal hazard tracking handles GPU read ordering.
+            if (mem_plan_heap && buf_remaining_uses[bid] == 0 &&
+                metal_pool.bufs[bid] &&
+                metal_pool.bufs[bid].heap == mem_plan_heap) {
+                metal_pool.bufs[bid] = nil;
+                metal_pool.sizes[bid] = 0;
+            }
         }
     }
-    // Flush if memory pressure is high and there are buffers to reclaim
     if (pending_free_count > 0 && metal_bytes_inuse > 6ULL * 1024 * 1024 * 1024)
         metal_flush();
 }

@@ -117,6 +117,53 @@ Term thvm_ddu(TinyHVM *ctx, Term label_expr, Term val, Term bod) {
     return term_new(TAG_DDU, 0, loc);
 }
 
+// EQL: structural equality — heap [a, b]
+Term thvm_eql(TinyHVM *ctx, Term a, Term b) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     a);
+    heap_set(ctx, loc + 1, b);
+    return term_new(TAG_EQL, 0, loc);
+}
+
+// AND: short-circuit AND — heap [a, b]
+Term thvm_and(TinyHVM *ctx, Term a, Term b) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     a);
+    heap_set(ctx, loc + 1, b);
+    return term_new(TAG_AND, 0, loc);
+}
+
+// OR: short-circuit OR — heap [a, b]
+Term thvm_or(TinyHVM *ctx, Term a, Term b) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     a);
+    heap_set(ctx, loc + 1, b);
+    return term_new(TAG_OR, 0, loc);
+}
+
+// MAT: pattern match — heap [handler, fallback], EXT = match_tag
+Term thvm_mat(TinyHVM *ctx, u32 match_tag, Term handler, Term fallback) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     handler);
+    heap_set(ctx, loc + 1, fallback);
+    return term_new(TAG_MAT, (u8)match_tag, loc);
+}
+
+// USP: unordered SUP — heap [a, b], EXT = label
+Term thvm_usp(TinyHVM *ctx, u32 label, Term a, Term b) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     a);
+    heap_set(ctx, loc + 1, b);
+    return term_new(TAG_USP, (u8)label, loc);
+}
+
+// UDP: unordered DUP — heap [val], EXT = label, single output port
+Term thvm_udp(TinyHVM *ctx, u32 label, Term val) {
+    u64 loc = heap_alloc(ctx, 1);
+    heap_set(ctx, loc, val);
+    return term_new(TAG_UDP, (u8)label, loc);
+}
+
 // INC: priority wrapper — transparent to reduce, lower priority in collapse
 Term thvm_inc(TinyHVM *ctx, Term term) {
     u64 loc = heap_alloc(ctx, 1);
@@ -124,10 +171,10 @@ Term thvm_inc(TinyHVM *ctx, Term term) {
     return term_new(TAG_INC, 0, loc);
 }
 
-// Collapse: DFS that extracts all SUP branches into a flat array
+// Collapse: DFS that extracts all SUP/USP branches into a flat array
 static void collapse_dfs(TinyHVM *ctx, Term t, CollapseResult *cr) {
     Term reduced = thvm_reduce(ctx, t);
-    if (term_tag(reduced) == TAG_SUP) {
+    if (term_tag(reduced) == TAG_SUP || term_tag(reduced) == TAG_USP) {
         u64 loc = term_val(reduced);
         collapse_dfs(ctx, heap_read(ctx, loc + 0), cr);
         collapse_dfs(ctx, heap_read(ctx, loc + 1), cr);
@@ -197,6 +244,90 @@ void thvm_collapse_grouped_free(GroupedCollapseResult *gr) {
     if (gr->leaves) free(gr->leaves);
     gr->leaves = NULL;
     gr->count = gr->cap = 0;
+}
+
+// Priority-aware collapse: 64-bucket priority queue.
+// INC decreases key (explore sooner), SUP/USP increases key (explore later).
+#define COLLAPSE_BUCKETS 64
+
+typedef struct { Term *tasks; u32 head, count, cap; } CollapseBucket;
+
+static void bucket_push(CollapseBucket *b, Term t) {
+    if (b->count >= b->cap) {
+        u32 new_cap = b->cap ? b->cap * 2 : 16;
+        Term *new_tasks = (Term *)malloc(new_cap * sizeof(Term));
+        for (u32 i = 0; i < b->count; i++)
+            new_tasks[i] = b->tasks[(b->head + i) % b->cap];
+        free(b->tasks);
+        b->tasks = new_tasks;
+        b->head = 0;
+        b->cap = new_cap;
+    }
+    u32 tail = (b->head + b->count) % b->cap;
+    b->tasks[tail] = t;
+    b->count++;
+}
+
+static Term bucket_pop(CollapseBucket *b) {
+    Term t = b->tasks[b->head];
+    b->head = (b->head + 1) % b->cap;
+    b->count--;
+    return t;
+}
+
+static void cr_push(CollapseResult *cr, Term t) {
+    if (cr->count >= cr->cap) {
+        cr->cap = cr->cap ? cr->cap * 2 : 16;
+        cr->terms = realloc(cr->terms, cr->cap * sizeof(Term));
+    }
+    cr->terms[cr->count++] = t;
+}
+
+CollapseResult thvm_collapse_ordered(TinyHVM *ctx, Term t, u32 limit) {
+    CollapseBucket buckets[COLLAPSE_BUCKETS];
+    memset(buckets, 0, sizeof(buckets));
+    CollapseResult cr = {NULL, 0, 0};
+
+    // Seed at middle priority
+    bucket_push(&buckets[32], t);
+
+    while (cr.count < limit) {
+        // Find lowest non-empty bucket
+        int best = -1;
+        for (int i = 0; i < COLLAPSE_BUCKETS; i++) {
+            if (buckets[i].count > 0) { best = i; break; }
+        }
+        if (best < 0) break;
+
+        Term task = bucket_pop(&buckets[best]);
+        // Peel INC wrappers before reducing (thvm_reduce strips INC transparently).
+        // Re-enqueue at adjusted priority so ordering is respected.
+        if (term_tag(task) == TAG_INC) {
+            while (term_tag(task) == TAG_INC) {
+                best = (best > 0) ? best - 1 : 0;
+                task = heap_read(ctx, term_val(task));
+            }
+            bucket_push(&buckets[best], task);
+            continue;
+        }
+        Term reduced = thvm_reduce(ctx, task);
+        u8 tag = term_tag(reduced);
+
+        if (tag == TAG_SUP || tag == TAG_USP) {
+            // SUP/USP: increase key (lower priority = explored later)
+            u32 key = (best < COLLAPSE_BUCKETS - 1) ? (u32)(best + 1) : (u32)(COLLAPSE_BUCKETS - 1);
+            u64 loc = term_val(reduced);
+            bucket_push(&buckets[key], heap_read(ctx, loc + 0));
+            bucket_push(&buckets[key], heap_read(ctx, loc + 1));
+        } else if (tag == TAG_ERA) {
+            continue;  // skip erased branches
+        } else {
+            cr_push(&cr, reduced);
+        }
+    }
+
+    for (int i = 0; i < COLLAPSE_BUCKETS; i++) free(buckets[i].tasks);
+    return cr;
 }
 
 // Parallel collapse via Chase-Lev work-stealing deques.

@@ -39,10 +39,16 @@ static u32 tag_arity(u32 tag, u32 ext) {
         case TAG_TOP:
             if (ext == UOP_WHERE) return 3;
             return 2;
+        case TAG_USP: return 2;
+        case TAG_UDP: return 1;
+        case TAG_EQL: return 2;
+        case TAG_AND: return 2;
+        case TAG_OR:  return 2;
+        case TAG_MAT: return 2;
         case TAG_CTR: return ext; // arity in ext field
         // Leaves:
         case TAG_TEN: case TAG_ERA: case TAG_NUM:
-        case TAG_VAR: case TAG_REF:
+        case TAG_VAR: case TAG_REF: case TAG_ANY:
             return 0;
         default: return 0;
     }

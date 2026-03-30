@@ -68,6 +68,7 @@ static void tensor_materialize_graph(TinyHVM *ctx, u32 tid);
 static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
     TensorMeta *m = &ctx->tensors[tid];
     if (m->buf_id != 0) return;
+    if (getenv("THVM_TRACE")) fprintf(stderr, "MAT_CHAIN tid=%u op=%u buf=%u\n", tid, m->creator_op, m->buf_id);
 
     // Post-reduce fusion: if this deferred ew chain contains a deferred reduce
     // (reachable via views), fuse pre-reduce ew → reduce → post-reduce ew in one kernel.
@@ -77,6 +78,7 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
         u32 cur = tid;
         for (u32 depth = 0; depth < 20; depth++) {
             TensorMeta *cm = &ctx->tensors[cur];
+            if (getenv("THVM_TRACE")) fprintf(stderr, "  SCAN d=%u tid=%u op=%u buf=%u\n", depth, cur, cm->creator_op, cm->buf_id);
             if (cm->buf_id != 0) break;
             if (cm->creator_op == UOP_SUM || cm->creator_op == UOP_RMAX) {
                 reduce_tid = cur; reduce_input = cm->src_ids[0]; break;
@@ -88,6 +90,7 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
         if (reduce_tid && reduce_input &&
             ctx->tensors[reduce_input].buf_id == 0 &&
             is_elementwise(ctx->tensors[reduce_input].creator_op)) {
+            if(getenv("THVM_TRACE")) fprintf(stderr, "POST_REDUCE_FUSION: tid=%u reduce=%u input=%u\n", tid, reduce_tid, reduce_input);
             // Walk pre-reduce ew chain
             FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0, op_tids[FUSE_MAX_OPS];
             u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves = 0;

@@ -236,6 +236,35 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         return reduce_id(ctx, t);
     }
 
+    // Post-reduce detection: if the ew chain's src[0] path leads to
+    // a deferred RESHAPE(SUM(ew_chain)), absorb the reduce into this fusion.
+    // This handles relu(mm+b) where MM is decomposed to expand+MUL+SUM.
+    if (!has_reduce && is_elementwise(top_uop)) {
+        Term probe = t;
+        for (u32 d = 0; d < 10; d++) {
+            if (term_tag(probe) != TAG_TOP) break;
+            u32 pu = term_ext(probe);
+            if (is_elementwise(pu)) {
+                probe = heap_read(ctx, term_val(probe)); // follow src[0]
+            } else if (is_view_op(pu)) {
+                probe = heap_read(ctx, term_val(probe));
+            } else if (pu == UOP_SUM || pu == UOP_RMAX) {
+                // Found reduce under the ew chain!
+                Term sum_input2 = heap_read(ctx, term_val(probe));
+                if (term_tag(sum_input2) == TAG_TOP && is_elementwise(term_ext(sum_input2))) {
+                    // Pattern: ew_chain → view? → SUM(ew_chain)
+                    // Treat as reshape_reduce_fuse with post-reduce ops
+                    has_reduce = pu;
+                    sum_term = probe;
+                    ew_root = sum_input2;
+                    // The post-reduce ops are the ew chain from t down to the reduce
+                    // They'll be handled by the ReduceSpec post_reduce_start
+                }
+                break;
+            } else break;
+        }
+    }
+
     // Walk the tree
     FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0;
     u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves = 0;

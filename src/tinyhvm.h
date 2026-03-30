@@ -81,7 +81,17 @@ typedef u64 Term;
 #define TAG_DDU  16  // Dynamic DUP: !&(label_expr){val, bod}. Heap: [label_expr, val, bod]
 #define TAG_INC  17  // Priority wrapper: transparent to reduce, lower priority in collapse
 
-#define TAG_COUNT 18
+// Type enumeration machinery (ported from HVM4):
+#define TAG_EQL  18  // Structural equality: (a === b). Heap: [a, b]. Strict both sides.
+#define TAG_AND  19  // Short-circuit AND: (a .&. b). Heap: [a, b]. 0→0, n→b.
+#define TAG_OR   20  // Short-circuit OR:  (a .|. b). Heap: [a, b]. 0→b, n→1.
+#define TAG_MAT  21  // Pattern match: λ{#K:h; m}. Heap: [handler, fallback]. EXT=match_tag. WNF atom.
+#define TAG_ANY  22  // Wildcard: matches anything. No heap (atom). EQL(ANY,x)→1, DUP→ANY.
+// Unordered superpositions (from Taelin's spec, not yet in HVM4):
+#define TAG_USP  23  // Unordered SUP: %L{a, b}. Heap: [a, b], EXT = label. {a,b}=={b,a}.
+#define TAG_UDP  24  // Unordered DUP: !%L{x}=v. Heap: [val], EXT = label. Single output port.
+
+#define TAG_COUNT 25
 
 // ============================================================
 // UOps — Minimal tensor operations (tinygrad-inspired)
@@ -681,6 +691,16 @@ typedef struct { Term term; LabelChoice *path; u32 path_len; } GroupedLeaf;
 typedef struct { GroupedLeaf *leaves; u32 count; u32 cap; } GroupedCollapseResult;
 GroupedCollapseResult thvm_collapse_grouped(TinyHVM *ctx, Term t);
 void thvm_collapse_grouped_free(GroupedCollapseResult *gr);
+
+// Type enumeration + unordered SUPs
+Term     thvm_eql(TinyHVM *ctx, Term a, Term b);
+Term     thvm_and(TinyHVM *ctx, Term a, Term b);
+Term     thvm_or(TinyHVM *ctx, Term a, Term b);
+Term     thvm_mat(TinyHVM *ctx, u32 match_tag, Term handler, Term fallback);
+static inline Term thvm_any(void) { return term_new(TAG_ANY, 0, 0); }
+Term     thvm_usp(TinyHVM *ctx, u32 label, Term a, Term b);
+Term     thvm_udp(TinyHVM *ctx, u32 label, Term val);
+CollapseResult thvm_collapse_ordered(TinyHVM *ctx, Term t, u32 limit);
 
 // Inet ops
 Term     thvm_where(TinyHVM *ctx, Term cond, Term then_t, Term else_t);

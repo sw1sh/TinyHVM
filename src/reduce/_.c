@@ -89,7 +89,8 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
 
     // Already WNF atoms → go directly to apply
     if (tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
-        tag == TAG_LAM || tag == TAG_SUP || tag == TAG_BRI) { whnf = next; goto apply; }
+        tag == TAG_LAM || tag == TAG_SUP || tag == TAG_BRI ||
+        tag == TAG_MAT || tag == TAG_ANY || tag == TAG_USP) { whnf = next; goto apply; }
 
     // TAG_TOP: try declarative rewrite rules first (fusion, etc.).
     // If no rule matches, reduce args depth-first then fire interact.
@@ -220,7 +221,8 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps) {
 static const char *tag_names[] = {
     "APP", "LAM", "VAR", "SUP", "DP0", "DP1", "ERA",
     "NUM", "REF", "OP2", "TEN", "TOP", "CTR",
-    "BRI", "ANN", "DSU", "DDU", "INC"
+    "BRI", "ANN", "DSU", "DDU", "INC",
+    "EQL", "AND", "OR", "MAT", "ANY", "USP", "UDP"
 };
 
 // uop_names now in tinyhvm.h

@@ -59,9 +59,8 @@ static u32 uop_emit_f(UOpKernel *k, KOpType type, u32 a0, u32 a1, u32 a2, f32 im
 // Build index expression for a leaf view using coordinates.
 // coords[d] = UOp id for coordinate d (uint). Returns UOp id for the flat index (uint).
 static u32 uop_build_index(UOpKernel *k, const View *v, u32 *coords, u32 rank) {
-    // Start with offset as uint constant
-    u32 off = (v->offset > 0) ? (u32)v->offset : 0;
-    u32 idx = uop_emit(k, KOP_CONST_U, 0, 0, 0, off);
+    // Offset may be negative (e.g., shrink views). Use signed→uint wrapping.
+    u32 idx = uop_emit(k, KOP_CONST_U, 0, 0, 0, (u32)(i32)v->offset);
 
     for (u32 d = 0; d < rank && d < v->shape.rank; d++) {
         if (v->strides[d] == 0 || v->shape.dims[d] == 1) continue;

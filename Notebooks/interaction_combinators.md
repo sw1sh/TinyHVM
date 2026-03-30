@@ -399,14 +399,16 @@ TNumValue /@ TCollapse[decoded]
 
 Church naturals apply a successor function $n$ times: $\text{zero} = \lambda s.\lambda z.\, z$, $\text{succ}(n) = \lambda s.\lambda z.\, s\,(n\;s\;z)$.
 
+Since `succ` uses `s` twice, we must explicitly DUP it — interaction nets are linear:
+
 ```wolfram
 TInit[];
-zero = TLam[s |-> TLam[z |-> z]];
-succ = TLam[n |-> TLam[s |-> TLam[z |->
-  TApp[s, TApp[TApp[n, s], z]]
-]]];
-two = TApp[succ, TApp[succ, zero]];
-three = TApp[succ, two];
+mkZero[] := TLam[s |-> TLam[z |-> z]];
+mkSucc[n_TTerm] := TLam[s |-> Module[{s0, s1},
+  {s0, s1} = TDup[s];
+  TLam[z |-> TApp[s0, TApp[TApp[n, s1], z]]]
+]];
+three = mkSucc[mkSucc[mkSucc[mkZero[]]]];
 decoded = TApp[TApp[three, TLam[x |-> TOp2["Add", x, TNum[1]]]], TNum[0]];
 TNumValue[TReduce[decoded]]
 ```
@@ -415,158 +417,155 @@ TNumValue[TReduce[decoded]]
 
 ## 14. Program Synthesis via Superposition
 
-This is the core application of interaction combinators to search. Instead of evaluating $N$ candidate programs one at a time, **superpose all candidates into a single term** and evaluate them simultaneously. The APP-SUP rule distributes the evaluation across all branches.
+Instead of evaluating $N$ candidate programs one at a time, **superpose all candidates into a single term** and evaluate simultaneously. The APP-SUP rule distributes evaluation across all branches with optimal sharing.
 
-### Finding a constant
+### Boolean function synthesis: find XOR
 
-**Problem**: Find $c$ such that $c + 3 = 7$.
+**Problem**: Which of the 16 two-input boolean functions has truth table $\{0, 1, 1, 0\}$?
+
+Superpose all $2^4 = 16$ candidate truth tables. Each output bit is an independent $\text{SUP}(0,1)$. The OP2-SUP rule distributes the equality checks across all 16 combinations simultaneously:
 
 ```wolfram
 TInit[];
-cSpace = Fold[TSup[#2, #1] &, TNum[7], Reverse @ Table[TNum[i], {i, 0, 6}]];
-results = TOp2["Add", cSpace, TNum[3]];
-checks = TOp2["Eq", results, TNum[7]];
-matches = TNumValue /@ TCollapse[checks];
-{"matches" -> matches, "c" -> (FirstPosition[matches, 1][[1]] - 1)}
+mkBit[] := TSup[TNum[0], TNum[1]];
+b00 = mkBit[]; b01 = mkBit[]; b10 = mkBit[]; b11 = mkBit[];
+target = {0, 1, 1, 0};
+allPass = TOp2["Mul",
+  TOp2["Mul", TOp2["Eq", b00, TNum[target[[1]]]], TOp2["Eq", b01, TNum[target[[2]]]]],
+  TOp2["Mul", TOp2["Eq", b10, TNum[target[[3]]]], TOp2["Eq", b11, TNum[target[[4]]]]]];
+results = TNumValue /@ TCollapse[allPass];
+{"candidates" -> Length[results], "matches" -> Total[results]}
 ```
 
-### Finding a Boolean function
+### 3-variable synthesis: find Majority
 
-**Problem**: Find $f: \{0,1\} \to \{0,1\}$ such that $f(1) = 0$ and $f(0) = 1$.
-
-There are exactly 4 such functions. We superpose all of them and test both constraints:
+Scale up: which of the $2^8 = 256$ three-input boolean functions computes **majority vote** (output 1 iff at least 2 of 3 inputs are 1)?
 
 ```wolfram
 TInit[];
-mkCandidates[] := TSup[
-  TLam[x |-> TNum[1]],
-  TSup[TLam[x |-> TNum[0]],
-    TSup[TLam[x |-> x],
-      TLam[x |-> TOp2["Sub", TNum[1], x]]]]];
-c1 = TNumValue /@ TCollapse[TOp2["Eq", TApp[mkCandidates[], TNum[1]], TNum[0]]];
-c2 = TNumValue /@ TCollapse[TOp2["Eq", TApp[mkCandidates[], TNum[0]], TNum[1]]];
-names = {"const1", "const0", "id", "not"};
-solution = c1 * c2;
-{"c1 (f(1)=0)" -> c1, "c2 (f(0)=1)" -> c2, "winner" -> Pick[names, solution, 1]}
+mkBit[] := TSup[TNum[0], TNum[1]];
+bits = Table[mkBit[], 8];
+majorityTable = {0, 0, 0, 1, 0, 1, 1, 1};
+checks = MapThread[TOp2["Eq", #1, TNum[#2]] &, {bits, majorityTable}];
+allPass = Fold[TOp2["Mul", #1, #2] &, First[checks], Rest[checks]];
+results = TNumValue /@ TCollapse[allPass];
+{"candidates" -> Length[results], "matches" -> Total[results]}
 ```
 
-### Finding a linear function
+256 candidates tested in one reduction. Exactly one match.
 
-**Problem**: Find $(a, b)$ such that $f(x) = ax + b$ with $f(1) = 5$ and $f(3) = 11$.
+### Operation synthesis: search over program structure
 
-16 candidates ($a, b \in \{0,1,2,3\}$), evaluated simultaneously:
+Not just constants — search over the **structure** of the program. Which operation transforms $4 \to 12$?
 
 ```wolfram
 TInit[];
-mkSearch[] := Module[{a, b},
-  a = Fold[TSup[#2, #1] &, TNum[3], Reverse @ Table[TNum[i], {i, 0, 2}]];
-  b = Fold[TSup[#2, #1] &, TNum[3], Reverse @ Table[TNum[i], {i, 0, 2}]];
-  TLam[x |-> TOp2["Add", TOp2["Mul", a, x], b]]
-];
-c1 = TNumValue /@ TCollapse[TOp2["Eq", TApp[mkSearch[], TNum[1]], TNum[5]]];
-c2 = TNumValue /@ TCollapse[TOp2["Eq", TApp[mkSearch[], TNum[3]], TNum[11]]];
+candidates = TSup[
+  TLam[x |-> TOp2["Add", x, TNum[3]]],
+  TSup[TLam[x |-> TOp2["Mul", x, TNum[3]]],
+    TSup[TLam[x |-> TOp2["Sub", x, TNum[3]]],
+      TLam[x |-> Module[{x0, x1}, {x0, x1} = TDup[x]; TOp2["Mul", x0, x1]]]]]];
+checks = TOp2["Eq", TApp[candidates, TNum[4]], TNum[12]];
+names = {"x+3", "x*3", "x-3", Row[{"x", Superscript["", "2"]}]};
+results = TNumValue /@ TCollapse[checks];
+Pick[names, results, 1]
+```
+
+### Composition synthesis: find $g \circ h$
+
+**Problem**: Find primitives $g$ and $h$ from $\{+1, \times 2, \times 3, +5\}$ such that $g(h(3)) = 13$ **and** $g(h(1)) = 7$.
+
+$4 \times 4 = 16$ candidate compositions, all evaluated simultaneously via nested APP-SUP:
+
+```wolfram
+TInit[];
+mkOps[] := TSup[
+  TLam[x |-> TOp2["Add", x, TNum[1]]],
+  TSup[TLam[x |-> TOp2["Mul", x, TNum[2]]],
+    TSup[TLam[x |-> TOp2["Mul", x, TNum[3]]],
+      TLam[x |-> TOp2["Add", x, TNum[5]]]]]];
+c1 = TNumValue /@ TCollapse[TOp2["Eq", TApp[mkOps[], TApp[mkOps[], TNum[3]]], TNum[13]]];
+c2 = TNumValue /@ TCollapse[TOp2["Eq", TApp[mkOps[], TApp[mkOps[], TNum[1]]], TNum[7]]];
 solution = c1 * c2;
+opNames = {"+1", "\[Times]2", "\[Times]3", "+5"};
 pos = FirstPosition[solution, 1][[1]] - 1;
-{"a" -> Quotient[pos, 4], "b" -> Mod[pos, 4], "checks" -> solution}
+Row[{"g=", opNames[[Quotient[pos, 4] + 1]], ", h=", opNames[[Mod[pos, 4] + 1]]}]
 ```
 
-### SupGen Benchmarks (Taelin, 2024–2026)
+### Sorting by exhaustive permutation search
 
-These search patterns scale dramatically via **optimal sharing** — common subcomputations across candidates are evaluated once:
+**Problem**: Sort $[5, 2, 8]$. Superpose all 6 permutations, check which one is non-decreasing.
+
+We use the trick that for values $< 1000$, unsigned subtraction $b - a$ stays small when $b \geq a$ and wraps to $> 10^9$ when $b < a$, so $\lfloor (b-a)/1000 \rfloor = 0$ iff $b \geq a$:
 
 ```wolfram
-Grid[{
-  {Style["Problem", Bold], Style["Space", Bold], Style["Brute Force", Bold], Style["SupGen", Bold], Style["Speedup", Bold]},
-  {"ADD-CARRY (16 bits)", Superscript["2", "16"], "262M interactions", "36K interactions", Row[{"7,277", "\[Times]"}]},
-  {"XOR-XNOR discovery", "\[Dash]", "2.8s (Haskell)", "0.0085s (HVM)", Row[{"330", "\[Times]"}]},
-  {Row[{"\[Lambda]", "-equation solving"}], "\[Dash]", "0.992s (Haskell)", "0.0011s (HVM)", Row[{"862", "\[Times]"}]},
-  {"Peano Sort (pos 5.7M)", "huge", "5m17s enumerate", "2s (NeoGen)", Row[{"159", "\[Times]"}]}
-}, Frame -> All, Alignment -> Left, Spacings -> {2, 0.8},
-  Background -> {None, {LightDarkSwitched[GrayLevel[0.9], GrayLevel[0.2]], None}},
-  ItemStyle -> Directive[FontSize -> 11]]
+TInit[];
+geq[a_, b_] := TOp2["Eq", TOp2["Div", TOp2["Sub", b, a], TNum[1000]], TNum[0]];
+pack3[x_, y_, z_] := TOp2["Add", TOp2["Add", TOp2["Mul", x, TNum[10000]], TOp2["Mul", y, TNum[100]]], z];
+perms = TSup[
+  pack3[TNum[5], TNum[2], TNum[8]],
+  TSup[pack3[TNum[5], TNum[8], TNum[2]],
+    TSup[pack3[TNum[2], TNum[5], TNum[8]],
+      TSup[pack3[TNum[2], TNum[8], TNum[5]],
+        TSup[pack3[TNum[8], TNum[2], TNum[5]],
+          pack3[TNum[8], TNum[5], TNum[2]]]]]]];
+{p0, p1} = TDup[perms]; {p2, p3} = TDup[p1];
+x = TOp2["Div", p0, TNum[10000]];
+y = TOp2["Mod", TOp2["Div", p2, TNum[100]], TNum[100]];
+z = TOp2["Mod", p3, TNum[100]];
+sorted = TOp2["Mul", geq[x, y], geq[y, z]];
+results = TNumValue /@ TCollapse[sorted];
+permNames = {"[5,2,8]", "[5,8,2]", "[2,5,8]", "[2,8,5]", "[8,2,5]", "[8,5,2]"};
+Pick[permNames, results, 1]
 ```
 
-The cost per candidate in the ADD-CARRY benchmark is **sub-1 interaction** — 65,536 candidates cost only 36K total interactions. This is not parallelism; it is algorithmic sharing.
+Taelin's NeoGen scales this to real algorithms: **Peano Sort synthesized in 2 seconds** (159x over brute-force enumeration of 5.7M candidates). ADD-CARRY with 16 unknown bits: 65K candidates in 36K total interactions — **sub-1 interaction per candidate**.
 
 ---
 
-## 15. Dependent Types: The ICC Vision
+## 15. Bridges as Types: Specification-Driven Search
 
-The program synthesis above is **untyped** — every candidate is evaluated, even nonsensical ones. The **Interaction Calculus of Constructions** (ICC) adds type-directed pruning: ill-typed candidates are erased *before evaluation*, via the same interaction rules.
+Bridges turn types into **executable specifications**. Annotate a candidate with $\{f : \theta g.\, \text{spec}(g)\}$ and ANN-BRI reduction tests it — the spec IS the type.
 
-### Types from bridges
+### Bridge as function spec
 
-All type constructors are **derived** from the bridge primitive $\theta$:
-
-$\text{Fun}\;A\;B = \theta f.\,\lambda x.\,\{(f\;\{x : A\}) : B\}$
-
-$\text{All}\;A\;B = \theta f.\,\lambda x.\,\{(f\;\{x : A\}) : (B\;x)\}$
-
-$\text{Ind}\;A\;B = \theta f.\,\lambda x.\,\{(f\;\{x : A\}) : (B\;f\;x)\}$
-
-The key difference: in **All** (Pi type), the return type $B$ depends on the *argument* $x$. In **Ind** (self type), the return type depends on both the *function itself* $f$ and the argument. This is impossible without bridges — the function being typed has no name in scope with just $\lambda$.
-
-### Type checking as reduction
-
-When you annotate a value with a type $\{v : T\}$, two things can happen:
-
-**ANN-BRI (annihilation)**: If $T = \theta f.\, \text{body}$, the bridge binds the value: $\{v : \theta f.T\} \to T[f := v]$. This is the type check *succeeding* — the value flows into the type body for further inspection.
+The bridge $\theta f.\, (f(3) == 7)$ is a type that accepts only functions mapping $3 \to 7$:
 
 ```wolfram
 TInit[];
-anyType = TBri[x |-> x];
-ann = TAnn[TNum[42], anyType];
-TNumValue[TReduce[ann]]
+spec = TBri[f |-> TOp2["Eq", TApp[f, TNum[3]], TNum[7]]];
+good = TLam[x |-> TOp2["Add", x, TNum[4]]];
+bad = TLam[x |-> TOp2["Mul", x, TNum[2]]];
+{dp0, dp1} = TDup[spec];
+{TNumValue[TReduce[TAnn[good, dp0]]], TNumValue[TReduce[TAnn[bad, dp1]]]}
 ```
+
+### Typed composition search
+
+Same composition problem as above, but using bridges as the test mechanism. The bridge IS the type — it checks the function against its specification:
 
 ```wolfram
 TInit[];
-checkPositive = TBri[v |-> TOp2["Mul", v, v]];
-ann = TAnn[TNum[7], checkPositive];
-TNumValue[TReduce[ann]]
+mkSpec[input_, target_] := TBri[f |-> TOp2["Eq", TApp[f, TNum[input]], TNum[target]]];
+mkCompose[] := Module[{g, h},
+  g = TSup[TLam[x |-> TOp2["Add", x, TNum[1]]], TSup[TLam[x |-> TOp2["Mul", x, TNum[2]]],
+      TSup[TLam[x |-> TOp2["Mul", x, TNum[3]]], TLam[x |-> TOp2["Add", x, TNum[5]]]]]];
+  h = TSup[TLam[x |-> TOp2["Add", x, TNum[1]]], TSup[TLam[x |-> TOp2["Mul", x, TNum[2]]],
+      TSup[TLam[x |-> TOp2["Mul", x, TNum[3]]], TLam[x |-> TOp2["Add", x, TNum[5]]]]]];
+  TLam[x |-> TApp[g, TApp[h, x]]]];
+c1 = TNumValue /@ TCollapse[TAnn[mkCompose[], mkSpec[3, 13]]];
+c2 = TNumValue /@ TCollapse[TAnn[mkCompose[], mkSpec[1, 7]]];
+solution = c1 * c2;
+{"candidates" -> Length[solution], "matches" -> Total[solution]}
 ```
 
-**ANN-LAM (commutation)**: If $T = \lambda x.\, \text{body}$, the annotation distributes inward — checking each part of the function recursively:
+### From predicates to dependent types
+
+The examples above use bridges as flat predicates: $\theta f.\, \text{check}(f)$. Full ICC goes further — the bridge body can contain **nested annotations**, distributing type checks inward via the ANN-LAM commutation rule:
 
 $\{v : \lambda x.T\} \;\to\; \lambda x.\,\{(v\;\$k) : T[x := \theta\$k.x]\}$
 
-This is **bidirectional type inference** emerging from interaction rules. No separate type checker needed.
-
-### Typed search: pruning candidates
-
-In a typed SupGen search, each candidate is annotated with its required type. When reduction encounters a type mismatch (an annotation that can't simplify), the branch gets stuck and is erased:
-
-```
-candidates = SUP(f1, f2, f3, f4)
-typed = {candidates : (Nat → Nat)}       ← annotation flows inward via ANN-LAM
-                                            ill-typed branches → stuck → ERA
-survivors = collapse(typed)               ← only well-typed functions remain
-```
-
-The type system acts as a **compile-time filter** on the search space. For program ASTs, most random trees are garbage — they divide by zero, produce wrong shapes, or violate invariants. Types prune them for free.
-
-### Self types: what makes ICC unique
-
-Standard type theory (Calculus of Constructions) cannot express inductive types as a primitive — it needs axioms. ICC's **Ind** type encodes induction directly:
-
-$\text{Ind}\;A\;B = \theta f.\,\lambda x.\,\{(f\;\{x : A\}) : (B\;f\;x)\}$
-
-The $f$ in $B\;f\;x$ is the function being typed — it appears in its own return type. This self-reference is what makes inductive proofs possible: a recursive function's type can express "I work correctly on all recursive calls."
-
-Church-encoded natural numbers, booleans, lists, and equality proofs are all instances of this pattern. SupGen can search over programs of these types, synthesizing functions that are *provably correct by construction*.
-
-```wolfram
-Grid[{
-  {Style["Type", Bold], Style["ICC Encoding", Bold], Style["What it enables", Bold]},
-  {"Any", Row[{"\[Theta]", "x. x"}], "Top type \[Dash] accepts anything"},
-  {Row[{"A ", "\[RightArrow]", " B"}], Row[{"\[Theta]", "f. \[Lambda]x. {(f {x:A}) : B}"}], "Simple function types"},
-  {Row[{"\[CapitalPi](x:A). B(x)"}], Row[{"\[Theta]", "f. \[Lambda]x. {(f {x:A}) : (B x)}"}], "Dependent functions (polymorphism)"},
-  {Row[{"\[CapitalPi]f(x:A). B(f,x)"}], Row[{"\[Theta]", "f. \[Lambda]x. {(f {x:A}) : (B f x)}"}], "Self types (induction, recursion)"},
-  {Row[{"\[CapitalSigma](x:A). B(x)"}], Row[{"\[Theta]", "p. (p \[Lambda]fst.\[Lambda]snd.\[Lambda]p(p {fst:A} {snd:(B fst)}))"}], "Dependent pairs (existentials)"}
-}, Frame -> All, Alignment -> Left, Spacings -> {2, 0.8},
-  Background -> {None, {LightDarkSwitched[GrayLevel[0.9], GrayLevel[0.2]], None}},
-  ItemStyle -> Directive[FontSize -> 11]]
-```
+This turns the type $\lambda A.\lambda B.\,\theta f.\,\lambda x.\,\{(f\;\{x:A\}) : B\}$ into a **bidirectional type checker** that verifies $f$ maps $A$-typed inputs to $B$-typed outputs — with no separate type-checking pass. The return type can depend on the input (**Pi type**: $B(x)$) or on the function itself (**self type**: $B(f,x)$), enabling polymorphism and induction as derived concepts rather than axioms.
 
 ---
 

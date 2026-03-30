@@ -717,6 +717,72 @@ EXTERN_C DLLEXPORT int thvmCollapse(
     return LIBRARY_NO_ERROR;
 }
 
+// thvmCollapsePar[termId, baseOutId, nThreads] → Integer (count)
+EXTERN_C DLLEXPORT int thvmCollapsePar(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint term_id  = MArgument_getInteger(args[0]);
+    mint base_id  = MArgument_getInteger(args[1]);
+    mint nthreads = MArgument_getInteger(args[2]);
+
+    CollapseResult cr = thvm_collapse_par(g_ctx, get_term(term_id), (u32)nthreads);
+    for (u32 i = 0; i < cr.count; i++) {
+        set_term(base_id + (mint)i, cr.terms[i]);
+    }
+    MArgument_setInteger(res, (mint)cr.count);
+    thvm_collapse_free(&cr);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmCollapseGrouped[termId, baseOutId] → MTensor (packed path data)
+// Stores leaf terms at baseOutId+0..count-1 (like thvmCollapse).
+// Returns packed integer tensor: {count, pathLen0, label0, branch0, ..., -1, pathLen1, ...}
+// where -1 separates leaves. Labels are SUP labels, branches are 0(left)/1(right).
+EXTERN_C DLLEXPORT int thvmCollapseGrouped(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint term_id = MArgument_getInteger(args[0]);
+    mint base_id = MArgument_getInteger(args[1]);
+
+    GroupedCollapseResult gr = thvm_collapse_grouped(g_ctx, get_term(term_id));
+
+    // Store leaf terms in registry
+    for (u32 i = 0; i < gr.count; i++)
+        set_term(base_id + (mint)i, gr.leaves[i].term);
+
+    // Compute packed size: count + sum(1 + 2*pathLen + 1) per leaf
+    // Format: [count, pathLen_i, label, branch, label, branch, ..., -1, ...]
+    mint packed_size = 1;  // count
+    for (u32 i = 0; i < gr.count; i++)
+        packed_size += 1 + 2 * (mint)gr.leaves[i].path_len + 1;  // pathLen + pairs + sentinel
+
+    mint dims[1] = { packed_size > 0 ? packed_size : 1 };
+    MTensor packedT;
+    libData->MTensor_new(MType_Integer, 1, dims, &packedT);
+    mint *data = libData->MTensor_getIntegerData(packedT);
+
+    data[0] = (mint)gr.count;
+    mint pos = 1;
+    for (u32 i = 0; i < gr.count; i++) {
+        data[pos++] = (mint)gr.leaves[i].path_len;
+        for (u32 j = 0; j < gr.leaves[i].path_len; j++) {
+            data[pos++] = (mint)gr.leaves[i].path[j].label;
+            data[pos++] = (mint)gr.leaves[i].path[j].branch;
+        }
+        data[pos++] = -1;  // sentinel
+    }
+
+    MArgument_setMTensor(res, packedT);
+    thvm_collapse_grouped_free(&gr);
+    return LIBRARY_NO_ERROR;
+}
+
 // thvmNum[outId, value] → Void — create TAG_NUM integer term
 EXTERN_C DLLEXPORT int thvmNum(
     WolframLibraryData libData, mint argc, MArgument *args, MArgument res)

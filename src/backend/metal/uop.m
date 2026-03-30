@@ -224,7 +224,7 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
 
     if (!has_reduce) {
         // Pure elementwise: load leaves, apply ops, store
-        u32 vals[UOP_MAX]; // val[i] = UOp for FusedOp output i
+        u32 vals[64]; // FusedOp arg indices: max n_leaves(32) + n_ops(32) // val[i] = UOp for FusedOp output i
         for (u32 li = 0; li < n_leaves; li++) {
             u32 idx = uop_build_index(k, leaf_views[li], coords, rank, full_shape);
             vals[li] = uop_emit(k, KOP_LOAD, idx, 0, 0, 1 + li); // buf 0=out, 1..=leaves
@@ -252,7 +252,7 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
     }
 
     // Load leaves + apply pre-reduce ops (inside loop)
-    u32 vals[UOP_MAX];
+    u32 vals[64]; // FusedOp arg indices: max n_leaves(32) + n_ops(32)
     for (u32 li = 0; li < n_leaves; li++) {
         u32 idx = uop_build_index(k, leaf_views[li], coords, rank, full_shape);
         vals[li] = uop_emit(k, KOP_LOAD, idx, 0, 0, 1 + li);

@@ -33,7 +33,9 @@ static inline int ws_pop(WsDeque *q, u64 *out) {
     atomic_store_explicit(&q->bot, b, memory_order_relaxed);
     atomic_thread_fence(memory_order_seq_cst);
     u64 t = atomic_load_explicit(&q->top, memory_order_relaxed);
-    if (t <= b) {
+    // Signed comparison: b = old_bot - 1 may underflow to UINT64_MAX
+    // when deque was empty (bot==0). (i64)(b-t) < 0 catches this safely.
+    if ((int64_t)(b - t) >= 0) {
         *out = q->buf[b & q->mask];
         if (t == b) {
             // Last element — race with thief

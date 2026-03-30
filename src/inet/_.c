@@ -199,72 +199,97 @@ void thvm_collapse_grouped_free(GroupedCollapseResult *gr) {
     gr->count = gr->cap = 0;
 }
 
-// Parallel collapse: distribute SUP branches across threads
+// Parallel collapse via Chase-Lev work-stealing deques.
+// Each worker owns a deque: push SUP children (LIFO for locality),
+// idle workers steal from others (FIFO for load balance).
 #include <pthread.h>
+#include <stdatomic.h>
+#include <sched.h>
 
 typedef struct {
     TinyHVM *ctx;
-    Term *tasks;
-    u32 task_start, task_end;
-    u32 tid;
+    WsDeque  deque;
+    u32      tid;
+    u32      n_workers;
     CollapseResult result;
-} CollapseWorkerArg;
+} WSCollapseWorker;
 
-static void *collapse_worker_fn(void *arg) {
-    CollapseWorkerArg *w = (CollapseWorkerArg *)arg;
-    tl_thread_id = w->tid;
-    w->result = (CollapseResult){NULL, 0, 0};
-    for (u32 i = w->task_start; i < w->task_end; i++)
-        collapse_dfs(w->ctx, w->tasks[i], &w->result);
-    return NULL;
+static WSCollapseWorker ws_cw[16];
+static _Atomic(i32)     ws_remaining;  // tasks in-flight + in deques
+
+static inline void ws_store_leaf(WSCollapseWorker *w, Term t) {
+    if (w->result.count >= w->result.cap) {
+        w->result.cap = w->result.cap ? w->result.cap * 2 : 256;
+        w->result.terms = realloc(w->result.terms, w->result.cap * sizeof(Term));
+    }
+    w->result.terms[w->result.count++] = t;
 }
 
-// Collect top-level SUP branches (non-reducing walk of already-reduced SUP tree)
-static void collect_sup_branches(TinyHVM *ctx, Term t, Term **out, u32 *count, u32 *cap, u32 depth) {
-    if (depth > 0 && term_tag(t) == TAG_SUP) {
-        u64 loc = term_val(t);
-        collect_sup_branches(ctx, heap_read(ctx, loc + 0), out, count, cap, depth - 1);
-        collect_sup_branches(ctx, heap_read(ctx, loc + 1), out, count, cap, depth - 1);
+static inline void ws_process(WSCollapseWorker *w, Term task) {
+    Term reduced = thvm_reduce(w->ctx, task);
+    if (term_tag(reduced) == TAG_SUP) {
+        u64 loc = term_val(reduced);
+        // +2 children -1 self = net +1
+        atomic_fetch_add_explicit(&ws_remaining, 1, memory_order_relaxed);
+        ws_push(&w->deque, heap_read(w->ctx, loc + 0));
+        ws_push(&w->deque, heap_read(w->ctx, loc + 1));
     } else {
-        if (*count >= *cap) {
-            *cap = *cap ? *cap * 2 : 16;
-            *out = realloc(*out, *cap * sizeof(Term));
-        }
-        (*out)[(*count)++] = t;
+        ws_store_leaf(w, reduced);
+        atomic_fetch_sub_explicit(&ws_remaining, 1, memory_order_release);
     }
+}
+
+static void *ws_collapse_fn(void *arg) {
+    WSCollapseWorker *w = (WSCollapseWorker *)arg;
+    tl_thread_id = w->tid;
+    u32 idle_spins = 0;
+
+    for (;;) {
+        u64 task;
+        // Try own deque (LIFO — cache-friendly depth-first)
+        if (ws_pop(&w->deque, &task)) {
+            ws_process(w, (Term)task);
+            idle_spins = 0;
+            continue;
+        }
+        // Try stealing from others (FIFO — breadth-first load balance)
+        int found = 0;
+        for (u32 i = 1; i < w->n_workers; i++) {
+            u32 victim = (w->tid + i) % w->n_workers;
+            if (ws_steal(&ws_cw[victim].deque, &task)) {
+                ws_process(w, (Term)task);
+                found = 1;
+                idle_spins = 0;
+                break;
+            }
+        }
+        if (found) continue;
+        // No work — check termination
+        if (atomic_load_explicit(&ws_remaining, memory_order_acquire) <= 0) break;
+        if (++idle_spins > 64) { sched_yield(); idle_spins = 0; }
+    }
+    return NULL;
 }
 
 CollapseResult thvm_collapse_par(TinyHVM *ctx, Term t, u32 n_threads) {
     if (n_threads <= 1) return thvm_collapse(ctx, t);
 
-    // First reduce root to expose top-level SUP tree
-    Term reduced = thvm_reduce(ctx, t);
-    if (term_tag(reduced) != TAG_SUP)  {
-        CollapseResult cr = {malloc(sizeof(Term)), 1, 1};
-        cr.terms[0] = reduced;
-        return cr;
-    }
+    // Phase 1: Serial reduce-and-collect.
+    // collapse_dfs fires ALL interaction rules (serial — required because branches
+    // share heap state via DUP nodes). After this, cr contains flat WHNF leaves.
+    CollapseResult cr = {NULL, 0, 0};
+    collapse_dfs(ctx, t, &cr);
+    if (cr.count == 0) return cr;
 
-    // Collect branches from the top-level SUP tree (depth up to ~14 levels = 16K tasks max)
-    Term *tasks = NULL;
-    u32 task_count = 0, task_cap = 0;
-    u32 target_depth = 1;
-    while ((1u << target_depth) < n_threads * 4 && target_depth < 14) target_depth++;
-    collect_sup_branches(ctx, reduced, &tasks, &task_count, &task_cap, target_depth);
-
-    if (task_count <= 1 || n_threads <= 1) {
-        // Not enough work to parallelize — fall back to serial
-        free(tasks);
-        CollapseResult cr = {NULL, 0, 0};
-        collapse_dfs(ctx, reduced, &cr);
-        return cr;
-    }
-
-    // Set up per-thread heap banks for safe concurrent allocation
+    // Phase 2: Parallel final-reduce on collected leaves.
+    // Leaves are typically already NUMs/TENs (WHNF atoms), so this is trivially
+    // fast. But if any leaf is a complex term (e.g., from grouped collapse that
+    // stopped early), threads can reduce them independently since they no longer
+    // share DUP structure after collapse_dfs resolved all SUPs.
     u32 nt = (n_threads < 16) ? n_threads : 16;
-    if (nt > task_count) nt = task_count;
+    if (cr.count < nt * 64) return cr;  // not enough work to justify threading
 
-    // Init thread banks
+    // Init per-thread heap banks
     u64 heap_per = (HEAP_CAP - ctx->heap_pos) / nt;
     u64 hbase = ctx->heap_pos;
     u32 tensors_per = (MAX_TENSORS - ctx->tensor_count) / nt;
@@ -282,36 +307,39 @@ CollapseResult thvm_collapse_par(TinyHVM *ctx, Term t, u32 n_threads) {
     }
     ctx->n_threads = nt;
 
-    // Distribute tasks across workers
-    u32 per_worker = task_count / nt;
-    u32 leftover = task_count % nt;
-    CollapseWorkerArg *args = calloc(nt, sizeof(CollapseWorkerArg));
-    pthread_t *threads = calloc(nt, sizeof(pthread_t));
-    u32 pos = 0;
+    // Init work-stealing workers and seed with collected leaves
     for (u32 i = 0; i < nt; i++) {
-        args[i].ctx = ctx;
-        args[i].tasks = tasks;
-        args[i].tid = i;
-        args[i].task_start = pos;
-        u32 chunk = per_worker + (i < leftover ? 1 : 0);
-        args[i].task_end = pos + chunk;
-        pos += chunk;
+        ws_init(&ws_cw[i].deque);
+        ws_cw[i].ctx = ctx;
+        ws_cw[i].tid = i;
+        ws_cw[i].n_workers = nt;
+        ws_cw[i].result = (CollapseResult){NULL, 0, 0};
     }
 
-    // Spawn workers (main thread does worker 0's share)
-    for (u32 i = 1; i < nt; i++)
-        pthread_create(&threads[i], NULL, collapse_worker_fn, &args[i]);
+    // Distribute leaves round-robin across worker deques
+    u32 seeded = 0;
+    for (u32 i = 0; i < cr.count; i++) {
+        ws_push(&ws_cw[i % nt].deque, cr.terms[i]);
+        seeded++;
+    }
+    atomic_store_explicit(&ws_remaining, (i32)seeded, memory_order_release);
 
-    // Main thread = worker 0
+    // Spawn workers (main thread = worker 0)
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 32 * 1024 * 1024);
+    pthread_t threads[16];
+    for (u32 i = 1; i < nt; i++)
+        pthread_create(&threads[i], &attr, ws_collapse_fn, &ws_cw[i]);
+    pthread_attr_destroy(&attr);
+
     tl_thread_id = 0;
-    args[0].result = (CollapseResult){NULL, 0, 0};
-    for (u32 i = args[0].task_start; i < args[0].task_end; i++)
-        collapse_dfs(ctx, tasks[i], &args[0].result);
+    ws_collapse_fn(&ws_cw[0]);
 
     for (u32 i = 1; i < nt; i++)
         pthread_join(threads[i], NULL);
 
-    // Finalize banks: update global watermarks
+    // Finalize banks
     u64 max_heap = ctx->heap_pos;
     u32 max_tensor = ctx->tensor_count;
     for (u32 i = 0; i < nt; i++) {
@@ -324,22 +352,20 @@ CollapseResult thvm_collapse_par(TinyHVM *ctx, Term t, u32 n_threads) {
     ctx->tensor_count = max_tensor;
     ctx->n_threads = 0;
 
-    // Merge results
+    // Free the serial-phase results and merge parallel results
+    free(cr.terms);
     u32 total = 0;
-    for (u32 i = 0; i < nt; i++) total += args[i].result.count;
-    CollapseResult cr = {malloc(total * sizeof(Term)), 0, total};
+    for (u32 i = 0; i < nt; i++) total += ws_cw[i].result.count;
+    cr = (CollapseResult){malloc(total * sizeof(Term)), 0, total};
     for (u32 i = 0; i < nt; i++) {
-        if (args[i].result.count > 0) {
-            memcpy(cr.terms + cr.count, args[i].result.terms,
-                   args[i].result.count * sizeof(Term));
-            cr.count += args[i].result.count;
+        if (ws_cw[i].result.count > 0) {
+            memcpy(cr.terms + cr.count, ws_cw[i].result.terms,
+                   ws_cw[i].result.count * sizeof(Term));
+            cr.count += ws_cw[i].result.count;
         }
-        free(args[i].result.terms);
+        free(ws_cw[i].result.terms);
     }
 
-    free(tasks);
-    free(args);
-    free(threads);
     return cr;
 }
 

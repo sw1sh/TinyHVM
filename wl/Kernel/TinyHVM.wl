@@ -62,7 +62,16 @@ TAnn::usage = "TAnn[term, type] creates an annotation term {term : type}. Transp
 TDsu::usage = "TDsu[labelExpr, a, b] creates a dynamic SUP. Label is an expression reduced at interaction time.";
 TDdu::usage = "TDdu[labelExpr, val, bod] creates a dynamic DUP. Label is an expression, bod receives both copies.";
 TInc::usage = "TInc[term] creates a priority wrapper. Transparent to reduce, lower priority in collapse.";
-TCollapse::usage = "TCollapse[term] extracts all branches from a superposed term into a flat list.";
+TCollapse::usage = "TCollapse[term] extracts all branches from a superposed term into a flat list (priority-queue, respects INC).";
+TCollapsePar::usage = "TCollapsePar[term, nThreads] parallel work-stealing collapse. Falls back to TCollapse for nThreads<=1.";
+TCollapseGrouped::usage = "TCollapseGrouped[term] collapses and returns <|\"values\" -> {TTerm...}, \"bf\" -> {<|label->branch,...|>...}|>.  Each bf (branch function) is an Association mapping SUP labels to branch choices (0=left, 1=right).";
+TGroupBy::usage = "TGroupBy[gr, {labels}] partitions grouped collapse results by branch choices on the given label subset.  Returns <|{b1,b2,...} -> {values...}, ...|>.";
+TBranchFunction::usage = "TBranchFunction[gr, i] returns the branch function (label->branch Association) for the i-th result.";
+TGroupings::usage = "TGroupings[{a,b,c,...}, f] builds a single SUP term encoding all Groupings (binary tree parenthesizations) of the elements under f.  With TTerm elements, atoms are shared (OK for TNum etc).  With Function elements (factories), each leaf calls its factory for a fresh TTerm — correct for lambdas/SUPs.";
+
+(* ── Synthesis ─────────────────────────────────────────────────────────── *)
+
+FindBooleanAlternative::usage = "FindBooleanAlternative[expr, {op1, op2, ...}] finds Boolean expressions equivalent to expr using only the given operators.  Method->\"TinyHVM\" uses superposition synthesis (all candidates reduced in parallel via DUP-SUP annihilation).";
 
 (* ── Autograd ───────────────────────────────────────────────────────────── *)
 
@@ -247,6 +256,8 @@ thvmDsuFn = None;
 thvmDduFn = None;
 thvmIncFn = None;
 thvmCollapseFn = None;
+thvmCollapseParFn = None;
+thvmCollapseGroupedFn = None;
 thvmNumFn = None;
 thvmOp2Fn = None;
 thvmNumValueFn = None;
@@ -357,6 +368,10 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
         {Integer, Integer}, "Void"];
     thvmCollapseFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmCollapse",
         {Integer, Integer}, Integer];
+    thvmCollapseParFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmCollapsePar",
+        {Integer, Integer, Integer}, Integer];
+    thvmCollapseGroupedFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmCollapseGrouped",
+        {Integer, Integer}, {Integer, 1}];
     thvmNumFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmNum",
         {Integer, Integer}, "Void"];
     thvmOp2Fn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmOp2",
@@ -745,14 +760,91 @@ TInc[term_TTerm] := Module[{out = allocId[]},
     TTerm[out]
 ];
 
-(* TCollapse[term] — extract all branches from a superposed term as a flat list *)
+(* TCollapse[term] — PQ-based collapse, respects INC priority *)
 TCollapse[t_TTerm] := Module[{base, count},
     loadLibrary[];
     base = allocId[];
-    (* Reserve block of IDs for collapsed leaves *)
     $nextId += 255;
     count = thvmCollapseFn[t[[1]], base];
     Table[TTerm[base + i], {i, 0, count - 1}]
+];
+
+(* TCollapsePar[term, nThreads] — parallel work-stealing collapse *)
+TCollapsePar[t_TTerm, nThreads_Integer:4] := Module[{base, count},
+    loadLibrary[];
+    base = allocId[];
+    $nextId += 255;
+    count = thvmCollapseParFn[t[[1]], base, nThreads];
+    Table[TTerm[base + i], {i, 0, count - 1}]
+];
+
+(* TCollapseGrouped[term] — collapse with label-path tracking.
+   Returns <|"values" -> {TTerm...}, "bf" -> {<|label->branch,...|>...}|>
+   Each bf (branch function) maps SUP labels to branch choices (0=left, 1=right).
+   Recover bf for result i:  gr["bf"][[i]]
+   Look up branch for label L: gr["bf"][[i]][L] *)
+TCollapseGrouped[t_TTerm] := Module[{base, packed, count, pos, values, bfs},
+    loadLibrary[];
+    base = allocId[];
+    $nextId += 255;
+    packed = thvmCollapseGroupedFn[t[[1]], base];
+    count = packed[[1]];
+    values = Table[TTerm[base + i], {i, 0, count - 1}];
+    pos = 2;
+    bfs = Table[Module[{plen, bf},
+        plen = packed[[pos]]; pos++;
+        bf = Association @@ Table[
+            packed[[pos + 2 j]] -> packed[[pos + 2 j + 1]],
+            {j, 0, plen - 1}];
+        pos += 2 plen + 1;
+        bf
+    ], {i, count}];
+    <|"values" -> values, "bf" -> bfs|>
+];
+
+(* TGroupBy[gr, {labels}] — partition results by branch choices on label subset.
+   Returns <|{b1,b2,...} -> {values...}, ...|> *)
+TGroupBy[gr_Association, labels_List] :=
+    GroupBy[
+        Thread[{gr["bf"], gr["values"]}],
+        Lookup[First[#], labels] &,
+        Map[Last]
+    ];
+
+(* TBranchFunction[gr, i] — the branch function for the i-th collapsed result *)
+TBranchFunction[gr_Association, i_Integer] := gr["bf"][[i]];
+
+(* TGroupings[elems, f] — Groupings as a lazy SUP term.
+   Builds one superposed TTerm encoding all C(n-1) parenthesizations (Catalan number).
+   f must be (TTerm, TTerm) -> TTerm, e.g. TOp2["Add", ##]&.
+   Each structural choice (split point) gets a fresh label — independent dimensions.
+   Collapse to enumerate; TCollapseGrouped to recover which splits were chosen.
+
+   TTerm form: elements are atoms (TNum etc), shared freely across alternatives.
+   Function form: elements are factories called at each leaf — correct for non-atomic
+   elements (lambdas, SUPs) that cannot be shared across collapse branches. *)
+TGroupings[{x_TTerm}, _] := x;
+TGroupings[{x_TTerm, y_TTerm}, f_] := f[x, y];
+TGroupings[elems:{__TTerm}, f_] := With[{
+    alts = Table[
+        f[TGroupings[elems[[;; k]], f], TGroupings[elems[[k + 1 ;;]], f]],
+        {k, 1, Length[elems] - 1}]},
+    iSupTree[alts]
+];
+(* Factory form: each element is a zero-arg Function creating a fresh TTerm *)
+TGroupings[facs:{__Function}, f_] := iGroupFacs[facs, f];
+iGroupFacs[{fac_Function}, _] := fac[];
+iGroupFacs[{f1_Function, f2_Function}, f_] := f[f1[], f2[]];
+iGroupFacs[facs:{__Function}, f_] := With[{
+    alts = Table[
+        f[iGroupFacs[facs[[;; k]], f], iGroupFacs[facs[[k + 1 ;;]], f]],
+        {k, 1, Length[facs] - 1}]},
+    iSupTree[alts]
+];
+(* Encode a list of alternatives as a balanced binary SUP tree *)
+iSupTree[{x_}] := x;
+iSupTree[alts_List] := With[{mid = Ceiling[Length[alts] / 2]},
+    TSup[TFreshLabel[], iSupTree[alts[[;; mid]]], iSupTree[alts[[mid + 1 ;;]]]]
 ];
 
 TNum[n_Integer] := Module[{out = allocId[]},
@@ -1077,6 +1169,7 @@ TReduceSteps[t_TTerm, n_Integer] := TReduceSteps[ToTTensor[t], n];
 Get[FileNameJoin[{DirectoryName[$InputFileName], "Visualization.wl"}]];
 Get[FileNameJoin[{DirectoryName[$InputFileName], "Layers.wl"}]];
 Get[FileNameJoin[{DirectoryName[$InputFileName], "NetCompile.wl"}]];
+Get[FileNameJoin[{DirectoryName[$InputFileName], "Synthesis.wl"}]];
 
 End[];
 EndPackage[];

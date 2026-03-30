@@ -8,7 +8,8 @@
 typedef enum {
     KOP_NOOP = 0,
     KOP_GID,     // grid position: imm.u = axis (0=x, 1=y, 2=z)
-    KOP_CONST,   // constant: imm.f = value
+    KOP_CONST_F, // float constant: imm.f = value
+    KOP_CONST_U, // uint constant: imm.u = value
     KOP_RANGE,   // reduce loop: imm.u = trip count. arg[0] = body end marker
     KOP_ENDRANGE,// close reduce loop
     KOP_LOAD,    // load: imm.u = buf_idx, arg[0] = index
@@ -55,21 +56,23 @@ static u32 uop_emit_f(UOpKernel *k, KOpType type, u32 a0, u32 a1, u32 a2, f32 im
     return id;
 }
 
-// Build index expression for a leaf view using coordinates
-// coords[d] = UOp id for coordinate d. Returns UOp id for the flat index.
+// Build index expression for a leaf view using coordinates.
+// coords[d] = UOp id for coordinate d (uint). Returns UOp id for the flat index (uint).
 static u32 uop_build_index(UOpKernel *k, const View *v, u32 *coords, u32 rank) {
-    // Start with offset
-    u32 idx = uop_emit_f(k, KOP_CONST, 0, 0, 0, (f32)v->offset);
+    // Start with offset as uint constant
+    u32 off = (v->offset > 0) ? (u32)v->offset : 0;
+    u32 idx = uop_emit(k, KOP_CONST_U, 0, 0, 0, off);
+
     for (u32 d = 0; d < rank && d < v->shape.rank; d++) {
         if (v->strides[d] == 0 || v->shape.dims[d] == 1) continue;
+        // idx = idx + coords[d] * stride
+        u32 term;
         if (v->strides[d] == 1) {
-            // idx += coord
-            idx = uop_emit(k, KOP_ALU, idx, coords[d], 0, UOP_ADD);
+            term = coords[d];
         } else {
-            // idx += coord * stride
-            u32 scaled = uop_emit(k, KOP_IDX, coords[d], 0, 0, (u32)v->strides[d]);
-            idx = uop_emit(k, KOP_ALU, idx, scaled, 0, UOP_ADD);
+            term = uop_emit(k, KOP_IDX, coords[d], 0, 0, (u32)v->strides[d]);
         }
+        idx = uop_emit(k, KOP_IDX, idx, term, 0, 1); // idx*1 + term = idx + term
     }
     return idx;
 }
@@ -114,7 +117,7 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
         for (int oi = (int)n_out - 1; oi >= 0; oi--) {
             u32 d = out_dims[oi];
             u32 dim = full_shape->dims[d];
-            if (dim == 1) { coords[d] = uop_emit_f(k, KOP_CONST, 0,0,0, 0.f); continue; }
+            if (dim == 1) { coords[d] = uop_emit(k, KOP_CONST_U, 0,0,0, 0); continue; }
             coords[d] = uop_emit(k, KOP_MOD, rem, 0, 0, dim);
             if (oi > 0) rem = uop_emit(k, KOP_DIV, rem, 0, 0, dim);
         }
@@ -160,15 +163,25 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
         u32 a = vals[ops[i].arg_a], b = vals[ops[i].arg_b];
         vals[n_leaves + i] = uop_emit(k, KOP_ALU, a, b, 0, ops[i].uop);
     }
-    acc = uop_emit(k, KOP_ACC, acc, vals[n_leaves + pre_ops - 1], 0,
+    u32 acc_init = acc; // save ACC_INIT id — this is the variable that persists
+    uop_emit(k, KOP_ACC, acc, vals[n_leaves + pre_ops - 1], 0,
                    reduce->reduce_type);
     uop_emit(k, KOP_ENDRANGE, range, 0, 0, 0);
 
-    // Post-reduce ops (if any)
-    u32 result = acc;
+    // Post-reduce ops: execute OUTSIDE the reduce loop using acc result.
+    // ALL leaf references must be re-loaded since the in-loop loads are out of scope.
+    u32 result = acc_init;
     if (reduce->post_reduce_start > 0 && reduce->post_reduce_start < n_ops) {
         u32 prs = reduce->post_reduce_start;
-        vals[n_leaves + prs - 1] = acc; // post-reduce chain starts from acc
+        // Re-load ALL leaves with output-only coordinates
+        for (u32 li = 0; li < n_leaves; li++) {
+            u32 pidx = uop_build_index(k, leaf_views[li], coords, rank);
+            vals[li] = uop_emit(k, KOP_LOAD, pidx, 0, 0, 1 + li);
+        }
+        // Map the pre-reduce accumulator result
+        u32 n_pre = prs;
+        for (u32 i = 0; i < n_pre; i++)
+            vals[n_leaves + i] = acc_init; // any pre-reduce op ref → acc
         for (u32 i = prs; i < n_ops; i++) {
             u32 a = vals[ops[i].arg_a], b = vals[ops[i].arg_b];
             vals[n_leaves + i] = uop_emit(k, KOP_ALU, a, b, 0, ops[i].uop);
@@ -202,10 +215,11 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
             u32 vb = (b < n_leaves) ? vals[b] : (b == n_leaves) ? result : vals[b];
             vals[n_leaves + i] = uop_emit(k, KOP_ALU, va, vb, 0, ops[i].uop);
         }
-        acc2 = uop_emit(k, KOP_ACC, acc2, vals[n_leaves + n_ops - 1], 0,
+        u32 acc2_init = acc2;
+        uop_emit(k, KOP_ACC, acc2, vals[n_leaves + n_ops - 1], 0,
                         reduce->reduce2_type);
         uop_emit(k, KOP_ENDRANGE, range2, 0, 0, 0);
-        result = acc2;
+        result = acc2_init;
     }
 
     u32 out_idx = uop_emit(k, KOP_IDX, gid, 0, 0, 1);
@@ -232,15 +246,21 @@ static NSString *uop_render_msl(const UOpKernel *k) {
         switch (op->type) {
             case KOP_GID:
                 [s appendFormat:@"%@uint v%u=gid_x;\n", indent, i]; break;
-            case KOP_CONST:
+            case KOP_CONST_U:
+                [s appendFormat:@"%@uint v%u=%uu;\n", indent, i, op->imm.u]; break;
+            case KOP_CONST_F:
                 [s appendFormat:@"%@float v%u=%.8ef;\n", indent, i, op->imm.f]; break;
             case KOP_MOD:
                 [s appendFormat:@"%@uint v%u=v%u%%%uu;\n", indent, i, op->arg[0], op->imm.u]; break;
             case KOP_DIV:
                 [s appendFormat:@"%@uint v%u=v%u/%uu;\n", indent, i, op->arg[0], op->imm.u]; break;
             case KOP_IDX:
-                if (op->imm.u == 1)
+                if (op->imm.u == 1 && op->arg[1] == 0)
                     [s appendFormat:@"%@uint v%u=v%u;\n", indent, i, op->arg[0]];
+                else if (op->imm.u == 1)
+                    [s appendFormat:@"%@uint v%u=v%u+v%u;\n", indent, i, op->arg[0], op->arg[1]];
+                else if (op->arg[1] == 0)
+                    [s appendFormat:@"%@uint v%u=v%u*%uu;\n", indent, i, op->arg[0], op->imm.u];
                 else
                     [s appendFormat:@"%@uint v%u=v%u*%uu+v%u;\n", indent, i,
                         op->arg[0], op->imm.u, op->arg[1]]; break;
@@ -281,7 +301,7 @@ static NSString *uop_render_msl(const UOpKernel *k) {
                     [s appendFormat:@"%@v%u=max(v%u,v%u);\n", indent, acc_var, acc_var, val];
                 else
                     [s appendFormat:@"%@v%u+=v%u;\n", indent, acc_var, val];
-                [s appendFormat:@"%@float v%u=v%u;\n", indent, i, acc_var]; // SSA alias
+                // No SSA alias — references to this ACC resolve to acc_var
             } break;
             default: break;
         }

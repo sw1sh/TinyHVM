@@ -672,6 +672,12 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
     if (getenv("THVM_DUMP_CODEGEN")) fprintf(stderr, "--- codegen (n_ops=%u n_leaves=%u n_side=%u cmd=%u) ---\n%s\n---\n", n_ops, n_leaves, n_side_outputs, jit.n_cmds, [src UTF8String]);
     NSError *err;
     id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
+    if (!lib && _use_uop && n_side_outputs == 0) {
+        // UOp MSL failed to compile — fall back to old codegen
+        src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views,
+                                 full_shape, reduce, side_op_indices, n_side_outputs);
+        lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
+    }
     if (!lib) { NSLog(@"codegen error: %@\n%@", err, src); return nil; }
     id<MTLComputePipelineState> pipe =
         [mtl_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"K"]

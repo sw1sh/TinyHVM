@@ -140,6 +140,10 @@ static void grad_prescan(TinyHVM *ctx, Term loss);
 // ── grad/ — thvm_grad, thvm_grad_multi (pure IC term constructors) ────────────
 #include "grad/_.c"
 
+// ── parallel/ — work-stealing deque + per-thread state ──────────────────────
+#include "parallel/wsdeque.c"
+#include "parallel/workers.c"
+
 // ── inet/ — interaction combinator term constructors ─────────────────────────
 #include "inet/_.c"
 

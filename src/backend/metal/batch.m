@@ -14,6 +14,9 @@ static void metal_flush(void) {
         clock_gettime(CLOCK_MONOTONIC, &t0);
         [batch_cmd commit];
         [batch_cmd waitUntilCompleted];
+        if (batch_cmd.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "GPU ERROR: %s\n", [[batch_cmd.error localizedDescription] UTF8String]);
+        }
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double ms = (double)(t1.tv_sec-t0.tv_sec)*1000.0 + (double)(t1.tv_nsec-t0.tv_nsec)/1e6;
         flush_total_ms += ms;

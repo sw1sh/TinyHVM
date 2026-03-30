@@ -31,8 +31,8 @@ static u64 mem_plan_sizes[MAX_PLAN_ENTRIES]; // alloc size
 static u32 mem_plan_count = 0;
 static u32 mem_plan_cursor = 0;
 static int mem_plan_active = 0;
-static id<MTLBuffer> mem_plan_buf = nil; // ONE big pre-allocated buffer
-static u64 mem_plan_buf_size = 0;
+static id<MTLHeap> mem_plan_heap = nil; // Metal heap for suballocation
+static u64 mem_plan_heap_size = 0;
 
 // Recording: track large alloc sequence + lifetimes during step 0
 static u32 plan_alloc_ids[MAX_PLAN_ENTRIES];
@@ -52,14 +52,14 @@ static u32 metal_buf_alloc(u64 bytes) {
 
     // 0. Memory plan: suballocation from ONE pre-allocated MTLBuffer.
     // Each alloc gets a unique OFFSET — no region overlap at any given time.
-    if (0 && mem_plan_active && bytes >= PLAN_MIN_BYTES &&
-        mem_plan_cursor < mem_plan_count && mem_plan_buf) {
-        u32 c = mem_plan_cursor++;
-        if (mem_plan_sizes[c] >= bytes &&
-            mem_plan_offset[c] + bytes <= mem_plan_buf_size) {
-            metal_pool.bufs[id] = mem_plan_buf;
-            metal_pool.sizes[id] = bytes; // actual needed size, not region size
-            buf_offset[id] = mem_plan_offset[c];
+    if (mem_plan_active && bytes >= PLAN_MIN_BYTES &&
+        mem_plan_cursor < mem_plan_count && mem_plan_heap) {
+        mem_plan_cursor++;
+        metal_pool.bufs[id] = [mem_plan_heap newBufferWithLength:bytes
+                                                         options:MTLResourceStorageModeShared];
+        if (metal_pool.bufs[id]) {
+            metal_pool.sizes[id] = bytes;
+            buf_offset[id] = 0;
             goto done;
         }
     }
@@ -278,11 +278,14 @@ static void metal_pool_reset(u32 keep) {
             }
         }
 
-        // Allocate (or resize) the big buffer
-        if (next_offset > mem_plan_buf_size) {
-            mem_plan_buf = [mtl_dev newBufferWithLength:next_offset
-                                               options:MTLResourceStorageModeShared];
-            mem_plan_buf_size = next_offset;
+        // Create Metal heap sized to fit all simultaneously-alive regions
+        if (next_offset > mem_plan_heap_size) {
+            MTLHeapDescriptor *desc = [[MTLHeapDescriptor alloc] init];
+            desc.size = next_offset * 2; // 2x for Metal alignment overhead
+            desc.storageMode = MTLStorageModeShared;
+            desc.hazardTrackingMode = MTLHazardTrackingModeTracked;
+            mem_plan_heap = [mtl_dev newHeapWithDescriptor:desc];
+            mem_plan_heap_size = next_offset;
         }
 
         if (reuse_count > 0)
@@ -292,13 +295,14 @@ static void metal_pool_reset(u32 keep) {
     }
 
     // Move ephemeral buffers to free list.
-    // Skip plan-buf backed slots (managed by the plan).
+    // Heap-backed buffers just get nil'd (heap manages their memory).
     for (u32 i = buf_keep; i < metal_pool.count; i++) {
         u64 sz = metal_pool.sizes[i];
         if (sz <= metal_bytes_inuse) metal_bytes_inuse -= sz;
         else metal_bytes_inuse = 0;
-        if (metal_pool.bufs[i] == mem_plan_buf) {
-            // Plan-managed region — don't free, just clear slot
+        // Heap-backed buffers: just nil the slot (heap auto-reclaims)
+        if (mem_plan_heap && metal_pool.bufs[i] &&
+            metal_pool.bufs[i].heap == mem_plan_heap) {
             metal_pool.bufs[i] = nil; metal_pool.sizes[i] = 0;
             buf_refcount[i] = 0; buf_offset[i] = 0; continue;
         }

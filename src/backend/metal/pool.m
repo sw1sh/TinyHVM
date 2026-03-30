@@ -24,19 +24,20 @@ static u16 buf_remaining_uses[MAX_BUFS];
 #define PLAN_MIN_BYTES (512 * 1024)  // plan buffers >= 512KB
 #define MAX_PLAN_ENTRIES 2048
 
-// Memory plan: maps alloc sequence N → earlier alloc M whose buffer to reuse.
-// -1 = no reuse (allocate fresh). Values are indices into the alloc sequence.
+// Memory plan: maps alloc sequence N → earlier alloc M whose OFFSET to reuse.
 static i32 mem_plan_reuse[MAX_PLAN_ENTRIES]; // reuse[N] = M or -1
+static u64 mem_plan_offset[MAX_PLAN_ENTRIES]; // byte offset in the big buffer
+static u64 mem_plan_sizes[MAX_PLAN_ENTRIES]; // alloc size
 static u32 mem_plan_count = 0;
 static u32 mem_plan_cursor = 0;
 static int mem_plan_active = 0;
+static id<MTLBuffer> mem_plan_buf = nil; // ONE big pre-allocated buffer
+static u64 mem_plan_buf_size = 0;
 
 // Recording: track large alloc sequence + lifetimes during step 0
-static u32 plan_alloc_ids[MAX_PLAN_ENTRIES]; // buf_ids in alloc order
-static u32 plan_alloc_birth[MAX_PLAN_ENTRIES]; // dispatch_counter at alloc time
+static u32 plan_alloc_ids[MAX_PLAN_ENTRIES];
+static u32 plan_alloc_birth[MAX_PLAN_ENTRIES];
 static u32 plan_alloc_count = 0;
-// Step 1+: buf_ids assigned to each plan entry (for reuse lookup)
-static u32 plan_step_bufs[MAX_PLAN_ENTRIES];
 
 #define METAL_MEM_BUDGET (4ULL * 1024 * 1024 * 1024) // 4GB hard limit
 
@@ -49,23 +50,18 @@ static u32 metal_buf_alloc(u64 bytes) {
         exit(1);
     }
 
-    // 0. Memory plan: suballocation from a single large MTLBuffer.
-    // Each alloc gets a unique offset region — no memory overlap, no GPU conflicts.
-    if (0 && mem_plan_active && bytes >= PLAN_MIN_BYTES && mem_plan_cursor < mem_plan_count) {
+    // 0. Memory plan: suballocation from ONE pre-allocated MTLBuffer.
+    // Each alloc gets a unique OFFSET — no region overlap at any given time.
+    if (0 && mem_plan_active && bytes >= PLAN_MIN_BYTES &&
+        mem_plan_cursor < mem_plan_count && mem_plan_buf) {
         u32 c = mem_plan_cursor++;
-        i32 reuse = mem_plan_reuse[c];
-        if (reuse >= 0 && (u32)reuse < c) {
-            // Reuse: take the SAME offset as the dead alloc (different time, same region)
-            u32 src_id = plan_step_bufs[reuse];
-            if (src_id && metal_pool.bufs[src_id]) {
-                metal_pool.bufs[id] = metal_pool.bufs[src_id];
-                metal_pool.sizes[id] = metal_pool.sizes[src_id];
-                buf_offset[id] = buf_offset[src_id]; // same region, different time
-                plan_step_bufs[c] = id;
-                goto done;
-            }
+        if (mem_plan_sizes[c] >= bytes &&
+            mem_plan_offset[c] + bytes <= mem_plan_buf_size) {
+            metal_pool.bufs[id] = mem_plan_buf;
+            metal_pool.sizes[id] = bytes; // actual needed size, not region size
+            buf_offset[id] = mem_plan_offset[c];
+            goto done;
         }
-        plan_step_bufs[c] = 0; // set after normal alloc below
     }
 
     // 1. Free list (from pool_reset)
@@ -103,8 +99,7 @@ done:
             plan_alloc_ids[pc] = id;
             plan_alloc_birth[pc] = dispatch_counter;
         }
-        if (mem_plan_active && mem_plan_cursor > 0 && plan_step_bufs[mem_plan_cursor-1] == 0)
-            plan_step_bufs[mem_plan_cursor-1] = id;
+        // (step 1+: plan cursor already advanced in alloc path above)
         plan_alloc_count++;
     }
 
@@ -263,27 +258,56 @@ static void metal_pool_reset(u32 keep) {
         u32 reuse_count = 0;
         for (u32 i = 0; i < mem_plan_count; i++)
             if (mem_plan_reuse[i] >= 0) reuse_count++;
+        // Assign offsets: each alloc gets a unique region. Reused allocs share
+        // the same offset as their dead predecessor (different time, same region).
+        u64 next_offset = 0;
+        #define ALIGN_4K(x) (((x) + 0xFFF) & ~0xFFFULL)
+        for (u32 a = 0; a < plan_alloc_count; a++) {
+            u32 bid = plan_alloc_ids[a];
+            u64 bsz = metal_pool.sizes[bid];
+            i32 r = mem_plan_reuse[a];
+            if (r >= 0) {
+                // Reuse: same offset as the dead alloc
+                mem_plan_offset[a] = mem_plan_offset[r];
+                mem_plan_sizes[a] = mem_plan_sizes[r]; // same region size
+            } else {
+                // Fresh: allocate new region
+                mem_plan_offset[a] = next_offset;
+                mem_plan_sizes[a] = bsz;
+                next_offset += ALIGN_4K(bsz);
+            }
+        }
+
+        // Allocate (or resize) the big buffer
+        if (next_offset > mem_plan_buf_size) {
+            mem_plan_buf = [mtl_dev newBufferWithLength:next_offset
+                                               options:MTLResourceStorageModeShared];
+            mem_plan_buf_size = next_offset;
+        }
+
         if (reuse_count > 0)
-            fprintf(stderr, "MEM_PLAN: %u allocs, %u reused\n", mem_plan_count, reuse_count);
+            fprintf(stderr, "MEM_PLAN: %u allocs, %u reused, big_buf=%.1fMB (was %.1fMB)\n",
+                mem_plan_count, reuse_count, (double)next_offset/1e6,
+                (double)(plan_alloc_count * ALIGN_4K(metal_pool.sizes[plan_alloc_ids[0]]))/1e6);
     }
 
-    // Move ephemeral buffers to free list. Dedup: shared MTLBuffers (from plan
-    // reuse) must only be added once. Skip duplicates.
+    // Move ephemeral buffers to free list.
+    // Skip plan-buf backed slots (managed by the plan).
     for (u32 i = buf_keep; i < metal_pool.count; i++) {
         u64 sz = metal_pool.sizes[i];
         if (sz <= metal_bytes_inuse) metal_bytes_inuse -= sz;
         else metal_bytes_inuse = 0;
+        if (metal_pool.bufs[i] == mem_plan_buf) {
+            // Plan-managed region — don't free, just clear slot
+            metal_pool.bufs[i] = nil; metal_pool.sizes[i] = 0;
+            buf_refcount[i] = 0; buf_offset[i] = 0; continue;
+        }
         if (metal_pool.bufs[i]) {
-            // Check if this MTLBuffer is already in the free list (shared slot)
-            int dup = 0;
-            for (u32 f = 0; f < free_count && !dup; f++)
-                if (free_list[f].buf == metal_pool.bufs[i]) dup = 1;
-            if (!dup && free_count < MAX_FREE_BUFS) {
+            if (free_count < MAX_FREE_BUFS) {
                 free_list[free_count].buf = metal_pool.bufs[i];
                 free_list[free_count].size = sz;
                 free_count++;
             }
-            // Don't [release] — ARC handles it when slot is nil'd
         }
         metal_pool.bufs[i] = nil;
         metal_pool.sizes[i] = 0;

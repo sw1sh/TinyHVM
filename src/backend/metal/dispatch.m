@@ -17,7 +17,7 @@ static void dispatch_1d_ids(id<MTLComputePipelineState> pipe,
     id<MTLComputeCommandEncoder> enc = get_encoder();
     [enc setComputePipelineState:pipe];
     for (u32 i = 0; i < n_bufs; i++)
-        [enc setBuffer:metal_pool.bufs[buf_ids[i]] offset:0 atIndex:i];
+        [enc setBuffer:metal_pool.bufs[buf_ids[i]] offset:BUF_OFFSET(buf_ids[i]) atIndex:i];
     for (u32 i = 0; i < n_params; i++)
         [enc setBytes:params[i] length:param_sizes[i] atIndex:n_bufs + i];
     NSUInteger tpg = MIN(pipe.maxTotalThreadsPerThreadgroup, (NSUInteger)numel);

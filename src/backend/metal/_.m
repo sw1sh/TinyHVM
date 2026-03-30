@@ -21,6 +21,7 @@ static void metal_dispatch_kernel(u32 dst_buf, u32 dst_numel,
 #include "conv.m"     // CNN/layout ops
 #include "optim.m"    // optimizer/pooling GPU kernels
 #include "fused.m"    // fused kernel codegen (legacy — being replaced by codegen.m)
+#include "uop.m"      // UOp IR + MSL renderer (must be before codegen for forward refs)
 #include "codegen.m"  // unified JIT codegen
 #include "jit.m"      // JIT capture/replay
 #include "profile.m"  // profiling

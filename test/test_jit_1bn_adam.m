@@ -93,8 +93,8 @@ int main(void) {
     jit_begin_capture(n_persistent);
     double t0=now_s();
     thvm_reduce(ctx,train_step);
-    f32 lv=thvm_to_host(ctx,loss)[0];
     jit_end_capture();
+    f32 lv=thvm_to_host(ctx,loss)[0];
     jit_flush();
     {u32 lwb2=ctx->tensors[(u32)term_val(lw)].buf_id;
      f32*lwd2=(f32*)metal_pool.bufs[lwb2].contents;

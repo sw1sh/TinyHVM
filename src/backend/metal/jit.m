@@ -348,6 +348,11 @@ static void jit_replay_commands(void) {
     // Encode all commands
     for (u32 ci = 0; ci < jit.n_cmds; ci++) {
         JITCmd *cmd = &jit.cmds[ci];
+        // Barrier: flush GPU and start new command buffer (preserves capture ordering)
+        if (!cmd->is_blit && !cmd->is_mps && cmd->n_bufs == 0) {
+            if (batch_dirty) metal_flush();
+            continue;
+        }
         if (cmd->is_blit) {
             if (batch_encoder) { [batch_encoder endEncoding]; batch_encoder = nil; }
             if (!batch_cmd) batch_cmd = [mtl_queue commandBuffer];

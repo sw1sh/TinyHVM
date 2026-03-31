@@ -5,6 +5,13 @@ static double flush_total_ms = 0;
 static u32 flush_count_total = 0;
 
 static void metal_flush(void) {
+    // Record flush as a barrier in JIT — ensures replay inserts GPU sync
+    if (jit.state == JIT_CAPTURE && batch_dirty && jit.n_cmds < JIT_MAX_CMDS) {
+        JITCmd *cmd = &jit.cmds[jit.n_cmds++];
+        memset(cmd, 0, sizeof(*cmd));
+        cmd->is_blit = 0; cmd->is_mps = 0;
+        cmd->n_bufs = 0; // marker: 0 bufs = barrier/flush
+    }
     if (batch_encoder) {
         [batch_encoder endEncoding];
         batch_encoder = nil;

@@ -118,15 +118,16 @@ int main(void) {
         memset(oh_data,0,BS*10*sizeof(f32));
         for(u32 i=0;i<BS;i++) oh_data[i*10+data.train_labels[bi*BS+i]]=1.f;
         ctx->tensors[oh_bid].backend->buf_write(ctx->tensors[oh_bid].buf_id, oh_data, BS*10*sizeof(f32));
+        // Split replay: restore consts first, then override per-step values
+        { extern void jit_restore_consts(void); jit_restore_consts(); }
         for(int i=0;i<NP;i++){u32 gid=(u32)term_val(gs[i]);
-            memset(metal_pool.bufs[ctx->tensors[gid].buf_id].contents,0,psz[i]*sizeof(f32));}
-        // Update Adam bias correction
+            memset(BUF_CONTENTS(ctx->tensors[gid].buf_id),0,psz[i]*sizeof(f32));}
         opt.t = step + 1;
         f32 bc1v = 1.0f - powf(opt.beta1, (f32)opt.t);
         f32 bc2v = 1.0f - powf(opt.beta2, (f32)opt.t);
-        memcpy(metal_pool.bufs[ctx->tensors[opt.bc1_tid].buf_id].contents, &bc1v, 4);
-        memcpy(metal_pool.bufs[ctx->tensors[opt.bc2_tid].buf_id].contents, &bc2v, 4);
-        jit_replay();
+        memcpy(BUF_CONTENTS(ctx->tensors[opt.bc1_tid].buf_id), &bc1v, 4);
+        memcpy(BUF_CONTENTS(ctx->tensors[opt.bc2_tid].buf_id), &bc2v, 4);
+        { extern void jit_replay_commands(void); jit_replay_commands(); }
         if(step<3||step%100==0||step==n_steps-1){
             jit_flush();
             // Check dense layer weight sum and grad sum

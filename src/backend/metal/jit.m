@@ -326,15 +326,17 @@ void jit_alloc_ephemeral(void) {
         }
 }
 
-void jit_replay(void) {
+// Restore JIT constant data (call before jit_replay_commands)
+void jit_restore_consts(void) {
     if (!jit.ephemeral_ready) jit_alloc_ephemeral();
-
-    // Restore constant data
     for (u32 ci = 0; ci < jit.n_consts; ci++) {
         u32 bid = jit.slots[jit.consts[ci].slot].buf_id;
         memcpy(BUF_CONTENTS(bid), jit.consts[ci].data, jit.consts[ci].size);
     }
+}
 
+// Encode all JIT commands (call after jit_restore_consts + any buffer overrides)
+static void jit_replay_commands(void) {
     // Encode all commands
     for (u32 ci = 0; ci < jit.n_cmds; ci++) {
         JITCmd *cmd = &jit.cmds[ci];
@@ -382,4 +384,10 @@ void jit_replay(void) {
         }
     }
     total_dispatches += jit.n_cmds;
+}
+
+// Full replay: restore consts + encode commands
+void jit_replay(void) {
+    jit_restore_consts();
+    jit_replay_commands();
 }

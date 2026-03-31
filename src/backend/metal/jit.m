@@ -329,6 +329,14 @@ void jit_alloc_ephemeral(void) {
 // Restore JIT constant data (call before jit_replay_commands)
 void jit_restore_consts(void) {
     if (!jit.ephemeral_ready) jit_alloc_ephemeral();
+    // Zero ALL ephemeral buffers — prevents stale data from prior replay
+    // from affecting kernels that expect zero-initialized intermediates.
+    for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+        u32 bid = jit.slots[s].buf_id;
+        if (bid && metal_pool.bufs[bid])
+            memset(BUF_CONTENTS(bid), 0, metal_pool.sizes[bid]);
+    }
+    // Restore captured const data (overwrites zeros for const slots)
     for (u32 ci = 0; ci < jit.n_consts; ci++) {
         u32 bid = jit.slots[jit.consts[ci].slot].buf_id;
         memcpy(BUF_CONTENTS(bid), jit.consts[ci].data, jit.consts[ci].size);

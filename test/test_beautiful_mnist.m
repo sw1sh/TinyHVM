@@ -24,7 +24,7 @@ static double now_s(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);re
 int main(void) {
     srand(42); MNISTData data=mnist_load("data");
     TinyHVM*ctx=thvm_init("metal");
-    u32 BS=128; // tinygrad uses 512
+    u32 BS=128;
     u32 n_steps=70;
 
     // Model: beautiful_mnist architecture

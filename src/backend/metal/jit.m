@@ -2,6 +2,12 @@
 // Records GPU dispatch sequence on step 0, replays for steps 1+.
 // JITState, JITCmd, JITSlot defined in init.m.
 static u32 jit_orig_buf_ids[JIT_MAX_SLOTS]; // capture-time buf_ids (for tensor update)
+static u64 jit_slot_offsets[JIT_MAX_SLOTS]; // slot → byte offset in unified buffer
+static u64 jit_slot_sizes[JIT_MAX_SLOTS];   // slot → region size
+static u32 jit_n_plan;                       // number of plan indices
+static u64 jit_plan_sizes[JIT_MAX_SLOTS];    // plan_idx → size (for default path)
+static u32 jit_plan_bufs[JIT_MAX_SLOTS];     // plan_idx → buf_id (for zeroing)
+static u32 jit_unified_buf;                  // unified buffer's buf_id
 
 static u32 jit_slot_for_buf(u32 buf_id) {
     for (u32 i = 0; i < jit.n_slots; i++)
@@ -91,171 +97,280 @@ void jit_end_capture(void) {
     jit.state = JIT_OFF;
     if (batch_dirty) metal_flush();
 
-    // Map buf_ids to slots for constants saved during capture.
-    u32 n_valid = 0;
-    for (u32 ci = 0; ci < jit.n_consts; ci++) {
-        u32 bid = jit.consts[ci].slot;
-        for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
-            if (jit.slots[s].buf_id == bid) {
-                jit.consts[n_valid] = jit.consts[ci];
-                jit.consts[n_valid].slot = s;
-                n_valid++;
-                break;
-            }
+    // Detect GPU-written slots and snapshot CPU-written constants
+    u8 gpu_written[JIT_MAX_SLOTS]; memset(gpu_written, 0, jit.n_slots);
+    for (u32 ci = 0; ci < jit.n_cmds; ci++) {
+        JITCmd *cmd = &jit.cmds[ci];
+        if (cmd->is_blit) {
+            gpu_written[cmd->blit_dst_slot] = 1;
+        } else if (cmd->is_mps) {
+            gpu_written[cmd->mps_dst_slot] = 1;
+        } else if (cmd->n_bufs > 0) {
+            gpu_written[cmd->buf_slots[0]] = 1;
         }
     }
-    jit.n_consts = n_valid;
+
+    // Snapshot CPU-written ephemeral buffer contents (GPU idle after flush).
+    jit.n_consts = 0;
+    for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+        if (gpu_written[s]) continue;
+        u64 sz = jit.slots[s].alloc_size;
+        if (sz > 0 && sz <= JIT_CONST_MAX_BYTES && jit.n_consts < JIT_MAX_CONST) {
+            u32 bid = jit.slots[s].buf_id;
+            JITConst *c = &jit.consts[jit.n_consts++];
+            c->slot = s;
+            c->size = (u32)sz;
+            memcpy(c->data, BUF_CONTENTS(bid), sz);
+        }
+    }
 
     // ── Memory Planner ─────────────────────────────────────────
-    // Scan the captured dispatch sequence to find first/last use of each
-    // ephemeral slot. Slots with non-overlapping lifetimes share buffers.
-    // Same algorithm as tinygrad's _internal_memory_planner.
     u32 n_eph = jit.n_slots - jit.persistent_count;
     if (n_eph > 0) {
         u32 first_use[JIT_MAX_SLOTS], last_use[JIT_MAX_SLOTS];
-        for (u32 s = 0; s < jit.n_slots; s++) { first_use[s] = UINT32_MAX; last_use[s] = 0; }
+        // last_use_is_read: 1 if the slot's last use is a READ (input), not a WRITE (output).
+        // Such slots can be released at last_use (not last_use+1) since the GPU
+        // reads the buffer completely before writing the output in the same dispatch.
+        u8 last_use_is_read[JIT_MAX_SLOTS];
+        for (u32 s = 0; s < jit.n_slots; s++) { first_use[s] = UINT32_MAX; last_use[s] = 0; last_use_is_read[s] = 1; }
 
-        // Scan commands for slot usage
         for (u32 ci = 0; ci < jit.n_cmds; ci++) {
             JITCmd *cmd = &jit.cmds[ci];
             if (cmd->is_blit) {
                 u32 slots[] = { cmd->blit_dst_slot, cmd->blit_src_slot };
                 for (int j = 0; j < 2; j++) {
                     if (first_use[slots[j]] == UINT32_MAX) first_use[slots[j]] = ci;
-                    last_use[slots[j]] = ci;
+                    if (ci >= last_use[slots[j]]) {
+                        last_use[slots[j]] = ci;
+                        last_use_is_read[slots[j]] = (j > 0); // j=0 is dst (write), j>0 is src (read)
+                    }
                 }
             } else if (cmd->is_mps) {
                 u32 slots[] = { cmd->mps_dst_slot, cmd->mps_a_slot, cmd->mps_b_slot };
                 for (int j = 0; j < 3; j++) {
                     if (first_use[slots[j]] == UINT32_MAX) first_use[slots[j]] = ci;
-                    last_use[slots[j]] = ci;
+                    if (ci >= last_use[slots[j]]) {
+                        last_use[slots[j]] = ci;
+                        last_use_is_read[slots[j]] = (j > 0);
+                    }
                 }
             } else {
                 for (u32 j = 0; j < cmd->n_bufs; j++) {
                     u32 s = cmd->buf_slots[j];
                     if (first_use[s] == UINT32_MAX) first_use[s] = ci;
-                    last_use[s] = ci;
+                    if (ci >= last_use[s]) {
+                        last_use[s] = ci;
+                        last_use_is_read[s] = (j > 0); // j=0 is output (write), j>0 is input (read)
+                    }
                 }
             }
         }
 
-        // Mark const-written slots as first_use=0 (alive from start)
-        for (u32 ci = 0; ci < jit.n_consts; ci++) {
-            u32 s = jit.consts[ci].slot;
-            first_use[s] = 0;
-        }
-
-        // Detect "input" slots: read by a command but never written (output)
-        // by any command. These are externally written (CPU memset/memcpy
-        // between replays) and must be first_use=0 to prevent sharing.
-        // Convention: buf_slots[0] is the output, rest are inputs.
-        u8 gpu_written[JIT_MAX_SLOTS]; memset(gpu_written, 0, jit.n_slots);
-        for (u32 ci = 0; ci < jit.n_cmds; ci++) {
-            JITCmd *cmd = &jit.cmds[ci];
-            if (cmd->is_blit) {
-                gpu_written[cmd->blit_dst_slot] = 1;
-            } else if (cmd->is_mps) {
-                gpu_written[cmd->mps_dst_slot] = 1;
-            } else if (cmd->n_bufs > 0) {
-                gpu_written[cmd->buf_slots[0]] = 1; // first buf = output
-            }
-        }
+        for (u32 ci = 0; ci < jit.n_consts; ci++)
+            first_use[jit.consts[ci].slot] = 0;
         for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
             if (!gpu_written[s] && first_use[s] != UINT32_MAX)
-                first_use[s] = 0; // externally written → alive from start
+                first_use[s] = 0;
         }
 
-        // Greedy planner: assign physical buffer indices to ephemeral slots.
-        // Slots with non-overlapping [first_use, last_use] share the same buffer.
-        // jit.slots[s].plan_buf = index into a compacted buffer array.
-        // Free pool: (size, plan_idx) entries for reuse.
-        struct { u64 size; u32 plan_idx; } fpool[256];
-        u32 fpool_n = 0;
-        u32 next_plan = 0;  // next physical buffer index
-        // Store plan assignment per slot
-        u32 plan_assignment[JIT_MAX_SLOTS]; // slot → plan buffer index
-        u64 plan_buf_size[JIT_MAX_SLOTS];   // plan buffer → size
-        memset(plan_assignment, 0xFF, sizeof(plan_assignment));
 
-        // Process ephemeral slots in first_use order
-        // Simple: iterate commands, for each command release dead slots, then assign
+        // Greedy planner: assign plan buffer indices to ephemeral slots.
+        // Slots with non-overlapping lifetimes share the same physical buffer.
+        // No size constraint — plan buffer sized to MAX slot in each group.
+        // Optimization: slots whose last use is a READ can be released at last_use
+        // (not last_use+1), enabling same-command reuse by the output slot.
+        struct { u64 size; u32 plan_idx; } fpool[2048];
+        u32 fpool_n = 0;
+        u32 next_plan = 0;
+        u32 plan_assignment[JIT_MAX_SLOTS]; // current state (may be released)
+        u32 slot_plan[JIT_MAX_SLOTS];       // saved plan_idx (never overwritten)
+        u64 plan_buf_size[JIT_MAX_SLOTS];
+        memset(plan_assignment, 0xFF, sizeof(plan_assignment));
+        memset(slot_plan, 0xFF, sizeof(slot_plan));
+
+        u64 old_mem = 0;
+        for (u32 s = jit.persistent_count; s < jit.n_slots; s++)
+            old_mem += jit.slots[s].alloc_size;
+
         for (u32 ci = 0; ci <= jit.n_cmds; ci++) {
-            // Release slots whose last_use < ci
+            // Release slots: standard release at last_use+1, but read-only slots
+            // release at last_use (read completes before write in same dispatch).
             for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
-                if (plan_assignment[s] != 0xFFFFFFFF && last_use[s] < ci) {
-                    // Return to free pool
-                    if (fpool_n < 256) {
-                        fpool[fpool_n].size = jit.slots[s].alloc_size;
+                u32 threshold = last_use_is_read[s] ? last_use[s] : last_use[s] + 1;
+                if (plan_assignment[s] != 0xFFFFFFFF && plan_assignment[s] != 0xFFFFFFFE && ci >= threshold) {
+                    if (fpool_n < 2048) {
+                        fpool[fpool_n].size = plan_buf_size[plan_assignment[s]];
                         fpool[fpool_n].plan_idx = plan_assignment[s];
                         fpool_n++;
                     }
-                    plan_assignment[s] = 0xFFFFFFFE; // mark as released
+                    plan_assignment[s] = 0xFFFFFFFE;
                 }
             }
             if (ci == jit.n_cmds) break;
 
-            // Assign slots first used at this command
-            JITCmd *cmd = &jit.cmds[ci];
-            u32 cmd_slots[24]; u32 cmd_ns = 0;
-            if (cmd->is_blit) {
-                cmd_slots[cmd_ns++] = cmd->blit_dst_slot;
-                cmd_slots[cmd_ns++] = cmd->blit_src_slot;
-            } else if (cmd->is_mps) {
-                cmd_slots[cmd_ns++] = cmd->mps_dst_slot;
-                cmd_slots[cmd_ns++] = cmd->mps_a_slot;
-                cmd_slots[cmd_ns++] = cmd->mps_b_slot;
-            } else {
-                for (u32 j = 0; j < cmd->n_bufs; j++)
-                    cmd_slots[cmd_ns++] = cmd->buf_slots[j];
-            }
-            for (u32 j = 0; j < cmd_ns; j++) {
-                u32 s = cmd_slots[j];
-                if (s < jit.persistent_count) continue; // persistent — skip
-                if (plan_assignment[s] != 0xFFFFFFFF) continue; // already assigned
-                if (first_use[s] != ci) continue; // not born yet
+            // Assign ALL slots with first_use == ci (including forced first_use=0)
+            for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+                if (plan_assignment[s] != 0xFFFFFFFF) continue;
+                if (first_use[s] != ci) continue;
                 u64 sz = jit.slots[s].alloc_size;
+                if (sz == 0) sz = 4;
 
-                // Find compatible free buffer
-                int found = -1;
+                // Find best-fit free buffer (no size constraint, just >= sz)
+                int best = -1;
+                u64 best_size = UINT64_MAX;
                 for (u32 f = 0; f < fpool_n; f++) {
-                    if (fpool[f].size >= sz && fpool[f].size <= sz * 2) {
-                        found = (int)f;
-                        break;
+                    if (fpool[f].size >= sz && fpool[f].size < best_size) {
+                        best = (int)f;
+                        best_size = fpool[f].size;
                     }
                 }
-                if (found >= 0) {
-                    plan_assignment[s] = fpool[found].plan_idx;
-                    fpool[found] = fpool[--fpool_n];
+                if (best >= 0) {
+                    plan_assignment[s] = fpool[best].plan_idx;
+                    slot_plan[s] = fpool[best].plan_idx;
+                    if (sz > plan_buf_size[fpool[best].plan_idx])
+                        plan_buf_size[fpool[best].plan_idx] = sz;
+                    fpool[best] = fpool[--fpool_n];
                 } else {
                     plan_assignment[s] = next_plan;
+                    slot_plan[s] = next_plan;
                     plan_buf_size[next_plan] = sz;
                     next_plan++;
                 }
             }
         }
 
-        // Store plan in JIT slots (overwrite buf_id temporarily — resolved at replay)
-        u32 n_reused = n_eph - next_plan;
-        u64 old_mem = 0, new_mem = 0;
-        for (u32 s = jit.persistent_count; s < jit.n_slots; s++)
-            old_mem += jit.slots[s].alloc_size;
-        for (u32 p = 0; p < next_plan; p++)
-            new_mem += plan_buf_size[p];
+        u64 new_mem = 0;
+        for (u32 p = 0; p < next_plan; p++) new_mem += plan_buf_size[p];
 
         // Save original buf_ids before overwriting with plan_assignment
         for (u32 s = jit.persistent_count; s < jit.n_slots; s++)
             jit_orig_buf_ids[s] = jit.slots[s].buf_id;
-        // Overload buf_id with plan_assignment for replay
         for (u32 s = jit.persistent_count; s < jit.n_slots; s++)
             jit.slots[s].buf_id = plan_assignment[s];
 
+        // Compute per-plan-idx offsets (contiguously packed)
+        jit_n_plan = next_plan;
+        u64 plan_offsets[JIT_MAX_SLOTS];
+        u64 heap_off = 0;
+        for (u32 p = 0; p < next_plan; p++) {
+            plan_offsets[p] = heap_off;
+            heap_off += (plan_buf_size[p] + 4095ULL) & ~4095ULL;
+        }
+        fprintf(stderr, "  Plan offsets: %u plans, heap_off=%.2f MB\n",
+            next_plan, (double)heap_off/1048576.0);
+        // Store per-SLOT offset and size (for unified path)
+        for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+            u32 p = slot_plan[s]; // saved plan_idx (never overwritten by release)
+            if (p < next_plan) {
+                jit_slot_offsets[s] = plan_offsets[p];
+                jit_slot_sizes[s] = plan_buf_size[p];
+            } else {
+                jit_slot_offsets[s] = 0;
+                jit_slot_sizes[s] = jit.slots[s].alloc_size;
+            }
+        }
+        // Debug
+        u64 max_slot_off = 0;
+        u32 n_assigned = 0, n_released = 0;
+        for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+            if (jit_slot_offsets[s] > max_slot_off) max_slot_off = jit_slot_offsets[s];
+            u32 p2 = plan_assignment[s];
+            if (p2 < next_plan) n_assigned++;
+            else n_released++;
+        }
+        fprintf(stderr, "  Slots: %u assigned, %u released. Max offset=%.2f MB\n",
+            n_assigned, n_released, (double)max_slot_off/1048576.0);
+        // Store per-plan-idx sizes (for default path)
+        for (u32 p = 0; p < next_plan; p++)
+            jit_plan_sizes[p] = plan_buf_size[p];
+
         fprintf(stderr, "JIT captured %u cmds, %u slots (%u persistent), %u consts\n",
                 jit.n_cmds, jit.n_slots, jit.persistent_count, jit.n_consts);
-        fprintf(stderr, "JIT memory reduced from %.2f MB -> %.2f MB, %u -> %u bufs\n",
-                (double)old_mem/1e6, (double)new_mem/1e6, n_eph, next_plan);
+        fprintf(stderr, "JIT memory: %u slots -> %u bufs, %.2f MB (was %.2f MB)\n",
+                n_eph, next_plan, (double)new_mem/1048576.0, (double)old_mem/1048576.0);
     } else {
         fprintf(stderr, "JIT captured %u cmds, %u slots (%u persistent), %u consts\n",
                 jit.n_cmds, jit.n_slots, jit.persistent_count, jit.n_consts);
+    }
+
+
+    // ── JIT Dispatch Composition Diagnostic ───────────────────────
+    {
+        u32 n_compute = 0, n_mps = 0, n_blit = 0, n_barrier = 0;
+        for (u32 ci = 0; ci < jit.n_cmds; ci++) {
+            JITCmd *cmd = &jit.cmds[ci];
+            if (cmd->is_blit) { n_blit++; }
+            else if (cmd->is_mps) { n_mps++; }
+            else if (cmd->n_bufs == 0) { n_barrier++; }
+            else { n_compute++; }
+        }
+        fprintf(stderr, "\n=== JIT Dispatch Composition (%u total) ===\n", jit.n_cmds);
+        fprintf(stderr, "  Compute dispatches: %u\n", n_compute);
+        fprintf(stderr, "  MPS matmul:         %u\n", n_mps);
+        fprintf(stderr, "  Blit copies:        %u\n", n_blit);
+        fprintf(stderr, "  Barriers:           %u\n", n_barrier);
+
+        // Grid size histogram for compute dispatches
+        // Buckets: <256, <1K, <4K, <16K, <64K, <256K, <1M, <4M, <16M, >=16M
+        u32 grid_buckets[10] = {0};
+        const char *grid_labels[] = {"<256","<1K","<4K","<16K","<64K","<256K","<1M","<4M","<16M",">=16M"};
+        u64 grid_thresholds[] = {256,1024,4096,16384,65536,262144,1048576,4194304,16777216,UINT64_MAX};
+        for (u32 ci = 0; ci < jit.n_cmds; ci++) {
+            JITCmd *cmd = &jit.cmds[ci];
+            if (cmd->is_blit || cmd->is_mps || cmd->n_bufs == 0) continue;
+            u64 total = (u64)cmd->grid[0] * cmd->grid[1] * cmd->grid[2];
+            for (int b = 0; b < 10; b++) {
+                if (total < grid_thresholds[b]) { grid_buckets[b]++; break; }
+            }
+        }
+        fprintf(stderr, "\n  Compute grid size histogram (total threads):\n");
+        for (int b = 0; b < 10; b++) {
+            if (grid_buckets[b] > 0)
+                fprintf(stderr, "    %-8s: %u\n", grid_labels[b], grid_buckets[b]);
+        }
+
+        // Top 5 most common pipeline states by pointer
+        struct { void *pipe; u32 count; } pipe_counts[512];
+        u32 n_pipes = 0;
+        for (u32 ci = 0; ci < jit.n_cmds; ci++) {
+            JITCmd *cmd = &jit.cmds[ci];
+            if (cmd->is_blit || cmd->is_mps || cmd->n_bufs == 0) continue;
+            void *p = (__bridge void *)cmd->pipe;
+            int found = -1;
+            for (u32 pi = 0; pi < n_pipes; pi++) {
+                if (pipe_counts[pi].pipe == p) { found = (int)pi; break; }
+            }
+            if (found >= 0) { pipe_counts[found].count++; }
+            else if (n_pipes < 512) {
+                pipe_counts[n_pipes].pipe = p;
+                pipe_counts[n_pipes].count = 1;
+                n_pipes++;
+            }
+        }
+        // Sort top 5 by count (simple selection sort for top entries)
+        fprintf(stderr, "\n  Top pipeline states (compute only):\n");
+        for (int rank = 0; rank < 5 && rank < (int)n_pipes; rank++) {
+            u32 best = rank;
+            for (u32 j = rank + 1; j < n_pipes; j++) {
+                if (pipe_counts[j].count > pipe_counts[best].count) best = j;
+            }
+            if (best != (u32)rank) {
+                void *tmp_p = pipe_counts[rank].pipe; u32 tmp_c = pipe_counts[rank].count;
+                pipe_counts[rank].pipe = pipe_counts[best].pipe; pipe_counts[rank].count = pipe_counts[best].count;
+                pipe_counts[best].pipe = tmp_p; pipe_counts[best].count = tmp_c;
+            }
+            // Try to get pipeline label
+            id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pipe_counts[rank].pipe;
+            NSString *label = pso.label;
+            if (label && label.length > 0)
+                fprintf(stderr, "    #%d: %3u dispatches  pipe=%p  label=%s\n",
+                    rank+1, pipe_counts[rank].count, pipe_counts[rank].pipe, label.UTF8String);
+            else
+                fprintf(stderr, "    #%d: %3u dispatches  pipe=%p\n",
+                    rank+1, pipe_counts[rank].count, pipe_counts[rank].pipe);
+        }
+        fprintf(stderr, "  Unique compute pipelines: %u\n", n_pipes);
+        fprintf(stderr, "===========================================\n\n");
     }
 }
 
@@ -293,59 +408,125 @@ void jit_flush(void) {
     if (batch_dirty) metal_flush();
 }
 
-// Allocate ephemeral buffers without executing any commands.
-// Call once after jit_end_capture, before any replay.
+// Allocate ephemeral buffers via offset-based suballocation.
+// One unified MTLBuffer, each slot at a different offset.
 void jit_alloc_ephemeral(void) {
     if (jit.ephemeral_ready) return;
     jit.ephemeral_ready = 1;
-        // Find max plan_idx to know how many physical buffers needed
-        u32 max_plan = 0;
-        for (u32 i = jit.persistent_count; i < jit.n_slots; i++) {
-            u32 p = jit.slots[i].buf_id; // plan_idx from memory planner
-            if (p != 0xFFFFFFFF && p != 0xFFFFFFFE && p > max_plan) max_plan = p;
+
+    // Compute total unified buffer size from slot offsets
+    u64 heap_total = 0;
+    for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+        u64 end = jit_slot_offsets[s] + ((jit_slot_sizes[s] + 4095ULL) & ~4095ULL);
+        if (end > heap_total) heap_total = end;
+    }
+    if (heap_total == 0) heap_total = 4;
+
+    // Drain pending_free and release free-list to reclaim capture-time memory
+    for (u32 i = 0; i < pending_free_count; i++)
+        metal_buf_free(pending_free[i]);
+    pending_free_count = 0;
+    for (u32 i = 0; i < free_count; i++) {
+        if (free_list[i].buf) {
+            metal_bytes_total -= free_list[i].size;
+            free_list[i].buf = nil;
         }
-        // Allocate physical buffers for each plan_idx
-        u32 plan_bufs[JIT_MAX_SLOTS];
-        for (u32 p = 0; p <= max_plan; p++) {
-            // Find the largest alloc_size among slots assigned to this plan_idx
-            u64 max_sz = 0;
-            for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
-                if (jit.slots[s].buf_id == p && jit.slots[s].alloc_size > max_sz)
-                    max_sz = jit.slots[s].alloc_size;
+    }
+    free_count = 0;
+
+    if (getenv("UNIFIED")) {
+        // Offset suballocation: ONE buffer, per-slot offsets
+        fprintf(stderr, "  UNIFIED: allocating %.2f MB heap (%u slots)\n",
+            (double)heap_total/1048576.0, jit.n_slots - jit.persistent_count);
+        jit_unified_buf = metal_buf_alloc(heap_total);
+        id<MTLBuffer> unified_mtl = metal_pool.bufs[jit_unified_buf];
+        fprintf(stderr, "  UNIFIED: buf_id=%u mtl=%p len=%llu\n",
+            jit_unified_buf, (void*)unified_mtl, (u64)unified_mtl.length);
+        fprintf(stderr, "  Creating %u alias buf_ids (pool.count=%u, MAX=%u, pers=%u, n_slots=%u)\n",
+            jit.n_slots - jit.persistent_count, metal_pool.count, (u32)MAX_BUFS, jit.persistent_count, jit.n_slots);
+        for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+            u64 sz = jit_slot_sizes[s];
+            if (sz == 0) sz = 4;
+            assert(metal_pool.count < MAX_BUFS);
+            u32 bid = metal_pool.count++;
+            metal_pool.bufs[bid] = unified_mtl;
+            metal_pool.sizes[bid] = sz;
+            buf_offset[bid] = jit_slot_offsets[s];
+            buf_refcount[bid] = 0;
+            jit.slots[s].buf_id = bid;
+        }
+        fprintf(stderr, "  Aliases: pool.count=%u\n", metal_pool.count);
+        // Verify no offset exceeds buffer length
+        u32 n_oob = 0;
+        for (u32 s2 = jit.persistent_count; s2 < jit.n_slots; s2++) {
+            u32 b2 = jit.slots[s2].buf_id;
+            if (b2 && metal_pool.bufs[b2] == unified_mtl) {
+                if (buf_offset[b2] + metal_pool.sizes[b2] > unified_mtl.length && n_oob++ < 3)
+                    fprintf(stderr, "  OOB: slot=%u bid=%u off=%llu sz=%llu len=%llu\n",
+                        s2, b2, (u64)buf_offset[b2], metal_pool.sizes[b2], (u64)unified_mtl.length);
             }
-            if (max_sz == 0) max_sz = 4; // avoid zero-size alloc
-            plan_bufs[p] = metal_buf_alloc(max_sz);
         }
-        // Resolve slot buf_ids: each slot gets the buf_id of its plan_idx
+        fprintf(stderr, "  UNIFIED: aliases done, pool.count=%u, oob=%u\n", metal_pool.count, n_oob);
+        return;
+    }
+
+    // Default: plan-idx based, one buffer per plan_idx
+    {
+        u32 plan_bufs[JIT_MAX_SLOTS];
+        for (u32 p = 0; p < jit_n_plan; p++) {
+            plan_bufs[p] = metal_buf_alloc(jit_plan_sizes[p]);
+            jit_plan_bufs[p] = plan_bufs[p];
+        }
+
         for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
             u32 p = jit.slots[s].buf_id;
-            if (p <= max_plan)
+            if (p < jit_n_plan)
                 jit.slots[s].buf_id = plan_bufs[p];
+            else if (jit.slots[s].alloc_size > 0)
+                jit.slots[s].buf_id = metal_buf_alloc(jit.slots[s].alloc_size);
             else
-                jit.slots[s].buf_id = metal_buf_alloc(jit.slots[s].alloc_size); // fallback
+                jit.slots[s].buf_id = 0;
         }
+        return;
+    }
+
+    // Allocate ONE unified buffer
+    jit_unified_buf = metal_buf_alloc(heap_total);
+    id<MTLBuffer> unified_mtl = metal_pool.bufs[jit_unified_buf];
+    fprintf(stderr, "  Unified: requested=%.2f MB, got=%.2f MB (pool.sizes=%.2f MB)\n",
+        (double)heap_total/1048576.0, (double)unified_mtl.length/1048576.0,
+        (double)metal_pool.sizes[jit_unified_buf]/1048576.0);
+
+    // Each ephemeral slot gets its own buf_id aliasing the unified buffer
+    for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+        u64 sz = jit_slot_sizes[s];
+        if (sz == 0) sz = 4;
+        assert(metal_pool.count < MAX_BUFS);
+        u32 bid = metal_pool.count++;
+        metal_pool.bufs[bid] = unified_mtl;
+        metal_pool.sizes[bid] = sz;
+        buf_offset[bid] = jit_slot_offsets[s];
+        buf_refcount[bid] = 0;
+        jit.slots[s].buf_id = bid;
+    }
 }
 
 // Restore JIT constant data (call before jit_replay_commands)
 void jit_restore_consts(void) {
     if (!jit.ephemeral_ready) jit_alloc_ephemeral();
-    // Zero ALL ephemeral buffers — prevents stale data from prior replay
-    // from affecting kernels that expect zero-initialized intermediates.
-    for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
-        u32 bid = jit.slots[s].buf_id;
-        if (bid && metal_pool.bufs[bid])
-            memset(BUF_CONTENTS(bid), 0, metal_pool.sizes[bid]);
-    }
+    // NOTE: ephemeral buffer zeroing is UNNECESSARY because JIT replay executes
+    // the same commands as capture — every buffer is written before read.
+    // Only const data (CPU-written scalars) needs restoration.
     // Restore captured const data (overwrites zeros for const slots)
     for (u32 ci = 0; ci < jit.n_consts; ci++) {
         u32 bid = jit.slots[jit.consts[ci].slot].buf_id;
-        memcpy(BUF_CONTENTS(bid), jit.consts[ci].data, jit.consts[ci].size);
+        if (bid && metal_pool.bufs[bid])
+            memcpy(BUF_CONTENTS(bid), jit.consts[ci].data, jit.consts[ci].size);
     }
 }
 
 // Encode all JIT commands (call after jit_restore_consts + any buffer overrides)
 static void jit_replay_commands(void) {
-    // Encode all commands
     for (u32 ci = 0; ci < jit.n_cmds; ci++) {
         JITCmd *cmd = &jit.cmds[ci];
         // Barrier: flush GPU and start new command buffer (preserves capture ordering)

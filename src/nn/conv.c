@@ -430,6 +430,10 @@ Term thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
 
     // Record conv info for specialized backward (avoids 8-dim contiguify chain).
     // The FUSING tensor inherits this when the rewrite rules fuse the chain.
+    // Record conv info for specialized backward.
+    // Record conv info for specialized backward (avoids 8-dim contiguify chain).
+    // NOTE: currently disabled — out is TAG_TOP (lazy) so this never fires.
+    // Enabling requires fixing thvm_pool's complex path interaction with no_fuse=1.
     if (term_tag(out) == TAG_TEN) {
         u32 out_id = (u32)term_val(out);
         TensorMeta *om = &ctx->tensors[out_id];

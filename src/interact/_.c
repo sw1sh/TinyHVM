@@ -201,7 +201,6 @@ inet_step:
                                 sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt), my->view.shape, ma->view.shape),
                                 sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at), my->view.shape, mb_p->view.shape));
                         case UOP_MM: {
-                            // Backward MMs use MPS (inputs materialized by ENSURE above)
                             ENSURE(ctx, aid); ENSURE(ctx, bid);
                             ma = &ctx->tensors[aid]; mb_p = &ctx->tensors[bid];
                             u32 bt_id = tensor_transpose_2d(ctx, bid);
@@ -278,7 +277,10 @@ inet_step:
                         }
                         case UOP_RESHAPE: {
                             // Specialized conv backward: use MPS matmul for dW and dX
-                            // instead of walking the 8-dim chain (saves ~12 contiguify buffers per conv).
+                            // NOTE: conv metadata propagation from MUL→SUM→RESHAPE doesn't work
+                            // because post-reduce fusion creates new tensor IDs that lose the metadata.
+                            // The conv backward path only fires when conv metadata is set on the
+                            // RESHAPE tensor itself (which requires the lazy chain to resolve first).
                             if (my->conv_input_id && my->conv_weight_id &&
                                 my->conv_groups == 1 && ma->backend->op_mm) {
                                 u32 inp_id = my->conv_input_id;
@@ -418,21 +420,38 @@ inet_step:
                     u32 dst_id = (u32)term_val(dst_r);
                     u32 src_id = (u32)term_val(src_t);
                     if (dst_id != src_id) {
-                        ENSURE(ctx, src_id);
                         TensorMeta *md = &ctx->tensors[dst_id];
                         TensorMeta *ms = &ctx->tensors[src_id];
-                        if (md->backend->buf_copy && ms->view.contiguous &&
-                            ms->view.numel == md->view.numel) {
-                            md->backend->buf_copy(md->buf_id, ms->buf_id,
-                                (u64)md->view.numel * sizeof(f32));
-                        } else if (md->backend->contiguify) {
-                            md->backend->contiguify(md->buf_id, md->view.numel,
-                                                     ms->buf_id, &ms->view);
+                        // ASSIGN elision: if src is deferred ew with same numel,
+                        // tell materializer to write directly into dst's buffer.
+                        if (ms->buf_id == 0 && ms->creator_op &&
+                            is_elementwise(ms->creator_op) &&
+                            ms->view.contiguous && ms->view.numel == md->view.numel &&
+                            ms->defer_consumers == 0) {
+                            ms->assign_target = md->buf_id;
+                            ENSURE(ctx, src_id);
+                            ms = &ctx->tensors[src_id];
+                            ms->assign_target = 0;
+                            // If materializer used the target, no blit needed
+                            if (ms->buf_id == md->buf_id) goto assign_done;
                         } else {
-                            u64 nbytes = (u64)md->view.numel * sizeof(f32);
-                            f32 *src_host = (f32 *)thvm_to_host(ctx, src_t);
-                            md->backend->buf_write(md->buf_id, src_host, nbytes);
+                            ENSURE(ctx, src_id);
+                            ms = &ctx->tensors[src_id]; // refresh after ENSURE
+                            md = &ctx->tensors[dst_id];
+                            if (md->backend->buf_copy && ms->view.contiguous &&
+                                ms->view.numel == md->view.numel) {
+                                md->backend->buf_copy(md->buf_id, ms->buf_id,
+                                    (u64)md->view.numel * sizeof(f32));
+                            } else if (md->backend->contiguify) {
+                                md->backend->contiguify(md->buf_id, md->view.numel,
+                                                         ms->buf_id, &ms->view);
+                            } else {
+                                u64 nbytes = (u64)md->view.numel * sizeof(f32);
+                                f32 *src_host = (f32 *)thvm_to_host(ctx, src_t);
+                                md->backend->buf_write(md->buf_id, src_host, nbytes);
+                            }
                         }
+                    assign_done:
                         if (md->host_ptr) { free(md->host_ptr); md->host_ptr = NULL; }
                         heap_set(ctx, loc + 1, dst_r);
                     }
@@ -934,11 +953,7 @@ inet_step:
             u32 dst_id;
             TensorMeta *md;
 
-            // Elementwise ops: DEFER dispatch when BOTH inputs already have data.
-            // Creates tensor with buf_id=0 — materialized later by ENSURE at
-            // fusion boundaries. This fuses chains of backward ops into one kernel.
-            // Defer elementwise: create tensor with buf_id=0, let tensor_materialize
-            // fuse chains at boundaries. Shared intermediates get multi-output kernels.
+            // Elementwise ops: DEFER dispatch for GPU fusion.
             if (is_elementwise(uop) && ma->backend->dispatch_kernel_rs) {
                 dst_id = ctx->tensor_count++;
                 md = &ctx->tensors[dst_id];
@@ -960,11 +975,14 @@ inet_step:
                 RETURN_REDUCED(term_ten(dst_id, ma->dtype));
             }
 
-            // Defer reduce when input is deferred, elementwise, unshared.
-            // Only when backend has codegen (dispatch_kernel_rs) for fused reduce+ew.
+            // Defer reduce when input is deferred ew or view-of-deferred-ew.
             if (((uop == UOP_SUM && b_id != 0) || uop == UOP_RMAX) &&
                 ma->buf_id == 0 && ma->creator_op &&
-                is_elementwise(ma->creator_op) && ma->defer_consumers == 0 &&
+                (is_elementwise(ma->creator_op) ||
+                 (is_view_op(ma->creator_op) && ma->src_ids[0] &&
+                  ctx->tensors[ma->src_ids[0]].buf_id == 0 &&
+                  is_elementwise(ctx->tensors[ma->src_ids[0]].creator_op))) &&
+                ma->defer_consumers == 0 &&
                 ma->backend->dispatch_kernel_rs) {
                 dst_id = ctx->tensor_count++;
                 md = &ctx->tensors[dst_id];
@@ -1065,6 +1083,67 @@ inet_step:
                 }
             }
 
+            // View-through fusion: SUM(view*(ew_chain), axes)
+            // Walk through chains of view ops to find a deferred ew base.
+            if (is_reduce && ma->buf_id == 0 && is_view_op(ma->creator_op) &&
+                ma->creator_op != UOP_PERMUTE && // permute handled above
+                ma->backend && ma->backend->dispatch_kernel_rs) {
+                // Walk through view ops to find ew base
+                u32 view_base_id = ma->src_ids[0];
+                for (u32 _vd = 0; _vd < 5; _vd++) {
+                    TensorMeta *vt = &ctx->tensors[view_base_id];
+                    if (vt->buf_id != 0 || !vt->creator_op) break;
+                    if (is_elementwise(vt->creator_op)) break; // found ew
+                    if (is_view_op(vt->creator_op) && vt->creator_op != UOP_PERMUTE)
+                        view_base_id = vt->src_ids[0]; // follow view chain
+                    else break;
+                }
+                TensorMeta *vb = &ctx->tensors[view_base_id];
+                if (vb->buf_id == 0 && vb->creator_op &&
+                    is_elementwise(vb->creator_op)) {
+                    FusedOp fops[32]; u32 fn = 0, ftids[32];
+                    u32 flids[16]; const View *flvs[16]; u32 fnl = 0;
+                    int fr = materialize_walk(ctx, view_base_id, fops, &fn, ftids, flids, flvs, &fnl);
+                    if (fr >= 0 && fn > 0) {
+                        for (u32 i = 0; i < fn; i++) {
+                            if (fops[i].arg_a >= 16) fops[i].arg_a = fnl + (fops[i].arg_a - 16);
+                            if (fops[i].arg_b >= 16) fops[i].arg_b = fnl + (fops[i].arg_b - 16);
+                        }
+                        ReduceSpec ers = {0}; ers.reduce_type = uop;
+                        Term sum_arg_e = heap_read(ctx, loc + 1);
+                        if (term_tag(sum_arg_e) == TAG_TEN || term_tag(sum_arg_e) == TAG_TOP) {
+                            Term axes_e = thvm_reduce(ctx, sum_arg_e);
+                            if (term_tag(axes_e) == TAG_TEN) {
+                                u32 axid = (u32)term_val(axes_e); ENSURE(ctx, axid);
+                                TensorMeta *axt = &ctx->tensors[axid];
+                                f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
+                                for (u32 i = 0; i < axt->view.numel; i++) {
+                                    u32 ax = (u32)af[i]; if (ax < ma->view.shape.rank) ers.is_reduce[ax] = 1;
+                                }
+                            }
+                        } else {
+                            for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--)
+                                if (ma->view.shape.dims[d] > 1) { ers.is_reduce[d] = 1; break; }
+                        }
+                        u32 sbufs[8], sops[8]; u32 ns = 0;
+                        for (u32 i = 0; i < fn && ns < 8; i++) {
+                            TensorMeta *sm = &ctx->tensors[ftids[i]];
+                            if (sm->buf_id != 0 && sm->defer_consumers > 0) {
+                                sbufs[ns] = sm->buf_id; sops[ns] = fnl + i; ns++;
+                            }
+                        }
+                        u32 fbufs[16];
+                        for (u32 i = 0; i < fnl; i++) fbufs[i] = ctx->tensors[flids[i]].buf_id;
+                        // full_shape = reshaped shape (ma->view.shape), leaves in original shape
+                        Shape rshape = ma->view.shape;
+                        vb->backend->dispatch_kernel_rs(md->buf_id, fbufs, flvs, fnl,
+                            fops, fn, &rshape, &ers, ns ? sbufs : NULL, ns ? sops : NULL, ns);
+                        ctx->itrs++;
+                        RETURN_REDUCED(term_ten(dst_id, ma->dtype));
+                    }
+                }
+            }
+
             // Eager reduce fusion: if reduce input is deferred ew, fuse at dispatch time.
             if (is_reduce && ma->buf_id == 0 && ma->creator_op &&
                 is_elementwise(ma->creator_op)) {
@@ -1091,19 +1170,26 @@ inet_step:
                 }
             }
 
+            // Defer MM: create deferred tensor, materialize later.
+            // This lets the backward graph build fully before dispatching.
+            if (uop == UOP_MM) {
+                md->buf_id = 0;
+                md->creator_op = UOP_MM;
+                md->src_ids[0] = a_id;
+                md->src_ids[1] = b_id;
+                if (a_id) ctx->tensors[a_id].defer_consumers++;
+                if (b_id) ctx->tensors[b_id].defer_consumers++;
+                ctx->itrs++;
+                RETURN_REDUCED(term_ten(dst_id, ma->dtype));
+            }
+
             // Materialize lazy inputs before dispatch
             {
                 ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];
                 if (b_id) { ENSURE(ctx, b_id); if (is_binary) mb = &ctx->tensors[b_id]; }
             }
             // Dispatch
-            if (uop == UOP_MM) {
-                // MPS matmul for materialized inputs (backward MMs from GRAD handler).
-                // Forward MMs are decomposed at thvm_op time when inputs are lazy.
-                u32 M = ma->view.shape.dims[0], K = ma->view.shape.dims[1], N = mb->view.shape.dims[1];
-                md->backend->op_mm(md->buf_id, ma->buf_id, &ma->view,
-                                mb->buf_id, &mb->view, M, K, N);
-            } else if (is_reduce) {
+            if (is_reduce) {
                 // Check if explicit axes are provided
                 Term sum_arg2 = heap_read(ctx, loc + 1);
                 int has_explicit_axes = (term_tag(sum_arg2) == TAG_TOP || term_tag(sum_arg2) == TAG_TEN);

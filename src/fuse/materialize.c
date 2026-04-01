@@ -4,6 +4,27 @@
 // Shared intermediates (defer_consumers > 0) get side-output buffers written by
 // the same fused kernel — no separate dispatch needed.
 
+// Pre-computed reference counts: how many tensors reference each tid as src.
+// Populated once by ref_prescan, then used by materialize_walk for O(1) checks.
+static u16 tensor_ref_count[MAX_TENSORS];
+static u32 ref_prescan_done = 0;
+
+static void ref_prescan(TinyHVM *ctx) {
+    if (ref_prescan_done >= ctx->tensor_count) return;
+    memset(tensor_ref_count, 0, ctx->tensor_count * sizeof(u16));
+    for (u32 t = 0; t < ctx->tensor_count; t++) {
+        u32 s0 = ctx->tensors[t].src_ids[0];
+        u32 s1 = ctx->tensors[t].src_ids[1];
+        if (s0 && s0 < ctx->tensor_count) tensor_ref_count[s0]++;
+        if (s1 && s1 < ctx->tensor_count) tensor_ref_count[s1]++;
+    }
+    ref_prescan_done = ctx->tensor_count;
+}
+
+// When set, materialize_walk won't walk through reshape (used in reduce contexts
+// where reshape changes the coordinate space that reduce axes reference).
+static u8 walk_no_reshape_through = 0;
+
 // Walk provenance chain. op_tids[i] = tensor ID for op i.
 static int materialize_walk(TinyHVM *ctx, u32 tid,
                              FusedOp *ops, u32 *n_ops, u32 *op_tids,
@@ -24,6 +45,41 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
 
     if (is_view_op(uop)) {
         u32 base = m->src_ids[0];
+        // Walk THROUGH reshape: use base's coordinate space, not reshape's.
+        // The output buffer is flat — reshape just reinterprets it.
+        // Only for contiguous reshapes where all leaves have matching numel.
+        // Walk through reshape into base ew chain.
+        // Uses pre-computed ref counts to check if consumed ops are safe.
+        if (uop == UOP_RESHAPE && !walk_no_reshape_through &&
+            base && ctx->tensors[base].buf_id == 0 && ctx->tensors[base].creator_op &&
+            is_elementwise(ctx->tensors[base].creator_op) &&
+            !ctx->tensors[base].requires_grad && // GRAD handler will add refs later
+            tensor_ref_count[base] <= 1) {
+            // Pre-check: scan base chain for any op with ref_count > 1
+            int safe = 1;
+            {
+                u32 stk[32]; u32 sn = 0;
+                stk[sn++] = base;
+                while (sn > 0 && safe) {
+                    u32 s = stk[--sn];
+                    TensorMeta *sm = &ctx->tensors[s];
+                    if (sm->buf_id != 0) continue; // leaf — OK
+                    if (tensor_ref_count[s] > 1) { safe = 0; break; }
+                    if (!sm->creator_op) continue;
+                    if (is_elementwise(sm->creator_op)) {
+                        if (sm->src_ids[0] && sn < 30) stk[sn++] = sm->src_ids[0];
+                        if (sm->src_ids[1] && is_binary(sm->creator_op) && sn < 30)
+                            stk[sn++] = sm->src_ids[1];
+                    }
+                    // Stop at non-ew (will be materialized as leaf)
+                }
+            }
+            if (safe) {
+                int sub = materialize_walk(ctx, base, ops, n_ops, op_tids, leaf_ids, leaf_views, n_leaves);
+                if (sub >= 0) return sub;
+            }
+        }
+        // Fallback: materialize base, share buffer
         if (base && ctx->tensors[base].buf_id == 0 && ctx->tensors[base].creator_op)
             tensor_materialize(ctx, base);
         if (base && ctx->tensors[base].buf_id != 0) {
@@ -50,7 +106,10 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
         if (arg_b < 0) return -1;
     }
 
-    if (*n_ops >= FUSE_MAX_OPS) return -1;
+    if (*n_ops >= FUSE_MAX_OPS) {
+        if (getenv("THVM_DIAG")) fprintf(stderr, "FUSE_LIMIT: ops=%u leaves=%u tid=%u\n", *n_ops, *n_leaves, tid);
+        return -1;
+    }
     u32 op_idx = (*n_ops)++;
     ops[op_idx] = (FusedOp){ .uop = uop, .arg_a = (u32)arg_a, .arg_b = is_binary(uop) ? (u32)arg_b : 0 };
     op_tids[op_idx] = tid;
@@ -106,7 +165,25 @@ static void memory_prescan(TinyHVM *ctx) {
 static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
     TensorMeta *m = &ctx->tensors[tid];
     if (m->buf_id != 0) return;
+    ref_prescan(ctx); // ensure reference counts are up to date
     if (getenv("THVM_TRACE")) fprintf(stderr, "MAT_CHAIN tid=%u op=%u buf=%u\n", tid, m->creator_op, m->buf_id);
+
+    // Deferred MM: materialize inputs, then dispatch via MPS.
+    if (m->creator_op == UOP_MM && m->src_ids[0] && m->src_ids[1]) {
+        ENSURE(ctx, m->src_ids[0]);
+        ENSURE(ctx, m->src_ids[1]);
+        TensorMeta *ma = &ctx->tensors[m->src_ids[0]];
+        TensorMeta *mb = &ctx->tensors[m->src_ids[1]];
+        if (ma->buf_id && mb->buf_id) {
+            // Use ASSIGN elision target if available
+            if (m->assign_target) m->buf_id = m->assign_target;
+            else m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+            u32 M = ma->view.shape.dims[0], K = ma->view.shape.dims[1], N = mb->view.shape.dims[1];
+            m->backend->op_mm(m->buf_id, ma->buf_id, &ma->view,
+                              mb->buf_id, &mb->view, M, K, N);
+            return;
+        }
+    }
 
     // Post-reduce fusion: if this deferred ew chain contains a deferred reduce
     // (reachable via views), fuse pre-reduce ew → reduce → post-reduce ew in one kernel.
@@ -129,11 +206,12 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
             ctx->tensors[reduce_input].buf_id == 0 &&
             is_elementwise(ctx->tensors[reduce_input].creator_op)) {
             if(getenv("THVM_TRACE")) fprintf(stderr, "POST_REDUCE_FUSION: tid=%u reduce=%u input=%u\n", tid, reduce_tid, reduce_input);
-            // Walk pre-reduce ew chain
             FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0, op_tids[FUSE_MAX_OPS];
             u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
+            walk_no_reshape_through = 1;
             int pre_res = materialize_walk(ctx, reduce_input, ops, &n_ops, op_tids,
                                             leaf_ids, leaf_views, &n_leaves);
+            walk_no_reshape_through = 0;
             if (pre_res >= 0 && n_ops > 0) {
                 u32 pre_ops = n_ops, pre_leaves = n_leaves;
                 // Collect post-reduce ew ops (from reduce output to tid)
@@ -212,18 +290,21 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
 
     // Deferred reduce (SUM/RMAX): fuse reduce + elementwise input chain
     u32 reduce_type = 0, reduce_axes_id = 0, walk_tid = tid;
-    if ((m->creator_op == UOP_SUM || m->creator_op == UOP_RMAX) && m->src_ids[0] &&
-        ctx->tensors[m->src_ids[0]].buf_id == 0 &&
-        is_elementwise(ctx->tensors[m->src_ids[0]].creator_op)) {
-        reduce_type = m->creator_op;
-        reduce_axes_id = m->src_ids[1];
-        walk_tid = m->src_ids[0];
+    if ((m->creator_op == UOP_SUM || m->creator_op == UOP_RMAX) && m->src_ids[0]) {
+        TensorMeta *ri = &ctx->tensors[m->src_ids[0]];
+        if (ri->buf_id == 0 && is_elementwise(ri->creator_op)) {
+            reduce_type = m->creator_op;
+            reduce_axes_id = m->src_ids[1];
+            walk_tid = m->src_ids[0];
+        }
     }
 
     FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0; u32 op_tids[FUSE_MAX_OPS];
     u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
 
+    if (reduce_type) walk_no_reshape_through = 1;
     int result = materialize_walk(ctx, walk_tid, ops, &n_ops, op_tids, leaf_ids, leaf_views, &n_leaves);
+    walk_no_reshape_through = 0;
     if (m->buf_id != 0) return;
     if (result < 0 || n_ops == 0) {
         // Post-reduce fusion: if the walk failed because it hit a deferred reduce,
@@ -258,8 +339,10 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                 if (ctx->tensors[reduce_input].buf_id == 0 &&
                     is_elementwise(ctx->tensors[reduce_input].creator_op)) {
                     n_ops = 0; n_leaves = 0;
+                    walk_no_reshape_through = 1;
                     int pre_result = materialize_walk(ctx, reduce_input, ops, &n_ops, op_tids,
                                                        leaf_ids, leaf_views, &n_leaves);
+                    walk_no_reshape_through = 0;
                     if (pre_result >= 0 && n_ops > 0) {
                         u32 pre_reduce_ops = n_ops;
                         u32 pre_reduce_leaves = n_leaves;
@@ -432,21 +515,48 @@ dispatch_chain:
         if (ops[i].arg_b >= FUSE_MAX_LEAVES) ops[i].arg_b = n_leaves + (ops[i].arg_b - FUSE_MAX_LEAVES);
     }
 
-    m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+    // ASSIGN elision: use pre-assigned target buffer if available
+    if (m->assign_target) {
+        m->buf_id = m->assign_target;
+    } else {
+        m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+    }
 
-    // Allocate side output buffers for shared/grad-needed intermediates (not walk_tid).
-    // Moved here from materialize_walk to avoid zombie buffers from failed walks.
+    // Allocate side output buffers for shared/grad-needed intermediates.
+    // Exclude tid (the tensor being materialized — it gets the main output buffer).
+    // For reduce fusion: walk_tid != tid, so walk_tid CAN get a side output.
+    // But walk_tid's defer_consumers includes the reduce itself (+1), so only
+    // allocate when defer_consumers > 1 (meaning someone ELSE needs the value).
     for (u32 i = 0; i < n_ops; i++) {
         TensorMeta *sm = &ctx->tensors[op_tids[i]];
-        if (sm->defer_consumers > 0 && sm->buf_id == 0 && op_tids[i] != walk_tid)
+        u32 min_dc = (reduce_type && op_tids[i] == walk_tid) ? 1 : 0;
+        if (sm->defer_consumers > min_dc && sm->buf_id == 0 && op_tids[i] != tid)
             sm->buf_id = sm->backend->buf_alloc(sm->view.numel * sizeof(f32));
+    }
+
+    // Propagate side-output buf_ids to views that reference them
+    // (view-through walk marked bases with defer_consumers++, views need their buf_id)
+    for (u32 i = 0; i < n_ops; i++) {
+        u32 oid = op_tids[i];
+        TensorMeta *sm = &ctx->tensors[oid];
+        if (sm->buf_id != 0) {
+            // Check if any view references this tensor as base
+            for (u32 vt = oid + 1; vt < ctx->tensor_count && vt < oid + 200; vt++) {
+                TensorMeta *vm = &ctx->tensors[vt];
+                if (vm->buf_id == 0 && is_view_op(vm->creator_op) && vm->src_ids[0] == oid) {
+                    vm->buf_id = sm->buf_id;
+                    if (vm->backend && vm->backend->buf_incref) vm->backend->buf_incref(sm->buf_id);
+                }
+            }
+        }
     }
 
     // Collect side outputs (shared intermediates + grad-needed with own buffers)
     u32 side_bufs[8]; u32 side_ops[8]; u32 n_sides = 0;
     for (u32 i = 0; i < n_ops && n_sides < 8; i++) {
         TensorMeta *sm = &ctx->tensors[op_tids[i]];
-        if (sm->buf_id != 0 && sm->defer_consumers > 0 && op_tids[i] != walk_tid) {
+        u32 min_dc2 = (reduce_type && op_tids[i] == walk_tid) ? 1 : 0;
+        if (sm->buf_id != 0 && sm->defer_consumers > min_dc2 && op_tids[i] != tid) {
             side_bufs[n_sides] = sm->buf_id;
             side_ops[n_sides] = n_leaves + i; // remapped op index
             n_sides++;
@@ -567,8 +677,10 @@ static int tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf,
     FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0, op_tids[FUSE_MAX_OPS];
     u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
 
+    walk_no_reshape_through = 1;
     int result = materialize_walk(ctx, input_tid, ops, &n_ops, op_tids,
                                    leaf_ids, leaf_views, &n_leaves);
+    walk_no_reshape_through = 0;
     if (result < 0 || n_ops == 0) return 0;
 
     // Remap op indices
@@ -952,7 +1064,7 @@ static void tensor_materialize(TinyHVM *ctx, u32 tid) {
     if (m->buf_id != 0) return;
     // Run memory prescan periodically to find newly deferred tensors.
     // Reset scan state when tensor_count drops (pool_reset happened).
-    if (ctx->tensor_count < prescan_tc) { prescan_from = 0; prescan_tc = 0; }
+    if (ctx->tensor_count < prescan_tc) { prescan_from = 0; prescan_tc = 0; ref_prescan_done = 0; }
     if (ctx->tensor_count > prescan_tc + 20) {
         memory_prescan(ctx);
         prescan_tc = ctx->tensor_count;

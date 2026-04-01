@@ -89,11 +89,14 @@ static int cg_leaf_is_flat(const View *v, u32 target_numel) {
 // Kernel iterates output axes via dispatch grid, reduce axes via inner loop.
 // Leaf indexing uses coordinates for ALL axes.
 
+static int _codegen_group_reduce = 0; // set by codegen for group reduce kernels
+
 static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                                     const View **leaf_views,
                                     const Shape *full_shape,
                                     const ReduceSpec *reduce,
                                     const u32 *side_op_indices, u32 n_side_outputs) {
+    _codegen_group_reduce = 0;
     u32 rank = full_shape->rank;
     if (rank == 0) rank = 1;
 
@@ -103,6 +106,14 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     u32 out_shape[MAX_DIM];           // output-axis-only dims (for dispatch grid)
     u32 out_numel = 1, reduce_numel = 1;
     int has_reduce = reduce && reduce->reduce_type;
+
+    // Pre-compute reduce_numel for group_reduce decision
+    if (has_reduce) {
+        for (u32 d = 0; d < rank; d++)
+            if (reduce->is_reduce[d]) reduce_numel *= full_shape->dims[d];
+    }
+    int group_reduce = has_reduce && reduce_numel >= 1024 && reduce->reduce_type == UOP_SUM;
+    reduce_numel = 1; // reset — recomputed in the axis classification loop
 
     for (u32 d = 0; d < rank; d++) {
         if (has_reduce && reduce->is_reduce[d]) {
@@ -160,12 +171,22 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     for (u32 i = 0; i < n_leaves; i++)
         [s appendFormat:@"  device const float *in%u[[buffer(%u)]],\n", i, buf_offset + i];
     [s appendFormat:@"  uint3 gid[[thread_position_in_grid]])\n{\n"];
-    [s appendFormat:@"  uint ix=gid.x,iy=gid.y,iz=gid.z;\n"];
-    [s appendFormat:@"  if(ix>=%uu||iy>=%uu||iz>=%uu)return;\n",
-        inner_dispatch, mid, outer];
-
-    if (use_f4) [s appendFormat:@"  uint inner_base=ix*4u;\n"];
-    else [s appendFormat:@"  uint inner_base=ix;\n"];
+    if (group_reduce) {
+        // Group reduce: 1D dispatch, split gid.x into lane + flat output index
+        [s appendFormat:@"  uint _lane=gid.x%%256u;\n"];
+        [s appendFormat:@"  uint _oidx=gid.x/256u;\n"];
+        [s appendFormat:@"  if(_oidx>=%uu)return;\n", out_numel];
+        // Decompose flat output index into 3D (iz, iy, ix)
+        [s appendFormat:@"  uint iz=_oidx/%uu,iy=(_oidx/%uu)%%%uu,ix=_oidx%%%uu;\n",
+            mid * inner, inner, mid, inner];
+        [s appendFormat:@"  uint inner_base=ix;\n"];
+    } else {
+        [s appendFormat:@"  uint ix=gid.x,iy=gid.y,iz=gid.z;\n"];
+        [s appendFormat:@"  if(ix>=%uu||iy>=%uu||iz>=%uu)return;\n",
+            inner_dispatch, mid, outer];
+        if (use_f4) [s appendFormat:@"  uint inner_base=ix*4u;\n"];
+        else [s appendFormat:@"  uint inner_base=ix;\n"];
+    }
 
     // ── Output axis coordinates from grid ──────────────────────
     for (u32 oi = 0; oi < n_out; oi++) {
@@ -190,7 +211,16 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     if (has_reduce) {
         [s appendFormat:@"  float acc=%s;\n",
             reduce->reduce_type == UOP_RMAX ? "-1e30f" : "0.0f"];
-        [s appendFormat:@"  for(uint r=0;r<%uu;r++){\n", reduce_numel];
+        if (group_reduce) {
+            // Parallel reduce: contiguous block per thread (preserves serial sum order)
+            [s appendFormat:@"  uint _blk=%uu/256u,_r0=_lane*_blk,_r1=min(_r0+_blk,%uu);\n",
+                reduce_numel, reduce_numel];
+            // Last thread handles remainder
+            [s appendFormat:@"  if(_lane==255u)_r1=%uu;\n", reduce_numel];
+            [s appendFormat:@"  for(uint r=_r0;r<_r1;r++){\n"];
+        } else {
+            [s appendFormat:@"  for(uint r=0;r<%uu;r++){\n", reduce_numel];
+        }
         // Decompose r into per-reduce-axis coordinates (innermost last)
         u32 rdiv = 1;
         for (int ri = (int)n_red - 1; ri >= 0; ri--) {
@@ -392,6 +422,14 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             [s appendFormat:@"    acc=max(acc,t%u);\n  }\n", last];
         else
             [s appendFormat:@"    acc+=t%u;\n  }\n", last];
+        if (group_reduce) {
+            // Serial cross-thread reduction: preserves summation order
+            [s appendString:@"  threadgroup float _sh[256];\n"];
+            [s appendString:@"  _sh[_lane]=acc;\n"];
+            [s appendString:@"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"];
+            [s appendString:@"  if(_lane!=0u)return;\n"];
+            [s appendString:@"  acc=0.f;for(uint _i=0;_i<256u;_i++)acc+=_sh[_i];\n"];
+        }
         [s appendFormat:@"  uint oi=iz*%uu+iy*%uu+inner_base;\n",
             mid*inner, inner];
 
@@ -652,6 +690,7 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     }
 
     [s appendString:@"}\n"];
+    _codegen_group_reduce = group_reduce;
     return s;
 }
 
@@ -677,7 +716,7 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
     int has_reduce_r = reduce && reduce->reduce_type;
     _last_compiled_uop = 0;
     _last_local_size = 0;
-    if (_use_uop && n_side_outputs == 0) {
+    if (0 && _use_uop && n_side_outputs == 0 && !has_reduce_r) {
         static UOpKernel uk; // static: avoid 10KB stack allocation in recursive calls
         if (uop_from_fused(&uk, ops, n_ops, n_leaves, leaf_views, full_shape, reduce)) {
             src = uop_render_msl(&uk);
@@ -686,9 +725,11 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
         } else
             src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views,
                                      full_shape, reduce, side_op_indices, n_side_outputs);
+            if (_codegen_group_reduce) _last_local_size = 256;
     } else {
         src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views,
                                  full_shape, reduce, side_op_indices, n_side_outputs);
+        if (_codegen_group_reduce) _last_local_size = 256;
     }
     if (getenv("THVM_DUMP_CODEGEN")) fprintf(stderr, "--- codegen (n_ops=%u n_leaves=%u n_side=%u cmd=%u) ---\n%s\n---\n", n_ops, n_leaves, n_side_outputs, jit.n_cmds, [src UTF8String]);
     NSError *err;

@@ -724,9 +724,25 @@ inet_step:
                                 _nn == ma->view.numel) {
                                 new_view = view_create(ns);
                                 if (ma->st.n_views == 0) {
-                                    ma->st.views[0] = ma->view;
-                                    ma->st.views[1] = new_view;
-                                    ma->st.n_views = 2;
+                                    // Walk view chain to build full ST from buffer to top.
+                                    // Chain: buffer → pool → pad → expand → (this reshape)
+                                    View chain[ST_MAX_VIEWS]; u32 cn = 0;
+                                    chain[cn++] = ma->view; // current view (topmost)
+                                    u32 walk = a_id;
+                                    while (cn < ST_MAX_VIEWS - 1) {
+                                        TensorMeta *wm = &ctx->tensors[walk];
+                                        if (!is_view_op(wm->creator_op) || !wm->src_ids[0]) break;
+                                        u32 base = wm->src_ids[0];
+                                        TensorMeta *bm = &ctx->tensors[base];
+                                        if (bm->buf_id != ma->buf_id) break; // different buffer
+                                        chain[cn++] = bm->view;
+                                        walk = base;
+                                    }
+                                    // Reverse: views[0] = deepest (buffer), views[n-1] = reshape
+                                    for (u32 vi = 0; vi < cn; vi++)
+                                        ma->st.views[vi] = chain[cn - 1 - vi];
+                                    ma->st.views[cn] = new_view;
+                                    ma->st.n_views = cn + 1;
                                 } else {
                                     ma->st.views[ma->st.n_views] = new_view;
                                     ma->st.n_views++;

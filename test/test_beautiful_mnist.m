@@ -53,7 +53,7 @@ int main(void) {
 
     printf("=== TinyHVM beautiful_mnist ===\n");
     printf("  Conv(32,k5)→Conv(32,k5)→BN→Pool→Conv(64,k3)→Conv(64,k3)→BN→Pool→Dense(%u)\n",ff);
-    printf("  BS=%u, Adam(lr=0.001), %u steps\n\n",BS,n_steps);
+    printf("  BS=%u, Adam(lr=0.0005), %u steps\n\n",BS,n_steps);
 
     double t0=now_s();
     for(u32 step=0;step<n_steps;step++){@autoreleasepool{
@@ -102,7 +102,10 @@ int main(void) {
 
         if(step<3||step%10==0||step==n_steps-1){
             f32 lv=thvm_to_host(ctx,loss)[0];
-            printf("  step %3u: loss=%5.2f (%.1fs)\n",step,lv,now_s()-t0);
+            extern u32 total_dispatches;
+            extern void print_dispatch_breakdown(void);
+            if(step==0) { print_dispatch_breakdown(); }
+            printf("  step %3u: loss=%5.2f (%.1fs) [%u dispatches]\n",step,lv,now_s()-t0,total_dispatches);
         }
         extern u32 total_dispatches; total_dispatches=0;
         thvm_reset(ctx,nw);

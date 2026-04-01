@@ -17,17 +17,20 @@ static View view_reshape(View v, Shape new_shape) {
   assert(new_numel == v.numel && "reshape: numel mismatch");
 
   if (v.has_mask) {
-    // Masked views: only propagate mask for contiguous strides.
-    // Non-contiguous masked views (from PAD on permuted gradients) need
-    // materialization — the mask-to-stride interaction is too complex
-    // for the merge-split algorithm to handle correctly.
-    int src_contig = 1;
-    i32 exp2 = 1;
-    for (int i = (int)v.shape.rank - 1; i >= 0; i--) {
-      if (v.shape.dims[i] > 1 && v.strides[i] != exp2) { src_contig = 0; break; }
-      exp2 *= (i32)v.shape.dims[i];
-    }
-    if (!src_contig) {
+    // Masked views: allow reshape if ALL non-trivial dims match 1:1
+    // (pure unit-dim insertion/removal). This preserves the mask because
+    // each source dim maps directly to one target dim.
+    // For merges/splits of non-trivial dims, fall to contiguify fallback.
+    u32 old_nt[MAX_DIM], new_nt[MAX_DIM]; u32 on_m = 0, nn_m = 0;
+    for (u32 i = 0; i < v.shape.rank; i++)
+      if (v.shape.dims[i] > 1) old_nt[on_m++] = v.shape.dims[i];
+    for (u32 i = 0; i < new_shape.rank; i++)
+      if (new_shape.dims[i] > 1) new_nt[nn_m++] = new_shape.dims[i];
+    int dims_match = (on_m == nn_m);
+    if (dims_match)
+      for (u32 i = 0; i < on_m; i++)
+        if (old_nt[i] != new_nt[i]) { dims_match = 0; break; }
+    if (!dims_match) {
       View r = {0};
       r.shape = new_shape; r.numel = new_numel; r.offset = v.offset;
       for (u32 i = 0; i < new_shape.rank; i++) {
@@ -38,7 +41,7 @@ static View view_reshape(View v, Shape new_shape) {
       r.contiguous = 0;
       return r;
     }
-    // Contiguous masked: fall through to merge-split, propagate mask at end.
+    // Pure 1-dim insertion: fall through to merge-split + mask propagation.
   }
 
   // Merge-split algorithm: walk old and new shapes simultaneously.

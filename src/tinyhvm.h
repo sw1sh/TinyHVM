@@ -395,6 +395,11 @@ typedef struct {
     // n_compound_masks=0 means no compound masks (backward compat).
     u8  n_compound_masks;
     struct { u8 dim_a, dim_b; i32 stride_a; u32 begin, end; } compound_masks[2]; // max 2 spatial dims
+    // Modular indexing: for dims created by merging broadcast (stride-0) with
+    // non-zero dims, the coord must be taken modulo the non-zero dim's size.
+    // mod_size[d] > 0 → codegen emits (c_d % mod_size[d]) * stride[d]
+    // mod_size[d] == 0 → normal: c_d * stride[d]
+    u32 mod_size[MAX_DIM];
 } View;
 
 // ============================================================

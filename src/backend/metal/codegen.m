@@ -262,8 +262,14 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                 [s appendFormat:@"%@uint i%u=%d", indent, li, lv->offset];
                 for (u32 d = 0; d < rank; d++) {
                     if (lv->strides[d] == 0 || lv->shape.dims[d] == 1) continue;
-                    if (lv->strides[d] == 1) [s appendFormat:@"+c%u", d];
-                    else [s appendFormat:@"+c%u*%du", d, lv->strides[d]];
+                    if (lv->mod_size[d] > 0 && lv->mod_size[d] < lv->shape.dims[d]) {
+                        // Modular indexing: (coord % mod_size) * stride
+                        [s appendFormat:@"+(c%u%%%uu)*%du", d, lv->mod_size[d], lv->strides[d]];
+                    } else if (lv->strides[d] == 1) {
+                        [s appendFormat:@"+c%u", d];
+                    } else {
+                        [s appendFormat:@"+c%u*%du", d, lv->strides[d]];
+                    }
                 }
                 [s appendString:@";\n"];
                 continue;
@@ -290,13 +296,15 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
         u32 leaf_div = 1;
         for (int d = (int)lv->shape.rank - 1; d >= 0; d--) {
             if (lv->strides[d] == 0) { leaf_div *= lv->shape.dims[d]; continue; }
+            u32 dim = lv->shape.dims[d];
+            u32 mod = (lv->mod_size[d] > 0 && lv->mod_size[d] < dim) ? lv->mod_size[d] : dim;
             if (leaf_div == 1 && lv->strides[d] == 1)
-                [s appendFormat:@"+(fi%u%%%uu)", li, lv->shape.dims[d]];
+                [s appendFormat:@"+(fi%u%%%uu)", li, mod];
             else if (leaf_div == 1)
-                [s appendFormat:@"+(fi%u%%%uu)*%du", li, lv->shape.dims[d], lv->strides[d]];
+                [s appendFormat:@"+(fi%u%%%uu)*%du", li, mod, lv->strides[d]];
             else
                 [s appendFormat:@"+((fi%u/%uu)%%%uu)*%du", li, leaf_div,
-                    lv->shape.dims[d], lv->strides[d]];
+                    mod, lv->strides[d]];
             leaf_div *= lv->shape.dims[d];
         }
         [s appendString:@";\n"];

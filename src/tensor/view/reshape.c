@@ -73,7 +73,8 @@ static View view_reshape(View v, Shape new_shape) {
 
   // Compute strides for new shape — start with 0 for trivial dims
   i32 new_strides[MAX_DIM];
-  for (u32 i = 0; i < new_shape.rank; i++) new_strides[i] = 0;
+  u32 new_mod_size[MAX_DIM];
+  for (u32 i = 0; i < new_shape.rank; i++) { new_strides[i] = 0; new_mod_size[i] = 0; }
 
   // Walk both dimension lists
   u32 oi = 0, ni = 0;
@@ -143,8 +144,10 @@ static View view_reshape(View v, Shape new_shape) {
   r.offset = v.offset;
 
   if (reshapable) {
-    for (u32 i = 0; i < new_shape.rank; i++)
+    for (u32 i = 0; i < new_shape.rank; i++) {
       r.strides[i] = new_strides[i];
+      r.mod_size[i] = new_mod_size[i];
+    }
     // Check if the result is truly contiguous
     r.contiguous = 1;
     i32 expected = 1;

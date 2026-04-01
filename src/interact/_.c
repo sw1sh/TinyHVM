@@ -719,6 +719,14 @@ inet_step:
                             ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];
                             u32 numel = ma->view.numel;
                             u32 orig_a_id = a_id;
+                            if (getenv("THVM_DIAG")) {
+                                fprintf(stderr, "CONTIGUIFY: numel=%u (%.1fMB) mask=%d shape=[",
+                                    numel, numel*4.f/1048576.f, ma->view.has_mask);
+                                for(u32 _d=0;_d<ma->view.shape.rank;_d++) fprintf(stderr,"%u,",ma->view.shape.dims[_d]);
+                                fprintf(stderr,"] strides=[");
+                                for(u32 _d=0;_d<ma->view.shape.rank;_d++) fprintf(stderr,"%d,",ma->view.strides[_d]);
+                                fprintf(stderr,"]\n");
+                            }
                             u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
                             if (ma->backend->contiguify) {
                                 ma->backend->contiguify(ctx->tensors[mat_id].buf_id, numel,

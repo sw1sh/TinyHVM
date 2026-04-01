@@ -243,6 +243,65 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     for (u32 li = 0; li < n_leaves; li++) {
         const View *lv = leaf_views[li];
 
+        // Path D: ShapeTracker composition (MUST be checked FIRST)
+        if (leaf_sts && leaf_sts[li] && leaf_sts[li]->n_views >= 2) {
+            const ShapeTracker *st = leaf_sts[li];
+            // Compute flat index from kernel coordinates
+            u32 fs_d[MAX_DIM];
+            if (rank > 0) {
+                fs_d[rank - 1] = 1;
+                for (int d = (int)rank - 2; d >= 0; d--)
+                    fs_d[d] = fs_d[d + 1] * full_shape->dims[d + 1];
+            }
+            [s appendFormat:@"%@uint si%u=", indent, li];
+            for (u32 d = 0; d < rank; d++) {
+                if (d > 0) [s appendString:@"+"];
+                if (fs_d[d] == 1) [s appendFormat:@"c%u", d];
+                else [s appendFormat:@"c%u*%uu", d, fs_d[d]];
+            }
+            [s appendString:@";\n"];
+            // Unravel through views[0].shape (physical), apply strides
+            for (int vi = (int)st->n_views - 2; vi >= 0; vi--) {
+                const View *vw = &st->views[vi];
+                u32 udiv = 1;
+                [s appendFormat:@"%@si%u=%d", indent, li, vw->offset];
+                for (int d = (int)vw->shape.rank - 1; d >= 0; d--) {
+                    u32 dim = vw->shape.dims[d];
+                    if (dim <= 1) { udiv *= dim; continue; }
+                    if (vw->strides[d] != 0) {
+                        if (udiv == 1)
+                            [s appendFormat:@"+(si%u%%%uu)*%du", li, dim, vw->strides[d]];
+                        else
+                            [s appendFormat:@"+((si%u/%uu)%%%uu)*%du", li, udiv, dim, vw->strides[d]];
+                    }
+                    udiv *= dim;
+                }
+                [s appendString:@";\n"];
+                // Mask check
+                if (vw->has_mask) {
+                    u32 mdiv = 1;
+                    [s appendFormat:@"%@bool vm%u_%u=true", indent, li, vi];
+                    for (int d = (int)vw->shape.rank - 1; d >= 0; d--) {
+                        u32 dim = vw->shape.dims[d];
+                        if (dim <= 1) { mdiv *= dim; continue; }
+                        if (vw->mask_begin[d] > 0 || vw->mask_end[d] < dim) {
+                            if (mdiv == 1) {
+                                if (vw->mask_begin[d] > 0) [s appendFormat:@"&&(si%u%%%uu)>=%uu", li, dim, vw->mask_begin[d]];
+                                if (vw->mask_end[d] < dim) [s appendFormat:@"&&(si%u%%%uu)<%uu", li, dim, vw->mask_end[d]];
+                            } else {
+                                if (vw->mask_begin[d] > 0) [s appendFormat:@"&&((si%u/%uu)%%%uu)>=%uu", li, mdiv, dim, vw->mask_begin[d]];
+                                if (vw->mask_end[d] < dim) [s appendFormat:@"&&((si%u/%uu)%%%uu)<%uu", li, mdiv, dim, vw->mask_end[d]];
+                            }
+                        }
+                        mdiv *= dim;
+                    }
+                    [s appendString:@";\n"];
+                }
+            }
+            [s appendFormat:@"%@uint i%u=si%u;\n", indent, li, li];
+            continue;
+        }
+
         // Path A: flat contiguous
         if (!has_reduce && cg_leaf_is_flat(lv, out_numel)) {
             if (use_f4) [s appendFormat:@"  // leaf %u: flat (f4)\n", li];
@@ -298,19 +357,17 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             [s appendString:@";\n"];
 
             // Step 2: for each view from n-2 down to 0, unravel + apply strides
+            // Port of tinygrad's views_to_indexed_uops: unravel through VIEW's shape
             for (int vi = (int)st->n_views - 2; vi >= 0; vi--) {
                 const View *vw = &st->views[vi];
-                // Unravel si through views[vi+1].shape → multi-dim coords → apply vw strides
-                const View *outer = &st->views[vi + 1];
-                // Compute unravel divisors for outer shape
+                // Unravel si through vw->shape (the view being applied)
+                // This matches tinygrad: unravel(view.shape, idx)
                 u32 udiv = 1;
                 [s appendFormat:@"%@si%u=%d", indent, li, vw->offset];
-                for (int d = (int)outer->shape.rank - 1; d >= 0; d--) {
-                    u32 dim = outer->shape.dims[d];
+                for (int d = (int)vw->shape.rank - 1; d >= 0; d--) {
+                    u32 dim = vw->shape.dims[d];
                     if (dim <= 1) { udiv *= dim; continue; }
-                    // coord_d = (si / udiv) % dim
-                    // Then apply vw stride if vw has this dim
-                    if ((u32)d < vw->shape.rank && vw->strides[d] != 0) {
+                    if (vw->strides[d] != 0) {
                         if (udiv == 1)
                             [s appendFormat:@"+(si%u%%%uu)*%du", li, dim, vw->strides[d]];
                         else
@@ -323,11 +380,10 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                 if (vw->has_mask) {
                     u32 mdiv = 1;
                     [s appendFormat:@"%@bool vm%u_%u=true", indent, li, vi];
-                    for (int d = (int)outer->shape.rank - 1; d >= 0; d--) {
-                        u32 dim = outer->shape.dims[d];
+                    for (int d = (int)vw->shape.rank - 1; d >= 0; d--) {
+                        u32 dim = vw->shape.dims[d];
                         if (dim <= 1) { mdiv *= dim; continue; }
-                        if ((u32)d < vw->shape.rank &&
-                            (vw->mask_begin[d] > 0 || vw->mask_end[d] < vw->shape.dims[d])) {
+                        if (vw->mask_begin[d] > 0 || vw->mask_end[d] < vw->shape.dims[d]) {
                             if (mdiv == 1) {
                                 if (vw->mask_begin[d] > 0)
                                     [s appendFormat:@"&&(si%u%%%uu)>=%uu", li, dim, vw->mask_begin[d]];
@@ -845,18 +901,20 @@ static void metal_dispatch_kernel_rs_st(u32 out_buf,
     FusedOp *ops, u32 n_ops, const Shape *full_shape, const ReduceSpec *reduce,
     u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs);
 
+// Global ST per-leaf pointers. Set before dispatch by materialize_walk.
+const ShapeTracker *_dispatch_leaf_sts[FUSE_MAX_LEAVES];
+
 void metal_dispatch_kernel_rs(u32 out_buf,
                                u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
                                FusedOp *ops, u32 n_ops,
                                const Shape *full_shape,
                                const ReduceSpec *reduce,
                                u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs) {
-    // No ShapeTracker — delegate to the full version
-    const ShapeTracker *null_sts[FUSE_MAX_LEAVES];
-    memset(null_sts, 0, sizeof(null_sts));
-    metal_dispatch_kernel_rs_st(out_buf, leaf_bufs, leaf_views, null_sts, n_leaves,
+    metal_dispatch_kernel_rs_st(out_buf, leaf_bufs, leaf_views,
+                                 (const ShapeTracker *const *)_dispatch_leaf_sts, n_leaves,
                                  ops, n_ops, full_shape, reduce,
                                  side_bufs, side_op_indices, n_side_outputs);
+    memset(_dispatch_leaf_sts, 0, sizeof(_dispatch_leaf_sts));
 }
 
 void metal_dispatch_kernel_rs_st(u32 out_buf,

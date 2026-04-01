@@ -50,6 +50,8 @@ static u32 tensor_view_of(TinyHVM *ctx, u32 src_id, View new_view) {
   m->buf_id   = ms->buf_id;
   m->backend  = ms->backend;
   m->view     = new_view;
+  m->st       = ms->st;
+  if (m->st.n_views > 0) m->st.views[m->st.n_views - 1] = new_view;
   if (m->buf_id && m->backend && m->backend->buf_incref)
       m->backend->buf_incref(m->buf_id);
   return id;

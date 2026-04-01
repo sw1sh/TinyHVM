@@ -717,59 +717,36 @@ inet_step:
                         }
                         if (needs_materialize) {
                             ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];
-                            u32 numel = ma->view.numel;
-                            u32 orig_a_id = a_id;
-                            if (getenv("THVM_DIAG")) {
-                                fprintf(stderr, "CONTIGUIFY: numel=%u (%.1fMB) mask=%d shape=[",
-                                    numel, numel*4.f/1048576.f, ma->view.has_mask);
-                                for(u32 _d=0;_d<ma->view.shape.rank;_d++) fprintf(stderr,"%u,",ma->view.shape.dims[_d]);
-                                fprintf(stderr,"] strides=[");
-                                for(u32 _d=0;_d<ma->view.shape.rank;_d++) fprintf(stderr,"%d,",ma->view.strides[_d]);
-                                fprintf(stderr,"]\n");
-                            }
-                            u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
-                            if (ma->backend->contiguify) {
-                                ma->backend->contiguify(ctx->tensors[mat_id].buf_id, numel,
-                                                         ma->buf_id, &ma->view);
-                            } else {
-                                // CPU path: strided gather
-                                f32 *src = malloc(numel * sizeof(f32));
-                                u32 buf_bytes = (ma->view.offset > 0) ? (u32)ma->view.offset : 0;
-                                for (u32 d = 0; d < ma->view.shape.rank; d++)
-                                    if (ma->view.strides[d] > 0)
-                                        buf_bytes += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
-                                buf_bytes += 1;
-                                if (buf_bytes == 0) buf_bytes = 1;
-                                f32 *raw = malloc(buf_bytes * sizeof(f32));
-                                ma->backend->buf_read(ma->buf_id, raw, buf_bytes * sizeof(f32));
-                                for (u32 flat = 0; flat < numel; flat++) {
-                                    u32 rem = flat; i32 idx = ma->view.offset;
-                                    int msk = 0;
-                                    for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
-                                        u32 coord = rem % ma->view.shape.dims[d];
-                                        rem /= ma->view.shape.dims[d];
-                                        if (ma->view.has_mask && (coord < ma->view.mask_begin[d] || coord >= ma->view.mask_end[d])) msk = 1;
-                                        idx += (i32)coord * (ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
-                                    }
-                                    src[flat] = (msk || idx < 0 || (u32)idx >= buf_bytes) ? 0.f : raw[(u32)idx];
+                            // ShapeTracker: share buffer, push view stack.
+                            // Only when numel matches (valid reshape) and buffer exists.
+                            { u32 _nn=1; for(u32 _i=0;_i<ns.rank;_i++) _nn*=ns.dims[_i];
+                            if (ma->buf_id != 0 && ma->st.n_views < ST_MAX_VIEWS - 1 &&
+                                _nn == ma->view.numel) {
+                                new_view = view_create(ns);
+                                if (ma->st.n_views == 0) {
+                                    ma->st.views[0] = ma->view;
+                                    ma->st.views[1] = new_view;
+                                    ma->st.n_views = 2;
+                                } else {
+                                    ma->st.views[ma->st.n_views] = new_view;
+                                    ma->st.n_views++;
                                 }
-                                free(raw);
-                                ctx->tensors[mat_id].backend->buf_write(ctx->tensors[mat_id].buf_id, src, numel * sizeof(f32));
-                                free(src);
-                            }
-
-                            // Record provenance so GRAD can walk through materialized copies.
-                            // Must be unconditional — gradient tensors don't have requires_grad
-                            // but GRAD still needs to traverse their provenance chain.
+                                break; // → tensor_view_of copies st
+                            }}
+                            // Fallback: contiguify
                             {
+                                u32 numel = ma->view.numel, orig_a_id = a_id;
+                                u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
+                                if (ma->backend->contiguify)
+                                    ma->backend->contiguify(ctx->tensors[mat_id].buf_id, numel, ma->buf_id, &ma->view);
                                 ctx->tensors[mat_id].requires_grad = ctx->tensors[orig_a_id].requires_grad;
                                 ctx->tensors[mat_id].creator_op = UOP_RESHAPE;
                                 ctx->tensors[mat_id].src_ids[0] = orig_a_id;
                                 ctx->tensors[mat_id].src_ids[1] = b_id;
+                                a_id = mat_id;
+                                ma = &ctx->tensors[a_id];
+                                new_view = view_reshape(ma->view, ns);
                             }
-                            a_id = mat_id;
-                            ma = &ctx->tensors[a_id];
-                            new_view = view_reshape(ma->view, ns);
                         }
                         break;
                     }

@@ -373,20 +373,17 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
         // has stride-0 dims or is contiguous, it's valid.
         int valid = rv.contiguous;
         if (!valid) {
-            // Check if view_reshape produced valid non-contiguous strides
-            // (stride-0 dims properly propagated). If any non-trivial dim
-            // has stride 0, it's a valid expanded view alias.
-            int has_stride0 = 0;
-            for (u32 d = 0; d < new_shape.rank; d++)
-                if (new_shape.dims[d] > 1 && rv.strides[d] == 0) has_stride0 = 1;
-            // If source had stride-0 and result has stride-0, the merge-split
-            // algorithm succeeded. If source had stride-0 but result has none,
-            // it's the fallback (not reshapable).
-            int src_has_stride0 = 0;
-            for (u32 d = 0; d < m->view.shape.rank; d++)
-                if (m->view.shape.dims[d] > 1 && m->view.strides[d] == 0) src_has_stride0 = 1;
-            if (src_has_stride0 && has_stride0) valid = 1;
-            if (!src_has_stride0 && !has_stride0) valid = 0; // permuted, needs materialize
+            // Detect if view_reshape's merge-split algorithm produced valid
+            // strides (non-fallback). The fallback writes natural contiguous
+            // strides; the algorithm writes the actual computed strides.
+            // If strides differ from natural contiguous, the algorithm succeeded.
+            int is_fallback = 1;
+            i32 nat_s = 1;
+            for (int d = (int)new_shape.rank - 1; d >= 0; d--) {
+                if (new_shape.dims[d] > 1 && rv.strides[d] != nat_s) { is_fallback = 0; break; }
+                nat_s *= (i32)new_shape.dims[d];
+            }
+            if (!is_fallback) valid = 1; // algorithm produced custom strides → reshapable
         }
         if (!valid) goto lazy;
         // Reshape is valid as a view alias — same buffer, computed strides

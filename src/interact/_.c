@@ -276,11 +276,10 @@ inet_step:
                             UN_GRAD(thvm_op(ctx, UOP_MUL, thvm_expand(ctx, gy, ma->view.shape), mask));
                         }
                         case UOP_RESHAPE: {
-                            // Specialized conv backward: use MPS matmul for dW and dX
-                            // NOTE: conv metadata propagation from MUL→SUM→RESHAPE doesn't work
-                            // because post-reduce fusion creates new tensor IDs that lose the metadata.
-                            // The conv backward path only fires when conv metadata is set on the
-                            // RESHAPE tensor itself (which requires the lazy chain to resolve first).
+                            // Specialized conv backward: use MPS matmul for dW and dX.
+                            // Currently disabled: conv metadata can't be set because out is TAG_TOP.
+                            // Even when enabled, MPS MM path still needs contiguify of im2col,
+                            // so it doesn't reduce dispatch count. Needs ShapeTracker instead.
                             if (my->conv_input_id && my->conv_weight_id &&
                                 my->conv_groups == 1 && ma->backend->op_mm) {
                                 u32 inp_id = my->conv_input_id;

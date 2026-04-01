@@ -470,6 +470,7 @@ typedef struct {
     // across visits. When grad_refs reaches 0, walk once with combined gy.
     u16         grad_refs;   // expected GRAD visits remaining (0 = not shared)
     Term        grad_cache;  // accumulated gy from prior visits (0 = empty)
+    u32         assign_target; // ASSIGN elision: write fused output here instead of new buf
 
     // Fusion metadata (only when creator_op == UOP_FUSING)
     u64         fusing_loc; // heap loc of the original subnet root TAG_TOP

@@ -93,6 +93,7 @@ static int _codegen_group_reduce = 0; // set by codegen for group reduce kernels
 
 static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                                     const View **leaf_views,
+                                    const ShapeTracker *const *leaf_sts, // NULL or per-leaf ST
                                     const Shape *full_shape,
                                     const ReduceSpec *reduce,
                                     const u32 *side_op_indices, u32 n_side_outputs) {
@@ -274,6 +275,78 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                 [s appendString:@";\n"];
                 continue;
             }
+        }
+
+        // Path D: ShapeTracker composition (views_to_indexed_uops port)
+        // Process views right-to-left: compute flat idx from outer view,
+        // unravel through each inner view, apply strides.
+        if (leaf_sts && leaf_sts[li] && leaf_sts[li]->n_views >= 2) {
+            const ShapeTracker *st = leaf_sts[li];
+            // Step 1: compute flat index from kernel coords (= views[n-1] space)
+            u32 fs_d[MAX_DIM];
+            if (rank > 0) {
+                fs_d[rank - 1] = 1;
+                for (int d = (int)rank - 2; d >= 0; d--)
+                    fs_d[d] = fs_d[d + 1] * full_shape->dims[d + 1];
+            }
+            [s appendFormat:@"%@uint si%u=", indent, li];
+            for (u32 d = 0; d < rank; d++) {
+                if (d > 0) [s appendString:@"+"];
+                if (fs_d[d] == 1) [s appendFormat:@"c%u", d];
+                else [s appendFormat:@"c%u*%uu", d, fs_d[d]];
+            }
+            [s appendString:@";\n"];
+
+            // Step 2: for each view from n-2 down to 0, unravel + apply strides
+            for (int vi = (int)st->n_views - 2; vi >= 0; vi--) {
+                const View *vw = &st->views[vi];
+                // Unravel si through views[vi+1].shape → multi-dim coords → apply vw strides
+                const View *outer = &st->views[vi + 1];
+                // Compute unravel divisors for outer shape
+                u32 udiv = 1;
+                [s appendFormat:@"%@si%u=%d", indent, li, vw->offset];
+                for (int d = (int)outer->shape.rank - 1; d >= 0; d--) {
+                    u32 dim = outer->shape.dims[d];
+                    if (dim <= 1) { udiv *= dim; continue; }
+                    // coord_d = (si / udiv) % dim
+                    // Then apply vw stride if vw has this dim
+                    if ((u32)d < vw->shape.rank && vw->strides[d] != 0) {
+                        if (udiv == 1)
+                            [s appendFormat:@"+(si%u%%%uu)*%du", li, dim, vw->strides[d]];
+                        else
+                            [s appendFormat:@"+((si%u/%uu)%%%uu)*%du", li, udiv, dim, vw->strides[d]];
+                    }
+                    udiv *= dim;
+                }
+                [s appendString:@";\n"];
+                // Handle mask on this view
+                if (vw->has_mask) {
+                    u32 mdiv = 1;
+                    [s appendFormat:@"%@bool vm%u_%u=true", indent, li, vi];
+                    for (int d = (int)outer->shape.rank - 1; d >= 0; d--) {
+                        u32 dim = outer->shape.dims[d];
+                        if (dim <= 1) { mdiv *= dim; continue; }
+                        if ((u32)d < vw->shape.rank &&
+                            (vw->mask_begin[d] > 0 || vw->mask_end[d] < vw->shape.dims[d])) {
+                            if (mdiv == 1) {
+                                if (vw->mask_begin[d] > 0)
+                                    [s appendFormat:@"&&(si%u%%%uu)>=%uu", li, dim, vw->mask_begin[d]];
+                                if (vw->mask_end[d] < vw->shape.dims[d])
+                                    [s appendFormat:@"&&(si%u%%%uu)<%uu", li, dim, vw->mask_end[d]];
+                            } else {
+                                if (vw->mask_begin[d] > 0)
+                                    [s appendFormat:@"&&((si%u/%uu)%%%uu)>=%uu", li, mdiv, dim, vw->mask_begin[d]];
+                                if (vw->mask_end[d] < vw->shape.dims[d])
+                                    [s appendFormat:@"&&((si%u/%uu)%%%uu)<%uu", li, mdiv, dim, vw->mask_end[d]];
+                            }
+                        }
+                        mdiv *= dim;
+                    }
+                    [s appendString:@";\n"];
+                }
+            }
+            [s appendFormat:@"%@uint i%u=si%u;\n", indent, li, li];
+            continue;
         }
 
         // Path C: flat-index decomposition through leaf's own shape
@@ -705,6 +778,7 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
 // ── Get or compile a cached kernel (new interface) ─────────────────
 static id<MTLComputePipelineState> cg_get_pipe_rs(
         const FusedOp *ops, u32 n_ops, u32 n_leaves, const View **leaf_views,
+        const ShapeTracker *const *leaf_sts,
         const Shape *full_shape, const ReduceSpec *reduce,
         const u32 *side_op_indices, u32 n_side_outputs) {
     u64 key = cg_hash_rs(ops, n_ops, n_leaves, leaf_views, full_shape, reduce);
@@ -731,11 +805,11 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
             _last_compiled_uop = 1;
             _last_local_size = (int)uk.local_size;
         } else
-            src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views,
+            src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views, leaf_sts,
                                      full_shape, reduce, side_op_indices, n_side_outputs);
             if (_codegen_group_reduce) _last_local_size = 256;
     } else {
-        src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views,
+        src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views, leaf_sts,
                                  full_shape, reduce, side_op_indices, n_side_outputs);
         if (_codegen_group_reduce) _last_local_size = 256;
     }
@@ -744,7 +818,7 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
     id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
     if (!lib && _use_uop && n_side_outputs == 0) {
         // UOp MSL failed to compile — fall back to old codegen
-        src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views,
+        src = codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views, leaf_sts,
                                  full_shape, reduce, side_op_indices, n_side_outputs);
         lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
     }
@@ -765,8 +839,29 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
 }
 
 // ── Dispatch (new interface with ReduceSpec) ───────────────────────
+static void metal_dispatch_kernel_rs_st(u32 out_buf,
+    u32 *leaf_bufs, const View **leaf_views,
+    const ShapeTracker *const *leaf_sts, u32 n_leaves,
+    FusedOp *ops, u32 n_ops, const Shape *full_shape, const ReduceSpec *reduce,
+    u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs);
+
 void metal_dispatch_kernel_rs(u32 out_buf,
                                u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+                               FusedOp *ops, u32 n_ops,
+                               const Shape *full_shape,
+                               const ReduceSpec *reduce,
+                               u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs) {
+    // No ShapeTracker — delegate to the full version
+    const ShapeTracker *null_sts[FUSE_MAX_LEAVES];
+    memset(null_sts, 0, sizeof(null_sts));
+    metal_dispatch_kernel_rs_st(out_buf, leaf_bufs, leaf_views, null_sts, n_leaves,
+                                 ops, n_ops, full_shape, reduce,
+                                 side_bufs, side_op_indices, n_side_outputs);
+}
+
+void metal_dispatch_kernel_rs_st(u32 out_buf,
+                               u32 *leaf_bufs, const View **leaf_views,
+                               const ShapeTracker *const *leaf_sts, u32 n_leaves,
                                FusedOp *ops, u32 n_ops,
                                const Shape *full_shape,
                                const ReduceSpec *reduce,
@@ -789,7 +884,8 @@ void metal_dispatch_kernel_rs(u32 out_buf,
     if (n_out == 0) { n_out = 1; out_shape[0] = 1; out_dims[0] = rank; }
 
     id<MTLComputePipelineState> pipe = cg_get_pipe_rs(ops, n_ops, n_leaves,
-                                                       leaf_views, full_shape, reduce,
+                                                       leaf_views, leaf_sts,
+                                                       full_shape, reduce,
                                                        side_op_indices, n_side_outputs);
     if (!pipe) return;
 
@@ -929,9 +1025,9 @@ static NSString *codegen_kernel(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                 if (prod == reduce_dim) break;
             }
         }
-        return codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views, &full, &rs, NULL, 0);
+        return codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views, NULL, &full, &rs, NULL, 0);
     }
-    return codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views, &full, NULL, NULL, 0);
+    return codegen_kernel_rs(ops, n_ops, n_leaves, leaf_views, NULL, &full, NULL, NULL, 0);
 }
 
 // Old get_pipe (wrapper)

@@ -1,36 +1,194 @@
-// tensor/view/reshape.c — view_reshape(): change shape, compute strides
-// Implements merge-split algorithm matching tinygrad's ShapeTracker.
-// For non-contiguous views (expanded, permuted), computes valid strides
-// when possible, avoiding materialization.
+// tensor/view/reshape.c — view_reshape(): direct port of tinygrad's View.reshape()
+// Uses merge_dims() + reversed walk, matching tinygrad/shape/view.py exactly.
+
+// merge_dims: port of tinygrad's merge_dims() (view.py:45-64)
+// Returns array of (merged_size, stride, real_size) tuples.
+// real_size = merged_size excluding stride-0 dims (broadcast).
+typedef struct { u32 merged_size; i32 stride; u32 real_size; } MergedDim;
+
+static u32 merge_dims(const View *v, MergedDim *ret) {
+  u32 rank = v->shape.rank;
+  if (rank == 0) return 0;
+
+  u32 n = 0;
+  ret[0] = (MergedDim){
+    .merged_size = v->shape.dims[0],
+    .stride = v->strides[0],
+    .real_size = (v->strides[0] != 0) ? v->shape.dims[0] : 0
+  };
+  n = 1;
+
+  // merging = true if this dim has mask width 1 (or size 1 with no mask)
+  int merging = v->has_mask
+    ? ((i32)(v->mask_end[0] - v->mask_begin[0]) == 1)
+    : (v->shape.dims[0] == 1);
+
+  for (u32 i = 1; i < rank; i++) {
+    u32 s = v->shape.dims[i];
+    i32 st = v->strides[i];
+
+    // always merge size-1 dims
+    if (s == 1) continue;
+
+    u32 last_s = ret[n-1].merged_size;
+    i32 last_st = ret[n-1].stride;
+    u32 last_rs = ret[n-1].real_size;
+
+    // merge if: previous was "merging" (size-1 or mask-width-1),
+    // OR strides are contiguous (last_stride == s * st)
+    if (merging || last_st == (i32)(s * (u32)st)) {
+      ret[n-1].merged_size = last_s * s;
+      ret[n-1].stride = st;
+      ret[n-1].real_size = merging ? s : last_rs * s;
+    } else {
+      ret[n++] = (MergedDim){ .merged_size = s, .stride = st, .real_size = s };
+    }
+
+    merging = v->has_mask
+      ? ((i32)(v->mask_end[i] - v->mask_begin[i]) == 1)
+      : (s == 1);
+  }
+  return n;
+}
+
+// _reshape_mask: port of tinygrad's _reshape_mask() (view.py:67-96)
+// Returns 1 if mask was successfully reshaped, 0 if not possible.
+static int reshape_mask(const View *v, Shape new_shape,
+                        u32 *new_mask_begin, u32 *new_mask_end) {
+  if (!v->has_mask) {
+    for (u32 i = 0; i < new_shape.rank; i++) {
+      new_mask_begin[i] = 0;
+      new_mask_end[i] = new_shape.dims[i];
+    }
+    return 1;
+  }
+
+  // Process from right to left (reversed)
+  u32 nm_count = 0;
+  u32 nm_b[MAX_DIM], nm_e[MAX_DIM]; // reversed order
+
+  int oi = (int)v->shape.rank - 1;   // old shape index (reversed)
+  int ni = (int)new_shape.rank - 1;  // new shape index (reversed)
+  int mi = (int)v->shape.rank - 1;   // mask index (reversed)
+
+  u32 curr_stride = 1;
+  u32 old_dim = (oi >= 0) ? v->shape.dims[oi--] : 1;
+  u32 new_dim = (ni >= 0) ? new_shape.dims[ni--] : 1;
+  u32 mask_l = (mi >= 0) ? v->mask_begin[mi] : 0;
+  u32 mask_r = (mi >= 0) ? v->mask_end[mi] : 1;
+  if (mi >= 0) mi--;
+
+  while (nm_count < new_shape.rank) {
+    u32 next_stride = new_dim * curr_stride;
+
+    if (old_dim == next_stride) {
+      // Simply copy mask and get next batch
+      nm_b[nm_count] = mask_l / curr_stride;
+      nm_e[nm_count] = (mask_r - 1) / curr_stride + 1;
+      nm_count++;
+      curr_stride = 1;
+      old_dim = (oi >= 0) ? v->shape.dims[oi--] : 1;
+      new_dim = (ni >= 0) ? new_shape.dims[ni--] : 1;
+      mask_l = (mi >= 0) ? v->mask_begin[mi] : 0;
+      mask_r = (mi >= 0) ? v->mask_end[mi] : 1;
+      if (mi >= 0) mi--;
+    } else if (old_dim > next_stride) {
+      // Mask can only be split if reshape doesn't cut across the mask
+      if (old_dim % next_stride != 0) return 0;
+      if ((mask_l % next_stride != 0 || mask_r % next_stride != 0) &&
+          mask_l / next_stride != (mask_r - 1) / next_stride) return 0;
+      nm_b[nm_count] = (mask_l % next_stride) / curr_stride;
+      nm_e[nm_count] = ((mask_r - 1) % next_stride) / curr_stride + 1;
+      nm_count++;
+      curr_stride = next_stride;
+      new_dim = (ni >= 0) ? new_shape.dims[ni--] : 1;
+    } else {
+      // old_dim < next_stride: combine masks
+      u32 next_mask_l = (mi >= 0) ? v->mask_begin[mi] : 0;
+      u32 next_mask_r = (mi >= 0) ? v->mask_end[mi] : 1;
+      if (mi >= 0) mi--;
+      // combine if mask can unfold continuously
+      if (mask_l != 0 && mask_r != 0 && mask_l != mask_r &&
+          next_mask_r - next_mask_l != 1) return 0;
+      u32 combined_l = next_mask_l * old_dim + mask_l;
+      u32 combined_r = (next_mask_r - 1) * old_dim + mask_r;
+      mask_l = combined_l;
+      mask_r = combined_r;
+      u32 next_old = (oi >= 0) ? v->shape.dims[oi--] : 1;
+      old_dim = old_dim * next_old;
+    }
+  }
+
+  // Reverse the output
+  for (u32 i = 0; i < new_shape.rank; i++) {
+    new_mask_begin[i] = nm_b[new_shape.rank - 1 - i];
+    new_mask_end[i] = nm_e[new_shape.rank - 1 - i];
+  }
+  return 1;
+}
 
 static View view_reshape(View v, Shape new_shape) {
   u32 new_numel = 1;
   for (u32 i = 0; i < new_shape.rank; i++)
     new_numel *= new_shape.dims[i];
   if (new_numel != v.numel) {
-    fprintf(stderr, "reshape: numel mismatch old=%u new=%u old_shape=[", v.numel, new_numel);
-    for (u32 _d=0;_d<v.shape.rank;_d++) fprintf(stderr,"%u,",v.shape.dims[_d]);
-    fprintf(stderr,"] new_shape=[");
-    for (u32 _d=0;_d<new_shape.rank;_d++) fprintf(stderr,"%u,",new_shape.dims[_d]);
-    fprintf(stderr,"]\n");
+    fprintf(stderr, "reshape: numel mismatch old=%u new=%u\n", v.numel, new_numel);
   }
   assert(new_numel == v.numel && "reshape: numel mismatch");
 
-  if (v.has_mask) {
-    // Masked views: allow reshape if ALL non-trivial dims match 1:1
-    // (pure unit-dim insertion/removal). This preserves the mask because
-    // each source dim maps directly to one target dim.
-    // For merges/splits of non-trivial dims, fall to contiguify fallback.
-    u32 old_nt[MAX_DIM], new_nt[MAX_DIM]; u32 on_m = 0, nn_m = 0;
+  // Same shape → identity
+  if (v.shape.rank == new_shape.rank) {
+    int same = 1;
     for (u32 i = 0; i < v.shape.rank; i++)
-      if (v.shape.dims[i] > 1) old_nt[on_m++] = v.shape.dims[i];
+      if (v.shape.dims[i] != new_shape.dims[i]) { same = 0; break; }
+    if (same) return v;
+  }
+
+  // Contiguous → just change shape
+  if (v.contiguous) {
+    View r = {0};
+    r.shape = new_shape;
+    r.numel = new_numel;
+    // Compute natural strides
+    if (new_shape.rank > 0) {
+      r.strides[new_shape.rank - 1] = 1;
+      for (int i = (int)new_shape.rank - 2; i >= 0; i--)
+        r.strides[i] = r.strides[i+1] * (i32)new_shape.dims[i+1];
+    }
+    // Canonicalize: stride=0 for size-1 dims
     for (u32 i = 0; i < new_shape.rank; i++)
-      if (new_shape.dims[i] > 1) new_nt[nn_m++] = new_shape.dims[i];
-    int dims_match = (on_m == nn_m);
-    if (dims_match)
-      for (u32 i = 0; i < on_m; i++)
-        if (old_nt[i] != new_nt[i]) { dims_match = 0; break; }
-    if (!dims_match) {
+      if (new_shape.dims[i] == 1) r.strides[i] = 0;
+    r.contiguous = (v.offset == 0 && !v.has_mask);
+    r.offset = v.offset;
+    return r;
+  }
+
+  // Port of tinygrad View.reshape() lines 325-342
+  // Use merge_dims then walk reversed
+  MergedDim md[MAX_DIM];
+  u32 n_md = merge_dims(&v, md);
+
+  i32 r_strides[MAX_DIM];
+  u32 r_count = 0;
+  int ni_rev = (int)new_shape.rank - 1; // walk new_shape reversed
+
+  // Walk merged dims reversed
+  for (int mi = (int)n_md - 1; mi >= 0; mi--) {
+    u32 merged_size = md[mi].merged_size;
+    i32 new_stride = md[mi].stride;
+    u32 real_size = md[mi].real_size;
+
+    u32 acc = 1;
+    while (acc < merged_size && ni_rev >= 0) {
+      u32 new_dim = new_shape.dims[ni_rev];
+      if (new_dim == 0) break;
+      r_strides[r_count++] = new_stride * (i32)acc;
+      acc *= new_dim;
+      ni_rev--;
+      if (acc >= real_size && real_size > 0) new_stride = 0;
+    }
+    if (acc != merged_size) {
+      // Can't reshape — return fallback
       View r = {0};
       r.shape = new_shape; r.numel = new_numel; r.offset = v.offset;
       for (u32 i = 0; i < new_shape.rank; i++) {
@@ -41,114 +199,25 @@ static View view_reshape(View v, Shape new_shape) {
       r.contiguous = 0;
       return r;
     }
-    // Pure 1-dim insertion: fall through to merge-split + mask propagation.
   }
 
-  // Merge-split algorithm: walk old and new shapes simultaneously.
-  // Skip dims of size 1 (they don't affect data layout).
-  // For each group of merged old dims → one new dim (or split):
-  //   - All stride-0 → new stride is 0
-  //   - Contiguous chain → new stride is the innermost stride
-  //   - Otherwise → not reshapable (need materialization)
-
-  // Collect non-trivial (size > 1) old dims
-  u32 od[MAX_DIM], os[MAX_DIM], on = 0;
-  for (u32 i = 0; i < v.shape.rank; i++) {
-    if (v.shape.dims[i] > 1) {
-      od[on] = v.shape.dims[i];
-      os[on] = (u32)v.strides[i];
-      on++;
-    }
-  }
-  // Collect non-trivial new dims
-  u32 nd[MAX_DIM], nn = 0;
-  u32 new_dim_map[MAX_DIM]; // index into new_shape for each non-trivial dim
-  for (u32 i = 0; i < new_shape.rank; i++) {
-    if (new_shape.dims[i] > 1) {
-      new_dim_map[nn] = i;
-      nd[nn] = new_shape.dims[i];
-      nn++;
-    }
-  }
-
-  // Compute strides for new shape — start with 0 for trivial dims
-  i32 new_strides[MAX_DIM];
-  u32 new_mod_size[MAX_DIM];
-  for (u32 i = 0; i < new_shape.rank; i++) { new_strides[i] = 0; new_mod_size[i] = 0; }
-
-  // Walk both dimension lists
-  u32 oi = 0, ni = 0;
-  int reshapable = 1;
-
-  while (oi < on && ni < nn) {
-    // Match old dims to new dims by accumulating products
-    u32 old_prod = od[oi];
-    u32 old_start = oi;
-    oi++;
-
-    u32 new_prod = nd[ni];
-    u32 new_start = ni;
-    ni++;
-
-    // Grow whichever side is smaller until products match
-    while (old_prod != new_prod) {
-      if (old_prod < new_prod) {
-        if (oi >= on) { reshapable = 0; break; }
-        old_prod *= od[oi++];
-      } else {
-        if (ni >= nn) { reshapable = 0; break; }
-        new_prod *= nd[ni++];
-      }
-    }
-    if (!reshapable) break;
-
-    // Check if old dims in [old_start, oi) are compatible for merging
-    int all_zero = 1, any_zero = 0;
-    for (u32 k = old_start; k < oi; k++) {
-      if (os[k] == 0) any_zero = 1;
-      else all_zero = 0;
-    }
-
-    if (all_zero) {
-      // All stride-0: new dims all get stride 0
-      for (u32 k = new_start; k < ni; k++)
-        new_strides[new_dim_map[k]] = 0;
-    } else if (any_zero) {
-      // Mix of stride-0 and non-zero: can't reshape
-      reshapable = 0; break;
-    } else {
-      // All non-zero: check contiguity within the merged group
-      for (u32 k = old_start; k + 1 < oi; k++) {
-        if ((i32)os[k] != (i32)(od[k + 1] * os[k + 1])) {
-          reshapable = 0; break;
-        }
-      }
-      if (!reshapable) break;
-
-      // Assign strides to new dims: innermost gets the innermost old stride,
-      // then multiply outward
-      i32 inner_stride = (i32)os[oi - 1];
-      for (int k = (int)ni - 1; k >= (int)new_start; k--) {
-        new_strides[new_dim_map[k]] = inner_stride;
-        inner_stride *= (i32)nd[k];
-      }
-    }
-  }
-
-  // If any dims left over, not reshapable
-  if (oi != on || ni != nn) reshapable = 0;
+  // Prepend zeros for remaining new dims (size-1 dims at the front)
+  u32 n_prepend = new_shape.rank - r_count;
 
   View r = {0};
   r.shape = new_shape;
   r.numel = new_numel;
   r.offset = v.offset;
 
-  if (reshapable) {
-    for (u32 i = 0; i < new_shape.rank; i++) {
-      r.strides[i] = new_strides[i];
-      r.mod_size[i] = new_mod_size[i];
-    }
-    // Check if the result is truly contiguous
+  // Fill strides: n_prepend zeros + reversed r_strides
+  for (u32 i = 0; i < n_prepend; i++)
+    r.strides[i] = 0;
+  for (u32 i = 0; i < r_count; i++)
+    r.strides[n_prepend + i] = r_strides[r_count - 1 - i];
+
+  // Check contiguous
+  r.contiguous = 0;
+  if (r.offset == 0 && !v.has_mask) {
     r.contiguous = 1;
     i32 expected = 1;
     for (int i = (int)new_shape.rank - 1; i >= 0; i--) {
@@ -157,47 +226,39 @@ static View view_reshape(View v, Shape new_shape) {
         expected *= (i32)new_shape.dims[i];
       }
     }
-  } else {
-    // Fallback: contiguous strides, mark non-contiguous for materialization
-    for (u32 i = 0; i < new_shape.rank; i++) {
-      i32 st = 1;
-      for (u32 j = i + 1; j < new_shape.rank; j++) st *= (i32)new_shape.dims[j];
-      r.strides[i] = st;
-    }
-    r.contiguous = 0;
   }
 
-  // Propagate mask from source to reshaped view (if source was masked).
-  // Walk old/new non-trivial dims in parallel and map 1:1 mask bounds.
-  // Dims that merged/split get full range (conservative but correct).
-  if (v.has_mask && reshapable) {
-    r.has_mask = 1;
-    // Initialize all dims to full range
-    for (u32 i = 0; i < new_shape.rank; i++) {
-      r.mask_begin[i] = 0;
-      r.mask_end[i] = new_shape.dims[i];
-    }
-    // Map 1:1 dims: walk old and new non-trivial dims
-    u32 oi2 = 0, ni2 = 0;
-    while (oi2 < on && ni2 < nn) {
-      if (od[oi2] == nd[ni2]) {
-        // Same size: direct mask mapping
-        // Find original dim index for oi2
-        u32 orig_d = 0, cnt = 0;
-        for (u32 d = 0; d < v.shape.rank; d++)
-          if (v.shape.dims[d] > 1) { if (cnt == oi2) { orig_d = d; break; } cnt++; }
-        r.mask_begin[new_dim_map[ni2]] = v.mask_begin[orig_d];
-        r.mask_end[new_dim_map[ni2]] = v.mask_end[orig_d];
-        oi2++; ni2++;
-      } else {
-        // Merged or split: skip both (keep full range = conservative)
-        u32 op = od[oi2], np2 = nd[ni2];
-        while (op != np2) {
-          if (op < np2) { oi2++; if (oi2 < on) op *= od[oi2]; else break; }
-          else { ni2++; if (ni2 < nn) np2 *= nd[ni2]; else break; }
-        }
-        oi2++; ni2++;
+  // Reshape mask
+  if (v.has_mask) {
+    u32 new_mb[MAX_DIM], new_me[MAX_DIM];
+    if (reshape_mask(&v, new_shape, new_mb, new_me)) {
+      r.has_mask = 1;
+      // Adjust offset for mask shift
+      i32 old_mask_off = 0, new_mask_off = 0;
+      for (u32 i = 0; i < v.shape.rank; i++)
+        old_mask_off += (i32)v.mask_begin[i] * v.strides[i];
+      for (u32 i = 0; i < new_shape.rank; i++)
+        new_mask_off += (i32)new_mb[i] * r.strides[i];
+      r.offset += old_mask_off - new_mask_off;
+      for (u32 i = 0; i < new_shape.rank; i++) {
+        r.mask_begin[i] = new_mb[i];
+        r.mask_end[i] = new_me[i];
       }
+      // Check if mask is trivial (all full range)
+      int trivial = 1;
+      for (u32 i = 0; i < new_shape.rank; i++)
+        if (r.mask_begin[i] != 0 || r.mask_end[i] != new_shape.dims[i]) { trivial = 0; break; }
+      if (trivial) r.has_mask = 0;
+    } else {
+      // Mask reshape failed → not reshapable
+      r.has_mask = 0;
+      for (u32 i = 0; i < new_shape.rank; i++) {
+        i32 st = 1;
+        for (u32 j = i + 1; j < new_shape.rank; j++) st *= (i32)new_shape.dims[j];
+        r.strides[i] = st;
+      }
+      r.contiguous = 0;
+      return r;
     }
   }
 

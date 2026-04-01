@@ -395,12 +395,19 @@ typedef struct {
     // n_compound_masks=0 means no compound masks (backward compat).
     u8  n_compound_masks;
     struct { u8 dim_a, dim_b; i32 stride_a; u32 begin, end; } compound_masks[2]; // max 2 spatial dims
-    // Modular indexing: for dims created by merging broadcast (stride-0) with
-    // non-zero dims, the coord must be taken modulo the non-zero dim's size.
-    // mod_size[d] > 0 → codegen emits (c_d % mod_size[d]) * stride[d]
-    // mod_size[d] == 0 → normal: c_d * stride[d]
+    // Modular indexing (reserved for future use)
     u32 mod_size[MAX_DIM];
 } View;
+
+// ShapeTracker: stack of views for composed transformations.
+// Matches tinygrad's ShapeTracker(views: tuple[View, ...]).
+// When a reshape can't be expressed as a single view, views are stacked.
+// At codegen time, views_to_idx() composes them right-to-left via unravel.
+#define ST_MAX_VIEWS 4
+typedef struct {
+    View views[ST_MAX_VIEWS];
+    u8   n_views;  // 0 = unused (use tensor's view directly), 1+ = stacked
+} ShapeTracker;
 
 // ============================================================
 // Shape tracking for lazy TAG_TOP nodes (ShapeTracker)
@@ -457,7 +464,8 @@ typedef struct {
     u32         buf_id;     // GPU buffer handle
     u32         dtype;
     u32         refcount;
-    View        view;
+    View        view;       // logical view (shape for broadcasting etc.)
+    ShapeTracker st;        // view stack for codegen (0 views = use view directly)
     void       *host_ptr;   // cached host copy
     Backend    *backend;    // which backend owns this tensor's buffer
 

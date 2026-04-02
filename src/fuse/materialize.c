@@ -318,15 +318,16 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
             if (rank <= MAX_DIM) {
                 f32 pf[MAX_DIM];
                 META_READ(pm->backend, pm->buf_id, pf, rank * sizeof(f32));
-                // Read the SUM's axes and transform through PERMUTE
-                // SUM input dim j = MUL output dim perm[j]
+                // Transform SUM axes from permuted to unpermuted space.
+                // PERMUTE: out[i] = in[perm[i]]. Reducing SUM dim j (out-space)
+                // means reducing all positions where coord j varies. In in-space,
+                // coord j comes from in[perm[j]], so reduce in-dim perm[j].
                 u32 axes_tid = m->src_ids[1];
                 if (axes_tid) {
                     TensorMeta *am = &ctx->tensors[axes_tid];
                     u32 n_axes = am->view.numel;
                     f32 axes_f[MAX_DIM];
                     META_READ(am->backend, am->buf_id, axes_f, n_axes * sizeof(f32));
-                    // Create transformed axes tensor
                     f32 new_axes_f[MAX_DIM];
                     for (u32 j = 0; j < n_axes; j++)
                         new_axes_f[j] = pf[(u32)axes_f[j]];

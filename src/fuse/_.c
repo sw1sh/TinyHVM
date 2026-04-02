@@ -271,6 +271,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
 
     // Pattern match: elementwise, SUM/RMAX(ew), RESHAPE(SUM/RMAX(ew))
     u32 has_reduce = 0; // 0=none, UOP_SUM, UOP_RMAX
+    u32 reduce_axes_id = 0; // when set, use transformed axes (from PERMUTE between ew and reduce)
     Term ew_root = t, sum_term = term_era(), reshape_term = term_era();
 
     if (top_uop == UOP_RESHAPE) {

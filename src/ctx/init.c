@@ -358,9 +358,6 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
         // Use view_reshape's merge-split algorithm to compute new strides.
-        // Returns valid strides for contiguous, expanded (stride-0), and
-        // compatible permuted views. Falls to lazy only when strides are
-        // truly incompatible (mixed stride-0/non-zero, or non-contiguous merge).
         // Masked views (from PAD) must be materialized before reshape —
         // view_reshape drops the mask, causing wrong data downstream.
         if (m->view.has_mask) goto lazy;

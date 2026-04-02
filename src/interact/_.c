@@ -716,24 +716,6 @@ inet_step:
                             if (looks_contiguous) needs_materialize = 1;
                         }
                         if (needs_materialize) {
-                            // During backward (no_fuse=1): defer the reshape
-                            { u32 _nn=1; for(u32 _i=0;_i<ns.rank;_i++) _nn*=ns.dims[_i];
-                            if (0 && ctx->no_fuse && _nn == ma->view.numel) { // deferred reshape disabled
-                                u32 def_id = ctx->tensor_count++;
-                                TensorMeta *dm = &ctx->tensors[def_id];
-                                memset(dm, 0, sizeof(*dm));
-                                dm->dtype = ma->dtype;
-                                dm->refcount = 1;
-                                dm->backend = ma->backend;
-                                dm->view = view_create(ns);
-                                dm->creator_op = UOP_RESHAPE;
-                                dm->creator_loc = loc;
-                                dm->src_ids[0] = a_id;
-                                dm->src_ids[1] = b_id;
-                                dm->requires_grad = ma->requires_grad;
-                                ctx->itrs++;
-                                RETURN_REDUCED(term_ten(def_id, ma->dtype));
-                            }}
                             ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];
                             u32 numel = ma->view.numel;
                             u32 orig_a_id = a_id;

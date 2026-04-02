@@ -101,6 +101,9 @@ int main(void) {
         u32 gids[NP]; for(u32 i=0;i<NP;i++) gids[i]=(u32)term_val(gs[i]);
         Term bn_assigns=thvm_app(ctx,bn1.assigns,bn2.assigns);
         thvm_reduce(ctx,thvm_app(ctx,grad_term,bn_assigns));
+        if(step==0){for(int i=0;i<NP;i++){f32*g=thvm_to_host(ctx,gs[i]);f32 s2=0;
+            for(u32 j=0;j<psz[i];j++)s2+=g[j]*g[j];
+            if(sqrtf(s2)>1e-10||i<2||i==12)printf("  g[%d]L2=%.4f ",i,sqrtf(s2));}printf("\n");}
         double t_bwd = now_s();
         u32 d_bwd = total_dispatches;
         adam_step_direct(ctx,&opt,gids);

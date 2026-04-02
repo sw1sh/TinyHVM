@@ -1112,7 +1112,11 @@ inet_step:
             }
 
             // Defer reduce when input is deferred ew or view-of-deferred-ew.
-            if (((uop == UOP_SUM && b_id != 0) || uop == UOP_RMAX) &&
+            // During backward (no_fuse=1): DON'T defer reduces. Deferred reduces
+            // become TAG_TEN with buf_id=0, but the reducer treats TAG_TEN as WNF
+            // and never materializes them. This causes zero gradients.
+            if (!ctx->no_fuse &&
+                ((uop == UOP_SUM && b_id != 0) || uop == UOP_RMAX) &&
                 ma->buf_id == 0 && ma->creator_op &&
                 (is_elementwise(ma->creator_op) ||
                  (is_view_op(ma->creator_op) && ma->src_ids[0] &&

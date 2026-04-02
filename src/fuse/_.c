@@ -332,6 +332,19 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             Term probe = sum_input;
             int found = 0;
             for (int d = 0; d < 5; d++) {
+                // Also handle TAG_TEN deferred tensors in the view chain
+                if (term_tag(probe) == TAG_TEN) {
+                    u32 _pid = (u32)term_val(probe);
+                    TensorMeta *_pm = &ctx->tensors[_pid];
+                    if (_pm->buf_id == 0 && _pm->creator_op) {
+                        if (is_elementwise(_pm->creator_op)) { found = 1; break; }
+                        if (is_view_op(_pm->creator_op) && _pm->src_ids[0]) {
+                            probe = term_ten(_pm->src_ids[0], _pm->dtype);
+                            continue;
+                        }
+                    }
+                    break;
+                }
                 if (term_tag(probe) != TAG_TOP) break;
                 u32 pu = term_ext(probe);
                 if (is_elementwise(pu)) { found = 1; break; }

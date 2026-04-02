@@ -414,6 +414,7 @@ Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
     if (term_tag(t) == TAG_TEN) {
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
+        if (m->buf_id == 0) goto expand_lazy; // deferred → stay lazy
         // Expand: set stride=0 where dim goes from 1→N
         u32 id = ctx->tensor_count++;
         ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0;
@@ -446,16 +447,18 @@ Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
         if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
-    f32 dims[MAX_DIM];
+expand_lazy:;
+    { f32 dims[MAX_DIM];
     for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (f32)new_shape.dims[i];
     Term shape_t = thvm_tensor(ctx, dims, SHAPE(new_shape.rank));
-    return thvm_op(ctx, UOP_EXPAND, t, shape_t);
+    return thvm_op(ctx, UOP_EXPAND, t, shape_t); }
 }
 
 Term thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank) {
     if (term_tag(t) == TAG_TEN) {
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
+        if (m->buf_id == 0) goto permute_lazy;
         u32 id = ctx->tensor_count++;
         ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0;
         ctx->tensors[id].host_ptr = NULL;
@@ -473,10 +476,11 @@ Term thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank) {
         if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
-    f32 axes_f[MAX_DIM];
+permute_lazy:;
+    { f32 axes_f[MAX_DIM];
     for (u32 i = 0; i < rank; i++) axes_f[i] = (f32)axes[i];
     Term axes_t = thvm_tensor(ctx, axes_f, SHAPE(rank));
-    return thvm_op(ctx, UOP_PERMUTE, t, axes_t);
+    return thvm_op(ctx, UOP_PERMUTE, t, axes_t); }
 }
 
 // Pad: pairs = [before0, after0, before1, after1, ...]
@@ -484,6 +488,7 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
     if (term_tag(t) == TAG_TEN) {
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
+        if (m->buf_id == 0) goto pad_lazy;
         u32 pad_before[MAX_DIM], pad_after[MAX_DIM];
         for (u32 i = 0; i < ndim; i++) {
             pad_before[i] = pairs[i*2];
@@ -506,11 +511,11 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
-    // Lazy fallback
-    f32 pairs_f[MAX_DIM * 2];
+pad_lazy:;
+    { f32 pairs_f[MAX_DIM * 2];
     for (u32 i = 0; i < ndim * 2; i++) pairs_f[i] = (f32)pairs[i];
     Term pairs_t = thvm_tensor(ctx, pairs_f, SHAPE(ndim * 2));
-    return thvm_op(ctx, UOP_PAD, t, pairs_t);
+    return thvm_op(ctx, UOP_PAD, t, pairs_t); }
 }
 
 // Shrink: pairs = [start0, end0, start1, end1, ...]
@@ -518,6 +523,7 @@ Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
     if (term_tag(t) == TAG_TEN) {
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
+        if (m->buf_id == 0) goto shrink_lazy;
         // Shrink = adjust offset + shape (zero-copy if contiguous, otherwise materialize)
         u32 new_dims[MAX_DIM];
         i32 offset = m->view.offset;
@@ -551,10 +557,11 @@ Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
-    f32 pairs_f[MAX_DIM * 2];
+shrink_lazy:;
+    { f32 pairs_f[MAX_DIM * 2];
     for (u32 i = 0; i < ndim * 2; i++) pairs_f[i] = (f32)pairs[i];
     Term pairs_t = thvm_tensor(ctx, pairs_f, SHAPE(ndim * 2));
-    return thvm_op(ctx, UOP_SHRINK, t, pairs_t);
+    return thvm_op(ctx, UOP_SHRINK, t, pairs_t); }
 }
 
 // ============================================================

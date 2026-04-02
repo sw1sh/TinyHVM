@@ -115,7 +115,30 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                     if (ns.dims[d] > 1 && nv.strides[d] != exp) { dense = 0; break; }
                     exp *= (i32)ns.dims[d];
                 }
-                if (dense) nv = *base; // non-aliasable: keep physical view
+                if (dense) {
+                    // Keep physical strides but with the RESHAPE target's rank.
+                    // Map base dims → new dims via the merge-split pattern.
+                    // For pure 1-dim insertion: copy base strides to matching new dims,
+                    // set stride=0 for inserted 1-dims.
+                    nv = *base;
+                    nv.shape = ns;
+                    nv.shape.rank = rank;
+                    // Re-run view_reshape on the base to get correct strides
+                    // (this handles 1-dim insertion, stride-0 propagation, etc.)
+                    View rv2 = view_reshape(*base, ns);
+                    // Use rv2 strides if they're non-fallback (algorithm succeeded)
+                    int is_fb = 1;
+                    i32 ns2 = 1;
+                    for (int d2 = (int)rank - 1; d2 >= 0; d2--) {
+                        if (ns.dims[d2] > 1 && rv2.strides[d2] != ns2) { is_fb = 0; break; }
+                        ns2 *= (i32)ns.dims[d2];
+                    }
+                    if (!is_fb) {
+                        // Algorithm produced valid strides — use them
+                        for (u32 d2 = 0; d2 < rank; d2++) nv.strides[d2] = rv2.strides[d2];
+                    }
+                    // else: keep base strides (fallback, shape already set to ns)
+                }
             }
         }
         // Propagate mask from base to composed view.

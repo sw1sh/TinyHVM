@@ -213,12 +213,9 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
         [s appendFormat:@"  float acc=%s;\n",
             reduce->reduce_type == UOP_RMAX ? "-1e30f" : "0.0f"];
         if (group_reduce) {
-            // Parallel reduce: contiguous block per thread (preserves serial sum order)
-            [s appendFormat:@"  uint _blk=%uu/256u,_r0=_lane*_blk,_r1=min(_r0+_blk,%uu);\n",
-                reduce_numel, reduce_numel];
-            // Last thread handles remainder
-            [s appendFormat:@"  if(_lane==255u)_r1=%uu;\n", reduce_numel];
-            [s appendFormat:@"  for(uint r=_r0;r<_r1;r++){\n"];
+            // Parallel reduce: strided access for memory coalescing.
+            // Adjacent threads access adjacent memory positions.
+            [s appendFormat:@"  for(uint r=_lane;r<%uu;r+=256u){\n", reduce_numel];
         } else {
             [s appendFormat:@"  for(uint r=0;r<%uu;r++){\n", reduce_numel];
         }

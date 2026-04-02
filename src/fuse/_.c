@@ -115,7 +115,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                     if (ns.dims[d] > 1 && nv.strides[d] != exp) { dense = 0; break; }
                     exp *= (i32)ns.dims[d];
                 }
-                if (dense) nv = *base; // original behavior
+                if (dense) nv = *base; // non-aliasable: keep physical view
             }
         }
         // Propagate mask from base to composed view.

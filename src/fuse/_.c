@@ -289,23 +289,71 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         Term sum_input = heap_read(ctx, sum_loc);
         if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
             has_reduce = top_uop; sum_term = t; ew_root = sum_input;
-        } else if (term_tag(sum_input) == TAG_TOP && is_view_op(term_ext(sum_input))) {
-            // SUM(view_chain(ew)) — walk through view ops to find ew.
-            // Set ew_root to sum_input (the view op) — fuse_walk_inner
-            // handles view ops transparently, composing them onto leaf views.
+        } else {
+            // SUM(chain) where chain may contain view ops and/or deferred TAG_TEN.
+            // Walk through to find the ew root. Track PERMUTE ops to transform axes.
             Term probe = sum_input;
             int found = 0;
-            for (int d = 0; d < 5; d++) {
-                if (term_tag(probe) != TAG_TOP) break;
-                u32 pu = term_ext(probe);
-                if (is_elementwise(pu)) { found = 1; break; }
-                if (!is_view_op(pu)) break;
-                probe = heap_read(ctx, term_val(probe));
+            // Track permutation for axes transform (only single PERMUTE supported)
+            f32 perm_f[MAX_DIM]; int has_perm = 0; u32 perm_rank = 0;
+            for (int d = 0; d < 10; d++) {
+                if (term_tag(probe) == TAG_TOP) {
+                    u32 pu = term_ext(probe);
+                    if (is_elementwise(pu)) { found = 1; ew_root = probe; break; }
+                    if (pu == UOP_PERMUTE && !has_perm) {
+                        // Read permutation for axes transform
+                        u64 ploc = term_val(probe);
+                        Term parg = heap_read(ctx, ploc + 1);
+                        if (term_tag(parg) == TAG_TEN) {
+                            TensorMeta *pp = &ctx->tensors[(u32)term_val(parg)];
+                            perm_rank = pp->view.numel;
+                            META_READ(pp->backend, pp->buf_id, perm_f, perm_rank * sizeof(f32));
+                            has_perm = 1;
+                        }
+                    }
+                    if (!is_view_op(term_ext(probe))) break;
+                    probe = heap_read(ctx, term_val(probe));
+                } else if (term_tag(probe) == TAG_TEN) {
+                    u32 ptid = (u32)term_val(probe);
+                    TensorMeta *pm = &ctx->tensors[ptid];
+                    if (pm->buf_id != 0) break; // materialized leaf
+                    if (is_elementwise(pm->creator_op)) { found = 1; ew_root = probe; break; }
+                    if (pm->creator_op == UOP_PERMUTE && !has_perm && pm->src_ids[1]) {
+                        TensorMeta *pp = &ctx->tensors[pm->src_ids[1]];
+                        perm_rank = pp->view.numel;
+                        META_READ(pp->backend, pp->buf_id, perm_f, perm_rank * sizeof(f32));
+                        has_perm = 1;
+                    }
+                    if (is_view_op(pm->creator_op) && pm->src_ids[0])
+                        probe = term_ten(pm->src_ids[0], pm->dtype);
+                    else break;
+                } else break;
             }
             if (found) {
-                has_reduce = top_uop; sum_term = t; ew_root = sum_input;
+                has_reduce = top_uop; sum_term = t;
+                // Transform reduce axes through PERMUTE if present
+                // PERMUTE: out[i] = in[perm[i]]. Reducing SUM dim j (out-space)
+                // means reducing in-dim perm[j].
+                // Transform reduce axes through PERMUTE (don't modify heap!)
+                if (has_perm) {
+                    u64 sl = term_val(sum_term);
+                    Term sa = heap_read(ctx, sl + 1);
+                    if (term_tag(sa) == TAG_TEN) {
+                        TensorMeta *am = &ctx->tensors[(u32)term_val(sa)];
+                        u32 n_axes = am->view.numel;
+                        f32 axes_f[MAX_DIM], new_axes_f[MAX_DIM];
+                        META_READ(am->backend, am->buf_id, axes_f, n_axes * sizeof(f32));
+                        for (u32 j = 0; j < n_axes; j++)
+                            new_axes_f[j] = perm_f[(u32)axes_f[j]];
+                        u32 na_tid = ctx->tensor_count++;
+                        ctx->tensors[na_tid] = *am;
+                        ctx->tensors[na_tid].buf_id = am->backend->buf_alloc(n_axes * sizeof(f32));
+                        am->backend->buf_write(ctx->tensors[na_tid].buf_id, new_axes_f, n_axes * sizeof(f32));
+                        reduce_axes_id = na_tid; // use transformed axes
+                    }
+                }
             } else return reduce_id(ctx, t);
-        } else return reduce_id(ctx, t);
+        }
     } else if (!is_elementwise(top_uop)) {
         return reduce_id(ctx, t);
     }
@@ -394,7 +442,8 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     if (has_reduce) {
         rs.reduce_type = has_reduce;
         u64 sum_loc = term_val(sum_term);
-        Term sum_axes = heap_read(ctx, sum_loc + 1);
+        Term sum_axes = reduce_axes_id ? term_ten(reduce_axes_id, DTYPE_F32)
+                                       : heap_read(ctx, sum_loc + 1);
         int found_axes = 0;
         if (term_tag(sum_axes) == TAG_TEN) {
             u32 ax_id = (u32)term_val(sum_axes);

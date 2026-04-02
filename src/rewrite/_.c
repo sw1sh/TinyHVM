@@ -29,14 +29,35 @@ static Term rule_sum_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b) {
         u32 child_uop = term_ext(a);
         if (!is_elementwise(child_uop) && !is_view_op(child_uop)) return t;
     } else if (term_tag(a) == TAG_TEN) {
-        // Deferred child: materialize it (fuses the elementwise chain),
-        // then let the SUM dispatch normally on the materialized result.
+        // Deferred child (TAG_TEN with buf_id=0): the elementwise chain was
+        // already interacted but deferred for fusion. Reconstruct it as a
+        // TAG_TOP so fuse_or_reduce can process it.
         u32 tid = (u32)term_val(a);
         if (tid < ctx->tensor_count && ctx->tensors[tid].buf_id == 0 &&
             ctx->tensors[tid].creator_op) {
-            tensor_materialize(ctx, tid);
+            TensorMeta *dm = &ctx->tensors[tid];
+            if (is_elementwise(dm->creator_op) || is_view_op(dm->creator_op)) {
+                // Reconstruct the deferred op as TAG_TOP for fusion
+                u64 _rl = heap_alloc(ctx, 2);
+                heap_set(ctx, _rl, term_ten(dm->src_ids[0], dm->dtype));
+                if (dm->src_ids[1])
+                    heap_set(ctx, _rl + 1, term_ten(dm->src_ids[1], dm->dtype));
+                else
+                    heap_set(ctx, _rl + 1, term_era());
+                Term reconstructed = term_new(TAG_TOP, dm->creator_op, _rl);
+                // Replace the SUM's arg with the reconstructed TAG_TOP
+                heap_set(ctx, loc, reconstructed);
+                a = reconstructed;
+                // Fall through to the TAG_TOP fusion path
+                u32 child_uop = term_ext(a);
+                if (!is_elementwise(child_uop) && !is_view_op(child_uop)) return t;
+            } else {
+                tensor_materialize(ctx, tid);
+                return t;
+            }
+        } else {
+            return t;
         }
-        return t; // SUM will dispatch normally on the now-materialized input
     } else {
         return t;
     }
@@ -115,7 +136,27 @@ static RewriteRule rewrite_rules[] = {
 // Try all matching rewrite rules. Returns rewritten term, or t if none matched.
 static Term rewrite_apply(TinyHVM *ctx, Term t) {
     if (rewrite_active) return t;
-    if (ctx->no_fuse) return t;
+    if (ctx->no_fuse) {
+        // During backward: allow SUM/RMAX fusion ONLY for huge deferred ew
+        // chains (>100M elements). Without this, BIN_GRAD's MUL(gy,bt) stays
+        // deferred and the downstream chain produces zero gradients.
+        // Only conv backward MULs exceed 100M — BN/loss SUMs are much smaller.
+        if (term_tag(t) != TAG_TOP) return t;
+        u32 _u = term_ext(t);
+        if (_u != UOP_SUM && _u != UOP_RMAX) return t;
+        Term _a = heap_read(ctx, term_val(t));
+        if (term_tag(_a) == TAG_TEN) {
+            u32 _aid = (u32)term_val(_a);
+            TensorMeta *_am = &ctx->tensors[_aid];
+            if (_am->buf_id != 0) return t; // already materialized
+            if (!_am->creator_op) return t;
+            if (!is_elementwise(_am->creator_op) && !is_view_op(_am->creator_op)) return t;
+            if (_am->view.numel <= 1000) return t;
+        } else if (term_tag(_a) == TAG_TOP) {
+            if (!is_elementwise(term_ext(_a)) && !is_view_op(term_ext(_a))) return t;
+        } else return t;
+        // Fall through to allow rewrite for this large SUM(ew/view)
+    }
     if (term_tag(t) != TAG_TOP) return t;
     // Skip rewrite rules when backend has no codegen (CPU) — fusion can't dispatch
     if (!ctx_default_backend(ctx) || !ctx_default_backend(ctx)->dispatch_kernel_rs) return t;

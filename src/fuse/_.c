@@ -32,10 +32,67 @@ static Term fuse_leaf_terms[FUSE_MAX_LEAVES];
 static int fuse_walk_inner(TinyHVM *ctx, Term t,
                            FusedOp *ops, u32 *n_ops,
                            u32 *leaf_ids, const View **leaf_views, u32 *n_leaves) {
-    // TAG_TEN: concrete tensor leaf
+    // TAG_TEN: concrete tensor leaf (or deferred ew to walk through)
     if (term_tag(t) == TAG_TEN) {
         u32 tid = (u32)term_val(t);
-        // Dedup: same tensor → reuse leaf index
+        TensorMeta *m = &ctx->tensors[tid];
+        // Deferred ew tensor (buf_id=0): walk through as a fuse op.
+        if (m->buf_id == 0 && m->creator_op && is_elementwise(m->creator_op) &&
+            m->src_ids[0]) {
+            if (*n_ops >= FUSE_MAX_OPS) return -1;
+            int a_res = fuse_walk_inner(ctx, term_ten(m->src_ids[0], m->dtype),
+                                        ops, n_ops, leaf_ids, leaf_views, n_leaves);
+            if (a_res < 0) return -1;
+            int b_res = a_res;
+            if (is_binary(m->creator_op) && m->src_ids[1]) {
+                b_res = fuse_walk_inner(ctx, term_ten(m->src_ids[1], m->dtype),
+                                        ops, n_ops, leaf_ids, leaf_views, n_leaves);
+                if (b_res < 0) return -1;
+            }
+            u32 oi = (*n_ops)++;
+            ops[oi] = (FusedOp){.uop = m->creator_op, .arg_a = (u32)a_res, .arg_b = (u32)b_res};
+            return (int)(WALK_LEAF_BASE * 2 + oi);
+        }
+        // Deferred view tensor (buf_id=0): walk through and compose view
+        // onto the leaf (same as TAG_TOP view handling).
+        if (m->buf_id == 0 && m->creator_op && is_view_op(m->creator_op) &&
+            m->src_ids[0]) {
+            int inner = fuse_walk_inner(ctx, term_ten(m->src_ids[0], m->dtype),
+                                        ops, n_ops, leaf_ids, leaf_views, n_leaves);
+            if (inner < 0) return -1;
+            if (inner >= (int)(WALK_LEAF_BASE * 2)) return -1; // op, not leaf
+            u32 leaf_idx = inner - WALK_LEAF_BASE;
+            const View *base = leaf_views[leaf_idx];
+            if (!base) return -1;
+            // Read view params and compose
+            if (m->creator_op == UOP_PERMUTE && m->src_ids[1]) {
+                TensorMeta *mp = &ctx->tensors[m->src_ids[1]];
+                u32 rank = mp->view.numel;
+                f32 pf[MAX_DIM];
+                META_READ(mp->backend, mp->buf_id, pf, rank * sizeof(f32));
+                View nv = {0}; nv.offset = base->offset; nv.shape.rank = rank; nv.numel = base->numel;
+                for (u32 j = 0; j < rank; j++) {
+                    nv.shape.dims[j] = base->shape.dims[(u32)pf[j]];
+                    nv.strides[j] = base->strides[(u32)pf[j]];
+                }
+                nv.contiguous = 0;
+                fuse_composed_views[leaf_idx] = nv;
+                leaf_views[leaf_idx] = &fuse_composed_views[leaf_idx];
+            } else if (m->creator_op == UOP_RESHAPE && m->src_ids[1]) {
+                TensorMeta *mp = &ctx->tensors[m->src_ids[1]];
+                u32 rank = mp->view.numel;
+                f32 rf[MAX_DIM];
+                META_READ(mp->backend, mp->buf_id, rf, rank * sizeof(f32));
+                Shape ns = {.rank = rank};
+                for (u32 j = 0; j < rank; j++) ns.dims[j] = (u32)rf[j];
+                View nv = view_reshape(*base, ns);
+                fuse_composed_views[leaf_idx] = nv;
+                leaf_views[leaf_idx] = &fuse_composed_views[leaf_idx];
+            }
+            // For EXPAND, SHRINK, PAD: similar composition (not implemented yet)
+            return inner; // return the composed leaf
+        }
+        // Normal leaf (materialized buffer)
         for (u32 i = 0; i < *n_leaves; i++)
             if (leaf_ids[i] == tid) return (int)(WALK_LEAF_BASE + i);
         if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
@@ -232,6 +289,22 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         Term sum_input = heap_read(ctx, sum_loc);
         if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
             has_reduce = top_uop; sum_term = t; ew_root = sum_input;
+        } else if (term_tag(sum_input) == TAG_TOP && is_view_op(term_ext(sum_input))) {
+            // SUM(view_chain(ew)) — walk through view ops to find ew.
+            // Set ew_root to sum_input (the view op) — fuse_walk_inner
+            // handles view ops transparently, composing them onto leaf views.
+            Term probe = sum_input;
+            int found = 0;
+            for (int d = 0; d < 5; d++) {
+                if (term_tag(probe) != TAG_TOP) break;
+                u32 pu = term_ext(probe);
+                if (is_elementwise(pu)) { found = 1; break; }
+                if (!is_view_op(pu)) break;
+                probe = heap_read(ctx, term_val(probe));
+            }
+            if (found) {
+                has_reduce = top_uop; sum_term = t; ew_root = sum_input;
+            } else return reduce_id(ctx, t);
         } else return reduce_id(ctx, t);
     } else if (!is_elementwise(top_uop)) {
         return reduce_id(ctx, t);
@@ -500,7 +573,11 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             // so the GRAD handler can read their individual values for backward.
             for (u32 i = 0; i < n_ops; i++) {
                 u32 itid = var_tid[n_leaves + i];
-                if (ctx->tensors[itid].requires_grad) {
+                // During backward (no_fuse=1): skip separate buffer allocation
+                // for requires_grad intermediates — backward-of-backward doesn't
+                // need these values. Without this, conv backward's MUL virtual
+                // allocates 5.2GB (1.3B elements) for requires_grad provenance.
+                if (ctx->tensors[itid].requires_grad && !ctx->no_fuse) {
                     ctx->tensors[itid].buf_id = ctx->tensors[itid].backend->buf_alloc(
                         ctx->tensors[itid].view.numel * sizeof(f32));
                 } else {

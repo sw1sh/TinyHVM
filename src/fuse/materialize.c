@@ -166,13 +166,7 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
     TensorMeta *m = &ctx->tensors[tid];
     if (m->buf_id != 0) return;
     ref_prescan(ctx); // ensure reference counts are up to date
-    if (getenv("THVM_TRACE")) {
-        fprintf(stderr, "MAT_CHAIN tid=%u op=%u buf=%u n=%u src0=%u(buf=%u,op=%u) src1=%u\n",
-            tid, m->creator_op, m->buf_id, m->view.numel,
-            m->src_ids[0], m->src_ids[0] ? ctx->tensors[m->src_ids[0]].buf_id : 0,
-            m->src_ids[0] ? ctx->tensors[m->src_ids[0]].creator_op : 0,
-            m->src_ids[1]);
-    }
+    if (getenv("THVM_TRACE")) fprintf(stderr, "MAT_CHAIN tid=%u op=%u buf=%u\n", tid, m->creator_op, m->buf_id);
 
     // Deferred MM: materialize inputs, then dispatch via MPS.
     if (m->creator_op == UOP_MM && m->src_ids[0] && m->src_ids[1]) {
@@ -302,44 +296,6 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
             reduce_type = m->creator_op;
             reduce_axes_id = m->src_ids[1];
             walk_tid = m->src_ids[0];
-        }
-        // Handle SUM(PERMUTE(deferred_ew)) — e.g., SUM(PERMUTE(MUL(gy,bt)))
-        // from conv backward. Walk from EW directly, but transform the SUM's
-        // reduce axes through the PERMUTE's inverse (axes are in permuted space,
-        // the fused kernel works in the EW's unpermuted space).
-        if (!reduce_type && ri->buf_id == 0 && ri->creator_op == UOP_PERMUTE &&
-            ri->src_ids[0] && ctx->tensors[ri->src_ids[0]].buf_id == 0 &&
-            is_elementwise(ctx->tensors[ri->src_ids[0]].creator_op) &&
-            ri->src_ids[1] && reduce_axes_id == 0) {
-            // Read the permutation array from the PERMUTE's parameter tensor
-            u32 perm_tid = ri->src_ids[1];
-            TensorMeta *pm = &ctx->tensors[perm_tid];
-            u32 rank = pm->view.numel;
-            if (rank <= MAX_DIM) {
-                f32 pf[MAX_DIM];
-                META_READ(pm->backend, pm->buf_id, pf, rank * sizeof(f32));
-                // Transform SUM axes from permuted to unpermuted space.
-                // PERMUTE: out[i] = in[perm[i]]. Reducing SUM dim j (out-space)
-                // means reducing all positions where coord j varies. In in-space,
-                // coord j comes from in[perm[j]], so reduce in-dim perm[j].
-                u32 axes_tid = m->src_ids[1];
-                if (axes_tid) {
-                    TensorMeta *am = &ctx->tensors[axes_tid];
-                    u32 n_axes = am->view.numel;
-                    f32 axes_f[MAX_DIM];
-                    META_READ(am->backend, am->buf_id, axes_f, n_axes * sizeof(f32));
-                    f32 new_axes_f[MAX_DIM];
-                    for (u32 j = 0; j < n_axes; j++)
-                        new_axes_f[j] = pf[(u32)axes_f[j]];
-                    u32 new_axes_tid = ctx->tensor_count++;
-                    ctx->tensors[new_axes_tid] = *am;
-                    ctx->tensors[new_axes_tid].buf_id = am->backend->buf_alloc(n_axes * sizeof(f32));
-                    am->backend->buf_write(ctx->tensors[new_axes_tid].buf_id, new_axes_f, n_axes * sizeof(f32));
-                    reduce_type = m->creator_op;
-                    reduce_axes_id = new_axes_tid;
-                    walk_tid = ri->src_ids[0]; // walk from the EW
-                }
-            }
         }
     }
 

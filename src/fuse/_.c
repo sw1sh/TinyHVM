@@ -72,7 +72,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             fuse_leaf_terms[idx] = t; // store the VIEW(TAG_TOP) term
             return (int)(WALK_LEAF_BASE + idx);
         }
-        int inner = fuse_walk_inner(ctx, view_input, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+int inner = fuse_walk_inner(ctx, view_input, ops, n_ops, leaf_ids, leaf_views, n_leaves);
         if (inner < 0) return -1;
         if (inner >= (int)(WALK_LEAF_BASE * 2)) return -1;
         u32 leaf_idx = inner - WALK_LEAF_BASE;

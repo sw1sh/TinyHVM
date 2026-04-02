@@ -498,6 +498,13 @@ typedef struct {
     u8          conv_stride[2];
     u8          conv_padding[4];
 
+    // Pool view metadata: enables correct backward for strided pool views.
+    // When pool_n_spatial > 0, this is a pool strided view [batch,C,OY,OX,KH,KW].
+    // Backward must scatter-add to input [batch,C,H,W], not just reshape.
+    u8          pool_n_spatial;  // 0 = not a pool view, 2 = 2D pool
+    u8          pool_kernel[2];  // KH, KW
+    u8          pool_stride[2];  // stride_h, stride_w
+
 } TensorMeta;
 
 // ============================================================

@@ -342,6 +342,60 @@ inet_step:
                                 }
                             }
                             generic_reshape_backward:;
+                            // Pool view backward: gy [..,OY,OX,KH,KW] → input [..,H,W]
+                            if (my->pool_n_spatial == 2) {
+                                u32 pkh = my->pool_kernel[0], pkw = my->pool_kernel[1];
+                                u32 psh = my->pool_stride[0], psw = my->pool_stride[1];
+                                u32 _r = my->view.shape.rank;
+                                u32 bd2 = _r - 4; // batch dims (before OY,OX,KH,KW)
+                                u32 ih = ma->view.shape.dims[bd2], iw = ma->view.shape.dims[bd2+1];
+                                if (psh == pkh && psw == pkw) {
+                                    // Non-overlapping: permute [..,OY,OX,KH,KW]→[..,OY,KH,OX,KW], reshape
+                                    u32 pp[MAX_DIM], _pi=0;
+                                    for (u32 _j=0;_j<bd2;_j++) pp[_pi++]=_j;
+                                    pp[_pi++]=bd2; pp[_pi++]=bd2+2; pp[_pi++]=bd2+1; pp[_pi++]=bd2+3;
+                                    Term gp = thvm_permute(ctx, gy, pp, _r);
+                                    u32 tgt[MAX_DIM];
+                                    for (u32 _j=0;_j<bd2;_j++) tgt[_j]=ma->view.shape.dims[_j];
+                                    tgt[bd2]=ih; tgt[bd2+1]=iw;
+                                    f32 tgtf[MAX_DIM];
+                                    for (u32 _j=0;_j<bd2+2;_j++) tgtf[_j]=(f32)tgt[_j];
+                                    UN_GRAD(thvm_op(ctx, UOP_RESHAPE, gp,
+                                        thvm_tensor(ctx, tgtf, SHAPE(bd2+2))));
+                                }
+                                // Overlapping (k > s): col2im via pad+sum over kernel positions
+                                // grad_input[..,h,w] = sum_{kh,kw} gy[..,h-kh,w-kw,kh,kw]
+                                // For each (kh,kw): extract slice, pad to [..,H,W], accumulate
+                                u32 _oy = my->view.shape.dims[bd2], _ox = my->view.shape.dims[bd2+1];
+                                Term acc = term_era();
+                                for (u32 _kh=0;_kh<pkh;_kh++) for (u32 _kw=0;_kw<pkw;_kw++) {
+                                    // Shrink to extract slice gy[..,_kh,_kw] at dims bd2+2, bd2+3
+                                    u32 sh[MAX_DIM*2];
+                                    for (u32 _j=0;_j<_r;_j++) {
+                                        sh[_j*2]=0; sh[_j*2+1]=my->view.shape.dims[_j];
+                                    }
+                                    sh[(bd2+2)*2]=_kh; sh[(bd2+2)*2+1]=_kh+1;
+                                    sh[(bd2+3)*2]=_kw; sh[(bd2+3)*2+1]=_kw+1;
+                                    Term sl = thvm_shrink(ctx, gy, sh, _r);
+                                    // Reshape to remove kernel dims: [..,OY,OX,1,1] → [..,OY,OX]
+                                    u32 slr[MAX_DIM]; u32 slrk=0;
+                                    for (u32 _j=0;_j<bd2;_j++) slr[slrk++]=my->view.shape.dims[_j];
+                                    slr[slrk++]=_oy; slr[slrk++]=_ox;
+                                    sl = thvm_reshape(ctx, sl, shape_of(slr, slrk));
+                                    // Pad to [..,H,W]: pad_top=_kh*psh, pad_bottom=ih-_oy*psh-_kh*psh
+                                    // For stride=1: pad_top=_kh, pad_bottom=pkh-1-_kh
+                                    u32 pp2[MAX_DIM*2];
+                                    memset(pp2,0,sizeof(pp2));
+                                    pp2[(bd2)*2]  =_kh*psh;
+                                    pp2[(bd2)*2+1]=ih - _oy*psh - _kh*psh;
+                                    pp2[(bd2+1)*2]  =_kw*psw;
+                                    pp2[(bd2+1)*2+1]=iw - _ox*psw - _kw*psw;
+                                    sl = thvm_pad(ctx, sl, pp2, slrk);
+                                    if (term_tag(acc) == TAG_ERA) acc = sl;
+                                    else acc = thvm_op(ctx, UOP_ADD, acc, sl);
+                                }
+                                UN_GRAD(acc);
+                            }
                             // Force lazy reshape in backward: keeps the chain composable.
                             Shape rs = ma->view.shape;
                             f32 dims[MAX_DIM];

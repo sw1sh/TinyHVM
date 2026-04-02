@@ -210,6 +210,14 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
             ctx->tensors[vid].creator_op = UOP_RESHAPE; // view provenance
             ctx->tensors[vid].src_ids[0] = src_id;
             if (m->requires_grad) ctx->tensors[vid].requires_grad = 1;
+            // Store pool metadata for correct backward (scatter-add, not reshape)
+            if (n_spatial == 2) {
+                ctx->tensors[vid].pool_n_spatial = 2;
+                ctx->tensors[vid].pool_kernel[0] = (u8)k_[0];
+                ctx->tensors[vid].pool_kernel[1] = (u8)k_[1];
+                ctx->tensors[vid].pool_stride[0] = (u8)s_[0];
+                ctx->tensors[vid].pool_stride[1] = (u8)s_[1];
+            }
             return term_ten(vid, m->dtype);
         }
     }
@@ -460,26 +468,33 @@ Term thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
 // ============================================================
 
 Term thvm_maxpool2d(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_) {
-    u32 k[] = {kernel[0], kernel[1]};
-    u32 s[] = {stride_[0], stride_[1]};
-
     const View *vx = term_view(ctx, x);
     assert(vx && "thvm_maxpool2d: input must have tracked shape");
     u32 bs = vx->shape.dims[0];
     u32 c  = vx->shape.dims[1];
     u32 IH = vx->shape.dims[2];
     u32 IW = vx->shape.dims[3];
-    u32 kh = kernel[0], kw2 = kernel[1];
-    u32 oy = (IH - kh) / stride_[0] + 1;
-    u32 ox = (IW - kw2) / stride_[1] + 1;
+    u32 kh = kernel[0], kw = kernel[1];
+    u32 sh = stride_[0], sw = stride_[1];
+    u32 oy = (IH - kh) / sh + 1;
+    u32 ox = (IW - kw) / sw + 1;
 
-    // Single pool call — pooled shape: [BS, C, OY, OX, KH, KW]
+    // Non-overlapping pool (stride == kernel): decompose into reshape + permute.
+    // Forward: [BS,C,H,W] → reshape [BS,C,OY,KH,OX,KW] → permute [BS,C,OY,OX,KH,KW]
+    // Backward correctly reverses: inv_permute → reshape → [BS,C,H,W]
+    // (The old thvm_pool strided view had wrong backward: plain reshape scrambles elements)
+    if (sh == kh && sw == kw) {
+        Term r1 = thvm_reshape(ctx, x, shape_of((u32[]){bs, c, oy, kh, ox, kw}, 6));
+        Term r2 = thvm_permute(ctx, r1, (u32[]){0,1,2,4,3,5}, 6);
+        Term r = thvm_rmax_axes(ctx, r2, (u32[]){4, 5}, 2);
+        return thvm_reshape(ctx, r, shape_of((u32[]){bs, c, oy, ox}, 4));
+    }
+
+    // Overlapping pool: use strided view via thvm_pool
+    u32 k[] = {kernel[0], kernel[1]};
+    u32 s[] = {stride_[0], stride_[1]};
     Term pool_t = thvm_pool(ctx, x, k, s, 2);
-    (void)kh; (void)kw2;
-
-    // Multi-axis RMAX: reduce both KH (axis 4) and KW (axis 5) in one dispatch
     Term r = thvm_rmax_axes(ctx, pool_t, (u32[]){4, 5}, 2);
-    // → [BS, C, OY, OX, 1, 1], squeeze to [BS, C, OY, OX]
     return thvm_reshape(ctx, r, shape_of((u32[]){bs, c, oy, ox}, 4));
 }
 

@@ -84,6 +84,8 @@ void print_dispatch_breakdown(void) {
     fprintf(stderr, "Dispatch breakdown:");
     for (int i = 0; i < DC_MAX; i++)
         if (dc[i]) fprintf(stderr, " %s=%u", names[i], dc[i]);
-    fprintf(stderr, " total=%u\n", total_dispatches);
+    extern u64 metal_bytes_inuse, metal_bytes_total;
+    fprintf(stderr, " total=%u mem=%.0fMB/%.0fMB\n", total_dispatches,
+        (double)metal_bytes_inuse/1e6, (double)metal_bytes_total/1e6);
     memset(dc, 0, sizeof(dc));
 }

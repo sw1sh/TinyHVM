@@ -440,7 +440,29 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     u32 fuse_side_bufs[8], fuse_side_ops[8]; u32 fuse_n_sides = 0;
     {
         u32 var_tid[FUSE_MAX_LEAVES + FUSE_MAX_OPS];
-        for (u32 i = 0; i < n_leaves; i++) var_tid[i] = leaf_ids[i];
+        // For leaves where the composed view differs from the original tensor's view,
+        // create a view-alias tensor. This ensures backward sees the correct shape
+        // (e.g., 8D composed view instead of 4D original weight).
+        for (u32 i = 0; i < n_leaves; i++) {
+            u32 lid = leaf_ids[i];
+            const View *composed = leaf_views[i];
+            const View *original = &ctx->tensors[lid].view;
+            // Check if shapes match
+            int same = (composed->shape.rank == original->shape.rank);
+            if (same)
+                for (u32 d = 0; d < composed->shape.rank; d++)
+                    if (composed->shape.dims[d] != original->shape.dims[d]) { same = 0; break; }
+            if (!same && ctx->tensors[lid].requires_grad) {
+                // Create view-alias with composed shape for correct backward broadcasting
+                u32 alias_id = tensor_view_of(ctx, lid, *composed);
+                ctx->tensors[alias_id].creator_op = UOP_RESHAPE;
+                ctx->tensors[alias_id].src_ids[0] = lid;
+                ctx->tensors[alias_id].requires_grad = 1;
+                var_tid[i] = alias_id;
+            } else {
+                var_tid[i] = lid;
+            }
+        }
         if (has_reduce) {
             // Create virtual intermediates FIRST (lower IDs)
             u32 ew_last_id = 0;

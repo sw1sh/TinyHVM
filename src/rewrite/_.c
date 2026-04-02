@@ -136,26 +136,24 @@ static RewriteRule rewrite_rules[] = {
 // Try all matching rewrite rules. Returns rewritten term, or t if none matched.
 static Term rewrite_apply(TinyHVM *ctx, Term t) {
     if (rewrite_active) return t;
+    // During backward: only allow SUM/RMAX fusion (reduce + ew chain).
+    // Elementwise-only fusion is unsafe during backward because it evaluates
+    // partial lazy chains before all GRAD inputs are ready.
     if (ctx->no_fuse) {
-        // During backward: allow SUM/RMAX fusion ONLY for huge deferred ew
-        // chains (>100M elements). Without this, BIN_GRAD's MUL(gy,bt) stays
-        // deferred and the downstream chain produces zero gradients.
-        // Only conv backward MULs exceed 100M — BN/loss SUMs are much smaller.
         if (term_tag(t) != TAG_TOP) return t;
         u32 _u = term_ext(t);
         if (_u != UOP_SUM && _u != UOP_RMAX) return t;
+        // Only fuse if child is deferred ew/view (not already materialized)
         Term _a = heap_read(ctx, term_val(t));
         if (term_tag(_a) == TAG_TEN) {
             u32 _aid = (u32)term_val(_a);
             TensorMeta *_am = &ctx->tensors[_aid];
-            if (_am->buf_id != 0) return t; // already materialized
+            if (_am->buf_id != 0) return t;
             if (!_am->creator_op) return t;
             if (!is_elementwise(_am->creator_op) && !is_view_op(_am->creator_op)) return t;
-            if (_am->view.numel <= 1000) return t;
         } else if (term_tag(_a) == TAG_TOP) {
             if (!is_elementwise(term_ext(_a)) && !is_view_op(term_ext(_a))) return t;
         } else return t;
-        // Fall through to allow rewrite for this large SUM(ew/view)
     }
     if (term_tag(t) != TAG_TOP) return t;
     // Skip rewrite rules when backend has no codegen (CPU) — fusion can't dispatch

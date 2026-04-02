@@ -23,6 +23,11 @@ static int is_binary(u32 uop) {
 static View fuse_composed_views[FUSE_MAX_LEAVES];
 static Term fuse_leaf_terms[FUSE_MAX_LEAVES];
 
+// Per-fuse state: PERMUTE between ew and reduce (set by fuse_walk_inner)
+static f32 _fuse_perm[MAX_DIM];
+static u32 _fuse_perm_rank = 0;
+static int _fuse_has_perm = 0;
+
 // ============================================================
 // fuse_walk_inner: recursive walk of lazy TAG_TOP tree
 // ============================================================
@@ -61,8 +66,13 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                                         ops, n_ops, leaf_ids, leaf_views, n_leaves);
             if (inner < 0) return -1;
             if (inner >= (int)(WALK_LEAF_BASE * 2)) {
-                // Inner returned OP. Don't compose view here — let the
-                // TAG_TOP handler above compose (avoids double-PERMUTE).
+                // Inner returned OP. Store PERMUTE perm for axes transform.
+                if (m->creator_op == UOP_PERMUTE && m->src_ids[1] && !_fuse_has_perm) {
+                    TensorMeta *ppm = &ctx->tensors[m->src_ids[1]];
+                    _fuse_perm_rank = ppm->view.numel;
+                    META_READ(ppm->backend, ppm->buf_id, _fuse_perm, _fuse_perm_rank * sizeof(f32));
+                    _fuse_has_perm = 1;
+                }
                 return inner;
             }
             u32 leaf_idx = inner - WALK_LEAF_BASE;
@@ -136,28 +146,18 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
 int inner = fuse_walk_inner(ctx, view_input, ops, n_ops, leaf_ids, leaf_views, n_leaves);
         if (inner < 0) return -1;
         if (inner >= (int)(WALK_LEAF_BASE * 2)) {
-            // Inner returned OP: compose PERMUTE onto all leaf views
+            // Inner returned OP (e.g., deferred MUL).
+            // DON'T compose PERMUTE onto leaf views — leaves stay in MUL space.
+            // The SUM axes will be transformed to MUL space instead (via
+            // _fuse_perm stored here and read during ReduceSpec building).
             if (uop == UOP_PERMUTE) {
                 Term parg = heap_read(ctx, loc + 1);
                 if (term_tag(parg) == TAG_TEN) {
                     TensorMeta *pp2 = &ctx->tensors[(u32)term_val(parg)];
-                    u32 pr = pp2->view.numel;
-                    f32 ppf2[MAX_DIM];
-                    META_READ(pp2->backend, pp2->buf_id, ppf2, pr * sizeof(f32));
-                    for (u32 li = 0; li < *n_leaves; li++) {
-                        const View *bv = leaf_views[li];
-                        if (bv->shape.rank != pr) continue;
-                        View nv2 = {0}; nv2.offset = bv->offset;
-                        nv2.shape.rank = pr; nv2.numel = bv->numel;
-                        for (u32 j = 0; j < pr; j++) {
-                            nv2.shape.dims[j] = bv->shape.dims[(u32)ppf2[j]];
-                            nv2.strides[j] = bv->strides[(u32)ppf2[j]];
-                        }
-                        nv2.contiguous = 0;
-                        fuse_composed_views[li] = nv2;
-                        leaf_views[li] = &fuse_composed_views[li];
-                    }
-                    return inner;
+                    _fuse_perm_rank = pp2->view.numel;
+                    META_READ(pp2->backend, pp2->buf_id, _fuse_perm, _fuse_perm_rank * sizeof(f32));
+                    _fuse_has_perm = 1;
+                    return inner; // OP with ORIGINAL leaf views
                 }
             }
             return -1;
@@ -293,6 +293,7 @@ static u32 fuse_unfused_count = 0, fuse_fused_count = 0;
 
 static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     // return reduce_id(ctx, t); // fusion enabled
+    _fuse_has_perm = 0; // reset per-fuse state
     if (term_tag(t) != TAG_TOP) return reduce_id(ctx, t);
     // Skip fusion when backend has no codegen (CPU) — avoids stack overflow in fuse_walk_inner
     if (!ctx_default_backend(ctx) || !ctx_default_backend(ctx)->dispatch_kernel_rs)
@@ -449,7 +450,13 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             f32 axes_f[MAX_DIM];
             META_READ(axt->backend, axt->buf_id, axes_f, n_axes * sizeof(f32));
             for (u32 i = 0; i < n_axes; i++) {
+                // Transform axis through PERMUTE if present.
+                // SUM axes are in permuted space; ew_view is in unpermuted (MUL) space.
+                // PERMUTE: out[j] = in[perm[j]], so reducing out dim j
+                // means reducing in dim perm[j].
                 int ax = (int)axes_f[i];
+                if (_fuse_has_perm && ax >= 0 && (u32)ax < _fuse_perm_rank)
+                    ax = (int)_fuse_perm[ax];
                 if (ax >= 0 && ax < (int)ew_view.shape.rank) {
                     rs.is_reduce[ax] = 1;
                     out_view.shape.dims[ax] = 1;

@@ -112,13 +112,6 @@ int main(void) {
             if(step==0) { print_dispatch_breakdown();
                 printf("  Phase: fwd+bwd=%u dispatches (%.0fms), adam=%u (%.0fms)\n",
                     d_bwd-d_fwd, (t_bwd-t_fwd)*1000, total_dispatches-d_bwd, (t_adam-t_bwd)*1000);
-                const char *pnames[NP]={"cw1","cb1","cw2","cb2","cw3","cb3","cw4","cb4",
-                    "bn1_g","bn1_b","bn2_g","bn2_b","lw","lb"};
-                for(int i=0;i<NP;i++){
-                    f32*gd=thvm_to_host(ctx,gs[i]); double norm=0;
-                    for(u32 j=0;j<psz[i];j++) norm+=gd[j]*gd[j];
-                    printf("  grad %-6s: norm=%.6f\n", pnames[i], sqrt(norm));
-                }
             }
             printf("  step %3u: loss=%5.2f (%.1fs) [%u dispatches]\n",step,lv,now_s()-t0,total_dispatches);
         }

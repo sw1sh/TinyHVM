@@ -718,7 +718,7 @@ inet_step:
                         if (needs_materialize) {
                             // During backward (no_fuse=1): defer the reshape
                             { u32 _nn=1; for(u32 _i=0;_i<ns.rank;_i++) _nn*=ns.dims[_i];
-                            if (ctx->no_fuse && _nn == ma->view.numel) {
+                            if (0 && ctx->no_fuse && _nn == ma->view.numel) { // deferred reshape disabled
                                 u32 def_id = ctx->tensor_count++;
                                 TensorMeta *dm = &ctx->tensors[def_id];
                                 memset(dm, 0, sizeof(*dm));

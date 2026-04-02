@@ -414,7 +414,7 @@ Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
     if (term_tag(t) == TAG_TEN) {
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
-        if (m->buf_id == 0) goto expand_lazy; // deferred → stay lazy
+        if (m->buf_id == 0) goto expand_lazy;
         // Expand: set stride=0 where dim goes from 1→N
         u32 id = ctx->tensor_count++;
         ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0;

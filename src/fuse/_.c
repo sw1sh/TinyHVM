@@ -115,30 +115,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                     if (ns.dims[d] > 1 && nv.strides[d] != exp) { dense = 0; break; }
                     exp *= (i32)ns.dims[d];
                 }
-                if (dense) {
-                    // Keep physical strides but with the RESHAPE target's rank.
-                    // Map base dims → new dims via the merge-split pattern.
-                    // For pure 1-dim insertion: copy base strides to matching new dims,
-                    // set stride=0 for inserted 1-dims.
-                    nv = *base;
-                    nv.shape = ns;
-                    nv.shape.rank = rank;
-                    // Re-run view_reshape on the base to get correct strides
-                    // (this handles 1-dim insertion, stride-0 propagation, etc.)
-                    View rv2 = view_reshape(*base, ns);
-                    // Use rv2 strides if they're non-fallback (algorithm succeeded)
-                    int is_fb = 1;
-                    i32 ns2 = 1;
-                    for (int d2 = (int)rank - 1; d2 >= 0; d2--) {
-                        if (ns.dims[d2] > 1 && rv2.strides[d2] != ns2) { is_fb = 0; break; }
-                        ns2 *= (i32)ns.dims[d2];
-                    }
-                    if (!is_fb) {
-                        // Algorithm produced valid strides — use them
-                        for (u32 d2 = 0; d2 < rank; d2++) nv.strides[d2] = rv2.strides[d2];
-                    }
-                    // else: keep base strides (fallback, shape already set to ns)
-                }
+                if (dense) nv = *base; // original behavior
             }
         }
         // Propagate mask from base to composed view.
@@ -228,6 +205,7 @@ static void fuse_remap(FusedOp *ops, u32 n_ops, u32 n_leaves) {
 static u32 fuse_unfused_count = 0, fuse_fused_count = 0;
 
 static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
+    // return reduce_id(ctx, t); // fusion enabled
     if (term_tag(t) != TAG_TOP) return reduce_id(ctx, t);
     // Skip fusion when backend has no codegen (CPU) — avoids stack overflow in fuse_walk_inner
     if (!ctx_default_backend(ctx) || !ctx_default_backend(ctx)->dispatch_kernel_rs)

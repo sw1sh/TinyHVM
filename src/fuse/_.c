@@ -106,6 +106,11 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             // For EXPAND, SHRINK, PAD: similar composition (not implemented yet)
             return inner; // return the composed leaf
         }
+        // Deferred non-ew leaf: materialize before use.
+        if (m->buf_id == 0 && m->creator_op) {
+            tensor_materialize(ctx, tid);
+            m = &ctx->tensors[tid];
+        }
         // Normal leaf (materialized buffer)
         for (u32 i = 0; i < *n_leaves; i++)
             if (leaf_ids[i] == tid) return (int)(WALK_LEAF_BASE + i);

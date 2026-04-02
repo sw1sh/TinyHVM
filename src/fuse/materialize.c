@@ -198,9 +198,9 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
             if (cm->creator_op == UOP_SUM || cm->creator_op == UOP_RMAX) {
                 reduce_tid = cur; reduce_input = cm->src_ids[0]; break;
             }
-            if (is_elementwise(cm->creator_op) || is_view_op(cm->creator_op))
+            if (is_elementwise(cm->creator_op))
                 cur = cm->src_ids[0];
-            else break;
+            else break; // don't cross view ops (different coord space)
         }
         if (reduce_tid && reduce_input &&
             ctx->tensors[reduce_input].buf_id == 0 &&

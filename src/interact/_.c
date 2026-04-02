@@ -1395,7 +1395,9 @@ inet_step:
                             in_data[flat] = raw[phys];
                         }
                         free(raw);
-                        f32 *out_data = calloc(out_numel, sizeof(f32));
+                        f32 *out_data = malloc(out_numel * sizeof(f32));
+                        for (u32 _oi = 0; _oi < out_numel; _oi++)
+                            out_data[_oi] = (uop == UOP_RMAX) ? -1e30f : 0.0f;
                         u32 out_strides[MAX_DIM];
                         out_strides[rank-1] = 1;
                         for (int d = (int)rank - 2; d >= 0; d--)

@@ -109,19 +109,6 @@ inet_step:
                         for (u32 _gi = 0; _gi < n_tgt; _gi++) {
                             Term p = heap_read(ctx, tgt_loc + 1 + 2*_gi);
                             if (term_tag(p) == TAG_TEN && (u32)term_val(p) == y_id) {
-                                // Debug: check gy value before deposit
-                                {static u32 _dc=0; if(_dc<8) {
-                                    Term _dgy = (term_tag(gy)==TAG_TEN) ? gy : thvm_reduce(ctx,gy);
-                                    if (term_tag(_dgy)==TAG_TEN) {
-                                        f32*_gh=thvm_to_host(ctx,_dgy);
-                                        u32 _gn=ctx->tensors[(u32)term_val(_dgy)].view.numel;
-                                        f32 _gs=0;for(u32 _j=0;_j<_gn;_j++)_gs+=_gh[_j]*_gh[_j];
-                                        fprintf(stderr,"PRE_DEPOSIT: pidx=%u yid=%u gy_L2=%.4f n=%u\n",_gi,y_id,sqrtf(_gs),_gn);
-                                    } else {
-                                        fprintf(stderr,"PRE_DEPOSIT: pidx=%u yid=%u gy_tag=%u (not TEN)\n",_gi,y_id,term_tag(_dgy));
-                                    }
-                                    _dc++;
-                                }}
                                 Term slot = heap_read(ctx, tgt_loc + 1 + 2*_gi + 1);
                                 Term accum = thvm_op(ctx, UOP_ADD, slot, gy);
                                 GRAD_RETURN(thvm_app(ctx,

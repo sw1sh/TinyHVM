@@ -60,7 +60,11 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             int inner = fuse_walk_inner(ctx, term_ten(m->src_ids[0], m->dtype),
                                         ops, n_ops, leaf_ids, leaf_views, n_leaves);
             if (inner < 0) return -1;
-            if (inner >= (int)(WALK_LEAF_BASE * 2)) return -1; // op, not leaf
+            if (inner >= (int)(WALK_LEAF_BASE * 2)) {
+                // Inner returned OP. Don't compose view here — let the
+                // TAG_TOP handler above compose (avoids double-PERMUTE).
+                return inner;
+            }
             u32 leaf_idx = inner - WALK_LEAF_BASE;
             const View *base = leaf_views[leaf_idx];
             if (!base) return -1;
@@ -131,7 +135,33 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         }
 int inner = fuse_walk_inner(ctx, view_input, ops, n_ops, leaf_ids, leaf_views, n_leaves);
         if (inner < 0) return -1;
-        if (inner >= (int)(WALK_LEAF_BASE * 2)) return -1;
+        if (inner >= (int)(WALK_LEAF_BASE * 2)) {
+            // Inner returned OP: compose PERMUTE onto all leaf views
+            if (uop == UOP_PERMUTE) {
+                Term parg = heap_read(ctx, loc + 1);
+                if (term_tag(parg) == TAG_TEN) {
+                    TensorMeta *pp2 = &ctx->tensors[(u32)term_val(parg)];
+                    u32 pr = pp2->view.numel;
+                    f32 ppf2[MAX_DIM];
+                    META_READ(pp2->backend, pp2->buf_id, ppf2, pr * sizeof(f32));
+                    for (u32 li = 0; li < *n_leaves; li++) {
+                        const View *bv = leaf_views[li];
+                        if (bv->shape.rank != pr) continue;
+                        View nv2 = {0}; nv2.offset = bv->offset;
+                        nv2.shape.rank = pr; nv2.numel = bv->numel;
+                        for (u32 j = 0; j < pr; j++) {
+                            nv2.shape.dims[j] = bv->shape.dims[(u32)ppf2[j]];
+                            nv2.strides[j] = bv->strides[(u32)ppf2[j]];
+                        }
+                        nv2.contiguous = 0;
+                        fuse_composed_views[li] = nv2;
+                        leaf_views[li] = &fuse_composed_views[li];
+                    }
+                    return inner;
+                }
+            }
+            return -1;
+        }
         u32 leaf_idx = inner - WALK_LEAF_BASE;
         const View *base = leaf_views[leaf_idx];
         if (!base) return -1;
@@ -353,7 +383,23 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     for (u32 i = 0; i < n_leaves; i++)
         if (LEAF_IS_LAZY(leaf_ids[i])) { has_lazy = 1; break; }
 
-    u32 min_ops = (has_reduce || has_lazy) ? 1 : 2;
+    // Lazy leaves: resolve FIRST, then re-walk to get correct ops/leaves.
+    if (has_lazy) {
+        for (u32 i = 0; i < n_leaves; i++) {
+            if (!LEAF_IS_LAZY(leaf_ids[i])) continue;
+            Term lt = fuse_leaf_terms[i];
+            thvm_reduce(ctx, lt);
+        }
+        n_ops = 0; n_leaves = 0;
+        int walk2 = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
+        if (walk2 < 0) return reduce_id(ctx, t);
+        fuse_remap(ops, n_ops, n_leaves);
+        for (u32 i = 0; i < n_leaves; i++)
+            if (LEAF_IS_LAZY(leaf_ids[i])) return reduce_id(ctx, t);
+        has_lazy = 0; // resolved
+    }
+
+    u32 min_ops = (has_reduce) ? 1 : 2;
     if (n_ops < min_ops) return reduce_id(ctx, t);
 
     // Fused reduce backward safety: most backward ops now use y (output) not at (input).
@@ -432,45 +478,8 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     }
     u32 out_numel = out_view.numel;
 
-    // Lazy leaves: reduce them FIRST, then re-walk the graph.
-    // We can't resolve lazy leaves in-place because thvm_reduce modifies
-    // the heap, invalidating the fuse's collected ops/leaf data.
-    // Two-phase: reduce → re-walk (graph is now all-TAG_TEN) → dispatch.
-    if (has_lazy) {
-        // Phase 1: reduce all lazy leaves
-        for (u32 i = 0; i < n_leaves; i++) {
-            if (!LEAF_IS_LAZY(leaf_ids[i])) continue;
-            Term lt = fuse_leaf_terms[i];
-            thvm_reduce(ctx, lt); // reduces in-place, updates heap
-        }
-        // Phase 2: re-walk the graph (now all leaves should be TAG_TEN)
-        n_ops = 0; n_leaves = 0;
-        int walk2 = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views, &n_leaves);
-        if (walk2 < 0) return reduce_id(ctx, t);
-        fuse_remap(ops, n_ops, n_leaves);
-        // Check for any remaining lazy leaves (shouldn't happen)
-        for (u32 i = 0; i < n_leaves; i++)
-            if (LEAF_IS_LAZY(leaf_ids[i])) return reduce_id(ctx, t);
-        // Recompute output shape from fresh leaf data
-        leaf_used[0] = 0; // reset
-        memset(leaf_used, 0, sizeof(leaf_used));
-        for (u32 i = 0; i < n_ops; i++) {
-            if (ops[i].arg_a < n_leaves) leaf_used[ops[i].arg_a] = 1;
-            if (ops[i].arg_b < n_leaves) leaf_used[ops[i].arg_b] = 1;
-        }
-        ew_view = (View){0}; ew_init = 0;
-        for (u32 i = 0; i < n_leaves; i++) {
-            if (!leaf_used[i]) continue;
-            if (!ew_init) { ew_view = *leaf_views[i]; ew_init = 1; continue; }
-            View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
-            if (!view_broadcast(&ew_view, leaf_views[i], &av_bc, &bv_bc, bc_shape, &bc_ndim))
-                return reduce_id(ctx, t);
-            ew_view = view_create(shape_of(bc_shape, bc_ndim));
-        }
-        if (!ew_init) return reduce_id(ctx, t);
-        // Recompute reduce (rebuild ReduceSpec, no trailing restriction)
-        out_view = ew_view;
-        memset(&rs, 0, sizeof(rs));
+    // (Lazy leaf resolution moved above — has_lazy is always 0 here)
+    if (0 && has_lazy) {
         if (has_reduce) {
             rs.reduce_type = has_reduce;
             u64 sloc = term_val(sum_term);

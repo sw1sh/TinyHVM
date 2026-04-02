@@ -122,7 +122,7 @@ int main(void) {
     // Eval
     printf("\n  Evaluating...\n");
     Term test_data=thvm_tensor(ctx,data.test_images,(Shape){.dims={data.n_test,1,28,28},.rank=4});
-    u32 ek=ctx->tensor_count; u32 cor=0,tbs=64,tb=data.n_test/tbs;
+    u32 ek=ctx->tensor_count; u32 cor=0,tbs=128,tb=data.n_test/tbs;
     for(u32 b=0;b<tb;b++){
         Term tx=thvm_shrink(ctx,test_data,(u32[]){b*tbs,(b+1)*tbs,0,1,0,28,0,28},4);
         u32 p0[]={0,0,0,0},s1[]={1,1},k2[]={2,2},s2[]={2,2};

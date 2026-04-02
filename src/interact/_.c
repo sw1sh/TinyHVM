@@ -1085,7 +1085,12 @@ inet_step:
             TensorMeta *md;
 
             // Elementwise ops: DEFER dispatch for GPU fusion.
-            if (is_elementwise(uop) && ma->backend->dispatch_kernel_rs) {
+            // During backward: don't defer small tensors (<10M elements).
+            // This prevents deferred chains that produce zero gradients
+            // when the chain includes view ops (PERMUTE) between ew and reduce.
+            u32 _out_n = 1; for(u32 _d=0;_d<out_ndim;_d++) _out_n*=out_shape[_d];
+            if (is_elementwise(uop) && ma->backend->dispatch_kernel_rs &&
+                !(ctx->no_fuse && _out_n < 10000000)) {
                 dst_id = ctx->tensor_count++;
                 md = &ctx->tensors[dst_id];
                 memset(md, 0, sizeof(*md));

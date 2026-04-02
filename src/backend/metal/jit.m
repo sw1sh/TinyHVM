@@ -422,15 +422,27 @@ void jit_alloc_ephemeral(void) {
     }
     if (heap_total == 0) heap_total = 4;
 
-    // Drain pending_free and release free-list to reclaim capture-time memory
+    // Free capture-time ephemeral buffers that are NOT shared with persistent tensors
     for (u32 i = 0; i < pending_free_count; i++)
         metal_buf_free(pending_free[i]);
     pending_free_count = 0;
-    for (u32 i = 0; i < free_count; i++) {
-        if (free_list[i].buf) {
-            metal_bytes_total -= free_list[i].size;
-            free_list[i].buf = nil;
+    // Release ephemeral slot buffers (only truly ephemeral ones)
+    for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+        u32 bid = jit_orig_buf_ids[s];
+        if (!bid || !metal_pool.bufs[bid]) continue;
+        // Check if this buffer is shared with any persistent slot
+        int shared = 0;
+        for (u32 ps = 0; ps < jit.persistent_count; ps++)
+            if (jit.slots[ps].buf_id == bid) { shared = 1; break; }
+        if (!shared) {
+            metal_bytes_total -= metal_pool.sizes[bid];
+            metal_bytes_inuse -= metal_pool.sizes[bid];
+            metal_pool.bufs[bid] = nil;
+            metal_pool.sizes[bid] = 0;
         }
+    }
+    for (u32 i = 0; i < free_count; i++) {
+        if (free_list[i].buf) { metal_bytes_total -= free_list[i].size; free_list[i].buf = nil; }
     }
     free_count = 0;
 
@@ -472,12 +484,17 @@ void jit_alloc_ephemeral(void) {
 
     // Default: plan-idx based, one buffer per plan_idx
     {
+        fprintf(stderr, "  Allocating %u plan buffers (%.1f MB)...\n",
+            jit_n_plan, (double)heap_total/1e6);
         u32 plan_bufs[JIT_MAX_SLOTS];
         for (u32 p = 0; p < jit_n_plan; p++) {
+            if (p < 3 || p == jit_n_plan-1)
+                fprintf(stderr, "    plan[%u]: %.1f MB\n", p, (double)jit_plan_sizes[p]/1e6);
             plan_bufs[p] = metal_buf_alloc(jit_plan_sizes[p]);
             jit_plan_bufs[p] = plan_bufs[p];
         }
 
+        fprintf(stderr, "  Plan alloc done. Assigning slots...\n");
         for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
             u32 p = jit.slots[s].buf_id;
             if (p < jit_n_plan)

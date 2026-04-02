@@ -39,7 +39,7 @@ static u32 plan_alloc_ids[MAX_PLAN_ENTRIES];
 static u32 plan_alloc_birth[MAX_PLAN_ENTRIES];
 static u32 plan_alloc_count = 0;
 
-#define METAL_MEM_BUDGET (12ULL * 1024 * 1024 * 1024) // 12GB hard limit
+#define METAL_MEM_BUDGET (18ULL * 1024 * 1024 * 1024) // 18GB (JIT needs capture + plan)
 
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);
@@ -109,6 +109,12 @@ static u32 metal_buf_alloc(u64 bytes) {
     // 3. Fresh allocation
     metal_pool.bufs[id] = [mtl_dev newBufferWithLength:bytes
                                                options:MTLResourceStorageModeShared];
+    if (!metal_pool.bufs[id]) {
+        fprintf(stderr, "FATAL: Metal newBuffer(%.1fMB) returned nil. GPU OOM.\n", (double)bytes/1e6);
+        fprintf(stderr, "  Total: %.0fMB. Buffers: %u. Free: %u.\n",
+            (double)metal_bytes_total/1e6, metal_pool.count, free_count);
+        exit(1);
+    }
     metal_pool.sizes[id] = bytes;
     metal_bytes_total += bytes;
     metal_bytes_inuse += bytes;

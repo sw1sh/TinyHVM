@@ -9,16 +9,6 @@
 static u16 tensor_ref_count[MAX_TENSORS];
 static u32 ref_prescan_done = 0;
 
-// ShapeTracker pointers per leaf — set during materialize_walk, read by codegen.
-static const ShapeTracker *mat_leaf_sts[FUSE_MAX_LEAVES];
-
-// Wire mat_leaf_sts into the global _dispatch_leaf_sts before dispatch.
-#define WIRE_ST(n) do { \
-    extern const ShapeTracker *_dispatch_leaf_sts[]; \
-    memset(_dispatch_leaf_sts, 0, FUSE_MAX_LEAVES * sizeof(void*)); \
-    for (u32 _i = 0; _i < (n); _i++) _dispatch_leaf_sts[_i] = mat_leaf_sts[_i]; \
-} while(0)
-
 static void ref_prescan(TinyHVM *ctx) {
     if (ref_prescan_done >= ctx->tensor_count) return;
     memset(tensor_ref_count, 0, ctx->tensor_count * sizeof(u16));
@@ -47,9 +37,7 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
         if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
         u32 idx = (*n_leaves)++;
         leaf_ids[idx] = tid;
-        // LOGICAL view for broadcasting. Physical view via mat_leaf_sts for Path D.
         leaf_views[idx] = &m->view;
-        mat_leaf_sts[idx] = (m->st.n_views >= 2) ? &m->st : NULL;
         return (int)idx;
     }
 
@@ -179,7 +167,6 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
     if (m->buf_id != 0) return;
     ref_prescan(ctx); // ensure reference counts are up to date
     if (getenv("THVM_TRACE")) fprintf(stderr, "MAT_CHAIN tid=%u op=%u buf=%u\n", tid, m->creator_op, m->buf_id);
-    memset(mat_leaf_sts, 0, sizeof(mat_leaf_sts));
 
     // Deferred MM: materialize inputs, then dispatch via MPS.
     if (m->creator_op == UOP_MM && m->src_ids[0] && m->src_ids[1]) {
@@ -293,7 +280,7 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                     m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
                     u32 bufs[FUSE_MAX_LEAVES];
                     for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
-                    WIRE_ST(n_leaves); m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+                    m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
                         ops, n_ops, &fs, &rs, n_sides?side_bufs:NULL, n_sides?side_ops:NULL, n_sides);
                     return;
                 }
@@ -455,7 +442,7 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                             m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
                             u32 bufs[FUSE_MAX_LEAVES];
                             for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
-                            WIRE_ST(n_leaves); m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+                            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
                                 ops, n_ops, &fs, &rs,
                                 n_sides2 ? side_bufs2 : NULL, n_sides2 ? side_ops2 : NULL, n_sides2);
                             return;
@@ -596,12 +583,12 @@ dispatch_chain:
                 for (int d = (int)full_shape.rank - 1; d >= 0; d--)
                     if (full_shape.dims[d] > 1) { rs.is_reduce[d] = 1; break; }
             }
-            WIRE_ST(n_leaves); m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
                                             ops, n_ops, &full_shape, &rs,
                                             n_sides ? side_bufs : NULL,
                                             n_sides ? side_ops : NULL, n_sides);
         } else {
-            WIRE_ST(n_leaves); m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
                                             ops, n_ops, &m->view.shape, NULL,
                                             side_bufs, side_ops, n_sides);
         }
@@ -718,7 +705,7 @@ static int tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf,
         for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
 
         Shape full_shape = im->view.shape;
-        WIRE_ST(n_leaves); im->backend->dispatch_kernel_rs(out_buf, bufs, leaf_views, n_leaves,
+        im->backend->dispatch_kernel_rs(out_buf, bufs, leaf_views, n_leaves,
                                          ops, n_ops, &full_shape, rs,
                                          n_sides ? side_bufs : NULL,
                                          n_sides ? side_ops : NULL, n_sides);
@@ -1035,7 +1022,7 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
     m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
     u32 bufs[FUSE_MAX_LEAVES];
     for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
-    WIRE_ST(n_leaves); m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+    m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
         ops, n_ops, &fs, &rs, NULL, NULL, 0);
 
     // Mark intermediate deferred tensors as "materialized" by allocating

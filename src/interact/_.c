@@ -717,52 +717,51 @@ inet_step:
                         }
                         if (needs_materialize) {
                             ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];
-                            // ShapeTracker: share buffer, push view stack.
-                            // Only when numel matches (valid reshape) and buffer exists.
-                            { u32 _nn=1; for(u32 _i=0;_i<ns.rank;_i++) _nn*=ns.dims[_i];
-                            if (ma->buf_id != 0 && ma->st.n_views < ST_MAX_VIEWS - 1 &&
-                                _nn == ma->view.numel) {
-                                new_view = view_create(ns);
-                                if (ma->st.n_views == 0) {
-                                    // Walk view chain to build full ST from buffer to top.
-                                    // Chain: buffer → pool → pad → expand → (this reshape)
-                                    View chain[ST_MAX_VIEWS]; u32 cn = 0;
-                                    chain[cn++] = ma->view; // current view (topmost)
-                                    u32 walk = a_id;
-                                    while (cn < ST_MAX_VIEWS - 1) {
-                                        TensorMeta *wm = &ctx->tensors[walk];
-                                        if (!is_view_op(wm->creator_op) || !wm->src_ids[0]) break;
-                                        u32 base = wm->src_ids[0];
-                                        TensorMeta *bm = &ctx->tensors[base];
-                                        if (bm->buf_id != ma->buf_id) break; // different buffer
-                                        chain[cn++] = bm->view;
-                                        walk = base;
+                            u32 numel = ma->view.numel;
+                            u32 orig_a_id = a_id;
+                            u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
+                            if (ma->backend->contiguify) {
+                                ma->backend->contiguify(ctx->tensors[mat_id].buf_id, numel,
+                                                         ma->buf_id, &ma->view);
+                            } else {
+                                // CPU path: strided gather
+                                f32 *src = malloc(numel * sizeof(f32));
+                                u32 buf_bytes = (ma->view.offset > 0) ? (u32)ma->view.offset : 0;
+                                for (u32 d = 0; d < ma->view.shape.rank; d++)
+                                    if (ma->view.strides[d] > 0)
+                                        buf_bytes += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
+                                buf_bytes += 1;
+                                if (buf_bytes == 0) buf_bytes = 1;
+                                f32 *raw = malloc(buf_bytes * sizeof(f32));
+                                ma->backend->buf_read(ma->buf_id, raw, buf_bytes * sizeof(f32));
+                                for (u32 flat = 0; flat < numel; flat++) {
+                                    u32 rem = flat; i32 idx = ma->view.offset;
+                                    int msk = 0;
+                                    for (int d = (int)ma->view.shape.rank - 1; d >= 0; d--) {
+                                        u32 coord = rem % ma->view.shape.dims[d];
+                                        rem /= ma->view.shape.dims[d];
+                                        if (ma->view.has_mask && (coord < ma->view.mask_begin[d] || coord >= ma->view.mask_end[d])) msk = 1;
+                                        idx += (i32)coord * (ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
                                     }
-                                    // Reverse: views[0] = deepest (buffer), views[n-1] = reshape
-                                    for (u32 vi = 0; vi < cn; vi++)
-                                        ma->st.views[vi] = chain[cn - 1 - vi];
-                                    ma->st.views[cn] = new_view;
-                                    ma->st.n_views = cn + 1;
-                                } else {
-                                    ma->st.views[ma->st.n_views] = new_view;
-                                    ma->st.n_views++;
+                                    src[flat] = (msk || idx < 0 || (u32)idx >= buf_bytes) ? 0.f : raw[(u32)idx];
                                 }
-                                break; // → tensor_view_of copies st
-                            }}
-                            // Fallback: contiguify
+                                free(raw);
+                                ctx->tensors[mat_id].backend->buf_write(ctx->tensors[mat_id].buf_id, src, numel * sizeof(f32));
+                                free(src);
+                            }
+
+                            // Record provenance so GRAD can walk through materialized copies.
+                            // Must be unconditional — gradient tensors don't have requires_grad
+                            // but GRAD still needs to traverse their provenance chain.
                             {
-                                u32 numel = ma->view.numel, orig_a_id = a_id;
-                                u32 mat_id = tensor_create(ctx, ma->view.shape, ma->dtype);
-                                if (ma->backend->contiguify)
-                                    ma->backend->contiguify(ctx->tensors[mat_id].buf_id, numel, ma->buf_id, &ma->view);
                                 ctx->tensors[mat_id].requires_grad = ctx->tensors[orig_a_id].requires_grad;
                                 ctx->tensors[mat_id].creator_op = UOP_RESHAPE;
                                 ctx->tensors[mat_id].src_ids[0] = orig_a_id;
                                 ctx->tensors[mat_id].src_ids[1] = b_id;
-                                a_id = mat_id;
-                                ma = &ctx->tensors[a_id];
-                                new_view = view_reshape(ma->view, ns);
                             }
+                            a_id = mat_id;
+                            ma = &ctx->tensors[a_id];
+                            new_view = view_reshape(ma->view, ns);
                         }
                         break;
                     }

@@ -200,7 +200,7 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
             }
             if (is_elementwise(cm->creator_op))
                 cur = cm->src_ids[0];
-            else break; // don't cross view ops (different coord space)
+            else break; // don't cross view ops
         }
         if (reduce_tid && reduce_input &&
             ctx->tensors[reduce_input].buf_id == 0 &&

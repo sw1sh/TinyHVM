@@ -1085,12 +1085,12 @@ inet_step:
             TensorMeta *md;
 
             // Elementwise ops: DEFER dispatch for GPU fusion.
-            // During backward: don't defer small tensors (<10M elements).
-            // This prevents deferred chains that produce zero gradients
-            // when the chain includes view ops (PERMUTE) between ew and reduce.
+            // All ew ops defer unconditionally — both forward and backward.
+            // Backward reduces don't defer (line 1118 guard), so deferred backward
+            // ew chains get materialized when the non-deferred reduce EENSUREs them.
             u32 _out_n = 1; for(u32 _d=0;_d<out_ndim;_d++) _out_n*=out_shape[_d];
-            if (is_elementwise(uop) && ma->backend->dispatch_kernel_rs &&
-                !(ctx->no_fuse && _out_n < 10000000)) {
+            (void)_out_n;
+            if (is_elementwise(uop) && ma->backend->dispatch_kernel_rs) {
                 dst_id = ctx->tensor_count++;
                 md = &ctx->tensors[dst_id];
                 memset(md, 0, sizeof(*md));

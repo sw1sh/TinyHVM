@@ -276,11 +276,67 @@ inet_step:
                             UN_GRAD(thvm_op(ctx, UOP_MUL, thvm_expand(ctx, gy, ma->view.shape), mask));
                         }
                         case UOP_RESHAPE: {
+                            // Auto-detect conv pattern: RESHAPE([BS,cout,OY,OX]) ← SUM(MUL(8D))
+                            // TODO: enable matmul-based conv backward once dW verified correct
+                            if (0 && !my->conv_input_id && my->view.shape.rank == 4 &&
+                                ma && ma->creator_op == UOP_SUM && ma->src_ids[0] &&
+                                ma->backend && ma->backend->op_mm) {
+                                u32 mul_id = ma->src_ids[0];
+                                TensorMeta *mmul = &ctx->tensors[mul_id];
+                                if (mmul->creator_op == UOP_MUL && mmul->view.shape.rank == 8 &&
+                                    mmul->src_ids[0] && mmul->src_ids[1]) {
+                                    TensorMeta *mw_src = &ctx->tensors[mmul->src_ids[1]];
+                                    // Weight shape: [1,groups,rcout,1,1,cin_g,KH,KW]
+                                    if (mw_src->view.shape.dims[0] == 1 &&
+                                        mw_src->view.shape.dims[3] == 1 && mw_src->view.shape.dims[4] == 1) {
+                                        // Extract conv params from shapes
+                                        u32 _groups = mw_src->view.shape.dims[1];
+                                        u32 _cin_g = mw_src->view.shape.dims[5];
+                                        u32 _KH = mw_src->view.shape.dims[6], _KW = mw_src->view.shape.dims[7];
+                                        // Find original weight (walk through reshapes)
+                                        u32 _w_id = mmul->src_ids[1];
+                                        while (_w_id && ctx->tensors[_w_id].creator_op == UOP_RESHAPE)
+                                            _w_id = ctx->tensors[_w_id].src_ids[0];
+                                        // Find original input: walk src[0] chain looking for tensor
+                                        // matching expected conv input shape [BS,cin,OY+KH-1,OX+KW-1]
+                                        u32 _BS = my->view.shape.dims[0];
+                                        u32 _OY = my->view.shape.dims[2], _OX = my->view.shape.dims[3];
+                                        u32 _exp_H = _OY + _KH - 1, _exp_W = _OX + _KW - 1;
+                                        u32 _exp_cin = _groups * _cin_g;
+                                        u32 _inp_id = mmul->src_ids[0];
+                                        for (u32 _d = 0; _d < 40 && _inp_id; _d++) {
+                                            TensorMeta *_m = &ctx->tensors[_inp_id];
+                                            if (_m->view.shape.rank == 4 &&
+                                                _m->view.shape.dims[0] == _BS &&
+                                                _m->view.shape.dims[1] == _exp_cin &&
+                                                _m->view.shape.dims[2] == _exp_H &&
+                                                _m->view.shape.dims[3] == _exp_W) break;
+                                            if (_m->src_ids[0]) _inp_id = _m->src_ids[0];
+                                            else break;
+                                        }
+                                        if (_w_id && _inp_id && _groups == 1 &&
+                                            ctx->tensors[_inp_id].view.shape.rank == 4) {
+                                            TensorMeta *_mi = &ctx->tensors[_inp_id];
+                                            // Verify shapes match before activating
+                                            u32 _cin = _mi->view.shape.dims[1];
+                                            u32 _OY = my->view.shape.dims[2];
+                                            u32 _OX = my->view.shape.dims[3];
+                                            u32 _exp_IH = _OY + _KH - 1; // stride=1
+                                            u32 _exp_IW = _OX + _KW - 1;
+                                            if (_mi->view.shape.dims[2] == _exp_IH &&
+                                                _mi->view.shape.dims[3] == _exp_IW &&
+                                                _cin == _cin_g * _groups) {
+                                                my->conv_input_id = _inp_id;
+                                                my->conv_weight_id = _w_id;
+                                                my->conv_groups = 1;
+                                                my->conv_KH = (u8)_KH; my->conv_KW = (u8)_KW;
+                                                my->conv_stride[0] = 1; my->conv_stride[1] = 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // Specialized conv backward: use MPS matmul for dW and dX
-                            // NOTE: conv metadata propagation from MUL→SUM→RESHAPE doesn't work
-                            // because post-reduce fusion creates new tensor IDs that lose the metadata.
-                            // The conv backward path only fires when conv metadata is set on the
-                            // RESHAPE tensor itself (which requires the lazy chain to resolve first).
                             if (my->conv_input_id && my->conv_weight_id &&
                                 my->conv_groups == 1 && ma->backend->op_mm) {
                                 u32 inp_id = my->conv_input_id;
@@ -301,9 +357,10 @@ inet_step:
                                 Term inp_t = term_ten(inp_id, mi->dtype);
                                 Term w_t = term_ten(w_id, mw->dtype);
                                 Term im2col = thvm_pool(ctx, inp_t, (u32[]){KH,KW}, (u32[]){sH,sW}, 2);
-                                // Reshape to [BS*OY*OX, cin*KH*KW] for matmul
+                                // Permute to [BS,OY,OX,cin,KH,KW] then reshape to [M,K]
                                 u32 M = BS*OY*OX, K = cin*KH*KW, N = cout;
-                                Term im_flat = thvm_reshape(ctx, im2col, SHAPE(M, K));
+                                Term im_perm = thvm_permute(ctx, im2col, (u32[]){0,2,3,1,4,5}, 6);
+                                Term im_flat = thvm_reshape(ctx, im_perm, SHAPE(M, K));
                                 // gy: [BS,cout,OY,OX] → [BS*OY*OX, cout] = [M, N]
                                 Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
                                 // Permute gy to [BS,OY,OX,cout] then reshape to [M,N]
@@ -315,29 +372,22 @@ inet_step:
                                 // Reshape to [cin,KH,KW,cout] → permute to [cout,cin,KH,KW]
                                 Term dW_rs = thvm_reshape(ctx, dW_flat, shape_of((u32[]){cin,KH,KW,cout}, 4));
                                 Term dW = thvm_permute(ctx, dW_rs, (u32[]){3,0,1,2}, 4);
-                                // dX_im2col = gy @ W^T: [M,N] @ [N,K] = [M,K]
-                                Term w_flat = thvm_reshape(ctx, w_t, SHAPE(N, K));
-                                Term w_T = thvm_permute(ctx, w_flat, (u32[]){1,0}, 2);
-                                Term dX_flat = thvm_op(ctx, UOP_MM, gy_flat, w_T);
-                                // col2im: reshape [M,K] → [BS,OY,OX,cin,KH,KW] → col2im sum
-                                // For now, use the generic chain for dX (simpler)
-                                // Only optimize dW (weight gradient) via matmul
-                                int _a_live = ma->requires_grad;
+                                // dW via matmul, dX via generic backward
                                 int _b_live = mw->requires_grad;
-                                // Walk dW to weight, dX to input (via generic chain)
-                                if (_a_live && _b_live) {
-                                    // Both input and weight need gradients
-                                    GRAD_RETURN(thvm_op(ctx, UOP_ADD,
-                                        GRAD3(w_t, dW, x),
-                                        GRAD3(at, thvm_op(ctx, UOP_RESHAPE, gy,
-                                            thvm_tensor(ctx, (f32[]){(f32)ma->view.shape.dims[0],(f32)ma->view.shape.dims[1],(f32)ma->view.shape.dims[2],(f32)ma->view.shape.dims[3],(f32)ma->view.shape.dims[4],(f32)ma->view.shape.dims[5],(f32)ma->view.shape.dims[6],(f32)ma->view.shape.dims[7]}, SHAPE(ma->view.shape.rank))), x)));
-                                } else if (_b_live) {
-                                    // Only weight gradient
-                                    Term _bg = GRAD3(w_t, dW, x);
-                                    if (term_tag(_bg) == TAG_TOP) GRAD_STEP(_bg);
-                                    GRAD_RETURN(_bg);
+                                if (_b_live) {
+                                    Term dW_grad = GRAD3(w_t, dW, x);
+                                    // dX: generic backward (reshape gy → walk SUM→MUL chain)
+                                    Shape _rs = ma->view.shape;
+                                    f32 _dims[MAX_DIM];
+                                    for (u32 j = 0; j < _rs.rank; j++) _dims[j] = (f32)_rs.dims[j];
+                                    Term _shape_t = thvm_tensor(ctx, _dims, SHAPE(_rs.rank));
+                                    // Clear weight requires_grad temporarily to prevent double dW deposit
+                                    u8 _saved_rg = ctx->tensors[w_id].requires_grad;
+                                    ctx->tensors[w_id].requires_grad = 0;
+                                    Term dX_grad = GRAD3(at, thvm_op(ctx, UOP_RESHAPE, gy, _shape_t), x);
+                                    ctx->tensors[w_id].requires_grad = _saved_rg;
+                                    GRAD_RETURN(thvm_op(ctx, UOP_ADD, dW_grad, dX_grad));
                                 } else {
-                                    // Only input gradient (or neither) — fall through to generic
                                     goto generic_reshape_backward;
                                 }
                             }

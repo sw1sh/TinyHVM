@@ -91,6 +91,9 @@ int main(void) {
         Term loss=cross_entropy_loss(ctx,logits,&data.train_labels[bi*BS],BS,10);
 
         // Backward + Adam
+        extern u32 total_dispatches;
+        double t_fwd = now_s();
+        u32 d_fwd = total_dispatches;
         Term gs[NP];
         for(int i=0;i<NP;i++){f32*z=calloc(psz[i],4);
             gs[i]=thvm_tensor(ctx,z,ctx->tensors[(u32)term_val(params[i])].view.shape);free(z);}
@@ -98,13 +101,18 @@ int main(void) {
         u32 gids[NP]; for(u32 i=0;i<NP;i++) gids[i]=(u32)term_val(gs[i]);
         Term bn_assigns=thvm_app(ctx,bn1.assigns,bn2.assigns);
         thvm_reduce(ctx,thvm_app(ctx,grad_term,bn_assigns));
+        double t_bwd = now_s();
+        u32 d_bwd = total_dispatches;
         adam_step_direct(ctx,&opt,gids);
+        double t_adam = now_s();
 
         if(step<3||step%10==0||step==n_steps-1){
             f32 lv=thvm_to_host(ctx,loss)[0];
-            extern u32 total_dispatches;
             extern void print_dispatch_breakdown(void);
-            if(step==0) { print_dispatch_breakdown(); }
+            if(step==0) { print_dispatch_breakdown();
+                printf("  Phase: fwd+bwd=%u dispatches (%.0fms), adam=%u (%.0fms)\n",
+                    d_bwd-d_fwd, (t_bwd-t_fwd)*1000, total_dispatches-d_bwd, (t_adam-t_bwd)*1000);
+            }
             printf("  step %3u: loss=%5.2f (%.1fs) [%u dispatches]\n",step,lv,now_s()-t0,total_dispatches);
         }
         extern u32 total_dispatches; total_dispatches=0;

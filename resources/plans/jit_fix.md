@@ -106,10 +106,15 @@ Forward pass is verified correct (cmd 7 output matches capture exactly).
 ViewParams are baked but should be correct (same layout). The bug must be
 in how the backward dispatch sequence reads from intermediate buffers.
 
-**Next concrete step:** Add per-param gradient direction check (sign of each element)
-at capture vs replay step 1 (same data). If many elements have FLIPPED signs,
-the backward is computing wrong directions. Then trace which specific backward
-command produces the first sign flip.
+**NARROWING (2026-04-04):**
+- CE + Adam + LINEAR model: JIT replay WORKS (w changes correctly)
+- CE + Adam + CNN model: JIT replay FAILS (destroys warm-up training)
+- Sum loss + SGD + ANY model: JIT replay WORKS
+- Issue is specifically conv backward during JIT replay
+- Conv backward involves im2col-reversed view ops (EXPAND/SHRINK/RESHAPE)
+  with ViewParams baked from capture time
+- Next: test conv+dense (no BN, no pool) to isolate if it's conv backward
+  specifically or the pool/reshape chain
 - Consts ARE needed: NaN without restoration (86 consts = backward scalars + shapes)
 - Loss readback broken: loss slot not found in JIT (buf_id 460 not in any slot)
 

@@ -547,11 +547,9 @@ inet_step:
 
             if (uop == UOP_ASSIGN) {
                     Term _dt=heap_read(ctx,loc); Term _st=heap_read(ctx,loc+1);
-                // UOP_ASSIGN(dst, src) — reduce src, blit into dst's buffer in-place
-                Term dst_t = heap_read(ctx, loc);
-                Term src_raw = heap_read(ctx, loc + 1);
-                Term src_t = thvm_reduce(ctx, src_raw);
-                Term dst_r = thvm_reduce(ctx, dst_t);
+                // UOP_ASSIGN(dst, src) — args already WNF from trampoline
+                Term dst_r = heap_read(ctx, loc);
+                Term src_t = heap_read(ctx, loc + 1);
                 if (term_tag(dst_r) == TAG_TEN && term_tag(src_t) == TAG_TEN) {
                     u32 dst_id = (u32)term_val(dst_r);
                     u32 src_id = (u32)term_val(src_t);
@@ -600,8 +598,8 @@ inet_step:
             if (uop == UOP_TODEVICE) {
                 // UOP_TODEVICE(tensor, device_idx_scalar)
                 // Read tensor from source backend, write to target backend
-                Term src_t = thvm_reduce(ctx, heap_read(ctx, loc));
-                Term dev_t = thvm_reduce(ctx, heap_read(ctx, loc + 1));
+                Term src_t = heap_read(ctx, loc);     // WNF from trampoline
+                Term dev_t = heap_read(ctx, loc + 1); // WNF from trampoline
                 if (term_tag(src_t) == TAG_TEN && term_tag(dev_t) == TAG_TEN) {
                     u32 src_id = (u32)term_val(src_t);
                     ENSURE(ctx, src_id);
@@ -633,8 +631,9 @@ inet_step:
             if (uop == UOP_WHERE) {
                 // UOP_WHERE(cond_ten, then_ten, else_ten) — elementwise ternary select
                 // Per tinyspec §ElementwiseOps: result[i] = A[i] if P[i]!=0 else B[i]
-                Term cond_t = thvm_reduce(ctx, heap_read(ctx, loc));
-                Term then_t = thvm_reduce(ctx, heap_read(ctx, loc + 1));
+                Term cond_t = heap_read(ctx, loc);     // WNF from trampoline
+                Term then_t = heap_read(ctx, loc + 1); // WNF from trampoline
+                // arg2 NOT reduced by trampoline (only GRAD uses TAG_TOP2)
                 Term else_t = thvm_reduce(ctx, heap_read(ctx, loc + 2));
                 if (term_tag(cond_t) != TAG_TEN || term_tag(then_t) != TAG_TEN ||
                     term_tag(else_t) != TAG_TEN) RETURN_REDUCED(term_era());
@@ -664,7 +663,7 @@ inet_step:
             // UOP_IFZ(counter, zero_case, succ_lam)
             // counter==0 → zero_case; counter>0 → APP(succ_lam, TEN(counter-1))
             if (uop == UOP_IFZ) {
-                Term ctr = thvm_reduce(ctx, heap_read(ctx, loc));
+                Term ctr = heap_read(ctx, loc); // WNF from trampoline
                 if (term_tag(ctr) != TAG_TEN) RETURN_REDUCED(term_era());
                 f32 *val = thvm_to_host(ctx, ctr);
                 ctx->itrs++;
@@ -682,7 +681,7 @@ inet_step:
 
             // UOP_LOG_PRINT(tensor) — print scalar value, return tensor unchanged
             if (uop == UOP_LOG_PRINT) {
-                Term t = thvm_reduce(ctx, heap_read(ctx, loc));
+                Term t = heap_read(ctx, loc); // WNF from trampoline
                 ctx->itrs++;
                 if (term_tag(t) == TAG_TEN) {
                     u32 tid = (u32)term_val(t);

@@ -1,12 +1,8 @@
             // === Phase 3 inet ops ===
 
             if (uop == UOP_ASSIGN) {
-                    Term _dt=heap_read(ctx,loc); Term _st=heap_read(ctx,loc+1);
-                // UOP_ASSIGN(dst, src) — must use thvm_reduce (not trampoline)
-                // because BN running stat assigns fail without it (57% accuracy).
-                // Both args read as TAG_TEN from trampoline, but something about
-                // the reduction order or side effects requires the inline reduce.
-                // TODO: investigate why trampoline-reduced args don't work for ASSIGN
+                // UOP_ASSIGN(dst, src) — thvm_reduce required for correctness
+                // (trampoline gives TAG_TEN but BN running stats fail without it)
                 Term dst_r = thvm_reduce(ctx, heap_read(ctx, loc));
                 Term src_t = thvm_reduce(ctx, heap_read(ctx, loc + 1));
                 if (term_tag(dst_r) == TAG_TEN && term_tag(src_t) == TAG_TEN) {

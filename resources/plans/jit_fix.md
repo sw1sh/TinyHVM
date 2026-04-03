@@ -74,9 +74,28 @@ that are numerically close to (but not identical with) what a fresh IC reduction
 produce. The differences are small per-step but accumulate in Adam's momentum, causing
 the gradient direction to be biased. This bias prevents convergence.
 
-**Path forward:** The JIT replay infrastructure is DONE. The convergence issue needs
-either: (a) investigate the numerical difference source, or (b) adopt tinygrad's
-approach of not using IC reduction at all — build the schedule directly and JIT that.
+**DEFINITIVE FINDING: beautiful_mnist ALSO has zero conv grads at step 0.**
+Only lw=356.9, lb=0.6, bb2=1.5 are non-zero — SAME as JIT capture. This is
+normal vanishing gradient behavior at initialization. The model trains purely
+through the dense layer initially.
+
+Non-JIT beautiful_mnist converges because it rebuilds the graph each step.
+Over 70 steps, the dense layer trains → forward intermediates change → conv
+grads eventually become non-zero → full model converges.
+
+JIT replay fires the SAME backward commands. These commands SHOULD produce
+non-zero conv grads when weights evolve. But 500 replay steps still shows
+only dense-layer grads. The commands are generic (MUL/ADD/SUM) so they
+should work on any input values. The question is whether the fused backward
+kernels correctly propagate non-zero values through the BN/pool chain when
+the forward intermediates change.
+
+**Path forward:** The JIT replay infrastructure is mechanically correct (verified
+with CNN+SGD). The convergence issue is that the captured backward dispatch
+sequence doesn't produce non-zero conv grads even after dense training. Options:
+(a) Capture at a later step (after warm-up) — requires multi-step non-JIT then JIT
+(b) Disable backward fusion during capture so backward commands are unfused
+(c) Adopt tinygrad approach: schedule → replay (no IC at all)
 - Consts ARE needed: NaN without restoration (86 consts = backward scalars + shapes)
 - Loss readback broken: loss slot not found in JIT (buf_id 460 not in any slot)
 

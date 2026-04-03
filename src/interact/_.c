@@ -17,7 +17,11 @@ static int is_elementwise(u32 uop);
 static Term thvm_interact(TinyHVM *ctx, Term t) {
     // Return result directly — the trampoline handles TAG_TOP results
     // via `next = r; goto enter;` (no need to force-reduce here).
-    #define RETURN_REDUCED(result) do { return (result); } while(0)
+    #define RETURN_REDUCED(result) do { \
+        Term _r = (result); \
+        if (term_tag(_r) == TAG_TOP) _r = thvm_reduce(ctx, _r); \
+        return _r; \
+    } while(0)
     // GRAD iterative step: loop back to inet_step in the same frame.
     #define GRAD_STEP(result) do { t = (result); goto inet_step; } while(0)
 

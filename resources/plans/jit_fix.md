@@ -96,6 +96,20 @@ sequence doesn't produce non-zero conv grads even after dense training. Options:
 (a) Capture at a later step (after warm-up) — requires multi-step non-JIT then JIT
 (b) Disable backward fusion during capture so backward commands are unfused
 (c) Adopt tinygrad approach: schedule → replay (no IC at all)
+
+**WARM-UP TEST RESULT (2026-04-04):**
+10 non-JIT warm-up steps → 68% accuracy. Then 60 JIT replay steps → **12.5%**.
+JIT replay ACTIVELY DESTROYS training. The backward produces wrong gradient
+directions that push weights away from the warm-up solution.
+
+Forward pass is verified correct (cmd 7 output matches capture exactly).
+ViewParams are baked but should be correct (same layout). The bug must be
+in how the backward dispatch sequence reads from intermediate buffers.
+
+**Next concrete step:** Add per-param gradient direction check (sign of each element)
+at capture vs replay step 1 (same data). If many elements have FLIPPED signs,
+the backward is computing wrong directions. Then trace which specific backward
+command produces the first sign flip.
 - Consts ARE needed: NaN without restoration (86 consts = backward scalars + shapes)
 - Loss readback broken: loss slot not found in JIT (buf_id 460 not in any slot)
 

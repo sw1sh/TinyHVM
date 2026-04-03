@@ -105,19 +105,27 @@ int main(void) {
     ctx->tensors[oh_tid].backend->buf_write(ctx->tensors[oh_tid].buf_id, oh_data, BS*10*sizeof(f32));
     for(int i=0;i<NP;i++) memset(metal_pool.bufs[ctx->tensors[gids[i]].buf_id].contents, 0, psz[i]*4);
 
-    // Build Adam as part of the graph (lazy path creates bc1/bc2 tensors we can update)
-    Term adam_term = adam_step_lazy(ctx, &opt, gids);
-    Term full_step = thvm_app(ctx, thvm_app(ctx, grad_term, bn_assigns), adam_term);
-    n_persistent = ctx->tensor_count; // bc1/bc2 tensors are now persistent
-
     jit_begin_capture(n_persistent);
     double t0 = now_s();
-    thvm_reduce(ctx, full_step);
+    thvm_reduce(ctx, train_step);
+    adam_step_direct(ctx, &opt, gids);
     f32 lv = thvm_to_host(ctx, loss)[0];
     jit_end_capture();
 
     // Save loss buf_id mapping before reset (loss is ephemeral)
     u32 loss_capture_bid = ctx->tensors[(u32)term_val(loss)].buf_id;
+    // Dump: what are the param/m/v buf_ids at capture time?
+    {
+        if (batch_dirty) metal_flush();
+        fprintf(stderr, "CAPTURE bid mapping (ALL params):\n");
+        for(int i=0;i<NP;i++){
+            u32 pid = (u32)term_val(params[i]);
+            u32 pbid = ctx->tensors[pid].buf_id;
+            u32 mbid = ctx->tensors[opt.m_bufs[i]].buf_id;
+            u32 vbid = ctx->tensors[opt.v_bufs[i]].buf_id;
+            fprintf(stderr, "  p[%2d]: param_bid=%3u m_bid=%3u v_bid=%3u\n", i, pbid, mbid, vbid);
+        }
+    }
     // Capture-time check
     {
         if (batch_dirty) metal_flush();
@@ -155,51 +163,27 @@ int main(void) {
         ctx->tensors[oh_tid].backend->buf_write(ctx->tensors[oh_tid].buf_id, oh_data, BS*10*sizeof(f32));
         // Zero grads
         for(int i=0;i<NP;i++) memset(metal_pool.bufs[ctx->tensors[gids[i]].buf_id].contents, 0, psz[i]*4);
-        // Restore consts FIRST (includes bc1/bc2 from step 0)
-        jit_restore_consts();
-        // THEN overwrite bc1/bc2 with correct values for this step
+        // Patch Adam bc1/bc2 in JIT commands
         opt.t++;
         f32 nbc1 = 1.0f - powf(opt.beta1, (f32)opt.t);
         f32 nbc2 = 1.0f - powf(opt.beta2, (f32)opt.t);
-        if (opt.bc1_tid) {
-            u32 bid = ctx->tensors[opt.bc1_tid].buf_id;
-            if (bid && bid < MAX_BUFS && metal_pool.bufs[bid])
-                memcpy(BUF_CONTENTS(bid), &nbc1, 4);
+        // Adam cmds use pipe_adam_step or pipe_adam_step_f4
+        // Params struct: {lr, beta1, beta2, eps, bc1, bc2} — bc1 at offset 16, bc2 at 20
+        for(u32 ci = 0; ci < jit.n_cmds; ci++) {
+            JITCmd *cmd = &jit.cmds[ci];
+            if (cmd->is_blit || cmd->is_mps || cmd->n_bufs == 0) continue;
+            if (cmd->pipe == pipe_adam_step || cmd->pipe == pipe_adam_step_f4) {
+                memcpy(cmd->params + 16, &nbc1, 4);
+                memcpy(cmd->params + 20, &nbc2, 4);
+            }
         }
-        if (opt.bc2_tid) {
-            u32 bid = ctx->tensors[opt.bc2_tid].buf_id;
-            if (bid && bid < MAX_BUFS && metal_pool.bufs[bid])
-                memcpy(BUF_CONTENTS(bid), &nbc2, 4);
-        }
-        // Then replay commands (uses our updated bc values)
-        { extern void jit_replay_commands(void); jit_replay_commands(); }
 
-        if(step==1){
+        jit_replay();
+
+        if(step<=3||step==n_steps-1){
             jit_flush();
-            // Dump last 10 commands' output slots → buf_ids
-            for(u32 ci = jit.n_cmds > 10 ? jit.n_cmds - 10 : 0; ci < jit.n_cmds; ci++) {
-                JITCmd *cmd = &jit.cmds[ci];
-                if (cmd->is_blit || cmd->is_mps || cmd->n_bufs == 0) continue;
-                u32 out_slot = cmd->buf_slots[0];
-                u32 out_bid = jit.slots[out_slot].buf_id;
-                int is_pers = (out_slot < jit.persistent_count);
-                fprintf(stderr, "CMD%u: out_slot=%u bid=%u %s pool=%p\n",
-                    ci, out_slot, out_bid, is_pers ? "PERS" : "eph",
-                    out_bid < MAX_BUFS ? (void*)metal_pool.bufs[out_bid] : NULL);
-            }
-            // Check weight + Adam state buf_ids
-            for(int i=0;i<NP&&i<4;i++){
-                u32 pid = ctx->tensors[(u32)term_val(params[i])].buf_id;
-                fprintf(stderr, "param[%d] bid=%u  m_bid=%u  v_bid=%u\n",
-                    i, pid, opt.m_bufs[i], opt.v_bufs[i]);
-            }
-            u32 w1bid = ctx->tensors[(u32)term_val(cw1)].buf_id;
-            fprintf(stderr, "W1 bid=%u val=%.8f pool=%p\n", w1bid, *(f32*)BUF_CONTENTS(w1bid),
-                (void*)metal_pool.bufs[w1bid]);
-            // Check if bid 14 == bid 1 (same Metal buffer?)
-            fprintf(stderr, "bid1 pool=%p  bid14 pool=%p  same=%d\n",
-                (void*)metal_pool.bufs[1], (void*)metal_pool.bufs[14],
-                metal_pool.bufs[1] == metal_pool.bufs[14]);
+            f32 w1v = *(f32*)BUF_CONTENTS(ctx->tensors[(u32)term_val(cw1)].buf_id);
+            printf("step %3u: w1[0]=%.8f (%.1fs)\n", step, w1v, now_s()-t0);
             // Check first few ephemeral slot outputs
             for(u32 si = jit.persistent_count; si < jit.persistent_count + 5 && si < jit.n_slots; si++) {
                 u32 bid = jit.slots[si].buf_id;

@@ -39,14 +39,11 @@ int main(void) {
     u32 psz[NP]={32*25,32, 32*32*25,32, 64*32*9,64, 64*64*9,64, 32,32, 64,64, ff*10,10};
     for(u32 i=0;i<NP;i++) thvm_set_requires_grad(ctx,params[i]);
 
-    // Fixed input + one-hot label buffers (persistent, overwritten each step)
+    // Fixed input buffer (persistent, overwritten each step)
     f32 *xbuf = calloc(BS*1*28*28, 4);
     Term x = thvm_tensor(ctx, xbuf, (Shape){.dims={BS,1,28,28},.rank=4}); free(xbuf);
     thvm_set_requires_grad(ctx, x);
-
-    f32 *ohbuf = calloc(BS*10, 4);
-    Term oh = thvm_tensor(ctx, ohbuf, SHAPE(BS, 10)); free(ohbuf);
-    u32 x_tid = (u32)term_val(x), oh_tid = (u32)term_val(oh);
+    u32 x_tid = (u32)term_val(x);
 
     // Adam state + grad accumulators (persistent)
     Adam opt = adam_init(ctx, 0.0005f, NP);
@@ -76,17 +73,22 @@ int main(void) {
     Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
         thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
 
-    // CE loss using pre-created oh buffer
-    Term probs = softmax(ctx, logits, BS, 10);
-    f32 eps = 1e-7f;
-    Term eps_t = thvm_expand(ctx, thvm_tensor(ctx, &eps, SHAPE(1, 1)), SHAPE(BS, 10));
-    Term clamped = thvm_op(ctx, UOP_MAX, probs, eps_t);
-    Term log_probs = thvm_op(ctx, UOP_LOG, clamped, term_era());
-    Term masked = thvm_op(ctx, UOP_MUL, oh, log_probs);
-    Term sum_all = thvm_sum_axes(ctx, masked, (u32[]){0, 1}, 2);
-    Term neg_sum = thvm_op(ctx, UOP_NEG, sum_all, term_era());
-    f32 inv_B = 1.f / (f32)BS;
-    Term loss = thvm_op(ctx, UOP_MUL, neg_sum, thvm_tensor(ctx, &inv_B, SHAPE(1, 1)));
+    // CE loss — cross_entropy_loss creates a one-hot tensor (persistent).
+    // We track its buf_id to overwrite labels per step during JIT replay.
+    u32 bi0 = rand() % (data.n_train / BS);
+    u32 oh_tc = ctx->tensor_count; // tensor count before CE (to find the one-hot)
+    Term loss = cross_entropy_loss(ctx, logits, &data.train_labels[bi0*BS], BS, 10);
+    // Find the one-hot tensor (created by cross_entropy_loss, shape [BS,10])
+    u32 oh_tid = 0;
+    for (u32 t = oh_tc; t < ctx->tensor_count; t++) {
+        View *v = &ctx->tensors[t].view;
+        if (v->shape.rank == 2 && v->shape.dims[0] == BS && v->shape.dims[1] == 10 &&
+            v->numel == BS*10 && ctx->tensors[t].buf_id) {
+            oh_tid = t; break;
+        }
+    }
+
+    printf("oh_tid=%u oh_bid=%u\n", oh_tid, oh_tid ? ctx->tensors[oh_tid].buf_id : 0);
 
     // Backward
     Term grad_term = thvm_grad_multi(ctx, loss, params, gs, NP);
@@ -96,13 +98,12 @@ int main(void) {
     u32 n_persistent = ctx->tensor_count;
     printf("Built graph: %u persistent tensors, %u pool bufs\n", n_persistent, metal_pool.count);
 
-    // === Step 0: Load batch, capture ===
-    u32 bi = rand() % (data.n_train / BS);
+    // === Step 0: Load batch (same as graph construction), capture ===
+    u32 bi = bi0;
     ctx->tensors[x_tid].backend->buf_write(ctx->tensors[x_tid].buf_id,
         &data.train_images[bi*BS*28*28], BS*28*28*sizeof(f32));
+    // one-hot already has correct labels from cross_entropy_loss(bi0)
     f32 *oh_data = calloc(BS*10, sizeof(f32));
-    for(u32 i=0;i<BS;i++) oh_data[i*10+data.train_labels[bi*BS+i]]=1.f;
-    ctx->tensors[oh_tid].backend->buf_write(ctx->tensors[oh_tid].buf_id, oh_data, BS*10*sizeof(f32));
     for(int i=0;i<NP;i++) memset(metal_pool.bufs[ctx->tensors[gids[i]].buf_id].contents, 0, psz[i]*4);
 
     jit_begin_capture(n_persistent);
@@ -154,8 +155,9 @@ int main(void) {
     // === Steps 1+: JIT Replay ===
     t0 = now_s();
     for(u32 step=1; step<n_steps; step++) {
-        // New batch data
-        bi = rand() % (data.n_train / BS);
+        // Step 1: SAME data as capture (test replay correctness)
+        // Steps 2+: new batch data
+        if (step == 1) bi = bi0; else bi = rand() % (data.n_train / BS);
         ctx->tensors[x_tid].backend->buf_write(ctx->tensors[x_tid].buf_id,
             &data.train_images[bi*BS*28*28], BS*28*28*sizeof(f32));
         memset(oh_data, 0, BS*10*sizeof(f32));
@@ -183,23 +185,17 @@ int main(void) {
         if(step<=3||step==n_steps-1){
             jit_flush();
             f32 w1v = *(f32*)BUF_CONTENTS(ctx->tensors[(u32)term_val(cw1)].buf_id);
-            printf("step %3u: w1[0]=%.8f (%.1fs)\n", step, w1v, now_s()-t0);
-            // Check first few ephemeral slot outputs
-            for(u32 si = jit.persistent_count; si < jit.persistent_count + 5 && si < jit.n_slots; si++) {
-                u32 bid = jit.slots[si].buf_id;
-                if (!bid || bid >= MAX_BUFS || !metal_pool.bufs[bid]) continue;
-                f32 *p = (f32*)BUF_CONTENTS(bid);
-                u32 n = (u32)(jit.slots[si].alloc_size / 4);
-                if (n > 4) n = 4;
-                fprintf(stderr, "SLOT%u(bid%u): [%.6f,%.6f,%.6f,%.6f]\n",
-                    si, bid, n>0?p[0]:0, n>1?p[1]:0, n>2?p[2]:0, n>3?p[3]:0);
-            }
             f32 gsum = 0;
             for(int i=0;i<NP;i++){
-                f32 *gd = (f32*)metal_pool.bufs[ctx->tensors[gids[i]].buf_id].contents;
+                f32 *gd = (f32*)BUF_CONTENTS(ctx->tensors[gids[i]].buf_id);
                 for(u32 j=0;j<psz[i];j++) gsum += fabsf(gd[j]);
             }
-            fprintf(stderr, "REPLAY1 |grad|=%.1f\n", gsum);
+            // Read loss from replay
+            u32 loss_replay_bid = jit_resolve_buf(loss_capture_bid);
+            f32 loss_v = (loss_replay_bid && loss_replay_bid < MAX_BUFS && metal_pool.bufs[loss_replay_bid])
+                ? *(f32*)BUF_CONTENTS(loss_replay_bid) : -1.f;
+            printf("step %3u: loss=%.2f w1=%.8f |g|=%.1f (%.1fs)\n", step, loss_v, w1v, gsum, now_s()-t0);
+            // Skip ephemeral slot dumps
         }
         if(step==n_steps-1){
             jit_flush();

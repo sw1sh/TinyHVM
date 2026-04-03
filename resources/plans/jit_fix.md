@@ -134,6 +134,34 @@ in how the backward dispatch sequence reads from intermediate buffers.
   w[0]-is-frozen observation was a red herring (element 0 had zero gradient).
   Also check BN running stats (rmean) before/after replay to verify they're
   being updated correctly.
+
+**WEIGHT COMPARISON (2026-04-04):**
+Non-JIT w1sum=-2.1 (94.3%), JIT w1sum=-2.4 (9.5%). Similar magnitude, completely
+different accuracy. Weights evolve to similar norm but WRONG direction.
+BN running stats not the issue (training=1 eval also fails).
+
+**STATUS**: JIT infrastructure is mechanically correct:
+- Forward replay: verified correct (cmd output matches)
+- GRAD handler: deposits all params correctly
+- Weights: update during replay (w1sum changes from 0 to -2.4)
+- Memory planner: NOT the issue (NO_PLAN same result)
+- BN running stats: NOT the issue (training=1 eval same result)
+
+**REMAINING BUG**: Backward fused kernels produce wrong gradient DIRECTION
+when replayed with evolved weights. Weights evolve to wrong configuration.
+The fused backward kernel reads correct intermediate values but computes
+wrong gradients (correct magnitude, wrong direction).
+
+**ACTIONABLE PATHS**:
+1. Binary search specific backward kernel: take the capture-time backward
+   commands, replace ONE kernel at a time with a fresh (non-JIT) computation,
+   find which kernel produces the wrong gradient direction.
+2. Disable backward fusion during capture: use `no_fuse=1` during GRAD handler
+   so backward dispatches are unfused individual ops. More dispatches but each
+   is trivially correct. Test if unfused backward replays correctly.
+3. Skip backward JIT: only capture forward+adam, rebuild backward each step.
+   Slower but correct.
+4. Adopt tinygrad architecture: schedule-first (no IC reduction).
 - Consts ARE needed: NaN without restoration (86 consts = backward scalars + shapes)
 - Loss readback broken: loss slot not found in JIT (buf_id 460 not in any slot)
 

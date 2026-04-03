@@ -152,6 +152,16 @@ when replayed with evolved weights. Weights evolve to wrong configuration.
 The fused backward kernel reads correct intermediate values but computes
 wrong gradients (correct magnitude, wrong direction).
 
+**ROOT CAUSE (2026-04-04):** Dispatch sequence is NON-DETERMINISTIC across steps!
+Step 0: fused=200, total=371. Step 1: fused=203, total=374.
+Three fused ew dispatches MISSING from JIT capture (captured step 0's 200,
+but step 1+ needs 203). The backward produces 3 more fused kernels at
+step 1 vs step 0, likely from data-dependent materialization decisions.
+
+**FIX**: Make dispatch sequence deterministic OR capture at step 1 (after
+the sequence stabilizes). The warm-up approach should work: do 1 non-JIT
+step first, then capture step 1's 374-dispatch sequence for replay.
+
 **ACTIONABLE PATHS**:
 1. Binary search specific backward kernel: take the capture-time backward
    commands, replace ONE kernel at a time with a fresh (non-JIT) computation,

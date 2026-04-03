@@ -1,8 +1,8 @@
             // === Phase 3 inet ops ===
 
             if (uop == UOP_ASSIGN) {
-                // thvm_reduce needed: trampoline occasionally leaves src as TAG_TOP
-                // (heap[loc+1] overwritten between trampoline store and handler read)
+                // thvm_reduce required: heap[loc+1] sometimes overwritten with TAG_TOP
+                // between trampoline store and handler read (heap aliasing, see debug notes)
                 Term dst_r = thvm_reduce(ctx, heap_read(ctx, loc));
                 Term src_t = thvm_reduce(ctx, heap_read(ctx, loc + 1));
                 if (term_tag(dst_r) == TAG_TEN && term_tag(src_t) == TAG_TEN) {

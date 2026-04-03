@@ -1009,13 +1009,9 @@ inet_step:
             if (is_binary) {
                 b_id = (u32)term_val(b);
             } else if (is_reduce) {
-                Term sum_arg = heap_read(ctx, loc + 1);
+                Term sum_arg = heap_read(ctx, loc + 1); // WNF from trampoline
                 if (term_tag(sum_arg) == TAG_TEN)
                     b_id = (u32)term_val(sum_arg);
-                else if (term_tag(sum_arg) == TAG_TOP) {
-                    sum_arg = thvm_reduce(ctx, sum_arg);
-                    if (term_tag(sum_arg) == TAG_TEN) b_id = (u32)term_val(sum_arg);
-                }
             }
             TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
 
@@ -1037,11 +1033,11 @@ inet_step:
                 out_ndim = ma->view.shape.rank;
                 for (u32 i = 0; i < out_ndim; i++) out_shape[i] = ma->view.shape.dims[i];
 
-                Term sum_arg = heap_read(ctx, loc + 1);
-                if (term_tag(sum_arg) == TAG_TOP || term_tag(sum_arg) == TAG_TEN) {
-                    // Explicit axes from thvm_sum_axes
-                    Term axes_t = thvm_reduce(ctx, sum_arg);
-                    if (term_tag(axes_t) == TAG_TEN) {
+                Term sum_arg = heap_read(ctx, loc + 1); // WNF from trampoline
+                if (term_tag(sum_arg) == TAG_TEN) {
+                    // Explicit axes from thvm_sum_axes (already reduced)
+                    Term axes_t = sum_arg;
+                    {
                         u32 ax_id = (u32)term_val(axes_t);
                         TensorMeta *max_t = &ctx->tensors[ax_id];
                         u32 n_axes = max_t->view.numel;
@@ -1196,7 +1192,7 @@ inet_step:
                         ReduceSpec ers = {0}; ers.reduce_type = uop;
                         Term sum_arg_e = heap_read(ctx, loc + 1);
                         if (term_tag(sum_arg_e) == TAG_TEN || term_tag(sum_arg_e) == TAG_TOP) {
-                            Term axes_e = thvm_reduce(ctx, sum_arg_e);
+                            Term axes_e = sum_arg_e; // WNF from trampoline
                             if (term_tag(axes_e) == TAG_TEN) {
                                 u32 axid = (u32)term_val(axes_e); ENSURE(ctx, axid);
                                 TensorMeta *axt = &ctx->tensors[axid];
@@ -1256,7 +1252,7 @@ inet_step:
                         ReduceSpec ers = {0}; ers.reduce_type = uop;
                         Term sum_arg_e = heap_read(ctx, loc + 1);
                         if (term_tag(sum_arg_e) == TAG_TEN || term_tag(sum_arg_e) == TAG_TOP) {
-                            Term axes_e = thvm_reduce(ctx, sum_arg_e);
+                            Term axes_e = sum_arg_e; // WNF from trampoline
                             if (term_tag(axes_e) == TAG_TEN) {
                                 u32 axid = (u32)term_val(axes_e); ENSURE(ctx, axid);
                                 TensorMeta *axt = &ctx->tensors[axid];
@@ -1295,7 +1291,7 @@ inet_step:
                 ReduceSpec ers = {0}; ers.reduce_type = uop;
                 Term sum_arg_e = heap_read(ctx, loc + 1);
                 if (term_tag(sum_arg_e) == TAG_TEN || term_tag(sum_arg_e) == TAG_TOP) {
-                    Term axes_e = thvm_reduce(ctx, sum_arg_e);
+                    Term axes_e = sum_arg_e; // WNF from trampoline
                     if (term_tag(axes_e) == TAG_TEN) {
                         u32 axid = (u32)term_val(axes_e); ENSURE(ctx, axid);
                         TensorMeta *axt = &ctx->tensors[axid];
@@ -1341,7 +1337,7 @@ inet_step:
                 u32 explicit_axes[MAX_DIM];
 
                 if (has_explicit_axes) {
-                    Term axes_t2 = thvm_reduce(ctx, sum_arg2);
+                    Term axes_t2 = sum_arg2; // WNF from trampoline
                     if (term_tag(axes_t2) == TAG_TEN) {
                         u32 ax_id = (u32)term_val(axes_t2);
                         TensorMeta *axt = &ctx->tensors[ax_id];

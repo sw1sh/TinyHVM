@@ -39,11 +39,12 @@ int main(void) {
     u32 psz[NP]={32*25,32, 32*32*25,32, 64*32*9,64, 64*64*9,64, 32,32, 64,64, ff*10,10};
     for(u32 i=0;i<NP;i++) thvm_set_requires_grad(ctx,params[i]);
 
-    // Fixed input buffer (persistent, overwritten each step)
-    f32 *xbuf = calloc(BS*1*28*28, 4);
-    Term x = thvm_tensor(ctx, xbuf, (Shape){.dims={BS,1,28,28},.rank=4}); free(xbuf);
+    // Input: persistent dataset tensor + shrink view (required for grad propagation)
+    Term td = thvm_tensor(ctx, data.train_images, (Shape){.dims={data.n_train,1,28,28},.rank=4});
+    Term x = thvm_shrink(ctx, td, (u32[]){0,BS,0,1,0,28,0,28}, 4);
     thvm_set_requires_grad(ctx, x);
     u32 x_tid = (u32)term_val(x);
+    u32 td_tid = (u32)term_val(td);
 
     // Adam state + grad accumulators (persistent)
     Adam opt = adam_init(ctx, 0.0005f, NP);
@@ -98,9 +99,10 @@ int main(void) {
     u32 n_persistent = ctx->tensor_count;
     printf("Built graph: %u persistent tensors, %u pool bufs\n", n_persistent, metal_pool.count);
 
-    // === Step 0: Load batch (same as graph construction), capture ===
+    // === Step 0: Load batch into td buffer at offset 0 (shrink reads from there) ===
     u32 bi = bi0;
-    ctx->tensors[x_tid].backend->buf_write(ctx->tensors[x_tid].buf_id,
+    // Write batch data to the START of td's buffer (shrink view reads [0,BS,...])
+    ctx->tensors[td_tid].backend->buf_write(ctx->tensors[td_tid].buf_id,
         &data.train_images[bi*BS*28*28], BS*28*28*sizeof(f32));
     // one-hot already has correct labels from cross_entropy_loss(bi0)
     f32 *oh_data = calloc(BS*10, sizeof(f32));
@@ -158,7 +160,8 @@ int main(void) {
         // Step 1: SAME data as capture (test replay correctness)
         // Steps 2+: new batch data
         if (step == 1) bi = bi0; else bi = rand() % (data.n_train / BS);
-        ctx->tensors[x_tid].backend->buf_write(ctx->tensors[x_tid].buf_id,
+        // Write batch to td buffer at offset 0 (shrink view reads from there)
+        ctx->tensors[td_tid].backend->buf_write(ctx->tensors[td_tid].buf_id,
             &data.train_images[bi*BS*28*28], BS*28*28*sizeof(f32));
         memset(oh_data, 0, BS*10*sizeof(f32));
         for(u32 i=0;i<BS;i++) oh_data[i*10+data.train_labels[bi*BS+i]]=1.f;

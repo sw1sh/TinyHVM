@@ -99,7 +99,6 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         Term rw = rewrite_apply(ctx, next);
         if (rw != next) { next = rw; goto enter; }
 
-        // No rule matched: default depth-first reduction
         u64 loc = term_val(next);
         PUSH(next);
         next = heap_read(ctx, loc + 0);

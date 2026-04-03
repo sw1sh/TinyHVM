@@ -1,12 +1,14 @@
             // === Phase 3 inet ops ===
 
             if (uop == UOP_ASSIGN) {
-                // DUP'd ASSIGN terms share heap loc — trampoline's heap_set
-                // from one copy overwrites the other's stored WNF.
-                // thvm_reduce avoids this (fresh stack, no heap aliasing).
-                Term dst_r = thvm_reduce(ctx, heap_read(ctx, loc));
-                Term src_t = thvm_reduce(ctx, heap_read(ctx, loc + 1));
-                if (term_tag(dst_r) == TAG_TEN && term_tag(src_t) == TAG_TEN) {
+                // Args WNF from trampoline. When reached via inet_step
+                // (combinator chain), args may be unreduced — return t
+                // so the trampoline re-enters and reduces args.
+                Term dst_r = heap_read(ctx, loc);
+                Term src_t = heap_read(ctx, loc + 1);
+                if (term_tag(dst_r) != TAG_TEN || term_tag(src_t) != TAG_TEN)
+                    return t;  // trampoline will re-enter and reduce args
+                {
                     u32 dst_id = (u32)term_val(dst_r);
                     u32 src_id = (u32)term_val(src_t);
                     if (dst_id != src_id) {
@@ -48,7 +50,6 @@
                     ctx->itrs++;
                     RETURN_REDUCED(dst_r);
                 }
-                RETURN_REDUCED(term_era());
             }
 
             if (uop == UOP_TODEVICE) {

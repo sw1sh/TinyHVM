@@ -73,10 +73,14 @@ static BNResult batchnorm_forward(TinyHVM *ctx, Term x,
                 thvm_op(ctx, UOP_SUB, x, mean_bc), invstd_bc), gamma_bc),
             beta_bc);
 
+        // Wrap each ASSIGN in APP(ASSIGN, ERA) so that ASSIGN enters
+        // as the fun of an APP (trampoline reduces args) rather than
+        // the arg (inet_step skips arg reduction).
+        Term a_rm = thvm_app(ctx, thvm_assign(ctx, rmean, new_rm), term_era());
+        Term a_rv = thvm_app(ctx, thvm_assign(ctx, rvar, new_rv), term_era());
         return (BNResult){
             .output = out,
-            .assigns = thvm_app(ctx, thvm_assign(ctx, rmean, new_rm),
-                                     thvm_assign(ctx, rvar, new_rv))
+            .assigns = thvm_app(ctx, a_rm, a_rv),
         };
     }
 

@@ -1,6 +1,7 @@
 // metal/jit.m — JIT capture/replay for training loops
 // Records GPU dispatch sequence on step 0, replays for steps 1+.
 // JITState, JITCmd, JITSlot defined in init.m.
+int jit_debug_replay = 0;
 static u32 jit_orig_buf_ids[JIT_MAX_SLOTS]; // capture-time buf_ids (for tensor update)
 static u64 jit_slot_offsets[JIT_MAX_SLOTS]; // slot → byte offset in unified buffer
 static u64 jit_slot_sizes[JIT_MAX_SLOTS];   // slot → region size
@@ -166,11 +167,19 @@ void jit_end_capture(void) {
             }
         }
 
-        for (u32 ci = 0; ci < jit.n_consts; ci++)
+        // Const slots: alive for entire replay (GPU reads at any point)
+        for (u32 ci = 0; ci < jit.n_consts; ci++) {
             first_use[jit.consts[ci].slot] = 0;
+            if (last_use[jit.consts[ci].slot] < jit.n_cmds)
+                last_use[jit.consts[ci].slot] = jit.n_cmds; // keep alive through all cmds
+        }
+        // CPU-written non-const slots: also alive for entire replay
         for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
-            if (!gpu_written[s] && first_use[s] != UINT32_MAX)
+            if (!gpu_written[s] && first_use[s] != UINT32_MAX) {
                 first_use[s] = 0;
+                if (last_use[s] < jit.n_cmds)
+                    last_use[s] = jit.n_cmds;
+            }
         }
 
 
@@ -196,7 +205,7 @@ void jit_end_capture(void) {
             // Release slots: standard release at last_use+1, but read-only slots
             // release at last_use (read completes before write in same dispatch).
             for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
-                u32 threshold = last_use_is_read[s] ? last_use[s] : last_use[s] + 1;
+                u32 threshold = last_use[s] + 1; // always release AFTER last use
                 if (plan_assignment[s] != 0xFFFFFFFF && plan_assignment[s] != 0xFFFFFFFE && ci >= threshold) {
                     if (fpool_n < 2048) {
                         fpool[fpool_n].size = plan_buf_size[plan_assignment[s]];
@@ -245,8 +254,19 @@ void jit_end_capture(void) {
         // Save original buf_ids before overwriting with plan_assignment
         for (u32 s = jit.persistent_count; s < jit.n_slots; s++)
             jit_orig_buf_ids[s] = jit.slots[s].buf_id;
-        for (u32 s = jit.persistent_count; s < jit.n_slots; s++)
-            jit.slots[s].buf_id = plan_assignment[s];
+        for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+            u32 p = slot_plan[s];
+            if (p < next_plan) {
+                jit.slots[s].buf_id = p;
+            } else {
+                // Unreferenced slot — assign a fresh plan entry
+                jit.slots[s].buf_id = next_plan;
+                u64 sz = jit.slots[s].alloc_size;
+                if (sz == 0) sz = 4;
+                plan_buf_size[next_plan] = sz;
+                next_plan++;
+            }
+        }
 
         // Compute per-plan-idx offsets (contiguously packed)
         jit_n_plan = next_plan;
@@ -520,13 +540,13 @@ void jit_restore_consts(void) {
     // Restore captured const data (overwrites zeros for const slots)
     for (u32 ci = 0; ci < jit.n_consts; ci++) {
         u32 bid = jit.slots[jit.consts[ci].slot].buf_id;
-        if (bid && metal_pool.bufs[bid])
+        if (bid && bid < MAX_BUFS && metal_pool.bufs[bid])
             memcpy(BUF_CONTENTS(bid), jit.consts[ci].data, jit.consts[ci].size);
     }
 }
 
 // Encode all JIT commands (call after jit_restore_consts + any buffer overrides)
-static void jit_replay_commands(void) {
+void jit_replay_commands(void) {
     for (u32 ci = 0; ci < jit.n_cmds; ci++) {
         JITCmd *cmd = &jit.cmds[ci];
         // Barrier: flush GPU and start new command buffer (preserves capture ordering)
@@ -561,6 +581,16 @@ static void jit_replay_commands(void) {
             [mm encodeToCommandBuffer:batch_cmd leftMatrix:mA rightMatrix:mB resultMatrix:mC];
             batch_dirty = 1;
         } else {
+            // Verify all buffers exist before encoding
+            int skip = 0;
+            for (u32 i = 0; i < cmd->n_bufs; i++) {
+                u32 _bid = jit.slots[cmd->buf_slots[i]].buf_id;
+                if (!_bid || _bid >= MAX_BUFS || !metal_pool.bufs[_bid]) {
+                    fprintf(stderr, "JIT_REPLAY: nil buf cmd=%u slot=%u bid=%u\n", ci, cmd->buf_slots[i], _bid);
+                    skip = 1; break;
+                }
+            }
+            if (skip) continue;
             id<MTLComputeCommandEncoder> enc = get_encoder();
             [enc setComputePipelineState:cmd->pipe];
             for (u32 i = 0; i < cmd->n_bufs; i++) {
@@ -572,8 +602,14 @@ static void jit_replay_commands(void) {
                 [enc setBytes:cmd->params + poff length:cmd->param_sizes[i] atIndex:cmd->n_bufs + i];
                 poff += cmd->param_sizes[i];
             }
-            [enc dispatchThreads:MTLSizeMake(cmd->grid[0], cmd->grid[1], cmd->grid[2])
-               threadsPerThreadgroup:MTLSizeMake(cmd->tg[0], cmd->tg[1], cmd->tg[2])];
+            if (cmd->grid[1] == 0) {
+                // GROUP_REDUCE: dispatchThreadgroups (grid[1]==0 sentinel)
+                [enc dispatchThreadgroups:MTLSizeMake(cmd->grid[0], 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(cmd->tg[0], cmd->tg[1], cmd->tg[2])];
+            } else {
+                [enc dispatchThreads:MTLSizeMake(cmd->grid[0], cmd->grid[1], cmd->grid[2])
+                   threadsPerThreadgroup:MTLSizeMake(cmd->tg[0], cmd->tg[1], cmd->tg[2])];
+            }
             batch_dirty = 1;
         }
     }

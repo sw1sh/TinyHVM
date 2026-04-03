@@ -583,6 +583,16 @@ struct Backend {
 #define THVM_DEV_CPU   0
 #define THVM_DEV_METAL 1
 
+// Hash-consing for APP nodes (optional)
+#define HC_TABLE_BITS 18
+#define HC_TABLE_CAP  (1U << HC_TABLE_BITS)
+
+typedef struct {
+    Term fun;      // key part 1
+    Term arg;      // key part 2
+    Term result;   // TAG_APP term (== heap loc since TAG_APP=0)
+} HCSlot;
+
 typedef struct {
     Term       *heap;
     u64         heap_pos;
@@ -595,6 +605,7 @@ typedef struct {
 
     u64         itrs;       // interaction count
     u8          no_fuse;    // 1 to skip fusion (used during GRAD subnet re-reduction)
+    u8          no_grad_alloc; // 1 to skip separate buffer alloc for requires_grad virtual intermediates (backward)
     u8          no_dup;     // 1 to skip linear_use DUP (used inside GRAD handler)
     u8          prescan_done; // 1 after grad_prescan runs for current backward pass
 
@@ -619,6 +630,9 @@ typedef struct {
 
     // SUP/DUP labels — monotonic counter, only incremented at construction time
     u32         next_sup_label;
+
+    // Hash-consing table (NULL = disabled, lazy-allocated by thvm_app_hc)
+    HCSlot     *hc_table;
 
 } TinyHVM;
 
@@ -692,6 +706,8 @@ void     thvm_set_requires_grad(TinyHVM *ctx, Term t);
 // Lambda / inet combinators
 Term     thvm_lam(TinyHVM *ctx, Term *var_out, Term body);   // allocate LAM node
 Term     thvm_app(TinyHVM *ctx, Term fun, Term arg);         // allocate APP node
+Term     thvm_app_hc(TinyHVM *ctx, Term fun, Term arg);    // hash-consed APP
+void     thvm_hc_clear(TinyHVM *ctx);                      // clear HC table
 u32      thvm_define(TinyHVM *ctx, Term body);               // register def, return name id
 Term     thvm_ref(TinyHVM *ctx, u32 name);                   // TAG_REF(name)
 Term     thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b);   // TAG_SUP with label

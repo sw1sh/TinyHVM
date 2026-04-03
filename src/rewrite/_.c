@@ -76,6 +76,9 @@ static Term rule_sum_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b) {
 // ============================================================
 static Term rule_elementwise_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b) {
     (void)loc;
+    // During backward: ew chains must stay deferred for reduce fusion.
+    // Ew-only fusion materializes prematurely → SUM can't fuse with chain.
+    if (ctx->no_grad_alloc) return t;
     int chain = 0;
     if (term_tag(a) == TAG_TOP &&
         (is_elementwise(term_ext(a)) || is_view_op(term_ext(a))))

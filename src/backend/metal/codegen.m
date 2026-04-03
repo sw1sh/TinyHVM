@@ -959,8 +959,16 @@ void metal_dispatch_kernel_rs_st(u32 out_buf,
         u32 jit_buf_off = 1 + n_side_outputs;
         for (u32 i = 0; i < n_leaves; i++)
             ids[jit_buf_off + i] = leaf_bufs[i];
-        jit_record_dispatch_ids(pipe, ids, jit_buf_off + n_leaves, NULL, NULL, 0,
-                                gw, mid, outer, tw, 1, 1);
+        if (_last_local_size > 0) {
+            // GROUP_REDUCE: record threadgroups dispatch (NOT dispatchThreads)
+            jit_record_dispatch_ids(pipe, ids, jit_buf_off + n_leaves, NULL, NULL, 0,
+                                    out_numel, 1, 1, (u32)_last_local_size, 1, 1);
+            // Mark as threadgroups dispatch by setting grid[1] = 0 as sentinel
+            jit.cmds[jit.n_cmds - 1].grid[1] = 0;
+        } else {
+            jit_record_dispatch_ids(pipe, ids, jit_buf_off + n_leaves, NULL, NULL, 0,
+                                    gw, mid, outer, tw, 1, 1);
+        }
     }
 }
 

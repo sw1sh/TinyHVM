@@ -593,10 +593,12 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                 ctx->tensors[tid].creator_op = ops[i].uop;
                 ctx->tensors[tid].src_ids[0] = var_tid[a_var];
                 ctx->tensors[tid].src_ids[1] = is_binary(ops[i].uop) ? var_tid[b_var] : 0;
-                if (ctx->tensors[var_tid[a_var]].requires_grad)
-                    ctx->tensors[tid].requires_grad = 1;
-                if (is_binary(ops[i].uop) && ctx->tensors[var_tid[b_var]].requires_grad)
-                    ctx->tensors[tid].requires_grad = 1;
+                if (!ctx->no_grad_alloc) {
+                    if (ctx->tensors[var_tid[a_var]].requires_grad)
+                        ctx->tensors[tid].requires_grad = 1;
+                    if (is_binary(ops[i].uop) && ctx->tensors[var_tid[b_var]].requires_grad)
+                        ctx->tensors[tid].requires_grad = 1;
+                }
                 var_tid[n_leaves + i] = tid;
                 ew_last_id = tid;
             }
@@ -611,7 +613,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                 // for requires_grad intermediates — backward-of-backward doesn't
                 // need these values. Without this, conv backward's MUL virtual
                 // allocates 5.2GB (1.3B elements) for requires_grad provenance.
-                if (ctx->tensors[itid].requires_grad && !ctx->no_fuse) {
+                if (ctx->tensors[itid].requires_grad && !ctx->no_grad_alloc) {
                     ctx->tensors[itid].buf_id = ctx->tensors[itid].backend->buf_alloc(
                         ctx->tensors[itid].view.numel * sizeof(f32));
                 } else {
@@ -650,9 +652,12 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                 if (tid != dst_id) {
                     u32 ibuf = ctx->tensors[dst_id].buf_id;
                     // Intermediates with requires_grad need own buffer for backward
-                    int needs_rg = ctx->tensors[var_tid[a_var]].requires_grad;
-                    if (is_binary(ops[i].uop) && ctx->tensors[var_tid[b_var]].requires_grad)
-                        needs_rg = 1;
+                    int needs_rg = 0;
+                    if (!ctx->no_grad_alloc) {
+                        needs_rg = ctx->tensors[var_tid[a_var]].requires_grad;
+                        if (is_binary(ops[i].uop) && ctx->tensors[var_tid[b_var]].requires_grad)
+                            needs_rg = 1;
+                    }
                     if (needs_rg)
                         ibuf = ctx->tensors[dst_id].backend->buf_alloc(iv.numel * sizeof(f32));
                     else if (ctx->tensors[dst_id].backend && ctx->tensors[dst_id].backend->buf_incref)
@@ -667,10 +672,12 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                 ctx->tensors[tid].creator_op = ops[i].uop;
                 ctx->tensors[tid].src_ids[0] = var_tid[a_var];
                 ctx->tensors[tid].src_ids[1] = is_binary(ops[i].uop) ? var_tid[b_var] : 0;
-                if (ctx->tensors[var_tid[a_var]].requires_grad)
-                    ctx->tensors[tid].requires_grad = 1;
-                if (is_binary(ops[i].uop) && ctx->tensors[var_tid[b_var]].requires_grad)
-                    ctx->tensors[tid].requires_grad = 1;
+                if (!ctx->no_grad_alloc) {
+                    if (ctx->tensors[var_tid[a_var]].requires_grad)
+                        ctx->tensors[tid].requires_grad = 1;
+                    if (is_binary(ops[i].uop) && ctx->tensors[var_tid[b_var]].requires_grad)
+                        ctx->tensors[tid].requires_grad = 1;
+                }
                 var_tid[n_leaves + i] = tid;
             }
         }

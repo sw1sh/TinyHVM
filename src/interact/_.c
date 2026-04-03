@@ -42,11 +42,14 @@ inet_step:
                 // With this, deferred chains accumulate and tensor_materialize
                 // fuses them into fewer, larger kernels at ENSURE boundaries.
                 u8 _saved_nf = ctx->no_fuse;
-                ctx->no_fuse = 1;
+                u8 _saved_nga = ctx->no_grad_alloc;
+                ctx->no_fuse = 0;
+                ctx->no_grad_alloc = 1;
                 #define GRAD_RETURN(r) do { \
                     Term _gr = (r); \
                     if (term_tag(_gr) == TAG_TOP) _gr = thvm_reduce(ctx, _gr); \
                     ctx->no_fuse = _saved_nf; \
+                    ctx->no_grad_alloc = _saved_nga; \
                     return _gr; \
                 } while(0)
                 Term y  = heap_read(ctx, loc);
@@ -160,6 +163,16 @@ inet_step:
                     #define GRAD3(y_,gy_,x_) ({ \
                         u64 _l = heap_alloc(ctx, 3); \
                         heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
+                        /* Shape track: GRAD output shape = gy shape */ \
+                        { const View *_gv = NULL; \
+                          Term _gt = (gy_); \
+                          if (term_tag(_gt) == TAG_TEN) { \
+                              u32 _gid = (u32)term_val(_gt); \
+                              if (_gid < ctx->tensor_count) _gv = &ctx->tensors[_gid].view; \
+                          } else if (term_tag(_gt) == TAG_TOP) { \
+                              _gv = st_get(term_val(_gt)); \
+                          } \
+                          if (_gv) st_set(_l, _gv); } \
                         term_new(TAG_TOP, UOP_GRAD, _l); })
                     // No GRAD3_FWD — gradient accumulation handled by additive
                     // ASSIGN at the base case. Each GRAD path walks independently.
@@ -1112,10 +1125,10 @@ inet_step:
             }
 
             // Defer reduce when input is deferred ew or view-of-deferred-ew.
-            // During backward (no_fuse=1): DON'T defer reduces. Deferred reduces
+            // During backward (no_grad_alloc=1): DON'T defer reduces. Deferred reduces
             // become TAG_TEN with buf_id=0, but the reducer treats TAG_TEN as WNF
             // and never materializes them. This causes zero gradients.
-            if (!ctx->no_fuse &&
+            if (!ctx->no_grad_alloc &&
                 ((uop == UOP_SUM && b_id != 0) || uop == UOP_RMAX) &&
                 ma->buf_id == 0 && ma->creator_op &&
                 (is_elementwise(ma->creator_op) ||

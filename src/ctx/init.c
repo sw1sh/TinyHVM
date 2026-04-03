@@ -203,8 +203,8 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
         if (va && vb && va->shape.rank == 2 && vb->shape.rank == 2) {
             int a_lazy = (term_tag(a) == TAG_TOP);
             int b_lazy = (term_tag(b) == TAG_TOP);
-            // DISABLED: decomposition creates too many backward intermediates.
-            if (0) {
+            // Primitive matmul: EXPAND+MUL+SUM. Fuses with surrounding ops.
+            {
                 u32 M = va->shape.dims[0], K = va->shape.dims[1], N = vb->shape.dims[1];
                 extern Term thvm_sum_axes(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes);
                 Term a3 = thvm_expand(ctx, thvm_reshape(ctx, a, SHAPE(M, K, 1)), SHAPE(M, K, N));

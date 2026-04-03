@@ -120,8 +120,20 @@ in how the backward dispatch sequence reads from intermediate buffers.
 - 2-conv works (both cw and lw get grads). 3-conv fails (lw=0).
 - This is a GRAD handler bug, NOT a JIT replay bug.
 - JIT replay faithfully reproduces the capture's wrong gradients.
-- **FIX**: Debug GRAD handler's MM backward for deep architectures.
-  The issue is that at 3+ conv depth, the MM backward for lw returns zero.
+- **CORRECTION**: GRAD handler is CORRECT. `|g|=26.2` for lw (non-zero!).
+  I was checking g[0] which happens to be zero. The GRAD_DEPOSIT trace shows
+  ALL 4 params get deposits. The JIT replay IS applying gradients.
+- The 9.5-12.5% accuracy issue at BS=128 is from conv grads being zero at step 0
+  (vanishing gradients at init, NORMAL). Both non-JIT and JIT have this.
+- The warm-up test (68% → 12.5%) remains unexplained. The GRAD handler correctly
+  deposits gradients for all params. The backward dispatch sequence fires.
+  But the model's accuracy drops during replay. Possible cause: BN running stats
+  updated incorrectly during replay, or gradient DIRECTION is wrong despite
+  correct magnitude.
+- **Next**: Check w[100] or w_sum instead of w[0] in JIT replay tests. The
+  w[0]-is-frozen observation was a red herring (element 0 had zero gradient).
+  Also check BN running stats (rmean) before/after replay to verify they're
+  being updated correctly.
 - Consts ARE needed: NaN without restoration (86 consts = backward scalars + shapes)
 - Loss readback broken: loss slot not found in JIT (buf_id 460 not in any slot)
 

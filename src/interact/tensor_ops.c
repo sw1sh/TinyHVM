@@ -1,8 +1,9 @@
             // === Phase 3 inet ops ===
 
             if (uop == UOP_ASSIGN) {
-                // thvm_reduce required: heap[loc+1] sometimes overwritten with TAG_TOP
-                // between trampoline store and handler read (heap aliasing, see debug notes)
+                // DUP'd ASSIGN terms share heap loc — trampoline's heap_set
+                // from one copy overwrites the other's stored WNF.
+                // thvm_reduce avoids this (fresh stack, no heap aliasing).
                 Term dst_r = thvm_reduce(ctx, heap_read(ctx, loc));
                 Term src_t = thvm_reduce(ctx, heap_read(ctx, loc + 1));
                 if (term_tag(dst_r) == TAG_TEN && term_tag(src_t) == TAG_TEN) {

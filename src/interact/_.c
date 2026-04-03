@@ -50,7 +50,10 @@ inet_step:
 // ============================================================
 // Trampoline frame tags (used by reduce/_.c)
 // ============================================================
-#define TAG_TOP1 0x7E  // "arg0 done, entering arg1"
-#define TAG_TOP2 0x7F  // "arg1 done, entering arg2" (3-arg ops like GRAD)
+#define TAG_TOP1  0x7E  // TAG_TOP arg0 done, entering arg1
+#define TAG_TOP2  0x7F  // TAG_TOP arg1 done, entering arg2 (GRAD/WHERE/IFZ)
+#define TAG_OP2_1 0x7D  // OP2 arg0 done (non-SUP), entering arg1. EXT=opr, VAL=loc
+#define TAG_EQL_1 0x7C  // EQL arg0 done (non-SUP), entering arg1. VAL=loc
+#define TAG_MAT_1 0x7B  // APP fun=MAT, entering arg. VAL=app_loc
 
 #define FRAME_CAP 65536

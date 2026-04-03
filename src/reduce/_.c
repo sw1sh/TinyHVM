@@ -243,15 +243,75 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             whnf = frame; continue;
         }
 
-        // Combinator frames — arg0 reduced, store and fire
+        // Combinator frames — arg0 reduced, store and fire (or reduce arg1)
         if (ftag == TAG_APP || ftag == TAG_DP0 || ftag == TAG_DP1 ||
             ftag == TAG_DSU || ftag == TAG_DDU || ftag == TAG_UDP ||
-            ftag == TAG_OP2 || ftag == TAG_EQL || ftag == TAG_AND || ftag == TAG_OR) {
+            ftag == TAG_AND || ftag == TAG_OR) {
             u64 floc = term_val(frame);
             heap_set(ctx, floc + 0, whnf);
+            // APP-MAT: fun=MAT → need to reduce arg before firing
+            if (ftag == TAG_APP && term_tag(whnf) == TAG_MAT) {
+                Term arg = heap_read(ctx, floc + 1);
+                u8 at = term_tag(arg);
+                if (at == TAG_TEN || at == TAG_ERA || at == TAG_NUM ||
+                    at == TAG_SUP || at == TAG_CTR) {
+                    heap_set(ctx, floc + 1, arg);
+                    goto fire_comb;
+                }
+                PUSH(term_new(TAG_MAT_1, 0, floc));
+                next = arg;
+                goto enter;
+            }
+            fire_comb:;
             Term r = thvm_interact(ctx, frame);
             if (r == frame) { whnf = frame; continue; }
             TRACE_STEP(frame, r);
+            next = r; goto enter;
+        }
+
+        // OP2/EQL: arg0 done. If SUP → fire (lazy distribution). Else → reduce arg1.
+        if (ftag == TAG_OP2 || ftag == TAG_EQL) {
+            u64 floc = term_val(frame);
+            heap_set(ctx, floc + 0, whnf);
+            if (term_tag(whnf) == TAG_SUP) {
+                // SUP distribution: handler uses lazy arg1 for DUP
+                Term r = thvm_interact(ctx, frame);
+                if (r == frame) { whnf = frame; continue; }
+                TRACE_STEP(frame, r);
+                next = r; goto enter;
+            }
+            // Non-SUP: reduce arg1 via dedicated frame
+            Term a1 = heap_read(ctx, floc + 1);
+            u8 a1t = term_tag(a1);
+            if (a1t == TAG_TEN || a1t == TAG_ERA || a1t == TAG_NUM ||
+                a1t == TAG_SUP || a1t == TAG_CTR) {
+                // arg1 already WNF
+                Term r = thvm_interact(ctx, frame);
+                if (r == frame) { whnf = frame; continue; }
+                TRACE_STEP(frame, r);
+                next = r; goto enter;
+            }
+            u8 ftag2 = (ftag == TAG_OP2) ? TAG_OP2_1 : TAG_EQL_1;
+            PUSH(term_new(ftag2, term_ext(frame), floc));
+            next = a1;
+            goto enter;
+        }
+
+        // OP2_1/EQL_1/MAT_1: second arg done, reconstruct and fire
+        if (ftag == TAG_OP2_1 || ftag == TAG_EQL_1 || ftag == TAG_MAT_1) {
+            u64 floc = term_val(frame);
+            u8 w1t = term_tag(whnf);
+            if (w1t != TAG_TEN && w1t != TAG_ERA && w1t != TAG_NUM &&
+                w1t != TAG_SUP && w1t != TAG_CTR) { whnf = frame; continue; }
+            heap_set(ctx, floc + 1, whnf);
+            // Reconstruct original frame
+            u8 orig_tag = (ftag == TAG_OP2_1) ? TAG_OP2 :
+                          (ftag == TAG_EQL_1) ? TAG_EQL : TAG_APP;
+            u32 orig_ext = (ftag == TAG_OP2_1) ? term_ext(frame) : 0;
+            Term orig = term_new(orig_tag, orig_ext, floc);
+            Term r = thvm_interact(ctx, orig);
+            if (r == orig) { whnf = orig; continue; }
+            TRACE_STEP(orig, r);
             next = r; goto enter;
         }
 

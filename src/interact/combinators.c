@@ -56,10 +56,9 @@
                 goto inet_step;
             }
 
-            // APP-MAT: pattern match fired by application
+            // APP-MAT: pattern match — arg WNF from TAG_MAT_1 frame
             if (term_tag(fun) == TAG_MAT) {
-                Term arg = thvm_reduce(ctx, heap_read(ctx, loc + 1));
-                heap_set(ctx, loc + 1, arg);
+                Term arg = heap_read(ctx, loc + 1); // WNF from trampoline
 
                 // APP-MAT-SUP: (MAT &L{a,b}) → clone MAT, &L{(MAT₀ a), (MAT₁ b)}
                 if (term_tag(arg) == TAG_SUP) {
@@ -369,8 +368,7 @@
                 goto inet_step;
             }
 
-            Term y = thvm_reduce(ctx, heap_read(ctx, loc + 1));
-            heap_set(ctx, loc + 1, y);
+            Term y = heap_read(ctx, loc + 1); // WNF from TAG_OP2_1 frame
 
             // OP2-SUP (right): x is already NUM (atom), just reuse — no DUP needed
             if (term_tag(y) == TAG_SUP) {
@@ -514,9 +512,7 @@
                 goto inet_step;
             }
 
-            // Reduce right operand
-            Term b = thvm_reduce(ctx, heap_read(ctx, loc + 1));
-            heap_set(ctx, loc + 1, b);
+            Term b = heap_read(ctx, loc + 1); // WNF from TAG_EQL_1 frame
 
             // EQL-SUP-R: (a === &L{b0,b1}) → clone a, &L{(A₀===b0), (A₁===b1)}
             if (term_tag(b) == TAG_SUP) {

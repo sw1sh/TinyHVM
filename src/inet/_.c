@@ -16,6 +16,41 @@ Term thvm_app(TinyHVM *ctx, Term fun, Term arg) {
     return term_new(TAG_APP, 0, loc);
 }
 
+static inline u32 hc_hash_pair(Term f, Term x) {
+    u64 h = f * 0x9E3779B97F4A7C15ULL + x;
+    h ^= h >> 30;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    h ^= h >> 27;
+    return (u32)(h & (HC_TABLE_CAP - 1));
+}
+
+Term thvm_app_hc(TinyHVM *ctx, Term fun, Term arg) {
+    if (!ctx->hc_table)
+        ctx->hc_table = calloc(HC_TABLE_CAP, sizeof(HCSlot));
+    u32 h = hc_hash_pair(fun, arg);
+    for (;;) {
+        HCSlot *s = &ctx->hc_table[h];
+        if (s->result == 0) {
+            u64 loc = heap_alloc(ctx, 2);
+            heap_set(ctx, loc,     fun);
+            heap_set(ctx, loc + 1, arg);
+            Term t = term_new(TAG_APP, 0, loc);
+            s->fun = fun;
+            s->arg = arg;
+            s->result = t;
+            return t;
+        }
+        if (s->fun == fun && s->arg == arg)
+            return s->result;
+        h = (h + 1) & (HC_TABLE_CAP - 1);
+    }
+}
+
+void thvm_hc_clear(TinyHVM *ctx) {
+    if (ctx->hc_table)
+        memset(ctx->hc_table, 0, HC_TABLE_CAP * sizeof(HCSlot));
+}
+
 Term thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc,     a);

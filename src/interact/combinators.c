@@ -366,7 +366,9 @@ case TAG_OP2: {
         goto inet_step;
     }
 
-    Term y = heap_read(ctx, loc + 1); // WNF from trampoline COMB1 frame
+    // Now reduce y (after x-SUP distribution)
+    Term y = thvm_reduce(ctx, heap_read(ctx, loc + 1));
+    heap_set(ctx, loc + 1, y);
 
     // OP2-SUP (right): x is already NUM (atom), just reuse — no DUP needed
     if (term_tag(y) == TAG_SUP) {
@@ -508,7 +510,8 @@ case TAG_EQL: {
         goto inet_step;
     }
 
-    Term b = heap_read(ctx, loc + 1); // WNF from trampoline COMB1 frame
+    Term b = thvm_reduce(ctx, heap_read(ctx, loc + 1));
+    heap_set(ctx, loc + 1, b);
 
     // EQL-SUP-R: (a === &L{b0,b1}) → clone a, &L{(A₀===b0), (A₁===b1)}
     if (term_tag(b) == TAG_SUP) {

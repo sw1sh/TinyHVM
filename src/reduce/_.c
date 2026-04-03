@@ -225,25 +225,6 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             next = r; goto enter;
         }
 
-        if (ftag == TAG_COMB1) {
-            // COMB1 sentinel: arg1 just reduced. Pop original frame, store arg1, fire.
-            if (sp == 0) { whnf = frame; continue; }
-            Term orig_frame = stk[--sp];
-            u64 oloc = term_val(orig_frame);
-            u8 w1t = term_tag(whnf);
-            if (w1t != TAG_TEN && w1t != TAG_ERA && w1t != TAG_NUM &&
-                w1t != TAG_LAM && w1t != TAG_SUP && w1t != TAG_CTR) {
-                // arg1 not WNF — rebuild
-                heap_set(ctx, oloc + 1, whnf);
-                whnf = orig_frame; continue;
-            }
-            heap_set(ctx, oloc + 1, whnf);
-            Term r = thvm_interact(ctx, orig_frame);
-            if (r == orig_frame) { whnf = orig_frame; continue; }
-            TRACE_STEP(orig_frame, r);
-            next = r; goto enter;
-        }
-
         // Combinator frames — arg0 reduced, store and fire (or reduce arg1)
         {
             u64 floc = term_val(frame);
@@ -256,34 +237,13 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 TRACE_STEP(frame, r);
                 next = r; goto enter;
             }
-            // 2-arg combinators: store arg0. If SUP → fire (lazy distribution).
-            // Otherwise → push COMB1 frame, reduce arg1.
+            // 2-arg combinators: store arg0 and fire (handler reduces arg1)
             if (ftag == TAG_OP2 || ftag == TAG_EQL || ftag == TAG_AND || ftag == TAG_OR) {
                 heap_set(ctx, floc + 0, whnf);
-                if (term_tag(whnf) == TAG_SUP) {
-                    // SUP distribution uses lazy arg1 — fire interact now
-                    Term r = thvm_interact(ctx, frame);
-                    if (r == frame) { whnf = frame; continue; }
-                    TRACE_STEP(frame, r);
-                    next = r; goto enter;
-                }
-                // Not SUP: reduce arg1 via COMB1 frame
-                Term a1 = heap_read(ctx, floc + 1);
-                u8 a1t = term_tag(a1);
-                if (a1t == TAG_TEN || a1t == TAG_ERA || a1t == TAG_NUM ||
-                    a1t == TAG_LAM || a1t == TAG_SUP || a1t == TAG_CTR) {
-                    // arg1 already WNF — fire
-                    Term r = thvm_interact(ctx, frame);
-                    if (r == frame) { whnf = frame; continue; }
-                    TRACE_STEP(frame, r);
-                    next = r; goto enter;
-                }
-                // Push original frame marked as COMB1 (second-arg sentinel)
-                // We store the original frame AND a COMB1 marker:
-                PUSH(frame); // original OP2/EQL/AND/OR frame with correct ext
-                PUSH(term_new(TAG_COMB1, 0, 0)); // sentinel: next pop is the orig frame
-                next = a1;
-                goto enter;
+                Term r = thvm_interact(ctx, frame);
+                if (r == frame) { whnf = frame; continue; }
+                TRACE_STEP(frame, r);
+                next = r; goto enter;
             }
             whnf = frame; continue;
         }

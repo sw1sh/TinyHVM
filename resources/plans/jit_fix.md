@@ -113,8 +113,15 @@ in how the backward dispatch sequence reads from intermediate buffers.
 - Issue is specifically conv backward during JIT replay
 - Conv backward involves im2col-reversed view ops (EXPAND/SHRINK/RESHAPE)
   with ViewParams baked from capture time
-- Next: test conv+dense (no BN, no pool) to isolate if it's conv backward
-  specifically or the pool/reshape chain
+- **ROOT CAUSE FOUND**: GRAD handler produces zero gradient for dense weight
+  in 3-conv architecture. `glw=0.0` during CAPTURE (not a JIT issue).
+  Conv grads non-zero (gc1=-0.002) but lw zero. The backward traversal
+  misses the lw branch of MM(h, lw) in deeper architectures.
+- 2-conv works (both cw and lw get grads). 3-conv fails (lw=0).
+- This is a GRAD handler bug, NOT a JIT replay bug.
+- JIT replay faithfully reproduces the capture's wrong gradients.
+- **FIX**: Debug GRAD handler's MM backward for deep architectures.
+  The issue is that at 3+ conv depth, the MM backward for lw returns zero.
 - Consts ARE needed: NaN without restoration (86 consts = backward scalars + shapes)
 - Loss readback broken: loss slot not found in JIT (buf_id 460 not in any slot)
 

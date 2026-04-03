@@ -106,7 +106,15 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         goto enter;
     }
 
-    // Combinator tags: dispatch thvm_interact (handles APP/REF/DP0/DP1)
+    // Combinator tags: push frame and reduce arg0 for APP/DP0/DP1.
+    // Other combinators fire interact directly.
+    if (tag == TAG_APP || tag == TAG_DP0 || tag == TAG_DP1) {
+        u64 loc = term_val(next);
+        PUSH(next);
+        next = heap_read(ctx, loc + 0); // reduce fun (APP) or val (DP)
+        goto enter;
+    }
+
     {
         Term r = thvm_interact(ctx, next);
         if (r == next) { whnf = next; goto apply; }  // combinator WNF or stuck

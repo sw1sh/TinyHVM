@@ -1,8 +1,7 @@
         // TAG_APP: beta reduction + APP-SUP distribution
         case TAG_APP: {
             u64 loc = term_val(t);
-            Term fun = thvm_reduce(ctx, heap_read(ctx, loc));
-            heap_set(ctx, loc, fun);
+            Term fun = heap_read(ctx, loc); // WNF from trampoline frame
 
             // APP-SUP (fun position): (&L{f0,f1} arg) → !&L{a0,a1}=arg; &L{(f0 a0),(f1 a1)}
             if (term_tag(fun) == TAG_SUP) {
@@ -155,8 +154,7 @@
             u32 dp_index = (tag == TAG_DP1) ? 1 : 0;
             u32 dup_label = term_ext(t);
             u64 dup_loc = term_val(t);
-            Term val = thvm_reduce(ctx, heap_read(ctx, dup_loc));
-            heap_set(ctx, dup_loc, val);
+            Term val = heap_read(ctx, dup_loc); // WNF from trampoline frame
 
             // DUP ⊳ SUP
             if (term_tag(val) == TAG_SUP) {
@@ -406,7 +404,7 @@
             u64 loc = term_val(t);
             Term sub = heap_read(ctx, loc);
             if (term_is_sub(sub)) return t;
-            return thvm_reduce(ctx, sub);
+            return sub; // trampoline re-enters with substitution
         }
 
         // TAG_BRI: bridge — returned as-is until applied (WNF, like LAM)

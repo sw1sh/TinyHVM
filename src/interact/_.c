@@ -55,12 +55,7 @@ inet_step:
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
                 Term x  = heap_read(ctx, loc + 2);
-
-                // Reduce x if lazy (trampoline only auto-reduces slots 0,1; slot 2 stays raw)
-                if (term_tag(x) != TAG_TEN && term_tag(x) != TAG_ERA && term_tag(x) != TAG_CTR) {
-                    x = thvm_reduce(ctx, x);
-                    heap_set(ctx, loc + 2, x);
-                }
+                // x is guaranteed WNF by the trampoline's TAG_TOP2 phase.
 
                 // Deferred grad_prescan: run ONCE when forward provenance is ready.
                 // Only the top-level GRAD needs prescan; recursive GRAD3s reuse the counts.

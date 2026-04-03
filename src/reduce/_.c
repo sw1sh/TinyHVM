@@ -51,7 +51,7 @@ static void top_decref_inputs(TinyHVM *ctx, u64 loc, u32 uop, Term result) {
 // Pre-allocated stack pool — each recursion level gets a slice.
 // 4096 frames per slice, 64 max nesting depth = 2MB TLS.
 #define REDUCE_SLICE 16384   // 16K frames per depth level (128KB)
-#define REDUCE_MAX_DEPTH 128  // 128 depth × 128KB = 16MB TLS per thread
+#define REDUCE_MAX_DEPTH 512  // 512 depth × 128KB = 64MB TLS per thread
 static _Thread_local Term reduce_pool[REDUCE_SLICE * REDUCE_MAX_DEPTH];
 static _Thread_local int  reduce_depth = 0;
 
@@ -134,15 +134,24 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             Term a1 = heap_read(ctx, loc + 1);
             u8 a1t2 = term_tag(a1);
 
-            // GRAD: fire with lazy gy (arg1) to keep backward chain lazy.
+            // GRAD: skip arg1 (gy stays lazy), reduce arg2 (x) via TAG_TOP2.
             // Chain rule formulas just wrap gy in new lazy ops — no reduction needed.
-            // Base case / deposit explicitly reduce gy inside the GRAD handler.
             if (term_ext(frame) == UOP_GRAD) {
-                Term r = thvm_interact(ctx, frame);
-                if (r == frame) { whnf = frame; continue; }
-                TRACE_STEP(frame, r);
-                top_decref_inputs(ctx, loc, term_ext(frame), r);
-                next = r; goto enter;
+                // arg0 (y) is done. arg1 (gy) stays lazy. Now reduce arg2 (x).
+                Term a2 = heap_read(ctx, loc + 2);
+                u8 a2t = term_tag(a2);
+                if (a2t == TAG_TEN || a2t == TAG_ERA || a2t == TAG_NUM || a2t == TAG_CTR) {
+                    // arg2 already WNF — fire immediately
+                    Term r = thvm_interact(ctx, frame);
+                    if (r == frame) { whnf = frame; continue; }
+                    TRACE_STEP(frame, r);
+                    top_decref_inputs(ctx, loc, term_ext(frame), r);
+                    next = r; goto enter;
+                }
+                // arg2 not ready: push TAG_TOP2, reduce arg2
+                PUSH(term_new(TAG_TOP2, (u8)term_ext(frame), loc));
+                next = a2;
+                goto enter;
             }
 
             // Any WNF in arg1 slot is "ready"
@@ -169,6 +178,22 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             if (w1t != TAG_TEN && w1t != TAG_ERA && w1t != TAG_NUM &&
                 w1t != TAG_LAM && w1t != TAG_SUP) { whnf = frame; continue; }
             heap_set(ctx, loc + 1, whnf);  // store arg1 result
+            Term top_frame = term_new(TAG_TOP, term_ext(frame), loc);
+            Term r = thvm_interact(ctx, top_frame);
+            if (r == top_frame) { whnf = top_frame; continue; }
+            TRACE_STEP(top_frame, r);
+            top_decref_inputs(ctx, loc, term_ext(frame), r);
+            next = r; goto enter;
+        }
+
+        if (ftag == TAG_TOP2) {
+            // arg2 just finished. whnf = arg2's WNF result.
+            u64 loc = term_val(frame);
+            u8 w2t = term_tag(whnf);
+            if (w2t != TAG_TEN && w2t != TAG_ERA && w2t != TAG_NUM &&
+                w2t != TAG_LAM && w2t != TAG_SUP && w2t != TAG_CTR) { whnf = frame; continue; }
+            heap_set(ctx, loc + 2, whnf);  // store arg2 result
+            // All needed args ready — fire interact
             Term top_frame = term_new(TAG_TOP, term_ext(frame), loc);
             Term r = thvm_interact(ctx, top_frame);
             if (r == top_frame) { whnf = top_frame; continue; }

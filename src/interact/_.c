@@ -13,11 +13,9 @@ static Term thvm_interact(TinyHVM *ctx, Term t) {
     // Return result to trampoline. Eagerly reduce TAG_TOP so the interaction
     // handler always returns WNF (TAG_TEN/ERA/NUM/etc.), not lazy terms.
     // This is required because GRAD_STEP (goto inet_step) expects resolved args.
-    #define RETURN_REDUCED(result) do { \
-        Term _r = (result); \
-        if (term_tag(_r) == TAG_TOP) _r = thvm_reduce(ctx, _r); \
-        return _r; \
-    } while(0)
+    // Return result directly — the trampoline handles TAG_TOP results
+    // via `next = r; goto enter;` (no need to force-reduce here).
+    #define RETURN_REDUCED(result) do { return (result); } while(0)
     // GRAD iterative step: instead of GRAD_STEP(GRAD3(...)) which recurses
     // O(chain_depth) via thvm_reduce, loop back to inet_step in the same frame.
     // Only works for pure GRAD3 results (not GRAD_ADD which needs reduction first).
@@ -45,12 +43,11 @@ inet_step:
                 u8 _saved_nga = ctx->no_grad_alloc;
                 ctx->no_fuse = 0;
                 ctx->no_grad_alloc = 1;
+                // Return from GRAD handler — restore flags, let trampoline reduce
                 #define GRAD_RETURN(r) do { \
-                    Term _gr = (r); \
-                    if (term_tag(_gr) == TAG_TOP) _gr = thvm_reduce(ctx, _gr); \
                     ctx->no_fuse = _saved_nf; \
                     ctx->no_grad_alloc = _saved_nga; \
-                    return _gr; \
+                    return (r); \
                 } while(0)
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);

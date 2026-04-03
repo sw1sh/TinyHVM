@@ -45,16 +45,18 @@ JIT replay produces 12.4% accuracy (random chance). Capture step 0 is correct.
 **Confirmed working:**
 - JIT tiny test (SGD): weights update correctly across replay steps
 - All GPU dispatch paths record to JIT (comprehensive audit)
-- Checksum verify: commands 0-6 match perfectly for same-input replay
-- Command 7+ diverge due to weight evolution (Adam step 0 changes weights) — EXPECTED
-- Overfit test (same batch every step): gradients decrease (2323→81), expected 10% on test set
-- Manual CE loss was broken (zero grads) — fixed with cross_entropy_loss
+- JIT capture == non-JIT (cos_sim=1.0 for all non-zero params)
+- Forward pass cmd 7 output matches capture EXACTLY for same-data replay
+- Overfit test (same batch every step): gradients decrease (2323→81)
+- Fixed: manual CE → cross_entropy_loss, thvm_tensor → thvm_shrink for input
 
 **Still broken:**
-- JIT BM (200 steps): 9.6% accuracy despite non-zero gradients (|g|=2139→399)
-- NOT planner: same result with NO_PLAN=1
-- NOT const aliasing: verified no persistent/ephemeral MTLBuffer aliasing
-- NOT GPU sync: explicit flush between steps doesn't help
+- JIT BM replay: 9.5-9.7% accuracy at 70-500 steps despite non-zero grads
+- |grad| decreases (2323→390 over 500 steps) but weights barely change (0.004)
+- Grads cancel in direction: large |g| but near-zero momentum m
+- NOT planner: same result with NO_PLAN=1 (16GB budget)
+- NOT const aliasing, NOT GPU sync, NOT forward computation
+- NOT one-hot labels: oh_bid is persistent, not in consts, buf_write works
 - Consts ARE needed: NaN without restoration (86 consts = backward scalars + shapes)
 - Loss readback broken: loss slot not found in JIT (buf_id 460 not in any slot)
 

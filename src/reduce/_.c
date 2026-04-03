@@ -106,12 +106,15 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         goto enter;
     }
 
-    // Combinator tags: push frame and reduce arg0 for APP/DP0/DP1.
-    // Other combinators fire interact directly.
-    if (tag == TAG_APP || tag == TAG_DP0 || tag == TAG_DP1) {
+    // Combinator tags: push frame and reduce arg0.
+    // 2-arg combinators (OP2/EQL/AND/OR) reduce arg1 inside their handler
+    // because the SUP distribution needs to happen between arg0 and arg1 reduction.
+    if (tag == TAG_APP || tag == TAG_DP0 || tag == TAG_DP1 ||
+        tag == TAG_OP2 || tag == TAG_EQL || tag == TAG_AND || tag == TAG_OR ||
+        tag == TAG_DSU || tag == TAG_DDU || tag == TAG_UDP) {
         u64 loc = term_val(next);
         PUSH(next);
-        next = heap_read(ctx, loc + 0); // reduce fun (APP) or val (DP)
+        next = heap_read(ctx, loc + 0);
         goto enter;
     }
 
@@ -179,12 +182,11 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         }
 
         if (ftag == TAG_TOP1) {
-            // arg1 just finished. whnf = arg1's result (any WNF is valid: TEN, ERA, NUM, LAM, SUP).
+            // arg1 just finished. whnf = arg1's result.
             u64 loc = term_val(frame);
             u8  w1t = term_tag(whnf);
-            // Accept any WNF as "ready"
             if (w1t != TAG_TEN && w1t != TAG_ERA && w1t != TAG_NUM &&
-                w1t != TAG_LAM && w1t != TAG_SUP) { whnf = frame; continue; }
+                w1t != TAG_LAM && w1t != TAG_SUP && w1t != TAG_CTR) { whnf = frame; continue; }
             heap_set(ctx, loc + 1, whnf);  // store arg1 result
             Term top_frame = term_new(TAG_TOP, term_ext(frame), loc);
             Term r = thvm_interact(ctx, top_frame);
@@ -210,17 +212,20 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             next = r; goto enter;
         }
 
-        // Combinator frames (APP, DP0, DP1)
+        // Combinator frames — arg0 reduced, store and fire (or reduce arg1)
         {
             u64 floc = term_val(frame);
-            if (ftag == TAG_APP) {
+            // 1-arg combinators: store arg0, fire interact
+            if (ftag == TAG_APP || ftag == TAG_DP0 || ftag == TAG_DP1 ||
+                ftag == TAG_DSU || ftag == TAG_DDU || ftag == TAG_UDP) {
                 heap_set(ctx, floc + 0, whnf);
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
                 TRACE_STEP(frame, r);
                 next = r; goto enter;
             }
-            if (ftag == TAG_DP0 || ftag == TAG_DP1) {
+            // 2-arg combinators: store arg0 and fire (handler reduces arg1)
+            if (ftag == TAG_OP2 || ftag == TAG_EQL || ftag == TAG_AND || ftag == TAG_OR) {
                 heap_set(ctx, floc + 0, whnf);
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }

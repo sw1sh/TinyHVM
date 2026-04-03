@@ -345,8 +345,8 @@
         case TAG_OP2: {
             u64 loc = term_val(t);
             u32 opr = term_ext(t);
-            Term x = thvm_reduce(ctx, heap_read(ctx, loc));
-            heap_set(ctx, loc, x);
+            Term x = heap_read(ctx, loc); // WNF from trampoline
+            // y reduced AFTER x-SUP check (distribution needs lazy y for DUP)
 
             // OP2-SUP (left): OP2(opr, &L{x0,x1}, y) → &L{OP2(opr,x0,y0), OP2(opr,x1,y1)}
             if (term_tag(x) == TAG_SUP) {
@@ -354,10 +354,9 @@
                 u64 sup_loc = term_val(x);
                 Term x0 = heap_read(ctx, sup_loc + 0);
                 Term x1 = heap_read(ctx, sup_loc + 1);
-                Term y = heap_read(ctx, loc + 1);
-                // Clone y with SUP's label
+                Term y_lazy = heap_read(ctx, loc + 1); // lazy y for DUP
                 u64 dup_loc = heap_alloc(ctx, 1);
-                heap_set(ctx, dup_loc, y);
+                heap_set(ctx, dup_loc, y_lazy);
                 Term y0 = term_new(TAG_DP0, lab, dup_loc);
                 Term y1 = term_new(TAG_DP1, lab, dup_loc);
                 ctx->itrs++;
@@ -367,6 +366,7 @@
                 goto inet_step;
             }
 
+            // Now reduce y (after x-SUP distribution)
             Term y = thvm_reduce(ctx, heap_read(ctx, loc + 1));
             heap_set(ctx, loc + 1, y);
 
@@ -422,7 +422,7 @@
         // TAG_DSU: dynamic SUP — reduce label_expr to NUM, then create normal SUP
         case TAG_DSU: {
             u64 loc = term_val(t);
-            Term label_expr = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term label_expr = heap_read(ctx, loc); // WNF from trampoline
             heap_set(ctx, loc, label_expr);
             if (term_tag(label_expr) != TAG_NUM) return t;  // not ready
             u32 label = term_as_u32(label_expr);
@@ -436,7 +436,7 @@
         // TAG_DDU: dynamic DUP — reduce label_expr to NUM, then dup val, apply bod
         case TAG_DDU: {
             u64 loc = term_val(t);
-            Term label_expr = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term label_expr = heap_read(ctx, loc); // WNF from trampoline
             heap_set(ctx, loc, label_expr);
             if (term_tag(label_expr) != TAG_NUM) return t;  // not ready
             u32 label = term_as_u32(label_expr);
@@ -465,9 +465,7 @@
         // Pattern: same as TAG_OP2 (reduce left, check SUP, reduce right, check SUP, compare)
         case TAG_EQL: {
             u64 loc = term_val(t);
-            // Reduce left operand
-            Term a = thvm_reduce(ctx, heap_read(ctx, loc));
-            heap_set(ctx, loc, a);
+            Term a = heap_read(ctx, loc); // WNF from trampoline
 
             // EQL-SUP-L: (&L{a0,a1} === b) → clone b, &L{(a0===B₀), (a1===B₁)}
             if (term_tag(a) == TAG_SUP) {
@@ -512,7 +510,6 @@
                 goto inet_step;
             }
 
-            // Reduce right operand
             Term b = thvm_reduce(ctx, heap_read(ctx, loc + 1));
             heap_set(ctx, loc + 1, b);
 
@@ -581,7 +578,7 @@
         // TAG_AND: short-circuit boolean AND — reduce left, short-circuit on 0
         case TAG_AND: {
             u64 loc = term_val(t);
-            Term a = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term a = heap_read(ctx, loc); // WNF from trampoline
             heap_set(ctx, loc, a);
 
             // AND-SUP: distribute
@@ -632,7 +629,7 @@
         // TAG_OR: short-circuit boolean OR — reduce left, short-circuit on nonzero
         case TAG_OR: {
             u64 loc = term_val(t);
-            Term a = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term a = heap_read(ctx, loc); // WNF from trampoline
             heap_set(ctx, loc, a);
 
             // OR-SUP: distribute
@@ -686,8 +683,7 @@
         case TAG_UDP: {
             u32 udp_label = term_ext(t);
             u64 udp_loc = term_val(t);
-            Term val = thvm_reduce(ctx, heap_read(ctx, udp_loc));
-            heap_set(ctx, udp_loc, val);
+            Term val = heap_read(ctx, udp_loc); // WNF from trampoline
 
             // UDP ⊳ USP (same label): consume ONE branch, keep producing from other
             if (term_tag(val) == TAG_USP && term_ext(val) == udp_label) {

@@ -8,12 +8,11 @@
                 u8 _saved_nga = ctx->no_grad_alloc;
                 ctx->no_fuse = 0;
                 ctx->no_grad_alloc = 1;
+                // Restore flags, return directly — trampoline reduces TAG_TOP results
                 #define GRAD_RETURN(r) do { \
-                    Term _gr = (r); \
-                    if (term_tag(_gr) == TAG_TOP) _gr = thvm_reduce(ctx, _gr); \
                     ctx->no_fuse = _saved_nf; \
                     ctx->no_grad_alloc = _saved_nga; \
-                    return _gr; \
+                    return (r); \
                 } while(0)
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
@@ -57,9 +56,9 @@
                 if (term_tag(y) == TAG_TEN) {
                     u32 y_id = (u32)term_val(y);
 
-                    // Base case: y == x → return grad_y
+                    // Base case: y == x → return grad_y (trampoline reduces)
                     if (term_tag(x) == TAG_TEN && (u32)term_val(x) == y_id) {
-                        GRAD_RETURN(thvm_reduce(ctx, gy));
+                        GRAD_RETURN(gy);
                     }
 
                     // Multi-target: x = TAG_CTR encoding (param, slot) pairs.
@@ -232,9 +231,9 @@
                             GRAD_RETURN(GRAD3(unfused, gy, x));
                         }
                         case UOP_SUM: {
-                            Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
-                            gy_r = thvm_reshape(ctx, gy_r, my->view.shape);
-                            UN_GRAD(thvm_expand(ctx, gy_r, ma->view.shape));
+                            // SUM backward: gy → reshape → expand (all lazy)
+                            Term gy_rs = thvm_reshape(ctx, gy, my->view.shape);
+                            UN_GRAD(thvm_expand(ctx, gy_rs, ma->view.shape));
                         }
                         case UOP_RMAX: {
                             ENSURE(ctx, aid); ma = &ctx->tensors[aid];
@@ -334,9 +333,8 @@
                                 Term im_perm = thvm_permute(ctx, im2col, (u32[]){0,2,3,1,4,5}, 6);
                                 Term im_flat = thvm_reshape(ctx, im_perm, SHAPE(M, K));
                                 // gy: [BS,cout,OY,OX] → [BS*OY*OX, cout] = [M, N]
-                                Term gy_r = (term_tag(gy) == TAG_TEN) ? gy : thvm_reduce(ctx, gy);
-                                // Permute gy to [BS,OY,OX,cout] then reshape to [M,N]
-                                Term gy_perm = thvm_permute(ctx, gy_r, (u32[]){0,2,3,1}, 4);
+                                // Permute gy (can stay lazy — wraps in TAG_TOP)
+                                Term gy_perm = thvm_permute(ctx, gy, (u32[]){0,2,3,1}, 4);
                                 Term gy_flat = thvm_reshape(ctx, gy_perm, SHAPE(M, N));
                                 // dW = im2col^T @ gy = [K,M] @ [M,N] = [K,N]
                                 Term im_T = thvm_permute(ctx, im_flat, (u32[]){1,0}, 2);

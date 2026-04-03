@@ -58,3 +58,4 @@ py/tinyhvm/shaders.metallib
 # Benchmark binaries
 /bench_*
 wl/LibraryResources/MacOSX-ARM64/TinyHVM.dylib
+bench/

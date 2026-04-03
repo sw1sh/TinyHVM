@@ -490,7 +490,15 @@ void jit_alloc_ephemeral(void) {
         return;
     }
 
-    // Default: plan-idx based, one buffer per plan_idx
+    // Plan-idx based or independent alloc (NO_PLAN=1 for debugging)
+    if (getenv("NO_PLAN")) {
+        // Independent: each slot gets its own buffer (no sharing)
+        for (u32 s = jit.persistent_count; s < jit.n_slots; s++) {
+            u64 sz = jit.slots[s].alloc_size;
+            jit.slots[s].buf_id = (sz > 0) ? metal_buf_alloc(sz) : 0;
+        }
+        return;
+    }
     {
         u32 plan_bufs[JIT_MAX_SLOTS];
         for (u32 p = 0; p < jit_n_plan; p++) {

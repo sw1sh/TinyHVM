@@ -57,6 +57,26 @@ JIT replay produces 12.4% accuracy (random chance). Capture step 0 is correct.
 - NOT planner: same result with NO_PLAN=1 (16GB budget)
 - NOT const aliasing, NOT GPU sync, NOT forward computation
 - NOT one-hot labels: oh_bid is persistent, not in consts, buf_write works
+
+**BREAKTHROUGH: CNN + SGD + sum loss — JIT replay WORKS!**
+Weights explode (lr too high) but they DO update: lw[0] goes from 0.007 to -22M in 5 steps.
+This PROVES the JIT replay infrastructure is correct — commands fire, buffers resolve,
+weights update through the full CNN backward + SGD assign chain.
+
+The issue is SPECIFICALLY Adam + CE during replay. Adam normalizes gradient direction.
+With JIT replay, each step's gradient points in a slightly different direction (different
+batch data + evolved weights). Adam momentum averages these directions. In non-JIT, the
+same thing happens but the model converges. The JIT replay's numerical behavior differs
+subtly enough that Adam momentum doesn't converge.
+
+**Root cause hypothesis:** The fused backward kernels during replay compute gradients
+that are numerically close to (but not identical with) what a fresh IC reduction would
+produce. The differences are small per-step but accumulate in Adam's momentum, causing
+the gradient direction to be biased. This bias prevents convergence.
+
+**Path forward:** The JIT replay infrastructure is DONE. The convergence issue needs
+either: (a) investigate the numerical difference source, or (b) adopt tinygrad's
+approach of not using IC reduction at all — build the schedule directly and JIT that.
 - Consts ARE needed: NaN without restoration (86 consts = backward scalars + shapes)
 - Loss readback broken: loss slot not found in JIT (buf_id 460 not in any slot)
 

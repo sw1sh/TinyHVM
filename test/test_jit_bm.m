@@ -54,65 +54,67 @@ int main(void) {
         gs[i]=thvm_tensor(ctx,z,ctx->tensors[(u32)term_val(params[i])].view.shape);free(z);}
     u32 gids[NP]; for(u32 i=0;i<NP;i++) gids[i]=(u32)term_val(gs[i]);
 
-    // Build graph ONCE
     u32 p0[]={0,0,0,0},s1[]={1,1},k2[]={2,2},s2[]={2,2};
-    Term h=thvm_conv2d(ctx,x,cw1,cb1,1,s1,p0);
-    h=thvm_op(ctx,UOP_RELU,h,term_era());
-    h=thvm_conv2d(ctx,h,cw2,cb2,1,s1,p0);
-    h=thvm_op(ctx,UOP_RELU,h,term_era());
-    BNResult bn1=batchnorm_forward(ctx,h,bn1_g,bn1_b,bn1_rm,bn1_rv,BS,32,20,20,1);
-    h=bn1.output;
-    h=thvm_maxpool2d(ctx,h,k2,s2);
-    h=thvm_conv2d(ctx,h,cw3,cb3,1,s1,p0);
-    h=thvm_op(ctx,UOP_RELU,h,term_era());
-    h=thvm_conv2d(ctx,h,cw4,cb4,1,s1,p0);
-    h=thvm_op(ctx,UOP_RELU,h,term_era());
-    BNResult bn2=batchnorm_forward(ctx,h,bn2_g,bn2_b,bn2_rm,bn2_rv,BS,64,6,6,1);
-    h=bn2.output;
-    h=thvm_maxpool2d(ctx,h,k2,s2);
-    h=thvm_reshape(ctx,h,SHAPE(BS,ff));
-    Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
-        thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
+    u32 nw = ctx->tensor_count;  // weight watermark
+    f32 *oh_data = calloc(BS*10, sizeof(f32));
 
-    // CE loss — cross_entropy_loss creates a one-hot tensor (persistent).
-    // We track its buf_id to overwrite labels per step during JIT replay.
-    u32 bi0 = rand() % (data.n_train / BS);
-    u32 oh_tc = ctx->tensor_count; // tensor count before CE (to find the one-hot)
-    Term loss = cross_entropy_loss(ctx, logits, &data.train_labels[bi0*BS], BS, 10);
-    // Find the one-hot tensor (created by cross_entropy_loss, shape [BS,10])
-    u32 oh_tid = 0;
-    for (u32 t = oh_tc; t < ctx->tensor_count; t++) {
-        View *v = &ctx->tensors[t].view;
-        if (v->shape.rank == 2 && v->shape.dims[0] == BS && v->shape.dims[1] == 10 &&
-            v->numel == BS*10 && ctx->tensors[t].buf_id) {
-            oh_tid = t; break;
-        }
+    // === Warm-up step 0: stabilize dispatch sequence (371→374) ===
+    {   u32 bi=rand()%(data.n_train/BS);
+        ctx->tensors[td_tid].backend->buf_write(ctx->tensors[td_tid].buf_id,
+            &data.train_images[bi*BS*28*28],BS*28*28*sizeof(f32));
+        Term h=thvm_conv2d(ctx,x,cw1,cb1,1,s1,p0);h=thvm_op(ctx,UOP_RELU,h,term_era());
+        h=thvm_conv2d(ctx,h,cw2,cb2,1,s1,p0);h=thvm_op(ctx,UOP_RELU,h,term_era());
+        BNResult _b1=batchnorm_forward(ctx,h,bn1_g,bn1_b,bn1_rm,bn1_rv,BS,32,20,20,1);
+        h=_b1.output;h=thvm_maxpool2d(ctx,h,k2,s2);
+        h=thvm_conv2d(ctx,h,cw3,cb3,1,s1,p0);h=thvm_op(ctx,UOP_RELU,h,term_era());
+        h=thvm_conv2d(ctx,h,cw4,cb4,1,s1,p0);h=thvm_op(ctx,UOP_RELU,h,term_era());
+        BNResult _b2=batchnorm_forward(ctx,h,bn2_g,bn2_b,bn2_rm,bn2_rv,BS,64,6,6,1);
+        h=_b2.output;h=thvm_maxpool2d(ctx,h,k2,s2);h=thvm_reshape(ctx,h,SHAPE(BS,ff));
+        Term lo=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
+            thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
+        Term _l=cross_entropy_loss(ctx,lo,&data.train_labels[bi*BS],BS,10);
+        Term _gs[NP];for(int i=0;i<NP;i++){f32*z=calloc(psz[i],4);
+            _gs[i]=thvm_tensor(ctx,z,ctx->tensors[(u32)term_val(params[i])].view.shape);free(z);}
+        u32 _gids[NP];for(u32 i=0;i<NP;i++) _gids[i]=(u32)term_val(_gs[i]);
+        Term _g=thvm_grad_multi(ctx,_l,params,_gs,NP);
+        thvm_reduce(ctx,thvm_app(ctx,_g,thvm_app(ctx,_b1.assigns,_b2.assigns)));
+        adam_step_direct(ctx,&opt,_gids);
+        f32 lv0=thvm_to_host(ctx,_l)[0];
+        extern u32 total_dispatches;
+        printf("warmup: loss=%.2f (%u dispatches)\n",lv0,total_dispatches);
+        total_dispatches=0;
+        thvm_reset(ctx,nw);
     }
 
-    printf("oh_tid=%u oh_bid=%u\n", oh_tid, oh_tid ? ctx->tensors[oh_tid].buf_id : 0);
-
-    // Backward
-    Term grad_term = thvm_grad_multi(ctx, loss, params, gs, NP);
-    Term bn_assigns = thvm_app(ctx, bn1.assigns, bn2.assigns);
-    Term train_step = thvm_app(ctx, grad_term, bn_assigns);
-
-    u32 n_persistent = ctx->tensor_count;
-    printf("Built graph: %u persistent tensors, %u pool bufs\n", n_persistent, metal_pool.count);
-
-    // === Step 0: Load batch into td buffer at offset 0 (shrink reads from there) ===
-    u32 bi = bi0;
-    // Write batch data to the START of td's buffer (shrink view reads [0,BS,...])
+    // === Build graph for capture (step 1 — stable dispatch sequence) ===
+    u32 bi0=rand()%(data.n_train/BS);
     ctx->tensors[td_tid].backend->buf_write(ctx->tensors[td_tid].buf_id,
-        &data.train_images[bi*BS*28*28], BS*28*28*sizeof(f32));
-    // one-hot already has correct labels from cross_entropy_loss(bi0)
-    f32 *oh_data = calloc(BS*10, sizeof(f32));
-    for(int i=0;i<NP;i++) memset(metal_pool.bufs[ctx->tensors[gids[i]].buf_id].contents, 0, psz[i]*4);
+        &data.train_images[bi0*BS*28*28],BS*28*28*sizeof(f32));
+    Term h=thvm_conv2d(ctx,x,cw1,cb1,1,s1,p0);h=thvm_op(ctx,UOP_RELU,h,term_era());
+    h=thvm_conv2d(ctx,h,cw2,cb2,1,s1,p0);h=thvm_op(ctx,UOP_RELU,h,term_era());
+    BNResult bn1=batchnorm_forward(ctx,h,bn1_g,bn1_b,bn1_rm,bn1_rv,BS,32,20,20,1);
+    h=bn1.output;h=thvm_maxpool2d(ctx,h,k2,s2);
+    h=thvm_conv2d(ctx,h,cw3,cb3,1,s1,p0);h=thvm_op(ctx,UOP_RELU,h,term_era());
+    h=thvm_conv2d(ctx,h,cw4,cb4,1,s1,p0);h=thvm_op(ctx,UOP_RELU,h,term_era());
+    BNResult bn2=batchnorm_forward(ctx,h,bn2_g,bn2_b,bn2_rm,bn2_rv,BS,64,6,6,1);
+    h=bn2.output;h=thvm_maxpool2d(ctx,h,k2,s2);h=thvm_reshape(ctx,h,SHAPE(BS,ff));
+    Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
+        thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
+    Term loss=cross_entropy_loss(ctx,logits,&data.train_labels[bi0*BS],BS,10);
+    u32 oh_tid=0;for(u32 t=0;t<ctx->tensor_count;t++){View*v=&ctx->tensors[t].view;
+        if(v->shape.rank==2&&v->shape.dims[0]==BS&&v->shape.dims[1]==10&&v->numel==BS*10&&ctx->tensors[t].buf_id) oh_tid=t;}
+    Term grad_term=thvm_grad_multi(ctx,loss,params,gs,NP);
+    Term bn_assigns=thvm_app(ctx,bn1.assigns,bn2.assigns);
+    Term train_step=thvm_app(ctx,grad_term,bn_assigns);
+    u32 n_persistent=ctx->tensor_count;
 
+    // Capture
+    for(int i=0;i<NP;i++) memset(metal_pool.bufs[ctx->tensors[gids[i]].buf_id].contents,0,psz[i]*4);
     jit_begin_capture(n_persistent);
-    double t0 = now_s();
-    thvm_reduce(ctx, train_step);
-    adam_step_direct(ctx, &opt, gids);
-    f32 lv = thvm_to_host(ctx, loss)[0];
+    double t0=now_s();
+    thvm_reduce(ctx,train_step);
+    adam_step_direct(ctx,&opt,gids);
+    f32 lv=thvm_to_host(ctx,loss)[0];
     jit_end_capture();
 
     // Save loss buf_id mapping before reset (loss is ephemeral)
@@ -159,7 +161,7 @@ int main(void) {
     for(u32 step=1; step<n_steps; step++) {
         // Step 1: SAME data as capture (test replay correctness)
         // Steps 2+: new batch data
-        if (step == 1) bi = bi0; else bi = rand() % (data.n_train / BS);
+        u32 bi = rand() % (data.n_train / BS);
         // Write batch to td buffer at offset 0 (shrink view reads from there)
         ctx->tensors[td_tid].backend->buf_write(ctx->tensors[td_tid].buf_id,
             &data.train_images[bi*BS*28*28], BS*28*28*sizeof(f32));

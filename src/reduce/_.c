@@ -106,10 +106,19 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         goto enter;
     }
 
-    // Combinator tags: dispatch thvm_interact (handles APP/REF/DP0/DP1)
+    // Combinator tags: push frame and reduce arg0 for tags that need it.
+    if (tag == TAG_APP || tag == TAG_DP0 || tag == TAG_DP1 ||
+        tag == TAG_OP2 || tag == TAG_EQL || tag == TAG_AND || tag == TAG_OR ||
+        tag == TAG_DSU || tag == TAG_DDU || tag == TAG_UDP) {
+        u64 loc = term_val(next);
+        PUSH(next);
+        next = heap_read(ctx, loc + 0);
+        goto enter;
+    }
+
     {
         Term r = thvm_interact(ctx, next);
-        if (r == next) { whnf = next; goto apply; }  // combinator WNF or stuck
+        if (r == next) { whnf = next; goto apply; }
         TRACE_STEP(next, r);
         next = r;
         goto enter;
@@ -178,11 +187,23 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             if (w1t != TAG_TEN && w1t != TAG_ERA && w1t != TAG_NUM &&
                 w1t != TAG_LAM && w1t != TAG_SUP) { whnf = frame; continue; }
             heap_set(ctx, loc + 1, whnf);  // store arg1 result
-            Term top_frame = term_new(TAG_TOP, term_ext(frame), loc);
+            // 3-arg ops (WHERE, IFZ): reduce arg2 before firing
+            u32 _uop1 = term_ext(frame);
+            if (_uop1 == UOP_WHERE || _uop1 == UOP_IFZ) {
+                Term a2 = heap_read(ctx, loc + 2);
+                u8 a2t = term_tag(a2);
+                if (a2t != TAG_TEN && a2t != TAG_ERA && a2t != TAG_NUM &&
+                    a2t != TAG_CTR && a2t != TAG_LAM && a2t != TAG_SUP) {
+                    PUSH(term_new(TAG_TOP2, (u8)_uop1, loc));
+                    next = a2;
+                    goto enter;
+                }
+            }
+            Term top_frame = term_new(TAG_TOP, _uop1, loc);
             Term r = thvm_interact(ctx, top_frame);
             if (r == top_frame) { whnf = top_frame; continue; }
             TRACE_STEP(top_frame, r);
-            top_decref_inputs(ctx, loc, term_ext(frame), r);
+            top_decref_inputs(ctx, loc, _uop1, r);
             next = r; goto enter;
         }
 
@@ -221,6 +242,20 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             }
             whnf = frame; continue;
         }
+
+        // Combinator frames — arg0 reduced, store and fire
+        if (ftag == TAG_APP || ftag == TAG_DP0 || ftag == TAG_DP1 ||
+            ftag == TAG_DSU || ftag == TAG_DDU || ftag == TAG_UDP ||
+            ftag == TAG_OP2 || ftag == TAG_EQL || ftag == TAG_AND || ftag == TAG_OR) {
+            u64 floc = term_val(frame);
+            heap_set(ctx, floc + 0, whnf);
+            Term r = thvm_interact(ctx, frame);
+            if (r == frame) { whnf = frame; continue; }
+            TRACE_STEP(frame, r);
+            next = r; goto enter;
+        }
+
+        whnf = frame; continue;
     }
     // Stack empty — whnf is the result
   }

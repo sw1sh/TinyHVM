@@ -1,7 +1,7 @@
         // TAG_APP: beta reduction + APP-SUP distribution
         case TAG_APP: {
             u64 loc = term_val(t);
-            Term fun = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term fun = heap_read(ctx, loc); // WNF from trampoline
             heap_set(ctx, loc, fun);
 
             // APP-SUP (fun position): (&L{f0,f1} arg) → !&L{a0,a1}=arg; &L{(f0 a0),(f1 a1)}
@@ -155,7 +155,7 @@
             u32 dp_index = (tag == TAG_DP1) ? 1 : 0;
             u32 dup_label = term_ext(t);
             u64 dup_loc = term_val(t);
-            Term val = thvm_reduce(ctx, heap_read(ctx, dup_loc));
+            Term val = heap_read(ctx, dup_loc); // WNF from trampoline
             heap_set(ctx, dup_loc, val);
 
             // DUP ⊳ SUP
@@ -347,7 +347,7 @@
         case TAG_OP2: {
             u64 loc = term_val(t);
             u32 opr = term_ext(t);
-            Term x = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term x = heap_read(ctx, loc); // WNF from trampoline
             heap_set(ctx, loc, x);
 
             // OP2-SUP (left): OP2(opr, &L{x0,x1}, y) → &L{OP2(opr,x0,y0), OP2(opr,x1,y1)}
@@ -406,7 +406,7 @@
             u64 loc = term_val(t);
             Term sub = heap_read(ctx, loc);
             if (term_is_sub(sub)) return t;
-            return thvm_reduce(ctx, sub);
+            return sub; // trampoline re-enters
         }
 
         // TAG_BRI: bridge — returned as-is until applied (WNF, like LAM)
@@ -424,7 +424,7 @@
         // TAG_DSU: dynamic SUP — reduce label_expr to NUM, then create normal SUP
         case TAG_DSU: {
             u64 loc = term_val(t);
-            Term label_expr = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term label_expr = heap_read(ctx, loc); // WNF from trampoline
             heap_set(ctx, loc, label_expr);
             if (term_tag(label_expr) != TAG_NUM) return t;  // not ready
             u32 label = term_as_u32(label_expr);
@@ -438,7 +438,7 @@
         // TAG_DDU: dynamic DUP — reduce label_expr to NUM, then dup val, apply bod
         case TAG_DDU: {
             u64 loc = term_val(t);
-            Term label_expr = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term label_expr = heap_read(ctx, loc); // WNF from trampoline
             heap_set(ctx, loc, label_expr);
             if (term_tag(label_expr) != TAG_NUM) return t;  // not ready
             u32 label = term_as_u32(label_expr);
@@ -468,7 +468,7 @@
         case TAG_EQL: {
             u64 loc = term_val(t);
             // Reduce left operand
-            Term a = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term a = heap_read(ctx, loc); // WNF from trampoline
             heap_set(ctx, loc, a);
 
             // EQL-SUP-L: (&L{a0,a1} === b) → clone b, &L{(a0===B₀), (a1===B₁)}
@@ -583,7 +583,7 @@
         // TAG_AND: short-circuit boolean AND — reduce left, short-circuit on 0
         case TAG_AND: {
             u64 loc = term_val(t);
-            Term a = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term a = heap_read(ctx, loc); // WNF from trampoline
             heap_set(ctx, loc, a);
 
             // AND-SUP: distribute
@@ -634,7 +634,7 @@
         // TAG_OR: short-circuit boolean OR — reduce left, short-circuit on nonzero
         case TAG_OR: {
             u64 loc = term_val(t);
-            Term a = thvm_reduce(ctx, heap_read(ctx, loc));
+            Term a = heap_read(ctx, loc); // WNF from trampoline
             heap_set(ctx, loc, a);
 
             // OR-SUP: distribute
@@ -688,8 +688,7 @@
         case TAG_UDP: {
             u32 udp_label = term_ext(t);
             u64 udp_loc = term_val(t);
-            Term val = thvm_reduce(ctx, heap_read(ctx, udp_loc));
-            heap_set(ctx, udp_loc, val);
+            Term val = heap_read(ctx, udp_loc); // WNF from trampoline
 
             // UDP ⊳ USP (same label): consume ONE branch, keep producing from other
             if (term_tag(val) == TAG_USP && term_ext(val) == udp_label) {

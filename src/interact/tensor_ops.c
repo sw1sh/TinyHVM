@@ -92,8 +92,7 @@
                 // Per tinyspec §ElementwiseOps: result[i] = A[i] if P[i]!=0 else B[i]
                 Term cond_t = heap_read(ctx, loc);     // WNF from trampoline
                 Term then_t = heap_read(ctx, loc + 1); // WNF from trampoline
-                // arg2 NOT reduced by trampoline (only GRAD uses TAG_TOP2)
-                Term else_t = thvm_reduce(ctx, heap_read(ctx, loc + 2));
+                Term else_t = heap_read(ctx, loc + 2); // WNF from trampoline (TAG_TOP2)
                 if (term_tag(cond_t) != TAG_TEN || term_tag(then_t) != TAG_TEN ||
                     term_tag(else_t) != TAG_TEN) RETURN_REDUCED(term_era());
                 u32 c_id = (u32)term_val(cond_t);

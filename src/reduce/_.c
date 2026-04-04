@@ -92,10 +92,16 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         tag == TAG_LAM || tag == TAG_SUP || tag == TAG_BRI ||
         tag == TAG_MAT || tag == TAG_ANY || tag == TAG_USP) { whnf = next; goto apply; }
 
-    // TAG_TOP: try declarative rewrite rules first (fusion, etc.).
-    // If no rule matches, reduce args depth-first then fire interact.
+    // TAG_TOP: compute ops are WNF (lazy). Non-compute ops reduce args and fire.
     if (tag == TAG_TOP) {
-        // Rewrite rules: pattern-match and dispatch (fusion, etc.)
+        u32 _uop = term_ext(next);
+        // Compute ops: WNF (constructor). Scheduler dispatches later.
+        if (_uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
+            _uop != UOP_LOG_PRINT && _uop != UOP_TODEVICE && _uop != UOP_WHERE &&
+            _uop != UOP_FUSING) {
+            whnf = next; goto apply;
+        }
+        // Non-compute: reduce args then fire interact (existing behavior)
         Term rw = rewrite_apply(ctx, next);
         if (rw != next) { next = rw; goto enter; }
 

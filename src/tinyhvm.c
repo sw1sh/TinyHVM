@@ -88,11 +88,7 @@ Term thvm_dsu(TinyHVM *ctx, Term label_expr, Term a, Term b);
 Term thvm_ddu(TinyHVM *ctx, Term label_expr, Term val, Term bod);
 Term thvm_inc(TinyHVM *ctx, Term term);
 Term thvm_mm(TinyHVM *ctx, Term a, Term b);
-static void fusing_interact(TinyHVM *ctx, u32 tid);
-#define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0){ \
-    if(c->tensors[t].fusing_loc) fusing_interact(c,t); \
-    else if(c->tensors[t].creator_op) tensor_materialize(c,t); \
-}}while(0)
+#define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0&&c->tensors[t].creator_op)tensor_materialize(c,t);}while(0)
 
 // Read strided view to contiguous host buffer
 static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel) {

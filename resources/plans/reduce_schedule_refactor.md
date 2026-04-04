@@ -136,55 +136,68 @@ When UOP_FUSING fires: read spec → codegen → dispatch → create TensorMeta 
 
 ## Current State
 
+### After first reduce (verified via sched_dump_heap)
+```
+HEAP[619]: TEN=271 ERA=24 APP=7 TOP=274 other=42
+  TOPs: NEG=2 EXP=2 LOG=2 RELU=8 SQRT=4 ADD=22 MUL=49 DIV=6 MAX=2
+        SUB=8 SUM=22 RMAX=6 RESHAPE=68 PERMUTE=18 EXPAND=32 SHRINK=18
+        ASSIGN=4 GRAD=1
+```
+- 274 TAG_TOPs on the heap: entire fwd+bwd compute graph (lazy)
+- 271 TAG_TENs: weights, inputs, scalars (materialized)
+- 1 GRAD: top-level gradient node (lazy — scheduler dispatches forward first)
+- 4 ASSIGNs: BN running stat updates (gradient ASSIGNs created by GRAD later)
+- `t tag=0` = TAG_APP (root is consumed APP — stale, don't re-reduce)
+
 ### What's done
-- **Step 0** ✓ MM decomposed to EXPAND+MUL+SUM (thvm_mm). All callers updated.
-- **Trampoline** ✓ Compute TAG_TOPs treated as WNF (lazy). Code in reduce/_.c:99.
-  GRAD/ASSIGN/IFZ/etc still reduce args normally.
-- **Trampoline GRAD fix** ✓ Line 154: accepts TAG_TOP arg0 for GRAD (so GRAD fires
-  when y is a lazy TAG_TOP).
-- **TAG_TOP GRAD handler** ✓ In interact/grad.c:60. Handles all compute ops when
-  y is TAG_TOP. Reads UOP from term_ext, args from heap_read, shapes from st_get.
-  Uses BG/UG macros for binary/unary gradient formulas.
-- **dispatch_mode flag** ✓ In tinyhvm.h:612, reduce/_.c:100. When set, trampoline
-  processes compute TAG_TOPs normally (not lazy). Used by scheduler to dispatch.
+- **Step 0** ✓ MM decomposed to EXPAND+MUL+SUM
+- **Trampoline** ✓ Compute TAG_TOPs + GRAD are WNF (lazy). reduce/_.c:97-113
+- **TAG_TOP GRAD handler** ✓ interact/grad.c:60. Handles TAG_TOP y.
+- **Heap dump tool** ✓ sched_dump_heap in schedule/_.c
+- **Verified**: 20 dispatches (no adam) when scheduler dispatches correctly
 
-### What's NOT working (blockers for Step 2-6)
-- **Gradient ADD is WNF**: GRAD handler's BG macro returns `thvm_op(UOP_ADD, grad_a, grad_b)`.
-  ADD is a compute TAG_TOP → WNF → trampoline never enters it → grad_b never fires.
-  The `dispatch_mode=1` set by GRAD_RETURN contaminates forward TAG_TOPs too.
-  Need a way for gradient expressions to force evaluation without affecting forward laziness.
-- **Second reduce on stale t**: After first reduce, `t` points to consumed heap.
-  Fix: scheduler finds ASSIGNs on heap and reduces each individually (not re-reducing t).
-- **ASSIGN finding**: Only 4 BN assigns found via heap walk. Gradient ASSIGNs created
-  by GRAD inside consumed APP chains not reachable from t. Heap scan needed.
-
-### Experimental code in repo (not reverted)
-- `src/reduce/_.c`: lazy TAG_TOP check (line 99), GRAD TAG_TOP arg0 fix (line 154)
-- `src/interact/grad.c`: TAG_TOP GRAD handler (line 60), dispatch_mode in GRAD_RETURN (line 16)
-- `src/interact/tensor_ops.c`: defer_all check (line 269), ASSIGN guard (line 14)
-- `src/tinyhvm.h`: defer_all, dispatch_mode fields
-- `src/schedule/_.c`: reverted to passthrough
-- `test/test_beautiful_mnist.m`: uses thvm_reduce (not thvm_eval)
-
-### Verified numbers (from earlier experiments)
-- With lazy forward + scheduler dispatch: **20 dispatches** (no adam), **34 total**
-- Memory: **631MB** (vs 2121MB baseline)
-- Tinygrad: 73 kernels for same model
-- Default path: 94.4% correct, 368 dispatches (unchanged)
+### What's NOT done
+- The scheduler (Step 2-6) — the core missing piece
 
 ## Immediate Next Steps
 
-1. **Fix gradient ADD WNF problem** (Step 1 blocker):
-   Gradient expressions created by GRAD must reduce, but they're compute TAG_TOPs (WNF).
-   Options: (a) use a non-WNF combinator for gradient combining, (b) have GRAD reduce
-   gradient expressions internally before returning, (c) structural tagging to distinguish
-   gradient TAG_TOPs from forward TAG_TOPs. **Ask user which approach.**
+The scheduler needs to:
 
-2. **Fix ASSIGN finding** (Step 2 blocker):
-   Gradient ASSIGNs are inside consumed APP chains. Need heap scan or track them during GRAD.
+### Step 2: Walk TAG_TOP graph, build kernel groups
+- Scan the 274 TAG_TOPs on the heap
+- Group into fused kernels (reuse `fuse_walk_inner` for TAG_TOP trees)
+- Identify kernel boundaries: SUM/RMAX (reduces), multi-consumer nodes
+- Output: array of KernelEntry with FusedOps, leaf TAG_TEN refs, ReduceSpec
 
-3. **Fix second reduce target** (Step 3):
-   Don't re-reduce stale `t`. Reduce each found ASSIGN individually with dispatch_mode=1.
+### Step 3: Memory planner
+- Compute lifetimes across kernel entries
+- Greedy interval coloring for buffer reuse
+
+### Step 4: Write UOP_FUSING specs + build new reducible graph
+- For each kernel: allocate heap for UOP_FUSING node with kernel spec
+- **Build a NEW root term** that chains:
+  `APP(UOP_FUSING_0, APP(UOP_FUSING_1, ... APP(GRAD_term, ASSIGN_chain)))`
+  The second reduce walks this chain — each UOP_FUSING fires (dispatch),
+  GRAD fires (creates backward TAG_TOPs which get their own UOP_FUSING pass),
+  ASSIGNs fire (buf_copy).
+- Key: there is NO single root in an inet. The scheduler creates reducible
+  entries for every output tensor. `thvm_reduce` can start from any of them.
+
+### Step 5: UOP_FUSING interaction handler
+- When UOP_FUSING fires: read spec → codegen → dispatch → TAG_TEN
+
+### Step 6: Second reduce
+- Reduce the new graph built by scheduler
+- UOP_FUSINGs fire → forward materializes → GRAD fires → backward materializes → ASSIGNs fire
+
+### Key design question for Step 4
+The scheduler should produce a NEW reducible graph on the heap. Not re-reduce
+the stale `t`. The new graph chains UOP_FUSING → GRAD → ASSIGN nodes.
+Each UOP_FUSING has its kernel spec. GRAD references forward UOP_FUSING outputs.
+ASSIGNs reference backward UOP_FUSING outputs.
+
+The second `thvm_reduce` processes this new graph. No dispatch_mode flag needed —
+UOP_FUSING is in the non-WNF set (line 103), so the trampoline fires it normally.
 
 ## Key Insight from Exploration
 Scheduler DAG analysis showed:

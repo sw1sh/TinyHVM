@@ -624,7 +624,7 @@
             // During backward (no_grad_alloc=1): DON'T defer reduces. Deferred reduces
             // become TAG_TEN with buf_id=0, but the reducer treats TAG_TEN as WNF
             // and never materializes them. This causes zero gradients.
-            if ((!ctx->no_grad_alloc || ctx->defer_all) &&
+            if (!ctx->no_grad_alloc &&
                 ((uop == UOP_SUM && b_id != 0) || uop == UOP_RMAX) &&
                 ma->buf_id == 0 && ma->creator_op &&
                 (is_elementwise(ma->creator_op) ||

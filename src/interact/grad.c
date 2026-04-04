@@ -13,7 +13,7 @@
                 #define GRAD_RETURN(r) do { \
                     ctx->no_fuse = _saved_nf; \
                     ctx->no_grad_alloc = _saved_nga; \
-                    ctx->dispatch_mode = 1; /* gradient exprs must reduce, not stay lazy */ \
+                    /* don't set dispatch_mode — let lazy trampoline handle gradient TAG_TOPs */ \
                     return (r); \
                 } while(0)
                 Term y  = heap_read(ctx, loc);

@@ -107,8 +107,7 @@ int main(void) {
         double t_adam = now_s();
 
         if(step<3||step%10==0||step==n_steps-1){
-            if (term_tag(loss) == TAG_TOP) { ctx->dispatch_mode = 1; loss = thvm_reduce(ctx, loss); ctx->dispatch_mode = 0; }
-            f32 lv = (term_tag(loss)==TAG_TEN) ? thvm_to_host(ctx,loss)[0] : 0;
+            f32 lv=thvm_to_host(ctx,loss)[0];
             extern void print_dispatch_breakdown(void);
             if(step==0) { print_dispatch_breakdown();
                 printf("  Phase: fwd+bwd=%u dispatches (%.0fms), adam=%u (%.0fms)\n",

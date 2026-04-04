@@ -141,7 +141,8 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             // arg0 just finished. whnf = arg0's result.
             u64 loc = term_val(frame);
             if (term_tag(whnf) != TAG_TEN && term_tag(whnf) != TAG_ERA &&
-                term_tag(whnf) != TAG_NUM && term_tag(whnf) != TAG_SUP) {
+                term_tag(whnf) != TAG_NUM && term_tag(whnf) != TAG_SUP &&
+                !(term_tag(whnf) == TAG_TOP && term_ext(frame) == UOP_GRAD)) {
                 heap_set(ctx, loc+0, whnf); whnf = frame; continue;
             }
             heap_set(ctx, loc + 0, whnf);  // store arg0 result

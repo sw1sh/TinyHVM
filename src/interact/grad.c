@@ -56,6 +56,7 @@
                 // ── GRAD on TAG_TOP: pure graph rewrite ──
                 // y is a lazy compute op. Read UOP + args from heap.
                 if (term_tag(y) == TAG_TOP && term_ext(y) != UOP_GRAD) {
+                    static u32 _gc = 0; _gc++; if (_gc <= 30 && getenv("THVM_SCHED_DIAG")) fprintf(stderr, "GRAD_TOP[%u]: uop=%s\n", _gc, term_ext(y)<UOP_COUNT?uop_names[term_ext(y)]:"?");
                     u32 cop = term_ext(y);
                     u64 y_loc = term_val(y);
                     Term at = heap_read(ctx, y_loc);
@@ -76,7 +77,21 @@
                           else if (term_tag(_gt)==TAG_TOP) _gv=st_get(term_val(_gt)); \
                           if (_gv) st_set(_l, _gv); } \
                         term_new(TAG_TOP, UOP_GRAD, _l); })
-                    #define BG(da_,db_) do { GRAD_RETURN(thvm_op(ctx, UOP_ADD, GRAD3_H(at,da_,x), GRAD3_H(bt,db_,x))); } while(0)
+                    // Chain gradients: SUP wraps both. DUP then evaluates each.
+                    // Using APP(APP(LAM(ERA), grad_a), grad_b) to force both evaluations.
+                    // Simpler: return ADD(grad_a, grad_b). ADD is compute TAG_TOP (WNF).
+                    // But with lazy TAG_TOPs, ADD never fires. Need something that fires.
+                    // Use thvm_app with nested APP: APP(APP(id, grad_a), grad_b) where id = LAM(VAR(0)).
+                    // Actually: just run grad_a, then grad_b, via GRAD_STEP loop.
+                    #define BG(da_,db_) do { \
+                        Term _gb = GRAD3_H(bt,db_,x); \
+                        Term _ga = GRAD3_H(at,da_,x); \
+                        /* Chain: APP(_ga, _gb). _ga fires as fun, _gb fires as arg. */ \
+                        /* But _ga returns ERA → APP(ERA, _gb) → ERA. _gb never fires. */ \
+                        /* Fix: use SUP to force both: &0{_ga, _gb}. DUP splits. */ \
+                        /* Simplest: thvm_app(ctx, thvm_app(ctx, _ga, term_era()), thvm_app(ctx, _gb, term_era())) */ \
+                        GRAD_RETURN(thvm_app(ctx, thvm_app(ctx, _ga, term_era()), thvm_app(ctx, _gb, term_era()))); \
+                    } while(0)
                     #define UG(da_) do { Term _u=GRAD3_H(at,da_,x); if(term_tag(_u)==TAG_TOP) GRAD_STEP(_u); GRAD_RETURN(_u); } while(0)
 
                     switch (cop) {

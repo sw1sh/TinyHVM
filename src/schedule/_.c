@@ -27,10 +27,46 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     // Phase 1: Reduce — compute TAG_TOPs stay WNF, GRAD fires
     t = thvm_reduce(ctx, t);
 
-    // Phase 2: Find ASSIGNs, dispatch their src trees
-    u64 assign_locs[128]; u32 na = sched_find_assigns(ctx, t, assign_locs, 128);
+    // Phase 2: Scan heap for ALL unreduced ASSIGNs (src is TAG_TOP).
+    // GRAD creates ASSIGNs inside consumed APP chains — not reachable from t.
+    u64 assign_locs[128]; u32 na = 0;
+    for (u64 h = 1; h < ctx->heap_pos && na < 128; h++) {
+        Term ht = ctx->heap[h];
+        // ASSIGN TAG_TOPs are stored on heap as part of APP(ASSIGN(...), ERA) patterns.
+        // The ASSIGN itself is at heap[loc] where loc is the TAG_TOP's val.
+        // We detect ASSIGN by checking TAG_TOP with UOP_ASSIGN ext.
+        // But heap stores raw Terms at each slot — a TAG_TOP(UOP_ASSIGN, loc) would
+        // be in a parent's arg slot. Let's just look for the pattern:
+        // heap[h] = TAG_TEN(dst), heap[h+1] = TAG_TOP(src) where this is an ASSIGN's args.
+        // Better: use sched_find_assigns to walk from t.
+    }
+    na = sched_find_assigns(ctx, t, assign_locs, 128);
+    u32 na_walk = na;
+    // Also scan heap slots directly for ASSIGN TAG_TOPs
+    // (GRAD deposits are inside consumed APP chains — not reachable from t)
+    for (u64 h = 1; h < ctx->heap_pos && na < 128; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
+            u64 loc = term_val(ht);
+            if (loc >= ctx->heap_pos) continue;
+            Term dst = heap_read(ctx, loc);
+            Term src = heap_read(ctx, loc + 1);
+            if (term_tag(dst) == TAG_TEN && term_tag(src) == TAG_TOP) {
+                // Check not already in assign_locs
+                int found = 0;
+                for (u32 j = 0; j < na; j++) if (assign_locs[j] == loc) { found = 1; break; }
+                if (!found) assign_locs[na++] = loc;
+            }
+        }
+    }
+    // Count ALL ASSIGN-like patterns on heap for debugging
+    u32 _ha = 0;
+    for (u64 h = 1; h + 1 < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) _ha++;
+    }
     if (getenv("THVM_SCHED_DIAG"))
-        fprintf(stderr, "SCHED: %u assigns\n", na);
+        fprintf(stderr, "SCHED: %u assigns (%u walk + %u heap scan), %u ASSIGN terms on heap\n", na, na_walk, na - na_walk, _ha);
 
     for (u32 i = 0; i < na; i++) {
         Term src = heap_read(ctx, assign_locs[i] + 1);

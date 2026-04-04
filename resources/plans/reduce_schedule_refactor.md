@@ -1,5 +1,7 @@
 # Plan: Refactor Reduce / Schedule / Realize
 
+> **Rule**: Do NOT change this plan's architecture. If stuck on implementation, ASK the user instead of pivoting to a different approach. The three-phase reduce → schedule → reduce architecture is the target. No "single-pass" fallbacks, no flag hacks, no reverting to the old eager path.
+
 ## Architecture
 
 ```

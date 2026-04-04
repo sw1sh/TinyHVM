@@ -608,7 +608,8 @@ typedef struct {
     u8          no_grad_alloc; // 1 to skip separate buffer alloc for requires_grad virtual intermediates (backward)
     u8          no_dup;     // 1 to skip linear_use DUP (used inside GRAD handler)
     u8          prescan_done; // 1 after grad_prescan runs for current backward pass
-    u8          defer_all;   // 1 = all compute ops defer during first reduce
+    u8          defer_all;   // (unused)
+    u8          dispatch_mode; // 1 = trampoline reduces compute TAG_TOPs normally
 
     // Named definitions for TAG_REF (global def table)
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term

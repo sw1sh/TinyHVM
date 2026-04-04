@@ -95,8 +95,10 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     // TAG_TOP: compute ops are WNF (lazy). Non-compute ops reduce args and fire.
     if (tag == TAG_TOP) {
         u32 _uop = term_ext(next);
-        // Compute ops: WNF (constructor). Scheduler dispatches later.
-        if (_uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
+        // Compute ops: WNF (constructor) UNLESS dispatch_mode is set.
+        // dispatch_mode: scheduler is materializing — process normally.
+        if (!ctx->dispatch_mode &&
+            _uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
             _uop != UOP_LOG_PRINT && _uop != UOP_TODEVICE && _uop != UOP_WHERE &&
             _uop != UOP_FUSING) {
             whnf = next; goto apply;

@@ -92,6 +92,7 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
     for (u32 i = 1; i < ctx->tensor_count; i++) {
         ctx->tensors[i].grad_refs = 0;
         ctx->tensors[i].grad_cache = 0;
+        ctx->tensors[i].defer_consumers = 0;
     }
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();

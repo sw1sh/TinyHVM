@@ -108,10 +108,13 @@ int main(void) {
     Term train_step=thvm_app(ctx,grad_term,bn_assigns);
     u32 n_persistent=ctx->tensor_count;
 
-    // Capture
-    for(int i=0;i<NP;i++) memset(metal_pool.bufs[ctx->tensors[gids[i]].buf_id].contents,0,psz[i]*4);
+    // Capture — zero grads via GPU (inside capture, so JIT replays them)
     jit_begin_capture(n_persistent);
     double t0=now_s();
+    for(int i=0;i<NP;i++) {
+        extern void metal_op_zero_fill(u32 buf, u32 n);
+        metal_op_zero_fill(ctx->tensors[gids[i]].buf_id, psz[i]);
+    }
     thvm_reduce(ctx,train_step);
     adam_step_direct(ctx,&opt,gids);
     f32 lv=thvm_to_host(ctx,loss)[0];
@@ -168,8 +171,7 @@ int main(void) {
         memset(oh_data, 0, BS*10*sizeof(f32));
         for(u32 i=0;i<BS;i++) oh_data[i*10+data.train_labels[bi*BS+i]]=1.f;
         ctx->tensors[oh_tid].backend->buf_write(ctx->tensors[oh_tid].buf_id, oh_data, BS*10*sizeof(f32));
-        // Zero grads
-        for(int i=0;i<NP;i++) memset(metal_pool.bufs[ctx->tensors[gids[i]].buf_id].contents, 0, psz[i]*4);
+        // Grads zeroed by GPU zero_fill captured in JIT — no CPU memset needed
         // Patch Adam bc1/bc2 in JIT commands
         opt.t++;
         f32 nbc1 = 1.0f - powf(opt.beta1, (f32)opt.t);

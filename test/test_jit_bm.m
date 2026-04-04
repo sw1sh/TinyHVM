@@ -215,6 +215,8 @@ int main(void) {
         train_time, n_steps-1, train_time*1000/(n_steps-1));
 
     // === Eval ===
+    // Clean up JIT state before eval — reset pool to weight watermark
+    thvm_reset(ctx, nw);
     // Use non-JIT forward pass for evaluation (simpler, uses persistent weights)
     Term test_data = thvm_tensor(ctx, data.test_images, (Shape){.dims={data.n_test,1,28,28},.rank=4});
     u32 ek = ctx->tensor_count;

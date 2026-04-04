@@ -164,6 +164,21 @@ When UOP_FUSING fires: read spec → codegen → dispatch → create TensorMeta 
   the full Step 1 GRAD refactor — GRAD must walk TAG_TOPs on the heap.
   With TAG_TOPs preserved, the scheduler can plan fusion correctly and
   the second reduce dispatches everything in the right order.
+- **Second blocker**: IC reduction is destructive — heap is modified during reduce.
+  Can't run thvm_reduce twice on the same term. The first reduce modifies the heap
+  (stores WNF results, fires APP β-reductions). The second reduce sees the modified
+  graph and can't re-process it correctly.
+
+  **Architecture revision needed**: instead of reduce→schedule→reduce, the scheduler
+  must be integrated INTO the single reduce pass. When the trampoline encounters a
+  compute TAG_TOP, instead of the interact handler returning t (defer) or dispatching
+  eagerly, it should call the scheduler to decide optimal fusion THEN dispatch.
+
+  This is a single-pass architecture: reduce walks the graph depth-first, and at
+  each node the scheduler decides whether to absorb (fuse into parent kernel) or
+  dispatch (start a new kernel). The scheduler's decisions are made as the trampoline
+  processes nodes — no separate pass needed.
+
 - Default path: 94.4% correct, 368 dispatches (unchanged baseline)
 
 ## Key Insight from Exploration

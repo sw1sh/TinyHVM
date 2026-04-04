@@ -151,7 +151,20 @@ When UOP_FUSING fires: read spec → codegen → dispatch → create TensorMeta 
 - Memory planner: 27 specs → 2 physical bufs (205→164MB, 1.3x reuse)
 - Total: 51 dispatches, 602MB (scheduled kernels only 164MB, rest from old path)
 - Tinygrad: 73 kernels, 257MB. Gap is from 17 non-scheduled dispatches.
-- Next: correctness (GRAD TAG_TOP path), then eliminate old path dispatches
+- **Correctness blocker identified**: defer_all breaks ew-reduce fusion contract.
+  When reduces defer but ew ops dispatch, the ew chain gets fused+dispatched
+  during the first reduce. The deferred reduce later can't re-fuse because
+  the ew intermediates are already materialized (values gone from registers).
+  Forward works (loss=2.72) because forward reduces dispatch via rewrite rules.
+  Backward breaks because backward ew ops dispatch with no_grad_alloc=1
+  (no separate intermediate buffers) then the deferred backward reduces
+  can't read the intermediate values that were virtual in the ew kernel.
+- **Fix**: the two-reduce architecture requires compute TAG_TOPs to stay as
+  TAG_TOPs during the first reduce (no dispatch, no TensorMeta). This is
+  the full Step 1 GRAD refactor — GRAD must walk TAG_TOPs on the heap.
+  With TAG_TOPs preserved, the scheduler can plan fusion correctly and
+  the second reduce dispatches everything in the right order.
+- Default path: 94.4% correct, 368 dispatches (unchanged baseline)
 
 ## Key Insight from Exploration
 Scheduler DAG analysis showed:

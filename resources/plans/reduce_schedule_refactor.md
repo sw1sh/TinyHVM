@@ -135,38 +135,56 @@ When UOP_FUSING fires: read spec → codegen → dispatch → create TensorMeta 
 ---
 
 ## Current State
-- Step 0 (MM decompose): ✓ done
-- Scheduler counting: ✓ 30 reduces (14 fwd + 16 bwd) + 14 adam = 44 target
-- Reduce breakdown: conv MM=8, BN=10, pool=2, softmax/loss=4, dense=1, bwd sums=5
-- **Tinygrad comparison**: tinygrad produces 73 kernels for same 4conv+dense model!
-  MLP: 32 kernels. Our 30 reduces = 44 total is ALREADY COMPETITIVE.
-- Step 3 (scheduler fusion walk): ✓ 30 fused reduce kernels
-- Step 4 (memory/absorbed): ✓ mark absorbed tensors as virtual → no OOM
-- Scheduler path: 65 dispatches, 434MB (vs default 71 dispatches, 1564MB)
-- Breakdown: 269 absorbed (virtual), 35 to dispatch (SUM=27 RMAX=3 + 5 standalone)
-- Theoretical min: 30 reduce kernels + 5 standalone + 14 adam = 49 dispatches
-- Tinygrad: 73 kernels for same model — we're ALREADY LOWER
-- To reach ≤20: need fewer reduces in graph (multi-reduce BN, fewer sum_to_shape)
-- Step 5-6 (UOP_FUSING): ✓ scheduler writes 27 fusing specs to heap,
-  ENSURE dispatches via sched_dispatch_fusing. 51 dispatches, 418MB.
-  (tinygrad: 73 kernels for same model — we're 30% better)
-- Memory planner: 27 specs → 2 physical bufs (205→164MB, 1.3x reuse)
-- Total: 51 dispatches, 602MB (scheduled kernels only 164MB, rest from old path)
-- Tinygrad: 73 kernels, 257MB. Gap is from 17 non-scheduled dispatches.
-- **Correctness blocker identified**: defer_all breaks ew-reduce fusion contract.
-  When reduces defer but ew ops dispatch, the ew chain gets fused+dispatched
-  during the first reduce. The deferred reduce later can't re-fuse because
-  the ew intermediates are already materialized (values gone from registers).
-  Forward works (loss=2.72) because forward reduces dispatch via rewrite rules.
-  Backward breaks because backward ew ops dispatch with no_grad_alloc=1
-  (no separate intermediate buffers) then the deferred backward reduces
-  can't read the intermediate values that were virtual in the ew kernel.
-- **Fix**: the two-reduce architecture requires compute TAG_TOPs to stay as
-  TAG_TOPs during the first reduce (no dispatch, no TensorMeta). This is
-  the full Step 1 GRAD refactor — GRAD must walk TAG_TOPs on the heap.
-  With TAG_TOPs preserved, the scheduler can plan fusion correctly and
-  the second reduce dispatches everything in the right order.
-- Default path: 94.4% correct, 368 dispatches (unchanged baseline)
+
+### What's done
+- **Step 0** ✓ MM decomposed to EXPAND+MUL+SUM (thvm_mm). All callers updated.
+- **Trampoline** ✓ Compute TAG_TOPs treated as WNF (lazy). Code in reduce/_.c:99.
+  GRAD/ASSIGN/IFZ/etc still reduce args normally.
+- **Trampoline GRAD fix** ✓ Line 154: accepts TAG_TOP arg0 for GRAD (so GRAD fires
+  when y is a lazy TAG_TOP).
+- **TAG_TOP GRAD handler** ✓ In interact/grad.c:60. Handles all compute ops when
+  y is TAG_TOP. Reads UOP from term_ext, args from heap_read, shapes from st_get.
+  Uses BG/UG macros for binary/unary gradient formulas.
+- **dispatch_mode flag** ✓ In tinyhvm.h:612, reduce/_.c:100. When set, trampoline
+  processes compute TAG_TOPs normally (not lazy). Used by scheduler to dispatch.
+
+### What's NOT working (blockers for Step 2-6)
+- **Gradient ADD is WNF**: GRAD handler's BG macro returns `thvm_op(UOP_ADD, grad_a, grad_b)`.
+  ADD is a compute TAG_TOP → WNF → trampoline never enters it → grad_b never fires.
+  The `dispatch_mode=1` set by GRAD_RETURN contaminates forward TAG_TOPs too.
+  Need a way for gradient expressions to force evaluation without affecting forward laziness.
+- **Second reduce on stale t**: After first reduce, `t` points to consumed heap.
+  Fix: scheduler finds ASSIGNs on heap and reduces each individually (not re-reducing t).
+- **ASSIGN finding**: Only 4 BN assigns found via heap walk. Gradient ASSIGNs created
+  by GRAD inside consumed APP chains not reachable from t. Heap scan needed.
+
+### Experimental code in repo (not reverted)
+- `src/reduce/_.c`: lazy TAG_TOP check (line 99), GRAD TAG_TOP arg0 fix (line 154)
+- `src/interact/grad.c`: TAG_TOP GRAD handler (line 60), dispatch_mode in GRAD_RETURN (line 16)
+- `src/interact/tensor_ops.c`: defer_all check (line 269), ASSIGN guard (line 14)
+- `src/tinyhvm.h`: defer_all, dispatch_mode fields
+- `src/schedule/_.c`: reverted to passthrough
+- `test/test_beautiful_mnist.m`: uses thvm_reduce (not thvm_eval)
+
+### Verified numbers (from earlier experiments)
+- With lazy forward + scheduler dispatch: **20 dispatches** (no adam), **34 total**
+- Memory: **631MB** (vs 2121MB baseline)
+- Tinygrad: 73 kernels for same model
+- Default path: 94.4% correct, 368 dispatches (unchanged)
+
+## Immediate Next Steps
+
+1. **Fix gradient ADD WNF problem** (Step 1 blocker):
+   Gradient expressions created by GRAD must reduce, but they're compute TAG_TOPs (WNF).
+   Options: (a) use a non-WNF combinator for gradient combining, (b) have GRAD reduce
+   gradient expressions internally before returning, (c) structural tagging to distinguish
+   gradient TAG_TOPs from forward TAG_TOPs. **Ask user which approach.**
+
+2. **Fix ASSIGN finding** (Step 2 blocker):
+   Gradient ASSIGNs are inside consumed APP chains. Need heap scan or track them during GRAD.
+
+3. **Fix second reduce target** (Step 3):
+   Don't re-reduce stale `t`. Reduce each found ASSIGN individually with dispatch_mode=1.
 
 ## Key Insight from Exploration
 Scheduler DAG analysis showed:

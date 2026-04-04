@@ -47,7 +47,7 @@ int main(void) {
     h = thvm_op(ctx, UOP_RELU, h, term_era());
     h = thvm_reshape(ctx, h, SHAPE(BS, flat_f));
     Term logits = thvm_op(ctx, UOP_ADD,
-        thvm_op(ctx, UOP_MM, h, lw),
+        thvm_mm(ctx, h, lw),
         thvm_expand(ctx, thvm_reshape(ctx, lb, SHAPE(1,10)), SHAPE(BS,10)));
     Term loss = cross_entropy_loss(ctx, logits, data.train_labels, BS, 10);
     thvm_reduce(ctx, loss);
@@ -78,7 +78,7 @@ int main(void) {
     h = thvm_op(ctx, UOP_RELU, h, term_era());
     h = thvm_reshape(ctx, h, SHAPE(BS, flat_f));
     logits = thvm_op(ctx, UOP_ADD,
-        thvm_op(ctx, UOP_MM, h, lw),
+        thvm_mm(ctx, h, lw),
         thvm_expand(ctx, thvm_reshape(ctx, lb, SHAPE(1,10)), SHAPE(BS,10)));
     loss = cross_entropy_loss(ctx, logits, data.train_labels, BS, 10);
     thvm_reduce(ctx, loss);

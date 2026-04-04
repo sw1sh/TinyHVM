@@ -94,7 +94,7 @@ static void test_backward_chain(void) {
     thvm_set_requires_grad(ctx, W);
     thvm_set_requires_grad(ctx, B);
 
-    Term xw = thvm_op(ctx, UOP_MM, X, W);
+    Term xw = thvm_mm(ctx, X, W);
     Term z = thvm_op(ctx, UOP_RELU, thvm_op(ctx, UOP_ADD, xw,
              thvm_expand(ctx, B, SHAPE(2, 2))), term_era());
     u32 ax[] = {0, 1};

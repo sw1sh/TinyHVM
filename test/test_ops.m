@@ -320,7 +320,7 @@ static void test_matmul(void) {
     f32 a[] = {1,2,3,4}, b[] = {5,6,7,8};
     Term ta = thvm_tensor(ctx, a, SHAPE(2, 2));
     Term tb = thvm_tensor(ctx, b, SHAPE(2, 2));
-    Term result = thvm_op(ctx, UOP_MM, ta, tb);
+    Term result = thvm_mm(ctx, ta, tb);
     u32 n; f32 *out = eval_buf(ctx, result, &n);
     f32 expected[] = {19,22,43,50};
     int ok = (n == 4);
@@ -337,7 +337,7 @@ static void test_matmul_rect(void) {
     f32 b[] = {7,8, 9,10, 11,12};   // [3,2]
     Term ta = thvm_tensor(ctx, a, SHAPE(2, 3));
     Term tb = thvm_tensor(ctx, b, SHAPE(3, 2));
-    Term result = thvm_op(ctx, UOP_MM, ta, tb);
+    Term result = thvm_mm(ctx, ta, tb);
     u32 n; f32 *out = eval_buf(ctx, result, &n);
     // row0: 1*7+2*9+3*11=58, 1*8+2*10+3*12=64
     // row1: 4*7+5*9+6*11=139, 4*8+5*10+6*12=154
@@ -453,7 +453,7 @@ static void test_grad_matmul(void) {
     Term tb = thvm_tensor(ctx, b, SHAPE(2, 2));
     thvm_set_requires_grad(ctx, ta);
     thvm_set_requires_grad(ctx, tb);
-    Term mm = thvm_op(ctx, UOP_MM, ta, tb);
+    Term mm = thvm_mm(ctx, ta, tb);
     u32 axes[] = {0, 1};
     Term loss = thvm_sum_axes(ctx, mm, axes, 2);
     loss = thvm_reshape(ctx, loss, SHAPE(1));

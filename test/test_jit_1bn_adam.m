@@ -52,7 +52,7 @@ int main(void) {
     BNResult bn=batchnorm_forward(ctx,h,bn_g,bn_b,bn_rm,bn_rv,BS,C,26,26,1);
     h=bn.output; h=thvm_maxpool2d(ctx,h,k2,s2);
     h=thvm_reshape(ctx,h,SHAPE(BS,ff));
-    Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
+    Term logits=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,lw),
         thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
     Term probs=softmax(ctx,logits,BS,10);
     f32 eps=1e-7f;
@@ -157,7 +157,7 @@ int main(void) {
         th=batchnorm_forward(ctx,th,bn_g,bn_b,bn_rm,bn_rv,tbs,C,26,26,1).output; // training mode for eval
         th=thvm_maxpool2d(ctx,th,k2e,s2e);
         th=thvm_reshape(ctx,th,SHAPE(tbs,ff));
-        Term tlo=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,th,lw),
+        Term tlo=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,th,lw),
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(tbs,10)));
         f32 acc=thvm_eval_accuracy(ctx,tlo,&data.test_labels[b*tbs],tbs,10);
         cor+=(u32)(acc*(f32)tbs/100.f);thvm_reset(ctx,ek);

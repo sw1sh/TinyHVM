@@ -70,7 +70,7 @@ int main(void) {
         h=thvm_conv2d(ctx,h,cw4,cb4,1,s1,p0);h=thvm_op(ctx,UOP_RELU,h,term_era());
         BNResult _b2=batchnorm_forward(ctx,h,bn2_g,bn2_b,bn2_rm,bn2_rv,BS,64,6,6,1);
         h=_b2.output;h=thvm_maxpool2d(ctx,h,k2,s2);h=thvm_reshape(ctx,h,SHAPE(BS,ff));
-        Term lo=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
+        Term lo=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,lw),
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
         Term _l=cross_entropy_loss(ctx,lo,&data.train_labels[bi*BS],BS,10);
         Term _gs[NP];for(int i=0;i<NP;i++){f32*z=calloc(psz[i],4);
@@ -98,7 +98,7 @@ int main(void) {
     h=thvm_conv2d(ctx,h,cw4,cb4,1,s1,p0);h=thvm_op(ctx,UOP_RELU,h,term_era());
     BNResult bn2=batchnorm_forward(ctx,h,bn2_g,bn2_b,bn2_rm,bn2_rv,BS,64,6,6,1);
     h=bn2.output;h=thvm_maxpool2d(ctx,h,k2,s2);h=thvm_reshape(ctx,h,SHAPE(BS,ff));
-    Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
+    Term logits=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,lw),
         thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
     Term loss=cross_entropy_loss(ctx,logits,&data.train_labels[bi0*BS],BS,10);
     u32 oh_tid=0;for(u32 t=0;t<ctx->tensor_count;t++){View*v=&ctx->tensors[t].view;
@@ -238,7 +238,7 @@ int main(void) {
         th = batchnorm_forward(ctx,th,bn2_g,bn2_b,bn2_rm,bn2_rv,tbs,64,6,6,0).output;
         th = thvm_maxpool2d(ctx,th,k2,s2);
         th = thvm_reshape(ctx,th,SHAPE(tbs,ff));
-        Term tlo = thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,th,lw),
+        Term tlo = thvm_op(ctx,UOP_ADD,thvm_mm(ctx,th,lw),
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(tbs,10)));
         f32 acc = thvm_eval_accuracy(ctx, tlo, &data.test_labels[b*tbs], tbs, 10);
         cor += (u32)(acc*(f32)tbs/100.f);

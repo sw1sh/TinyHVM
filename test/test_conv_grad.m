@@ -48,7 +48,7 @@ int main(void) {
     Term gy_flat = thvm_reshape(ctx, gy_perm, SHAPE(M, N));
 
     // dW_flat = im_T @ gy_flat = [K,M] @ [M,N] = [K,N]
-    Term dW_flat = thvm_op(ctx, UOP_MM, im_T, gy_flat);
+    Term dW_flat = thvm_mm(ctx, im_T, gy_flat);
     // reshape [K,N] → [cin,KH,KW,cout]
     Term dW_rs = thvm_reshape(ctx, dW_flat, shape_of((u32[]){cin,KH,KW,cout}, 4));
     // permute → [cout,cin,KH,KW]
@@ -91,7 +91,7 @@ int main(void) {
     // === Test dX via matmul + col2im ===
     // dX_flat = gy_flat @ w_flat = [M,N] @ [N,K] = [M,K]
     Term w_flat2 = thvm_reshape(ctx, w, SHAPE(N, K));
-    Term dX_flat2 = thvm_op(ctx, UOP_MM, gy_flat, w_flat2);
+    Term dX_flat2 = thvm_mm(ctx, gy_flat, w_flat2);
     // reshape [M,K] → [BS,OY,OX,cin,KH,KW]
     Term dX_6d = thvm_reshape(ctx, dX_flat2, shape_of((u32[]){BS,OY,OX,cin,KH,KW}, 6));
     // permute to [BS,cin,OY,OX,KH,KW]

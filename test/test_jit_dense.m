@@ -48,7 +48,7 @@ int main(void) {
     for (int i = 0; i < NP; i++) thvm_set_requires_grad(ctx, params[i]);
 
     // Build graph: dense + softmax + CE loss
-    Term logits = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, x, w),
+    Term logits = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, x, w),
         thvm_expand(ctx, thvm_reshape(ctx, b, SHAPE(1, 10)), SHAPE(BS, 10)));
     Term probs = softmax(ctx, logits, BS, 10);
     f32 eps = 1e-7f;

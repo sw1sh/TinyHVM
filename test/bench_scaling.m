@@ -44,10 +44,10 @@ int main(void) {
             Term TA = thvm_tensor(ctx, A, SHAPE(N, N));
             Term TB = thvm_tensor(ctx, B, SHAPE(N, N));
             // Warmup
-            for (int i = 0; i < 2; i++) { Term TC = thvm_op(ctx, UOP_MM, TA, TB); thvm_reduce(ctx, TC); thvm_to_host(ctx, TC); }
+            for (int i = 0; i < 2; i++) { Term TC = thvm_mm(ctx, TA, TB); thvm_reduce(ctx, TC); thvm_to_host(ctx, TC); }
             t0 = now();
             for (int i = 0; i < iters; i++) {
-                Term TC = thvm_op(ctx, UOP_MM, TA, TB);
+                Term TC = thvm_mm(ctx, TA, TB);
                 thvm_reduce(ctx, TC);
                 thvm_to_host(ctx, TC); // sync
             }
@@ -94,8 +94,8 @@ int main(void) {
         // Warmup
         for(int s=0;s<3;s++){
             Term X=thvm_shrink(ctx,td,(u32[]){0,BS,0,D},2); thvm_set_requires_grad(ctx,X);
-            Term h=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,X,W1),thvm_expand(ctx,B1,SHAPE(BS,H))),term_era());
-            Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,W2),thvm_expand(ctx,B2,SHAPE(BS,C)));
+            Term h=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,thvm_mm(ctx,X,W1),thvm_expand(ctx,B1,SHAPE(BS,H))),term_era());
+            Term logits=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,W2),thvm_expand(ctx,B2,SHAPE(BS,C)));
             Term loss=cross_entropy_loss(ctx,logits,data.train_labels,BS,C);
             Term gs[NP]; for(int i=0;i<NP;i++){f32*z=calloc(psz[i],4);gs[i]=thvm_tensor(ctx,z,ctx->tensors[(u32)term_val(params[i])].view.shape);free(z);}
             Term gt=thvm_grad_multi(ctx,loss,params,gs,NP);
@@ -110,8 +110,8 @@ int main(void) {
         for(int s=0;s<iters;s++){
             u32 bi2=s%(data.n_train/BS);
             Term X=thvm_shrink(ctx,td,(u32[]){bi2*BS,(bi2+1)*BS,0,D},2); thvm_set_requires_grad(ctx,X);
-            Term h=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,X,W1),thvm_expand(ctx,B1,SHAPE(BS,H))),term_era());
-            Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,W2),thvm_expand(ctx,B2,SHAPE(BS,C)));
+            Term h=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,thvm_mm(ctx,X,W1),thvm_expand(ctx,B1,SHAPE(BS,H))),term_era());
+            Term logits=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,W2),thvm_expand(ctx,B2,SHAPE(BS,C)));
             Term loss=cross_entropy_loss(ctx,logits,&data.train_labels[bi2*BS],BS,C);
             Term gs[NP]; for(int i=0;i<NP;i++){f32*z=calloc(psz[i],4);gs[i]=thvm_tensor(ctx,z,ctx->tensors[(u32)term_val(params[i])].view.shape);free(z);}
             Term gt=thvm_grad_multi(ctx,loss,params,gs,NP);
@@ -145,8 +145,8 @@ int main(void) {
         for(int s=0;s<iters;s++){
             u32 bi2=s%(data.n_train/BS);
             Term X=thvm_shrink(ctx,td,(u32[]){bi2*BS,(bi2+1)*BS,0,D},2); thvm_set_requires_grad(ctx,X);
-            Term h=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,X,W1),thvm_expand(ctx,B1,SHAPE(BS,H))),term_era());
-            Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,W2),thvm_expand(ctx,B2,SHAPE(BS,C)));
+            Term h=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,thvm_mm(ctx,X,W1),thvm_expand(ctx,B1,SHAPE(BS,H))),term_era());
+            Term logits=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,W2),thvm_expand(ctx,B2,SHAPE(BS,C)));
             Term loss=cross_entropy_loss(ctx,logits,&data.train_labels[bi2*BS],BS,C);
             Term gs[NP]; for(int i=0;i<NP;i++){f32*z=calloc(psz[i],4);gs[i]=thvm_tensor(ctx,z,ctx->tensors[(u32)term_val(params[i])].view.shape);free(z);}
             Term gt=thvm_grad_multi(ctx,loss,params,gs,NP);

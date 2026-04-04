@@ -53,7 +53,7 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
         if (uop == UOP_RESHAPE && !walk_no_reshape_through &&
             base && ctx->tensors[base].buf_id == 0 && ctx->tensors[base].creator_op &&
             is_elementwise(ctx->tensors[base].creator_op) &&
-            !ctx->tensors[base].requires_grad && // GRAD handler will add refs later
+            !ctx->tensors[base].requires_grad &&
             tensor_ref_count[base] <= 1) {
             // Pre-check: scan base chain for any op with ref_count > 1
             int safe = 1;
@@ -566,7 +566,6 @@ dispatch_chain:
     if (m->backend->dispatch_kernel_rs) {
         u32 bufs[FUSE_MAX_LEAVES];
         for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
-
         if (reduce_type) {
             ReduceSpec rs = {0};
             rs.reduce_type = reduce_type;

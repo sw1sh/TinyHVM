@@ -30,7 +30,7 @@ int main(int argc, char **argv) {
     Term b = thvm_tensor(ctx, b_data, b_shape, 2);
 
     // z = relu(matmul(x, w) + b)  — b is auto-broadcast!
-    Term xw  = thvm_op(ctx, UOP_MM, x, w);
+    Term xw  = thvm_mm(ctx, x, w);
     Term xwb = thvm_op(ctx, UOP_ADD, xw, b);
     Term z   = thvm_op(ctx, UOP_RELU, xwb, term_era());
 

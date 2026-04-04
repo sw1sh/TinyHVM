@@ -61,8 +61,8 @@ int main(int argc, char **argv) {
         // Forward: x @ W1 → relu → @ W2
         Term x = thvm_tensor(ctx, xd, SHAPE(BS, IN));
         Term h = thvm_op(ctx, UOP_RELU,
-                 thvm_op(ctx, UOP_MM, x, W1), term_era());
-        Term logits = thvm_op(ctx, UOP_MM, h, W2);
+                 thvm_mm(ctx, x, W1), term_era());
+        Term logits = thvm_mm(ctx, h, W2);
 
         // MSE loss
         Term y = thvm_tensor(ctx, yd, SHAPE(BS, OUT));

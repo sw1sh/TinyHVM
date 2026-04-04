@@ -36,7 +36,7 @@ int main(void) {
     printf("tensor_count=%u, metal_pool.count=%u\n", ctx->tensor_count, metal_pool.count);
 
     // Build graph: loss = sum(X @ W)
-    Term mm = thvm_op(ctx, UOP_MM, x, w);  // [BS, K]
+    Term mm = thvm_mm(ctx, x, w);  // [BS, K]
     Term loss = thvm_sum_axes(ctx, mm, (u32[]){0, 1}, 2);  // scalar
     Term grad_term = thvm_grad_multi(ctx, loss, &w, &gw, 1);
     Term sgd = thvm_assign(ctx, w,

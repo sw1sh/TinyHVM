@@ -334,6 +334,29 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
     return term_top(uop, loc);
 }
 
+// Matmul: [M,K] @ [K,N] → [M,N]. Decomposed to EXPAND+MUL+SUM primitives.
+// Codegen can recognize this pattern and emit MPS matmul as optimization.
+Term thvm_mm(TinyHVM *ctx, Term a, Term b) {
+    // Get shapes from TAG_TEN or shape table
+    Shape sa, sb;
+    if (term_tag(a) == TAG_TEN) sa = ctx->tensors[(u32)term_val(a)].view.shape;
+    else { const View *v = st_get(term_val(a)); sa = v ? v->shape : SHAPE(1); }
+    if (term_tag(b) == TAG_TEN) sb = ctx->tensors[(u32)term_val(b)].view.shape;
+    else { const View *v = st_get(term_val(b)); sb = v ? v->shape : SHAPE(1); }
+    u32 M = sa.dims[0], K = sa.dims[1], N = sb.dims[1];
+    // a: [M,K] → [M,K,1] → expand [M,K,N]
+    Term a3 = thvm_reshape(ctx, a, SHAPE(M, K, 1));
+    Term a_exp = thvm_expand(ctx, a3, SHAPE(M, K, N));
+    // b: [K,N] → [1,K,N] → expand [M,K,N]
+    Term b3 = thvm_reshape(ctx, b, SHAPE(1, K, N));
+    Term b_exp = thvm_expand(ctx, b3, SHAPE(M, K, N));
+    // mul: [M,K,N], sum over K (axis 1) → [M,1,N]
+    Term mul = thvm_op(ctx, UOP_MUL, a_exp, b_exp);
+    Term summed = thvm_sum_axes(ctx, mul, (u32[]){1}, 1);
+    // reshape [M,1,N] → [M,N]
+    return thvm_reshape(ctx, summed, SHAPE(M, N));
+}
+
 // Multi-axis SUM: reduces along specified axes in one pass.
 // Matches tinygrad's .sum(axis=[...]) — the axes tensor is stored as the
 // second heap slot, just like reshape stores shape.

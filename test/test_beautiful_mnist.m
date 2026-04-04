@@ -86,7 +86,7 @@ int main(void) {
 
         // Dense
         h=thvm_reshape(ctx,h,SHAPE(BS,ff));
-        Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
+        Term logits=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,lw),
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
         Term loss=cross_entropy_loss(ctx,logits,&data.train_labels[bi*BS],BS,10);
 
@@ -100,7 +100,7 @@ int main(void) {
         Term grad_term=thvm_grad_multi(ctx,loss,params,gs,NP);
         u32 gids[NP]; for(u32 i=0;i<NP;i++) gids[i]=(u32)term_val(gs[i]);
         Term bn_assigns=thvm_app(ctx,bn1.assigns,bn2.assigns);
-        thvm_reduce(ctx,thvm_app(ctx,grad_term,bn_assigns));
+        thvm_eval(ctx,thvm_app(ctx,grad_term,bn_assigns));
         double t_bwd = now_s();
         u32 d_bwd = total_dispatches;
         adam_step_direct(ctx,&opt,gids);
@@ -139,7 +139,7 @@ int main(void) {
         th=batchnorm_forward(ctx,th,bn2_g,bn2_b,bn2_rm,bn2_rv,tbs,64,6,6,0).output;
         th=thvm_maxpool2d(ctx,th,k2,s2);
         th=thvm_reshape(ctx,th,SHAPE(tbs,ff));
-        Term tlo=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,th,lw),
+        Term tlo=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,th,lw),
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(tbs,10)));
         f32 acc=thvm_eval_accuracy(ctx,tlo,&data.test_labels[b*tbs],tbs,10);
         cor+=(u32)(acc*(f32)tbs/100.f);thvm_reset(ctx,ek);

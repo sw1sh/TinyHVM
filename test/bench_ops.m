@@ -95,14 +95,14 @@ int main(void) {
         for(u32 i=0;i<K*N;i++) b[i]=0.01f;
         for(int w=0;w<3;w++){
             Term ta=thvm_tensor(ctx,a,SHAPE(M,K)),tb=thvm_tensor(ctx,b,SHAPE(K,N));
-            thvm_reduce(ctx,thvm_op(ctx,UOP_MM,ta,tb));
+            thvm_reduce(ctx,thvm_mm(ctx,ta,tb));
             thvm_reset(ctx,keep);
         }
         gc_reset();
         double t0=now_ms();
         for(int i=0;i<50;i++){
             Term ta=thvm_tensor(ctx,a,SHAPE(M,K)),tb=thvm_tensor(ctx,b,SHAPE(K,N));
-            thvm_reduce(ctx,thvm_op(ctx,UOP_MM,ta,tb));
+            thvm_reduce(ctx,thvm_mm(ctx,ta,tb));
             thvm_reset(ctx,keep);
         }
         double t1=now_ms();
@@ -180,7 +180,7 @@ int main(void) {
         f32 *x=calloc(M*K,4),*w=calloc(K*N,4),*b=calloc(N,4);
         Term tx=thvm_tensor(ctx,x,SHAPE(M,K)),tw=thvm_tensor(ctx,w,SHAPE(K,N)),tb=thvm_tensor(ctx,b,SHAPE(N));
         total_dispatches=0;
-        Term mm=thvm_op(ctx,UOP_MM,tx,tw);
+        Term mm=thvm_mm(ctx,tx,tw);
         Term bias=thvm_expand(ctx,thvm_reshape(ctx,tb,SHAPE(1,N)),SHAPE(M,N));
         Term out=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,mm,bias),term_era());
         thvm_reduce(ctx,out);
@@ -194,7 +194,7 @@ int main(void) {
         f32 *x=calloc(M*K,4),*w=calloc(K*N,4),*b=calloc(N,4);
         Term tx=thvm_tensor(ctx,x,SHAPE(M,K)),tw=thvm_tensor(ctx,w,SHAPE(K,N)),tb=thvm_tensor(ctx,b,SHAPE(N));
         total_dispatches=0;
-        Term mm=thvm_op(ctx,UOP_MM,tx,tw);
+        Term mm=thvm_mm(ctx,tx,tw);
         Term bias=thvm_expand(ctx,thvm_reshape(ctx,tb,SHAPE(1,N)),SHAPE(M,N));
         Term fwd=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,mm,bias),term_era());
         Term loss=thvm_sum_axes(ctx,fwd,(u32[]){0,1},2);
@@ -209,7 +209,7 @@ int main(void) {
         f32 *x=calloc(M*K,4),*w=calloc(K*N,4),*b=calloc(N,4);
         Term tx=thvm_tensor(ctx,x,SHAPE(M,K)),tw=thvm_tensor(ctx,w,SHAPE(K,N)),tb=thvm_tensor(ctx,b,SHAPE(N));
         thvm_set_requires_grad(ctx,tw);
-        Term mm=thvm_op(ctx,UOP_MM,tx,tw);
+        Term mm=thvm_mm(ctx,tx,tw);
         Term bias=thvm_expand(ctx,thvm_reshape(ctx,tb,SHAPE(1,N)),SHAPE(M,N));
         Term fwd=thvm_op(ctx,UOP_RELU,thvm_op(ctx,UOP_ADD,mm,bias),term_era());
         Term loss=thvm_sum_axes(ctx,fwd,(u32[]){0,1},2);

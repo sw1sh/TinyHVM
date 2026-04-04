@@ -41,11 +41,11 @@ int main(void) {
     Term X=thvm_tensor(ctx,data.train_images,SHAPE(BS,784));
 
     // Forward: skip MLP with h reuse (diamond)
-    Term z1=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,X,W1),thvm_expand(ctx,B1,SHAPE(BS,H)));
+    Term z1=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,X,W1),thvm_expand(ctx,B1,SHAPE(BS,H)));
     Term h=thvm_op(ctx,UOP_RELU,z1,term_era());
     Term hs=thvm_reshape(ctx,thvm_op(ctx,UOP_SUM,thvm_reshape(ctx,h,SHAPE(BS*H)),term_era()),SHAPE(1,1));
     Term out=thvm_op(ctx,UOP_ADD,
-        thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,W2),thvm_expand(ctx,B2,SHAPE(BS,10))),
+        thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,W2),thvm_expand(ctx,B2,SHAPE(BS,10))),
         thvm_expand(ctx,hs,SHAPE(BS,10)));
 
     // Cross-entropy

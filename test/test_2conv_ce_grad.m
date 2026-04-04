@@ -55,7 +55,7 @@ int main(void) {
     Term h2=thvm_conv2d(ctx,h1,cw2,cb2,1,s1,p0);
     h2=thvm_op(ctx,UOP_RELU,h2,term_era());
     Term flat=thvm_reshape(ctx,h2,SHAPE(BS,flat_f));
-    Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,flat,lw),
+    Term logits=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,flat,lw),
         thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
     Term loss=cross_entropy_loss(ctx,logits,data.train_labels,BS,10);
     thvm_reduce(ctx,loss);

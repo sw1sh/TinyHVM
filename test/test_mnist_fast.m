@@ -86,7 +86,7 @@ int main(void) {
         h=thvm_conv2d(ctx,h,cw4,cb4,1,s1,p1);
         h=thvm_op(ctx,UOP_RELU,h,term_era());
         h=thvm_reshape(ctx,h,SHAPE(BS,ff));
-        Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
+        Term logits=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,lw),
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
         Term loss=cross_entropy_loss(ctx,logits,&data.train_labels[bi*BS],BS,10);
 
@@ -131,7 +131,7 @@ int main(void) {
         th=thvm_conv2d(ctx,th,cw4,cb4,1,s1,p1);
         th=thvm_op(ctx,UOP_RELU,th,term_era());
         th=thvm_reshape(ctx,th,SHAPE(tbs,ff));
-        Term tlo=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,th,lw),
+        Term tlo=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,th,lw),
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(tbs,10)));
         f32 acc=thvm_eval_accuracy(ctx,tlo,&data.test_labels[b*tbs],tbs,10);
         cor+=(u32)(acc*(f32)tbs/100.f);thvm_reset(ctx,ek);

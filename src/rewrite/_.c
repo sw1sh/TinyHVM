@@ -139,6 +139,7 @@ static RewriteRule rewrite_rules[] = {
 // Try all matching rewrite rules. Returns rewritten term, or t if none matched.
 static Term rewrite_apply(TinyHVM *ctx, Term t) {
     if (rewrite_active) return t;
+    if (ctx->defer_all) return t;
     // During backward: only allow SUM/RMAX fusion (reduce + ew chain).
     // Elementwise-only fusion is unsafe during backward because it evaluates
     // partial lazy chains before all GRAD inputs are ready.

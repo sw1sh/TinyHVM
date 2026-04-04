@@ -52,11 +52,11 @@ static Term lazy_mse(TinyHVM *ctx, Term pred, Term target) {
 static Term lazy_forward(TinyHVM *ctx, Term x, Term W1, Term b1, Term W2, Term b2) {
     // h = relu(x @ W1 + b1)
     Term pre1 = thvm_op(ctx, UOP_ADD,
-                    thvm_op(ctx, UOP_MM, x, W1), b1);
+                    thvm_mm(ctx, x, W1), b1);
     Term h    = thvm_op(ctx, UOP_RELU, pre1, term_era());
     // out = h @ W2 + b2
     Term out  = thvm_op(ctx, UOP_ADD,
-                    thvm_op(ctx, UOP_MM, h, W2), b2);
+                    thvm_mm(ctx, h, W2), b2);
     return out;
 }
 

@@ -55,8 +55,8 @@ static BobNet bobnet_init(TinyHVM *ctx, u32 in_d, u32 hid, u32 out_d) {
 }
 
 static Term bobnet_fwd(TinyHVM *ctx, BobNet *net, Term x) {
-    return thvm_op(ctx, UOP_MM,
-           thvm_op(ctx, UOP_RELU, thvm_op(ctx, UOP_MM, x, net->l1), term_era()),
+    return thvm_mm(ctx,
+           thvm_op(ctx, UOP_RELU, thvm_mm(ctx, x, net->l1), term_era()),
            net->l2);
 }
 

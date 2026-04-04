@@ -32,7 +32,7 @@ static void test(const char *dev){
     h=bn.output;
     h=thvm_maxpool2d(ctx,h,k2,s2); // [4,4,12,12]
     h=thvm_reshape(ctx,h,SHAPE(BS,ff));
-    Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
+    Term logits=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,lw),
         thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
     Term loss=cross_entropy_loss(ctx,logits,&data.train_labels[0],BS,10);
     #define NP 2

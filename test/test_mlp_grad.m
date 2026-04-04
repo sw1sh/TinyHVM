@@ -49,9 +49,9 @@ int main() {
         Term target = thvm_tensor(ctx, target_data, shape_of((u32[]){BS, OUT}, 2));
 
         // Forward: h = relu(x @ W1 + b1); out = h @ W2 + b2
-        Term h = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, x, w1), b1);
+        Term h = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, x, w1), b1);
         h = thvm_op(ctx, UOP_RELU, h, term_era());
-        Term out = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, w2), b2);
+        Term out = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, h, w2), b2);
 
         // MSE loss
         Term diff = thvm_op(ctx, UOP_SUB, out, target);

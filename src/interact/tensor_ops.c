@@ -11,6 +11,7 @@
                 {
                     u32 dst_id = (u32)term_val(dst_r);
                     u32 src_id = (u32)term_val(src_t);
+                    if (ctx->tensors[src_id].buf_id == 0) return t; // deferred — scheduler handles
                     if (dst_id != src_id) {
                         TensorMeta *md = &ctx->tensors[dst_id];
                         TensorMeta *ms = &ctx->tensors[src_id];
@@ -265,6 +266,51 @@
 
             u32 a_id = (u32)term_val(a);
             TensorMeta *ma = &ctx->tensors[a_id];
+
+            // defer_all: all compute ops create deferred TensorMeta, no dispatch
+            if (ctx->defer_all) {
+                u32 b_id = is_binary ? (u32)term_val(b) : 0;
+                TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
+                u32 out_shape[MAX_DIM]; u32 out_ndim;
+                if (is_reduce) {
+                    out_ndim = ma->view.shape.rank;
+                    for (u32 i = 0; i < out_ndim; i++) out_shape[i] = ma->view.shape.dims[i];
+                    Term sa = heap_read(ctx, loc + 1);
+                    if (term_tag(sa) == TAG_TEN) {
+                        u32 ax_id = (u32)term_val(sa);
+                        TensorMeta *axt = &ctx->tensors[ax_id];
+                        f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel * 4);
+                        for (u32 i = 0; i < axt->view.numel; i++) out_shape[(u32)af[i]] = 1;
+                        if (!b_id) b_id = ax_id;
+                    } else { for (int d=(int)out_ndim-1;d>=0;d--) if(out_shape[d]>1){out_shape[d]=1;break;} }
+                } else if (is_binary) {
+                    View av, bv; view_broadcast(&ma->view, &mb->view, &av, &bv, out_shape, &out_ndim);
+                } else if (is_movement && term_tag(b)==TAG_TEN) {
+                    u32 bv_id = (u32)term_val(b); b_id = bv_id;
+                    TensorMeta *bm = &ctx->tensors[bv_id];
+                    if (uop==UOP_PERMUTE) {
+                        out_ndim = ma->view.shape.rank;
+                        f32 pf[MAX_DIM]; META_READ(bm->backend, bm->buf_id, pf, out_ndim*4);
+                        for (u32 i=0;i<out_ndim;i++) out_shape[i]=ma->view.shape.dims[(u32)pf[i]];
+                    } else {
+                        out_ndim = bm->view.numel;
+                        f32 df[MAX_DIM]; META_READ(bm->backend, bm->buf_id, df, out_ndim*4);
+                        for (u32 i=0;i<out_ndim;i++) out_shape[i]=(u32)df[i];
+                    }
+                } else {
+                    out_ndim = ma->view.shape.rank;
+                    for (u32 i=0;i<out_ndim;i++) out_shape[i]=ma->view.shape.dims[i];
+                }
+                u32 dst_id = ctx->tensor_count++;
+                TensorMeta *md = &ctx->tensors[dst_id];
+                memset(md, 0, sizeof(*md));
+                md->dtype = ma->dtype; md->refcount = 1; md->backend = ma->backend;
+                md->view = view_create(shape_of(out_shape, out_ndim));
+                md->creator_op = uop; md->src_ids[0] = a_id; md->src_ids[1] = b_id;
+                if (ma->requires_grad || (mb && mb->requires_grad)) md->requires_grad = 1;
+                ctx->itrs++;
+                RETURN_REDUCED(term_ten(dst_id, ma->dtype));
+            }
 
             // Movement ops: create view, share buffer, no compute
             if (is_movement) {

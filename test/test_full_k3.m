@@ -39,7 +39,7 @@ static void test(const char *dev){
     BNResult bn2=batchnorm_forward(ctx,h,bn2_g,bn2_b,bn2_rm,bn2_rv,BS,64,6,6,1);
     h=bn2.output;h=thvm_maxpool2d(ctx,h,k2,s2);
     h=thvm_reshape(ctx,h,SHAPE(BS,ff));
-    Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
+    Term logits=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,lw),
         thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
     Term loss=cross_entropy_loss(ctx,logits,&data.train_labels[0],BS,10);
     // Gradient for ALL 14 params

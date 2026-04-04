@@ -36,7 +36,7 @@ int main(void) {
 
             // Warmup
             for (int i = 0; i < 3; i++) {
-                Term C = thvm_op(ctx, UOP_MM, A, B);
+                Term C = thvm_mm(ctx, A, B);
                 thvm_reduce(ctx, C);
             }
             if (ctx->backends[1] && ctx->backends[1]->end_batch) ctx->backends[1]->end_batch();
@@ -45,7 +45,7 @@ int main(void) {
             int iters = (N <= 512) ? 50 : (N <= 1024) ? 20 : 10;
             double t0 = now();
             for (int i = 0; i < iters; i++) {
-                Term C = thvm_op(ctx, UOP_MM, A, B);
+                Term C = thvm_mm(ctx, A, B);
                 thvm_reduce(ctx, C);
                 thvm_to_host(ctx, C); // force GPU sync
             }
@@ -81,9 +81,9 @@ int main(void) {
         // Warmup
         for (int i = 0; i < 5; i++) {
             Term h = thvm_op(ctx, UOP_RELU,
-                thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1),
+                thvm_op(ctx, UOP_ADD, thvm_mm(ctx, X, W1),
                     thvm_expand(ctx, B1, SHAPE(BS, H))), term_era());
-            Term out = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
+            Term out = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, h, W2),
                 thvm_expand(ctx, B2, SHAPE(BS, C)));
             thvm_reduce(ctx, out);
             thvm_reset(ctx, keep);
@@ -93,9 +93,9 @@ int main(void) {
         double t0 = now();
         for (int i = 0; i < iters; i++) {
             Term h = thvm_op(ctx, UOP_RELU,
-                thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1),
+                thvm_op(ctx, UOP_ADD, thvm_mm(ctx, X, W1),
                     thvm_expand(ctx, B1, SHAPE(BS, H))), term_era());
-            Term out = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
+            Term out = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, h, W2),
                 thvm_expand(ctx, B2, SHAPE(BS, C)));
             thvm_reduce(ctx, out);
             thvm_to_host(ctx, out); // force sync
@@ -135,9 +135,9 @@ int main(void) {
         for (int s = 0; s < 3; s++) {
             Term X = thvm_shrink(ctx, td, (u32[]){0,BS,0,D}, 2);
             Term h = thvm_op(ctx, UOP_RELU,
-                thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1),
+                thvm_op(ctx, UOP_ADD, thvm_mm(ctx, X, W1),
                     thvm_expand(ctx, B1, SHAPE(BS,H))), term_era());
-            Term logits = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
+            Term logits = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, h, W2),
                 thvm_expand(ctx, B2, SHAPE(BS,C)));
             Term loss = cross_entropy_loss(ctx, logits, data.train_labels, BS, C);
             Term gs[NP]; for(int i=0;i<NP;i++){f32*z=calloc(psz[i],4);gs[i]=thvm_tensor(ctx,z,ctx->tensors[(u32)term_val(params[i])].view.shape);free(z);}
@@ -156,9 +156,9 @@ int main(void) {
             Term X = thvm_shrink(ctx, td, (u32[]){bi*BS,(bi+1)*BS,0,D}, 2);
             thvm_set_requires_grad(ctx, X);
             Term h = thvm_op(ctx, UOP_RELU,
-                thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1),
+                thvm_op(ctx, UOP_ADD, thvm_mm(ctx, X, W1),
                     thvm_expand(ctx, B1, SHAPE(BS,H))), term_era());
-            Term logits = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
+            Term logits = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, h, W2),
                 thvm_expand(ctx, B2, SHAPE(BS,C)));
             Term loss = cross_entropy_loss(ctx, logits, &data.train_labels[bi*BS], BS, C);
             Term gs[NP]; for(int i=0;i<NP;i++){f32*z=calloc(psz[i],4);gs[i]=thvm_tensor(ctx,z,ctx->tensors[(u32)term_val(params[i])].view.shape);free(z);}

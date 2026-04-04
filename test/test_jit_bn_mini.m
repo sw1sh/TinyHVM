@@ -64,7 +64,7 @@ int main(void) {
     BNResult bn2=batchnorm_forward(ctx,h,bn2_g,bn2_b,bn2_rm,bn2_rv,BS,C2,11,11,1);
     h=bn2.output; h=thvm_maxpool2d(ctx,h,k2,s2);
     h=thvm_reshape(ctx,h,SHAPE(BS,ff));
-    Term logits=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),
+    Term logits=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,lw),
         thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
 
     // Loss
@@ -158,7 +158,7 @@ int main(void) {
         BNResult bn2b=batchnorm_forward(ctx,h2,bn2_g,bn2_b,bn2_rm,bn2_rv,BS,C2,11,11,1);
         h2=bn2b.output; h2=thvm_maxpool2d(ctx,h2,k22,s22);
         h2=thvm_reshape(ctx,h2,SHAPE(BS,ff));
-        Term logits2=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h2,lw),
+        Term logits2=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h2,lw),
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
         Term probs2=softmax(ctx,logits2,BS,10);
         f32 eps2=1e-7f;
@@ -254,7 +254,7 @@ int main(void) {
         th=batchnorm_forward(ctx,th,bn2_g,bn2_b,bn2_rm,bn2_rv,tbs,C2,11,11,0).output;
         th=thvm_maxpool2d(ctx,th,k2e,s2e);
         th=thvm_reshape(ctx,th,SHAPE(tbs,ff));
-        Term tlo=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,th,lw),
+        Term tlo=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,th,lw),
             thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(tbs,10)));
         f32 acc=thvm_eval_accuracy(ctx,tlo,&data.test_labels[b2*tbs],tbs,10);
         cor+=(u32)(acc*(f32)tbs/100.f);thvm_reset(ctx,ek);

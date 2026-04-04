@@ -24,10 +24,10 @@ static Term train_program(TinyHVM *ctx,
     assert(train_id < 256);
 
     // Forward: 2-layer MLP
-    Term z1  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1),
+    Term z1  = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, X, W1),
                        thvm_expand(ctx, B1, SHAPE(4, 4)));
     Term h   = thvm_op(ctx, UOP_RELU, z1, term_era());
-    Term out = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
+    Term out = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, h, W2),
                        thvm_expand(ctx, B2, SHAPE(4, 1)));
 
     // MSE Loss
@@ -156,7 +156,7 @@ static Term mnist_train_program(TinyHVM *ctx,
 
     // Forward: h = relu(X@W1+B1), out = h@W2 + B2 + skip(h)
     // h used TWICE: in MM and in skip — tests DUP / gradient accumulation
-    Term z1  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1),
+    Term z1  = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, X, W1),
                        thvm_expand(ctx, B1, SHAPE(batch_size, hidden_dim)));
     Term h   = thvm_op(ctx, UOP_RELU, z1, term_era());
     // Skip: h used twice (MM + mean reduction). Mean keeps logits reasonable.
@@ -167,7 +167,7 @@ static Term mnist_train_program(TinyHVM *ctx,
             SHAPE(1, 1)),
         thvm_tensor(ctx, &inv_bh, SHAPE(1, 1)));
     Term out = thvm_op(ctx, UOP_ADD,
-        thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
+        thvm_op(ctx, UOP_ADD, thvm_mm(ctx, h, W2),
                        thvm_expand(ctx, B2, SHAPE(batch_size, 10))),
         thvm_expand(ctx, h_mean, SHAPE(batch_size, 10)));
 

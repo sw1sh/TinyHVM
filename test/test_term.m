@@ -122,7 +122,7 @@ static void test_matmul_identity(void) {
     f32 i_d[] = {1,0,0,1};
     Term x = thvm_tensor(ctx, x_d, shape_of(s, 2));
     Term w = thvm_tensor(ctx, i_d, shape_of(s, 2));
-    Term r = thvm_reduce(ctx, thvm_op(ctx, UOP_MM, x, w));
+    Term r = thvm_reduce(ctx, thvm_mm(ctx, x, w));
     f32 *out = thvm_to_host(ctx, r);
     ASSERT(out != NULL, "mm returns data");
     ASSERT_NEAR(out[0], 1, 1e-5f, "mm I [0,0]");
@@ -213,7 +213,7 @@ static void test_full_forward(void) {
     Term b = thvm_tensor(ctx, b_d, shape_of(bs, 2));
 
     Term z = thvm_op(ctx, UOP_RELU,
-                thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, x, w), b),
+                thvm_op(ctx, UOP_ADD, thvm_mm(ctx, x, w), b),
                 term_era());
 
     Term result = thvm_reduce(ctx, z);
@@ -312,7 +312,7 @@ static void test_grad_mm(void) {
     thvm_set_requires_grad(ctx, a);
     thvm_set_requires_grad(ctx, b);
 
-    Term yr = thvm_reduce(ctx, thvm_op(ctx, UOP_MM, a, b));
+    Term yr = thvm_reduce(ctx, thvm_mm(ctx, a, b));
 
     f32 *fwd = thvm_to_host(ctx, yr);
     ASSERT_NEAR(fwd[0], 19.0f, 1e-4f, "mm[0,0]=19");
@@ -513,7 +513,7 @@ static void test_grad_chain(void) {
     thvm_set_requires_grad(ctx, w);
     thvm_set_requires_grad(ctx, b);
 
-    Term mm = thvm_op(ctx, UOP_MM, x, w);
+    Term mm = thvm_mm(ctx, x, w);
     Term added = thvm_op(ctx, UOP_ADD, mm, b);
     Term act = thvm_op(ctx, UOP_RELU, added, term_era());
     Term s1 = thvm_op(ctx, UOP_SUM, act, term_era());

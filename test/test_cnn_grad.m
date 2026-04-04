@@ -76,7 +76,7 @@ int main(void) {
     h = thvm_op(ctx, UOP_RELU, h, term_era());
     h = thvm_reshape(ctx, h, SHAPE(BS, flat_f));
     Term logits = thvm_op(ctx, UOP_ADD,
-        thvm_op(ctx, UOP_MM, h, lin_w),
+        thvm_mm(ctx, h, lin_w),
         thvm_expand(ctx, thvm_reshape(ctx, lin_b, SHAPE(1, 10)), SHAPE(BS, 10)));
 
     // ── Cross-entropy loss ───────────────────────────────────────

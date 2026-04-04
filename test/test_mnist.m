@@ -160,7 +160,7 @@ static int run_mlp(MNISTData *data) {
     for (u32 b = 0; b < tb; b++) {
         u32 off = b * test_bs;
         Term X = thvm_tensor(ctx, &data->test_images[off * 784], SHAPE(test_bs, 784));
-        Term z1 = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, X, W1),
+        Term z1 = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, X, W1),
                          thvm_expand(ctx, B1, SHAPE(test_bs, H)));
         Term h  = thvm_op(ctx, UOP_RELU, z1, term_era());
         f32 inv_bh_e = 1.0f / (f32)(test_bs * H);
@@ -170,7 +170,7 @@ static int run_mlp(MNISTData *data) {
                 SHAPE(1, 1)),
             thvm_tensor(ctx, &inv_bh_e, SHAPE(1, 1)));
         Term out = thvm_reduce(ctx, thvm_op(ctx, UOP_ADD,
-            thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, W2),
+            thvm_op(ctx, UOP_ADD, thvm_mm(ctx, h, W2),
                          thvm_expand(ctx, B2, SHAPE(test_bs, 10))),
             thvm_expand(ctx, hm, SHAPE(test_bs, 10))));
         f32 *od = thvm_to_host(ctx, out);

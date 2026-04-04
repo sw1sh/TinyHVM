@@ -101,7 +101,7 @@ static void test_metal_matmul(void) {
     f32 a[] = {1,2,3,4}, b[] = {5,6,7,8};
     Term ta = thvm_tensor(ctx, a, SHAPE(2, 2));
     Term tb = thvm_tensor(ctx, b, SHAPE(2, 2));
-    Term r = thvm_op(ctx, UOP_MM, ta, tb);
+    Term r = thvm_mm(ctx, ta, tb);
     u32 n; f32 *out = eval_v(ctx, r, &n);
     f32 expected[] = {19, 22, 43, 50};
     int ok = (n == 4);
@@ -206,7 +206,7 @@ static void test_cpu_metal_parity(void) {
     TinyHVM *cpu_ctx = thvm_init("cpu");
     Term ca = thvm_tensor(cpu_ctx, a, SHAPE(2, 2));
     Term cb = thvm_tensor(cpu_ctx, b, SHAPE(2, 2));
-    Term cr = thvm_op(cpu_ctx, UOP_MM, ca, cb);
+    Term cr = thvm_mm(cpu_ctx, ca, cb);
     u32 cn; f32 *cpu_out = eval_v(cpu_ctx, cr, &cn);
     f32 cpu_vals[4]; for (int i = 0; i < 4; i++) cpu_vals[i] = cpu_out[i];
     thvm_free(cpu_ctx);
@@ -215,7 +215,7 @@ static void test_cpu_metal_parity(void) {
     TinyHVM *mtl_ctx = thvm_init("metal");
     Term ma = thvm_tensor(mtl_ctx, a, SHAPE(2, 2));
     Term mb = thvm_tensor(mtl_ctx, b, SHAPE(2, 2));
-    Term mr = thvm_op(mtl_ctx, UOP_MM, ma, mb);
+    Term mr = thvm_mm(mtl_ctx, ma, mb);
     u32 mn; f32 *mtl_out = eval_v(mtl_ctx, mr, &mn);
 
     int ok = (cn == 4) && (mn == 4);

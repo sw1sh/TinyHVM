@@ -54,7 +54,7 @@ int main(void) {
     h = thvm_op(ctx, UOP_RELU, h, term_era());
     h = thvm_reshape(ctx, h, SHAPE(BS, flat_f));
     Term logits = thvm_op(ctx, UOP_ADD,
-        thvm_op(ctx, UOP_MM, h, lw),
+        thvm_mm(ctx, h, lw),
         thvm_expand(ctx, thvm_reshape(ctx, lb, SHAPE(1,10)), SHAPE(BS,10)));
 
     // Cross-entropy loss (has softmax diamonds)

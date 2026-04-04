@@ -46,7 +46,7 @@ int main(void) {
             thvm_set_requires_grad(ctx,x);
             x=thvm_reshape(ctx,x,SHAPE(BS,n_in));
             x=thvm_op(ctx,UOP_MUL,x,thvm_expand(ctx,norm,SHAPE(BS,n_in))); // normalize
-            Term lo=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,x,W),
+            Term lo=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,x,W),
                 thvm_expand(ctx,thvm_reshape(ctx,B,SHAPE(1,10)),SHAPE(BS,10)));
             Term loss=cross_entropy_loss(ctx,lo,&data.train_labels[bi*BS],BS,10);
             Term gs[NP];for(int i=0;i<NP;i++){f32*z=calloc(psz[i],4);gs[i]=thvm_tensor(ctx,z,ctx->tensors[(u32)term_val(p[i])].view.shape);free(z);}
@@ -64,7 +64,7 @@ int main(void) {
             Term x=thvm_shrink(ctx,test_data,(u32[]){b2*tbs,(b2+1)*tbs,0,1,0,28,0,28},4);
             x=thvm_reshape(ctx,x,SHAPE(tbs,n_in));
             x=thvm_op(ctx,UOP_MUL,x,thvm_expand(ctx,norm,SHAPE(tbs,n_in)));
-            Term lo=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,x,W),thvm_expand(ctx,thvm_reshape(ctx,B,SHAPE(1,10)),SHAPE(tbs,10)));
+            Term lo=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,x,W),thvm_expand(ctx,thvm_reshape(ctx,B,SHAPE(1,10)),SHAPE(tbs,10)));
             f32 acc=thvm_eval_accuracy(ctx,lo,&data.test_labels[b2*tbs],tbs,10);
             cor+=(u32)(acc*(f32)tbs/100.f);thvm_reset(ctx,ek);
         }

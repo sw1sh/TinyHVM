@@ -46,7 +46,7 @@ static f32 forward_loss(TinyHVM *ctx, f32 *x_data, u32 BS,
     h = thvm_conv2d(ctx, h, cw3, cb3, 1, s1, p1);
     h = thvm_op(ctx, UOP_RELU, h, term_era());
     h = thvm_reshape(ctx, h, SHAPE(BS, flat_f));
-    Term logits = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, lw),
+    Term logits = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, h, lw),
         thvm_expand(ctx, thvm_reshape(ctx, lb, SHAPE(1,10)), SHAPE(BS,10)));
     Term loss = cross_entropy_loss(ctx, logits, labels, BS, 10);
     return thvm_to_host(ctx, loss)[0];
@@ -102,7 +102,7 @@ int main(void) {
     h = thvm_conv2d(ctx, h, params[4], params[5], 1, s1, p1);
     h = thvm_op(ctx, UOP_RELU, h, term_era());
     h = thvm_reshape(ctx, h, SHAPE(BS, flat_f));
-    Term logits = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MM, h, params[6]),
+    Term logits = thvm_op(ctx, UOP_ADD, thvm_mm(ctx, h, params[6]),
         thvm_expand(ctx, thvm_reshape(ctx, params[7], SHAPE(1,10)), SHAPE(BS,10)));
     Term loss = cross_entropy_loss(ctx, logits, labels, BS, 10);
 

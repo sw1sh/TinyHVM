@@ -54,7 +54,7 @@ int main(void) {
     h=thvm_conv2d(ctx,h,cw3,cb3,1,s1,p1);h=thvm_op(ctx,UOP_RELU,h,term_era());
     h=thvm_conv2d(ctx,h,cw4,cb4,1,s1,p1);h=thvm_op(ctx,UOP_RELU,h,term_era());
     h=thvm_reshape(ctx,h,SHAPE(BS,ff));
-    Term lo=thvm_op(ctx,UOP_ADD,thvm_op(ctx,UOP_MM,h,lw),thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
+    Term lo=thvm_op(ctx,UOP_ADD,thvm_mm(ctx,h,lw),thvm_expand(ctx,thvm_reshape(ctx,lb,SHAPE(1,10)),SHAPE(BS,10)));
     Term probs=softmax(ctx,lo,BS,10);f32 eps=1e-7f;
     Term lp=thvm_op(ctx,UOP_LOG,thvm_op(ctx,UOP_MAX,probs,thvm_expand(ctx,thvm_tensor(ctx,&eps,SHAPE(1,1)),SHAPE(BS,10))),term_era());
     Term mk=thvm_op(ctx,UOP_MUL,ohf,lp);Term sa=thvm_sum_axes(ctx,mk,(u32[]){0,1},2);

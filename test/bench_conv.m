@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
         Term flat = thvm_reshape(ctx, h2, SHAPE(BS, flat_dim));
 
         // FC
-        Term logits = thvm_op(ctx, UOP_MM, flat, tfc);
+        Term logits = thvm_mm(ctx, flat, tfc);
 
         // MSE loss
         Term diff = thvm_op(ctx, UOP_SUB, logits, ty);

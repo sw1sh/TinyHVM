@@ -323,6 +323,12 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     } else if (top_uop == UOP_SUM || top_uop == UOP_RMAX) {
         u64 sum_loc = term_val(t);
         Term sum_input = heap_read(ctx, sum_loc);
+        { static int _ft = 0; if (_ft < 3 && getenv("THVM_SCHED_DIAG"))
+            fprintf(stderr, "  fuse SUM: input tag=%u ext=%u is_ew=%d is_view=%d\n",
+                term_tag(sum_input), term_ext(sum_input),
+                term_tag(sum_input)==TAG_TOP?is_elementwise(term_ext(sum_input)):0,
+                term_tag(sum_input)==TAG_TOP?is_view_op(term_ext(sum_input)):0);
+          _ft++; }
         if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
             has_reduce = top_uop; sum_term = t; ew_root = sum_input;
         } else if (term_tag(sum_input) == TAG_TOP && is_view_op(term_ext(sum_input))) {
@@ -403,7 +409,11 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         if (LEAF_IS_LAZY(leaf_ids[i])) { has_lazy = 1; break; }
 
     // Lazy leaves: resolve FIRST, then re-walk to get correct ops/leaves.
+    // In scheduler mode (no_lazy_resolve): skip — return failure so caller
+    // can dispatch dependencies first and retry.
     if (has_lazy) {
+        extern int fuse_no_lazy_resolve;
+        if (fuse_no_lazy_resolve) return ~0u; // scheduler: skip, retry later
         for (u32 i = 0; i < n_leaves; i++) {
             if (!LEAF_IS_LAZY(leaf_ids[i])) continue;
             Term lt = fuse_leaf_terms[i];

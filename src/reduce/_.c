@@ -95,13 +95,22 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     // TAG_TOP: compute ops are WNF (lazy). Non-compute ops reduce args and fire.
     if (tag == TAG_TOP) {
         u32 _uop = term_ext(next);
-        // Compute ops: WNF (constructor) UNLESS dispatch_mode is set.
-        // dispatch_mode: scheduler is materializing — process normally.
+        // Compute ops: WNF only if args are also WNF (TAG_TEN, ERA, NUM, lazy TAG_TOP).
+        // If any arg needs reduction (GRAD, ASSIGN, APP), process normally.
         if (!ctx->dispatch_mode &&
             _uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
             _uop != UOP_LOG_PRINT && _uop != UOP_TODEVICE && _uop != UOP_WHERE &&
             _uop != UOP_FUSING) {
-            whnf = next; goto apply;
+            u64 _loc = term_val(next);
+            Term _a0 = heap_read(ctx, _loc);
+            int _lazy = 1;
+            // Check if arg0 needs reduction (is GRAD, APP, or other non-WNF)
+            if (term_tag(_a0) == TAG_TOP) {
+                u32 _a0u = term_ext(_a0);
+                if (_a0u == UOP_GRAD || _a0u == UOP_ASSIGN || _a0u == UOP_IFZ || _a0u == UOP_FUSING)
+                    _lazy = 0;
+            } else if (term_tag(_a0) == TAG_APP) _lazy = 0;
+            if (_lazy) { whnf = next; goto apply; }
         }
         // Non-compute: reduce args then fire interact (existing behavior)
         Term rw = rewrite_apply(ctx, next);

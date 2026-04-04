@@ -25,7 +25,9 @@ static u32 sched_find_assigns(TinyHVM *ctx, Term t, u64 *locs, u32 max) {
 
 Term thvm_eval(TinyHVM *ctx, Term t) {
     // Phase 1: Reduce — compute TAG_TOPs stay WNF, GRAD fires
+    // GRAD sets dispatch_mode=1 so gradient expressions reduce (not stay lazy)
     t = thvm_reduce(ctx, t);
+    ctx->dispatch_mode = 0; // clear for subsequent forward ops
 
     // Phase 2: Scan heap for ALL unreduced ASSIGNs (src is TAG_TOP).
     // GRAD creates ASSIGNs inside consumed APP chains — not reachable from t.

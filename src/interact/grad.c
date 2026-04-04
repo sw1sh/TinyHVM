@@ -8,10 +8,12 @@
                 u8 _saved_nga = ctx->no_grad_alloc;
                 ctx->no_fuse = 0;
                 ctx->no_grad_alloc = 1;
+
                 // Restore flags, return directly — trampoline reduces TAG_TOP results
                 #define GRAD_RETURN(r) do { \
                     ctx->no_fuse = _saved_nf; \
                     ctx->no_grad_alloc = _saved_nga; \
+                    ctx->dispatch_mode = 1; /* gradient exprs must reduce, not stay lazy */ \
                     return (r); \
                 } while(0)
                 Term y  = heap_read(ctx, loc);
@@ -56,7 +58,7 @@
                 // ── GRAD on TAG_TOP: pure graph rewrite ──
                 // y is a lazy compute op. Read UOP + args from heap.
                 if (term_tag(y) == TAG_TOP && term_ext(y) != UOP_GRAD) {
-                    static u32 _gc = 0; _gc++; if (_gc <= 30 && getenv("THVM_SCHED_DIAG")) fprintf(stderr, "GRAD_TOP[%u]: uop=%s\n", _gc, term_ext(y)<UOP_COUNT?uop_names[term_ext(y)]:"?");
+                    static u32 _gc = 0; _gc++; if (_gc <= 100 && getenv("THVM_SCHED_DIAG")) fprintf(stderr, "GRAD_TOP[%u]: uop=%s\n", _gc, term_ext(y)<UOP_COUNT?uop_names[term_ext(y)]:"?");
                     u32 cop = term_ext(y);
                     u64 y_loc = term_val(y);
                     Term at = heap_read(ctx, y_loc);
@@ -83,15 +85,9 @@
                     // But with lazy TAG_TOPs, ADD never fires. Need something that fires.
                     // Use thvm_app with nested APP: APP(APP(id, grad_a), grad_b) where id = LAM(VAR(0)).
                     // Actually: just run grad_a, then grad_b, via GRAD_STEP loop.
-                    #define BG(da_,db_) do { \
-                        Term _gb = GRAD3_H(bt,db_,x); \
-                        Term _ga = GRAD3_H(at,da_,x); \
-                        /* Chain: APP(_ga, _gb). _ga fires as fun, _gb fires as arg. */ \
-                        /* But _ga returns ERA → APP(ERA, _gb) → ERA. _gb never fires. */ \
-                        /* Fix: use SUP to force both: &0{_ga, _gb}. DUP splits. */ \
-                        /* Simplest: thvm_app(ctx, thvm_app(ctx, _ga, term_era()), thvm_app(ctx, _gb, term_era())) */ \
-                        GRAD_RETURN(thvm_app(ctx, thvm_app(ctx, _ga, term_era()), thvm_app(ctx, _gb, term_era()))); \
-                    } while(0)
+                    // ADD(grad_a, grad_b): during backward (no_grad_alloc=1), ADD is NOT WNF
+                    // so the trampoline processes both branches.
+                    #define BG(da_,db_) do { GRAD_RETURN(thvm_op(ctx, UOP_ADD, GRAD3_H(at,da_,x), GRAD3_H(bt,db_,x))); } while(0)
                     #define UG(da_) do { Term _u=GRAD3_H(at,da_,x); if(term_tag(_u)==TAG_TOP) GRAD_STEP(_u); GRAD_RETURN(_u); } while(0)
 
                     switch (cop) {

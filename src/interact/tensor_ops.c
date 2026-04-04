@@ -11,7 +11,7 @@
                 {
                     u32 dst_id = (u32)term_val(dst_r);
                     u32 src_id = (u32)term_val(src_t);
-                    if (ctx->tensors[src_id].buf_id == 0) return t; // deferred — scheduler handles
+                    if (ctx->defer_all && ctx->tensors[src_id].buf_id == 0) return t; // scheduler handles
                     if (dst_id != src_id) {
                         TensorMeta *md = &ctx->tensors[dst_id];
                         TensorMeta *ms = &ctx->tensors[src_id];

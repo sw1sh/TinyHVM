@@ -113,7 +113,7 @@
                     Term at = term_ten(aid, ma->dtype);
 
                     int is_bin = (cop==UOP_ADD||cop==UOP_SUB||cop==UOP_MUL||
-                                  cop==UOP_DIV||cop==UOP_MAX||cop==UOP_MM||cop==UOP_CMP);
+                                  cop==UOP_DIV||cop==UOP_MAX||cop==UOP_CMP);
                     TensorMeta *mb_p = is_bin ? &ctx->tensors[bid] : NULL;
                     Term bt = is_bin ? term_ten(bid, mb_p->dtype) : term_era();
 
@@ -171,13 +171,9 @@
                                 sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt), my->view.shape, ma->view.shape),
                                 sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at), my->view.shape, mb_p->view.shape));
                         case UOP_MM: {
-                            // No ENSURE needed — transpose only reads view metadata
-                            ma = &ctx->tensors[aid]; mb_p = &ctx->tensors[bid];
-                            u32 bt_id = tensor_transpose_2d(ctx, bid);
-                            u32 at_id = tensor_transpose_2d(ctx, aid);
-                            BIN_GRAD(
-                                thvm_op(ctx, UOP_MM, gy, term_ten(bt_id, mb_p->dtype)),
-                                thvm_op(ctx, UOP_MM, term_ten(at_id, ma->dtype), gy));
+                            // Dead code — UOP_MM decomposed to EXPAND+MUL+SUM.
+                            // No tensor has creator_op==UOP_MM anymore.
+                            GRAD_RETURN(term_era());
                         }
                         case UOP_RELU: {
                             // Use y (output) not at (input) for mask: y>0 iff at>0
@@ -336,13 +332,13 @@
                                 Term gy_flat = thvm_reshape(ctx, gy_perm, SHAPE(M, N));
                                 // dW = im2col^T @ gy = [K,M] @ [M,N] = [K,N]
                                 Term im_T = thvm_permute(ctx, im_flat, (u32[]){1,0}, 2);
-                                Term dW_flat = thvm_op(ctx, UOP_MM, im_T, gy_flat);
+                                Term dW_flat = thvm_mm(ctx, im_T, gy_flat);
                                 // Reshape to [cin,KH,KW,cout] → permute to [cout,cin,KH,KW]
                                 Term dW_rs = thvm_reshape(ctx, dW_flat, shape_of((u32[]){cin,KH,KW,cout}, 4));
                                 Term dW = thvm_permute(ctx, dW_rs, (u32[]){3,0,1,2}, 4);
                                 // dX via matmul + col2im (both verified numerically correct)
                                 Term w_flat = thvm_reshape(ctx, w_t, SHAPE(N, K));
-                                Term dX_flat = thvm_op(ctx, UOP_MM, gy_flat, w_flat);
+                                Term dX_flat = thvm_mm(ctx, gy_flat, w_flat);
                                 Term dX_6d = thvm_reshape(ctx, dX_flat,
                                     shape_of((u32[]){BS,OY,OX,cin,KH,KW}, 6));
                                 Term dX_perm = thvm_permute(ctx, dX_6d, (u32[]){0,3,1,2,4,5}, 6);

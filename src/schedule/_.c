@@ -218,9 +218,9 @@ static void schedule_rewrite(TinyHVM *ctx, u32 from, u32 to) {
     // Plan memory: pre-assign buffers with reuse
     schedule_plan_memory(ctx, spec_tids, n_specs < 512 ? n_specs : 512);
 
-    // Mark absorbed sentinels
-    for (u32 t = from; t < to; t++)
-        if (sched_absorbed[t] && ctx->tensors[t].buf_id == 0) ctx->tensors[t].buf_id = 1;
+    // Don't mark absorbed tensors — let the old path handle everything.
+    // The fusing specs provide optimized dispatch for reduces;
+    // absorbed intermediates get materialized normally by tensor_materialize.
 
     if (getenv("THVM_SCHED_DIAG"))
         fprintf(stderr, "SCHED: %u kernel specs, %u planned bufs\n", n_specs, n_specs);
@@ -228,6 +228,7 @@ static void schedule_rewrite(TinyHVM *ctx, u32 from, u32 to) {
 
 Term thvm_eval(TinyHVM *ctx, Term t) {
     if (!getenv("THVM_SCHED")) return thvm_reduce(ctx, t);
+    if (!getenv("THVM_DEFER")) return thvm_reduce(ctx, t);
     u32 tc = ctx->tensor_count;
     ctx->defer_all = 1;
     t = thvm_reduce(ctx, t);

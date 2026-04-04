@@ -267,8 +267,8 @@
             u32 a_id = (u32)term_val(a);
             TensorMeta *ma = &ctx->tensors[a_id];
 
-            // defer_all: all compute ops create deferred TensorMeta, no dispatch
-            if (ctx->defer_all) {
+            // defer_all: skip (reduces use the existing defer path below with relaxed guard)
+            if (0) {
                 u32 b_id = is_binary ? (u32)term_val(b) : 0;
                 TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
                 u32 out_shape[MAX_DIM]; u32 out_ndim;
@@ -308,6 +308,9 @@
                 md->view = view_create(shape_of(out_shape, out_ndim));
                 md->creator_op = uop; md->src_ids[0] = a_id; md->src_ids[1] = b_id;
                 if (ma->requires_grad || (mb && mb->requires_grad)) md->requires_grad = 1;
+                // Track consumers (needed by tensor_materialize for side outputs)
+                if (a_id) ctx->tensors[a_id].defer_consumers++;
+                if (b_id && is_binary) ctx->tensors[b_id].defer_consumers++;
                 ctx->itrs++;
                 RETURN_REDUCED(term_ten(dst_id, ma->dtype));
             }
@@ -617,7 +620,7 @@
             // During backward (no_grad_alloc=1): DON'T defer reduces. Deferred reduces
             // become TAG_TEN with buf_id=0, but the reducer treats TAG_TEN as WNF
             // and never materializes them. This causes zero gradients.
-            if (!ctx->no_grad_alloc &&
+            if ((!ctx->no_grad_alloc || ctx->defer_all) &&
                 ((uop == UOP_SUM && b_id != 0) || uop == UOP_RMAX) &&
                 ma->buf_id == 0 && ma->creator_op &&
                 (is_elementwise(ma->creator_op) ||

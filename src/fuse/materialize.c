@@ -24,6 +24,9 @@ static void ref_prescan(TinyHVM *ctx) {
 // When set, materialize_walk won't walk through reshape (used in reduce contexts
 // where reshape changes the coordinate space that reduce axes reference).
 static u8 walk_no_reshape_through = 0;
+// When set, materialize_walk won't trigger tensor_materialize as side effect
+// (used by scheduler during planning — pure read-only walk).
+static u8 walk_no_materialize = 0;
 
 // Walk provenance chain. op_tids[i] = tensor ID for op i.
 static int materialize_walk(TinyHVM *ctx, u32 tid,
@@ -79,8 +82,9 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
                 if (sub >= 0) return sub;
             }
         }
-        // Fallback: materialize base, share buffer
-        if (base && ctx->tensors[base].buf_id == 0 && ctx->tensors[base].creator_op)
+        // Fallback: materialize base, share buffer (skip during pure planning walk)
+        if (base && ctx->tensors[base].buf_id == 0 && ctx->tensors[base].creator_op &&
+            !walk_no_materialize)
             tensor_materialize(ctx, base);
         if (base && ctx->tensors[base].buf_id != 0) {
             m->buf_id = ctx->tensors[base].buf_id;

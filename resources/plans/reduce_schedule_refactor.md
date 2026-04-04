@@ -148,8 +148,10 @@ When UOP_FUSING fires: read spec → codegen → dispatch → create TensorMeta 
 - Step 5-6 (UOP_FUSING): ✓ scheduler writes 27 fusing specs to heap,
   ENSURE dispatches via sched_dispatch_fusing. 51 dispatches, 418MB.
   (tinygrad: 73 kernels for same model — we're 30% better)
-- Remaining 17 fused dispatches: BN running stats + loss + standalone bwd ops
-- Next: correctness (GRAD TAG_TOP path needs debugging)
+- Memory planner: 27 specs → 2 physical bufs (205→164MB, 1.3x reuse)
+- Total: 51 dispatches, 602MB (scheduled kernels only 164MB, rest from old path)
+- Tinygrad: 73 kernels, 257MB. Gap is from 17 non-scheduled dispatches.
+- Next: correctness (GRAD TAG_TOP path), then eliminate old path dispatches
 
 ## Key Insight from Exploration
 Scheduler DAG analysis showed:

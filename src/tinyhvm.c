@@ -88,9 +88,9 @@ Term thvm_dsu(TinyHVM *ctx, Term label_expr, Term a, Term b);
 Term thvm_ddu(TinyHVM *ctx, Term label_expr, Term val, Term bod);
 Term thvm_inc(TinyHVM *ctx, Term term);
 Term thvm_mm(TinyHVM *ctx, Term a, Term b);
-static void sched_dispatch_fusing(TinyHVM *ctx, u32 tid);
+static void fusing_interact(TinyHVM *ctx, u32 tid);
 #define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0){ \
-    if(c->tensors[t].fusing_loc) sched_dispatch_fusing(c,t); \
+    if(c->tensors[t].fusing_loc) fusing_interact(c,t); \
     else if(c->tensors[t].creator_op) tensor_materialize(c,t); \
 }}while(0)
 

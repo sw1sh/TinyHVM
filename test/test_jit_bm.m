@@ -22,7 +22,7 @@ static double now_s(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);re
 int main(void) {
     srand(42); MNISTData data=mnist_load("data");
     TinyHVM*ctx=thvm_init("metal");
-    u32 BS=128, n_steps=70;
+    u32 BS=512, n_steps=70;
 
     // Weights
     Term cw1=mkw(ctx,(Shape){.dims={32,1,5,5},.rank=4},25),cb1=mkz(ctx,32);

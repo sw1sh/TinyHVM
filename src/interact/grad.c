@@ -171,7 +171,7 @@
                                 sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt), my->view.shape, ma->view.shape),
                                 sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at), my->view.shape, mb_p->view.shape));
                         case UOP_MM: {
-                            ENSURE(ctx, aid); ENSURE(ctx, bid);
+                            // No ENSURE needed — transpose only reads view metadata
                             ma = &ctx->tensors[aid]; mb_p = &ctx->tensors[bid];
                             u32 bt_id = tensor_transpose_2d(ctx, bid);
                             u32 at_id = tensor_transpose_2d(ctx, aid);
@@ -189,7 +189,7 @@
                         }
                         case UOP_NEG:   UN_GRAD(thvm_op(ctx, UOP_NEG, gy, term_era()));
                         case UOP_EXP:   UN_GRAD(thvm_op(ctx, UOP_MUL, gy, y));
-                        case UOP_LOG: { ENSURE(ctx, aid); at = term_ten(aid, ctx->tensors[aid].dtype);
+                        case UOP_LOG: { at = term_ten(aid, ctx->tensors[aid].dtype);
                             UN_GRAD(thvm_op(ctx, UOP_DIV, gy, at)); }
                         case UOP_SQRT: {
                             f32 two = 2.0f;
@@ -197,7 +197,6 @@
                             UN_GRAD(thvm_op(ctx, UOP_DIV, gy, denom));
                         }
                         case UOP_DIV: {
-                            ENSURE(ctx, aid); ENSURE(ctx, bid);
                             at = term_ten(aid, ctx->tensors[aid].dtype);
                             bt = term_ten(bid, ctx->tensors[bid].dtype);
                             mb_p = &ctx->tensors[bid];
@@ -208,7 +207,6 @@
                                     thvm_op(ctx, UOP_MUL, bt, bt)));
                         }
                         case UOP_MAX: {
-                            ENSURE(ctx, aid); ENSURE(ctx, bid);
                             at = term_ten(aid, ctx->tensors[aid].dtype);
                             bt = term_ten(bid, ctx->tensors[bid].dtype);
                             mb_p = &ctx->tensors[bid];
@@ -236,7 +234,7 @@
                             UN_GRAD(thvm_expand(ctx, gy_rs, ma->view.shape));
                         }
                         case UOP_RMAX: {
-                            ENSURE(ctx, aid); ma = &ctx->tensors[aid];
+                            ma = &ctx->tensors[aid];
                             at = term_ten(aid, ma->dtype);
                             Term max_bc = thvm_expand(ctx,
                                 thvm_reshape(ctx, y, my->view.shape), ma->view.shape);

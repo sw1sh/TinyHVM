@@ -53,6 +53,76 @@
                         term_new(TAG_TOP, UOP_GRAD, _l1)));
                 }
 
+                // ── GRAD on TAG_TOP: pure graph rewrite ──
+                // y is a lazy compute op. Read UOP + args from heap.
+                if (term_tag(y) == TAG_TOP && term_ext(y) != UOP_GRAD) {
+                    u32 cop = term_ext(y);
+                    u64 y_loc = term_val(y);
+                    Term at = heap_read(ctx, y_loc);
+                    Term bt = heap_read(ctx, y_loc + 1);
+                    const View *yv = st_get(y_loc);
+                    Shape y_shape = yv ? yv->shape : SHAPE(1);
+                    Shape a_shape = SHAPE(1), b_shape = SHAPE(1);
+                    if (term_tag(at) == TAG_TEN) a_shape = ctx->tensors[(u32)term_val(at)].view.shape;
+                    else if (term_tag(at) == TAG_TOP) { const View *av = st_get(term_val(at)); if (av) a_shape = av->shape; }
+                    if (term_tag(bt) == TAG_TEN) b_shape = ctx->tensors[(u32)term_val(bt)].view.shape;
+                    else if (term_tag(bt) == TAG_TOP) { const View *bv = st_get(term_val(bt)); if (bv) b_shape = bv->shape; }
+
+                    #define GRAD3_H(y_,gy_,x_) ({ \
+                        u64 _l = heap_alloc(ctx, 3); \
+                        heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
+                        { const View *_gv = NULL; Term _gt = (gy_); \
+                          if (term_tag(_gt)==TAG_TEN && (u32)term_val(_gt)<ctx->tensor_count) _gv=&ctx->tensors[(u32)term_val(_gt)].view; \
+                          else if (term_tag(_gt)==TAG_TOP) _gv=st_get(term_val(_gt)); \
+                          if (_gv) st_set(_l, _gv); } \
+                        term_new(TAG_TOP, UOP_GRAD, _l); })
+                    #define BG(da_,db_) do { GRAD_RETURN(thvm_op(ctx, UOP_ADD, GRAD3_H(at,da_,x), GRAD3_H(bt,db_,x))); } while(0)
+                    #define UG(da_) do { Term _u=GRAD3_H(at,da_,x); if(term_tag(_u)==TAG_TOP) GRAD_STEP(_u); GRAD_RETURN(_u); } while(0)
+
+                    switch (cop) {
+                        case UOP_ADD: BG(sum_to_shape(ctx,gy,y_shape,a_shape), sum_to_shape(ctx,gy,y_shape,b_shape));
+                        case UOP_SUB: BG(sum_to_shape(ctx,gy,y_shape,a_shape), thvm_op(ctx,UOP_NEG,sum_to_shape(ctx,gy,y_shape,b_shape),term_era()));
+                        case UOP_MUL: BG(sum_to_shape(ctx,thvm_op(ctx,UOP_MUL,gy,bt),y_shape,a_shape), sum_to_shape(ctx,thvm_op(ctx,UOP_MUL,gy,at),y_shape,b_shape));
+                        case UOP_NEG: UG(thvm_op(ctx,UOP_NEG,gy,term_era()));
+                        case UOP_RELU: { f32 z=0; UG(thvm_op(ctx,UOP_MUL,gy,thvm_op(ctx,UOP_CMP,y,thvm_tensor(ctx,&z,SHAPE(1))))); }
+                        case UOP_EXP: UG(thvm_op(ctx,UOP_MUL,gy,y));
+                        case UOP_LOG: UG(thvm_op(ctx,UOP_DIV,gy,at));
+                        case UOP_SQRT: { f32 two=2; UG(thvm_op(ctx,UOP_DIV,gy,thvm_op(ctx,UOP_MUL,thvm_tensor(ctx,&two,SHAPE(1)),y))); }
+                        case UOP_DIV: { Term ng=thvm_op(ctx,UOP_NEG,gy,term_era()); BG(thvm_op(ctx,UOP_DIV,gy,bt), thvm_op(ctx,UOP_DIV,thvm_op(ctx,UOP_MUL,ng,at),thvm_op(ctx,UOP_MUL,bt,bt))); }
+                        case UOP_MAX: { Term mask=thvm_op(ctx,UOP_CMP,at,bt); f32 one=1; Term inv=thvm_op(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),mask);
+                            BG(sum_to_shape(ctx,thvm_op(ctx,UOP_MUL,gy,mask),y_shape,a_shape), sum_to_shape(ctx,thvm_op(ctx,UOP_MUL,gy,inv),y_shape,b_shape)); }
+                        case UOP_CMP: GRAD_RETURN(term_era());
+                        case UOP_SUM: { Term gy_rs=thvm_reshape(ctx,gy,y_shape); UG(thvm_expand(ctx,gy_rs,a_shape)); }
+                        case UOP_RMAX: { Term max_bc=thvm_expand(ctx,thvm_reshape(ctx,y,y_shape),a_shape); f32 one=1;
+                            Term mask=thvm_op(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),thvm_op(ctx,UOP_CMP,max_bc,at));
+                            UG(thvm_op(ctx,UOP_MUL,thvm_expand(ctx,gy,a_shape),mask)); }
+                        case UOP_RESHAPE: UG(sum_to_shape(ctx,gy,y_shape,a_shape));
+                        case UOP_PERMUTE: {
+                            if (term_tag(bt)==TAG_TEN) { u32 pid=(u32)term_val(bt); TensorMeta *mp=&ctx->tensors[pid];
+                                u32 nd=mp->view.numel; f32 pf[MAX_DIM]; META_READ(mp->backend,mp->buf_id,pf,nd*4);
+                                u32 inv[MAX_DIM]; for(u32 j=0;j<nd;j++) inv[(u32)pf[j]]=j;
+                                UG(thvm_permute(ctx,gy,inv,nd));
+                            } else GRAD_RETURN(term_era()); }
+                        case UOP_EXPAND: UG(sum_to_shape(ctx,gy,y_shape,a_shape));
+                        case UOP_SHRINK: {
+                            if (term_tag(bt)==TAG_TEN) { u32 sid=(u32)term_val(bt); TensorMeta *ms=&ctx->tensors[sid];
+                                u32 nd=ms->view.numel/2; f32 sf[MAX_DIM*2]; META_READ(ms->backend,ms->buf_id,sf,nd*2*4);
+                                u32 pp[MAX_DIM*2]; for(u32 j=0;j<nd;j++){pp[j*2]=(u32)sf[j*2];pp[j*2+1]=a_shape.dims[j]-(u32)sf[j*2+1];}
+                                UG(thvm_pad(ctx,gy,pp,nd));
+                            } else GRAD_RETURN(term_era()); }
+                        case UOP_PAD: {
+                            if (term_tag(bt)==TAG_TEN) { u32 pid2=(u32)term_val(bt); TensorMeta *mp2=&ctx->tensors[pid2];
+                                u32 nd=mp2->view.numel/2; f32 pf2[MAX_DIM*2]; META_READ(mp2->backend,mp2->buf_id,pf2,nd*2*4);
+                                u32 sp[MAX_DIM*2]; for(u32 j=0;j<nd;j++){sp[j*2]=(u32)pf2[j*2];sp[j*2+1]=(u32)pf2[j*2]+a_shape.dims[j];}
+                                UG(thvm_shrink(ctx,gy,sp,nd));
+                            } else GRAD_RETURN(term_era()); }
+                        default: GRAD_RETURN(term_era());
+                    }
+                    #undef GRAD3_H
+                    #undef BG
+                    #undef UG
+                }
+
                 if (term_tag(y) == TAG_TEN) {
                     u32 y_id = (u32)term_val(y);
 

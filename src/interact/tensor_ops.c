@@ -264,10 +264,14 @@
             if (term_tag(a) != TAG_TEN) return t;
             if (is_binary && term_tag(b) != TAG_TEN) return t;
 
+            // Pure reduce: ALL compute ops stay as TAG_TOP (WNF).
+            // No TensorMeta. GRAD handles TAG_TOP directly.
+            if (ctx->defer_all) return t;
+
             u32 a_id = (u32)term_val(a);
             TensorMeta *ma = &ctx->tensors[a_id];
 
-            // defer_all: skip (reduces use the existing defer path below with relaxed guard)
+            // (old defer_all path disabled)
             if (0) {
                 u32 b_id = is_binary ? (u32)term_val(b) : 0;
                 TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;

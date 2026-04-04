@@ -223,7 +223,7 @@ static void schedule_rewrite(TinyHVM *ctx, u32 from, u32 to) {
         if (sched_absorbed[t] && ctx->tensors[t].buf_id == 0) ctx->tensors[t].buf_id = 1;
 
     if (getenv("THVM_SCHED_DIAG"))
-        fprintf(stderr, "SCHED: %u kernel specs written\n", n_specs);
+        fprintf(stderr, "SCHED: %u kernel specs, %u planned bufs\n", n_specs, n_specs);
 }
 
 Term thvm_eval(TinyHVM *ctx, Term t) {

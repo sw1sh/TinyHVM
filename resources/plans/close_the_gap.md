@@ -1,137 +1,139 @@
 # Plan: Close the TinyHVM/Tinygrad Gap
 
-## Global Picture
+## Current State (2026-04-04)
 
-**Goal**: Match tinygrad's beautiful_mnist: 98.3% accuracy, ~79ms/step, ~20 dispatches, 0.82GB.
+| Metric | TinyHVM (non-JIT) | TinyHVM (JIT) | Tinygrad | Gap |
+|--------|-------------------|---------------|----------|-----|
+| Accuracy | 94.3% (BS=128) | **96.6%** (BS=128) | 98.3% (BS=512) | BS=512 |
+| Speed | 500ms/step | ~410ms/step | 79ms/step | 5x |
+| Dispatches | 374 | 374 | ~20 | 18x |
+| Memory | 2.1GB | 1.7GB (planner) | 0.82GB | 2x |
 
-**Current** (2026-04-03): 94.4% accuracy, 505ms/step, 374 dispatches, 2.1GB (BS=128).
-BS=512 works at 95.9%/3133ms but needs memory planner for 98%+ at reasonable speed.
+### What's Done
 
-### Architecture Gap
+- [x] JIT capture/replay — 96.6% accuracy with 1 warm-up step
+- [x] Memory planner — 12.5GB→1.7GB compression in jit_end_capture
+- [x] ASSIGN fully lazy (0 thvm_reduce calls)
+- [x] BN assigns wrapped in APP(ASSIGN,ERA) for inet_step safety
+- [x] All gradient bugs fixed (CPU=Metal for all 14 params)
+- [x] Deferred ew ops (forward + backward)
+- [x] SUM/RMAX fusion with deferred ew chains
+- [x] Primitive matmul (EXPAND+MUL+SUM)
 
-**Tinygrad**: Lazy graph → schedule → memory plan → JIT. Everything determined before execution.
-**TinyHVM**: Eager IC reduction + deferred dispatch. Execution order is non-deterministic
-(mid-step steal, lazy ENSURE). This blocks both memory planning and JIT.
+### JIT Architecture
 
----
+1. **Warm-up step** (1 non-JIT IC reduction): stabilizes dispatch count (371→374)
+2. **Capture step** (non-JIT IC reduction + JIT recording): 374 dispatches captured
+3. **Replay steps** (JIT replay): same 374 dispatches, new input/label data per step
+4. **thvm_reset(nw) before eval**: cleans up JIT pool state for correct eval
 
-## Phase 1: JIT Replay (prerequisite for everything)
+Key: `jit_restore_consts` restores 87 CPU-written backward scalars (shapes, axes,
+epsilon). `jit_alloc_ephemeral` allocates plan buffers. Adam bc1/bc2 patched per step.
 
-**Priority: HIGHEST. Unblocks memory planner AND speed.**
+### Open Issues
 
-### Why JIT First
-
-The memory planner CANNOT work without deterministic execution order:
-- 5 attempts at suballocation all corrupted training data
-- Root cause: buffer alloc/access order differs between steps (mid-step steal,
-  lazy ENSURE, deferred chains delay access beyond static predictions)
-- Tinygrad solves this by computing the schedule BEFORE execution
-- TinyHVM equivalent: JIT captures step 0's execution, replays it deterministically
-
-With JIT:
-1. Step 0: JIT records every dispatch + alloc in actual execution order
-2. JIT replay on step 1+: deterministic dispatch sequence = deterministic alloc sequence
-3. Memory planner runs on the JIT's recorded sequence (exact lifetimes)
-4. Speed: JIT replay skips IC reduction overhead → <100ms/step
-
-### Current JIT State
-
-Already partially implemented in `src/backend/metal/jit.m`:
-- JIT_CAPTURE / JIT_REPLAY states
-- `jit_record_dispatch_ids` records compute dispatches
-- `jit_record_mps` records MPS matmul calls
-- `jit.consts[]` saves CPU-written constants
-- Missing: buffer allocation replay, memory planner integration
-
-### Implementation
-
-1. **Capture phase** (step 0): Record dispatch sequence + alloc sequence + buf writes
-2. **Replay phase** (step 1+): Replay dispatches in recorded order, using recorded buffers
-3. **Buffer mapping**: Map step 0's buf_ids to step 1+'s buf_ids (same alloc sequence)
-4. **Memory planner**: After capture, compute lifetimes from the recorded sequence,
-   assign offsets, allocate one big buffer. Replay uses suballocated offsets.
-
-### Verification
-- Step 1 accuracy = step 0 accuracy (deterministic)
-- Dispatch count identical across steps
-- Speed < 100ms/step at BS=128
-- Memory planner reduces BS=512 to ~1GB
+- **3-dispatch non-determinism** (371 at step 0, 374 at step 1+): cause unknown despite
+  clearing defer_consumers, buf_cpu_only, grad_refs. Persistent tensor metadata identical
+  between steps. Workaround: 1 warm-up step before capture.
+- **JIT eval cleanup**: must call thvm_reset(nw) before eval or ephemeral pool entries
+  corrupt eval's buffer allocation.
 
 ---
 
-## Phase 2: Memory Planner (on top of JIT)
+## Phase 1: Memory Planner → BS=512 (NEXT)
 
-With JIT providing deterministic execution, the planner is straightforward:
-- JIT records: alloc(buf_id, size) at position P, last_use(buf_id) at position Q
-- Planner: for each alloc, find dead alloc with compatible size → assign same offset
-- One big MTLBuffer with suballocated offsets via buf_offset[]
-- All the infrastructure (buf_offset, BUF_OFFSET, BUF_CONTENTS) already exists
+The planner already runs in `jit_end_capture` and compresses 12.5GB→1.7GB. Need to verify
+it works for BS=512 training with the JIT.
 
-Expected: 2.1GB → ~0.8GB at BS=128. BS=512 fits comfortably.
+### Steps
+
+1. **Verify planner at BS=128**: Run JIT BM test with planner enabled (default).
+   Already shown: 96.6% accuracy with planner. ✓
+2. **Test BS=512**: Change BS=512 in JIT BM test. Planner should compress to ~1GB.
+   Verify accuracy ≥ 98%.
+3. **Fix any BS=512 issues**: May need larger HEAP_CAP, more JIT slots, etc.
+
+### Expected Result
+- BS=512: 98%+ accuracy, ~1GB memory, ~400ms/step
 
 ---
 
-## Phase 3: Eliminate Standalone EW Dispatches (200 → ~0)
+## Phase 2: Speed — JIT Replay Optimization
+
+Current: ~410ms/step at BS=128. Target: <100ms/step.
+
+### Steps
+
+1. **Profile replay**: Where does time go? GPU kernel execution vs CPU encoding overhead.
+2. **Metal ICB** (indirect command buffer): Batch ALL replay commands into one ICB.
+   Submit once per step instead of encoding each command individually.
+   Tinygrad's MetalGraph does this: one `executeCommandsInBuffer` call per step.
+3. **Eliminate CPU/GPU sync in replay loop**: Move grad zeroing to GPU (zero_fill dispatch
+   captured in JIT). Remove CPU memset + metal_flush between steps.
+
+### Expected Result
+- <100ms/step at BS=128, <200ms/step at BS=512
+
+---
+
+## Phase 3: Dispatch Reduction (374 → ~50)
+
+### Eliminate Standalone EW Dispatches (200 fused_ew → ~0)
 
 The 200 fused_ew dispatches are backward ew chains materialized at ENSURE boundaries.
 In tinygrad, these are absorbed into reduce kernels.
 
-### Fix: Lazy ENSURE During Backward
+Fix: Lazy ENSURE during backward — don't materialize deferred ew chains. Let them stay
+deferred until a reduce (SUM/RMAX) absorbs them. Expected: 374 → ~171 dispatches.
 
-ENSURE should NOT materialize deferred ew chains during backward. Instead, chains
-stay deferred until a reduce (SUM/RMAX) absorbs them.
+### Multi-Reduce Fusion (~171 → ~50)
 
-With primitive matmul (no MPS), backward has no ops that REQUIRE materialized buffers.
-All backward ops (MUL, ADD, SUM, EXPAND, RESHAPE) work with deferred chains.
+Shared tensors (grad_refs > 1) create ADD + SUM pairs. Fuse into single kernel:
+`SUM(ADD(da, db))` instead of `SUM(da) + SUM(db)`.
 
-Implementation: `ENSURE` during backward only materializes if the tensor has no
-creator_op (it's a leaf = weight/input). Deferred chains pass through.
+### SHRINK/PAD in fuse_walk_inner
 
-Expected: 374 → ~171 dispatches (157 reduces + ~0 fused_ew + 14 adam)
-
----
-
-## Phase 4: Reduce Fusion (~171 → ~50)
-
-### Merge Multi-Input Reduces
-
-Shared tensors (grad_refs > 1) create ADD + SUM pairs.
-Fuse: `SUM(ADD(da, db))` instead of `SUM(da) + SUM(db)`.
-
-### Forward SHRINK/PAD in Walker
-
-fuse_walk_inner stops at SHRINK/PAD (line 106: "not implemented yet").
-Implementing these view compositions fuses more forward ops.
-
-Expected: ~50 dispatches total
+Currently stops at SHRINK/PAD ("not implemented yet"). Implementing these view
+compositions fuses more forward ops.
 
 ---
 
-## What's Already Done
+## Phase 4: Range-Based Fusion Refactor (374 → ~20)
 
-- [x] Deferred ew ops (forward + backward)
-- [x] SUM/RMAX fusion with deferred ew chains (102 fused reduces)
-- [x] GRAD3 shape tracking (st_set)
-- [x] no_grad_alloc flag (separate buffer allocation from rewrite control)
-- [x] Primitive matmul (EXPAND+MUL+SUM, no MPS dependency)
-- [x] All gradient bugs fixed (CPU=Metal for all 14 params)
-- [x] Budget guard fix (metal_bytes_total, catches OOM before system kill)
-- [x] BS=512 verified working (95.9% at 3133ms/step)
+Replace ad-hoc pattern matching with principled range keys. Each op has an iteration
+domain. Ops with compatible domains fuse. One reduce per kernel.
 
-## What Failed (Memory Planner Without JIT)
+See detailed design in the earlier plan version (RangeKey struct, 5 refactor steps).
 
-- 5 suballocation attempts: all corrupt training data
-- Root cause: non-deterministic execution order between steps
-- dispatch-log lifetimes miss CPU reads, contiguify blits, adam_step
-- tensor-graph lifetimes miss lazy execution ordering
-- Direct buffer reuse: ARC + buf_decref lifecycle issues
+---
+
+## Phase 5: Fix 3-Dispatch Non-Determinism
+
+Eliminate the need for warm-up by making the dispatch sequence deterministic across steps.
+The 3 extra fused dispatches at step 1 come from BN-forward related materializations.
+Cause unknown — not defer_consumers, not buf_cpu_only, not grad_refs.
+
+Low priority since warm-up is a cheap workaround (~500ms one-time cost).
+
+---
 
 ## Expected Progression
 
 | After | Accuracy | Dispatches | Speed | Memory |
 |-------|----------|------------|-------|--------|
-| Current | 94.4% (BS=128) | 374 | 505ms | 2.1GB |
-| Phase 1 (JIT) | 94.4% | 374 | **<100ms** | 2.1GB |
-| Phase 2 (Planner) | **98%+ (BS=512)** | 374 | <100ms | **~0.8GB** |
-| Phase 3 (Lazy ENSURE) | 98%+ | **~171** | <50ms | ~0.8GB |
-| Phase 4 (Reduce fusion) | 98%+ | **~50** | <30ms | ~0.8GB |
+| Current (JIT BS=128) | 96.6% | 374 | 410ms | 1.7GB |
+| Phase 1 (BS=512) | **98%+** | 374 | ~400ms | **~1GB** |
+| Phase 2 (ICB speed) | 98%+ | 374 | **<100ms** | ~1GB |
+| Phase 3 (dispatch cut) | 98%+ | **~50** | <50ms | ~1GB |
+| Phase 4 (ranges) | 98%+ | **~20** | **<30ms** | ~1GB |
+
+## Critical Files
+
+| File | Phase | Change |
+|------|-------|--------|
+| `test/test_jit_bm.m` | 1 | BS=512 test |
+| `src/backend/metal/jit.m` | 2 | ICB replay, eliminate CPU sync |
+| `src/interact/tensor_ops.c` | 3 | Lazy ENSURE during backward |
+| `src/fuse/_.c` | 3,4 | Multi-reduce fusion, RangeKey |
+| `src/fuse/materialize.c` | 3 | SHRINK/PAD view composition |
+| `src/backend/metal/codegen.m` | 3,4 | SHRINK/PAD index codegen |

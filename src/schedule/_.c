@@ -27,9 +27,11 @@ static void sched_dump_heap(TinyHVM *ctx) {
     fprintf(stderr, "\n");
 }
 
-// Phase 2: Walk TAG_TOPs on heap, dispatch fused kernels.
-// Currently dispatches directly via fuse_or_reduce.
-// TODO: replace with pure rewrite (fuse_build_kernel → UOP_FUSING on heap).
+// Multi-consumer propagation arrays (forward-declared for sched_all)
+static Term sched_replaced_from[SCHED_MAX_KERNELS];
+static Term sched_replaced_to[SCHED_MAX_KERNELS];
+static u32  sched_replaced_count = 0;
+
 static u32 sched_all(TinyHVM *ctx) {
     u32 total = 0;
     fuse_no_lazy_resolve = 1;
@@ -54,20 +56,30 @@ static u32 sched_all(TinyHVM *ctx) {
                 continue;
             }
 
-            // View ops: pool RESHAPEs resolved when input is TAG_TEN.
-            // Other views composed by fuse_walk_inner (no dispatch needed).
+            // View ops: resolve to TAG_TEN (view alias) when input is TAG_TEN.
+            // This makes dispatched results visible to the next layer's ew chains.
             if (is_view_op(uop)) {
                 u64 vloc = term_val(ht);
                 Term vinput = heap_read(ctx, vloc);
                 if (term_tag(vinput) == TAG_TEN) {
                     u32 src_id = (u32)term_val(vinput);
                     const View *sv = st_get(vloc);
-                    if (sv && sv->numel != ctx->tensors[src_id].view.numel) {
-                        u32 vid = tensor_view_of(ctx, src_id, *sv);
-                        ctx->tensors[vid].creator_op = UOP_RESHAPE;
-                        ctx->tensors[vid].src_ids[0] = src_id;
-                        ctx->heap[h] = term_ten(vid, DTYPE_F32);
-                        progress++;
+                    if (sv) {
+                        if (sv->numel != ctx->tensors[src_id].view.numel) {
+                            // Pool stride view: numel mismatch (overlapping windows)
+                            u32 vid = tensor_view_of(ctx, src_id, *sv);
+                            ctx->tensors[vid].creator_op = UOP_RESHAPE;
+                            ctx->tensors[vid].src_ids[0] = src_id;
+                            ctx->heap[h] = term_ten(vid, DTYPE_F32);
+                            progress++;
+                        } else {
+                            // Normal view: create view alias with st_get shape
+                            u32 vid = tensor_view_of(ctx, src_id, *sv);
+                            ctx->tensors[vid].creator_op = uop;
+                            ctx->tensors[vid].src_ids[0] = src_id;
+                            ctx->heap[h] = term_ten(vid, DTYPE_F32);
+                            progress++;
+                        }
                     }
                 }
                 continue;
@@ -78,6 +90,9 @@ static u32 sched_all(TinyHVM *ctx) {
             {
                 KernelEntry ke;
                 if (fuse_build_kernel(ctx, ht, &ke)) {
+                    // Record original TAG_TOP for multi-consumer propagation
+                    if (sched_replaced_count < SCHED_MAX_KERNELS)
+                        sched_replaced_from[sched_replaced_count++] = ht;
                     u32 kid = sched_kernel_count++;
                     sched_kernels[kid] = ke;
                     // Allocate heap space for UOP_FUSING node
@@ -103,15 +118,38 @@ static u32 sched_all(TinyHVM *ctx) {
     return total;
 }
 
-// Dispatch all UOP_FUSING on the heap → TAG_TEN
+// Dispatch all UOP_FUSING on the heap → TAG_TEN, then propagate to multi-consumer positions.
 static void sched_dispatch_fusing(TinyHVM *ctx) {
+    // Dispatch UOP_FUSINGs
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_FUSING) {
+            // Read kernel index to record the TAG_TEN result
+            u64 floc = term_val(ht);
+            u32 kid = (u32)term_val(heap_read(ctx, floc + 1));
             Term r = thvm_reduce(ctx, ht);
             ctx->heap[h] = r;
+            // Record mapping: original TAG_TOP → dispatched TAG_TEN
+            if (kid < sched_replaced_count)
+                sched_replaced_to[kid] = r;
         }
     }
+    // Propagate: for each dispatched TAG_TEN, find other heap positions
+    // that still hold TAG_TOPs matching the original kernel's output.
+    // The original TAG_TOP was stored as sched_replaced_from[kid] during scheduling.
+    if (sched_replaced_count > 0) {
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            Term ht = ctx->heap[h];
+            if (term_tag(ht) != TAG_TOP) continue;
+            for (u32 i = 0; i < sched_replaced_count; i++) {
+                if (ht == sched_replaced_from[i]) {
+                    ctx->heap[h] = sched_replaced_to[i];
+                    break;
+                }
+            }
+        }
+    }
+    sched_replaced_count = 0;
 }
 
 Term thvm_eval(TinyHVM *ctx, Term t) {

@@ -287,18 +287,24 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         return (int)(WALK_LEAF_BASE + new_idx);
     }
 
-    // Non-elementwise TAG_TOP (SUM, MM, etc.): lazy leaf boundary.
-    // Shape from the shape table (set at node creation in thvm_op).
+    // Non-elementwise TAG_TOP (SUM, pool RESHAPE, etc.): leaf boundary.
+    // If arg0 is TAG_TEN → resolved leaf (use input buffer + st_get view).
+    // Otherwise → lazy leaf (needs resolution in a later pass).
     if (!is_elementwise(uop)) {
         const View *sv = st_get(term_val(t));
         if (!sv) return -1;
         if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
         u32 idx = (*n_leaves)++;
-        // Use heap loc as unique ID (not ~0u) to prevent false dedup
-        leaf_ids[idx] = (u32)(term_val(t) | 0x80000000u); // high bit = lazy marker
+        // Check if input is already TAG_TEN → non-lazy leaf
+        Term leaf_input = heap_read(ctx, term_val(t));
+        if (term_tag(leaf_input) == TAG_TEN) {
+            leaf_ids[idx] = (u32)term_val(leaf_input); // real tensor ID
+        } else {
+            leaf_ids[idx] = (u32)(term_val(t) | 0x80000000u); // lazy marker
+        }
         fuse_composed_views[idx] = *sv;
         leaf_views[idx] = &fuse_composed_views[idx];
-        fuse_leaf_terms[idx] = t;
+        fuse_leaf_terms[idx] = (term_tag(leaf_input) == TAG_TEN) ? leaf_input : t;
         return (int)(WALK_LEAF_BASE + idx);
     }
 

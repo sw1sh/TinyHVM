@@ -36,10 +36,11 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
     // pool[..., o0, o1, k0, k1] = input[..., o0*s0+k0, o1*s1+k1]
     // Strides: output dims use input_stride*s, kernel dims use input_stride*1.
     // This is a single view alias — no expand, no contiguify.
-    if (term_tag(x) == TAG_TEN && n_spatial == 2) {
-        u32 src_id = (u32)term_val(x);
-        TensorMeta *m = &ctx->tensors[src_id];
-        if (m->buf_id != 0 || m->creator_op) {  // has buffer or is deferred view
+    if (n_spatial == 2) {
+        int is_ten = (term_tag(x) == TAG_TEN);
+        u32 src_id = is_ten ? (u32)term_val(x) : 0;
+        TensorMeta *m = is_ten ? &ctx->tensors[src_id] : NULL;
+        if (!is_ten || m->buf_id != 0 || m->creator_op) {
             // Build output shape: [batch..., o0, o1, k0, k1]
             u32 out_rank = bd + n_spatial * 2;
             Shape out_shape = {.rank = out_rank};
@@ -206,19 +207,32 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
                 }
             }
 
-            u32 vid = tensor_view_of(ctx, src_id, ov);
-            ctx->tensors[vid].creator_op = UOP_RESHAPE; // view provenance
-            ctx->tensors[vid].src_ids[0] = src_id;
-            if (m->requires_grad) ctx->tensors[vid].requires_grad = 1;
-            // Store pool metadata for correct backward (scatter-add, not reshape)
-            if (n_spatial == 2) {
-                ctx->tensors[vid].pool_n_spatial = 2;
-                ctx->tensors[vid].pool_kernel[0] = (u8)k_[0];
-                ctx->tensors[vid].pool_kernel[1] = (u8)k_[1];
-                ctx->tensors[vid].pool_stride[0] = (u8)s_[0];
-                ctx->tensors[vid].pool_stride[1] = (u8)s_[1];
+            if (is_ten) {
+                // TAG_TEN: create view alias with real buffer
+                u32 vid = tensor_view_of(ctx, src_id, ov);
+                ctx->tensors[vid].creator_op = UOP_RESHAPE;
+                ctx->tensors[vid].src_ids[0] = src_id;
+                if (m->requires_grad) ctx->tensors[vid].requires_grad = 1;
+                if (n_spatial == 2) {
+                    ctx->tensors[vid].pool_n_spatial = 2;
+                    ctx->tensors[vid].pool_kernel[0] = (u8)k_[0];
+                    ctx->tensors[vid].pool_kernel[1] = (u8)k_[1];
+                    ctx->tensors[vid].pool_stride[0] = (u8)s_[0];
+                    ctx->tensors[vid].pool_stride[1] = (u8)s_[1];
+                }
+                return term_ten(vid, m->dtype);
+            } else {
+                // TAG_TOP: create TAG_TOP with pool strides in shape table.
+                // The fuser treats this as a leaf with the correct pool view.
+                // Reuse UOP_RESHAPE — fuse_walk_inner's non-ew handler uses st_get.
+                u64 loc = ctx->heap_pos;
+                ctx->heap_pos += 2;
+                heap_set(ctx, loc, x);         // arg0 = input
+                heap_set(ctx, loc + 1, term_era()); // arg1 (unused for lazy pool)
+                Term pool_top = term_new(TAG_TOP, UOP_RESHAPE, loc);
+                st_set(loc, &ov);  // store pool view with correct strides
+                return pool_top;
             }
-            return term_ten(vid, m->dtype);
         }
     }
 

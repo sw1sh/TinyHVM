@@ -222,15 +222,12 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
                 }
                 return term_ten(vid, m->dtype);
             } else {
-                // TAG_TOP: create TAG_TOP with pool strides in shape table.
-                // The fuser treats this as a leaf with the correct pool view.
-                // Reuse UOP_RESHAPE — fuse_walk_inner's non-ew handler uses st_get.
-                u64 loc = ctx->heap_pos;
-                ctx->heap_pos += 2;
-                heap_set(ctx, loc, x);         // arg0 = input
-                heap_set(ctx, loc + 1, term_era()); // arg1 (unused for lazy pool)
-                Term pool_top = term_new(TAG_TOP, UOP_RESHAPE, loc);
-                st_set(loc, &ov);  // store pool view with correct strides
+                // TAG_TOP: create pool TAG_TOP with correct strides in shape table.
+                // Use thvm_op for proper heap allocation. UOP_RESHAPE makes the fuser
+                // treat this as a non-ew leaf (st_get returns pool strides).
+                Term pool_top = thvm_op(ctx, UOP_RESHAPE, x, term_era());
+                // Override the st_set from thvm_op with the pool view (custom strides)
+                st_set(term_val(pool_top), &ov);
                 return pool_top;
             }
         }

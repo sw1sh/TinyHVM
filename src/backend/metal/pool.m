@@ -39,7 +39,7 @@ static u32 plan_alloc_ids[MAX_PLAN_ENTRIES];
 static u32 plan_alloc_birth[MAX_PLAN_ENTRIES];
 static u32 plan_alloc_count = 0;
 
-#define METAL_MEM_BUDGET (12ULL * 1024 * 1024 * 1024) // 12GB hard limit
+#define METAL_MEM_BUDGET (24ULL * 1024 * 1024 * 1024) // 24GB (temporarily raised for scheduler dev)
 
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);
@@ -89,10 +89,10 @@ static u32 metal_buf_alloc(u64 bytes) {
         for (u32 i = 1; i < id; i++) {
             if (!metal_pool.bufs[i]) continue;
             u64 sz = metal_pool.sizes[i];
-            if (sz < bytes || sz > bytes * 2) continue;
+            if (sz < bytes || sz > bytes * 4) continue;
             if (buf_remaining_uses[i] > 0) continue;
             if (buf_last_use[i] > 0 && buf_last_use[i] + 1 >= dispatch_counter) continue;
-            if (buf_last_use[i] == 0 && i + 200 > id) continue;
+            if (buf_last_use[i] == 0 && i + 20 > id) continue;
             if (sz < reuse_size) { reuse_id = i; reuse_size = sz; }
         }
         if (reuse_id) {

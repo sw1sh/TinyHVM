@@ -134,76 +134,66 @@ When UOP_FUSING fires: read spec → codegen → dispatch → create TensorMeta 
 
 ---
 
-## Current State
+## Current State (2026-04-05)
 
-### After first reduce (verified via sched_dump_heap)
+### After first reduce
 ```
-HEAP[619]: TEN=271 ERA=24 APP=7 TOP=274 other=42
-  TOPs: NEG=2 EXP=2 LOG=2 RELU=8 SQRT=4 ADD=22 MUL=49 DIV=6 MAX=2
-        SUB=8 SUM=22 RMAX=6 RESHAPE=68 PERMUTE=18 EXPAND=32 SHRINK=18
-        ASSIGN=4 GRAD=1
+HEAP[806]: TEN=284 TOP=334 | NEG=8 EXP=2 LOG=3 RELU=8 SQRT=4 ADD=24 MUL=70
+  DIV=12 MAX=3 CMP=2 SUB=10 SUM=23 RMAX=6 RESHAPE=70 PERMUTE=18 EXPAND=36
+  SHRINK=18 ASSIGN=4 GRAD=13
 ```
-- 274 TAG_TOPs on the heap: entire fwd+bwd compute graph (lazy)
-- 271 TAG_TENs: weights, inputs, scalars (materialized)
-- 1 GRAD: top-level gradient node (lazy — scheduler dispatches forward first)
-- 4 ASSIGNs: BN running stat updates (gradient ASSIGNs created by GRAD later)
-- `t tag=0` = TAG_APP (root is consumed APP — stale, don't re-reduce)
+
+### Scheduler dispatches 91+ kernels (pass 0)
+- Unified scan: reduce → ew → view resolution, forward order
+- GRAD fires (5 of 13), creates backward TAG_TOPs
+- 28 reduce dispatches (SUM/RMAX via fuse_or_reduce)
+- 21 view resolutions (SHRINK/RESHAPE/EXPAND chains via thvm_reduce)
+- 36 ew dispatches (standalone RELU, ADD, etc.)
+- **OOM at 13GB** — dispatches without buffer reuse
 
 ### What's done
 - **Step 0** ✓ MM decomposed to EXPAND+MUL+SUM
-- **Trampoline** ✓ Compute TAG_TOPs + GRAD are WNF (lazy). reduce/_.c:97-113
-- **TAG_TOP GRAD handler** ✓ interact/grad.c:60. Handles TAG_TOP y.
-- **Heap dump tool** ✓ sched_dump_heap in schedule/_.c
-- **Verified**: 20 dispatches (no adam) when scheduler dispatches correctly
+- **Trampoline** ✓ Compute TAG_TOPs are WNF. View ops are NON-WNF (fire on TAG_TEN args)
+- **TAG_TOP GRAD handler** ✓ Walks TAG_TOPs on heap for provenance
+- **Scheduler unified scan** ✓ Multi-pass, processes all TAG_TOP types:
+  - Reduces: fuse_or_reduce (absorbs ew chains, DP0 look-through for axes)
+  - Views: thvm_reduce (non-WNF fires interact, DP0 pre-resolution for shared params)
+  - Ew: fuse_or_reduce (min_ops=1 in scheduler mode)
+  - GRAD: thvm_reduce when arg0 = TAG_TEN
+  - SUM(TAG_TEN): 0-op reduce kernel (min_ops=0)
+- **fuse_walk_inner** ✓ Walks through VIEW(ew_TAG_TOP) for EXPAND/PERMUTE/RESHAPE
+- **ASSIGN phase** ✓ thvm_reduce fires ASSIGNs (view ops resolve via trampoline)
 
-### What's NOT done
-- The scheduler (Step 2-6) — the core missing piece
+### What's NOT done — BLOCKER: memory planner
+Without buffer reuse, each dispatch allocates a fresh GPU buffer. 91+ dispatches
+at BS=128 with conv tensors → 13GB OOM. Tinygrad uses 0.82GB via 58→1 buffer reuse.
 
-## Immediate Next Steps
+## Immediate Next Step: Memory Planner
 
-The scheduler needs to:
+The scheduler currently dispatches directly via fuse_or_reduce. Each dispatch
+allocates a new buffer. The memory planner must run BEFORE dispatch to assign
+buffer slots with reuse.
 
-### Step 2: Walk TAG_TOP graph, build kernel groups
-- Scan the 274 TAG_TOPs on the heap
-- Group into fused kernels (reuse `fuse_walk_inner` for TAG_TOP trees)
-- Identify kernel boundaries: SUM/RMAX (reduces), multi-consumer nodes
-- Output: array of KernelEntry with FusedOps, leaf TAG_TEN refs, ReduceSpec
+### Option A: Pre-dispatch memory planning (simplest, within current architecture)
+1. **Collect dispatch list**: before dispatching, do a "dry run" that collects
+   KernelEntry[] (same as current fuse_or_reduce walk, but don't dispatch)
+2. **Lifetime analysis**: kernel i's output is consumed by kernel j → lifetime [i, j]
+3. **Greedy interval coloring**: assign buffer slots, reuse dead buffers
+4. **Dispatch with planned buffers**: fuse_or_reduce modified to use pre-allocated buffers
 
-### Step 3: Memory planner
-- Compute lifetimes across kernel entries
-- Greedy interval coloring for buffer reuse
+### Option B: UOP_FUSING rewrite (per original plan)
+1. Collect kernel groups (same dry run)
+2. Plan memory
+3. Write UOP_FUSING specs to heap (pure rewrite, no dispatch)
+4. Second thvm_reduce fires UOP_FUSING interactions → dispatch with planned buffers
 
-### Step 4: Write UOP_FUSING specs + build new reducible graph
-- For each kernel: allocate heap for UOP_FUSING node with kernel spec
-- **Build a NEW root term** that chains:
-  `APP(UOP_FUSING_0, APP(UOP_FUSING_1, ... APP(GRAD_term, ASSIGN_chain)))`
-  The second reduce walks this chain — each UOP_FUSING fires (dispatch),
-  GRAD fires (creates backward TAG_TOPs which get their own UOP_FUSING pass),
-  ASSIGNs fire (buf_copy).
-- Key: there is NO single root in an inet. The scheduler creates reducible
-  entries for every output tensor. `thvm_reduce` can start from any of them.
+Option B is cleaner (matches three-phase architecture) but more work. Option A
+is a pragmatic intermediate that unblocks training.
 
-### Step 5: UOP_FUSING interaction handler
-- When UOP_FUSING fires: read spec → codegen → dispatch → TAG_TEN
-
-### Step 6: Second reduce
-- Reduce the new graph built by scheduler
-- UOP_FUSINGs fire → forward materializes → GRAD fires → backward materializes → ASSIGNs fire
-
-### Key design question for Step 4
-The scheduler should produce a NEW reducible graph on the heap. Not re-reduce
-the stale `t`. The new graph chains UOP_FUSING → GRAD → ASSIGN nodes.
-Each UOP_FUSING has its kernel spec. GRAD references forward UOP_FUSING outputs.
-ASSIGNs reference backward UOP_FUSING outputs.
-
-The second `thvm_reduce` processes this new graph. No dispatch_mode flag needed —
-UOP_FUSING is in the non-WNF set (line 103), so the trampoline fires it normally.
-
-## Key Insight from Exploration
-Scheduler DAG analysis showed:
-- 2 kernel roots (ASSIGN outputs) containing 304 ops and 30 reduces
-- After splitting at reduce boundaries: ~30 fused kernels + 14 adam = ~44 total
-- MM decomposed to primitives: MM reduces fuse with post-MM ew → fewer kernels
-- 222MB memory from scheduling alone (massive reduction from 2.1GB)
-
-Tinygrad reference: MM is decomposed to EXPAND+MUL+REDUCE_AXIS. Post-MM ops (bias, relu) fuse into the same kernel. Each kernel has max 1 REDUCE_AXIS. Full_shape determines iteration domain; axis_types distinguish GLOBAL vs REDUCE dims.
+### Key: tinygrad's memory planner
+Port from JIT planner (`jit.m:128-315`). The planner:
+- Tracks buffer lifetimes across kernel schedule
+- Greedy interval coloring: for each new buffer, reuse the smallest dead buffer
+  that fits, or allocate new
+- Result: 58 unique buffers → 1 reused buffer pool
+- 2.1GB → 0.82GB at BS=512

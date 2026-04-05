@@ -24,6 +24,7 @@ static void sched_dump_heap(TinyHVM *ctx) {
 static u32 sched_all(TinyHVM *ctx) {
     u32 total = 0;
     fuse_no_lazy_resolve = 1;
+    ctx->no_grad_alloc = 1; // suppress requires_grad intermediate buffers (memory planner TODO)
 
     for (u32 pass = 0; pass < 50; pass++) {
         u32 progress = 0;
@@ -59,11 +60,11 @@ static u32 sched_all(TinyHVM *ctx) {
                 continue;
             }
 
-            // View ops: resolve via thvm_reduce (non-WNF trampoline)
+            // View ops: resolve via thvm_reduce (non-WNF trampoline).
+            // EXPAND/PERMUTE create view aliases (no allocation). SHRINK creates sub-views.
+            // RESHAPE may contiguify (allocation) — suppress during scheduling.
             if (is_view_op(uop)) {
-                // Pre-resolve DP0/DP1 in args (shape params might be DUP-shared).
-                // Read the shared value directly instead of running DUP interaction
-                // (which would create a SUP, not a TAG_TEN).
+                // Pre-resolve DP0/DP1 in args (shape params might be DUP-shared)
                 u64 vloc = term_val(ht);
                 for (u32 ai = 0; ai < 2; ai++) {
                     Term va = heap_read(ctx, vloc + ai);
@@ -73,7 +74,10 @@ static u32 sched_all(TinyHVM *ctx) {
                             heap_set(ctx, vloc + ai, shared);
                     }
                 }
+                // Suppress contiguify during scheduler view resolution
+                ctx->no_fuse = 1; // reuse flag to signal "no materialize"
                 Term r = thvm_reduce(ctx, ht);
+                ctx->no_fuse = 0;
                 if (r != ht && term_tag(r) == TAG_TEN) {
                     ctx->heap[h] = r;
                     progress++;
@@ -100,12 +104,16 @@ static u32 sched_all(TinyHVM *ctx) {
     }
 
     fuse_no_lazy_resolve = 0;
+    ctx->no_grad_alloc = 0;
     return total;
 }
 
 Term thvm_eval(TinyHVM *ctx, Term t) {
-    // Phase 1: Pure IC reduce — everything lazy
+    // Phase 1: Pure IC reduce — everything lazy.
+    // Suppress contiguify: view ops fire (non-WNF) but must not allocate GPU buffers.
+    ctx->no_fuse = 1;
     t = thvm_reduce(ctx, t);
+    ctx->no_fuse = 0;
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }
 
     // Phase 2: Schedule ALL kernels (forward + GRAD + backward)

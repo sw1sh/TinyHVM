@@ -359,6 +359,11 @@
                             }
                             if (looks_contiguous) needs_materialize = 1;
                         }
+                        if (needs_materialize && ctx->no_fuse) {
+                            // Scheduler view resolution: skip contiguify, return
+                            // the input unchanged. The fuser will compose views.
+                            RETURN_REDUCED(a);
+                        }
                         if (needs_materialize) {
                             ENSURE(ctx, a_id); ma = &ctx->tensors[a_id];
                             u32 numel = ma->view.numel;

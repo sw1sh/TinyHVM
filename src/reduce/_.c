@@ -103,6 +103,9 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             _uop != UOP_FUSING &&
             _uop != UOP_RESHAPE && _uop != UOP_PERMUTE && _uop != UOP_EXPAND &&
             _uop != UOP_SHRINK && _uop != UOP_PAD) {
+            // During pure IC phase (no_fuse=1): ALL compute ops are WNF unconditionally.
+            // This prevents compute ops near GRAD from firing and creating deferred TensorMeta.
+            if (ctx->no_fuse) { whnf = next; goto apply; }
             u64 _loc = term_val(next);
             int _lazy = 1;
             // Check if any arg needs reduction (GRAD, APP, ASSIGN, etc.)

@@ -68,7 +68,6 @@ static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target)
 
 // Forward declarations for cross-module dependencies
 static u32 reduce_id(TinyHVM *ctx, Term t);
-static u32 fuse_or_reduce(TinyHVM *ctx, Term t);
 static int is_elementwise(u32 uop);
 static int is_binary(u32 uop);
 static void tensor_materialize(TinyHVM *ctx, u32 tid);
@@ -120,9 +119,6 @@ static void grad_prescan(TinyHVM *ctx, Term loss);
 
 // ── interact/ — one interaction rule per active pair ─────────────────────────
 #include "interact/_.c"
-
-// ── rewrite/ — declarative pattern-based rewrite rules ───────────────────────
-#include "rewrite/_.c"
 
 // ── reduce/ — enter/apply trampoline ─────────────────────────────────────────
 #include "reduce/_.c"

@@ -435,7 +435,7 @@ static inline const View *st_get(u64 heap_loc) {
 // Fused Op / ReduceSpec (used by fuser + codegen + scheduler)
 // ============================================================
 #define FUSE_MAX_OPS    32
-#define FUSE_MAX_LEAVES 16
+#define FUSE_MAX_LEAVES 64
 
 typedef struct { u32 uop; u32 arg_a; u32 arg_b; } FusedOp;
 typedef struct {
@@ -465,6 +465,9 @@ typedef struct {
     u32        has_reduce;       // 0 or UOP_SUM/UOP_RMAX
     Term       reshape_term;     // post-reduce RESHAPE (or TAG_ERA)
     Term       sum_term;         // the SUM/RMAX TAG_TOP (for axes)
+    Term       original_term;    // original TAG_TOP before scheduling (for multi-consumer propagation)
+    Term       leaf_terms[FUSE_MAX_LEAVES]; // original leaf terms (for resolving UOP_FUSING deps)
+    int        fail_code;        // diagnostic: last failure reason from fuse_build_kernel
 } KernelEntry;
 
 typedef struct Backend Backend;

@@ -1,6 +1,5 @@
 // Forward declarations for fusion (defined in fuse/_.c)
 static int is_elementwise(u32 uop);
-static u32 fuse_or_reduce(TinyHVM *ctx, Term t);
 
 // Reduce a term to TAG_TEN and return its tensor ID (or ~0u on failure)
 static u32 reduce_id(TinyHVM *ctx, Term t) {
@@ -96,15 +95,14 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     // Only ASSIGN, GRAD, IFZ, LOG_PRINT, TODEVICE, WHERE, FUSING fire.
     if (tag == TAG_TOP) {
         u32 _uop = term_ext(next);
-        if (_uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
+        int _is_movement = (_uop >= UOP_RESHAPE && _uop <= UOP_PAD);
+        if (!_is_movement &&
+            _uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
             _uop != UOP_LOG_PRINT && _uop != UOP_TODEVICE && _uop != UOP_WHERE &&
             _uop != UOP_FUSING) {
             whnf = next; goto apply;
         }
         // Non-compute: reduce args then fire interact
-        Term rw = rewrite_apply(ctx, next);
-        if (rw != next) { next = rw; goto enter; }
-
         u64 loc = term_val(next);
         PUSH(next);
         next = heap_read(ctx, loc + 0);

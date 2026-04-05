@@ -282,6 +282,9 @@
             if (term_tag(val) == TAG_ERA) return val;
             if (term_tag(val) == TAG_NUM) return val;
             if (term_tag(val) == TAG_ANY) return val;
+            // DUP ⊳ TOP: WNF compute ops are read-only (shared lazily, like TAG_TEN).
+            // GRAD reads them as y-arguments; both projections get the same TAG_TOP.
+            if (term_tag(val) == TAG_TOP) return val;
 
             // DUP ⊳ USP: commutation (same as DUP-SUP but preserves TAG_USP)
             if (term_tag(val) == TAG_USP) {

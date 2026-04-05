@@ -15,6 +15,7 @@
 
 #include "pool.c"
 #include "ops.c"
+#include "dispatch.c"
 
 Backend cpu_backend = {
     .init      = cpu_init,
@@ -28,4 +29,5 @@ Backend cpu_backend = {
     .op_mm     = cpu_op_mm,
     .op_reduce = cpu_op_reduce,
     .pool_reset = cpu_pool_reset,
+    .dispatch_kernel_rs = cpu_dispatch_kernel_rs,
 };

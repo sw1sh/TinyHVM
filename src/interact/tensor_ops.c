@@ -31,6 +31,7 @@
                             ENSURE(ctx, src_id);
                             ms = &ctx->tensors[src_id]; // refresh after ENSURE
                             md = &ctx->tensors[dst_id];
+                            if (ms->buf_id == 0) { fprintf(stderr, "ASSIGN_NULL_BUF: dst=%u src=%u\n", dst_id, src_id); goto assign_done; }
                             if (md->backend->buf_copy && ms->view.contiguous &&
                                 ms->view.numel == md->view.numel) {
                                 md->backend->buf_copy(md->buf_id, ms->buf_id,
@@ -57,20 +58,33 @@
             // Fired by second thvm_reduce. Reads kernel spec from global table.
             if (uop == UOP_FUSING) {
                 extern KernelEntry sched_kernels[];
+                extern Term kid_results[];
+                extern u32 sched_kernel_count;
                 Term kid_term = heap_read(ctx, loc + 1); // arg1 = kernel index
                 u32 kid = (u32)term_val(kid_term);
+                // Dedup: same kid fired only once (multi-consumer propagation).
+                if (kid < sched_kernel_count && term_tag(kid_results[kid]) != TAG_ERA)
+                    RETURN_REDUCED(kid_results[kid]);
                 KernelEntry *ke = &sched_kernels[kid];
 
                 // Allocate output buffer
                 u32 dst_id = tensor_create(ctx, ke->out_shape, DTYPE_F32);
                 TensorMeta *md = &ctx->tensors[dst_id];
 
-                // Collect leaf buffers
+                // Collect leaf buffers — resolve placeholder IDs (0) from UOP_FUSING deps
                 u32 bufs[FUSE_MAX_LEAVES];
                 const View *views[FUSE_MAX_LEAVES];
                 for (u32 i = 0; i < ke->n_leaves; i++) {
-                    ENSURE(ctx, ke->leaf_ids[i]);
-                    bufs[i] = ctx->tensors[ke->leaf_ids[i]].buf_id;
+                    u32 lid = ke->leaf_ids[i];
+                    if (lid == 0) {
+                        // Placeholder from scheduled UOP_FUSING leaf.
+                        // Reduce the original leaf term — inner UOP_FUSING fires first.
+                        Term lt = ke->leaf_terms[i];
+                        Term lr = thvm_reduce(ctx, lt);
+                        if (term_tag(lr) == TAG_TEN) lid = (u32)term_val(lr);
+                    }
+                    ENSURE(ctx, lid);
+                    bufs[i] = ctx->tensors[lid].buf_id;
                     views[i] = &ke->leaf_views[i];
                 }
 
@@ -98,11 +112,15 @@
                         ctx->tensors[rs_id].creator_op = UOP_RESHAPE;
                         ctx->tensors[rs_id].src_ids[0] = dst_id;
                         ctx->itrs++;
-                        RETURN_REDUCED(term_ten(rs_id, DTYPE_F32));
+                        Term result = term_ten(rs_id, DTYPE_F32);
+                        kid_results[kid] = result;
+                        RETURN_REDUCED(result);
                     }
                 }
                 ctx->itrs++;
-                RETURN_REDUCED(term_ten(dst_id, DTYPE_F32));
+                { Term result = term_ten(dst_id, DTYPE_F32);
+                  kid_results[kid] = result;
+                  RETURN_REDUCED(result); }
             }
 
             if (uop == UOP_TODEVICE) {
@@ -317,12 +335,13 @@
             if (is_binary && term_tag(b) != TAG_TEN) return t;
 
             // Compute ops: return t (stay TAG_TOP). Scheduler rewrites to UOP_FUSING.
+            // Movement ops fire immediately when args are TAG_TEN.
 
             u32 a_id = (u32)term_val(a);
             TensorMeta *ma = &ctx->tensors[a_id];
 
-            // (old defer_all path disabled)
-            if (0) {
+            if (!is_movement) goto skip_movement;
+            {
                 u32 b_id = is_binary ? (u32)term_val(b) : 0;
                 TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
                 u32 out_shape[MAX_DIM]; u32 out_ndim;
@@ -551,6 +570,7 @@
                 ctx->itrs++;
                 RETURN_REDUCED(term_ten(dst_id, ma->dtype));
             }
+            skip_movement:;
 
             if (!ctx_default_backend(ctx)) return t;
 
@@ -569,8 +589,7 @@
                 RETURN_REDUCED(term_era());
             }
 
-            // ALL compute ops stay as TAG_TOP — scheduler rewrites them to UOP_FUSING.
-            // Second reduce fires UOP_FUSING → dispatch → TAG_TEN.
+            // Compute ops stay as TAG_TOP. Scheduler rewrites to UOP_FUSING.
             return t;
 
             // ---- DEAD CODE BELOW (kept for reference during migration) ----

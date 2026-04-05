@@ -66,10 +66,14 @@
                     const View *yv = st_get(y_loc);
                     Shape y_shape = yv ? yv->shape : SHAPE(1);
                     Shape a_shape = SHAPE(1), b_shape = SHAPE(1);
-                    if (term_tag(at) == TAG_TEN) a_shape = ctx->tensors[(u32)term_val(at)].view.shape;
-                    else if (term_tag(at) == TAG_TOP) { const View *av = st_get(term_val(at)); if (av) a_shape = av->shape; }
-                    if (term_tag(bt) == TAG_TEN) b_shape = ctx->tensors[(u32)term_val(bt)].view.shape;
-                    else if (term_tag(bt) == TAG_TOP) { const View *bv = st_get(term_val(bt)); if (bv) b_shape = bv->shape; }
+                    { Term _at = at;
+                      if (term_tag(_at)==TAG_DP0||term_tag(_at)==TAG_DP1) _at=heap_read(ctx,term_val(_at));
+                      if (term_tag(_at)==TAG_TEN) a_shape=ctx->tensors[(u32)term_val(_at)].view.shape;
+                      else if (term_tag(_at)==TAG_TOP) { const View *av=st_get(term_val(_at)); if(av) a_shape=av->shape; } }
+                    { Term _bt = bt;
+                      if (term_tag(_bt)==TAG_DP0||term_tag(_bt)==TAG_DP1) _bt=heap_read(ctx,term_val(_bt));
+                      if (term_tag(_bt)==TAG_TEN) b_shape=ctx->tensors[(u32)term_val(_bt)].view.shape;
+                      else if (term_tag(_bt)==TAG_TOP) { const View *bv=st_get(term_val(_bt)); if(bv) b_shape=bv->shape; } }
 
                     #define GRAD3_H(y_,gy_,x_) ({ \
                         u64 _l = heap_alloc(ctx, 3); \
@@ -85,9 +89,16 @@
                     // But with lazy TAG_TOPs, ADD never fires. Need something that fires.
                     // Use thvm_app with nested APP: APP(APP(id, grad_a), grad_b) where id = LAM(VAR(0)).
                     // Actually: just run grad_a, then grad_b, via GRAD_STEP loop.
-                    // ADD(grad_a, grad_b): during backward (no_grad_alloc=1), ADD is NOT WNF
-                    // so the trampoline processes both branches.
-                    #define BG(da_,db_) do { GRAD_RETURN(thvm_op(ctx, UOP_ADD, GRAD3_H(at,da_,x), GRAD3_H(bt,db_,x))); } while(0)
+                    // Both branches of a binary op backward: fire _ga eagerly (creates
+                    // ASSIGN side effects on the heap), then GRAD_STEP _gb inline.
+                    // Compute ops are always WNF so we can't use ADD to chain both.
+                    // GRAD_STEP is a goto — can't call it twice in sequence.
+                    // Fire _ga via real thvm_reduce call (returns), then GRAD_STEP _gb.
+                    #define BG(da_,db_) do { \
+                        Term _ga=GRAD3_H(at,da_,x), _gb=GRAD3_H(bt,db_,x); \
+                        thvm_reduce(ctx, _ga); \
+                        GRAD_STEP(_gb); \
+                    } while(0)
                     #define UG(da_) do { Term _u=GRAD3_H(at,da_,x); if(term_tag(_u)==TAG_TOP) GRAD_STEP(_u); GRAD_RETURN(_u); } while(0)
 
                     switch (cop) {
@@ -107,7 +118,7 @@
                         case UOP_RMAX: { Term max_bc=thvm_expand(ctx,thvm_reshape(ctx,y,y_shape),a_shape); f32 one=1;
                             Term mask=thvm_op(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),thvm_op(ctx,UOP_CMP,max_bc,at));
                             UG(thvm_op(ctx,UOP_MUL,thvm_expand(ctx,gy,a_shape),mask)); }
-                        case UOP_RESHAPE: UG(sum_to_shape(ctx,gy,y_shape,a_shape));
+                        case UOP_RESHAPE: UG(thvm_reshape(ctx,gy,a_shape));
                         case UOP_PERMUTE: {
                             if (term_tag(bt)==TAG_TEN) { u32 pid=(u32)term_val(bt); TensorMeta *mp=&ctx->tensors[pid];
                                 u32 nd=mp->view.numel; f32 pf[MAX_DIM]; META_READ(mp->backend,mp->buf_id,pf,nd*4);
@@ -136,7 +147,7 @@
 
                 if (term_tag(y) == TAG_TEN) {
                     u32 y_id = (u32)term_val(y);
-
+                    if (getenv("THVM_SCHED_DIAG")) { static int _gc=0; _gc++; if (_gc<=10) fprintf(stderr,"  GRAD_TEN[%d]: y_id=%u tag_x=%u\n",_gc,y_id,term_tag(x)); }
                     // Base case: y == x → return grad_y (trampoline reduces)
                     if (term_tag(x) == TAG_TEN && (u32)term_val(x) == y_id) {
                         GRAD_RETURN(gy);
@@ -152,8 +163,10 @@
                             if (term_tag(p) == TAG_TEN && (u32)term_val(p) == y_id) {
                                 Term slot = heap_read(ctx, tgt_loc + 1 + 2*_gi + 1);
                                 Term accum = thvm_op(ctx, UOP_ADD, slot, gy);
-                                GRAD_RETURN(thvm_app(ctx,
-                                    thvm_assign(ctx, slot, accum), term_era()));
+                                u64 _ah = heap_alloc(ctx, 1);
+                                heap_set(ctx, _ah, thvm_assign(ctx, slot, accum));
+                                if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  ASSIGN_CREATE: target=%u slot=%u\n", y_id, _gi);
+                                GRAD_RETURN(term_era());
                             }
                         }
                     }
@@ -218,9 +231,7 @@
                         int _a_live = ma->requires_grad; \
                         int _b_live = mb_p && mb_p->requires_grad; \
                         if (_a_live && _b_live) { \
-                            GRAD_RETURN(thvm_op(ctx, UOP_ADD, \
-                                GRAD3(at, da_, x), \
-                                GRAD3(bt, db_, x))); \
+                            GRAD_RETURN(thvm_app(ctx, GRAD3(at, da_, x), GRAD3(bt, db_, x))); \
                         } else if (_a_live) { \
                             UN_GRAD(da_); \
                         } else if (_b_live) { \
@@ -247,10 +258,17 @@
                                 sum_to_shape(ctx, gy, my->view.shape, ma->view.shape),
                                 thvm_op(ctx, UOP_NEG,
                                     sum_to_shape(ctx, gy, my->view.shape, mb_p->view.shape), term_era()));
-                        case UOP_MUL:
+                        case UOP_MUL: {
+                            static int _mc = 0; _mc++;
+                            if (_mc <= 6) {
+                                fprintf(stderr, "MUL_GRAD[%d]: y_id=%u y_shape=[", _mc, y_id);
+                                for(u32 _j=0;_j<my->view.shape.rank;_j++) fprintf(stderr,"%u,",my->view.shape.dims[_j]);
+                                fprintf(stderr,"] a=%u b=%u a_rg=%u b_rg=%u\n", aid, bid, ma->requires_grad, mb_p?mb_p->requires_grad:0);
+                            }
                             BIN_GRAD(
                                 sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, bt), my->view.shape, ma->view.shape),
                                 sum_to_shape(ctx, thvm_op(ctx, UOP_MUL, gy, at), my->view.shape, mb_p->view.shape));
+                        }
                         case UOP_MM: {
                             // Dead code — UOP_MM decomposed to EXPAND+MUL+SUM.
                             // No tensor has creator_op==UOP_MM anymore.

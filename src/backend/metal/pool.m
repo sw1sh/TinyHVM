@@ -39,7 +39,7 @@ static u32 plan_alloc_ids[MAX_PLAN_ENTRIES];
 static u32 plan_alloc_birth[MAX_PLAN_ENTRIES];
 static u32 plan_alloc_count = 0;
 
-#define METAL_MEM_BUDGET (24ULL * 1024 * 1024 * 1024) // 24GB (temporarily raised for scheduler dev)
+#define METAL_MEM_BUDGET (12ULL * 1024 * 1024 * 1024) // 12GB hard limit
 
 static u32 metal_buf_alloc(u64 bytes) {
     bytes = MAX(bytes, 4);

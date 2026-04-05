@@ -24,7 +24,7 @@ static void sched_dump_heap(TinyHVM *ctx) {
 static u32 sched_all(TinyHVM *ctx) {
     u32 total = 0;
     fuse_no_lazy_resolve = 1;
-    ctx->no_grad_alloc = 1; // suppress requires_grad intermediate buffers (memory planner TODO)
+    ctx->no_grad_alloc = 1; // suppress requires_grad intermediate buffers
 
     for (u32 pass = 0; pass < 50; pass++) {
         u32 progress = 0;
@@ -60,9 +60,10 @@ static u32 sched_all(TinyHVM *ctx) {
                 continue;
             }
 
-            // View ops: resolve via thvm_reduce (non-WNF trampoline).
-            // EXPAND/PERMUTE create view aliases (no allocation). SHRINK creates sub-views.
-            // RESHAPE may contiguify (allocation) — suppress during scheduling.
+            // View ops: resolve via thvm_reduce with dispatch_mode=1.
+            // View ops are WNF by default (no_fuse=1). dispatch_mode overrides
+            // the WNF check so views fire in the trampoline.
+            // no_fuse suppresses RESHAPE contiguify (returns input unchanged).
             if (is_view_op(uop)) {
                 // Pre-resolve DP0/DP1 in args (shape params might be DUP-shared)
                 u64 vloc = term_val(ht);
@@ -74,10 +75,12 @@ static u32 sched_all(TinyHVM *ctx) {
                             heap_set(ctx, vloc + ai, shared);
                     }
                 }
-                // Suppress contiguify during scheduler view resolution
-                ctx->no_fuse = 1; // reuse flag to signal "no materialize"
+                // dispatch_mode fires view ops. defer_all blocks compute ops.
+                ctx->dispatch_mode = 1;
+                ctx->defer_all = 1;
                 Term r = thvm_reduce(ctx, ht);
-                ctx->no_fuse = 0;
+                ctx->defer_all = 0;
+                ctx->dispatch_mode = 0;
                 if (r != ht && term_tag(r) == TAG_TEN) {
                     ctx->heap[h] = r;
                     progress++;
@@ -110,7 +113,8 @@ static u32 sched_all(TinyHVM *ctx) {
 
 Term thvm_eval(TinyHVM *ctx, Term t) {
     // Phase 1: Pure IC reduce — everything lazy.
-    // Suppress contiguify: view ops fire (non-WNF) but must not allocate GPU buffers.
+    // no_fuse=1: compute+view TAG_TOPs are WNF (no TensorMeta, no contiguify).
+    // Only APP, GRAD, ASSIGN, IFZ etc. fire (structural reduction).
     ctx->no_fuse = 1;
     t = thvm_reduce(ctx, t);
     ctx->no_fuse = 0;
@@ -120,7 +124,8 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     u32 n = sched_all(ctx);
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase2(%u total): ", n); sched_dump_heap(ctx); }
 
-    // Phase 3: Fire ASSIGNs
+    // Phase 3: Fire ASSIGNs (dispatch_mode=1 so view ops fire in ASSIGN chains)
+    ctx->dispatch_mode = 1;
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
@@ -128,6 +133,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             ctx->heap[h] = r;
         }
     }
+    ctx->dispatch_mode = 0;
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase3: "); sched_dump_heap(ctx); }
 
     return term_era();

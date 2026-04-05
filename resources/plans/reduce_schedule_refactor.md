@@ -136,41 +136,49 @@ When UOP_FUSING fires: read spec → codegen → dispatch → create TensorMeta 
 
 ## Current State (2026-04-05)
 
-### Scheduler: 205 dispatches (fwd + bwd)
-```
-pass 0: 76 dispatched  (forward reduces + ew + views)
-pass 1: 129 dispatched (GRAD fires → backward reduces + ew)
-```
-Pure IC first reduce: HEAP[648] TEN=274 TOP=281, GRAD=4 (reduced from 13).
-Forward fully dispatches. Backward fires via GRAD. ASSIGNs fire in phase 3.
+### What works
+- **Pure IC first reduce** ✓ no_fuse=1 → ALL compute+view ops WNF
+- **Graph walk** ✓ Unified forward scan discovers and dispatches 25 kernels at 12GB budget
+- **fuse_or_reduce** ✓ Absorbs ew chains into reduces, DP0 look-through, min_ops relaxed
+- **fuse_walk_inner** ✓ Walks VIEW(ew_TAG_TOP) for EXPAND/PERMUTE/RESHAPE
+- **View resolution** ✓ dispatch_mode + defer_all fires views without compute side-effects
+- **GRAD** ✓ Fires on TAG_TOP args, creates backward TAG_TOPs
+- **Buffer steal** ✓ dispatch_counter + buf_last_use in codegen.m
 
-### Blockers
-1. **OOM (13GB)** — budget raised to 24GB for dev. Root: ENSURE inside fuse_or_reduce
-   materializes deferred view chains from the interact handler. Needs proper memory
-   planner (buffer reuse) or elimination of ENSURE cascade.
-2. **view_expand rank mismatch** — backward GRAD creates EXPAND with rank=0. Shape bug
-   in grad handler, not scheduler.
+### Why hybrid dispatch hit a wall
+The current approach dispatches directly from the scheduler via fuse_or_reduce.
+This MIXES planning with execution:
+- View resolution (thvm_reduce) triggers contiguify → large GPU allocations
+- ENSURE inside fuse_or_reduce materializes deferred chains recursively
+- Flag gymnastics (no_fuse/dispatch_mode/defer_all) create fragile interactions
+- Forward chain stalls: ew→view→ew interleaving needs many passes, but the
+  contiguify allocations accumulate without mid-step freeing
 
-### What's done
-- **Step 0** ✓ MM decomposed to EXPAND+MUL+SUM
-- **Pure IC first reduce** ✓ no_fuse=1 → compute ops unconditionally WNF (no deferred TensorMeta)
-- **Trampoline** ✓ Compute TAG_TOPs WNF. View ops NON-WNF. RESHAPE contiguify suppressed (no_fuse).
-- **TAG_TOP GRAD handler** ✓ Walks TAG_TOPs on heap for provenance
-- **Scheduler unified scan** ✓ Multi-pass, processes all TAG_TOP types:
-  - Reduces: fuse_or_reduce (absorbs ew chains, DP0 look-through for SUM input + axes)
-  - Views: thvm_reduce for SHRINK/PAD + DP0 pre-resolution. EXPAND/PERMUTE/RESHAPE skipped
-    (handled by fuse_walk_inner view composition)
-  - Ew: fuse_or_reduce (min_ops=1, no_grad_alloc=1)
-  - GRAD: thvm_reduce when arg0 ready (TAG_TEN or TAG_TOP)
-  - SUM(TAG_TEN): 0-op reduce kernel (min_ops=0, leaf_used fix)
-- **fuse_walk_inner** ✓ Walks through VIEW(ew_TAG_TOP) for EXPAND/PERMUTE/RESHAPE
-- **ASSIGN phase** ✓ thvm_reduce fires ASSIGNs (view chains resolve via non-WNF trampoline)
-- **Buffer steal** ✓ dispatch_counter + buf_last_use in codegen.m. Relaxed pool guards.
-  Saves ~100MB but insufficient without full planner.
+With 24GB budget: 205 dispatches work (91 fwd + 114 bwd), but view_expand
+rank mismatch in backward. With 12GB: 25 dispatches, then stalls (view chains
+need more passes that don't make progress due to ordering).
 
-### What's NOT done — BLOCKER: memory planner
-Without buffer reuse, each dispatch allocates a fresh GPU buffer. 91+ dispatches
-at BS=128 with conv tensors → 13GB OOM. Tinygrad uses 0.82GB via 58→1 buffer reuse.
+### Key lesson
+**Cannot dispatch during scheduling.** The graph walk and kernel grouping work
+correctly. The memory management and dispatch sequencing do not. This confirms
+the plan's architecture: separate schedule (pure rewrite) from dispatch.
+
+### BLOCKER: need to separate plan from dispatch
+Two options (same as before, now informed by experience):
+
+**Option A: Two-pass scheduler (simpler)**
+1. Pass 1: walk heap with fuse_or_reduce in "dry run" mode → collect KernelEntry[]
+   (output size, leaf IDs, reduce spec). NO dispatch, NO allocation.
+2. Memory planner: greedy interval coloring on KernelEntry[] lifetimes
+3. Pass 2: dispatch each KernelEntry with pre-assigned buffer from plan
+
+**Option B: UOP_FUSING (per original architecture)**
+1. Walk heap → group into fused kernels → write UOP_FUSING specs to heap
+2. Memory plan on UOP_FUSING specs
+3. Second thvm_reduce fires UOP_FUSING interactions → dispatch with planned buffers
+
+Option A reuses the current fuse_or_reduce infrastructure (proven to work).
+Option B is cleaner but requires new UOP_FUSING interaction handler.
 
 ## Immediate Next Step: Memory Planner
 

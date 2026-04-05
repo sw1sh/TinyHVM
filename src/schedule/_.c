@@ -49,15 +49,42 @@ static u32 sched_all(TinyHVM *ctx) {
                 continue;
             }
 
-            // Skip view ops — handled by fuse_walk_inner inside fuse_or_reduce.
-            // SHRINK/PAD become lazy leaf boundaries (resolved when input is TAG_TEN).
-            if (is_view_op(uop)) continue;
+            // View ops: mostly handled by fuse_walk_inner inside fuse_or_reduce.
+            // Exception: pool RESHAPEs (numel mismatch) need direct view alias creation.
+            if (is_view_op(uop)) {
+                u64 vloc = term_val(ht);
+                Term vinput = heap_read(ctx, vloc);
+                if (term_tag(vinput) == TAG_TEN) {
+                    u32 src_id = (u32)term_val(vinput);
+                    const View *sv = st_get(vloc);
+                    if (sv && sv->numel != ctx->tensors[src_id].view.numel) {
+                        // Pool stride view: create view alias with pool strides
+                        u32 vid = tensor_view_of(ctx, src_id, *sv);
+                        ctx->tensors[vid].creator_op = UOP_RESHAPE;
+                        ctx->tensors[vid].src_ids[0] = src_id;
+                        ctx->heap[h] = term_ten(vid, DTYPE_F32);
+                        progress++;
+                    }
+                }
+                continue;
+            }
 
-            // All compute ops (reduce + ew): dispatch via fuse_or_reduce
+            // All compute ops (reduce + ew): try fused dispatch first
             u32 fid = fuse_or_reduce(ctx, ht);
             if (fid != ~0u) {
                 ctx->heap[h] = term_ten(fid, DTYPE_F32);
                 progress++;
+            } else {
+                // Fallback: individual dispatch via dispatch_mode.
+                // thvm_reduce walks into args (dispatch_mode fires everything).
+                // Pool RESHAPEs with numel mismatch return self (handled in interact).
+                ctx->dispatch_mode = 1;
+                Term r = thvm_reduce(ctx, ht);
+                ctx->dispatch_mode = 0;
+                if (r != ht && term_tag(r) == TAG_TEN) {
+                    ctx->heap[h] = r;
+                    progress++;
+                }
             }
         }
 
@@ -84,14 +111,21 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     u32 n = sched_all(ctx);
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase2(%u total): ", n); sched_dump_heap(ctx); }
 
-    // Phase 3: Fire ASSIGNs via thvm_reduce (view ops fire via interact handler)
+    // Phase 3: Fire ASSIGNs + resolve remaining view chains.
+    // dispatch_mode=1 so view ops (RESHAPE/EXPAND/PERMUTE) fire via trampoline.
+    ctx->dispatch_mode = 1;
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
-        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
+        if (term_tag(ht) != TAG_TOP) continue;
+        u32 uop = term_ext(ht);
+        // Skip RESHAPE: pool RESHAPEs have numel mismatch (overlapping windows).
+        // They're handled by fuse_walk_inner's st_get fallback during dispatch.
+        if (uop == UOP_ASSIGN || (is_view_op(uop) && uop != UOP_RESHAPE)) {
             Term r = thvm_reduce(ctx, ht);
-            ctx->heap[h] = r;
+            if (r != ht) ctx->heap[h] = r;
         }
     }
+    ctx->dispatch_mode = 0;
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase3: "); sched_dump_heap(ctx); }
 
     return term_era();

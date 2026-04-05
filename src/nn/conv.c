@@ -222,11 +222,14 @@ Term thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
                 }
                 return term_ten(vid, m->dtype);
             } else {
-                // TAG_TOP: create pool TAG_TOP with correct strides in shape table.
-                // Use thvm_op for proper heap allocation. UOP_RESHAPE makes the fuser
-                // treat this as a non-ew leaf (st_get returns pool strides).
-                Term pool_top = thvm_op(ctx, UOP_RESHAPE, x, term_era());
-                // Override the st_set from thvm_op with the pool view (custom strides)
+                // TAG_TOP: pool view with custom strides in shape table.
+                // Create a shape tensor so the interact handler can resolve it.
+                f32 shape_f[MAX_DIM];
+                for (u32 j = 0; j < out_rank; j++) shape_f[j] = (f32)out_shape.dims[j];
+                Term shape_t = thvm_tensor(ctx, shape_f,
+                    (Shape){.dims={out_rank}, .rank=1});
+                Term pool_top = thvm_op(ctx, UOP_RESHAPE, x, shape_t);
+                // Override the st_set from thvm_op with pool view (custom strides)
                 st_set(term_val(pool_top), &ov);
                 return pool_top;
             }

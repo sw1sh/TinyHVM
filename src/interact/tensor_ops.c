@@ -337,6 +337,10 @@
                         META_READ(mb->backend, mb->buf_id, dims, ns.rank * sizeof(f32));
                         for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
                         free(dims);
+                        // Pool stride view: numel mismatch (overlapping windows).
+                        // Return self unchanged — fuser handles via st_get.
+                        { u32 nn = 1; for (u32 i = 0; i < ns.rank; i++) nn *= ns.dims[i];
+                          if (nn != ma->view.numel) return t; }
 
                         // Identity reshape: same shape → keep original view (no contiguify)
                         int same_shape = (ma->view.shape.rank == ns.rank);
@@ -417,6 +421,8 @@
                         META_READ(mb->backend, mb->buf_id, dims, ns.rank * sizeof(f32));
                         for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
                         free(dims);
+                        // Guard: GRAD backward may create rank-mismatched expands
+                        if (ns.rank != ma->view.shape.rank) return t;
                         new_view = view_expand(ma->view, ns);
                         break;
                     }

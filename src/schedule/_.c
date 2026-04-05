@@ -85,6 +85,9 @@ static u32 sched_all(TinyHVM *ctx) {
                     heap_set(ctx, floc, term_era());              // arg0 (triggers immediate fire)
                     heap_set(ctx, floc + 1, term_new(TAG_NUM, 0, kid));  // arg1 = kernel index
                     ctx->heap[h] = term_new(TAG_TOP, UOP_FUSING, floc);
+                    // Store output shape so later fuse_build_kernel sees this as a ready leaf
+                    View out_v = view_create(ke.out_shape);
+                    st_set(floc, &out_v);
                     progress++;
                 }
             }
@@ -100,6 +103,17 @@ static u32 sched_all(TinyHVM *ctx) {
     return total;
 }
 
+// Dispatch all UOP_FUSING on the heap → TAG_TEN
+static void sched_dispatch_fusing(TinyHVM *ctx) {
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_FUSING) {
+            Term r = thvm_reduce(ctx, ht);
+            ctx->heap[h] = r;
+        }
+    }
+}
+
 Term thvm_eval(TinyHVM *ctx, Term t) {
     sched_kernel_count = 0;
 
@@ -107,23 +121,26 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     t = thvm_reduce(ctx, t);
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }
 
-    // Phase 2: Pure rewrite — TAG_TOPs → UOP_FUSING specs on heap
-    u32 n = sched_all(ctx);
-    if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase2(%u kernels): ", n); sched_dump_heap(ctx); }
+    // Phase 2+3 loop: schedule (rewrite) → dispatch (reduce) → repeat.
+    // Each iteration: schedule inner kernels → dispatch them → next level.
+    for (u32 iter = 0; iter < 50; iter++) {
+        u32 n = sched_all(ctx);
+        if (n == 0) break;
+        if (getenv("THVM_SCHED_DIAG"))
+            fprintf(stderr, "  sched iter %u: %u kernels\n", iter, n);
+        sched_dispatch_fusing(ctx);
+    }
+    if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after sched: "); sched_dump_heap(ctx); }
 
-    // Phase 3: Second reduce — UOP_FUSING fires (dispatch), ASSIGNs fire (buf_copy).
-    // UOP_FUSING is non-WNF → trampoline fires it → interact reads KernelEntry → dispatch.
-    // View ops in ASSIGN chains fire via interact handler (movement ops create view aliases).
+    // Final: fire ASSIGNs
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
-        if (term_tag(ht) != TAG_TOP) continue;
-        u32 uop = term_ext(ht);
-        if (uop == UOP_ASSIGN || uop == UOP_FUSING) {
+        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
             Term r = thvm_reduce(ctx, ht);
             ctx->heap[h] = r;
         }
     }
-    if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase3: "); sched_dump_heap(ctx); }
+    if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after assign: "); sched_dump_heap(ctx); }
 
     return term_era();
 }

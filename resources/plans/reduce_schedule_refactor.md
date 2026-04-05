@@ -136,33 +136,37 @@ When UOP_FUSING fires: read spec → codegen → dispatch → create TensorMeta 
 
 ## Current State (2026-04-05)
 
-### After first reduce
+### Scheduler: 205 dispatches (fwd + bwd)
 ```
-HEAP[806]: TEN=284 TOP=334 | NEG=8 EXP=2 LOG=3 RELU=8 SQRT=4 ADD=24 MUL=70
-  DIV=12 MAX=3 CMP=2 SUB=10 SUM=23 RMAX=6 RESHAPE=70 PERMUTE=18 EXPAND=36
-  SHRINK=18 ASSIGN=4 GRAD=13
+pass 0: 76 dispatched  (forward reduces + ew + views)
+pass 1: 129 dispatched (GRAD fires → backward reduces + ew)
 ```
+Pure IC first reduce: HEAP[648] TEN=274 TOP=281, GRAD=4 (reduced from 13).
+Forward fully dispatches. Backward fires via GRAD. ASSIGNs fire in phase 3.
 
-### Scheduler dispatches 91+ kernels (pass 0)
-- Unified scan: reduce → ew → view resolution, forward order
-- GRAD fires (5 of 13), creates backward TAG_TOPs
-- 28 reduce dispatches (SUM/RMAX via fuse_or_reduce)
-- 21 view resolutions (SHRINK/RESHAPE/EXPAND chains via thvm_reduce)
-- 36 ew dispatches (standalone RELU, ADD, etc.)
-- **OOM at 13GB** — dispatches without buffer reuse
+### Blockers
+1. **OOM (13GB)** — budget raised to 24GB for dev. Root: ENSURE inside fuse_or_reduce
+   materializes deferred view chains from the interact handler. Needs proper memory
+   planner (buffer reuse) or elimination of ENSURE cascade.
+2. **view_expand rank mismatch** — backward GRAD creates EXPAND with rank=0. Shape bug
+   in grad handler, not scheduler.
 
 ### What's done
 - **Step 0** ✓ MM decomposed to EXPAND+MUL+SUM
-- **Trampoline** ✓ Compute TAG_TOPs are WNF. View ops are NON-WNF (fire on TAG_TEN args)
+- **Pure IC first reduce** ✓ no_fuse=1 → compute ops unconditionally WNF (no deferred TensorMeta)
+- **Trampoline** ✓ Compute TAG_TOPs WNF. View ops NON-WNF. RESHAPE contiguify suppressed (no_fuse).
 - **TAG_TOP GRAD handler** ✓ Walks TAG_TOPs on heap for provenance
 - **Scheduler unified scan** ✓ Multi-pass, processes all TAG_TOP types:
-  - Reduces: fuse_or_reduce (absorbs ew chains, DP0 look-through for axes)
-  - Views: thvm_reduce (non-WNF fires interact, DP0 pre-resolution for shared params)
-  - Ew: fuse_or_reduce (min_ops=1 in scheduler mode)
-  - GRAD: thvm_reduce when arg0 = TAG_TEN
-  - SUM(TAG_TEN): 0-op reduce kernel (min_ops=0)
+  - Reduces: fuse_or_reduce (absorbs ew chains, DP0 look-through for SUM input + axes)
+  - Views: thvm_reduce for SHRINK/PAD + DP0 pre-resolution. EXPAND/PERMUTE/RESHAPE skipped
+    (handled by fuse_walk_inner view composition)
+  - Ew: fuse_or_reduce (min_ops=1, no_grad_alloc=1)
+  - GRAD: thvm_reduce when arg0 ready (TAG_TEN or TAG_TOP)
+  - SUM(TAG_TEN): 0-op reduce kernel (min_ops=0, leaf_used fix)
 - **fuse_walk_inner** ✓ Walks through VIEW(ew_TAG_TOP) for EXPAND/PERMUTE/RESHAPE
-- **ASSIGN phase** ✓ thvm_reduce fires ASSIGNs (view ops resolve via trampoline)
+- **ASSIGN phase** ✓ thvm_reduce fires ASSIGNs (view chains resolve via non-WNF trampoline)
+- **Buffer steal** ✓ dispatch_counter + buf_last_use in codegen.m. Relaxed pool guards.
+  Saves ~100MB but insufficient without full planner.
 
 ### What's NOT done — BLOCKER: memory planner
 Without buffer reuse, each dispatch allocates a fresh GPU buffer. 91+ dispatches

@@ -138,12 +138,13 @@ When UOP_FUSING fires: read spec → codegen → dispatch → create TensorMeta 
 
 ### What works
 - **Pure IC first reduce** ✓ no_fuse=1 → ALL compute+view ops WNF
-- **Graph walk** ✓ Unified forward scan discovers and dispatches 25 kernels at 12GB budget
-- **fuse_or_reduce** ✓ Absorbs ew chains into reduces, DP0 look-through, min_ops relaxed
-- **fuse_walk_inner** ✓ Walks VIEW(ew_TAG_TOP) for EXPAND/PERMUTE/RESHAPE
-- **View resolution** ✓ dispatch_mode + defer_all fires views without compute side-effects
+- **Graph walk** ✓ 37 dispatches (31 fwd + 6 GRAD) at 12GB, no OOM, no flags
+- **Pool stride trick** ✓ SHRINK=18→0, uses st_get strides for TAG_TOP pool inputs
+- **fuse_or_reduce** ✓ Absorbs ew chains, DP0 look-through, min_ops=0/1, TAG_NUM scalars
+- **fuse_walk_inner** ✓ VIEW(ew_TAG_TOP) for EXPAND/PERMUTE/RESHAPE, st_get fallback for pool
+- **Non-lazy leaves** ✓ When TAG_TOP's input is TAG_TEN → real tensor ID (not LEAF_IS_LAZY)
 - **GRAD** ✓ Fires on TAG_TOP args, creates backward TAG_TOPs
-- **Buffer steal** ✓ dispatch_counter + buf_last_use in codegen.m
+- **Buffer steal** ✓ dispatch_counter tracking, aggressive reuse
 
 ### Why hybrid dispatch hit a wall
 The current approach dispatches directly from the scheduler via fuse_or_reduce.

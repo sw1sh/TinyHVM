@@ -92,31 +92,16 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         tag == TAG_LAM || tag == TAG_SUP || tag == TAG_BRI ||
         tag == TAG_MAT || tag == TAG_ANY || tag == TAG_USP) { whnf = next; goto apply; }
 
-    // TAG_TOP: compute ops are WNF (lazy). Non-compute ops reduce args and fire.
+    // TAG_TOP: compute ops are WNF (interact handler returns t).
+    // Only ASSIGN, GRAD, IFZ, LOG_PRINT, TODEVICE, WHERE, FUSING fire.
     if (tag == TAG_TOP) {
         u32 _uop = term_ext(next);
-        // Compute ops: WNF only if args are also WNF (TAG_TEN, ERA, NUM, lazy TAG_TOP).
-        // If any arg needs reduction (GRAD, ASSIGN, APP), process normally.
-        if (!ctx->dispatch_mode &&
-            _uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
+        if (_uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
             _uop != UOP_LOG_PRINT && _uop != UOP_TODEVICE && _uop != UOP_WHERE &&
             _uop != UOP_FUSING) {
-            // During pure IC phase (no_fuse=1): ALL compute+view ops are WNF.
-            if (ctx->no_fuse) { whnf = next; goto apply; }
-            u64 _loc = term_val(next);
-            int _lazy = 1;
-            // Check if any arg needs reduction (GRAD, APP, ASSIGN, etc.)
-            for (u32 _ai = 0; _ai < 2 && _lazy; _ai++) {
-                Term _a = heap_read(ctx, _loc + _ai);
-                if (term_tag(_a) == TAG_TOP) {
-                    u32 _au = term_ext(_a);
-                    if (_au == UOP_GRAD || _au == UOP_ASSIGN || _au == UOP_IFZ || _au == UOP_FUSING)
-                        _lazy = 0;
-                } else if (term_tag(_a) == TAG_APP) _lazy = 0;
-            }
-            if (_lazy) { whnf = next; goto apply; }
+            whnf = next; goto apply;
         }
-        // Non-compute: reduce args then fire interact (existing behavior)
+        // Non-compute: reduce args then fire interact
         Term rw = rewrite_apply(ctx, next);
         if (rw != next) { next = rw; goto enter; }
 

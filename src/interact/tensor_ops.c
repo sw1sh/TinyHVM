@@ -264,9 +264,7 @@
             if (term_tag(a) != TAG_TEN) return t;
             if (is_binary && term_tag(b) != TAG_TEN) return t;
 
-            // Pure reduce: ALL compute ops stay as TAG_TOP (WNF).
-            // No TensorMeta. GRAD handles TAG_TOP directly.
-            if (ctx->defer_all) return t;
+            // Compute ops: return t (stay TAG_TOP). Scheduler rewrites to UOP_FUSING.
 
             u32 a_id = (u32)term_val(a);
             TensorMeta *ma = &ctx->tensors[a_id];
@@ -519,6 +517,11 @@
                 RETURN_REDUCED(term_era());
             }
 
+            // ALL compute ops stay as TAG_TOP — scheduler rewrites them to UOP_FUSING.
+            // Second reduce fires UOP_FUSING → dispatch → TAG_TEN.
+            return t;
+
+            // ---- DEAD CODE BELOW (kept for reference during migration) ----
             // For reduces, extract axes tensor ID to enable SUM deferral
             u32 b_id = 0;
             if (is_binary) {

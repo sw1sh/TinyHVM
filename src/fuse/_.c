@@ -186,7 +186,19 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         // Look through DUP references for shared shape params
         if (term_tag(arg2) == TAG_DP0 || term_tag(arg2) == TAG_DP1)
             arg2 = heap_read(ctx, term_val(arg2));
-        if (term_tag(arg2) != TAG_TEN) return -1;
+        if (term_tag(arg2) != TAG_TEN) {
+            // No shape params (e.g. pool stride view with ERA arg1).
+            // Fall back to non-ew leaf using st_get for the view.
+            const View *sv = st_get(term_val(t));
+            if (!sv) return -1;
+            if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
+            u32 fallback_idx = (*n_leaves)++;
+            leaf_ids[fallback_idx] = leaf_ids[leaf_idx]; // inherit inner leaf's tensor ID
+            fuse_composed_views[fallback_idx] = *sv;
+            leaf_views[fallback_idx] = &fuse_composed_views[fallback_idx];
+            fuse_leaf_terms[fallback_idx] = fuse_leaf_terms[leaf_idx];
+            return (int)(WALK_LEAF_BASE + fallback_idx);
+        }
         TensorMeta *mp = &ctx->tensors[(u32)term_val(arg2)];
         u32 rank = mp->view.numel;
         if (rank > MAX_DIM) return -1;

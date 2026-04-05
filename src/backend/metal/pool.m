@@ -82,17 +82,20 @@ static u32 metal_buf_alloc(u64 bytes) {
         }
     }
 
-    // 2. Mid-step steal (step 0, before plan exists)
-    if (!mem_plan_active && bytes >= 1024*1024 && dispatch_counter > 2) {
+    // 2. Mid-step steal: reuse buffers dead for 2+ dispatches.
+    // Aggressive: no size upper bound (waste some space), dispatch_counter-based death.
+    if (!mem_plan_active && bytes >= 4096 && dispatch_counter > 2) {
         u32 reuse_id = 0;
         u64 reuse_size = UINT64_MAX;
         for (u32 i = 1; i < id; i++) {
             if (!metal_pool.bufs[i]) continue;
             u64 sz = metal_pool.sizes[i];
-            if (sz < bytes || sz > bytes * 4) continue;
+            if (sz < bytes) continue; // must be >= required
+            if (buf_refcount[i] > 1) continue; // shared buffer, don't steal
             if (buf_remaining_uses[i] > 0) continue;
-            if (buf_last_use[i] > 0 && buf_last_use[i] + 1 >= dispatch_counter) continue;
-            if (buf_last_use[i] == 0 && i + 20 > id) continue;
+            // Dead: last used 2+ dispatches ago, or never used and not recent
+            if (buf_last_use[i] > 0 && buf_last_use[i] + 2 > dispatch_counter) continue;
+            if (buf_last_use[i] == 0 && i + 10 > id) continue;
             if (sz < reuse_size) { reuse_id = i; reuse_size = sz; }
         }
         if (reuse_id) {

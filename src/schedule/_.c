@@ -1,4 +1,8 @@
-// schedule/_.c — Three-phase eval: reduce → schedule(rewrite) → reduce
+// schedule/_.c — Three-phase eval: reduce → schedule(dispatch) → ASSIGNs
+//
+// NO flags (defer_all, dispatch_mode, no_fuse) — pure graph walk + dispatch.
+// View ops handled by fuse_walk_inner (EXPAND/PERMUTE/RESHAPE composition).
+// SHRINK/PAD are lazy leaf boundaries in fuse_walk_inner.
 
 int fuse_no_lazy_resolve = 0;
 
@@ -15,30 +19,26 @@ static void sched_dump_heap(TinyHVM *ctx) {
     fprintf(stderr, "\n");
 }
 
-// Schedule: dispatch fused kernels in dependency order.
-// Each pass has two sub-passes:
-//   1. Reduces (SUM/RMAX/RESHAPE) + GRADs — absorbs ew chains into fused kernels
-//   2. Standalone ew ops — dispatches remaining ew between reduces (RELU, bias ADD)
-// This interleaving ensures: inner reduce → ew (relu/bias) → outer reduce → ...
-// View ops resolved by trampoline (non-WNF) during ASSIGN phase.
+// Schedule: dispatch fused kernels via forward heap scan.
+// Each pass: try fuse_or_reduce on every SUM/RMAX/RESHAPE/ew TAG_TOP.
+// fuse_walk_inner handles view composition (EXPAND/PERMUTE/RESHAPE).
+// SHRINK/PAD are lazy leaf boundaries → multi-pass resolves layer by layer.
+// GRAD fires via thvm_reduce when arg0 is TAG_TEN.
 static u32 sched_all(TinyHVM *ctx) {
     u32 total = 0;
     fuse_no_lazy_resolve = 1;
-    ctx->no_grad_alloc = 1; // suppress requires_grad intermediate buffers
+    ctx->no_grad_alloc = 1;
 
     for (u32 pass = 0; pass < 50; pass++) {
         u32 progress = 0;
 
-        // Unified scan: process each TAG_TOP based on type.
-        // Forward scan means inner ops (lower positions) resolve first,
-        // making their results available as TAG_TEN for outer ops.
         for (u64 h = 1; h < ctx->heap_pos; h++) {
             Term ht = ctx->heap[h];
             if (term_tag(ht) != TAG_TOP) continue;
             u32 uop = term_ext(ht);
             if (uop == UOP_ASSIGN) continue;
 
-            // GRAD: fire when arg0 (loss) is TAG_TEN
+            // GRAD: fire when arg0 ready
             if (uop == UOP_GRAD) {
                 u64 loc = term_val(ht);
                 Term a0 = heap_read(ctx, loc);
@@ -49,54 +49,15 @@ static u32 sched_all(TinyHVM *ctx) {
                 continue;
             }
 
-            // Reduce patterns: SUM, RMAX, RESHAPE(SUM/RMAX)
-            if (uop == UOP_SUM || uop == UOP_RMAX || uop == UOP_RESHAPE) {
-                u32 fid = fuse_or_reduce(ctx, ht);
-                if (fid != ~0u) {
-                    Term result = term_ten(fid, DTYPE_F32);
-                    ctx->heap[h] = result;
-                    progress++;
-                }
-                continue;
-            }
+            // Skip view ops — handled by fuse_walk_inner inside fuse_or_reduce.
+            // SHRINK/PAD become lazy leaf boundaries (resolved when input is TAG_TEN).
+            if (is_view_op(uop)) continue;
 
-            // View ops: resolve via thvm_reduce with dispatch_mode=1.
-            // View ops are WNF by default (no_fuse=1). dispatch_mode overrides
-            // the WNF check so views fire in the trampoline.
-            // no_fuse suppresses RESHAPE contiguify (returns input unchanged).
-            if (is_view_op(uop)) {
-                // Pre-resolve DP0/DP1 in args (shape params might be DUP-shared)
-                u64 vloc = term_val(ht);
-                for (u32 ai = 0; ai < 2; ai++) {
-                    Term va = heap_read(ctx, vloc + ai);
-                    if (term_tag(va) == TAG_DP0 || term_tag(va) == TAG_DP1) {
-                        Term shared = heap_read(ctx, term_val(va));
-                        if (term_tag(shared) == TAG_TEN || term_tag(shared) == TAG_NUM)
-                            heap_set(ctx, vloc + ai, shared);
-                    }
-                }
-                // dispatch_mode fires view ops. defer_all blocks compute ops.
-                ctx->dispatch_mode = 1;
-                ctx->defer_all = 1;
-                Term r = thvm_reduce(ctx, ht);
-                ctx->defer_all = 0;
-                ctx->dispatch_mode = 0;
-                if (r != ht && term_tag(r) == TAG_TEN) {
-                    ctx->heap[h] = r;
-                    progress++;
-                }
-                continue;
-            }
-
-            // Ew ops: dispatch via fuse_or_reduce
-            if (is_elementwise(uop)) {
-                u32 fid = fuse_or_reduce(ctx, ht);
-                if (fid != ~0u) {
-                    Term result = term_ten(fid, DTYPE_F32);
-                    ctx->heap[h] = result;
-                    progress++;
-                }
-                continue;
+            // All compute ops (reduce + ew): dispatch via fuse_or_reduce
+            u32 fid = fuse_or_reduce(ctx, ht);
+            if (fid != ~0u) {
+                ctx->heap[h] = term_ten(fid, DTYPE_F32);
+                progress++;
             }
         }
 
@@ -113,8 +74,7 @@ static u32 sched_all(TinyHVM *ctx) {
 
 Term thvm_eval(TinyHVM *ctx, Term t) {
     // Phase 1: Pure IC reduce — everything lazy.
-    // no_fuse=1: compute+view TAG_TOPs are WNF (no TensorMeta, no contiguify).
-    // Only APP, GRAD, ASSIGN, IFZ etc. fire (structural reduction).
+    // no_fuse=1: ALL compute+view TAG_TOPs are WNF (no TensorMeta, no dispatch).
     ctx->no_fuse = 1;
     t = thvm_reduce(ctx, t);
     ctx->no_fuse = 0;
@@ -124,8 +84,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     u32 n = sched_all(ctx);
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase2(%u total): ", n); sched_dump_heap(ctx); }
 
-    // Phase 3: Fire ASSIGNs (dispatch_mode=1 so view ops fire in ASSIGN chains)
-    ctx->dispatch_mode = 1;
+    // Phase 3: Fire ASSIGNs via thvm_reduce (view ops fire via interact handler)
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
@@ -133,7 +92,6 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             ctx->heap[h] = r;
         }
     }
-    ctx->dispatch_mode = 0;
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase3: "); sched_dump_heap(ctx); }
 
     return term_era();

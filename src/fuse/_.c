@@ -126,6 +126,13 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         Term shared = heap_read(ctx, term_val(t));
         return fuse_walk_inner(ctx, shared, ops, n_ops, leaf_ids, leaf_views, n_leaves);
     }
+    // TAG_NUM: scalar constant (e.g. epsilon in BN). Convert to 1-element tensor.
+    if (term_tag(t) == TAG_NUM) {
+        f32 val = term_as_f32(t);
+        // Create a scalar tensor on the fly
+        Term scalar = thvm_tensor(ctx, &val, (Shape){.dims={1},.rank=1});
+        return fuse_walk_inner(ctx, scalar, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+    }
     if (term_tag(t) != TAG_TOP) return -1;
     u32 uop = term_ext(t);
 
@@ -133,7 +140,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
     // TAG_TEN input: walk through and compose view.
     // TAG_TOP ew/view input: walk through (ew chain is fusable).
     // TAG_TOP non-ew: lazy leaf boundary.
-    if (uop == UOP_EXPAND || uop == UOP_PERMUTE || uop == UOP_RESHAPE) {
+    if (is_view_op(uop)) {
         u64 loc = term_val(t);
         Term view_input = heap_read(ctx, loc);
         // Try to walk through: TAG_TEN, ew TAG_TOP, or view TAG_TOP
@@ -205,9 +212,12 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 nv.shape.dims[j] = nd; nv.numel *= nd;
             }
             nv.contiguous = 0;
-        } else { // RESHAPE
+        } else if (uop == UOP_RESHAPE) {
             Shape ns = {.rank = rank};
             for (u32 j = 0; j < rank; j++) ns.dims[j] = (u32)pf[j];
+            u32 new_numel = 1;
+            for (u32 j = 0; j < rank; j++) new_numel *= ns.dims[j];
+            if (new_numel != base->numel) return -1; // numel mismatch → can't compose
             nv = view_reshape(*base, ns);
             if (!nv.contiguous && !base->contiguous) {
                 i32 exp = 1; int dense = 1;
@@ -217,6 +227,26 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 }
                 if (dense) nv = *base; // non-aliasable: keep physical view
             }
+        } else if (uop == UOP_SHRINK) {
+            u32 ndim = rank / 2;
+            u32 starts[MAX_DIM], ends[MAX_DIM];
+            for (u32 j = 0; j < ndim && j < MAX_DIM; j++) {
+                starts[j] = (u32)pf[j * 2];
+                ends[j]   = (u32)pf[j * 2 + 1];
+            }
+            if (ndim != base->shape.rank) return -1; // rank mismatch
+            nv = view_shrink(*base, starts, ends);
+            if (nv.numel == 0) return -1; // degenerate
+        } else if (uop == UOP_PAD) {
+            u32 ndim = rank / 2;
+            u32 pad_before[MAX_DIM], pad_after[MAX_DIM];
+            for (u32 j = 0; j < ndim && j < MAX_DIM; j++) {
+                pad_before[j] = (u32)pf[j * 2];
+                pad_after[j]  = (u32)pf[j * 2 + 1];
+            }
+            nv = view_pad(*base, pad_before, pad_after);
+        } else {
+            return -1; // unknown view op
         }
         // Propagate mask from base to composed view.
         // PERMUTE: rearrange mask_begin/mask_end by axes

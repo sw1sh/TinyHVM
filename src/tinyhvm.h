@@ -432,8 +432,10 @@ static inline const View *st_get(u64 heap_loc) {
 }
 
 // ============================================================
-// Fused Op / ReduceSpec (used by fuser + codegen)
+// Fused Op / ReduceSpec (used by fuser + codegen + scheduler)
 // ============================================================
+#define FUSE_MAX_OPS    32
+#define FUSE_MAX_LEAVES 16
 
 typedef struct { u32 uop; u32 arg_a; u32 arg_b; } FusedOp;
 typedef struct {
@@ -449,6 +451,21 @@ typedef struct {
     u32 reduce2_start;     // first op index for reduce2 phase
     u8 is_reduce2[MAX_DIM]; // reduce axes for phase 2 (may differ from phase 1)
 } ReduceSpec;
+
+// KernelEntry: scheduler's output — one fused kernel ready for dispatch.
+// Produced by fuse_build_kernel (pure walk), consumed by UOP_FUSING handler.
+#define SCHED_MAX_KERNELS 512
+typedef struct {
+    FusedOp    ops[FUSE_MAX_OPS]; u32 n_ops;
+    u32        leaf_ids[FUSE_MAX_LEAVES];
+    View       leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves;
+    Shape      full_shape;       // ew iteration domain
+    Shape      out_shape;        // output shape (after reduce)
+    ReduceSpec reduce;
+    u32        has_reduce;       // 0 or UOP_SUM/UOP_RMAX
+    Term       reshape_term;     // post-reduce RESHAPE (or TAG_ERA)
+    Term       sum_term;         // the SUM/RMAX TAG_TOP (for axes)
+} KernelEntry;
 
 typedef struct Backend Backend;
 
@@ -604,12 +621,12 @@ typedef struct {
     u32         default_device;              // index into backends[]
 
     u64         itrs;       // interaction count
-    u8          no_fuse;    // 1 to skip fusion (used during GRAD subnet re-reduction)
-    u8          no_grad_alloc; // 1 to skip separate buffer alloc for requires_grad virtual intermediates (backward)
+    u8          no_fuse;    // (legacy, unused — compute ops always WNF)
+    u8          no_grad_alloc; // (legacy, unused)
     u8          no_dup;     // 1 to skip linear_use DUP (used inside GRAD handler)
     u8          prescan_done; // 1 after grad_prescan runs for current backward pass
-    u8          defer_all;   // (unused)
-    u8          dispatch_mode; // 1 = trampoline reduces compute TAG_TOPs normally
+    u8          defer_all;   // (legacy, unused)
+    u8          dispatch_mode; // (legacy, unused)
 
     // Named definitions for TAG_REF (global def table)
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term

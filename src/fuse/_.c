@@ -15,8 +15,7 @@ static int is_binary(u32 uop) {
            uop==UOP_MAX||uop==UOP_CMP;
 }
 
-#define FUSE_MAX_OPS 32
-#define FUSE_MAX_LEAVES 16
+// FUSE_MAX_OPS and FUSE_MAX_LEAVES defined in tinyhvm.h
 
 // Per-walk storage
 #define WALK_LEAF_BASE 10000
@@ -351,6 +350,169 @@ static void fuse_remap(FusedOp *ops, u32 n_ops, u32 n_leaves) {
 // fuse_or_reduce: try to fuse, or fall back to normal reduction
 // ============================================================
 static u32 fuse_unfused_count = 0, fuse_fused_count = 0;
+
+// fuse_build_kernel: pure walk + spec building. No dispatch, no TensorMeta.
+// Returns 1 on success (ke filled), 0 on failure (lazy leaves, pattern mismatch).
+static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
+    _fuse_has_perm = 0;
+    if (term_tag(t) != TAG_TOP) return 0;
+    if (!ctx_default_backend(ctx) || !ctx_default_backend(ctx)->dispatch_kernel_rs) return 0;
+    u32 top_uop = term_ext(t);
+    u32 has_reduce = 0;
+    Term ew_root = t, sum_term = term_era(), reshape_term = term_era();
+
+    // Pattern match (same as fuse_or_reduce)
+    if (top_uop == UOP_RESHAPE) {
+        u64 rs_loc = term_val(t);
+        Term inner = heap_read(ctx, rs_loc);
+        // Look through DUP
+        if (term_tag(inner) == TAG_DP0 || term_tag(inner) == TAG_DP1)
+            inner = heap_read(ctx, term_val(inner));
+        if (term_tag(inner) == TAG_TOP && (term_ext(inner) == UOP_SUM || term_ext(inner) == UOP_RMAX)) {
+            u64 sum_loc = term_val(inner);
+            Term sum_input = heap_read(ctx, sum_loc);
+            if (term_tag(sum_input) == TAG_DP0 || term_tag(sum_input) == TAG_DP1)
+                sum_input = heap_read(ctx, term_val(sum_input));
+            if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
+                has_reduce = term_ext(inner); sum_term = inner; reshape_term = t; ew_root = sum_input;
+            }
+        }
+        if (!has_reduce) return 0;
+    } else if (top_uop == UOP_SUM || top_uop == UOP_RMAX) {
+        u64 sum_loc = term_val(t);
+        Term sum_input = heap_read(ctx, sum_loc);
+        if (term_tag(sum_input) == TAG_DP0 || term_tag(sum_input) == TAG_DP1)
+            sum_input = heap_read(ctx, term_val(sum_input));
+        if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
+            has_reduce = top_uop; sum_term = t; ew_root = sum_input;
+        } else if (term_tag(sum_input) == TAG_TEN) {
+            has_reduce = top_uop; sum_term = t; ew_root = sum_input;
+        } else if (term_tag(sum_input) == TAG_TOP && is_view_op(term_ext(sum_input))) {
+            Term probe = sum_input; int found = 0;
+            for (int d = 0; d < 5; d++) {
+                if (term_tag(probe) == TAG_TEN) { found = 1; break; }
+                if (term_tag(probe) != TAG_TOP) break;
+                u32 pu = term_ext(probe);
+                if (is_elementwise(pu)) { found = 1; break; }
+                if (!is_view_op(pu)) break;
+                probe = heap_read(ctx, term_val(probe));
+            }
+            if (found) { has_reduce = top_uop; sum_term = t; ew_root = sum_input; }
+            else return 0;
+        } else return 0;
+    } else if (!is_elementwise(top_uop)) {
+        return 0;
+    }
+
+    // Post-reduce detection for ew chains above reduces
+    if (!has_reduce && is_elementwise(top_uop)) {
+        Term probe = t;
+        for (u32 d = 0; d < 10; d++) {
+            if (term_tag(probe) != TAG_TOP) break;
+            u32 pu = term_ext(probe);
+            if (is_elementwise(pu)) { probe = heap_read(ctx, term_val(probe)); }
+            else if (is_view_op(pu)) { probe = heap_read(ctx, term_val(probe)); }
+            else if (pu == UOP_SUM || pu == UOP_RMAX) {
+                Term si2 = heap_read(ctx, term_val(probe));
+                if (term_tag(si2) == TAG_TOP && is_elementwise(term_ext(si2))) {
+                    has_reduce = pu; sum_term = probe; ew_root = si2;
+                }
+                break;
+            } else break;
+        }
+    }
+
+    // Walk the tree
+    FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0;
+    u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views_p[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
+    int walk_result = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views_p, &n_leaves);
+    if (walk_result < 0) return 0;
+    fuse_remap(ops, n_ops, n_leaves);
+
+    // Check for lazy leaves
+    for (u32 i = 0; i < n_leaves; i++)
+        if (LEAF_IS_LAZY(leaf_ids[i])) return 0;
+
+    // min_ops check
+    extern int fuse_no_lazy_resolve;
+    u32 min_ops = has_reduce ? (fuse_no_lazy_resolve ? 0 : 1) :
+                               (fuse_no_lazy_resolve ? 1 : 2);
+    if (n_ops < min_ops) return 0;
+
+    // Leaf used + ew_view
+    u8 leaf_used[FUSE_MAX_LEAVES] = {0};
+    if (n_ops == 0) for (u32 i = 0; i < n_leaves; i++) leaf_used[i] = 1;
+    for (u32 i = 0; i < n_ops; i++) {
+        if (ops[i].arg_a < n_leaves) leaf_used[ops[i].arg_a] = 1;
+        if (ops[i].arg_b < n_leaves) leaf_used[ops[i].arg_b] = 1;
+    }
+    View ew_view = {0}; int ew_init = 0;
+    for (u32 i = 0; i < n_leaves; i++) {
+        if (!leaf_used[i]) continue;
+        if (!ew_init) { ew_view = *leaf_views_p[i]; ew_init = 1; continue; }
+        View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
+        if (!view_broadcast(&ew_view, leaf_views_p[i], &av_bc, &bv_bc, bc_shape, &bc_ndim)) return 0;
+        ew_view = view_create(shape_of(bc_shape, bc_ndim));
+    }
+    if (!ew_init) return 0;
+
+    // Reduce spec
+    View out_view = ew_view;
+    ReduceSpec rs = {0};
+    if (has_reduce) {
+        rs.reduce_type = has_reduce;
+        u64 sum_loc = term_val(sum_term);
+        Term sum_axes = heap_read(ctx, sum_loc + 1);
+        if (term_tag(sum_axes) == TAG_DP0 || term_tag(sum_axes) == TAG_DP1)
+            sum_axes = heap_read(ctx, term_val(sum_axes));
+        int found_axes = 0;
+        if (term_tag(sum_axes) == TAG_TEN) {
+            u32 ax_id = (u32)term_val(sum_axes);
+            TensorMeta *axt = &ctx->tensors[ax_id];
+            u32 n_axes = axt->view.numel;
+            f32 axes_f[MAX_DIM];
+            META_READ(axt->backend, axt->buf_id, axes_f, n_axes * sizeof(f32));
+            for (u32 i = 0; i < n_axes; i++) {
+                int ax = (int)axes_f[i];
+                if (_fuse_has_perm && ax >= 0 && (u32)ax < _fuse_perm_rank)
+                    ax = (int)_fuse_perm[ax];
+                if (ax >= 0 && ax < (int)ew_view.shape.rank) {
+                    rs.is_reduce[ax] = 1; out_view.shape.dims[ax] = 1; found_axes = 1;
+                }
+            }
+            if (found_axes) {
+                out_view.numel = 1;
+                for (u32 d = 0; d < out_view.shape.rank; d++) out_view.numel *= out_view.shape.dims[d];
+            }
+        }
+        if (!found_axes) {
+            for (int d = (int)ew_view.shape.rank - 1; d >= 0; d--) {
+                if (ew_view.shape.dims[d] > 1) {
+                    rs.is_reduce[d] = 1; out_view.shape.dims[d] = 1;
+                    out_view.numel = ew_view.numel / ew_view.shape.dims[d];
+                    found_axes = 1; break;
+                }
+            }
+        }
+        if (!found_axes) return 0;
+    }
+
+    // Fill KernelEntry
+    memcpy(ke->ops, ops, n_ops * sizeof(FusedOp));
+    ke->n_ops = n_ops;
+    for (u32 i = 0; i < n_leaves; i++) {
+        ke->leaf_ids[i] = leaf_ids[i];
+        ke->leaf_views[i] = *leaf_views_p[i];
+    }
+    ke->n_leaves = n_leaves;
+    ke->full_shape = ew_view.shape;
+    ke->out_shape = out_view.shape;
+    ke->reduce = rs;
+    ke->has_reduce = has_reduce;
+    ke->reshape_term = reshape_term;
+    ke->sum_term = sum_term;
+    return 1;
+}
 
 static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     // return reduce_id(ctx, t); // fusion enabled

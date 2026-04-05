@@ -100,7 +100,9 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         if (!ctx->dispatch_mode &&
             _uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
             _uop != UOP_LOG_PRINT && _uop != UOP_TODEVICE && _uop != UOP_WHERE &&
-            _uop != UOP_FUSING) {
+            _uop != UOP_FUSING &&
+            _uop != UOP_RESHAPE && _uop != UOP_PERMUTE && _uop != UOP_EXPAND &&
+            _uop != UOP_SHRINK && _uop != UOP_PAD) {
             u64 _loc = term_val(next);
             int _lazy = 1;
             // Check if any arg needs reduction (GRAD, APP, ASSIGN, etc.)

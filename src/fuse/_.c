@@ -130,31 +130,35 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
     u32 uop = term_ext(t);
 
     // View ops: walk through, compose view onto leaf.
-    // Works for both TAG_TEN inputs (compose view) and TAG_TOP inputs (treat as leaf).
+    // TAG_TEN input: walk through and compose view.
+    // TAG_TOP ew/view input: walk through (ew chain is fusable).
+    // TAG_TOP non-ew: lazy leaf boundary.
     if (uop == UOP_EXPAND || uop == UOP_PERMUTE || uop == UOP_RESHAPE) {
         u64 loc = term_val(t);
         Term view_input = heap_read(ctx, loc);
-        // If input is TAG_TOP (lazy), treat the VIEW(TAG_TOP) as a lazy leaf.
-        // The TAG_TOP will be reduced before the fused kernel runs, producing
-        // a TAG_TEN that the view's strides/shape correctly reference.
-        if (term_tag(view_input) != TAG_TEN) {
-            // Use shape tracking to get the VIEW output shape for the leaf
+        // Try to walk through: TAG_TEN, ew TAG_TOP, or view TAG_TOP
+        int can_walk = (term_tag(view_input) == TAG_TEN);
+        if (!can_walk && term_tag(view_input) == TAG_TOP) {
+            u32 vi_uop = term_ext(view_input);
+            can_walk = is_elementwise(vi_uop) || is_view_op(vi_uop);
+        }
+        if (!can_walk) {
+            // Non-ew, non-view TAG_TOP (e.g. SUM): lazy leaf boundary
             const View *sv = st_get(loc);
             if (!sv) return -1;
             if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
             u32 idx = (*n_leaves)++;
-            leaf_ids[idx] = ~0u; // sentinel: lazy leaf (will be resolved during reduce)
-            leaf_views[idx] = sv;
-            fuse_leaf_terms[idx] = t; // store the VIEW(TAG_TOP) term
+            leaf_ids[idx] = (u32)(term_val(view_input) | 0x80000000u);
+            fuse_composed_views[idx] = *sv;
+            leaf_views[idx] = &fuse_composed_views[idx];
+            fuse_leaf_terms[idx] = t;
             return (int)(WALK_LEAF_BASE + idx);
         }
-int inner = fuse_walk_inner(ctx, view_input, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+        int inner = fuse_walk_inner(ctx, view_input, ops, n_ops, leaf_ids, leaf_views, n_leaves);
         if (inner < 0) return -1;
         if (inner >= (int)(WALK_LEAF_BASE * 2)) {
             // Inner returned OP (e.g., deferred MUL).
-            // DON'T compose PERMUTE onto leaf views — leaves stay in MUL space.
-            // The SUM axes will be transformed to MUL space instead (via
-            // _fuse_perm stored here and read during ReduceSpec building).
+            // PERMUTE: store perm for reduce axis transform. RESHAPE: transparent.
             if (uop == UOP_PERMUTE) {
                 Term parg = heap_read(ctx, loc + 1);
                 if (term_tag(parg) == TAG_TEN) {
@@ -162,15 +166,19 @@ int inner = fuse_walk_inner(ctx, view_input, ops, n_ops, leaf_ids, leaf_views, n
                     _fuse_perm_rank = pp2->view.numel;
                     META_READ(pp2->backend, pp2->buf_id, _fuse_perm, _fuse_perm_rank * sizeof(f32));
                     _fuse_has_perm = 1;
-                    return inner; // OP with ORIGINAL leaf views
+                    return inner;
                 }
             }
+            if (uop == UOP_RESHAPE) return inner; // transparent for computation
             return -1;
         }
         u32 leaf_idx = inner - WALK_LEAF_BASE;
         const View *base = leaf_views[leaf_idx];
         if (!base) return -1;
         Term arg2 = heap_read(ctx, loc + 1);
+        // Look through DUP references for shared shape params
+        if (term_tag(arg2) == TAG_DP0 || term_tag(arg2) == TAG_DP1)
+            arg2 = heap_read(ctx, term_val(arg2));
         if (term_tag(arg2) != TAG_TEN) return -1;
         TensorMeta *mp = &ctx->tensors[(u32)term_val(arg2)];
         u32 rank = mp->view.numel;
@@ -323,22 +331,20 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
     } else if (top_uop == UOP_SUM || top_uop == UOP_RMAX) {
         u64 sum_loc = term_val(t);
         Term sum_input = heap_read(ctx, sum_loc);
-        { static int _ft = 0; if (_ft < 3 && getenv("THVM_SCHED_DIAG"))
-            fprintf(stderr, "  fuse SUM: input tag=%u ext=%u is_ew=%d is_view=%d\n",
-                term_tag(sum_input), term_ext(sum_input),
-                term_tag(sum_input)==TAG_TOP?is_elementwise(term_ext(sum_input)):0,
-                term_tag(sum_input)==TAG_TOP?is_view_op(term_ext(sum_input)):0);
-          _ft++; }
+        // Look through DUP references
+        if (term_tag(sum_input) == TAG_DP0 || term_tag(sum_input) == TAG_DP1)
+            sum_input = heap_read(ctx, term_val(sum_input));
         if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
             has_reduce = top_uop; sum_term = t; ew_root = sum_input;
+        } else if (term_tag(sum_input) == TAG_TEN) {
+            // SUM(TAG_TEN): reduce-only kernel (no ew ops, just reduce the leaf)
+            has_reduce = top_uop; sum_term = t; ew_root = sum_input;
         } else if (term_tag(sum_input) == TAG_TOP && is_view_op(term_ext(sum_input))) {
-            // SUM(view_chain(ew)) — walk through view ops to find ew.
-            // Set ew_root to sum_input (the view op) — fuse_walk_inner
-            // handles view ops transparently, composing them onto leaf views.
+            // SUM(view_chain(ew_or_ten)) — walk through view ops.
+            // fuse_walk_inner handles view ops transparently now.
             Term probe = sum_input;
             int found = 0;
             for (int d = 0; d < 5; d++) {
-                // Also handle TAG_TEN deferred tensors in the view chain
                 if (term_tag(probe) == TAG_TEN) {
                     u32 _pid = (u32)term_val(probe);
                     TensorMeta *_pm = &ctx->tensors[_pid];
@@ -349,7 +355,7 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
                             continue;
                         }
                     }
-                    break;
+                    found = 1; break; // materialized TAG_TEN: valid reduce leaf
                 }
                 if (term_tag(probe) != TAG_TOP) break;
                 u32 pu = term_ext(probe);
@@ -428,7 +434,11 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         has_lazy = 0; // resolved
     }
 
-    u32 min_ops = (has_reduce) ? 1 : 2;
+    // In scheduler mode: allow 0 ops for reduces (SUM(TAG_TEN) = reduce-only),
+    // and 1 op for standalone ew (single RELU etc. must still dispatch).
+    extern int fuse_no_lazy_resolve;
+    u32 min_ops = (has_reduce) ? (fuse_no_lazy_resolve ? 0 : 1) :
+                                 (fuse_no_lazy_resolve ? 1 : 2);
     if (n_ops < min_ops) return reduce_id(ctx, t);
 
     // Fused reduce backward safety: most backward ops now use y (output) not at (input).
@@ -447,6 +457,10 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
 
     // Output shape: broadcast only USED leaves (not unused base entries)
     u8 leaf_used[FUSE_MAX_LEAVES] = {0};
+    if (n_ops == 0) {
+        // Reduce-only kernel (SUM(TAG_TEN)): leaf is the direct input
+        for (u32 i = 0; i < n_leaves; i++) leaf_used[i] = 1;
+    }
     for (u32 i = 0; i < n_ops; i++) {
         if (ops[i].arg_a < n_leaves) leaf_used[ops[i].arg_a] = 1;
         if (ops[i].arg_b < n_leaves) leaf_used[ops[i].arg_b] = 1;
@@ -460,7 +474,9 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
             return reduce_id(ctx, t);
         ew_view = view_create(shape_of(bc_shape, bc_ndim));
     }
-    if (!ew_init) return reduce_id(ctx, t);
+    if (!ew_init) {
+        return reduce_id(ctx, t);
+    }
 
     // Reduce axes: read all axes, build ReduceSpec for general codegen.
     // No trailing-axis restriction — codegen handles any axis config.
@@ -470,6 +486,9 @@ static u32 fuse_or_reduce(TinyHVM *ctx, Term t) {
         rs.reduce_type = has_reduce;
         u64 sum_loc = term_val(sum_term);
         Term sum_axes = heap_read(ctx, sum_loc + 1);
+        // Look through DUP references for shared axes tensors
+        if (term_tag(sum_axes) == TAG_DP0 || term_tag(sum_axes) == TAG_DP1)
+            sum_axes = heap_read(ctx, term_val(sum_axes));
         int found_axes = 0;
         if (term_tag(sum_axes) == TAG_TEN) {
             u32 ax_id = (u32)term_val(sum_axes);

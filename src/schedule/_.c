@@ -15,44 +15,90 @@ static void sched_dump_heap(TinyHVM *ctx) {
     fprintf(stderr, "\n");
 }
 
-// Schedule: walk ALL TAG_TOPs on heap, dispatch fused kernels.
-// Multi-pass: each pass dispatches kernels whose leaves are ready (TAG_TEN).
-// Inner kernels dispatch first → their TAG_TEN results become leaves for outer kernels.
-// GRAD is included — it's just another TAG_TOP that fires when its args are ready.
+// Schedule: dispatch fused kernels in dependency order.
+// Each pass has two sub-passes:
+//   1. Reduces (SUM/RMAX/RESHAPE) + GRADs — absorbs ew chains into fused kernels
+//   2. Standalone ew ops — dispatches remaining ew between reduces (RELU, bias ADD)
+// This interleaving ensures: inner reduce → ew (relu/bias) → outer reduce → ...
+// View ops resolved by trampoline (non-WNF) during ASSIGN phase.
 static u32 sched_all(TinyHVM *ctx) {
     u32 total = 0;
     fuse_no_lazy_resolve = 1;
+
     for (u32 pass = 0; pass < 50; pass++) {
         u32 progress = 0;
+
+        // Unified scan: process each TAG_TOP based on type.
+        // Forward scan means inner ops (lower positions) resolve first,
+        // making their results available as TAG_TEN for outer ops.
         for (u64 h = 1; h < ctx->heap_pos; h++) {
             Term ht = ctx->heap[h];
             if (term_tag(ht) != TAG_TOP) continue;
             u32 uop = term_ext(ht);
-            // Skip ASSIGN (fired after all kernels dispatch)
             if (uop == UOP_ASSIGN) continue;
-            // GRAD: reduce it (fires GRAD handler which creates backward TAG_TOPs)
+
+            // GRAD: fire when arg0 (loss) is TAG_TEN
             if (uop == UOP_GRAD) {
-                // Only fire if arg0 (loss) is now TAG_TEN (forward dispatched)
                 u64 loc = term_val(ht);
                 Term a0 = heap_read(ctx, loc);
-                if (term_tag(a0) != TAG_TEN) continue; // not ready yet
+                if (term_tag(a0) != TAG_TEN) continue;
                 Term r = thvm_reduce(ctx, ht);
                 ctx->heap[h] = r;
                 progress++;
                 continue;
             }
-            // Compute TAG_TOPs: try fuse_or_reduce
-            u32 fid = fuse_or_reduce(ctx, ht);
-            if (fid != ~0u) {
-                ctx->heap[h] = term_ten(fid, DTYPE_F32);
-                progress++;
+
+            // Reduce patterns: SUM, RMAX, RESHAPE(SUM/RMAX)
+            if (uop == UOP_SUM || uop == UOP_RMAX || uop == UOP_RESHAPE) {
+                u32 fid = fuse_or_reduce(ctx, ht);
+                if (fid != ~0u) {
+                    Term result = term_ten(fid, DTYPE_F32);
+                    ctx->heap[h] = result;
+                    progress++;
+                }
+                continue;
+            }
+
+            // View ops: resolve via thvm_reduce (non-WNF trampoline)
+            if (is_view_op(uop)) {
+                // Pre-resolve DP0/DP1 in args (shape params might be DUP-shared).
+                // Read the shared value directly instead of running DUP interaction
+                // (which would create a SUP, not a TAG_TEN).
+                u64 vloc = term_val(ht);
+                for (u32 ai = 0; ai < 2; ai++) {
+                    Term va = heap_read(ctx, vloc + ai);
+                    if (term_tag(va) == TAG_DP0 || term_tag(va) == TAG_DP1) {
+                        Term shared = heap_read(ctx, term_val(va));
+                        if (term_tag(shared) == TAG_TEN || term_tag(shared) == TAG_NUM)
+                            heap_set(ctx, vloc + ai, shared);
+                    }
+                }
+                Term r = thvm_reduce(ctx, ht);
+                if (r != ht && term_tag(r) == TAG_TEN) {
+                    ctx->heap[h] = r;
+                    progress++;
+                }
+                continue;
+            }
+
+            // Ew ops: dispatch via fuse_or_reduce
+            if (is_elementwise(uop)) {
+                u32 fid = fuse_or_reduce(ctx, ht);
+                if (fid != ~0u) {
+                    Term result = term_ten(fid, DTYPE_F32);
+                    ctx->heap[h] = result;
+                    progress++;
+                }
+                continue;
             }
         }
+
         total += progress;
         if (getenv("THVM_SCHED_DIAG") && progress > 0)
             fprintf(stderr, "  pass %u: %u dispatched\n", pass, progress);
         if (progress == 0) break;
     }
+
     fuse_no_lazy_resolve = 0;
     return total;
 }

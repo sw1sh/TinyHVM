@@ -136,24 +136,26 @@ When UOP_FUSING fires: read spec → codegen → dispatch → create TensorMeta 
 
 ## Current State (2026-04-05)
 
-### What works
+### What works — 148 dispatches at 12GB
+- **Scheduler**: 148 dispatches over 3 passes (66+80+2), no OOM at 12GB
 - **Pure IC first reduce** ✓ no_fuse=1 → ALL compute+view ops WNF
-- **Graph walk** ✓ 37 dispatches (31 fwd + 6 GRAD) at 12GB, no OOM, no flags
-- **Pool stride trick** ✓ SHRINK=18→0, uses st_get strides for TAG_TOP pool inputs
-- **fuse_or_reduce** ✓ Absorbs ew chains, DP0 look-through, min_ops=0/1, TAG_NUM scalars
-- **fuse_walk_inner** ✓ VIEW(ew_TAG_TOP) for EXPAND/PERMUTE/RESHAPE, st_get fallback for pool
-- **Non-lazy leaves** ✓ When TAG_TOP's input is TAG_TEN → real tensor ID (not LEAF_IS_LAZY)
-- **GRAD** ✓ Fires on TAG_TOP args, creates backward TAG_TOPs
-- **Buffer steal** ✓ dispatch_counter tracking, aggressive reuse
+- **Fused dispatch**: fuse_or_reduce absorbs ew chains into reduces (DP0 look-through,
+  min_ops=0/1, TAG_NUM scalar handling, non-lazy leaves via st_get)
+- **Fallback dispatch**: dispatch_mode=1 fires individual ops via interact handler
+  when fuse_or_reduce fails (completes remaining forward+backward ops)
+- **Pool stride trick** ✓ SHRINK=0, stride-based pool for TAG_TOP inputs via st_get.
+  Direct pool view alias creation in scheduler (tensor_view_of with pool strides)
+- **View composition** ✓ fuse_walk_inner handles EXPAND/PERMUTE/RESHAPE/SHRINK/PAD,
+  st_get fallback for pool views, numel pre-check prevents assertion
+- **Buffer steal** ✓ dispatch_counter + buf_last_use in codegen, aggressive reuse
+- **Guards**: RESHAPE numel mismatch (pool) + EXPAND rank mismatch (GRAD) → return self
 
-### Why hybrid dispatch hit a wall
-The current approach dispatches directly from the scheduler via fuse_or_reduce.
-This MIXES planning with execution:
-- View resolution (thvm_reduce) triggers contiguify → large GPU allocations
-- ENSURE inside fuse_or_reduce materializes deferred chains recursively
-- Flag gymnastics (no_fuse/dispatch_mode/defer_all) create fragile interactions
-- Forward chain stalls: ew→view→ew interleaving needs many passes, but the
-  contiguify allocations accumulate without mid-step freeing
+### Remaining: 36 TAG_TOPs after phase 3
+- GRAD=1 unfired (backward branch blocked by shape bugs)
+- NEG=3 MUL=2 ADD=1 SUM=3 (backward compute ops that can't dispatch)
+- RESHAPE=25 EXPAND=1 (backward view ops)
+- Root cause: GRAD handler creates backward ops with wrong shapes
+  (view_expand rank mismatch, likely from sum_to_shape or missing cases)
 
 With 24GB budget: 205 dispatches work (91 fwd + 114 bwd), but view_expand
 rank mismatch in backward. With 12GB: 25 dispatches, then stalls (view chains

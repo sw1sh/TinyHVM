@@ -4,6 +4,12 @@ void thvm_realize(TinyHVM *ctx, Term t) {
 
 f32 *thvm_to_host(TinyHVM *ctx, Term t) {
     t = thvm_reduce(ctx, t);
+    if (term_tag(t) != TAG_TEN) {
+        // After scheduler: TAG_TOPs may need dispatch_mode to resolve
+        ctx->dispatch_mode = 1;
+        t = thvm_reduce(ctx, t);
+        ctx->dispatch_mode = 0;
+    }
     if (term_tag(t) != TAG_TEN) return NULL;
     u32 id = (u32)term_val(t);
     ENSURE(ctx, id);

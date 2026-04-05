@@ -498,11 +498,6 @@ typedef struct {
     // Deferred dispatch: how many deferred ops consume this tensor as input.
     u8          defer_consumers;
 
-    // GRAD accumulator: for shared tensors (multiple consumers on loss path),
-    // grad_refs counts expected backward visits. grad_cache accumulates gy
-    // across visits. When grad_refs reaches 0, walk once with combined gy.
-    u16         grad_refs;   // expected GRAD visits remaining (0 = not shared)
-    Term        grad_cache;  // accumulated gy from prior visits (0 = empty)
     u32         assign_target; // ASSIGN elision: write fused output here instead of new buf
 
     // Fusion metadata (only when creator_op == UOP_FUSING)
@@ -627,7 +622,6 @@ typedef struct {
     u8          no_fuse;    // (legacy, unused — compute ops always WNF)
     u8          no_grad_alloc; // (legacy, unused)
     u8          no_dup;     // 1 to skip linear_use DUP (used inside GRAD handler)
-    u8          prescan_done; // 1 after grad_prescan runs for current backward pass
     u8          defer_all;   // (legacy, unused)
     u8          dispatch_mode; // (legacy, unused)
 

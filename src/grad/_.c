@@ -38,50 +38,7 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
 //
 // At each leaf: if y matches any param_i, fire ASSIGN(slot_i, gy)
 // and return ERA. BIN_GRAD's ADD absorbs ERA correctly.
-// Pre-scan: walk loss provenance DAG, count backward refs for each tensor.
-// A tensor with N consumers on the loss path gets N GRAD visits.
-// When N > 1, the GRAD handler parks gradients and walks once with combined gy.
-static void grad_prescan(TinyHVM *ctx, Term loss) {
-    // When called from GRAD handler, loss is already TAG_TEN (reduced by trampoline).
-    // When called eagerly (legacy), it may be TAG_TOP → reduce it first.
-    if (term_tag(loss) != TAG_TEN) loss = thvm_reduce(ctx, loss);
-    if (term_tag(loss) != TAG_TEN) return;
-    u32 loss_id = (u32)term_val(loss);
-
-    // BFS through provenance
-    u32 *queue = malloc(ctx->tensor_count * sizeof(u32));
-    u8  *visited = calloc(ctx->tensor_count, 1);
-    u32 head = 0, tail = 0;
-    queue[tail++] = loss_id;
-    visited[loss_id] = 1;
-
-    while (head < tail) {
-        u32 tid = queue[head++];
-        TensorMeta *tm = &ctx->tensors[tid];
-        if (!tm->creator_op) continue;
-        u32 src0 = tm->src_ids[0], src1 = tm->src_ids[1];
-        // Each source gets one GRAD visit from this consumer
-        if (src0) {
-            ctx->tensors[src0].grad_refs++;
-            if (!visited[src0]) { visited[src0] = 1; queue[tail++] = src0; }
-        }
-        if (src1 && src1 != src0) {
-            // Only count binary ops with valid second source
-            u32 cop = tm->creator_op;
-            int is_bin = (cop==UOP_ADD||cop==UOP_SUB||cop==UOP_MUL||
-                          cop==UOP_DIV||cop==UOP_MAX||cop==UOP_MM||cop==UOP_CMP);
-            if (is_bin) {
-                ctx->tensors[src1].grad_refs++;
-                if (!visited[src1]) { visited[src1] = 1; queue[tail++] = src1; }
-            }
-        }
-    }
-    free(queue);
-    free(visited);
-}
-
 Term thvm_grad_multi(TinyHVM *ctx, Term loss, Term *params, Term *grad_slots, u32 n_params) {
-    // grad_prescan is deferred to the GRAD handler at reduction time.
     // This ensures the forward pass (required to establish provenance)
     // runs inside the JIT capture window.
 

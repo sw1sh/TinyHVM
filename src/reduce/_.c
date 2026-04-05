@@ -91,8 +91,8 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         tag == TAG_LAM || tag == TAG_SUP || tag == TAG_BRI ||
         tag == TAG_MAT || tag == TAG_ANY || tag == TAG_USP) { whnf = next; goto apply; }
 
-    // TAG_TOP: compute ops are WNF (interact handler returns t).
-    // Only ASSIGN, GRAD, IFZ, LOG_PRINT, TODEVICE, WHERE, FUSING fire.
+    // TAG_TOP: compute ops are WNF. Movement ops fire (create view aliases).
+    // Only ASSIGN, GRAD, IFZ, LOG_PRINT, TODEVICE, WHERE, FUSING fire too.
     if (tag == TAG_TOP) {
         u32 _uop = term_ext(next);
         int _is_movement = (_uop >= UOP_RESHAPE && _uop <= UOP_PAD);

@@ -114,9 +114,6 @@ static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel)
 // ── clone/ — deep-copy (ALO) for REF unfolding ──────────────────────────────
 #include "clone/_.c"
 
-// Forward declaration (defined in grad/_.c, used by interact/_.c)
-static void grad_prescan(TinyHVM *ctx, Term loss);
-
 // ── interact/ — one interaction rule per active pair ─────────────────────────
 #include "interact/_.c"
 

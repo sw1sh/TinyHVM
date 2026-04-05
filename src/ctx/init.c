@@ -88,15 +88,12 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
             ctx->backends[bi]->pool_set_persistent(max_persistent_buf);
     }
     ctx->tensor_count = keep > 0 ? keep : 1; // keep sentinel at 0
-    // Clear grad_refs/grad_cache for preserved tensors (re-counted each step)
+    // Clear per-step metadata for preserved tensors
     for (u32 i = 1; i < ctx->tensor_count; i++) {
-        ctx->tensors[i].grad_refs = 0;
-        ctx->tensors[i].grad_cache = 0;
         ctx->tensors[i].defer_consumers = 0;
     }
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();
-    ctx->prescan_done = 0; // reset for next backward pass
     // Clear shape tracker — stale entries from old heap locs cause wrong
     // view compositions after heap reuse.
     memset(st_keys, 0, sizeof(st_keys));
@@ -185,7 +182,7 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
 }
 
 // Fast path: skip linear_use + shape tracking. For internal backward ops
-// where sharing is managed explicitly (grad_cache, not DUP).
+// Fast path: skip linear_use + shape tracking.
 Term thvm_op_raw(TinyHVM *ctx, u32 uop, Term a, Term b) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc, a);

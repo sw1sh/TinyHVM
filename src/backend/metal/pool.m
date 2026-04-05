@@ -13,9 +13,6 @@ static u64 metal_bytes_inuse = 0;
 // (Metal guarantees sequential execution within command buffer).
 static u32 buf_last_use[MAX_BUFS];
 static u32 dispatch_counter = 0;
-// Remaining dispatch uses for each buffer (set by pre-scan, decremented after dispatch).
-// When remaining_uses reaches 0, the buffer is truly dead and can be stolen.
-static u16 buf_remaining_uses[MAX_BUFS];
 
 // ── Step-Level Memory Planner ──────────────────────────────────
 // Learn buffer lifetimes from step 0, plan reuse for step 1+.
@@ -82,32 +79,10 @@ static u32 metal_buf_alloc(u64 bytes) {
         }
     }
 
-    // 2. Mid-step steal: reuse buffers dead for 2+ dispatches.
-    // Aggressive: no size upper bound (waste some space), dispatch_counter-based death.
-    if (!mem_plan_active && bytes >= 4096 && dispatch_counter > 2) {
-        u32 reuse_id = 0;
-        u64 reuse_size = UINT64_MAX;
-        for (u32 i = 1; i < id; i++) {
-            if (!metal_pool.bufs[i]) continue;
-            u64 sz = metal_pool.sizes[i];
-            if (sz < bytes) continue; // must be >= required
-            if (buf_refcount[i] > 1) continue; // shared buffer, don't steal
-            if (buf_remaining_uses[i] > 0) continue;
-            // Dead: last used 2+ dispatches ago, or never used and not recent
-            if (buf_last_use[i] > 0 && buf_last_use[i] + 2 > dispatch_counter) continue;
-            if (buf_last_use[i] == 0 && i + 10 > id) continue;
-            if (sz < reuse_size) { reuse_id = i; reuse_size = sz; }
-        }
-        if (reuse_id) {
-            metal_pool.bufs[id] = metal_pool.bufs[reuse_id];
-            metal_pool.sizes[id] = metal_pool.sizes[reuse_id];
-            metal_pool.bufs[reuse_id] = nil;
-            metal_pool.sizes[reuse_id] = 0;
-            buf_refcount[reuse_id] = 0;
-            buf_last_use[reuse_id] = 0;
-            goto done;
-        }
-    }
+    // 2. Mid-step steal: DISABLED.
+    // The heuristic-based steal doesn't know which buffers are still needed
+    // as FUSING leaves. Buffer reuse is handled by pending_free (truly dead
+    // buffers released via tensor_release → buf_decref) and the memory planner.
 
     // 3. Fresh allocation
     metal_pool.bufs[id] = [mtl_dev newBufferWithLength:bytes
@@ -382,7 +357,6 @@ reset_counters:
     pending_free_count = 0;
     dispatch_counter = 0;
     memset(buf_last_use, 0, sizeof(buf_last_use));
-    memset(buf_remaining_uses, 0, sizeof(buf_remaining_uses));
     metal_pool.count = buf_keep;
 
     // Activate plan for next step
@@ -400,7 +374,7 @@ static void metal_pool_set_persistent(u32 max_persistent_buf) {
 // Flushes GPU if there are pending_free buffers above a memory threshold.
 // Pre-scan: mark buffer as having one more future dispatch use.
 static void metal_buf_mark_use(u32 id) {
-    if (id && id < MAX_BUFS) buf_remaining_uses[id]++;
+    (void)id; // no-op: inet DUP/ERA drives buffer lifetimes
 }
 
 static void metal_mem_checkpoint(u32 *leaf_buf_ids, u32 n_leaves) {
@@ -409,11 +383,10 @@ static void metal_mem_checkpoint(u32 *leaf_buf_ids, u32 n_leaves) {
         u32 bid = leaf_buf_ids[i];
         if (bid && bid < MAX_BUFS) {
             buf_last_use[bid] = dispatch_counter;
-            if (buf_remaining_uses[bid] > 0) buf_remaining_uses[bid]--;
             // Heap-backed: release consumed buffers back to heap immediately.
             // Metal's heap auto-reclaims the region for future allocs.
             // Safe: Metal hazard tracking handles GPU read ordering.
-            if (mem_plan_heap && buf_remaining_uses[bid] == 0 &&
+            if (mem_plan_heap &&
                 metal_pool.bufs[bid] &&
                 metal_pool.bufs[bid].heap == mem_plan_heap) {
                 metal_pool.bufs[bid] = nil;

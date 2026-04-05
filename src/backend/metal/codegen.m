@@ -941,7 +941,7 @@ void metal_dispatch_kernel_rs_st(u32 out_buf,
     for (u32 si = 0; si < n_side_outputs; si++) buf_cpu_only[side_bufs[si]] = 0;
     total_dispatches++;
     dispatch_counter++;
-    // Track buffer lifetimes for mid-step reuse
+    // Track buffer last-use for steal heuristic
     for (u32 li = 0; li < n_leaves; li++)
         buf_last_use[leaf_bufs[li]] = dispatch_counter;
     dc[has_reduce ? DC_REDUCE : DC_FUSED]++;

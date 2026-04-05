@@ -44,7 +44,7 @@
             }
             // APP-TEN: discard tensor, return arg (sequencing)
             if (term_tag(fun) == TAG_TEN) {
-                tensor_decref(ctx, (u32)term_val(fun));
+                tensor_release(ctx, (u32)term_val(fun));
                 ctx->itrs++;
                 t = heap_read(ctx, loc + 1);
                 goto inet_step;

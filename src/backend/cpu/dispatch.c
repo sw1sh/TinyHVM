@@ -40,15 +40,18 @@ static inline f32 leaf_read(const f32 *buf, const View *v,
                 return 0.f;
         }
     }
-    // Compute physical index via strides (zero stride = broadcast)
+    // Compute physical index via strides.
+    // Modulo coords by leaf dim to handle broadcast (leaf_dim=1 → coord%1=0).
     i32 idx = v->offset;
-    for (u32 d = 0; d < rank && d < v->shape.rank; d++)
-        idx += (i32)coords[d] * (v->strides[d] > 0 ? v->strides[d] : 0);
+    for (u32 d = 0; d < rank && d < v->shape.rank; d++) {
+        u32 c = coords[d] % v->shape.dims[d];
+        idx += (i32)c * v->strides[d];
+    }
     if (idx < 0) return 0.f;
     return buf[(u32)idx];
 }
 
-static void cpu_dispatch_kernel_rs(
+void cpu_dispatch_kernel_rs(
     u32 out_buf, u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
     FusedOp *ops, u32 n_ops, const Shape *full_shape, const ReduceSpec *reduce,
     u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs)
@@ -74,8 +77,7 @@ static void cpu_dispatch_kernel_rs(
 
     // Allocate output
     f32 *out = cpu_pool.bufs[out_buf];
-
-    // Initialize output
+    // Initialize output (reduce needs accumulator init)
     if (has_reduce) {
         f32 init = (reduce->reduce_type == UOP_RMAX) ? -1e30f : 0.f;
         for (u32 i = 0; i < out_numel; i++) out[i] = init;

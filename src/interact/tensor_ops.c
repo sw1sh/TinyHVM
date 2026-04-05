@@ -53,6 +53,58 @@
                 }
             }
 
+            // UOP_FUSING: scheduled kernel — dispatch from KernelEntry.
+            // Fired by second thvm_reduce. Reads kernel spec from global table.
+            if (uop == UOP_FUSING) {
+                extern KernelEntry sched_kernels[];
+                Term kid_term = heap_read(ctx, loc + 1); // arg1 = kernel index
+                u32 kid = (u32)term_val(kid_term);
+                KernelEntry *ke = &sched_kernels[kid];
+
+                // Allocate output buffer
+                u32 dst_id = tensor_create(ctx, ke->out_shape, DTYPE_F32);
+                TensorMeta *md = &ctx->tensors[dst_id];
+
+                // Collect leaf buffers
+                u32 bufs[FUSE_MAX_LEAVES];
+                const View *views[FUSE_MAX_LEAVES];
+                for (u32 i = 0; i < ke->n_leaves; i++) {
+                    ENSURE(ctx, ke->leaf_ids[i]);
+                    bufs[i] = ctx->tensors[ke->leaf_ids[i]].buf_id;
+                    views[i] = &ke->leaf_views[i];
+                }
+
+                // Dispatch
+                md->backend->dispatch_kernel_rs(
+                    md->buf_id, bufs, views, ke->n_leaves,
+                    ke->ops, ke->n_ops, &ke->full_shape,
+                    ke->has_reduce ? &ke->reduce : NULL,
+                    NULL, NULL, 0);
+
+                // Post-reduce reshape (if SUM was wrapped by RESHAPE)
+                if (ke->has_reduce && term_tag(ke->reshape_term) != TAG_ERA) {
+                    u64 rs_loc = term_val(ke->reshape_term);
+                    Term shape_t = heap_read(ctx, rs_loc + 1);
+                    if (term_tag(shape_t) == TAG_DP0 || term_tag(shape_t) == TAG_DP1)
+                        shape_t = heap_read(ctx, term_val(shape_t));
+                    if (term_tag(shape_t) == TAG_TEN) {
+                        TensorMeta *ms = &ctx->tensors[(u32)term_val(shape_t)];
+                        u32 rank = ms->view.numel;
+                        f32 dims_f[MAX_DIM];
+                        META_READ(ms->backend, ms->buf_id, dims_f, rank * sizeof(f32));
+                        Shape ns = {.rank = rank};
+                        for (u32 i = 0; i < rank; i++) ns.dims[i] = (u32)dims_f[i];
+                        u32 rs_id = tensor_view_of(ctx, dst_id, view_create(ns));
+                        ctx->tensors[rs_id].creator_op = UOP_RESHAPE;
+                        ctx->tensors[rs_id].src_ids[0] = dst_id;
+                        ctx->itrs++;
+                        RETURN_REDUCED(term_ten(rs_id, DTYPE_F32));
+                    }
+                }
+                ctx->itrs++;
+                RETURN_REDUCED(term_ten(dst_id, DTYPE_F32));
+            }
+
             if (uop == UOP_TODEVICE) {
                 // UOP_TODEVICE(tensor, device_idx_scalar)
                 // Read tensor from source backend, write to target backend

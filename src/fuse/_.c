@@ -298,15 +298,14 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         return (int)(WALK_LEAF_BASE + new_idx);
     }
 
-    // Non-elementwise TAG_TOP (SUM, pool RESHAPE, etc.): leaf boundary.
-    // If arg0 is TAG_TEN → resolved leaf (use input buffer + st_get view).
-    // Otherwise → lazy leaf (needs resolution in a later pass).
+    // Non-elementwise TAG_TOP (SUM, pool RESHAPE, UOP_FUSING, etc.): leaf boundary.
+    // TAG_TEN input or UOP_FUSING (scheduled) → non-lazy leaf.
+    // Other TAG_TOP → lazy leaf (needs scheduling in a later pass).
     if (!is_elementwise(uop)) {
         const View *sv = st_get(term_val(t));
         if (!sv) return -1;
         if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
         u32 idx = (*n_leaves)++;
-        // Check if input is already TAG_TEN → non-lazy leaf
         Term leaf_input = heap_read(ctx, term_val(t));
         if (term_tag(leaf_input) == TAG_TEN) {
             leaf_ids[idx] = (u32)term_val(leaf_input); // real tensor ID

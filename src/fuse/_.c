@@ -26,6 +26,14 @@ static int is_binary(u32 uop) {
 static View fuse_composed_views[FUSE_MAX_LEAVES];
 static Term fuse_leaf_terms[FUSE_MAX_LEAVES];
 
+// Per-fuse state: absorbed TAG_TOP terms (for marking as FUSING after scheduling)
+#define FUSE_MAX_ABSORBED 256
+static Term fuse_absorbed[FUSE_MAX_ABSORBED];
+static u32  fuse_n_absorbed = 0;
+static void fuse_mark_absorbed(Term t) {
+    if (fuse_n_absorbed < FUSE_MAX_ABSORBED) fuse_absorbed[fuse_n_absorbed++] = t;
+}
+
 // Per-fuse state: PERMUTE between ew and reduce (set by fuse_walk_inner)
 static f32 _fuse_perm[MAX_DIM];
 static u32 _fuse_perm_rank = 0;
@@ -432,6 +440,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
 
     // Elementwise ops: recurse into children, record op
     if (*n_ops >= FUSE_MAX_OPS) return -1;
+    fuse_mark_absorbed(t); // track this op for post-schedule marking
     u64 loc = term_val(t);
     int arg_a = fuse_walk_inner(ctx, heap_read(ctx, loc), ops, n_ops, leaf_ids, leaf_views, n_leaves);
     if (arg_a < 0) {
@@ -465,8 +474,9 @@ static void fuse_remap(FusedOp *ops, u32 n_ops, u32 n_leaves) {
 
 static u32 fuse_unfused_count = 0, fuse_fused_count = 0;
 
-// fuse_build_kernel: pure walk + spec building. No dispatch, no TensorMeta.
-// Returns 1 on success (ke filled), 0 on failure (lazy leaves, pattern mismatch).
+// fuse_build_kernel: walk from any compute root, collect ops + leaves + reduce.
+// No pattern matching — accepts ew, SUM, RMAX, RESHAPE(SUM/RMAX), or ew chains.
+// Returns 1 on success (ke filled), 0 on failure.
 static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     _fuse_has_perm = 0;
     if (term_tag(t) != TAG_TOP) return 0;
@@ -475,75 +485,38 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     u32 has_reduce = 0;
     Term ew_root = t, sum_term = term_era(), reshape_term = term_era();
 
-    // Pattern match
+    // Unwrap: RESHAPE(SUM/RMAX) → record reshape + reduce, walk from reduce input
+    // SUM/RMAX → record reduce, walk from reduce input
+    // Anything else → walk from root directly
+    Term cur = t;
+    // Walk through outer RESHAPE wrapper (if any)
     if (top_uop == UOP_RESHAPE) {
-        u64 rs_loc = term_val(t);
-        Term inner = heap_read(ctx, rs_loc);
-        // Look through DUP
+        Term inner = heap_read(ctx, term_val(cur));
         if (term_tag(inner) == TAG_DP0 || term_tag(inner) == TAG_DP1)
             inner = heap_read(ctx, term_val(inner));
         if (term_tag(inner) == TAG_TOP && (term_ext(inner) == UOP_SUM || term_ext(inner) == UOP_RMAX)) {
-            u64 sum_loc = term_val(inner);
-            Term sum_input = heap_read(ctx, sum_loc);
-            if (term_tag(sum_input) == TAG_DP0 || term_tag(sum_input) == TAG_DP1)
-                sum_input = heap_read(ctx, term_val(sum_input));
-            if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
-                has_reduce = term_ext(inner); sum_term = inner; reshape_term = t; ew_root = sum_input;
-            }
-        }
-        if (!has_reduce) return 0;
-    } else if (top_uop == UOP_SUM || top_uop == UOP_RMAX) {
-        u64 sum_loc = term_val(t);
-        Term sum_input = heap_read(ctx, sum_loc);
-        if (term_tag(sum_input) == TAG_DP0 || term_tag(sum_input) == TAG_DP1)
-            sum_input = heap_read(ctx, term_val(sum_input));
-        if (term_tag(sum_input) == TAG_TOP && is_elementwise(term_ext(sum_input))) {
-            has_reduce = top_uop; sum_term = t; ew_root = sum_input;
-        } else if (term_tag(sum_input) == TAG_TEN) {
-            has_reduce = top_uop; sum_term = t; ew_root = sum_input;
-        } else if (term_tag(sum_input) == TAG_TOP && term_ext(sum_input) == UOP_FUSING) {
-            // Scheduled kernel input — will resolve to TAG_TEN. Accept as reduce input.
-            has_reduce = top_uop; sum_term = t; ew_root = sum_input;
-        } else if (term_tag(sum_input) == TAG_TOP && is_view_op(term_ext(sum_input))) {
-            Term probe = sum_input; int found = 0;
-            for (int d = 0; d < 5; d++) {
-                if (term_tag(probe) == TAG_TEN) { found = 1; break; }
-                if (term_tag(probe) == TAG_DP0 || term_tag(probe) == TAG_DP1)
-                    probe = heap_read(ctx, term_val(probe)); // deref DUP
-                if (term_tag(probe) == TAG_TEN) { found = 1; break; }
-                if (term_tag(probe) != TAG_TOP) break;
-                u32 pu = term_ext(probe);
-                if (is_elementwise(pu)) { found = 1; break; }
-                if (pu == UOP_FUSING) { found = 1; break; }
-                if (!is_view_op(pu)) break;
-                probe = heap_read(ctx, term_val(probe));
-            }
-            if (found) { has_reduce = top_uop; sum_term = t; ew_root = sum_input; }
-            else { ke->fail_code = 4; return 0; }
-        } else { ke->fail_code = 5; return 0; }
-    } else if (!is_elementwise(top_uop)) {
-        return 0;
-    }
-
-    // Post-reduce detection for ew chains above reduces
-    if (!has_reduce && is_elementwise(top_uop)) {
-        Term probe = t;
-        for (u32 d = 0; d < 10; d++) {
-            if (term_tag(probe) != TAG_TOP) break;
-            u32 pu = term_ext(probe);
-            if (is_elementwise(pu)) { probe = heap_read(ctx, term_val(probe)); }
-            else if (is_view_op(pu)) { probe = heap_read(ctx, term_val(probe)); }
-            else if (pu == UOP_SUM || pu == UOP_RMAX) {
-                Term si2 = heap_read(ctx, term_val(probe));
-                if (term_tag(si2) == TAG_TOP && is_elementwise(term_ext(si2))) {
-                    has_reduce = pu; sum_term = probe; ew_root = si2;
-                }
-                break;
-            } else break;
+            reshape_term = t; cur = inner;
+        } else {
+            return 0; // standalone RESHAPE — not a compute kernel
         }
     }
+    // Check for reduce
+    u32 cur_uop = term_ext(cur);
+    if (cur_uop == UOP_SUM || cur_uop == UOP_RMAX) {
+        has_reduce = cur_uop;
+        sum_term = cur;
+        Term ri = heap_read(ctx, term_val(cur));
+        if (term_tag(ri) == TAG_DP0 || term_tag(ri) == TAG_DP1)
+            ri = heap_read(ctx, term_val(ri));
+        ew_root = ri; // walk from reduce input
+    } else if (is_elementwise(cur_uop)) {
+        ew_root = cur; // walk from ew root
+    } else {
+        return 0; // MM, ASSIGN, etc. — not handled by fuser
+    }
 
-    // Walk the tree
+    // Walk the tree (reset absorbed tracking)
+    fuse_n_absorbed = 0;
     FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0;
     u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views_p[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
     int walk_result = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views_p, &n_leaves);
@@ -554,11 +527,7 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     // from st_get. The dispatch handler resolves them via thvm_reduce(leaf_term).
     // leaf_id has bit 31 set as a lazy marker; cleared at dispatch time.
 
-    // min_ops check
-    extern int fuse_no_lazy_resolve;
-    u32 min_ops = has_reduce ? (fuse_no_lazy_resolve ? 0 : 1) :
-                               (fuse_no_lazy_resolve ? 1 : 2);
-    if (n_ops < min_ops) { ke->fail_code = 3; return 0; }
+    // Accept any kernel with at least 1 op or a reduce (no min_ops gate)
 
     // Leaf used + ew_view
     // n_ops==0: walk returned a single leaf (possibly after view compositions that created

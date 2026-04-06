@@ -74,6 +74,14 @@ static Term sched_one(TinyHVM *ctx, Term ht, u64 h) {
     ctx->heap[h] = ft;
     for (u64 ph = 1; ph < ctx->heap_pos; ph++)
         if (ph != h && ctx->heap[ph] == ht) ctx->heap[ph] = ft;
+    // Also replace absorbed ew ops (children that were fused into this kernel)
+    extern Term fuse_absorbed[];
+    extern u32 fuse_n_absorbed;
+    for (u32 ai = 0; ai < fuse_n_absorbed; ai++) {
+        Term at = fuse_absorbed[ai];
+        for (u64 ph = 1; ph < ctx->heap_pos; ph++)
+            if (ctx->heap[ph] == at) ctx->heap[ph] = ft;
+    }
     return ft;
 }
 
@@ -153,7 +161,7 @@ static u32 sched_all(TinyHVM *ctx) {
         if (era_progress == 0) break;
     }
 
-    // Single-pass forward scan: schedule each compute op as a kernel.
+    // Forward scan: schedule each compute op as a kernel.
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) != TAG_TOP) continue;

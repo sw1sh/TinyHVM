@@ -36,6 +36,47 @@ static void sched_dump_heap(TinyHVM *ctx) {
 
 
 
+// Walk through view ops and DP refs to find the innermost compute/leaf term.
+static Term sched_unwrap_views(TinyHVM *ctx, Term t) {
+    for (int d = 0; d < 20; d++) {
+        if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1)
+            t = heap_read(ctx, term_val(t));
+        if (term_tag(t) != TAG_TOP) break;
+        if (!is_view_op(term_ext(t))) break;
+        t = heap_read(ctx, term_val(t)); // walk through view op's input
+    }
+    return t;
+}
+
+// Schedule a single TAG_TOP as a FUSING kernel. Returns the FUSING term, or ERA on failure.
+static Term sched_one(TinyHVM *ctx, Term ht, u64 h) {
+    KernelEntry ke; ke.fail_code = 0;
+    if (!fuse_build_kernel(ctx, ht, &ke)) {
+        if (getenv("THVM_SCHED_DIAG")) {
+            u64 _l = term_val(ht);
+            Term _a0 = heap_read(ctx, _l);
+            fprintf(stderr, "  fuse_fail: %s@%llu arg0=tag%u/%s fc=%d\n",
+                uop_names[term_ext(ht)], h, term_tag(_a0),
+                term_tag(_a0)==TAG_TOP ? uop_names[term_ext(_a0)] : "", ke.fail_code);
+        }
+        return term_era();
+    }
+    ke.original_term = ht;
+    u32 kid = sched_kernel_count++;
+    sched_kernels[kid] = ke;
+    u64 floc = ctx->heap_pos; ctx->heap_pos += 2;
+    heap_set(ctx, floc, term_era());
+    heap_set(ctx, floc + 1, term_new(TAG_NUM, 0, kid));
+    Term ft = term_new(TAG_TOP, UOP_FUSING, floc);
+    View out_v = view_create(ke.out_shape);
+    st_set(floc, &out_v);
+    // Replace at h and propagate
+    ctx->heap[h] = ft;
+    for (u64 ph = 1; ph < ctx->heap_pos; ph++)
+        if (ph != h && ctx->heap[ph] == ht) ctx->heap[ph] = ft;
+    return ft;
+}
+
 static u32 sched_all(TinyHVM *ctx) {
     u32 total = 0;
     fuse_no_lazy_resolve = 1;
@@ -48,11 +89,9 @@ static u32 sched_all(TinyHVM *ctx) {
             Term ht = ctx->heap[h];
             if (term_tag(ht) != TAG_TOP) continue;
             u32 uop = term_ext(ht);
-            if (uop == UOP_ASSIGN) continue;
-            if (uop == UOP_GRAD)   continue;
-            if (uop == UOP_FUSING) continue; // already scheduled; arg0=ERA is intentional
+            if (uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_FUSING) continue;
+
             // View ops: resolve to TAG_TEN alias when input is TAG_TEN.
-            // TAG_TOP input: stay as TAG_TOP — fuser walks through via st_get.
             if (is_view_op(uop)) {
                 u64 vloc = term_val(ht);
                 Term vinput = heap_read(ctx, vloc);
@@ -109,42 +148,18 @@ static u32 sched_all(TinyHVM *ctx) {
                     }
                 }
             }
-
-            // Compute op: build kernel spec → write UOP_FUSING to heap (pure rewrite).
-            {
-                KernelEntry ke; ke.fail_code = 0;
-                if (!fuse_build_kernel(ctx, ht, &ke)) {
-                    if (getenv("THVM_SCHED_DIAG")) {
-                        u64 _l = term_val(ht);
-                        Term _a0 = heap_read(ctx, _l);
-                        fprintf(stderr, "  fuse_fail p%u: %s@%llu arg0=tag%u/%s fc=%d\n",
-                            pass, uop_names[uop], h, term_tag(_a0),
-                            term_tag(_a0)==TAG_TOP ? uop_names[term_ext(_a0)] : "", ke.fail_code);
-                    }
-                } else {
-                    ke.original_term = ht;
-                    u32 kid = sched_kernel_count++;
-                    sched_kernels[kid] = ke;
-                    u64 floc = ctx->heap_pos; ctx->heap_pos += 2;
-                    heap_set(ctx, floc, term_era());
-                    heap_set(ctx, floc + 1, term_new(TAG_NUM, 0, kid));
-                    ctx->heap[h] = term_new(TAG_TOP, UOP_FUSING, floc);
-                    View out_v = view_create(ke.out_shape);
-                    st_set(floc, &out_v);
-                    progress++;
-                    // Propagate: all copies of this term → same FUSING.
-                    // Ensures arg slots and DUP nodes see FUSING consistently.
-                    { Term ft = ctx->heap[h];
-                      for (u64 ph = 1; ph < ctx->heap_pos; ph++)
-                          if (ph != h && ctx->heap[ph] == ht) ctx->heap[ph] = ft; }
-                }
-            }
         }
+        total += era_progress;
+        if (era_progress == 0) break;
+    }
 
-        total += progress + era_progress;
-        if (getenv("THVM_SCHED_DIAG") && (progress > 0 || era_progress > 0))
-            fprintf(stderr, "  pass %u: %u kernels %u era\n", pass, progress, era_progress);
-        if (progress == 0) break;
+    // Single-pass forward scan: schedule each compute op as a kernel.
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) != TAG_TOP) continue;
+        u32 uop = term_ext(ht);
+        if (is_view_op(uop) || uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_FUSING) continue;
+        sched_one(ctx, ht, h);
     }
 
     fuse_no_lazy_resolve = 0;

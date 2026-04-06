@@ -172,31 +172,23 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     }
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }
 
-    // Iterate Phase 2 + Phase 3 until all ASSIGNs are resolved.
     // Phase 2: schedule compute ops → FUSING, resolve view ops → TAG_TEN aliases.
-    // Phase 3: dispatch FUSINGs → TAG_TEN, fire ASSIGNs.
-    // Iteration needed because: dispatch produces TAG_TEN, enabling view resolution,
-    // which enables ASSIGN firing. Each pass makes progress.
-    for (u32 _ei = 0; _ei < 20; _ei++) {
-        sched_all(ctx);
-        if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after sched[%u]: ", _ei); sched_dump_heap(ctx); }
+    sched_all(ctx);
+    if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after sched: "); sched_dump_heap(ctx); }
 
-        { Backend *be = ctx_default_backend(ctx);
-          if (be && be->end_batch) be->end_batch(); }
+    { Backend *be = ctx_default_backend(ctx);
+      if (be && be->end_batch) be->end_batch(); }
 
-        int n_assigned = 0;
-        for (u64 h = 1; h < ctx->heap_pos; h++) {
-            Term ht = ctx->heap[h];
-            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
-                Term r = thvm_reduce(ctx, ht);
-                ctx->heap[h] = r;
-                if (term_tag(r) != TAG_TOP || term_ext(r) != UOP_ASSIGN)
-                    n_assigned++;
-            }
+    // Phase 3: Fire ASSIGNs. ASSIGN handler resolves WNF view chains
+    // inline by dispatching inner FUSINGs and creating view aliases.
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
+            Term r = thvm_reduce(ctx, ht);
+            ctx->heap[h] = r;
         }
-        if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after assign[%u]: ", _ei); sched_dump_heap(ctx); }
-        if (n_assigned == 0) break;
     }
+    if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after assign: "); sched_dump_heap(ctx); }
 
     return term_era();
 }

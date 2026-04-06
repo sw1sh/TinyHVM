@@ -253,9 +253,11 @@ static View view_reshape(View v, Shape new_shape) {
         r.strides[i] = st;
       }
       r.contiguous = 0;
+      view_canonicalize(&r);
       return r;
     }
   }
 
+  view_canonicalize(&r);
   return r;
 }

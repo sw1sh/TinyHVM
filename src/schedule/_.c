@@ -48,6 +48,16 @@ static Term sched_unwrap_views(TinyHVM *ctx, Term t) {
     return t;
 }
 
+// Absorbed terms: ew ops fused into reduce kernels (pass 1). Pass 2 skips these.
+#define ABSORBED_MAX 4096
+static Term sched_absorbed_terms[ABSORBED_MAX];
+static u32  sched_n_absorbed = 0;
+static int sched_is_absorbed(Term t) {
+    for (u32 i = 0; i < sched_n_absorbed; i++)
+        if (sched_absorbed_terms[i] == t) return 1;
+    return 0;
+}
+
 // Schedule a single TAG_TOP as a FUSING kernel. Returns the FUSING term, or ERA on failure.
 static Term sched_one(TinyHVM *ctx, Term ht, u64 h) {
     KernelEntry ke; ke.fail_code = 0;
@@ -74,20 +84,19 @@ static Term sched_one(TinyHVM *ctx, Term ht, u64 h) {
     ctx->heap[h] = ft;
     for (u64 ph = 1; ph < ctx->heap_pos; ph++)
         if (ph != h && ctx->heap[ph] == ht) ctx->heap[ph] = ft;
-    // Also replace absorbed ew ops (children that were fused into this kernel)
+    // Record absorbed ew ops (don't replace on heap — breaks DUP refs)
     extern Term fuse_absorbed[];
     extern u32 fuse_n_absorbed;
-    for (u32 ai = 0; ai < fuse_n_absorbed; ai++) {
-        Term at = fuse_absorbed[ai];
-        for (u64 ph = 1; ph < ctx->heap_pos; ph++)
-            if (ctx->heap[ph] == at) ctx->heap[ph] = ft;
-    }
+    for (u32 ai = 0; ai < fuse_n_absorbed; ai++)
+        if (sched_n_absorbed < ABSORBED_MAX)
+            sched_absorbed_terms[sched_n_absorbed++] = fuse_absorbed[ai];
     return ft;
 }
 
 static u32 sched_all(TinyHVM *ctx) {
     u32 total = 0;
     fuse_no_lazy_resolve = 1;
+    sched_n_absorbed = 0;
 
     for (u32 pass = 0; pass < 50; pass++) {
         u32 progress = 0;
@@ -161,12 +170,28 @@ static u32 sched_all(TinyHVM *ctx) {
         if (era_progress == 0) break;
     }
 
-    // Forward scan: schedule each compute op as a kernel.
+    // Two-pass: reduces first (absorb ew children), then remaining ew.
+    // Pass 1: reduce roots (SUM, RMAX, RESHAPE(SUM/RMAX))
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) != TAG_TOP) continue;
+        u32 uop = term_ext(ht);
+        int is_reduce_root = (uop == UOP_SUM || uop == UOP_RMAX);
+        if (!is_reduce_root && uop == UOP_RESHAPE) {
+            Term inner = sched_unwrap_views(ctx, ht);
+            is_reduce_root = (term_tag(inner) == TAG_TOP &&
+                (term_ext(inner) == UOP_SUM || term_ext(inner) == UOP_RMAX));
+        }
+        if (!is_reduce_root) continue;
+        sched_one(ctx, ht, h);
+    }
+    // Pass 2: remaining compute ops (skip absorbed)
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) != TAG_TOP) continue;
         u32 uop = term_ext(ht);
         if (is_view_op(uop) || uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_FUSING) continue;
+        if (sched_is_absorbed(ht)) continue;
         sched_one(ctx, ht, h);
     }
 

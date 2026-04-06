@@ -11,5 +11,6 @@ static View view_pad(View v, const u32 *pad_before, const u32 *pad_after) {
     r.numel *= r.shape.dims[i];
   }
   r.contiguous = 0;
+  view_canonicalize(&r);
   return r;
 }

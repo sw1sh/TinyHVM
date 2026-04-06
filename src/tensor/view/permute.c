@@ -13,5 +13,6 @@ static View view_permute(View v, const u32 *axes) {
     }
   }
   r.contiguous = 0;
+  view_canonicalize(&r);
   return r;
 }

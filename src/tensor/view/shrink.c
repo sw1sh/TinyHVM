@@ -8,5 +8,6 @@ static View view_shrink(View v, const u32 *starts, const u32 *ends) {
     r.numel          *= r.shape.dims[i];
   }
   r.contiguous = 0;
+  view_canonicalize(&r);
   return r;
 }

@@ -615,8 +615,8 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
             META_READ(axt->backend, axt->buf_id, axes_f, n_axes * sizeof(f32));
             for (u32 i = 0; i < n_axes; i++) {
                 int ax = (int)axes_f[i];
-                if (_fuse_has_perm && ax >= 0 && (u32)ax < _fuse_perm_rank)
-                    ax = (int)_fuse_perm[ax];
+                // Don't transform axes through perm — SUM axes are in the ew chain's
+                // output space (post-permute). The leaf views already have composed strides.
                 if (ax >= 0 && ax < (int)ew_view.shape.rank) {
                     rs.is_reduce[ax] = 1; out_view.shape.dims[ax] = 1; found_axes = 1;
                 }
@@ -653,6 +653,15 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     ke->has_reduce = has_reduce;
     ke->reshape_term = reshape_term;
     ke->sum_term = sum_term;
+    if (getenv("THVM_KERN_DIAG") && has_reduce) {
+        fprintf(stderr, "FK ops=%u lv=%u perm=%d full=[", n_ops, n_leaves, _fuse_has_perm);
+        for(u32 d=0;d<ew_view.shape.rank;d++) fprintf(stderr,"%u,",ew_view.shape.dims[d]);
+        fprintf(stderr,"] out=[");
+        for(u32 d=0;d<out_view.shape.rank;d++) fprintf(stderr,"%u,",out_view.shape.dims[d]);
+        fprintf(stderr,"] ax=[");
+        for(u32 d=0;d<MAX_DIM;d++) if(rs.is_reduce[d]) fprintf(stderr,"%u,",d);
+        fprintf(stderr,"]\n");
+    }
     return 1;
 }
 

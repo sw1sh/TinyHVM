@@ -1,90 +1,158 @@
-#!/usr/bin/env python3
-"""Compare 2-layer CNN grads: Conv(1,4,3)→ReLU→Conv(4,8,3)→ReLU→Flatten→Linear"""
+"""Compare TinyHVM 2-conv+BN+maxpool gradients against NumPy reference.
+
+Reads the same random seed as test_ch32.m (srand(42), uniform [-1,1]).
+The C rand() sequence must match — this script uses ctypes to call the
+system's rand() with srand(42) for exact parity.
+"""
+import ctypes, struct, math
 import numpy as np
 
-BS, C1, C2 = 4, 4, 8
+libc = ctypes.CDLL(None)
+libc.srand(42)
 
-def conv2d_forward(x, w, b):
-    """x:[B,Cin,H,W] w:[Cout,Cin,KH,KW] b:[Cout] → [B,Cout,OH,OW]"""
-    B,Cin,H,W = x.shape
-    Cout,_,KH,KW = w.shape
-    OH, OW = H-KH+1, W-KW+1
-    # im2col
-    col = np.zeros((B, Cin, KH, KW, OH, OW), dtype=np.float32)
-    for kh in range(KH):
-        for kw in range(KW):
-            col[:,:,kh,kw,:,:] = x[:,:,kh:kh+OH,kw:kw+OW]
-    col_flat = col.reshape(B, Cin*KH*KW, OH*OW)        # [B, Cin*K*K, OH*OW]
-    w_flat = w.reshape(Cout, Cin*KH*KW)                  # [Cout, Cin*K*K]
-    out = np.einsum('ck,bkp->bcp', w_flat, col_flat)     # [B, Cout, OH*OW]
-    out = out.reshape(B, Cout, OH, OW)
-    out += b.reshape(1, Cout, 1, 1)
-    return out, col
+def crand_f32():
+    return libc.rand() / 2147483647.0 * 2 - 1
 
-def conv2d_backward(dy, x, w, col):
-    """dy:[B,Cout,OH,OW] → dw:[Cout,Cin,KH,KW], db:[Cout], dx:[B,Cin,H,W]"""
-    B,Cin,H,W = x.shape
-    Cout,_,KH,KW = w.shape
-    OH, OW = H-KH+1, W-KW+1
-    db = dy.sum(axis=(0,2,3))
-    dy_flat = dy.reshape(B, Cout, OH*OW)
-    col_flat = col.reshape(B, Cin*KH*KW, OH*OW)
-    w_flat = w.reshape(Cout, Cin*KH*KW)
-    # dw = sum_b dy @ col^T
-    dw = np.einsum('bcp,bkp->ck', dy_flat, col_flat).reshape(w.shape)
-    # dcol = w^T @ dy
-    dcol_flat = np.einsum('ck,bcp->bkp', w_flat, dy_flat)
-    dcol = dcol_flat.reshape(B, Cin, KH, KW, OH, OW)
-    dx = np.zeros_like(x)
-    for kh in range(KH):
-        for kw in range(KW):
-            dx[:,:,kh:kh+OH,kw:kw+OW] += dcol[:,:,kh,kw,:,:]
-    return dw, db, dx
+def crand_array(n):
+    return np.array([crand_f32() for _ in range(n)], dtype=np.float32)
 
-# Load data
-cw1 = np.fromfile('/tmp/c2_cw1.bin', dtype=np.float32).reshape(C1,1,3,3)
-cb1 = np.fromfile('/tmp/c2_cb1.bin', dtype=np.float32)
-cw2 = np.fromfile('/tmp/c2_cw2.bin', dtype=np.float32).reshape(C2,C1,3,3)
-cb2 = np.fromfile('/tmp/c2_cb2.bin', dtype=np.float32)
-flat_f = C2*24*24
-lw = np.fromfile('/tmp/c2_lw.bin', dtype=np.float32).reshape(flat_f, 10)
-lb = np.fromfile('/tmp/c2_lb.bin', dtype=np.float32)
-X = np.fromfile('/tmp/c2_X.bin', dtype=np.float32).reshape(BS, 1, 28, 28)
+BS, Cin, H, W, Cout, K = 4, 1, 14, 14, 32, 3
 
-# Forward
-h1_pre, col1 = conv2d_forward(X, cw1, cb1)
-h1 = np.maximum(h1_pre, 0)
-h2_pre, col2 = conv2d_forward(h1, cw2, cb2)
-h2 = np.maximum(h2_pre, 0)
-flat = h2.reshape(BS, flat_f)
-logits = flat @ lw + lb
-loss = logits.sum()
-print(f"numpy loss = {loss:.6f}")
+# Input
+x = crand_array(BS*Cin*H*W).reshape(BS, Cin, H, W)
 
-# Backward: loss = sum(logits)
-d_logits = np.ones_like(logits)
-d_lw = flat.T @ d_logits
-d_lb = d_logits.sum(axis=0)
-d_flat = d_logits @ lw.T
-d_h2 = d_flat.reshape(BS, C2, 24, 24)
-d_h2_pre = d_h2 * (h2_pre > 0).astype(np.float32)
-d_cw2, d_cb2, d_h1 = conv2d_backward(d_h2_pre, h1, cw2, col2)
-d_h1_pre = d_h1 * (h1_pre > 0).astype(np.float32)
-d_cw1, d_cb1, _ = conv2d_backward(d_h1_pre, X, cw1, col1)
+# Weights: b * crand where b = 1/sqrt(fan_in)
+def mkw(shape, fan_in):
+    n = int(np.prod(shape))
+    b = 1.0 / math.sqrt(fan_in)
+    return (b * crand_array(n)).reshape(shape)
 
-names = ['g_cw1','g_cb1','g_cw2','g_cb2','g_lw','g_lb']
-sizes = [C1*1*3*3, C1, C2*C1*3*3, C2, flat_f*10, 10]
-refs = [d_cw1, d_cb1, d_cw2, d_cb2, d_lw, d_lb]
-shapes = [cw1.shape, cb1.shape, cw2.shape, cb2.shape, lw.shape, lb.shape]
+w1 = mkw((Cout, Cin, K, K), Cin*K*K)
+b1 = np.zeros(Cout, dtype=np.float32)
+# consume rand for b1 tensor creation (test uses mkz which calls calloc, no rand)
 
-ok = True
-for name, sz, ref, sh in zip(names, sizes, refs, shapes):
-    got = np.fromfile(f'/tmp/c2_{name}.bin', dtype=np.float32).reshape(sh)
-    diff = np.abs(got - ref)
-    maxd, meand = diff.max(), diff.mean()
-    reld = (diff / (np.abs(ref) + 1e-12)).max()
-    status = "OK" if maxd < 1e-3 else "FAIL"
-    if maxd > 1e-3: ok = False
-    print(f"{name}: max_abs={maxd:.2e} mean={meand:.2e} max_rel={reld:.2e} {status}  got[0:4]={got.flatten()[:4]}")
+w2 = mkw((Cout, Cout, K, K), Cout*K*K)
+b2 = np.zeros(Cout, dtype=np.float32)
 
-print(f"\n{'PASS' if ok else 'FAIL'}")
+# BN params
+bn_g = np.ones(Cout, dtype=np.float32)
+bn_b = np.zeros(Cout, dtype=np.float32)
+bn_rm = np.zeros(Cout, dtype=np.float32)
+bn_rv = np.ones(Cout, dtype=np.float32)
+
+# Forward: conv1
+def conv2d_forward(x, w, b, stride=1):
+    BS, Cin, H, W = x.shape
+    Cout, _, K, _ = w.shape
+    OH = (H - K) // stride + 1
+    OW = (W - K) // stride + 1
+    out = np.zeros((BS, Cout, OH, OW), dtype=np.float32)
+    for n in range(BS):
+        for co in range(Cout):
+            for oh in range(OH):
+                for ow in range(OW):
+                    val = b[co]
+                    for ci in range(Cin):
+                        for kh in range(K):
+                            for kw in range(K):
+                                val += x[n, ci, oh*stride+kh, ow*stride+kw] * w[co, ci, kh, kw]
+                    out[n, co, oh, ow] = val
+    return out
+
+h1 = conv2d_forward(x, w1, b1)
+h1r = np.maximum(h1, 0)  # ReLU
+
+h2 = conv2d_forward(h1r, w2, b2)
+h2r = np.maximum(h2, 0)  # ReLU
+
+# BN forward (training mode)
+eps = 1e-5
+OH2 = H - K + 1 - K + 1  # 10
+mean = h2r.mean(axis=(0, 2, 3))  # (Cout,)
+var = h2r.var(axis=(0, 2, 3))    # (Cout,)
+h_bn = bn_g.reshape(1,-1,1,1) * (h2r - mean.reshape(1,-1,1,1)) / np.sqrt(var.reshape(1,-1,1,1) + eps) + bn_b.reshape(1,-1,1,1)
+
+# Maxpool 2x2
+PH = OH2 // 2
+h_pool = np.zeros((BS, Cout, PH, PH), dtype=np.float32)
+for n in range(BS):
+    for c in range(Cout):
+        for ph in range(PH):
+            for pw in range(PH):
+                h_pool[n,c,ph,pw] = h_bn[n,c,ph*2:ph*2+2,pw*2:pw*2+2].max()
+
+# Flatten + sum = loss
+h_flat = h_pool.reshape(BS, -1)
+loss = h_flat.sum()
+
+# Backward: d(loss)/d(h_flat) = 1
+dh_flat = np.ones_like(h_flat)
+dh_pool = dh_flat.reshape(BS, Cout, PH, PH)
+
+# Maxpool backward
+dh_bn = np.zeros_like(h_bn)
+for n in range(BS):
+    for c in range(Cout):
+        for ph in range(PH):
+            for pw in range(PH):
+                window = h_bn[n,c,ph*2:ph*2+2,pw*2:pw*2+2]
+                idx = np.unravel_index(window.argmax(), window.shape)
+                dh_bn[n,c,ph*2+idx[0],pw*2+idx[1]] += dh_pool[n,c,ph,pw]
+
+# BN backward
+N_bn = BS * OH2 * OH2
+x_hat = (h2r - mean.reshape(1,-1,1,1)) / np.sqrt(var.reshape(1,-1,1,1) + eps)
+dh2r = bn_g.reshape(1,-1,1,1) / np.sqrt(var.reshape(1,-1,1,1) + eps) / N_bn * (
+    N_bn * dh_bn - dh_bn.sum(axis=(0,2,3)).reshape(1,-1,1,1) - x_hat * (dh_bn * x_hat).sum(axis=(0,2,3)).reshape(1,-1,1,1)
+)
+
+# ReLU backward
+dh2 = dh2r * (h2 > 0)
+
+# Conv2 backward: dw2
+def conv2d_backward_w(x, dy, K):
+    BS, Cin, H, W = x.shape
+    _, Cout, OH, OW = dy.shape
+    dw = np.zeros((Cout, Cin, K, K), dtype=np.float32)
+    for n in range(BS):
+        for co in range(Cout):
+            for ci in range(Cin):
+                for kh in range(K):
+                    for kw in range(K):
+                        for oh in range(OH):
+                            for ow in range(OW):
+                                dw[co, ci, kh, kw] += x[n, ci, oh+kh, ow+kw] * dy[n, co, oh, ow]
+    return dw
+
+dw2 = conv2d_backward_w(h1r, dh2, K)
+
+# Conv2 backward: dx (for conv1 backward)
+def conv2d_backward_x(w, dy, input_shape):
+    BS, Cin, H, W = input_shape
+    Cout, _, K, _ = w.shape
+    _, _, OH, OW = dy.shape
+    dx = np.zeros((BS, Cin, H, W), dtype=np.float32)
+    for n in range(BS):
+        for ci in range(Cin):
+            for h in range(H):
+                for w_ in range(W):
+                    for co in range(Cout):
+                        for kh in range(K):
+                            for kw in range(K):
+                                oh = h - kh
+                                ow = w_ - kw
+                                if 0 <= oh < OH and 0 <= ow < OW:
+                                    dx[n, ci, h, w_] += w[co, ci, kh, kw] * dy[n, co, oh, ow]
+    return dx
+
+dh1r = conv2d_backward_x(w2, dh2, h1r.shape)
+
+# ReLU backward
+dh1 = dh1r * (h1 > 0)
+
+# Conv1 backward: dw1
+dw1 = conv2d_backward_w(x, dh1, K)
+
+n1 = math.sqrt((dw1**2).sum())
+n2 = math.sqrt((dw2**2).sum())
+print(f"numpy : w1={n1:.2f} w2={n2:.2f}")

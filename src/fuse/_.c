@@ -553,11 +553,9 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     if (walk_result < 0) { ke->fail_code = 1; return 0; }
     fuse_remap(ops, n_ops, n_leaves);
 
-    // Check for lazy leaves (unresolved non-ew TAG_TOP without known shape).
-    // FUSING placeholder leaves (leaf_id=0) are allowed: phase 3 resolves them
-    // bottom-up via thvm_reduce(leaf_term) in the UOP_FUSING handler.
-    for (u32 i = 0; i < n_leaves; i++)
-        if (LEAF_IS_LAZY(leaf_ids[i])) { ke->fail_code = 2; return 0; }
+    // Lazy leaves (TAG_TOP non-ew inputs): allowed if they have known shapes
+    // from st_get. The dispatch handler resolves them via thvm_reduce(leaf_term).
+    // leaf_id has bit 31 set as a lazy marker; cleared at dispatch time.
 
     // min_ops check
     extern int fuse_no_lazy_resolve;

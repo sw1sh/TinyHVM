@@ -71,24 +71,28 @@
                 u32 dst_id = tensor_create(ctx, ke->out_shape, DTYPE_F32);
                 TensorMeta *md = &ctx->tensors[dst_id];
 
-                // Collect leaf buffers — resolve placeholder IDs (0) from UOP_FUSING deps
+                // Collect leaf buffers — resolve placeholder/lazy IDs from UOP_FUSING deps
                 u32 bufs[FUSE_MAX_LEAVES];
                 const View *views[FUSE_MAX_LEAVES];
                 for (u32 i = 0; i < ke->n_leaves; i++) {
                     u32 lid = ke->leaf_ids[i];
-                    if (lid == 0) {
-                        // Placeholder from scheduled UOP_FUSING leaf.
+                    if (lid == 0 || (lid & 0x80000000u)) {
+                        // Placeholder (0) or lazy leaf (bit 31 set).
                         // Reduce the original leaf term — inner UOP_FUSING fires first.
                         Term lt = ke->leaf_terms[i];
                         Term lr = thvm_reduce(ctx, lt);
                         if (term_tag(lr) == TAG_TEN) lid = (u32)term_val(lr);
+                        else {
+                            // Still unresolved — fatal
+                            fprintf(stderr, "FUSING: leaf %u unresolved after reduce (tag=%u)\n", i, term_tag(lr));
+                            RETURN_REDUCED(term_era());
+                        }
                     }
                     ENSURE(ctx, lid);
                     bufs[i] = ctx->tensors[lid].buf_id;
                     views[i] = &ke->leaf_views[i];
                 }
 
-                // Dispatch
                 md->backend->dispatch_kernel_rs(
                     md->buf_id, bufs, views, ke->n_leaves,
                     ke->ops, ke->n_ops, &ke->full_shape,

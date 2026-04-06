@@ -421,14 +421,30 @@ static View    st_views[ST_TABLE_SIZE];
 static u64     st_keys[ST_TABLE_SIZE]; // 0 = empty
 
 static inline void st_set(u64 heap_loc, const View *v) {
+    u64 key = heap_loc + 1; // +1 so 0 means empty
     u32 idx = (u32)(heap_loc % ST_TABLE_SIZE);
+    for (u32 p = 0; p < 16; p++) { // linear probing, max 16 steps
+        u32 i = (idx + p) % ST_TABLE_SIZE;
+        if (st_keys[i] == 0 || st_keys[i] == key) {
+            st_views[i] = *v;
+            st_keys[i] = key;
+            return;
+        }
+    }
+    // Fallback: overwrite first slot (collision eviction)
     st_views[idx] = *v;
-    st_keys[idx] = heap_loc + 1; // +1 so 0 means empty
+    st_keys[idx] = key;
 }
 
 static inline const View *st_get(u64 heap_loc) {
+    u64 key = heap_loc + 1;
     u32 idx = (u32)(heap_loc % ST_TABLE_SIZE);
-    return (st_keys[idx] == heap_loc + 1) ? &st_views[idx] : NULL;
+    for (u32 p = 0; p < 16; p++) {
+        u32 i = (idx + p) % ST_TABLE_SIZE;
+        if (st_keys[i] == key) return &st_views[i];
+        if (st_keys[i] == 0) return NULL;
+    }
+    return NULL;
 }
 
 // ============================================================

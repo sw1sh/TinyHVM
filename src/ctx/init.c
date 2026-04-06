@@ -425,8 +425,12 @@ lazy:;
     for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (f32)new_shape.dims[i];
     Term shape_t = thvm_tensor(ctx, dims, SHAPE(new_shape.rank));
     Term r = thvm_op(ctx, UOP_RESHAPE, t, shape_t);
-    View ov = view_create(new_shape);
-    st_set(term_val(r), &ov);
+    // thvm_op already called st_set with composed strides (if input view available).
+    // Only override if no view was stored (va was NULL inside thvm_op).
+    if (!st_get(term_val(r))) {
+        View ov = view_create(new_shape);
+        st_set(term_val(r), &ov);
+    }
     return r; }
 }
 

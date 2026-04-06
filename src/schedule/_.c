@@ -35,6 +35,7 @@ static void sched_dump_heap(TinyHVM *ctx) {
 }
 
 
+
 static u32 sched_all(TinyHVM *ctx) {
     u32 total = 0;
     fuse_no_lazy_resolve = 1;
@@ -50,7 +51,6 @@ static u32 sched_all(TinyHVM *ctx) {
             if (uop == UOP_ASSIGN) continue;
             if (uop == UOP_GRAD)   continue;
             if (uop == UOP_FUSING) continue; // already scheduled; arg0=ERA is intentional
-
             // View ops: resolve to TAG_TEN alias when input is TAG_TEN.
             if (is_view_op(uop)) {
                 u64 vloc = term_val(ht);
@@ -162,6 +162,11 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     // FUSING leaves are allowed: phase 3 resolves them bottom-up recursively.
     sched_all(ctx);
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after sched: "); sched_dump_heap(ctx); }
+
+    // Flush GPU before phase 3 so forward buffers are committed.
+    // pool_reset with keep=tensor_count recycles old buffers without losing live ones.
+    { Backend *be = ctx_default_backend(ctx);
+      if (be && be->end_batch) be->end_batch(); }
 
     // Phase 3: Fire ASSIGNs — trampoline reduces src chain, fires FUSING → GPU → TAG_TEN.
     for (u64 h = 1; h < ctx->heap_pos; h++) {

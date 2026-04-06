@@ -188,7 +188,7 @@ static View view_reshape(View v, Shape new_shape) {
       if (acc >= real_size && real_size > 0) new_stride = 0;
     }
     if (acc != merged_size) {
-      // Can't reshape — return fallback
+      // Can't reshape — return fallback with natural strides
       View r = {0};
       r.shape = new_shape; r.numel = new_numel; r.offset = v.offset;
       for (u32 i = 0; i < new_shape.rank; i++) {

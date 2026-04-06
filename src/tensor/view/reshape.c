@@ -188,15 +188,10 @@ static View view_reshape(View v, Shape new_shape) {
       if (acc >= real_size && real_size > 0) new_stride = 0;
     }
     if (acc != merged_size) {
-      // Can't reshape — return fallback with natural strides
+      // Can't merge — signal failure via numel=0 sentinel.
+      // Caller should push a new View onto the ShapeTracker.
       View r = {0};
-      r.shape = new_shape; r.numel = new_numel; r.offset = v.offset;
-      for (u32 i = 0; i < new_shape.rank; i++) {
-        i32 st = 1;
-        for (u32 j = i + 1; j < new_shape.rank; j++) st *= (i32)new_shape.dims[j];
-        r.strides[i] = st;
-      }
-      r.contiguous = 0;
+      r.numel = 0; // sentinel: merge failed
       return r;
     }
   }

@@ -37,6 +37,7 @@ static _Thread_local u32 tl_thread_id = 0;
 #include "tensor/view/pad.c"
 #include "tensor/view/stride.c"
 #include "tensor/view/broadcast.c"
+#include "tensor/view/shapetracker.c"
 
 // ── tensor/ — tensor metadata and scalar helper ───────────────────────────────
 // tensor/create.c and tensor/scalar.c are included AFTER tensor_fill (below)

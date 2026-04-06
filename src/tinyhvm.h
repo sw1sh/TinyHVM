@@ -409,6 +409,21 @@ typedef struct {
     u8   n_views;  // 0 = unused (use tensor's view directly), 1+ = stacked
 } ShapeTracker;
 
+// ShapeTracker from a single View (no forward decl needed).
+static inline ShapeTracker st_from_view(View v) {
+    ShapeTracker st = { .n_views = 1 };
+    st.views[0] = v;
+    return st;
+}
+
+// Last view = output shape/strides.
+static inline const View *st_last_view(const ShapeTracker *st) {
+    return (st && st->n_views > 0) ? &st->views[st->n_views - 1] : NULL;
+}
+
+// Composition helpers (st_reshape, st_permute, st_expand) defined in
+// tensor/view/shapetracker.c — included after view_create/view_reshape.
+
 // ============================================================
 // Shape tracking for lazy TAG_TOP nodes (ShapeTracker)
 // ============================================================
@@ -417,34 +432,49 @@ typedef struct {
 // for lazy nodes without reducing them.
 // Hash table with collision detection via stored key (heap_loc).
 #define ST_TABLE_SIZE (1 << 18)  // 256K — much larger than heap usage per step
-static View    st_views[ST_TABLE_SIZE];
-static u64     st_keys[ST_TABLE_SIZE]; // 0 = empty
+static ShapeTracker st_trackers[ST_TABLE_SIZE];
+static u64          st_keys[ST_TABLE_SIZE]; // 0 = empty
 
-static inline void st_set(u64 heap_loc, const View *v) {
-    u64 key = heap_loc + 1; // +1 so 0 means empty
-    u32 idx = (u32)(heap_loc % ST_TABLE_SIZE);
-    for (u32 p = 0; p < 16; p++) { // linear probing, max 16 steps
-        u32 i = (idx + p) % ST_TABLE_SIZE;
-        if (st_keys[i] == 0 || st_keys[i] == key) {
-            st_views[i] = *v;
-            st_keys[i] = key;
-            return;
-        }
-    }
-    // Fallback: overwrite first slot (collision eviction)
-    st_views[idx] = *v;
-    st_keys[idx] = key;
-}
-
-static inline const View *st_get(u64 heap_loc) {
+// Store a ShapeTracker for a heap location.
+static inline void st_set_tracker(u64 heap_loc, const ShapeTracker *st) {
     u64 key = heap_loc + 1;
     u32 idx = (u32)(heap_loc % ST_TABLE_SIZE);
     for (u32 p = 0; p < 16; p++) {
         u32 i = (idx + p) % ST_TABLE_SIZE;
-        if (st_keys[i] == key) return &st_views[i];
+        if (st_keys[i] == 0 || st_keys[i] == key) {
+            st_trackers[i] = *st;
+            st_keys[i] = key;
+            return;
+        }
+    }
+    st_trackers[idx] = *st;
+    st_keys[idx] = key;
+}
+
+// Store a single View as a 1-view ShapeTracker (convenience).
+static inline void st_set(u64 heap_loc, const View *v) {
+    ShapeTracker st = { .n_views = 1 };
+    st.views[0] = *v;
+    st_set_tracker(heap_loc, &st);
+}
+
+// Get the full ShapeTracker for a heap location.
+static inline const ShapeTracker *st_get_tracker(u64 heap_loc) {
+    u64 key = heap_loc + 1;
+    u32 idx = (u32)(heap_loc % ST_TABLE_SIZE);
+    for (u32 p = 0; p < 16; p++) {
+        u32 i = (idx + p) % ST_TABLE_SIZE;
+        if (st_keys[i] == key) return &st_trackers[i];
         if (st_keys[i] == 0) return NULL;
     }
     return NULL;
+}
+
+// Get the output View (last view in the ShapeTracker) — backward compat.
+static inline const View *st_get(u64 heap_loc) {
+    const ShapeTracker *st = st_get_tracker(heap_loc);
+    if (!st || st->n_views == 0) return NULL;
+    return &st->views[st->n_views - 1];
 }
 
 // ============================================================

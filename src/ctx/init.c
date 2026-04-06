@@ -237,9 +237,19 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
             if (bf && uop == UOP_RESHAPE) {
                 Shape ns = {.rank = bn}; u32 nn = 1;
                 for (u32 i = 0; i < bn; i++) { ns.dims[i] = (u32)bf[i]; nn *= ns.dims[i]; }
-                if (va && nn == va->numel) out = view_reshape(*va, ns);
-                else out = view_create(ns);
-                st_set(loc, &out); stored = 1;
+                // Use ShapeTracker composition: merges if possible, pushes new view if not
+                const ShapeTracker *input_st = st_get_tracker(term_val(a));
+                if (input_st && va && nn == va->numel) {
+                    ShapeTracker composed = st_reshape(*input_st, ns);
+                    st_set_tracker(loc, &composed);
+                } else if (va && nn == va->numel) {
+                    ShapeTracker composed = st_reshape(st_from_view(*va), ns);
+                    st_set_tracker(loc, &composed);
+                } else {
+                    out = view_create(ns);
+                    st_set(loc, &out);
+                }
+                stored = 1;
             } else if (bf && uop == UOP_EXPAND) {
                 if (va) {
                     out = *va; out.shape.rank = bn; out.numel = 1;
@@ -383,30 +393,9 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
         // view_reshape drops the mask, causing wrong data downstream.
         if (m->view.has_mask) goto lazy;
         View rv = view_reshape(m->view, new_shape);
-        // view_reshape returns contiguous=0 in two cases:
-        // 1. Reshapable but non-contiguous (stride-0 dims) — strides are valid
-        // 2. Not reshapable — strides are placeholder, needs materialization
-        // Check: if any stride-0 dim in source has no corresponding stride-0
-        // in result, it's case 2 (not reshapable). Simple heuristic: if result
-        // has stride-0 dims or is contiguous, it's valid.
-        int valid = rv.contiguous;
-        if (!valid) {
-            // Check if view_reshape produced valid non-contiguous strides
-            // (stride-0 dims properly propagated). If any non-trivial dim
-            // has stride 0, it's a valid expanded view alias.
-            int has_stride0 = 0;
-            for (u32 d = 0; d < new_shape.rank; d++)
-                if (new_shape.dims[d] > 1 && rv.strides[d] == 0) has_stride0 = 1;
-            // If source had stride-0 and result has stride-0, the merge-split
-            // algorithm succeeded. If source had stride-0 but result has none,
-            // it's the fallback (not reshapable).
-            int src_has_stride0 = 0;
-            for (u32 d = 0; d < m->view.shape.rank; d++)
-                if (m->view.shape.dims[d] > 1 && m->view.strides[d] == 0) src_has_stride0 = 1;
-            if (src_has_stride0 && has_stride0) valid = 1;
-            if (!src_has_stride0 && !has_stride0) valid = 0; // permuted, needs materialize
-        }
-        if (!valid) goto lazy;
+        // view_reshape returns numel=0 when merge fails → go to lazy path
+        // (lazy path uses ShapeTracker composition which pushes a new view)
+        if (rv.numel == 0) goto lazy;
         // Reshape is valid as a view alias — same buffer, computed strides
         u32 id = ctx->tensor_count++;
         ctx->tensors[id] = *m; ctx->tensors[id].creator_loc = 0;

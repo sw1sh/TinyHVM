@@ -103,6 +103,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 Shape ns = {.rank = rank};
                 for (u32 j = 0; j < rank; j++) ns.dims[j] = (u32)rf[j];
                 View nv = view_reshape(*base, ns);
+                if (nv.numel == 0) return -1; // can't merge — fail this walk
                 fuse_composed_views[leaf_idx] = nv;
                 leaf_views[leaf_idx] = &fuse_composed_views[leaf_idx];
             }
@@ -335,15 +336,11 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 return (int)(WALK_LEAF_BASE + new_idx2);
             }
             nv = view_reshape(*base, ns);
-            if (!nv.contiguous && !base->contiguous) {
-                i32 exp = 1; int dense = 1;
-                for (int d = (int)rank - 1; d >= 0; d--) {
-                    if (ns.dims[d] > 1 && nv.strides[d] != exp) { dense = 0; break; }
-                    exp *= (i32)ns.dims[d];
-                }
-                // Only keep base view when ranks match: rank change means the fallback
-                // natural strides always look "dense", but the base has the wrong rank.
-                if (dense && base->shape.rank == (u32)rank) nv = *base;
+            if (nv.numel == 0) {
+                // Can't merge — use st_get view (ShapeTracker already composed correctly)
+                const View *sv = st_get(term_val(t));
+                if (!sv) return -1;
+                nv = *sv;
             }
         } else if (uop == UOP_SHRINK) {
             u32 ndim = rank / 2;

@@ -486,9 +486,9 @@
                         } else {
                             new_view = view_reshape(ma->view, ns);
                         }
-                        // Materialize only for failed reshapes (invalid strides).
-                        int needs_materialize = 0;
-                        if (!same_shape && !new_view.contiguous) {
+                        // view_reshape returns numel=0 when merge fails → materialize
+                        int needs_materialize = (new_view.numel == 0);
+                        if (!needs_materialize && !same_shape && !new_view.contiguous) {
                             int looks_contiguous = 1;
                             i32 exp_st = 1;
                             for (int d2 = (int)ns.rank - 1; d2 >= 0; d2--) {

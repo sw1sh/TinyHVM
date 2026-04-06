@@ -78,14 +78,30 @@
                     u32 lid = ke->leaf_ids[i];
                     if (lid == 0 || (lid & 0x80000000u)) {
                         // Placeholder (0) or lazy leaf (bit 31 set).
-                        // Reduce the original leaf term — inner UOP_FUSING fires first.
+                        // Try reducing the leaf term — FUSING leaves fire and return TAG_TEN.
                         Term lt = ke->leaf_terms[i];
                         Term lr = thvm_reduce(ctx, lt);
-                        if (term_tag(lr) == TAG_TEN) lid = (u32)term_val(lr);
+                        if (term_tag(lr) == TAG_TEN) { lid = (u32)term_val(lr); }
                         else {
-                            // Still unresolved — fatal
-                            fprintf(stderr, "FUSING: leaf %u unresolved after reduce (tag=%u)\n", i, term_tag(lr));
-                            RETURN_REDUCED(term_era());
+                            // WNF compute op: the scheduler replaced the TAG_TOP with FUSING
+                            // on the heap but leaf_terms holds the stale TAG_TOP.
+                            // Scan heap for the FUSING that replaced this TAG_TOP.
+                            for (u64 _sh = 1; _sh < ctx->heap_pos; _sh++) {
+                                Term _ht = ctx->heap[_sh];
+                                if (term_tag(_ht) == TAG_TOP && term_ext(_ht) == UOP_FUSING) {
+                                    extern KernelEntry sched_kernels[];
+                                    Term _kid_t = heap_read(ctx, term_val(_ht) + 1);
+                                    u32 _kid = (u32)term_val(_kid_t);
+                                    if (_kid < sched_kernel_count && sched_kernels[_kid].original_term == lt) {
+                                        lr = thvm_reduce(ctx, _ht);
+                                        if (term_tag(lr) == TAG_TEN) { lid = (u32)term_val(lr); break; }
+                                    }
+                                }
+                            }
+                            if (!(lid && lid != (lid | 0x80000000u))) {
+                                fprintf(stderr, "FUSING: leaf %u unresolved (tag=%u)\n", i, term_tag(lr));
+                                RETURN_REDUCED(term_era());
+                            }
                         }
                     }
                     ENSURE(ctx, lid);

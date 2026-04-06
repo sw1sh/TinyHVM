@@ -91,13 +91,12 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         tag == TAG_LAM || tag == TAG_SUP || tag == TAG_BRI ||
         tag == TAG_MAT || tag == TAG_ANY || tag == TAG_USP) { whnf = next; goto apply; }
 
-    // TAG_TOP: compute ops are WNF. Movement ops fire (create view aliases).
-    // Only ASSIGN, GRAD, IFZ, LOG_PRINT, TODEVICE, WHERE, FUSING fire too.
+    // TAG_TOP: ALL compute and movement ops are WNF. Nothing fires eagerly.
+    // Only ASSIGN, GRAD, IFZ, LOG_PRINT, TODEVICE, WHERE, FUSING fire.
+    // Movement ops are resolved by the scheduler in Phase 2.
     if (tag == TAG_TOP) {
         u32 _uop = term_ext(next);
-        int _is_movement = (_uop >= UOP_RESHAPE && _uop <= UOP_PAD);
-        if (!_is_movement &&
-            _uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
+        if (_uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
             _uop != UOP_LOG_PRINT && _uop != UOP_TODEVICE && _uop != UOP_WHERE &&
             _uop != UOP_FUSING) {
             whnf = next; goto apply;

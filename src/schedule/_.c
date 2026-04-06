@@ -52,6 +52,7 @@ static u32 sched_all(TinyHVM *ctx) {
             if (uop == UOP_GRAD)   continue;
             if (uop == UOP_FUSING) continue; // already scheduled; arg0=ERA is intentional
             // View ops: resolve to TAG_TEN alias when input is TAG_TEN.
+            // TAG_TOP input: stay as TAG_TOP — fuser walks through via st_get.
             if (is_view_op(uop)) {
                 u64 vloc = term_val(ht);
                 Term vinput = heap_read(ctx, vloc);
@@ -154,29 +155,48 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     sched_kernel_count = 0;
     for (u32 i = 0; i < SCHED_MAX_KERNELS; i++) kid_results[i] = term_era();
 
-    // Phase 1: Pure IC reduce — GRAD fires, compute ops stay TAG_TOP (WNF)
+    // Phase 1: Pure IC reduce — GRAD fires, compute/movement ops stay TAG_TOP (WNF).
+    // Binary backward (BG) puts one branch on the heap as a pending GRAD term.
+    // Scan and reduce pending GRADs until no more appear.
     t = thvm_reduce(ctx, t);
+    for (u32 _gi = 0; _gi < 100; _gi++) {
+        int found = 0;
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            Term ht = ctx->heap[h];
+            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD) {
+                ctx->heap[h] = thvm_reduce(ctx, ht);
+                found = 1;
+            }
+        }
+        if (!found) break;
+    }
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }
 
-    // Phase 2: Pure rewrite — convert all TAG_TOP compute ops to UOP_FUSING specs.
-    // FUSING leaves are allowed: phase 3 resolves them bottom-up recursively.
-    sched_all(ctx);
-    if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after sched: "); sched_dump_heap(ctx); }
+    // Iterate Phase 2 + Phase 3 until all ASSIGNs are resolved.
+    // Phase 2: schedule compute ops → FUSING, resolve view ops → TAG_TEN aliases.
+    // Phase 3: dispatch FUSINGs → TAG_TEN, fire ASSIGNs.
+    // Iteration needed because: dispatch produces TAG_TEN, enabling view resolution,
+    // which enables ASSIGN firing. Each pass makes progress.
+    for (u32 _ei = 0; _ei < 20; _ei++) {
+        sched_all(ctx);
+        if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after sched[%u]: ", _ei); sched_dump_heap(ctx); }
 
-    // Flush GPU before phase 3 so forward buffers are committed.
-    // pool_reset with keep=tensor_count recycles old buffers without losing live ones.
-    { Backend *be = ctx_default_backend(ctx);
-      if (be && be->end_batch) be->end_batch(); }
+        { Backend *be = ctx_default_backend(ctx);
+          if (be && be->end_batch) be->end_batch(); }
 
-    // Phase 3: Fire ASSIGNs — trampoline reduces src chain, fires FUSING → GPU → TAG_TEN.
-    for (u64 h = 1; h < ctx->heap_pos; h++) {
-        Term ht = ctx->heap[h];
-        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
-            Term r = thvm_reduce(ctx, ht);
-            ctx->heap[h] = r;
+        int n_assigned = 0;
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            Term ht = ctx->heap[h];
+            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
+                Term r = thvm_reduce(ctx, ht);
+                ctx->heap[h] = r;
+                if (term_tag(r) != TAG_TOP || term_ext(r) != UOP_ASSIGN)
+                    n_assigned++;
+            }
         }
+        if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after assign[%u]: ", _ei); sched_dump_heap(ctx); }
+        if (n_assigned == 0) break;
     }
-    if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after assign: "); sched_dump_heap(ctx); }
 
     return term_era();
 }

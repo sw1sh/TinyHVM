@@ -1,42 +1,3 @@
-            // Non-destructive view chain resolver: creates TAG_TEN aliases
-            // WITHOUT modifying the original heap. Used by GRAD to get correct
-            // composed views for forward chain terms that are TAG_TOP view ops.
-            // Prevents the trampoline from eagerly firing forward view ops
-            // (which corrupts shared heap state when backward also references them).
-            #define RESOLVE_VIEW(t_) ({ \
-                Term _rv = (t_); \
-                if (term_tag(_rv) == TAG_DP0 || term_tag(_rv) == TAG_DP1) \
-                    _rv = heap_read(ctx, term_val(_rv)); \
-                if (term_tag(_rv) == TAG_TOP) { \
-                    u32 _ruop = term_ext(_rv); \
-                    if (_ruop >= UOP_RESHAPE && _ruop <= UOP_PAD) { \
-                        u64 _rloc = term_val(_rv); \
-                        Term _rinput = heap_read(ctx, _rloc); \
-                        if (term_tag(_rinput) == TAG_DP0 || term_tag(_rinput) == TAG_DP1) \
-                            _rinput = heap_read(ctx, term_val(_rinput)); \
-                        /* Recursively resolve up to 5 view ops deep */ \
-                        for (int _rd = 0; _rd < 5 && term_tag(_rinput) == TAG_TOP; _rd++) { \
-                            u32 _riuop = term_ext(_rinput); \
-                            if (_riuop < UOP_RESHAPE || _riuop > UOP_PAD) break; \
-                            u64 _riloc = term_val(_rinput); \
-                            _rinput = heap_read(ctx, _riloc); \
-                            if (term_tag(_rinput) == TAG_DP0 || term_tag(_rinput) == TAG_DP1) \
-                                _rinput = heap_read(ctx, term_val(_rinput)); \
-                        } \
-                        if (term_tag(_rinput) == TAG_TEN) { \
-                            u32 _rsrc = (u32)term_val(_rinput); \
-                            const View *_rsv = st_get(_rloc); \
-                            if (_rsv) { \
-                                u32 _rvid = tensor_view_of(ctx, _rsrc, *_rsv); \
-                                ctx->tensors[_rvid].creator_op = _ruop; \
-                                ctx->tensors[_rvid].src_ids[0] = _rsrc; \
-                                _rv = term_ten(_rvid, ctx->tensors[_rsrc].dtype); \
-                            } \
-                        } \
-                    } \
-                } \
-                _rv; })
-
             if (uop == UOP_GRAD) {
                 // Disable rewrite fusion during backward: let deferred chains grow
                 // longer. Without this, rewrite_apply materializes each backward
@@ -92,8 +53,8 @@
                     static u32 _gc = 0; _gc++; if (_gc <= 100 && getenv("THVM_SCHED_DIAG")) fprintf(stderr, "GRAD_TOP[%u]: uop=%s\n", _gc, term_ext(y)<UOP_COUNT?uop_names[term_ext(y)]:"?");
                     u32 cop = term_ext(y);
                     u64 y_loc = term_val(y);
-                    Term at = RESOLVE_VIEW(heap_read(ctx, y_loc));
-                    Term bt = RESOLVE_VIEW(heap_read(ctx, y_loc + 1));
+                    Term at = heap_read(ctx, y_loc);
+                    Term bt = heap_read(ctx, y_loc + 1);
                     const View *yv = st_get(y_loc);
                     Shape y_shape = yv ? yv->shape : SHAPE(1);
                     Shape a_shape = SHAPE(1), b_shape = SHAPE(1);
@@ -115,19 +76,14 @@
                           if (_gv) st_set(_l, _gv); } \
                         term_new(TAG_TOP, UOP_GRAD, _l); })
                     // Chain gradients: SUP wraps both. DUP then evaluates each.
-                    // Using APP(APP(LAM(ERA), grad_a), grad_b) to force both evaluations.
-                    // Simpler: return ADD(grad_a, grad_b). ADD is compute TAG_TOP (WNF).
-                    // But with lazy TAG_TOPs, ADD never fires. Need something that fires.
-                    // Use thvm_app with nested APP: APP(APP(id, grad_a), grad_b) where id = LAM(VAR(0)).
-                    // Actually: just run grad_a, then grad_b, via GRAD_STEP loop.
-                    // Both branches of a binary op backward: fire _ga eagerly (creates
-                    // ASSIGN side effects on the heap), then GRAD_STEP _gb inline.
-                    // Compute ops are always WNF so we can't use ADD to chain both.
-                    // GRAD_STEP is a goto — can't call it twice in sequence.
-                    // Fire _ga via real thvm_reduce call (returns), then GRAD_STEP _gb.
+                    // Binary backward: both branches must fire (side-effect ASSIGNs).
+                    // _gb continues inline via GRAD_STEP (trampoline follows it).
+                    // _ga is placed on the heap as a pending GRAD term.
+                    // thvm_eval's Phase 1 scan finds and reduces pending GRADs.
                     #define BG(da_,db_) do { \
                         Term _ga=GRAD3_H(at,da_,x), _gb=GRAD3_H(bt,db_,x); \
-                        thvm_reduce(ctx, _ga); \
+                        u64 _ph = heap_alloc(ctx, 1); \
+                        heap_set(ctx, _ph, _ga); \
                         GRAD_STEP(_gb); \
                     } while(0)
                     #define UG(da_) do { Term _u=GRAD3_H(at,da_,x); if(term_tag(_u)==TAG_TOP) GRAD_STEP(_u); GRAD_RETURN(_u); } while(0)

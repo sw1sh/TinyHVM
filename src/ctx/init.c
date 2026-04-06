@@ -251,43 +251,69 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
                 }
                 stored = 1;
             } else if (bf && uop == UOP_EXPAND) {
-                if (va) {
-                    out = *va; out.shape.rank = bn; out.numel = 1;
-                    for (u32 i = 0; i < bn; i++) {
-                        u32 nd = (u32)bf[i];
-                        if (i < va->shape.rank && va->shape.dims[i] == 1 && nd > 1) out.strides[i] = 0;
-                        out.shape.dims[i] = nd; out.numel *= nd;
-                    }
-                    out.contiguous = 0;
+                // Compose expand onto input's ShapeTracker
+                const ShapeTracker *input_st = st_get_tracker(term_val(a));
+                if (input_st && va) {
+                    ShapeTracker composed = st_expand(*input_st, bf, bn);
+                    st_set_tracker(loc, &composed);
+                } else if (va) {
+                    ShapeTracker composed = st_expand(st_from_view(*va), bf, bn);
+                    st_set_tracker(loc, &composed);
                 } else {
                     Shape ns = {.rank = bn};
                     for (u32 i = 0; i < bn; i++) ns.dims[i] = (u32)bf[i];
                     out = view_create(ns);
+                    st_set(loc, &out);
                 }
-                st_set(loc, &out); stored = 1;
+                stored = 1;
             } else if (bf && uop == UOP_SHRINK) {
+                // Compose shrink onto input's ShapeTracker
                 u32 ndim = bn / 2;
-                Shape ns = {.rank = ndim}; u32 nn = 1;
-                for (u32 i = 0; i < ndim; i++) { ns.dims[i] = (u32)bf[i*2+1] - (u32)bf[i*2]; nn *= ns.dims[i]; }
-                out = view_create(ns);
-                st_set(loc, &out); stored = 1;
-            } else if (bf && uop == UOP_PAD && va) {
-                u32 ndim = bn / 2;
-                out = *va;
-                for (u32 i = 0; i < ndim; i++)
-                    out.shape.dims[i] += (u32)bf[i*2] + (u32)bf[i*2+1];
-                out.numel = 1;
-                for (u32 i = 0; i < out.shape.rank; i++) out.numel *= out.shape.dims[i];
-                out = view_create(out.shape);
-                st_set(loc, &out); stored = 1;
-            } else if (bf && uop == UOP_PERMUTE && va) {
-                out = (View){0}; out.offset = va->offset; out.shape.rank = bn; out.numel = va->numel;
-                for (u32 i = 0; i < bn; i++) {
-                    out.shape.dims[i] = va->shape.dims[(u32)bf[i]];
-                    out.strides[i] = va->strides[(u32)bf[i]];
+                u32 starts[MAX_DIM], ends[MAX_DIM];
+                for (u32 i = 0; i < ndim; i++) { starts[i] = (u32)bf[i*2]; ends[i] = (u32)bf[i*2+1]; }
+                const ShapeTracker *input_st = st_get_tracker(term_val(a));
+                if (input_st && va) {
+                    ShapeTracker composed = st_shrink(*input_st, starts, ends, ndim);
+                    st_set_tracker(loc, &composed);
+                } else {
+                    Shape ns = {.rank = ndim}; u32 nn = 1;
+                    for (u32 i = 0; i < ndim; i++) { ns.dims[i] = ends[i] - starts[i]; nn *= ns.dims[i]; }
+                    out = view_create(ns);
+                    st_set(loc, &out);
                 }
-                out.contiguous = 0;
-                st_set(loc, &out); stored = 1;
+                stored = 1;
+            } else if (bf && uop == UOP_PAD) {
+                // Compose pad onto input's ShapeTracker
+                u32 ndim = bn / 2;
+                u32 pb[MAX_DIM], pa[MAX_DIM];
+                for (u32 i = 0; i < ndim; i++) { pb[i] = (u32)bf[i*2]; pa[i] = (u32)bf[i*2+1]; }
+                const ShapeTracker *input_st = st_get_tracker(term_val(a));
+                if (input_st && va) {
+                    ShapeTracker composed = st_pad(*input_st, pb, pa);
+                    st_set_tracker(loc, &composed);
+                } else if (va) {
+                    ShapeTracker composed = st_pad(st_from_view(*va), pb, pa);
+                    st_set_tracker(loc, &composed);
+                } else {
+                    Shape ns = {.rank = ndim};
+                    for (u32 i = 0; i < ndim; i++) ns.dims[i] = (va ? va->shape.dims[i] : 0) + pb[i] + pa[i];
+                    out = view_create(ns);
+                    st_set(loc, &out);
+                }
+                stored = 1;
+            } else if (bf && uop == UOP_PERMUTE && va) {
+                // Compose permute onto input's ShapeTracker
+                u32 axes[MAX_DIM];
+                for (u32 i = 0; i < bn; i++) axes[i] = (u32)bf[i];
+                const ShapeTracker *input_st = st_get_tracker(term_val(a));
+                if (input_st) {
+                    ShapeTracker composed = st_permute(*input_st, axes, bn);
+                    st_set_tracker(loc, &composed);
+                } else {
+                    ShapeTracker composed = st_permute(st_from_view(*va), axes, bn);
+                    st_set_tracker(loc, &composed);
+                }
+                stored = 1;
             } else if ((uop == UOP_SUM || uop == UOP_RMAX)) {
                 if (bf) {
                 if (!va) goto skip_sum;
@@ -413,14 +439,8 @@ lazy:;
     { f32 dims[MAX_DIM];
     for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (f32)new_shape.dims[i];
     Term shape_t = thvm_tensor(ctx, dims, SHAPE(new_shape.rank));
-    Term r = thvm_op(ctx, UOP_RESHAPE, t, shape_t);
-    // thvm_op already called st_set with composed strides (if input view available).
-    // Only override if no view was stored (va was NULL inside thvm_op).
-    if (!st_get(term_val(r))) {
-        View ov = view_create(new_shape);
-        st_set(term_val(r), &ov);
-    }
-    return r; }
+    // thvm_op composes ShapeTracker via st_reshape — always succeeds.
+    return thvm_op(ctx, UOP_RESHAPE, t, shape_t); }
 }
 
 Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {

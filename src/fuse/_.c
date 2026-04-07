@@ -213,6 +213,24 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 can_walk = (di_uop == UOP_FUSING || is_elementwise(di_uop) || is_view_op(di_uop));
             }
         }
+        // Rank-changing RESHAPE: boundary. The composition path handles
+        // same-rank reshapes via st_reshape; cross-rank needs boundary
+        // to avoid mixing coordinate spaces in one kernel.
+        if (can_walk && uop == UOP_RESHAPE) {
+            Term rarg = heap_read(ctx, loc + 1);
+            if (term_tag(rarg) == TAG_DP0 || term_tag(rarg) == TAG_DP1)
+                rarg = heap_read(ctx, term_val(rarg));
+            if (term_tag(rarg) == TAG_TEN) {
+                u32 target_rank = ctx->tensors[(u32)term_val(rarg)].view.numel;
+                Term vi_check = view_input;
+                if (term_tag(vi_check) == TAG_DP0 || term_tag(vi_check) == TAG_DP1)
+                    vi_check = heap_read(ctx, term_val(vi_check));
+                const View *inner_v = (term_tag(vi_check) == TAG_TOP)
+                    ? st_get(term_val(vi_check)) : NULL;
+                if (inner_v && target_rank != inner_v->shape.rank)
+                    can_walk = 0;
+            }
+        }
         if (!can_walk) {
             // Non-ew, non-view TAG_TOP (e.g. SUM): lazy leaf boundary
             const View *sv = st_get(loc);
@@ -320,59 +338,62 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                   return (int)(WALK_LEAF_BASE + idx);
                 }
             }
-            // EXPAND/SHRINK/PAD: compose view onto all leaves added by inner walk.
-            // EXPAND(ew_chain) = ew_chain with each leaf broadcast to expanded coords.
+            // EXPAND/SHRINK/PAD: compose onto each leaf's ShapeTracker.
+            // On failure, fall back to boundary (undo walk, create lazy leaf).
             if (uop == UOP_EXPAND || uop == UOP_SHRINK || uop == UOP_PAD) {
                 Term parg = heap_read(ctx, loc + 1);
                 if (term_tag(parg) == TAG_DP0 || term_tag(parg) == TAG_DP1)
                     parg = heap_read(ctx, term_val(parg));
-                if (term_tag(parg) != TAG_TEN) {
-                    if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  view_op_noten2: %s parg=tag%u\n", uop_names[uop], term_tag(parg));
-                    return -1;
-                }
+                if (term_tag(parg) != TAG_TEN) goto view_op_boundary;
                 TensorMeta *mp2 = &ctx->tensors[(u32)term_val(parg)];
                 u32 rank2 = mp2->view.numel;
-                if (rank2 > MAX_DIM) return -1;
+                if (rank2 > MAX_DIM) goto view_op_boundary;
                 f32 pf2[MAX_DIM];
                 const f32 *cached2 = (const f32 *)mp2->host_ptr;
                 if (cached2) memcpy(pf2, cached2, rank2 * sizeof(f32));
                 else META_READ(mp2->backend, mp2->buf_id, pf2, rank2 * sizeof(f32));
+                int compose_ok2 = 1;
                 for (u32 li = leaves_before; li < *n_leaves; li++) {
                     const View *base2 = leaf_views[li];
-                    if (!base2) return -1;
-                    View nv2 = {0};
+                    if (!base2) { compose_ok2 = 0; break; }
                     if (uop == UOP_EXPAND) {
-                        nv2 = (View){0};
-                        nv2.shape.rank = rank2; nv2.numel = 1;
-                        nv2.offset = base2->offset;
-                        for (u32 j = 0; j < rank2; j++) {
-                            u32 nd = (u32)pf2[j];
-                            if (j < base2->shape.rank) {
-                                nv2.strides[j] = (base2->shape.dims[j] == 1 && nd > 1)
-                                    ? 0 : base2->strides[j];
-                            } else {
-                                nv2.strides[j] = 0; // beyond base rank: broadcast
-                            }
-                            nv2.shape.dims[j] = nd; nv2.numel *= nd;
-                        }
-                        nv2.contiguous = 0;
+                        // Rank mismatch check: if leaf rank != expand rank,
+                        // the dim mapping is ambiguous. Fall back.
+                        if (base2->shape.rank != rank2) { compose_ok2 = 0; break; }
+                        fuse_leaf_sts[li] = st_expand(fuse_leaf_sts[li], pf2, rank2);
                     } else if (uop == UOP_SHRINK) {
                         u32 ndim2 = rank2 / 2;
+                        if (ndim2 != base2->shape.rank) { compose_ok2 = 0; break; }
                         u32 s2[MAX_DIM], e2[MAX_DIM];
-                        for (u32 j = 0; j < ndim2 && j < MAX_DIM; j++) { s2[j]=(u32)pf2[j*2]; e2[j]=(u32)pf2[j*2+1]; }
-                        if (ndim2 != base2->shape.rank) return -1;
-                        nv2 = view_shrink(*base2, s2, e2);
-                        if (nv2.numel == 0) return -1;
+                        for (u32 j = 0; j < ndim2; j++) { s2[j]=(u32)pf2[j*2]; e2[j]=(u32)pf2[j*2+1]; }
+                        fuse_leaf_sts[li] = st_shrink(fuse_leaf_sts[li], s2, e2, ndim2);
                     } else { // PAD
                         u32 ndim2 = rank2 / 2;
                         u32 pb2[MAX_DIM], pa2[MAX_DIM];
-                        for (u32 j = 0; j < ndim2 && j < MAX_DIM; j++) { pb2[j]=(u32)pf2[j*2]; pa2[j]=(u32)pf2[j*2+1]; }
-                        nv2 = view_pad(*base2, pb2, pa2);
+                        for (u32 j = 0; j < ndim2; j++) { pb2[j]=(u32)pf2[j*2]; pa2[j]=(u32)pf2[j*2+1]; }
+                        fuse_leaf_sts[li] = st_pad(fuse_leaf_sts[li], pb2, pa2);
                     }
-                    fuse_composed_views[li] = nv2;
+                    // Update leaf view to outermost for broadcast checking
+                    fuse_composed_views[li] = fuse_leaf_sts[li].views[fuse_leaf_sts[li].n_views - 1];
                     leaf_views[li] = &fuse_composed_views[li];
                 }
-                return inner; // pass OP through with composed leaf views
+                if (compose_ok2) return inner;
+                // Fall back to boundary
+                view_op_boundary:
+                *n_leaves = leaves_before;
+                *n_ops = ops_before;
+                fuse_n_absorbed = absorbed_before;
+                { const View *sv = st_get(loc);
+                  if (!sv) return -1;
+                  if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
+                  u32 idx = (*n_leaves)++;
+                  leaf_ids[idx] = (u32)(term_val(view_input) | 0x80000000u);
+                  fuse_composed_views[idx] = *sv;
+                  leaf_views[idx] = &fuse_composed_views[idx];
+                  fuse_leaf_sts[idx] = st_from_view(*sv);
+                  fuse_leaf_terms[idx] = t;
+                  return (int)(WALK_LEAF_BASE + idx);
+                }
             }
             return -1;
         }
@@ -511,7 +532,31 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         u32 new_idx = (*n_leaves)++;
         leaf_ids[new_idx] = leaf_ids[leaf_idx];
         fuse_leaf_terms[new_idx] = fuse_leaf_terms[leaf_idx];
-        fuse_leaf_sts[new_idx] = fuse_leaf_sts[leaf_idx];
+        // Compose ST: apply the view op to the leaf's ShapeTracker
+        { ShapeTracker st_composed = fuse_leaf_sts[leaf_idx];
+          if (uop == UOP_RESHAPE) {
+            Shape ns2 = {.rank = rank};
+            for (u32 j = 0; j < rank; j++) ns2.dims[j] = (u32)pf[j];
+            st_composed = st_reshape(st_composed, ns2);
+          } else if (uop == UOP_PERMUTE) {
+            u32 axes[MAX_DIM];
+            for (u32 j = 0; j < rank; j++) axes[j] = (u32)pf[j];
+            st_composed = st_permute(st_composed, axes, rank);
+          } else if (uop == UOP_EXPAND) {
+            st_composed = st_expand(st_composed, pf, rank);
+          } else if (uop == UOP_SHRINK) {
+            u32 ndim = rank / 2;
+            u32 s3[MAX_DIM], e3[MAX_DIM];
+            for (u32 j = 0; j < ndim; j++) { s3[j]=(u32)pf[j*2]; e3[j]=(u32)pf[j*2+1]; }
+            st_composed = st_shrink(st_composed, s3, e3, ndim);
+          } else if (uop == UOP_PAD) {
+            u32 ndim = rank / 2;
+            u32 pb3[MAX_DIM], pa3[MAX_DIM];
+            for (u32 j = 0; j < ndim; j++) { pb3[j]=(u32)pf[j*2]; pa3[j]=(u32)pf[j*2+1]; }
+            st_composed = st_pad(st_composed, pb3, pa3);
+          }
+          fuse_leaf_sts[new_idx] = st_composed;
+        }
         fuse_composed_views[new_idx] = nv;
         leaf_views[new_idx] = &fuse_composed_views[new_idx];
         return (int)(WALK_LEAF_BASE + new_idx);

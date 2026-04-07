@@ -214,9 +214,6 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             }
         }
         // Rank-changing RESHAPE wrapping ew/view ops: boundary.
-        // Walking through would create 8D leaves from inner walk but sibling
-        // branches produce 4D leaves → rank mismatch at broadcast check.
-        // Only block OP-result case; leaf-result (TAG_TEN inner) is fine.
         if (can_walk && uop == UOP_RESHAPE) {
             Term vi_check = view_input;
             if (term_tag(vi_check) == TAG_DP0 || term_tag(vi_check) == TAG_DP1)
@@ -740,20 +737,67 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
         if (!ew_init) { ew_view = *leaf_views_p[i]; ew_init = 1; continue; }
         View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
         if (!view_broadcast(&ew_view, leaf_views_p[i], &av_bc, &bv_bc, bc_shape, &bc_ndim)) {
-            ke->fail_code = 6;
-            if (getenv("THVM_SCHED_DIAG")) {
-                fprintf(stderr, "  bc_fail: n_leaves=%u i=%u lid%u=%u lid%u=%u ew_shape=[", n_leaves, i, i-1, leaf_ids[i-1], i, leaf_ids[i]);
-                for (u32 _d = 0; _d < ew_view.shape.rank; _d++) fprintf(stderr, "%u,", ew_view.shape.dims[_d]);
-                fprintf(stderr, "] leaf_shape=[");
-                for (u32 _d = 0; _d < leaf_views_p[i]->shape.rank; _d++) fprintf(stderr, "%u,", leaf_views_p[i]->shape.dims[_d]);
-                fprintf(stderr, "]\n");
-                for (u32 _li = 0; _li < n_leaves; _li++) {
-                    fprintf(stderr, "    leaf[%u]: id=%u shape=[", _li, leaf_ids[_li]);
-                    for (u32 _d = 0; _d < leaf_views_p[_li]->shape.rank; _d++) fprintf(stderr, "%u,", leaf_views_p[_li]->shape.dims[_d]);
-                    fprintf(stderr, "]\n");
+            // Rank mismatch: lift lower-rank leaves to higher rank via st_reshape
+            int lifted = 0;
+            if (ew_view.shape.rank != leaf_views_p[i]->shape.rank) {
+                const Shape *hi_s = (ew_view.shape.rank > leaf_views_p[i]->shape.rank)
+                    ? &ew_view.shape : &leaf_views_p[i]->shape;
+                Shape squeezed = {.rank = 0};
+                for (u32 d = 0; d < hi_s->rank; d++)
+                    if (hi_s->dims[d] > 1) squeezed.dims[squeezed.rank++] = hi_s->dims[d];
+                if (squeezed.rank == 0) { squeezed.rank = 1; squeezed.dims[0] = 1; }
+                if (leaf_views_p[i]->shape.rank < ew_view.shape.rank) {
+                    Shape lift;
+                    if (fuse_leaf_reshape_target(squeezed, *hi_s, leaf_views_p[i]->shape, &lift)) {
+                        u32 tn = 1;
+                        for (u32 d = 0; d < lift.rank; d++) tn *= lift.dims[d];
+                        if (tn == leaf_views_p[i]->numel) {
+                            fuse_leaf_sts[i] = st_reshape(fuse_leaf_sts[i], lift);
+                            fuse_composed_views[i] = fuse_leaf_sts[i].views[fuse_leaf_sts[i].n_views - 1];
+                            leaf_views_p[i] = &fuse_composed_views[i];
+                            if (view_broadcast(&ew_view, leaf_views_p[i], &av_bc, &bv_bc, bc_shape, &bc_ndim))
+                                lifted = 1;
+                        }
+                    }
+                } else {
+                    int all_ok = 1;
+                    for (u32 li = 0; li < i; li++) {
+                        if (!leaf_used[li]) continue;
+                        if (leaf_views_p[li]->shape.rank == hi_s->rank) continue;
+                        Shape ls;
+                        if (!fuse_leaf_reshape_target(squeezed, *hi_s, leaf_views_p[li]->shape, &ls))
+                            { all_ok = 0; break; }
+                        u32 tn = 1;
+                        for (u32 d = 0; d < ls.rank; d++) tn *= ls.dims[d];
+                        if (tn != leaf_views_p[li]->numel) { all_ok = 0; break; }
+                        fuse_leaf_sts[li] = st_reshape(fuse_leaf_sts[li], ls);
+                        fuse_composed_views[li] = fuse_leaf_sts[li].views[fuse_leaf_sts[li].n_views - 1];
+                        leaf_views_p[li] = &fuse_composed_views[li];
+                    }
+                    if (all_ok) {
+                        ew_view = (View){0}; ew_init = 0;
+                        for (u32 li = 0; li <= i; li++) {
+                            if (!leaf_used[li]) continue;
+                            if (!ew_init) { ew_view = *leaf_views_p[li]; ew_init = 1; continue; }
+                            if (!view_broadcast(&ew_view, leaf_views_p[li], &av_bc, &bv_bc, bc_shape, &bc_ndim))
+                                { all_ok = 0; break; }
+                            ew_view = view_create(shape_of(bc_shape, bc_ndim));
+                        }
+                        if (all_ok) lifted = 1;
+                    }
                 }
             }
-            return 0;
+            if (!lifted) {
+                ke->fail_code = 6;
+                if (getenv("THVM_SCHED_DIAG")) {
+                    fprintf(stderr, "  bc_fail: n_leaves=%u i=%u ew=[", n_leaves, i);
+                    for (u32 _d = 0; _d < ew_view.shape.rank; _d++) fprintf(stderr, "%u,", ew_view.shape.dims[_d]);
+                    fprintf(stderr, "] leaf=[");
+                    for (u32 _d = 0; _d < leaf_views_p[i]->shape.rank; _d++) fprintf(stderr, "%u,", leaf_views_p[i]->shape.dims[_d]);
+                    fprintf(stderr, "]\n");
+                }
+                return 0;
+            }
         }
         ew_view = view_create(shape_of(bc_shape, bc_ndim));
     }

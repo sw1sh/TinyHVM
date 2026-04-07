@@ -403,6 +403,22 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         u32 leaf_idx = inner - WALK_LEAF_BASE;
         const View *base = leaf_views[leaf_idx];
         if (!base) return -1;
+        // Fast path: use pre-built ShapeTracker from shape table.
+        // Composed at creation time (ctx/init.c) — handles all view ops
+        // including rank-changing RESHAPEs, masks, compound views.
+        { const ShapeTracker *pre_st = st_get_tracker(loc);
+          if (pre_st && pre_st->n_views > 0) {
+            if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
+            u32 new_idx = (*n_leaves)++;
+            leaf_ids[new_idx] = leaf_ids[leaf_idx];
+            fuse_leaf_terms[new_idx] = fuse_leaf_terms[leaf_idx];
+            fuse_leaf_sts[new_idx] = *pre_st;
+            fuse_composed_views[new_idx] = pre_st->views[pre_st->n_views - 1];
+            leaf_views[new_idx] = &fuse_composed_views[new_idx];
+            return (int)(WALK_LEAF_BASE + new_idx);
+          }
+        }
+        // Fallback: manual composition (when ST not in shape table)
         Term arg2 = heap_read(ctx, loc + 1);
         // Look through DUP references for shared shape params
         if (term_tag(arg2) == TAG_DP0 || term_tag(arg2) == TAG_DP1)

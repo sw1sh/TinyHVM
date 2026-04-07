@@ -208,10 +208,9 @@
                     st_ptrs[i] = &ke->leaf_sts[i];
                     if (ke->leaf_sts[i].n_views >= 2) has_multiview = 1;
                 }
-                (void)has_multiview; // TODO: enable once codegen verified
                 md->backend->dispatch_kernel_rs(
                     md->buf_id, bufs, views,
-                    NULL, ke->n_leaves,
+                    has_multiview ? st_ptrs : NULL, ke->n_leaves,
                     ke->ops, ke->n_ops, &ke->full_shape,
                     ke->has_reduce ? &ke->reduce : NULL,
                     NULL, NULL, 0);

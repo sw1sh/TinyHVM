@@ -5,6 +5,15 @@
 // If merge fails (view_reshape returns numel=0), pushes a new contiguous view.
 static ShapeTracker st_reshape(ShapeTracker st, Shape new_shape) {
     if (st.n_views == 0) return st_from_view(view_create(new_shape));
+    // Verify numel match before calling view_reshape (which asserts)
+    u32 old_numel = st.views[st.n_views - 1].numel;
+    u32 new_numel = 1;
+    for (u32 i = 0; i < new_shape.rank; i++) new_numel *= new_shape.dims[i];
+    if (old_numel != new_numel) {
+        // Numel mismatch — can't reshape. Return unchanged.
+        // Caller must handle (e.g., create a boundary in the fuser).
+        return st;
+    }
     View merged = view_reshape(st.views[st.n_views - 1], new_shape);
     if (merged.numel != 0) {
         st.views[st.n_views - 1] = merged;

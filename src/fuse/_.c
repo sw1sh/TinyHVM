@@ -40,6 +40,36 @@ static f32 _fuse_perm[MAX_DIM];
 static u32 _fuse_perm_rank = 0;
 static int _fuse_has_perm = 0;
 
+// Compute a broadcast leaf's target shape in a reshaped iteration space.
+// For each OP dim, consume RESHAPE dims until product matches, then:
+//   leaf_dim==1 → all consumed dims become 1 (broadcast)
+//   leaf_dim==op_dim → copy consumed dims from rs_shape
+static int fuse_leaf_reshape_target(Shape op_shape, Shape rs_shape,
+                                     Shape leaf_shape, Shape *out_shape) {
+    *out_shape = (Shape){.rank = rs_shape.rank};
+    u32 ri = 0;
+    for (u32 oi = 0; oi < op_shape.rank && ri < rs_shape.rank; oi++) {
+        u32 op_dim = op_shape.dims[oi];
+        u32 leaf_dim = (oi < leaf_shape.rank) ? leaf_shape.dims[oi] : 1;
+        u32 prod = 1, ri_start = ri;
+        while (ri < rs_shape.rank && prod < op_dim) { prod *= rs_shape.dims[ri]; ri++; }
+        if (prod != op_dim) return 0;
+        if (leaf_dim == 1)
+            for (u32 j = ri_start; j < ri; j++) out_shape->dims[j] = 1;
+        else if (leaf_dim == op_dim)
+            for (u32 j = ri_start; j < ri; j++) out_shape->dims[j] = rs_shape.dims[j];
+        else return 0;
+    }
+    while (ri < rs_shape.rank) { out_shape->dims[ri] = 1; ri++; }
+    // Verify output numel matches leaf numel
+    u32 out_numel = 1;
+    for (u32 d = 0; d < out_shape->rank; d++) out_numel *= out_shape->dims[d];
+    u32 leaf_numel = 1;
+    for (u32 d = 0; d < leaf_shape.rank; d++) leaf_numel *= leaf_shape.dims[d];
+    if (out_numel != leaf_numel) return 0;
+    return 1;
+}
+
 // ============================================================
 // fuse_walk_inner: recursive walk of lazy TAG_TOP tree
 // ============================================================
@@ -183,23 +213,6 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 can_walk = (di_uop == UOP_FUSING || is_elementwise(di_uop) || is_view_op(di_uop));
             }
         }
-        // Rank-changing RESHAPE wrapping an ew chain: boundary.
-        // Prevents mixing 4D/6D/8D leaves in one kernel.
-        if (can_walk && uop == UOP_RESHAPE) {
-            Term rarg = heap_read(ctx, loc + 1);
-            if (term_tag(rarg) == TAG_DP0 || term_tag(rarg) == TAG_DP1)
-                rarg = heap_read(ctx, term_val(rarg));
-            if (term_tag(rarg) == TAG_TEN) {
-                u32 target_rank = ctx->tensors[(u32)term_val(rarg)].view.numel;
-                Term vi_check = view_input;
-                if (term_tag(vi_check) == TAG_DP0 || term_tag(vi_check) == TAG_DP1)
-                    vi_check = heap_read(ctx, term_val(vi_check));
-                const View *inner_v = (term_tag(vi_check) == TAG_TOP)
-                    ? st_get(term_val(vi_check)) : NULL;
-                if (inner_v && target_rank != inner_v->shape.rank)
-                    can_walk = 0;
-            }
-        }
         if (!can_walk) {
             // Non-ew, non-view TAG_TOP (e.g. SUM): lazy leaf boundary
             const View *sv = st_get(loc);
@@ -215,6 +228,8 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             return (int)(WALK_LEAF_BASE + idx);
         }
         u32 leaves_before = *n_leaves;
+        u32 ops_before = *n_ops;
+        u32 absorbed_before = fuse_n_absorbed;
         int inner = fuse_walk_inner(ctx, view_input, ops, n_ops, leaf_ids, leaf_views, n_leaves);
         if (inner < 0) {
             if (getenv("THVM_SCHED_DIAG"))
@@ -241,7 +256,70 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                     fprintf(stderr, "  perm_op_noten: parg=tag%u/%s\n", term_tag(parg),
                             term_tag(parg)==TAG_TOP?uop_names[term_ext(parg)]:"");
             }
-            if (uop == UOP_RESHAPE) return inner; // transparent for computation
+            if (uop == UOP_RESHAPE) {
+                // Compose RESHAPE onto each leaf's ShapeTracker.
+                // On failure, fall back to boundary (undo walk, create lazy leaf).
+                Term rarg2 = heap_read(ctx, loc + 1);
+                if (term_tag(rarg2) == TAG_DP0 || term_tag(rarg2) == TAG_DP1)
+                    rarg2 = heap_read(ctx, term_val(rarg2));
+                int compose_ok = 0;
+                if (term_tag(rarg2) == TAG_TEN) {
+                    TensorMeta *rmp2 = &ctx->tensors[(u32)term_val(rarg2)];
+                    u32 rrank2 = rmp2->view.numel;
+                    if (rrank2 <= MAX_DIM) {
+                        f32 rf2[MAX_DIM];
+                        const f32 *rc2 = (const f32 *)rmp2->host_ptr;
+                        if (rc2) memcpy(rf2, rc2, rrank2 * sizeof(f32));
+                        else META_READ(rmp2->backend, rmp2->buf_id, rf2, rrank2 * sizeof(f32));
+                        Shape rs_shape = {.rank = rrank2};
+                        for (u32 j = 0; j < rrank2; j++) rs_shape.dims[j] = (u32)rf2[j];
+                        Term vi_rs = view_input;
+                        if (term_tag(vi_rs) == TAG_DP0 || term_tag(vi_rs) == TAG_DP1)
+                            vi_rs = heap_read(ctx, term_val(vi_rs));
+                        const View *op_v = (term_tag(vi_rs) == TAG_TOP)
+                            ? st_get(term_val(vi_rs)) : NULL;
+                        u32 rs_numel = 1;
+                        for (u32 j = 0; j < rrank2; j++) rs_numel *= rs_shape.dims[j];
+                        if (op_v && rs_numel == op_v->numel) {
+                            compose_ok = 1;
+                            for (u32 li = leaves_before; li < *n_leaves; li++) {
+                                const View *lv = leaf_views[li];
+                                if (!lv) { compose_ok = 0; break; }
+                                Shape leaf_target;
+                                if (lv->numel == op_v->numel)
+                                    leaf_target = rs_shape;
+                                else if (!fuse_leaf_reshape_target(op_v->shape, rs_shape,
+                                            lv->shape, &leaf_target))
+                                    { compose_ok = 0; break; }
+                                // Verify numel
+                                u32 tn = 1;
+                                for (u32 d = 0; d < leaf_target.rank; d++) tn *= leaf_target.dims[d];
+                                if (tn != lv->numel) { compose_ok = 0; break; }
+                                fuse_leaf_sts[li] = st_reshape(fuse_leaf_sts[li], leaf_target);
+                                fuse_composed_views[li] = fuse_leaf_sts[li].views[fuse_leaf_sts[li].n_views - 1];
+                                leaf_views[li] = &fuse_composed_views[li];
+                            }
+                        }
+                    }
+                }
+                if (compose_ok) return inner;
+                // Composition failed — fall back to boundary.
+                // Undo inner walk: restore leaves, ops, and absorbed.
+                *n_leaves = leaves_before;
+                *n_ops = ops_before;
+                fuse_n_absorbed = absorbed_before;
+                { const View *sv = st_get(loc);
+                  if (!sv) return -1;
+                  if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
+                  u32 idx = (*n_leaves)++;
+                  leaf_ids[idx] = (u32)(term_val(view_input) | 0x80000000u);
+                  fuse_composed_views[idx] = *sv;
+                  leaf_views[idx] = &fuse_composed_views[idx];
+                  fuse_leaf_sts[idx] = st_from_view(*sv);
+                  fuse_leaf_terms[idx] = t;
+                  return (int)(WALK_LEAF_BASE + idx);
+                }
+            }
             // EXPAND/SHRINK/PAD: compose view onto all leaves added by inner walk.
             // EXPAND(ew_chain) = ew_chain with each leaf broadcast to expanded coords.
             if (uop == UOP_EXPAND || uop == UOP_SHRINK || uop == UOP_PAD) {

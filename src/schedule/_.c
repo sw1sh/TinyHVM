@@ -221,13 +221,12 @@ static Term sched_one(TinyHVM *ctx, Term ht, u64 h) {
     ctx->heap[h] = ft;
     for (u64 ph = 1; ph < ctx->heap_pos; ph++)
         if (ph != h && ctx->heap[ph] == ht) ctx->heap[ph] = ft;
-    // Record absorbed ew ops (for pass 2 skip — see sched_is_absorbed).
-    // With RESHAPE boundaries, absorbed terms may be referenced by other kernels'
-    // lazy leaves. Disable absorption to allow pass 2 to schedule them independently.
-    // The extra dispatch is wasteful but correct.
-    // extern Term fuse_absorbed[];
-    // extern u32 fuse_n_absorbed;
-    // (absorption disabled — pass 2 will schedule all remaining ops)
+    // Record absorbed ew ops (pass 2 skips them via sched_is_absorbed).
+    extern Term fuse_absorbed[];
+    extern u32 fuse_n_absorbed;
+    for (u32 ai = 0; ai < fuse_n_absorbed; ai++)
+        if (sched_n_absorbed < ABSORBED_MAX)
+            sched_absorbed_terms[sched_n_absorbed++] = fuse_absorbed[ai];
     return ft;
 }
 
@@ -323,7 +322,7 @@ static u32 sched_all(TinyHVM *ctx) {
         if (!is_reduce_root) continue;
         sched_one(ctx, ht, h);
     }
-    // Pass 2: remaining compute ops
+    // Pass 2: remaining compute ops (skip absorbed — they're fused into reduce kernels)
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) != TAG_TOP) continue;
@@ -331,6 +330,38 @@ static u32 sched_all(TinyHVM *ctx) {
         if (is_view_op(uop) || uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_FUSING) continue;
         if (sched_is_absorbed(ht)) continue;
         sched_one(ctx, ht, h);
+    }
+
+    // Pass 3: schedule absorbed ops that are needed by lazy leaves.
+    // RESHAPE boundaries create lazy leaves that may reference ops absorbed
+    // by another kernel. Scan all FUSING kernels' lazy leaves and schedule
+    // any remaining TAG_TOP ops independently (ignoring absorption).
+    for (u32 ki = 0; ki < sched_kernel_count; ki++) {
+        KernelEntry *kk = &sched_kernels[ki];
+        for (u32 li = 0; li < kk->n_leaves; li++) {
+            if (!(kk->leaf_ids[li] == 0 || (kk->leaf_ids[li] & 0x80000000u))) continue;
+            // Walk through view chain to find inner term
+            Term lt = kk->leaf_terms[li];
+            Term inner = lt;
+            while (term_tag(inner) == TAG_TOP && is_view_op(term_ext(inner))) {
+                Term nx = heap_read(ctx, term_val(inner));
+                if (term_tag(nx) == TAG_DP0 || term_tag(nx) == TAG_DP1)
+                    nx = heap_read(ctx, term_val(nx));
+                inner = nx;
+            }
+            // If inner is still an unscheduled TAG_TOP, schedule it now
+            if (term_tag(inner) == TAG_TOP && term_ext(inner) != UOP_FUSING &&
+                !is_view_op(term_ext(inner)) && term_ext(inner) != UOP_ASSIGN &&
+                term_ext(inner) != UOP_GRAD) {
+                // Find its heap position
+                for (u64 h = 1; h < ctx->heap_pos; h++) {
+                    if (ctx->heap[h] == inner) {
+                        sched_one(ctx, inner, h);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fuse_no_lazy_resolve = 0;

@@ -213,22 +213,25 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 can_walk = (di_uop == UOP_FUSING || is_elementwise(di_uop) || is_view_op(di_uop));
             }
         }
-        // Rank-changing RESHAPE: boundary. The composition path handles
-        // same-rank reshapes via st_reshape; cross-rank needs boundary
-        // to avoid mixing coordinate spaces in one kernel.
+        // Rank-changing RESHAPE wrapping ew/view ops: boundary.
+        // Walking through would create 8D leaves from inner walk but sibling
+        // branches produce 4D leaves → rank mismatch at broadcast check.
+        // Only block OP-result case; leaf-result (TAG_TEN inner) is fine.
         if (can_walk && uop == UOP_RESHAPE) {
-            Term rarg = heap_read(ctx, loc + 1);
-            if (term_tag(rarg) == TAG_DP0 || term_tag(rarg) == TAG_DP1)
-                rarg = heap_read(ctx, term_val(rarg));
-            if (term_tag(rarg) == TAG_TEN) {
-                u32 target_rank = ctx->tensors[(u32)term_val(rarg)].view.numel;
-                Term vi_check = view_input;
-                if (term_tag(vi_check) == TAG_DP0 || term_tag(vi_check) == TAG_DP1)
-                    vi_check = heap_read(ctx, term_val(vi_check));
-                const View *inner_v = (term_tag(vi_check) == TAG_TOP)
-                    ? st_get(term_val(vi_check)) : NULL;
-                if (inner_v && target_rank != inner_v->shape.rank)
-                    can_walk = 0;
+            Term vi_check = view_input;
+            if (term_tag(vi_check) == TAG_DP0 || term_tag(vi_check) == TAG_DP1)
+                vi_check = heap_read(ctx, term_val(vi_check));
+            if (term_tag(vi_check) == TAG_TOP &&
+                (is_elementwise(term_ext(vi_check)) || is_view_op(term_ext(vi_check)))) {
+                Term rarg = heap_read(ctx, loc + 1);
+                if (term_tag(rarg) == TAG_DP0 || term_tag(rarg) == TAG_DP1)
+                    rarg = heap_read(ctx, term_val(rarg));
+                if (term_tag(rarg) == TAG_TEN) {
+                    u32 target_rank = ctx->tensors[(u32)term_val(rarg)].view.numel;
+                    const View *inner_v = st_get(term_val(vi_check));
+                    if (inner_v && target_rank != inner_v->shape.rank)
+                        can_walk = 0;
+                }
             }
         }
         if (!can_walk) {
@@ -452,9 +455,27 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             u32 new_numel = 1;
             for (u32 j = 0; j < rank; j++) new_numel *= ns.dims[j];
             if (new_numel != base->numel) {
-                // Pool window view: overlapping windows expand the apparent element count.
-                // The st_set view (with correct pool strides) IS the right view to use.
-                // Fall back to st_get(loc) as the leaf view, inheriting the inner leaf's ID.
+                // Broadcast leaf through rank-changing reshape: try fuse_leaf_reshape_target
+                // to compute the leaf's target shape in the new coordinate space.
+                Term vi_rs = view_input;
+                if (term_tag(vi_rs) == TAG_DP0 || term_tag(vi_rs) == TAG_DP1)
+                    vi_rs = heap_read(ctx, term_val(vi_rs));
+                const View *op_v = (term_tag(vi_rs) == TAG_TOP)
+                    ? st_get(term_val(vi_rs)) : NULL;
+                if (!op_v && term_tag(vi_rs) == TAG_TEN)
+                    op_v = &ctx->tensors[(u32)term_val(vi_rs)].view;
+                if (op_v && new_numel == op_v->numel) {
+                    Shape leaf_target;
+                    if (fuse_leaf_reshape_target(op_v->shape, ns, base->shape, &leaf_target)) {
+                        u32 tn = 1;
+                        for (u32 d = 0; d < leaf_target.rank; d++) tn *= leaf_target.dims[d];
+                        if (tn == base->numel) {
+                            nv = view_reshape(*base, leaf_target);
+                            if (nv.numel != 0) goto reshape_leaf_done;
+                        }
+                    }
+                }
+                // Fall back to boundary: pool window or unmappable reshape.
                 const View *sv = st_get(term_val(t));
                 if (!sv) {
                     if (getenv("THVM_SCHED_DIAG"))
@@ -463,13 +484,14 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 }
                 if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
                 u32 new_idx2 = (*n_leaves)++;
-                leaf_ids[new_idx2] = leaf_ids[leaf_idx]; // inherit (0 = FUSING placeholder)
+                leaf_ids[new_idx2] = leaf_ids[leaf_idx];
                 fuse_composed_views[new_idx2] = *sv;
                 leaf_views[new_idx2] = &fuse_composed_views[new_idx2];
                 fuse_leaf_terms[new_idx2] = fuse_leaf_terms[leaf_idx];
                 fuse_leaf_sts[new_idx2] = st_from_view(*sv);
                 return (int)(WALK_LEAF_BASE + new_idx2);
             }
+            reshape_leaf_done:
             nv = view_reshape(*base, ns);
             if (nv.numel == 0) {
                 // Can't merge — use st_get view (ShapeTracker already composed correctly)

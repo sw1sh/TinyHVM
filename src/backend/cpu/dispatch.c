@@ -20,7 +20,8 @@ static inline f32 eval_uop(u32 uop, f32 a, f32 b) {
 }
 
 // Read a single element via multi-view ShapeTracker.
-// Port of Metal codegen Path D: unravel right-to-left through view stack.
+// Handles rank-changing reshapes: computes flat index through outer shape,
+// then decomposes through inner shape to apply inner strides.
 static inline f32 leaf_read_st(const f32 *buf, const ShapeTracker *st,
                                 const u32 *coords, u32 rank,
                                 const Shape *full_shape) {
@@ -33,26 +34,47 @@ static inline f32 leaf_read_st(const f32 *buf, const ShapeTracker *st,
         stride *= full_shape->dims[d];
       }
     }
-    // Step 2: for each view from n-2 down to 0, unravel si through
-    // views[vi+1].shape, apply views[vi] strides (matching Metal exactly)
+    // Step 2: for each view pair, convert flat index through reshape
     for (i32 vi = (i32)st->n_views - 2; vi >= 0; vi--) {
         const View *vw = &st->views[vi];
         const View *outer = &st->views[vi + 1];
-        i32 idx = vw->offset;
-        u32 udiv = 1;
-        int masked = 0;
-        for (i32 d = (i32)outer->shape.rank - 1; d >= 0; d--) {
+        // Pass 1: extract flat index in outer's contiguous space from si.
+        // For broadcast dims (outer dim=1), coordinate is 0 (no contribution).
+        u32 outer_flat = 0;
+        { u32 udiv = 1;
+          u32 ostrides[MAX_DIM];
+          if (outer->shape.rank > 0) {
+            ostrides[outer->shape.rank - 1] = 1;
+            for (i32 d = (i32)outer->shape.rank - 2; d >= 0; d--)
+                ostrides[d] = ostrides[d + 1] * outer->shape.dims[d + 1];
+          }
+          for (i32 d = (i32)outer->shape.rank - 1; d >= 0; d--) {
             u32 dim = outer->shape.dims[d];
             if (dim <= 1) { udiv *= dim; continue; }
             u32 c = (si / udiv) % dim;
-            // Mask check on vw
-            if (vw->has_mask && (u32)d < vw->shape.rank) {
-                if (c < vw->mask_begin[d] || c >= vw->mask_end[d])
-                    { masked = 1; break; }
-            }
-            if ((u32)d < vw->shape.rank && vw->strides[d] != 0)
-                idx += (i32)c * vw->strides[d];
+            outer_flat += c * ostrides[d];
             udiv *= dim;
+          }
+        }
+        // Pass 2: decompose outer_flat through inner (vw) shape, apply strides.
+        // The flat index is preserved across reshape (same numel).
+        i32 idx = vw->offset;
+        int masked = 0;
+        { u32 rem = outer_flat;
+          u32 istrides[MAX_DIM];
+          if (vw->shape.rank > 0) {
+            istrides[vw->shape.rank - 1] = 1;
+            for (i32 d = (i32)vw->shape.rank - 2; d >= 0; d--)
+                istrides[d] = istrides[d + 1] * vw->shape.dims[d + 1];
+          }
+          for (u32 d = 0; d < vw->shape.rank; d++) {
+            u32 c = rem / istrides[d];
+            rem %= istrides[d];
+            if (vw->has_mask && (c < vw->mask_begin[d] || c >= vw->mask_end[d]))
+                { masked = 1; break; }
+            if (vw->strides[d] != 0)
+                idx += (i32)c * vw->strides[d];
+          }
         }
         if (masked) return 0.f;
         if (idx < 0) return 0.f;

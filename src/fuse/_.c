@@ -181,6 +181,23 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 can_walk = (di_uop == UOP_FUSING || is_elementwise(di_uop) || is_view_op(di_uop));
             }
         }
+        // Rank-changing RESHAPE wrapping an ew chain: boundary.
+        // Prevents mixing 4D/6D/8D leaves in one kernel.
+        if (can_walk && uop == UOP_RESHAPE) {
+            Term rarg = heap_read(ctx, loc + 1);
+            if (term_tag(rarg) == TAG_DP0 || term_tag(rarg) == TAG_DP1)
+                rarg = heap_read(ctx, term_val(rarg));
+            if (term_tag(rarg) == TAG_TEN) {
+                u32 target_rank = ctx->tensors[(u32)term_val(rarg)].view.numel;
+                Term vi_check = view_input;
+                if (term_tag(vi_check) == TAG_DP0 || term_tag(vi_check) == TAG_DP1)
+                    vi_check = heap_read(ctx, term_val(vi_check));
+                const View *inner_v = (term_tag(vi_check) == TAG_TOP)
+                    ? st_get(term_val(vi_check)) : NULL;
+                if (inner_v && target_rank != inner_v->shape.rank)
+                    can_walk = 0;
+            }
+        }
         if (!can_walk) {
             // Non-ew, non-view TAG_TOP (e.g. SUM): lazy leaf boundary
             const View *sv = st_get(loc);
@@ -244,11 +261,17 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                     if (!base2) return -1;
                     View nv2 = {0};
                     if (uop == UOP_EXPAND) {
-                        nv2 = *base2; nv2.shape.rank = rank2; nv2.numel = 1;
+                        nv2 = (View){0};
+                        nv2.shape.rank = rank2; nv2.numel = 1;
+                        nv2.offset = base2->offset;
                         for (u32 j = 0; j < rank2; j++) {
                             u32 nd = (u32)pf2[j];
-                            if (j < base2->shape.rank && base2->shape.dims[j] == 1 && nd > 1)
-                                nv2.strides[j] = 0;
+                            if (j < base2->shape.rank) {
+                                nv2.strides[j] = (base2->shape.dims[j] == 1 && nd > 1)
+                                    ? 0 : base2->strides[j];
+                            } else {
+                                nv2.strides[j] = 0; // beyond base rank: broadcast
+                            }
                             nv2.shape.dims[j] = nd; nv2.numel *= nd;
                         }
                         nv2.contiguous = 0;

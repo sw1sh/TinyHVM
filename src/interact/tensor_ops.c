@@ -142,8 +142,56 @@
                                     }
                                 }
                             }
+                            // View chain: leaf is RESHAPE/EXPAND/etc wrapping a compute op.
+                            // Walk through view ops, dispatch inner FUSING, create view aliases.
+                            if (!(lid && lid != (lid | 0x80000000u)) &&
+                                term_tag(lr) == TAG_TOP && is_view_op(term_ext(lr))) {
+                                Term _inner = lr;
+                                u64 _vlocs[16]; u32 _vn = 0;
+                                while (term_tag(_inner) == TAG_TOP && _vn < 16) {
+                                    u32 _vu = term_ext(_inner);
+                                    if (!is_view_op(_vu)) break;
+                                    _vlocs[_vn++] = term_val(_inner);
+                                    Term _next = heap_read(ctx, term_val(_inner));
+                                    if (term_tag(_next) == TAG_DP0 || term_tag(_next) == TAG_DP1)
+                                        _next = heap_read(ctx, term_val(_next));
+                                    _inner = _next;
+                                }
+                                // Try to dispatch the inner term
+                                Term _ir = thvm_reduce(ctx, _inner);
+                                if (term_tag(_ir) != TAG_TEN) {
+                                    // Scan heap for FUSING that replaced inner
+                                    for (u64 _sh2 = 1; _sh2 < ctx->heap_pos; _sh2++) {
+                                        Term _ht2 = ctx->heap[_sh2];
+                                        if (term_tag(_ht2) == TAG_TOP && term_ext(_ht2) == UOP_FUSING) {
+                                            Term _kid_t2 = heap_read(ctx, term_val(_ht2) + 1);
+                                            u32 _kid2 = (u32)term_val(_kid_t2);
+                                            if (_kid2 < sched_kernel_count && sched_kernels[_kid2].original_term == _inner) {
+                                                _ir = thvm_reduce(ctx, _ht2);
+                                                if (term_tag(_ir) == TAG_TEN) break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (term_tag(_ir) == TAG_TEN) {
+                                    // Resolve view chain bottom-up
+                                    u32 _tid = (u32)term_val(_ir);
+                                    for (int _vi = (int)_vn - 1; _vi >= 0; _vi--) {
+                                        const View *_sv = st_get(_vlocs[_vi]);
+                                        if (_sv) {
+                                            u32 _nvid = tensor_view_of(ctx, _tid, *_sv);
+                                            _tid = _nvid;
+                                        }
+                                    }
+                                    lid = _tid;
+                                }
+                            }
                             if (!(lid && lid != (lid | 0x80000000u))) {
-                                fprintf(stderr, "FUSING: leaf %u unresolved (tag=%u)\n", i, term_tag(lr));
+                                fprintf(stderr, "FUSING: leaf %u unresolved (tag=%u ext=%u lt_tag=%u lt_ext=%u)\n",
+                                    i, term_tag(lr),
+                                    term_tag(lr)==TAG_TOP ? term_ext(lr) : 0,
+                                    term_tag(lt),
+                                    term_tag(lt)==TAG_TOP ? term_ext(lt) : 0);
                                 RETURN_REDUCED(term_era());
                             }
                         }

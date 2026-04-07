@@ -27,7 +27,7 @@ static void test(const char *dev){
     f32*gw1=calloc(wn,4);Term gw=thvm_tensor(ctx,gw1,(Shape){.dims={Cout,Cin,K,K},.rank=4});free(gw1);
     f32*gw2d=calloc(wn2,4);Term gw2=thvm_tensor(ctx,gw2d,(Shape){.dims={Cout,Cout,K,K},.rank=4});free(gw2d);
     Term grad=thvm_grad_multi(ctx,loss,(Term[]){w,w2},(Term[]){gw,gw2},2);
-    thvm_reduce(ctx,grad);
+    thvm_eval(ctx,grad);
     f32*dw=thvm_to_host(ctx,gw);f32*dw2=thvm_to_host(ctx,gw2);
     double n1=0,n2=0;for(u32 i=0;i<wn;i++)n1+=dw[i]*dw[i];for(u32 i=0;i<wn2;i++)n2+=dw2[i]*dw2[i];
     printf("%-6s: w1=%.2f w2=%.2f\n",dev,sqrt(n1),sqrt(n2));

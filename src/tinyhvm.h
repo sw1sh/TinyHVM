@@ -505,6 +505,7 @@ typedef struct {
     FusedOp    ops[FUSE_MAX_OPS]; u32 n_ops;
     u32        leaf_ids[FUSE_MAX_LEAVES];
     View       leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves;
+    ShapeTracker leaf_sts[FUSE_MAX_LEAVES]; // multi-view STs for cross-rank indexing
     Shape      full_shape;       // ew iteration domain
     Shape      out_shape;        // output shape (after reduce)
     ReduceSpec reduce;
@@ -613,7 +614,8 @@ struct Backend {
 
     // Advanced dispatch (optional — NULL means unsupported, fall back to CPU)
     void  (*dispatch_kernel_rs)(u32 out_buf,
-                                u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+                                u32 *leaf_bufs, const View **leaf_views,
+                                const ShapeTracker *const *leaf_sts, u32 n_leaves,
                                 FusedOp *ops, u32 n_ops,
                                 const Shape *full_shape, const ReduceSpec *reduce,
                                 u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs);

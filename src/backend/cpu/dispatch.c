@@ -19,6 +19,48 @@ static inline f32 eval_uop(u32 uop, f32 a, f32 b) {
     }
 }
 
+// Read a single element via multi-view ShapeTracker.
+// Port of Metal codegen Path D: unravel right-to-left through view stack.
+static inline f32 leaf_read_st(const f32 *buf, const ShapeTracker *st,
+                                const u32 *coords, u32 rank,
+                                const Shape *full_shape) {
+    if (!st || st->n_views <= 1) return 0.f;
+    // Step 1: compute flat index from kernel coords in full_shape space
+    u32 si = 0;
+    { u32 stride = 1;
+      for (i32 d = (i32)rank - 1; d >= 0; d--) {
+        si += coords[d] * stride;
+        stride *= full_shape->dims[d];
+      }
+    }
+    // Step 2: for each view from n-2 down to 0, unravel si through
+    // views[vi+1].shape, apply views[vi] strides (matching Metal exactly)
+    for (i32 vi = (i32)st->n_views - 2; vi >= 0; vi--) {
+        const View *vw = &st->views[vi];
+        const View *outer = &st->views[vi + 1];
+        i32 idx = vw->offset;
+        u32 udiv = 1;
+        int masked = 0;
+        for (i32 d = (i32)outer->shape.rank - 1; d >= 0; d--) {
+            u32 dim = outer->shape.dims[d];
+            if (dim <= 1) { udiv *= dim; continue; }
+            u32 c = (si / udiv) % dim;
+            // Mask check on vw
+            if (vw->has_mask && (u32)d < vw->shape.rank) {
+                if (c < vw->mask_begin[d] || c >= vw->mask_end[d])
+                    { masked = 1; break; }
+            }
+            if ((u32)d < vw->shape.rank && vw->strides[d] != 0)
+                idx += (i32)c * vw->strides[d];
+            udiv *= dim;
+        }
+        if (masked) return 0.f;
+        if (idx < 0) return 0.f;
+        si = (u32)idx;
+    }
+    return buf[si];
+}
+
 // Read a single element from a leaf buffer using its view.
 // coords[] are in the full_shape coordinate space.
 static inline f32 leaf_read(const f32 *buf, const View *v,
@@ -52,7 +94,8 @@ static inline f32 leaf_read(const f32 *buf, const View *v,
 }
 
 void cpu_dispatch_kernel_rs(
-    u32 out_buf, u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+    u32 out_buf, u32 *leaf_bufs, const View **leaf_views,
+    const ShapeTracker *const *leaf_sts, u32 n_leaves,
     FusedOp *ops, u32 n_ops, const Shape *full_shape, const ReduceSpec *reduce,
     u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs)
 {
@@ -107,9 +150,13 @@ void cpu_dispatch_kernel_rs(
             rem %= full_strides[d];
         }
 
-        // Read leaf values
-        for (u32 i = 0; i < n_leaves; i++)
-            vals[i] = leaf_read(leaf_ptrs[i], leaf_views[i], coords, rank);
+        // Read leaf values (use multi-view ST when available)
+        for (u32 i = 0; i < n_leaves; i++) {
+            if (leaf_sts && leaf_sts[i] && leaf_sts[i]->n_views >= 2)
+                vals[i] = leaf_read_st(leaf_ptrs[i], leaf_sts[i], coords, rank, full_shape);
+            else
+                vals[i] = leaf_read(leaf_ptrs[i], leaf_views[i], coords, rank);
+        }
 
         // Evaluate FusedOp DAG
         for (u32 i = 0; i < n_ops; i++) {

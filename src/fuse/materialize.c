@@ -284,7 +284,7 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                     m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
                     u32 bufs[FUSE_MAX_LEAVES];
                     for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
-                    m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+                    m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, NULL, n_leaves,
                         ops, n_ops, &fs, &rs, n_sides?side_bufs:NULL, n_sides?side_ops:NULL, n_sides);
                     return;
                 }
@@ -446,7 +446,7 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                             m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
                             u32 bufs[FUSE_MAX_LEAVES];
                             for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
-                            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+                            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, NULL, n_leaves,
                                 ops, n_ops, &fs, &rs,
                                 n_sides2 ? side_bufs2 : NULL, n_sides2 ? side_ops2 : NULL, n_sides2);
                             return;
@@ -473,7 +473,7 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                     for (int d=(int)fs.rank-1;d>=0;d--) if(fs.dims[d]>1){rs.is_reduce[d]=1;break;}
                 }
                 u32 bufs[]={ms->buf_id}; const View *views[]={&ms->view};
-                m->backend->dispatch_kernel_rs(m->buf_id, bufs, views, 1, NULL, 0, &fs, &rs, NULL, NULL, 0);
+                m->backend->dispatch_kernel_rs(m->buf_id, bufs, views, NULL, 1, NULL, 0, &fs, &rs, NULL, NULL, 0);
             }
             return;
         }
@@ -586,12 +586,12 @@ dispatch_chain:
                 for (int d = (int)full_shape.rank - 1; d >= 0; d--)
                     if (full_shape.dims[d] > 1) { rs.is_reduce[d] = 1; break; }
             }
-            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, NULL, n_leaves,
                                             ops, n_ops, &full_shape, &rs,
                                             n_sides ? side_bufs : NULL,
                                             n_sides ? side_ops : NULL, n_sides);
         } else {
-            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+            m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, NULL, n_leaves,
                                             ops, n_ops, &m->view.shape, NULL,
                                             side_bufs, side_ops, n_sides);
         }
@@ -708,7 +708,7 @@ static int tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf,
         for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
 
         Shape full_shape = im->view.shape;
-        im->backend->dispatch_kernel_rs(out_buf, bufs, leaf_views, n_leaves,
+        im->backend->dispatch_kernel_rs(out_buf, bufs, leaf_views, NULL, n_leaves,
                                          ops, n_ops, &full_shape, rs,
                                          n_sides ? side_bufs : NULL,
                                          n_sides ? side_ops : NULL, n_sides);
@@ -1025,7 +1025,7 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
     m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
     u32 bufs[FUSE_MAX_LEAVES];
     for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
-    m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, n_leaves,
+    m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, NULL, n_leaves,
         ops, n_ops, &fs, &rs, NULL, NULL, 0);
 
     // Mark intermediate deferred tensors as "materialized" by allocating

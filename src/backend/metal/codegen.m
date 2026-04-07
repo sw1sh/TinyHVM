@@ -843,15 +843,17 @@ static void metal_dispatch_kernel_rs_st(u32 out_buf,
     u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs);
 
 void metal_dispatch_kernel_rs(u32 out_buf,
-                               u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+                               u32 *leaf_bufs, const View **leaf_views,
+                               const ShapeTracker *const *leaf_sts, u32 n_leaves,
                                FusedOp *ops, u32 n_ops,
                                const Shape *full_shape,
                                const ReduceSpec *reduce,
                                u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs) {
-    // No ShapeTracker — delegate to the full version
-    const ShapeTracker *null_sts[FUSE_MAX_LEAVES];
-    memset(null_sts, 0, sizeof(null_sts));
-    metal_dispatch_kernel_rs_st(out_buf, leaf_bufs, leaf_views, null_sts, n_leaves,
+    // Delegate to the full version, using provided STs (or NULL)
+    const ShapeTracker *sts[FUSE_MAX_LEAVES];
+    if (leaf_sts) memcpy(sts, leaf_sts, n_leaves * sizeof(sts[0]));
+    else memset(sts, 0, sizeof(sts));
+    metal_dispatch_kernel_rs_st(out_buf, leaf_bufs, leaf_views, sts, n_leaves,
                                  ops, n_ops, full_shape, reduce,
                                  side_bufs, side_op_indices, n_side_outputs);
 }
@@ -1094,10 +1096,10 @@ void metal_dispatch_kernel(u32 out_buf,
                 if (prod == reduce_dim) break;
             }
         }
-        metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, n_leaves,
+        metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, NULL, n_leaves,
                                   ops, n_ops, &full, &rs, NULL, NULL, 0);
     } else {
-        metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, n_leaves,
+        metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, NULL, n_leaves,
                                   ops, n_ops, &full, NULL, NULL, NULL, 0);
     }
 }

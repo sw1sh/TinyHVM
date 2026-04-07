@@ -2,7 +2,8 @@
 
 // Forward declaration (defined in codegen.m, included after this file)
 void metal_dispatch_kernel_rs(u32 out_buf,
-                               u32 *leaf_bufs, const View **leaf_views, u32 n_leaves,
+                               u32 *leaf_bufs, const View **leaf_views,
+                               const ShapeTracker *const *leaf_sts, u32 n_leaves,
                                FusedOp *ops, u32 n_ops,
                                const Shape *full_shape,
                                const ReduceSpec *reduce,
@@ -223,7 +224,7 @@ void metal_dispatch_fused_rs(u32 out_buf,
                                FusedOp *ops, u32 n_ops,
                                const Shape *full_shape,
                                const ReduceSpec *reduce) {
-    metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, n_leaves,
+    metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, NULL, n_leaves,
                               ops, n_ops, full_shape, reduce, NULL, NULL, 0);
 }
 

@@ -201,8 +201,17 @@
                     views[i] = &ke->leaf_views[i];
                 }
 
+                // Build ST pointer array for multi-view leaves
+                const ShapeTracker *st_ptrs[FUSE_MAX_LEAVES];
+                int has_multiview = 0;
+                for (u32 i = 0; i < ke->n_leaves; i++) {
+                    st_ptrs[i] = &ke->leaf_sts[i];
+                    if (ke->leaf_sts[i].n_views >= 2) has_multiview = 1;
+                }
+                (void)has_multiview; // TODO: enable once codegen verified
                 md->backend->dispatch_kernel_rs(
-                    md->buf_id, bufs, views, ke->n_leaves,
+                    md->buf_id, bufs, views,
+                    NULL, ke->n_leaves,
                     ke->ops, ke->n_ops, &ke->full_shape,
                     ke->has_reduce ? &ke->reduce : NULL,
                     NULL, NULL, 0);

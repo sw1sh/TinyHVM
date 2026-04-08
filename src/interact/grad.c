@@ -19,7 +19,11 @@
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
                 Term x  = heap_read(ctx, loc + 2);
-                // x is guaranteed WNF by the trampoline's TAG_TOP2 phase.
+                // Resolve DP0/DP1 on y and x (from BG DUP)
+                for (int _dp = 0; _dp < 20 && (term_tag(y)==TAG_DP0||term_tag(y)==TAG_DP1); _dp++)
+                    y = heap_read(ctx, term_val(y));
+                for (int _dp = 0; _dp < 20 && (term_tag(x)==TAG_DP0||term_tag(x)==TAG_DP1); _dp++)
+                    x = heap_read(ctx, term_val(x));
 
                 // GRAD-SUP: gradient through superposition
                 // GRAD(&L{y0,y1}, gy, x) → &L{GRAD(y0, DP0_L(gy), DP0_L(x)), ...}
@@ -78,18 +82,21 @@
                     // Chain gradients: both branches must fire (side-effect ASSIGNs).
                     // DUP all shared terms (at, bt, gy, x) so each branch gets its own port.
                     // _gb continues inline, _ga is placed on heap for Phase 1 scan.
-                    // Binary gradient: both branches share at, bt, gy, x.
-                    // Only DUP gy (used in both da_expr and db_expr).
-                    // at/bt/x are NOT DUP'd: at goes to branch A (GRAD target),
-                    // bt goes to branch B (GRAD target), x goes to branch B.
-                    // Branch A's _ga is placed on heap; Branch B's _gb continues inline.
-                    #define BG(da_expr, db_expr) do { \
-                        Term _da = (da_expr); \
-                        Term _db = (db_expr); \
-                        Term _ga = GRAD3_H(at, _da, x); \
-                        Term _gb = GRAD3_H(bt, _db, x); \
-                        u64 _ph = heap_alloc(ctx, 1); \
-                        heap_set(ctx, _ph, _ga); \
+                    // Binary gradient: DUP all shared terms for proper IC structure.
+                    // Atoms (TEN, NUM, ERA, CTR) don't need DUP — copy is identity.
+                    #define _DUP(t,v0,v1) do { \
+                        u64 _d=heap_alloc(ctx,1); heap_set(ctx,_d,(t)); \
+                        v0=term_new(TAG_DP0,0,_d); v1=term_new(TAG_DP1,0,_d); \
+                    } while(0)
+                    #define BG(da_of_gy_bt, db_of_gy_at) do { \
+                        Term gy0,gy1; _DUP(gy,gy0,gy1); \
+                        Term at0,at1; _DUP(at,at0,at1); \
+                        Term bt0,bt1; _DUP(bt,bt0,bt1); \
+                        Term x0,x1;   _DUP(x,x0,x1); \
+                        Term _da; { Term gy=gy0,bt=bt0; (void)gy;(void)bt; _da=(da_of_gy_bt); } \
+                        Term _db; { Term gy=gy1,at=at1; (void)gy;(void)at; _db=(db_of_gy_at); } \
+                        Term _ga=GRAD3_H(at0,_da,x0), _gb=GRAD3_H(bt1,_db,x1); \
+                        u64 _ph=heap_alloc(ctx,1); heap_set(ctx,_ph,_ga); \
                         GRAD_STEP(_gb); \
                     } while(0)
                     #define UG(da_) do { Term _u=GRAD3_H(at,da_,x); if(term_tag(_u)==TAG_TOP) GRAD_STEP(_u); GRAD_RETURN(_u); } while(0)
@@ -162,9 +169,11 @@
                             Term p = heap_read(ctx, tgt_loc + 1 + 2*_gi);
                             if (term_tag(p) == TAG_TEN && (u32)term_val(p) == y_id) {
                                 Term slot = heap_read(ctx, tgt_loc + 1 + 2*_gi + 1);
-                                Term accum = thvm_op(ctx, UOP_ADD, slot, gy);
+                                // slot used by ADD and ASSIGN — DUP it
+                                Term slot0, slot1; _DUP(slot, slot0, slot1);
+                                Term accum = thvm_op(ctx, UOP_ADD, slot0, gy);
                                 u64 _ah = heap_alloc(ctx, 1);
-                                heap_set(ctx, _ah, thvm_assign(ctx, slot, accum));
+                                heap_set(ctx, _ah, thvm_assign(ctx, slot1, accum));
                                 if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  ASSIGN_CREATE: target=%u slot=%u\n", y_id, _gi);
                                 GRAD_RETURN(term_era());
                             }

@@ -515,9 +515,9 @@ static u32 sched_all(TinyHVM *ctx) {
     break; // just diagnostic for now
     }
 
-    // Pass 6: shared-input reduce merge.
-    // Find pairs of reduce kernels that share the same input (e.g., BN mean+var).
-    // Merge into multi-reduce: reduce1(input) + ew + reduce2(result1, input, ...).
+    // Pass 6: shared-input reduce merge (iterative).
+    for (u32 _mr_iter = 0; _mr_iter < 10; _mr_iter++) {
+    u32 n_mr = 0;
     for (u32 ki = 0; ki < sched_kernel_count; ki++) {
         KernelEntry *k1 = &sched_kernels[ki];
         if (!k1->has_reduce) continue;
@@ -573,9 +573,12 @@ static u32 sched_all(TinyHVM *ctx) {
             if (getenv("THVM_SCHED_DIAG"))
                 fprintf(stderr, "  multi_reduce_merge: k1=%u + k2=%u → ops=%u leaves=%u\n",
                         ki, kj, k1->n_ops, k1->n_leaves);
-            break; // one merge per k1
+            n_mr++;
+            break; // one merge per k1 per iteration
         }
     }
+    if (n_mr == 0) break;
+    } // end multi-reduce iteration
 
     fuse_no_lazy_resolve = 0;
     return total;

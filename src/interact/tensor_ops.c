@@ -111,8 +111,15 @@
                     RETURN_REDUCED(kid_results[kid]);
                 KernelEntry *ke = &sched_kernels[kid];
 
-                // Skip dead kernels (absorbed by merge passes)
+                // Dead kernel: redirect to absorber
                 if (ke->n_ops == 0 && ke->n_leaves == 0) {
+                    extern u32 sched_absorber[];
+                    u32 abs_kid = sched_absorber[kid];
+                    if (abs_kid < sched_kernel_count &&
+                        term_tag(kid_results[abs_kid]) != TAG_ERA) {
+                        kid_results[kid] = kid_results[abs_kid];
+                        RETURN_REDUCED(kid_results[abs_kid]);
+                    }
                     RETURN_REDUCED(term_era());
                 }
 

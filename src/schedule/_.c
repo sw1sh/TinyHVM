@@ -234,6 +234,41 @@ static Term sched_one(TinyHVM *ctx, Term ht, u64 h) {
 static u32 pre_merge_count = 0;
 static KernelEntry pre_merge_kernels_store[SCHED_MAX_KERNELS];
 
+// Kill a kernel and redirect its FUSING on the heap to another kernel's FUSING.
+// This ensures that other kernels' lazy leaves pointing to the dead FUSING
+// can still resolve during dispatch.
+static int sched_merge_active = 0; // when 1, heap redirects are applied
+u32 sched_absorber[SCHED_MAX_KERNELS]; // dead_ki → absorber_ki mapping
+
+static void sched_kill_kernel(TinyHVM *ctx, u32 dead_ki, u32 absorber_ki) {
+    sched_kernels[dead_ki].n_ops = 0;
+    sched_kernels[dead_ki].n_leaves = 0;
+    sched_kernels[dead_ki].has_reduce = 0;
+    sched_absorber[dead_ki] = absorber_ki; // record mapping for FUSING handler
+    if (!sched_merge_active) return; // skip heap redirect when merge is analysis-only
+    // Find the absorber's FUSING term on the heap (by scanning for its kid)
+    Term absorber_fusing = term_era();
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_FUSING) {
+            Term kid_t = heap_read(ctx, term_val(ht) + 1);
+            if (term_tag(kid_t) == TAG_NUM && (u32)term_val(kid_t) == absorber_ki) {
+                absorber_fusing = ht; break;
+            }
+        }
+    }
+    if (term_tag(absorber_fusing) == TAG_ERA) return;
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_FUSING) {
+            Term kid_t = heap_read(ctx, term_val(ht) + 1);
+            if (term_tag(kid_t) == TAG_NUM && (u32)term_val(kid_t) == dead_ki) {
+                ctx->heap[h] = absorber_fusing;
+            }
+        }
+    }
+}
+
 static u32 sched_all(TinyHVM *ctx) {
     u32 total = 0;
     fuse_no_lazy_resolve = 1;
@@ -367,10 +402,12 @@ static u32 sched_all(TinyHVM *ctx) {
         }
     }
 
-    // Merge passes modify sched_kernels for dispatch.
-    // Save pre-merge count for restore if Metal codegen can't handle merged kernels.
+    // Save pre-merge state. Merge passes modify sched_kernels.
+    // If THVM_MERGED_DISPATCH is set, also redirect heap for dispatch.
     pre_merge_count = sched_kernel_count;
     memcpy(pre_merge_kernels_store, sched_kernels, sched_kernel_count * sizeof(KernelEntry));
+    memset(sched_absorber, 0xFF, sizeof(sched_absorber)); // 0xFFFFFFFF = no absorber
+    sched_merge_active = !!getenv("THVM_MERGED_DISPATCH");
 
     // Pass 4: kernel merging — iteratively merge ew kernels with FUSING reduce leaves.
     // When an ew kernel has a FUSING leaf that points to a reduce kernel,
@@ -472,10 +509,10 @@ static u32 sched_all(TinyHVM *ctx) {
             merged.original_term = ew_ke->original_term;
             // Replace ew kernel with merged, mark reduce kernel as dead
             *ew_ke = merged;
-            r_ke->n_ops = 0; r_ke->n_leaves = 0; r_ke->has_reduce = 0; // dead
+            sched_kill_kernel(ctx, reduce_ki, ew_ki);
             if (getenv("THVM_SCHED_DIAG"))
-                fprintf(stderr, "  kernel_merge: ew=%u + reduce=%u → pre_ops=%u post_ops=%u leaves=%u\n",
-                        ew_ki, reduce_ki, r_ke->n_ops, ew_ke->n_ops - r_ke->n_ops, merged.n_leaves);
+                fprintf(stderr, "  kernel_merge: ew=%u + reduce=%u → ops=%u leaves=%u\n",
+                        ew_ki, reduce_ki, ew_ke->n_ops, merged.n_leaves);
             n_merges++;
             break; // only merge one reduce per ew kernel per iteration
         }
@@ -535,7 +572,7 @@ static u32 sched_all(TinyHVM *ctx) {
                 else op.arg_b = op.arg_b - r2_ke->n_leaves + ke->n_leaves + ke->n_ops;
                 ke->ops[ke->n_ops++] = op;
             }
-            r2_ke->n_ops = 0; r2_ke->n_leaves = 0; r2_ke->has_reduce = 0;
+            sched_kill_kernel(ctx, r2_ki, ki);
             n_merges2++;
             if (getenv("THVM_SCHED_DIAG"))
                 fprintf(stderr, "  chain_merge: ki=%u + r2=%u → ops=%u leaves=%u\n",
@@ -590,8 +627,7 @@ static u32 sched_all(TinyHVM *ctx) {
             // Update out_shape: apply k2's reduce axes
             for (u32 d = 0; d < k1->out_shape.rank && d < MAX_DIM; d++)
                 if (k2->reduce.is_reduce[d]) k1->out_shape.dims[d] = 1;
-            // Mark k2 as dead
-            k2->n_ops = 0; k2->n_leaves = 0; k2->has_reduce = 0;
+            sched_kill_kernel(ctx, kj, ki);
             if (getenv("THVM_SCHED_DIAG"))
                 fprintf(stderr, "  multi_reduce_merge: k1=%u + k2=%u → ops=%u leaves=%u\n",
                         ki, kj, k1->n_ops, k1->n_leaves);
@@ -648,8 +684,7 @@ static u32 sched_all(TinyHVM *ctx) {
             // Merge: update consumer's out_shape with producer's reduce axes
             for (u32 d = 0; d < ke->out_shape.rank && d < MAX_DIM; d++)
                 if (prod->reduce.is_reduce[d]) ke->out_shape.dims[d] = 1;
-            // Mark producer as dead (its output is now internal to consumer)
-            prod->n_ops = 0; prod->n_leaves = 0; prod->has_reduce = 0;
+            sched_kill_kernel(ctx, prod_ki, ki);
             n_cr++;
             if (getenv("THVM_SCHED_DIAG"))
                 fprintf(stderr, "  view_chain_merge: consumer=%u + producer=%u via leaf=%u\n", ki, prod_ki, lid);
@@ -732,7 +767,7 @@ static u32 sched_all(TinyHVM *ctx) {
             merged.out_shape = ew_ke->out_shape;
             merged.original_term = ew_ke->original_term;
             *ew_ke = merged;
-            r_ke->n_ops = 0; r_ke->n_leaves = 0; r_ke->has_reduce = 0;
+            sched_kill_kernel(ctx, reduce_ki, ew_ki);
             if (getenv("THVM_SCHED_DIAG"))
                 fprintf(stderr, "  pass7_merge: ew=%u + reduce=%u → ops=%u leaves=%u\n",
                         ew_ki, reduce_ki, ew_ke->n_ops, merged.n_leaves);
@@ -784,7 +819,7 @@ static u32 sched_all(TinyHVM *ctx) {
                 else op.arg_b = op.arg_b - k2->n_leaves + k1->n_leaves + k1->n_ops;
                 k1->ops[k1->n_ops++] = op;
             }
-            k2->n_ops = 0; k2->n_leaves = 0;
+            sched_kill_kernel(ctx, kj, ki);
             n_ee++;
             if (getenv("THVM_SCHED_DIAG"))
                 fprintf(stderr, "  ew_ew_merge: k1=%u + k2=%u → ops=%u leaves=%u\n", ki, kj, k1->n_ops, k1->n_leaves);
@@ -852,7 +887,7 @@ static u32 sched_all(TinyHVM *ctx) {
                 if (r_ke->ops[j].arg_a == li) r_ke->ops[j].arg_a = ew_result_idx;
                 if (r_ke->ops[j].arg_b == li) r_ke->ops[j].arg_b = ew_result_idx;
             }
-            ew_ke->n_ops = 0; ew_ke->n_leaves = 0;
+            sched_kill_kernel(ctx, ew_ki, ki);
             if (getenv("THVM_SCHED_DIAG"))
                 fprintf(stderr, "  reduce_absorb_ew: r=%u + ew=%u → ops=%u leaves=%u\n",
                         ki, ew_ki, r_ke->n_ops, r_ke->n_leaves);
@@ -1030,7 +1065,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
                 if (!has_alive_consumer) {
                     sched_kernels[ki].n_ops = 0;
                     sched_kernels[ki].n_leaves = 0;
-                    sched_kernels[ki].has_reduce = 0;
+                    sched_kernels[ki].has_reduce = 0; // analysis-only kill
                     n_dc++; n_fused_away++;
                 }
             }

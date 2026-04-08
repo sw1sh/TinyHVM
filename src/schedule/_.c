@@ -961,36 +961,91 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             MEM_FIND_OR_ADD(oid, osz*4, ai);
             for (u32 b=0;b<n_bufs;b++) if(bufs[b].id==oid){bufs[b].is_output=1;break;}
         }
-        // Dead-chain elimination: if a kernel's output feeds ONLY into dead kernels,
-        // its output is also unnecessary. Mark the kernel dead and zero its output.
-        // Repeat until stable (chains of dead consumers propagate).
+        // Dead-chain propagation: if a kernel's output feeds ONLY into dead kernels,
+        // kill the kernel too. Propagate until stable.
         u32 n_fused_away = 0;
         for (u32 _dc = 0; _dc < 20; _dc++) {
             u32 n_dc = 0;
+            // Rebuild alive list
+            n_alive = 0;
+            for (u32 ki = 0; ki < sched_kernel_count; ki++) {
+                KernelEntry *k = &sched_kernels[ki];
+                if (k->n_ops == 0 && k->n_leaves == 0) continue;
+                alive[n_alive++] = ki;
+            }
             for (u32 ai = 0; ai < n_alive; ai++) {
                 u32 ki = alive[ai];
-                KernelEntry *k = &sched_kernels[ki];
-                if (k->n_ops == 0 && k->n_leaves == 0) continue; // already dead
-                // Check: is this kernel's output consumed by any ALIVE kernel?
+                // Check: does any OTHER alive kernel consume this kernel's output?
                 int has_alive_consumer = 0;
-                u32 out_id = 0x40000000u | ki;
-                for (u32 b = 0; b < n_bufs; b++) {
-                    if (bufs[b].id == out_id && bufs[b].death > bufs[b].birth)
-                        has_alive_consumer = 1; // someone references it after birth
-                }
-                // If no alive consumer and this kernel's output is referenced only
-                // by dead kernels, mark its output buffer as zero-size
-                if (!has_alive_consumer) {
-                    for (u32 b = 0; b < n_bufs; b++) {
-                        if (bufs[b].id == out_id && bufs[b].size > 0) {
-                            bufs[b].size = 0;
-                            n_fused_away++;
-                            n_dc++;
+                for (u32 aj = 0; aj < n_alive && !has_alive_consumer; aj++) {
+                    if (aj == ai) continue;
+                    KernelEntry *ck = &sched_kernels[alive[aj]];
+                    for (u32 li = 0; li < ck->n_leaves; li++) {
+                        u32 lid = ck->leaf_ids[li];
+                        // Concrete leaf: check if tensor was derived from ki's output
+                        if (lid != 0 && !LEAF_IS_LAZY(lid) && lid < ctx->tensor_count) {
+                            TensorMeta *lm = &ctx->tensors[lid];
+                            if (lm->src_ids[0]) {
+                                // Trace back: src tensor numel matches ki's out_shape?
+                                KernelEntry *pk = &sched_kernels[ki];
+                                u32 pk_numel = 1;
+                                for (u32 d=0;d<pk->out_shape.rank;d++) pk_numel*=pk->out_shape.dims[d];
+                                TensorMeta *sm = &ctx->tensors[lm->src_ids[0]];
+                                if (sm->view.numel == pk_numel) { has_alive_consumer = 1; break; }
+                            }
+                        }
+                        // FUSING leaf: check kid
+                        if (lid == 0 || LEAF_IS_LAZY(lid)) {
+                            Term lt = ck->leaf_terms[li], ft = lt;
+                            while (term_tag(ft)==TAG_TOP && is_view_op(term_ext(ft))) {
+                                Term nx=heap_read(ctx,term_val(ft));
+                                if(term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1) nx=heap_read(ctx,term_val(nx));
+                                ft=nx;
+                            }
+                            if (term_tag(ft)==TAG_TOP && term_ext(ft)==UOP_FUSING) {
+                                u64 fl=term_val(ft); Term kt=heap_read(ctx,fl+1);
+                                if (term_tag(kt)==TAG_NUM && (u32)term_val(kt)==ki)
+                                    { has_alive_consumer = 1; break; }
+                            }
                         }
                     }
                 }
+                if (!has_alive_consumer) {
+                    sched_kernels[ki].n_ops = 0;
+                    sched_kernels[ki].n_leaves = 0;
+                    sched_kernels[ki].has_reduce = 0;
+                    n_dc++; n_fused_away++;
+                }
             }
             if (n_dc == 0) break;
+        }
+        // Rebuild alive list after dead-chain propagation
+        n_alive = 0;
+        for (u32 ki = 0; ki < sched_kernel_count; ki++) {
+            KernelEntry *k = &sched_kernels[ki];
+            if (k->n_ops == 0 && k->n_leaves == 0) continue;
+            alive[n_alive++] = ki;
+        }
+        // Rebuild buf registry with only alive kernels
+        n_bufs = 0;
+        for (u32 ai = 0; ai < n_alive; ai++) {
+            KernelEntry *k = &sched_kernels[alive[ai]];
+            for (u32 li = 0; li < k->n_leaves; li++) {
+                u32 lid = k->leaf_ids[li];
+                if (lid == 0 || LEAF_IS_LAZY(lid)) {
+                    Term lt=k->leaf_terms[li],ft=lt;
+                    while(term_tag(ft)==TAG_TOP&&is_view_op(term_ext(ft))){Term nx=heap_read(ctx,term_val(ft));if(term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1)nx=heap_read(ctx,term_val(nx));ft=nx;}
+                    if(term_tag(ft)==TAG_TOP&&term_ext(ft)==UOP_FUSING){u64 fl=term_val(ft);Term kt=heap_read(ctx,fl+1);if(term_tag(kt)==TAG_NUM){u32 pki=(u32)term_val(kt);u32 oid=0x40000000u|pki;KernelEntry*p=&sched_kernels[pki];u64 osz=1;for(u32 d=0;d<p->out_shape.rank;d++)osz*=p->out_shape.dims[d];MEM_FIND_OR_ADD(oid,osz*4,ai);}}
+                    continue;
+                }
+                u64 sz=(lid<ctx->tensor_count)?(u64)ctx->tensors[lid].view.numel*4:(u64)k->leaf_views[li].numel*4;
+                MEM_FIND_OR_ADD(lid,sz,ai);
+            }
+            u32 oid=0x40000000u|alive[ai]; u64 osz=1;
+            if(term_tag(k->reshape_term)!=TAG_ERA){const View*rv=st_get(term_val(k->reshape_term));if(rv){for(u32 d=0;d<rv->shape.rank;d++)osz*=rv->shape.dims[d];}else{for(u32 d=0;d<k->out_shape.rank;d++)osz*=k->out_shape.dims[d];}}
+            else{for(u32 d=0;d<k->out_shape.rank;d++)osz*=k->out_shape.dims[d];}
+            MEM_FIND_OR_ADD(oid,osz*4,ai);
+            for(u32 b=0;b<n_bufs;b++)if(bufs[b].id==oid){bufs[b].is_output=1;break;}
         }
         u32 peak_live=0; u64 peak_bytes=0;
         for (u32 ai=0;ai<n_alive;ai++) {

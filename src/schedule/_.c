@@ -394,103 +394,126 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after sched: "); sched_dump_heap(ctx); }
 
     // ── Memory analysis (pure algorithm, no dispatch) ──
-    // Compute buffer liveness, peak simultaneous buffers, theoretical peak memory.
+    // Track ALL buffers: inputs (concrete leaves) + outputs (kernel results).
+    // Output→consumer linkage via FUSING term kid on heap.
     if (getenv("THVM_MEM_DIAG")) {
-        // Collect all alive kernels in dispatch order
         u32 alive[SCHED_MAX_KERNELS], n_alive = 0;
         for (u32 ki = 0; ki < sched_kernel_count; ki++) {
             KernelEntry *k = &sched_kernels[ki];
             if (k->n_ops == 0 && k->n_leaves == 0) continue;
             alive[n_alive++] = ki;
         }
-        // Collect all unique buffer IDs (concrete tensor leaves)
-        #define MEM_MAX_BUFS 1024
-        u32 buf_ids[MEM_MAX_BUFS], n_bufs = 0;
-        u32 buf_first[MEM_MAX_BUFS], buf_last[MEM_MAX_BUFS]; // kernel index (in alive[])
-        u64 buf_sizes[MEM_MAX_BUFS];
+        // Buffer registry: inputs + outputs
+        #define MEM_MAX_BUFS 2048
+        typedef struct { u32 id; u64 size; u32 birth; u32 death; int is_output; } MemBuf;
+        MemBuf bufs[MEM_MAX_BUFS]; u32 n_bufs = 0;
+        // Helper: find or add buf
+        #define MEM_FIND_OR_ADD(bid, sz, b_ai) do { \
+            u32 _bi = 0xFFFFFFFFu; \
+            for (u32 _b = 0; _b < n_bufs; _b++) \
+                if (bufs[_b].id == (bid)) { _bi = _b; break; } \
+            if (_bi == 0xFFFFFFFFu && n_bufs < MEM_MAX_BUFS) { \
+                _bi = n_bufs++; \
+                bufs[_bi] = (MemBuf){.id=(bid), .size=(sz), .birth=(b_ai), .death=(b_ai), .is_output=0}; \
+            } \
+            if (_bi != 0xFFFFFFFFu) { \
+                if ((b_ai) < bufs[_bi].birth) bufs[_bi].birth = (b_ai); \
+                if ((b_ai) > bufs[_bi].death) bufs[_bi].death = (b_ai); \
+                if ((sz) > bufs[_bi].size) bufs[_bi].size = (sz); \
+            } \
+        } while(0)
+
         for (u32 ai = 0; ai < n_alive; ai++) {
-            KernelEntry *k = &sched_kernels[alive[ai]];
+            u32 ki = alive[ai];
+            KernelEntry *k = &sched_kernels[ki];
+            // Input leaves
             for (u32 li = 0; li < k->n_leaves; li++) {
                 u32 lid = k->leaf_ids[li];
-                if (lid == 0 || LEAF_IS_LAZY(lid)) continue;
-                // Find or add buffer
-                u32 bi = 0xFFFFFFFFu;
-                for (u32 b = 0; b < n_bufs; b++)
-                    if (buf_ids[b] == lid) { bi = b; break; }
-                if (bi == 0xFFFFFFFFu && n_bufs < MEM_MAX_BUFS) {
-                    bi = n_bufs++;
-                    buf_ids[bi] = lid;
-                    buf_first[bi] = ai;
-                    buf_last[bi] = ai;
-                    buf_sizes[bi] = (u64)k->leaf_views[li].numel * 4; // f32
+                if (lid == 0 || LEAF_IS_LAZY(lid)) {
+                    // FUSING/lazy leaf: find which kernel produced it → that kernel's output
+                    // The leaf_terms[li] links to the FUSING term → kid → kernel index
+                    Term lt = k->leaf_terms[li];
+                    Term ft = lt;
+                    while (term_tag(ft) == TAG_TOP && is_view_op(term_ext(ft))) {
+                        Term nx = heap_read(ctx, term_val(ft));
+                        if (term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1) nx = heap_read(ctx, term_val(nx));
+                        ft = nx;
+                    }
+                    if (term_tag(ft) == TAG_TOP && term_ext(ft) == UOP_FUSING) {
+                        u64 floc = term_val(ft);
+                        Term kid_t = heap_read(ctx, floc + 1);
+                        if (term_tag(kid_t) == TAG_NUM) {
+                            u32 prod_ki = (u32)term_val(kid_t);
+                            // Use producer kernel index as buffer ID (output buf)
+                            u32 out_id = 0x40000000u | prod_ki;
+                            KernelEntry *prod = &sched_kernels[prod_ki];
+                            u64 out_sz = 1;
+                            for (u32 d = 0; d < prod->out_shape.rank; d++) out_sz *= prod->out_shape.dims[d];
+                            MEM_FIND_OR_ADD(out_id, out_sz * 4, ai);
+                        }
+                    }
+                    continue;
                 }
-                if (bi != 0xFFFFFFFFu) {
-                    if (ai < buf_first[bi]) buf_first[bi] = ai;
-                    if (ai > buf_last[bi]) buf_last[bi] = ai;
-                }
+                u64 sz = (u64)k->leaf_views[li].numel * 4;
+                MEM_FIND_OR_ADD(lid, sz, ai);
             }
-            // Output buffer: kernel index ai, size = out_shape numel
-            u64 out_numel = 1;
-            for (u32 d = 0; d < k->out_shape.rank; d++) out_numel *= k->out_shape.dims[d];
-            // Output is "born" at ai, consumed by later kernels (unknown — assume last)
+            // Output buffer: born at this kernel
+            u32 out_id = 0x40000000u | ki;
+            u64 out_sz = 1;
+            for (u32 d = 0; d < k->out_shape.rank; d++) out_sz *= k->out_shape.dims[d];
+            MEM_FIND_OR_ADD(out_id, out_sz * 4, ai);
+            // Mark as output
+            for (u32 b = 0; b < n_bufs; b++)
+                if (bufs[b].id == out_id) { bufs[b].is_output = 1; break; }
         }
-        // Compute peak simultaneous: for each kernel, count live buffers
-        u32 peak_live = 0;
-        u64 peak_bytes = 0;
+        // Peak simultaneous
+        u32 peak_live = 0; u64 peak_bytes = 0;
         for (u32 ai = 0; ai < n_alive; ai++) {
-            u32 live = 0;
-            u64 live_bytes = 0;
+            u32 live = 0; u64 live_bytes = 0;
             for (u32 b = 0; b < n_bufs; b++) {
-                if (buf_first[b] <= ai && buf_last[b] >= ai) {
-                    live++;
-                    live_bytes += buf_sizes[b];
+                if (bufs[b].birth <= ai && bufs[b].death >= ai) {
+                    live++; live_bytes += bufs[b].size;
                 }
             }
-            // Add output buffer for this kernel
-            KernelEntry *k = &sched_kernels[alive[ai]];
-            u64 out_numel = 1;
-            for (u32 d = 0; d < k->out_shape.rank; d++) out_numel *= k->out_shape.dims[d];
-            live++;
-            live_bytes += out_numel * 4;
             if (live > peak_live) peak_live = live;
             if (live_bytes > peak_bytes) peak_bytes = live_bytes;
         }
-        // With reuse: buffers with non-overlapping lifetimes share slots
-        // Greedy: sort by birth, assign to first available slot
+        // Greedy reuse (sort by birth, assign to first free slot)
         u32 slot_count = 0;
-        u32 slot_end[MEM_MAX_BUFS]; // when each slot becomes free
-        u64 slot_size[MEM_MAX_BUFS];
-        u64 reuse_total = 0;
+        u32 slot_end[MEM_MAX_BUFS]; u64 slot_size[MEM_MAX_BUFS];
+        u64 reuse_saved = 0;
         for (u32 b = 0; b < n_bufs; b++) {
-            // Find a free slot (ended before this buf's birth) with compatible size
             int found = -1;
             for (u32 s = 0; s < slot_count; s++) {
-                if (slot_end[s] < buf_first[b] && slot_size[s] >= buf_sizes[b]) {
-                    found = (int)s;
-                    break;
+                if (slot_end[s] < bufs[b].birth && slot_size[s] >= bufs[b].size) {
+                    found = (int)s; break;
                 }
             }
             if (found >= 0) {
-                slot_end[found] = buf_last[b];
-                if (buf_sizes[b] > slot_size[found]) slot_size[found] = buf_sizes[b];
-                reuse_total += buf_sizes[b];
+                slot_end[found] = bufs[b].death;
+                if (bufs[b].size > slot_size[found]) slot_size[found] = bufs[b].size;
+                reuse_saved += bufs[b].size;
             } else if (slot_count < MEM_MAX_BUFS) {
-                slot_end[slot_count] = buf_last[b];
-                slot_size[slot_count] = buf_sizes[b];
+                slot_end[slot_count] = bufs[b].death;
+                slot_size[slot_count] = bufs[b].size;
                 slot_count++;
             }
         }
         u64 total_bytes = 0;
-        for (u32 b = 0; b < n_bufs; b++) total_bytes += buf_sizes[b];
+        for (u32 b = 0; b < n_bufs; b++) total_bytes += bufs[b].size;
         u64 slot_bytes = 0;
         for (u32 s = 0; s < slot_count; s++) slot_bytes += slot_size[s];
-        fprintf(stderr, "MEM_ANALYSIS: alive_kernels=%u unique_bufs=%u peak_live=%u\n",
-                n_alive, n_bufs, peak_live);
-        fprintf(stderr, "  total_buf_bytes=%.2fMB peak_simul=%.2fMB\n",
+        u32 n_inputs = 0, n_outputs = 0;
+        for (u32 b = 0; b < n_bufs; b++) { if (bufs[b].is_output) n_outputs++; else n_inputs++; }
+        fprintf(stderr, "MEM_ANALYSIS: kernels=%u bufs=%u (in=%u out=%u) peak_live=%u\n",
+                n_alive, n_bufs, n_inputs, n_outputs, peak_live);
+        fprintf(stderr, "  no_reuse=%.2fMB peak=%.2fMB\n",
                 (double)total_bytes/1e6, (double)peak_bytes/1e6);
-        fprintf(stderr, "  with_reuse: slots=%u slot_bytes=%.2fMB saved=%.2fMB (%.0f%%)\n",
-                slot_count, (double)slot_bytes/1e6, (double)reuse_total/1e6,
-                total_bytes > 0 ? 100.0 * reuse_total / total_bytes : 0.0);
+        fprintf(stderr, "  with_reuse: slots=%u need=%.2fMB saved=%.2fMB (%.0f%%)\n",
+                slot_count, (double)slot_bytes/1e6, (double)reuse_saved/1e6,
+                total_bytes > 0 ? 100.0 * reuse_saved / total_bytes : 0.0);
+        #undef MEM_FIND_OR_ADD
+        #undef MEM_MAX_BUFS
     }
 
     { Backend *be = ctx_default_backend(ctx);

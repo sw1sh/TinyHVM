@@ -230,6 +230,10 @@ static Term sched_one(TinyHVM *ctx, Term ht, u64 h) {
     return ft;
 }
 
+// Pre-merge state for analysis-only merge passes
+static u32 pre_merge_count = 0;
+static KernelEntry pre_merge_kernels_store[SCHED_MAX_KERNELS];
+
 static u32 sched_all(TinyHVM *ctx) {
     u32 total = 0;
     fuse_no_lazy_resolve = 1;
@@ -362,6 +366,10 @@ static u32 sched_all(TinyHVM *ctx) {
             }
         }
     }
+
+    // Save pre-merge state — merge passes are analysis-only until dispatch supports them.
+    pre_merge_count = sched_kernel_count;
+    memcpy(pre_merge_kernels_store, sched_kernels, sched_kernel_count * sizeof(KernelEntry));
 
     // Pass 4: kernel merging — iteratively merge ew kernels with FUSING reduce leaves.
     // When an ew kernel has a FUSING leaf that points to a reduce kernel,
@@ -855,6 +863,14 @@ static u32 sched_all(TinyHVM *ctx) {
     return total;
 }
 
+static void sched_restore_pre_merge(void) {
+    if (pre_merge_count > 0) {
+        sched_kernel_count = pre_merge_count;
+        memcpy(sched_kernels, pre_merge_kernels_store, pre_merge_count * sizeof(KernelEntry));
+        pre_merge_count = 0;
+    }
+}
+
 Term thvm_eval(TinyHVM *ctx, Term t) {
     sched_kernel_count = 0;
     for (u32 i = 0; i < SCHED_MAX_KERNELS; i++) kid_results[i] = term_era();
@@ -1124,6 +1140,9 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         #undef MEM_FIND_OR_ADD
         #undef MEM_MAX_BUFS
     }
+
+    // Restore pre-merge kernels for dispatch
+    sched_restore_pre_merge();
 
     { Backend *be = ctx_default_backend(ctx);
       if (be && be->end_batch) be->end_batch(); }

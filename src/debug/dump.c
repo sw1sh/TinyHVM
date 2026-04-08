@@ -99,10 +99,13 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
 
     // Seed: explicit root term
     if (term_tag(root) != TAG_ERA) HDOT_ENQUEUE(root);
-    // Seed: all live TAG_TOP terms on the heap (not just ASSIGN/FUSING)
+    // Seed: all live terms on the heap
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
-        if (term_tag(ht) == TAG_TOP && term_ext(ht) != UOP_GRAD)
+        u8 htag = term_tag(ht);
+        if (htag == TAG_TOP && term_ext(ht) != UOP_GRAD)
+            HDOT_ENQUEUE(ht);
+        else if (htag == TAG_APP || htag == TAG_LAM || htag == TAG_SUP)
             HDOT_ENQUEUE(ht);
     }
     // BFS: walk children

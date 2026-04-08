@@ -307,7 +307,7 @@ static u32 sched_all(TinyHVM *ctx) {
         if (era_progress == 0) break;
     }
 
-    // Pass 1: reduces first (absorb ew children)
+    // Pass 1: reduces without ew consumers
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) != TAG_TOP) continue;
@@ -319,9 +319,51 @@ static u32 sched_all(TinyHVM *ctx) {
                 (term_ext(inner) == UOP_SUM || term_ext(inner) == UOP_RMAX));
         }
         if (!is_reduce_root) continue;
+        // Check for ew consumer
+        int has_ew_consumer = 0;
+        for (u64 ch = 1; ch < ctx->heap_pos && !has_ew_consumer; ch++) {
+            Term ct = ctx->heap[ch];
+            if (term_tag(ct)!=TAG_TOP || !is_elementwise(term_ext(ct))) continue;
+            u64 cloc = term_val(ct);
+            for (u32 ai = 0; ai < 2 && !has_ew_consumer; ai++) {
+                Term ca = heap_read(ctx, cloc + ai);
+                if (term_tag(ca)==TAG_DP0||term_tag(ca)==TAG_DP1) ca = heap_read(ctx, term_val(ca));
+                if (ca == ht) { has_ew_consumer = 1; break; }
+                while (term_tag(ca)==TAG_TOP && is_view_op(term_ext(ca))) {
+                    Term nx = heap_read(ctx, term_val(ca));
+                    if (term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1) nx = heap_read(ctx, term_val(nx));
+                    if (nx == ht) { has_ew_consumer = 1; break; }
+                    ca = nx;
+                }
+            }
+        }
+        if (has_ew_consumer) continue;
         sched_one(ctx, ht, h);
     }
-    // Pass 2: remaining ew ops (skip absorbed)
+    // Pass 2: ew ops (absorb unscheduled reduces via _fuse_can_absorb_reduce)
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) != TAG_TOP) continue;
+        if (is_view_op(term_ext(ht)) || term_ext(ht)==UOP_ASSIGN || term_ext(ht)==UOP_GRAD || term_ext(ht)==UOP_FUSING) continue;
+        if (sched_is_absorbed(ht)) continue;
+        sched_one(ctx, ht, h);
+    }
+    // Pass 3: remaining reduces (not absorbed)
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) != TAG_TOP) continue;
+        u32 uop = term_ext(ht);
+        int is_reduce_root = (uop == UOP_SUM || uop == UOP_RMAX);
+        if (!is_reduce_root && uop == UOP_RESHAPE) {
+            Term inner = sched_unwrap_views(ctx, ht);
+            is_reduce_root = (term_tag(inner) == TAG_TOP &&
+                (term_ext(inner) == UOP_SUM || term_ext(inner) == UOP_RMAX));
+        }
+        if (!is_reduce_root) continue;
+        if (sched_is_absorbed(ht)) continue;
+        sched_one(ctx, ht, h);
+    }
+    // Pass 3: anything remaining
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) != TAG_TOP) continue;

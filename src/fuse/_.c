@@ -40,6 +40,11 @@ static f32 _fuse_perm[MAX_DIM];
 static u32 _fuse_perm_rank = 0;
 static int _fuse_has_perm = 0;
 
+// Per-fuse: allow absorbing one unscheduled SUM/RMAX during walk
+static int _fuse_can_absorb_reduce = 0;
+static Term _fuse_absorbed_reduce;
+static Term _fuse_absorbed_reshape;
+
 // Compute a broadcast leaf's target shape in a reshaped iteration space.
 // For each OP dim, consume RESHAPE dims until product matches, then:
 //   leaf_dim==1 → all consumed dims become 1 (broadcast)
@@ -600,9 +605,29 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         return (int)(WALK_LEAF_BASE + new_idx);
     }
 
+    // Absorb unscheduled reduce: walk INTO SUM/RMAX instead of boundary
+    if (!is_elementwise(uop) && _fuse_can_absorb_reduce) {
+        int is_absorbable = (uop == UOP_SUM || uop == UOP_RMAX);
+        Term rt = t;
+        if (!is_absorbable && uop == UOP_RESHAPE) {
+            Term _ri = heap_read(ctx, term_val(t));
+            if (term_tag(_ri)==TAG_DP0||term_tag(_ri)==TAG_DP1) _ri = heap_read(ctx, term_val(_ri));
+            if (term_tag(_ri)==TAG_TOP && (term_ext(_ri)==UOP_SUM||term_ext(_ri)==UOP_RMAX)) {
+                is_absorbable = 1;
+                _fuse_absorbed_reshape = t;
+                rt = _ri;
+            }
+        }
+        if (is_absorbable) {
+            _fuse_absorbed_reduce = rt;
+            _fuse_can_absorb_reduce = 0;
+            Term ri = heap_read(ctx, term_val(rt));
+            if (term_tag(ri)==TAG_DP0||term_tag(ri)==TAG_DP1) ri = heap_read(ctx, term_val(ri));
+            return fuse_walk_inner(ctx, ri, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+        }
+    }
+
     // Non-elementwise TAG_TOP (SUM, pool RESHAPE, UOP_FUSING, etc.): leaf boundary.
-    // TAG_TEN input or UOP_FUSING (scheduled) → non-lazy leaf.
-    // Other TAG_TOP → lazy leaf (needs scheduling in a later pass).
     if (!is_elementwise(uop)) {
         const View *sv = st_get(term_val(t));
         if (!sv) {
@@ -708,11 +733,22 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
 
     // Walk the tree (reset absorbed tracking)
     fuse_n_absorbed = 0;
+    _fuse_can_absorb_reduce = (!has_reduce && is_elementwise(top_uop)) ? 1 : 0;
+    _fuse_absorbed_reduce = term_era();
+    _fuse_absorbed_reshape = term_era();
     FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0;
     u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views_p[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
     int walk_result = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views_p, &n_leaves);
-    if (walk_result < 0) { ke->fail_code = 1; return 0; }
+    if (walk_result < 0) { _fuse_can_absorb_reduce = 0; ke->fail_code = 1; return 0; }
     fuse_remap(ops, n_ops, n_leaves);
+    // If a reduce was absorbed during the walk, record it
+    if (term_tag(_fuse_absorbed_reduce) == TAG_TOP) {
+        has_reduce = term_ext(_fuse_absorbed_reduce);
+        sum_term = _fuse_absorbed_reduce;
+        if (term_tag(_fuse_absorbed_reshape) != TAG_ERA)
+            reshape_term = _fuse_absorbed_reshape;
+    }
+    _fuse_can_absorb_reduce = 0;
 
     // Lazy leaves (TAG_TOP non-ew inputs): allowed if they have known shapes
     // from st_get. The dispatch handler resolves them via thvm_reduce(leaf_term).

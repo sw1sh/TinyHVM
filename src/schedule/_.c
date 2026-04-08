@@ -363,6 +363,111 @@ static u32 sched_all(TinyHVM *ctx) {
         }
     }
 
+    // Pass 4: kernel merging — merge ew kernels with their FUSING reduce leaves.
+    // When an ew kernel has a FUSING leaf that points to a reduce kernel,
+    // merge: the reduce kernel's ops become pre-reduce, ew kernel's ops become post-reduce.
+    for (u32 ew_ki = 0; ew_ki < sched_kernel_count; ew_ki++) {
+        KernelEntry *ew_ke = &sched_kernels[ew_ki];
+        if (ew_ke->has_reduce) continue; // already a reduce kernel
+        if (ew_ke->n_ops == 0) continue;
+        // Find a FUSING leaf that points to a reduce kernel
+        for (u32 li = 0; li < ew_ke->n_leaves; li++) {
+            if (ew_ke->leaf_ids[li] != 0) continue; // only FUSING placeholder leaves
+            Term lt = ew_ke->leaf_terms[li];
+            // Walk through view ops to find the FUSING term
+            Term fusing_t = lt;
+            while (term_tag(fusing_t) == TAG_TOP && is_view_op(term_ext(fusing_t))) {
+                Term nx = heap_read(ctx, term_val(fusing_t));
+                if (term_tag(nx) == TAG_DP0 || term_tag(nx) == TAG_DP1)
+                    nx = heap_read(ctx, term_val(nx));
+                fusing_t = nx;
+            }
+            if (term_tag(fusing_t) != TAG_TOP || term_ext(fusing_t) != UOP_FUSING) continue;
+            // Find the reduce kernel for this FUSING term.
+            // FUSING stores kid at (floc+1) as TAG_NUM.
+            u32 reduce_ki = 0xFFFFFFFFu;
+            { u64 floc = term_val(fusing_t);
+              Term kid_term = heap_read(ctx, floc + 1);
+              if (term_tag(kid_term) == TAG_NUM)
+                  reduce_ki = (u32)term_val(kid_term);
+            }
+            if (reduce_ki == 0xFFFFFFFFu) continue;
+            KernelEntry *r_ke = &sched_kernels[reduce_ki];
+            if (!r_ke->has_reduce) continue;
+            // Merge: r_ke (pre-reduce) + ew_ke (post-reduce)
+            // Check limits
+            if (r_ke->n_ops + ew_ke->n_ops > FUSE_MAX_OPS) continue;
+            if (r_ke->n_leaves + ew_ke->n_leaves > FUSE_MAX_LEAVES) continue;
+            // Build merged kernel in ew_ke
+            KernelEntry merged = {0};
+            // Pre-reduce ops from reduce kernel
+            memcpy(merged.ops, r_ke->ops, r_ke->n_ops * sizeof(FusedOp));
+            merged.n_ops = r_ke->n_ops;
+            // Pre-reduce leaves from reduce kernel
+            for (u32 j = 0; j < r_ke->n_leaves; j++) {
+                merged.leaf_ids[j] = r_ke->leaf_ids[j];
+                merged.leaf_views[j] = r_ke->leaf_views[j];
+                merged.leaf_terms[j] = r_ke->leaf_terms[j];
+                merged.leaf_sts[j] = r_ke->leaf_sts[j];
+            }
+            merged.n_leaves = r_ke->n_leaves;
+            // Reduce spec
+            merged.reduce = r_ke->reduce;
+            merged.has_reduce = r_ke->has_reduce;
+            merged.sum_term = r_ke->sum_term;
+            merged.reshape_term = r_ke->reshape_term;
+            merged.full_shape = r_ke->full_shape;
+            // Mark post-reduce start
+            merged.reduce.post_reduce_start = r_ke->n_ops;
+            // Append post-reduce leaves (from ew kernel, excluding the merged reduce leaf)
+            u32 ew_leaf_remap[FUSE_MAX_LEAVES];
+            u32 n_post_leaves = 0;
+            for (u32 j = 0; j < ew_ke->n_leaves; j++) {
+                if (j == li) {
+                    // This leaf is the reduce output — maps to reduce result
+                    ew_leaf_remap[j] = 0xFFFFFFFEu;
+                    continue;
+                }
+                ew_leaf_remap[j] = merged.n_leaves;
+                merged.leaf_ids[merged.n_leaves] = ew_ke->leaf_ids[j];
+                merged.leaf_views[merged.n_leaves] = ew_ke->leaf_views[j];
+                merged.leaf_terms[merged.n_leaves] = ew_ke->leaf_terms[j];
+                merged.leaf_sts[merged.n_leaves] = ew_ke->leaf_sts[j];
+                merged.n_leaves++;
+                n_post_leaves++;
+            }
+            merged.reduce.n_post_leaves = n_post_leaves;
+            // Append post-reduce ops with remapped references
+            u32 reduce_result_idx = r_ke->n_leaves + r_ke->n_ops - 1;
+            if (r_ke->n_ops == 0) reduce_result_idx = 0; // passthrough
+            for (u32 j = 0; j < ew_ke->n_ops; j++) {
+                FusedOp po = ew_ke->ops[j];
+                // Remap leaf refs
+                if (po.arg_a < ew_ke->n_leaves)
+                    po.arg_a = (ew_leaf_remap[po.arg_a] == 0xFFFFFFFEu)
+                        ? reduce_result_idx : ew_leaf_remap[po.arg_a];
+                else
+                    po.arg_a = po.arg_a - ew_ke->n_leaves + merged.n_leaves + merged.n_ops;
+                if (po.arg_b < ew_ke->n_leaves)
+                    po.arg_b = (ew_leaf_remap[po.arg_b] == 0xFFFFFFFEu)
+                        ? reduce_result_idx : ew_leaf_remap[po.arg_b];
+                else
+                    po.arg_b = po.arg_b - ew_ke->n_leaves + merged.n_leaves + merged.n_ops;
+                merged.ops[merged.n_ops++] = po;
+            }
+            // Output shape from ew kernel
+            merged.out_shape = ew_ke->out_shape;
+            merged.original_term = ew_ke->original_term;
+            // Replace ew kernel with merged, mark reduce kernel as dead
+            *ew_ke = merged;
+            r_ke->n_ops = 0; r_ke->n_leaves = 0; r_ke->has_reduce = 0; // dead
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "  kernel_merge: ew=%u + reduce=%u → pre_ops=%u post_ops=%u leaves=%u\n",
+                        ew_ki, reduce_ki, r_ke->n_ops, ew_ke->n_ops - r_ke->n_ops, merged.n_leaves);
+            break; // only merge one reduce per ew kernel
+        }
+    }
+
     fuse_no_lazy_resolve = 0;
     return total;
 }

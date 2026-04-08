@@ -176,8 +176,19 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         // Input edge: shared value → DUP
         if (stag == TAG_TOP)
             fprintf(f, "  n%llu -> dup%llu;\n", term_val(shared), dl);
-        else if (stag == TAG_TEN)
-            fprintf(f, "  t%u -> dup%llu;\n", (u32)term_val(shared), dl);
+        else if (stag == TAG_TEN) {
+            u32 _tv=(u32)term_val(shared); char _sh[64]=""; int _p=0;
+            const char *_fc="#e0e0e0",*_dt="?",*_bk="?"; int _gr=0;
+            if (_tv < ctx->tensor_count) { TensorMeta *_m=&ctx->tensors[_tv];
+                for (u32 _d=0;_d<_m->view.shape.rank;_d++)
+                    _p+=snprintf(_sh+_p,sizeof(_sh)-_p,"%s%u",_d?",":"",_m->view.shape.dims[_d]);
+                _dt=_m->dtype==0?"f32":_m->dtype==1?"i32":_m->dtype==2?"u8":"?";
+                _bk=_m->backend?((_m->backend==ctx->backends[0])?"cpu":"mtl"):"?";
+                _gr=_m->requires_grad; if(_gr) _fc="#ffe0e0"; }
+            fprintf(f, "  t%u [label=\"t%u\\n[%s]\\n%s %s%s\",shape=triangle,fillcolor=\"%s\"];\n",
+                    _tv,_tv,_sh,_dt,_bk,_gr?" grad":"",_fc);
+            fprintf(f, "  t%u -> dup%llu;\n", _tv, dl);
+        }
         else if (stag == TAG_DP0 || stag == TAG_DP1)
             fprintf(f, "  dup%llu -> dup%llu [label=\"%s\"];\n", term_val(shared), dl,
                     stag==TAG_DP1?"dp1":"dp0");
@@ -292,12 +303,17 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (ctag == TAG_DP0 || ctag == TAG_DP1) {
                 continue; // handled by DUP triangle pass
             } else if (ctag == TAG_TEN) {
-                char _sh[64]=""; int _p=0;
-                if (cval < ctx->tensor_count) { TensorMeta *_m=&ctx->tensors[cval];
+                u32 _tv=(u32)cval; char _sh[64]=""; int _p=0;
+                const char *_fc="#e0e0e0",*_dt="?",*_bk="?"; int _gr=0;
+                if (_tv < ctx->tensor_count) { TensorMeta *_m=&ctx->tensors[_tv];
                     for (u32 _d=0;_d<_m->view.shape.rank;_d++)
-                        _p+=snprintf(_sh+_p,sizeof(_sh)-_p,"%s%u",_d?",":"",_m->view.shape.dims[_d]); }
-                fprintf(f, "  t%u [label=\"t%u\\n[%s]\",shape=triangle,fillcolor=\"#e0e0e0\"];\n",(u32)cval,(u32)cval,_sh);
-                fprintf(f, "  t%u -> n%llu [label=\"%s\"];\n", (u32)cval, loc, elbl);
+                        _p+=snprintf(_sh+_p,sizeof(_sh)-_p,"%s%u",_d?",":"",_m->view.shape.dims[_d]);
+                    _dt=_m->dtype==0?"f32":_m->dtype==1?"i32":_m->dtype==2?"u8":"?";
+                    _bk=_m->backend?((_m->backend==ctx->backends[0])?"cpu":"mtl"):"?";
+                    _gr=_m->requires_grad; if(_gr) _fc="#ffe0e0"; }
+                fprintf(f, "  t%u [label=\"t%u\\n[%s]\\n%s %s%s\",shape=triangle,fillcolor=\"%s\"];\n",
+                        _tv,_tv,_sh,_dt,_bk,_gr?" grad":"",_fc);
+                fprintf(f, "  t%u -> n%llu [label=\"%s\"];\n", _tv, loc, elbl);
             } else if (ctag == TAG_ERA) {
                 fprintf(f, "  era%llu_%u [label=\"\",shape=point,width=0.1];\n", loc, ai);
                 fprintf(f, "  era%llu_%u -> n%llu [label=\"%s\"];\n", loc, ai, loc, elbl);

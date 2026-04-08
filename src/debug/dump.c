@@ -166,51 +166,42 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (!found && n_dup_locs < HDOT_DUP_MAX) dup_locs[n_dup_locs++] = dl;
         }
     }
-    // Emit DUP triangles
-    // Atoms and TAG_TOP (read-only WNF) are transparent DUPs — both ports
-    // get the same value, so render as direct edges instead of triangles.
-    // Only non-atom, non-TOP shared values get proper DUP triangles.
+    // Emit ALL DUP triangles — every DP0/DP1 on the heap is a real IC node.
+    // Tensors and ops must have single output; DUP is required for sharing.
     for (u32 di = 0; di < n_dup_locs; di++) {
         u64 dl = dup_locs[di];
         Term shared = heap_read(ctx, dl);
         u8 stag = term_tag(shared);
-        int is_transparent = (stag == TAG_TEN || stag == TAG_NUM || stag == TAG_ERA ||
-                              stag == TAG_CTR || stag == TAG_ANY || stag == TAG_TOP);
-        if (is_transparent) {
-            // Direct edges: shared value → each consumer (no DUP triangle)
-            for (u32 ei = 0; ei < n_dup_edges; ei++) {
-                if (dup_edges[ei].dp_loc != dl) continue;
-                if (stag == TAG_TOP)
-                    fprintf(f, "  n%llu -> n%llu;\n", term_val(shared), dup_edges[ei].consumer_loc);
-                else if (stag == TAG_TEN)
-                    fprintf(f, "  t%u -> n%llu;\n", (u32)term_val(shared), dup_edges[ei].consumer_loc);
-                // ERA/NUM: skip (would clutter)
-            }
-        } else {
-            // Real DUP triangle: 1 input + dp0 + dp1
-            fprintf(f, "  dup%llu [label=\"DUP\", shape=invtriangle, fillcolor=\"#d4b8e8\", fontsize=9, width=0.7, height=0.5];\n", dl);
-            if (stag == TAG_TOP)
-                fprintf(f, "  n%llu -> dup%llu;\n", term_val(shared), dl);
-            else if (stag == TAG_TEN)
-                fprintf(f, "  t%u -> dup%llu;\n", (u32)term_val(shared), dl);
-            else if (stag == TAG_DP0 || stag == TAG_DP1)
-                fprintf(f, "  dup%llu -> dup%llu [label=\"%s\"];\n", term_val(shared), dl,
-                        stag==TAG_DP1?"dp1":"dp0");
-            int has_dp0 = 0, has_dp1 = 0;
-            for (u32 ei = 0; ei < n_dup_edges; ei++) {
-                if (dup_edges[ei].dp_loc != dl) continue;
-                const char *lbl = dup_edges[ei].is_dp1 ? "dp1" : "dp0";
-                fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n", dl, dup_edges[ei].consumer_loc, lbl);
-                if (dup_edges[ei].is_dp1) has_dp1 = 1; else has_dp0 = 1;
-            }
-            if (!has_dp0) {
-                fprintf(f, "  dang%llu_0 [label=\"?\",shape=plain,fontsize=8,fontcolor=red];\n", dl);
-                fprintf(f, "  dup%llu -> dang%llu_0 [label=\"dp0\",style=dotted,color=red];\n", dl, dl);
-            }
-            if (!has_dp1) {
-                fprintf(f, "  dang%llu_1 [label=\"?\",shape=plain,fontsize=8,fontcolor=red];\n", dl);
-                fprintf(f, "  dup%llu -> dang%llu_1 [label=\"dp1\",style=dotted,color=red];\n", dl, dl);
-            }
+        fprintf(f, "  dup%llu [label=\"DUP\", shape=invtriangle, fillcolor=\"#d4b8e8\", fontsize=9, width=0.7, height=0.5];\n", dl);
+        // Input edge: shared value → DUP
+        if (stag == TAG_TOP)
+            fprintf(f, "  n%llu -> dup%llu;\n", term_val(shared), dl);
+        else if (stag == TAG_TEN)
+            fprintf(f, "  t%u -> dup%llu;\n", (u32)term_val(shared), dl);
+        else if (stag == TAG_DP0 || stag == TAG_DP1)
+            fprintf(f, "  dup%llu -> dup%llu [label=\"%s\"];\n", term_val(shared), dl,
+                    stag==TAG_DP1?"dp1":"dp0");
+        else if (stag == TAG_NUM) {
+            f32 fv; u32 bv=(u32)term_val(shared); memcpy(&fv,&bv,4);
+            fprintf(f, "  num_dup%llu [label=\"%.4g\",shape=plaintext,fontsize=8];\n", dl, fv);
+            fprintf(f, "  num_dup%llu -> dup%llu;\n", dl, dl);
+        }
+        // Output edges: dp0 + dp1
+        int has_dp0 = 0, has_dp1 = 0;
+        for (u32 ei = 0; ei < n_dup_edges; ei++) {
+            if (dup_edges[ei].dp_loc != dl) continue;
+            const char *lbl = dup_edges[ei].is_dp1 ? "dp1" : "dp0";
+            fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n", dl, dup_edges[ei].consumer_loc, lbl);
+            if (dup_edges[ei].is_dp1) has_dp1 = 1; else has_dp0 = 1;
+        }
+        // Dangling stubs for missing ports (structural error)
+        if (!has_dp0) {
+            fprintf(f, "  dang%llu_0 [label=\"?\",shape=plain,fontsize=8,fontcolor=red];\n", dl);
+            fprintf(f, "  dup%llu -> dang%llu_0 [label=\"dp0\",style=dotted,color=red];\n", dl, dl);
+        }
+        if (!has_dp1) {
+            fprintf(f, "  dang%llu_1 [label=\"?\",shape=plain,fontsize=8,fontcolor=red];\n", dl);
+            fprintf(f, "  dup%llu -> dang%llu_1 [label=\"dp1\",style=dotted,color=red];\n", dl, dl);
         }
     }
     // Helper: check if a DP reference is handled by a DUP triangle

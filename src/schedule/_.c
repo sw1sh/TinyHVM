@@ -363,9 +363,12 @@ static u32 sched_all(TinyHVM *ctx) {
         }
     }
 
-    // Pass 4: kernel merging — merge ew kernels with their FUSING reduce leaves.
+    // Pass 4: kernel merging — iteratively merge ew kernels with FUSING reduce leaves.
     // When an ew kernel has a FUSING leaf that points to a reduce kernel,
     // merge: the reduce kernel's ops become pre-reduce, ew kernel's ops become post-reduce.
+    // Iterate until no more merges (chains: ew2(ew1(reduce)) → ew2+ew1+reduce).
+    for (u32 _merge_iter = 0; _merge_iter < 10; _merge_iter++) {
+    u32 n_merges = 0;
     for (u32 ew_ki = 0; ew_ki < sched_kernel_count; ew_ki++) {
         KernelEntry *ew_ke = &sched_kernels[ew_ki];
         if (ew_ke->has_reduce) continue; // already a reduce kernel
@@ -464,9 +467,12 @@ static u32 sched_all(TinyHVM *ctx) {
             if (getenv("THVM_SCHED_DIAG"))
                 fprintf(stderr, "  kernel_merge: ew=%u + reduce=%u → pre_ops=%u post_ops=%u leaves=%u\n",
                         ew_ki, reduce_ki, r_ke->n_ops, ew_ke->n_ops - r_ke->n_ops, merged.n_leaves);
-            break; // only merge one reduce per ew kernel
+            n_merges++;
+            break; // only merge one reduce per ew kernel per iteration
         }
     }
+    if (n_merges == 0) break; // no more merges possible
+    } // end merge iteration loop
 
     fuse_no_lazy_resolve = 0;
     return total;

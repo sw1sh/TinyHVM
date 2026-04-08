@@ -194,7 +194,7 @@ static Term sched_one(TinyHVM *ctx, Term ht, u64 h) {
                 if (view_broadcast(&ke.leaf_views[0], &ke.leaf_views[1], &av_bc, &bv_bc, bc_shape, &bc_ndim))
                     ke.full_shape = shape_of(bc_shape, bc_ndim);
                 else
-                    ke.full_shape = va->shape;
+                    goto fuse_give_up; // incompatible shapes — can't create ew kernel
             } else {
                 ke.full_shape = va->shape;
             }
@@ -345,11 +345,14 @@ static u32 sched_all(TinyHVM *ctx) {
         }
         sched_one(ctx, ht, h);
     }
-    // Pass 2: ew ops (absorb unscheduled reduces via _fuse_can_absorb_reduce)
+    // Pass 2: ew ops ONLY — their walks absorb unscheduled reduces.
+    // CRITICAL: do NOT schedule SUM/RMAX here. They must remain TAG_TOP
+    // so that ew walks can find and absorb them via _fuse_can_absorb_reduce.
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) != TAG_TOP) continue;
-        if (is_view_op(term_ext(ht)) || term_ext(ht)==UOP_ASSIGN || term_ext(ht)==UOP_GRAD || term_ext(ht)==UOP_FUSING) continue;
+        u32 uop = term_ext(ht);
+        if (!is_elementwise(uop)) continue;
         if (sched_is_absorbed(ht)) continue;
         sched_one(ctx, ht, h);
     }
@@ -410,7 +413,233 @@ static u32 sched_all(TinyHVM *ctx) {
         }
     }
 
-    // Done. No merge passes — scheduling is complete.
+    // CSE: deduplicate kernels that compute the same thing.
+    // DUP in the IC graph creates identical reduce/ew terms on separate branches.
+    // Match by: ops structure + leaf equivalence (concrete IDs or lazy→FUSING kid).
+    {
+        u32 n_deduped = 0;
+        // Helper: resolve a leaf to a canonical key for comparison.
+        // Concrete leaf → tensor ID. Lazy FUSING leaf → kernel kid. Lazy TAG_TOP → heap loc.
+        #define LEAF_KEY(ke, li) ({ \
+            u32 _lid = (ke)->leaf_ids[li]; u32 _key = _lid; \
+            if (_lid == 0 || LEAF_IS_LAZY(_lid)) { \
+                Term _lt = (ke)->leaf_terms[li]; \
+                while (term_tag(_lt)==TAG_TOP && is_view_op(term_ext(_lt))) { \
+                    Term _nx = heap_read(ctx, term_val(_lt)); \
+                    if (term_tag(_nx)==TAG_DP0||term_tag(_nx)==TAG_DP1) _nx=heap_read(ctx,term_val(_nx)); \
+                    _lt = _nx; \
+                } \
+                if (term_tag(_lt)==TAG_TOP && term_ext(_lt)==UOP_FUSING) { \
+                    u64 _fl = term_val(_lt); Term _kt = heap_read(ctx, _fl+1); \
+                    if (term_tag(_kt)==TAG_NUM) _key = 0xC0000000u|(u32)term_val(_kt); \
+                } else _key = (u32)(term_val(_lt) | 0x80000000u); \
+            } \
+            _key; })
+
+        // Find ka's FUSING term on heap (cache per ki)
+        Term fusing_terms[SCHED_MAX_KERNELS];
+        for (u32 ki = 0; ki < sched_kernel_count; ki++) {
+            fusing_terms[ki] = term_era();
+            for (u64 h = 1; h < ctx->heap_pos; h++) {
+                Term ht = ctx->heap[h];
+                if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_FUSING) {
+                    u64 floc = term_val(ht);
+                    Term kid_t = heap_read(ctx, floc + 1);
+                    if (term_tag(kid_t) == TAG_NUM && (u32)term_val(kid_t) == ki) {
+                        fusing_terms[ki] = ht; break;
+                    }
+                }
+            }
+        }
+
+        for (u32 ki = 0; ki < sched_kernel_count; ki++) {
+            KernelEntry *ka = &sched_kernels[ki];
+            if (ka->n_ops == 0 && ka->n_leaves == 0) continue;
+            for (u32 kj = ki + 1; kj < sched_kernel_count; kj++) {
+                KernelEntry *kb = &sched_kernels[kj];
+                if (kb->n_ops == 0 && kb->n_leaves == 0) continue;
+                if (ka->n_ops != kb->n_ops || ka->n_leaves != kb->n_leaves) continue;
+                if (ka->has_reduce != kb->has_reduce) continue;
+                if (ka->full_shape.rank != kb->full_shape.rank) continue;
+                int same = 1;
+                for (u32 d = 0; d < ka->full_shape.rank && same; d++)
+                    if (ka->full_shape.dims[d] != kb->full_shape.dims[d]) same = 0;
+                for (u32 d = 0; d < ka->out_shape.rank && same; d++)
+                    if (ka->out_shape.dims[d] != kb->out_shape.dims[d]) same = 0;
+                if (!same) continue;
+                for (u32 i = 0; i < ka->n_ops && same; i++)
+                    if (ka->ops[i].uop != kb->ops[i].uop ||
+                        ka->ops[i].arg_a != kb->ops[i].arg_a ||
+                        ka->ops[i].arg_b != kb->ops[i].arg_b) same = 0;
+                if (!same) continue;
+                // Compare leaves via canonical keys
+                for (u32 i = 0; i < ka->n_leaves && same; i++) {
+                    u32 key_a = LEAF_KEY(ka, i);
+                    u32 key_b = LEAF_KEY(kb, i);
+                    if (key_a != key_b) same = 0;
+                }
+                if (!same) continue;
+                if (ka->has_reduce) {
+                    for (u32 d = 0; d < MAX_DIM && same; d++)
+                        if (ka->reduce.is_reduce[d] != kb->reduce.is_reduce[d]) same = 0;
+                    if (!same) continue;
+                }
+                // Duplicate! Redirect kb's FUSING to ka's on the heap.
+                Term ka_ft = fusing_terms[ki];
+                if (term_tag(ka_ft) == TAG_ERA) continue;
+                for (u64 h = 1; h < ctx->heap_pos; h++) {
+                    Term ht = ctx->heap[h];
+                    if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_FUSING) {
+                        u64 floc = term_val(ht);
+                        Term kid_t = heap_read(ctx, floc + 1);
+                        if (term_tag(kid_t) == TAG_NUM && (u32)term_val(kid_t) == kj)
+                            ctx->heap[h] = ka_ft;
+                    }
+                }
+                kb->n_ops = 0; kb->n_leaves = 0; kb->has_reduce = 0;
+                n_deduped++;
+            }
+        }
+        #undef LEAF_KEY
+        if (n_deduped && getenv("THVM_SCHED_DIAG"))
+            fprintf(stderr, "CSE: deduped %u kernels\n", n_deduped);
+    }
+
+    // Post-reduce ew merge: fold single-consumer ew kernels into their consumer.
+    // If ew kernel E feeds exactly 1 kernel K (via FUSING leaf), and K is a reduce
+    // kernel, merge E's ops as post-reduce ops into K.
+    {
+        u32 n_merged = 0;
+        // For each FUSING kernel, find which kid it references (build consumer map)
+        for (u32 ei = 0; ei < sched_kernel_count; ei++) {
+            KernelEntry *ek = &sched_kernels[ei];
+            if (ek->n_ops == 0 && ek->n_leaves == 0) continue; // dead
+            if (ek->has_reduce) continue; // only merge ew into reduce
+            if (ek->n_ops == 0) continue; // passthrough, skip
+
+            // Find E's FUSING term on heap → its kid
+            u32 ek_kid = ei;
+
+            // Count how many live kernels consume E (reference E's kid as a FUSING leaf)
+            u32 n_consumers = 0;
+            u32 consumer_kid = 0xFFFFFFFFu;
+            u32 consumer_leaf_idx = 0;
+            for (u32 ci = 0; ci < sched_kernel_count; ci++) {
+                if (ci == ei) continue;
+                KernelEntry *ck = &sched_kernels[ci];
+                if (ck->n_ops == 0 && ck->n_leaves == 0) continue;
+                for (u32 li = 0; li < ck->n_leaves; li++) {
+                    u32 lid = ck->leaf_ids[li];
+                    if (lid != 0 && !LEAF_IS_LAZY(lid)) continue;
+                    // Resolve lazy leaf to FUSING kid
+                    Term lt = ck->leaf_terms[li];
+                    while (term_tag(lt)==TAG_TOP && is_view_op(term_ext(lt))) {
+                        Term nx = heap_read(ctx, term_val(lt));
+                        if (term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1) nx=heap_read(ctx,term_val(nx));
+                        lt = nx;
+                    }
+                    if (term_tag(lt)==TAG_TOP && term_ext(lt)==UOP_FUSING) {
+                        u64 fl = term_val(lt);
+                        Term kt = heap_read(ctx, fl+1);
+                        if (term_tag(kt)==TAG_NUM && (u32)term_val(kt)==ek_kid) {
+                            n_consumers++;
+                            consumer_kid = ci;
+                            consumer_leaf_idx = li;
+                        }
+                    }
+                }
+            }
+
+            // Only merge if single consumer
+            if (n_consumers != 1) continue;
+            KernelEntry *ck = &sched_kernels[consumer_kid];
+            // For reduce consumers: merge as post-reduce ops
+            // For ew consumers: not supported yet (would need prepend)
+            if (!ck->has_reduce) continue;
+            if (ck->reduce.post_reduce_start) continue; // already has post-reduce
+            // Check: can we fit E's ops + leaves into the consumer?
+            if (ck->n_ops + ek->n_ops > FUSE_MAX_OPS) continue;
+            if (ck->n_leaves + ek->n_leaves > FUSE_MAX_LEAVES) continue;
+
+            // Merge: E's ops become post-reduce ops in the consumer.
+            // The reduce result index in the consumer is: ck->n_leaves + ck->n_ops - 1
+            // E's ops reference E's leaves and E's prior ops.
+            // After merge: E's leaf indices shift by ck->n_leaves, E's op refs shift similarly.
+            u32 pre_n_leaves = ck->n_leaves;
+            u32 pre_n_ops = ck->n_ops;
+
+            // Add E's non-FUSING leaves to the consumer
+            // E's leaf that references the consumer itself (the reduce result) should be
+            // remapped to the reduce result index (pre_n_leaves + pre_n_ops - 1).
+            u32 reduce_result_idx = pre_n_leaves + pre_n_ops - 1;
+            // But if pre_n_ops == 0, reduce result is the passthrough from leaf[0].
+            if (pre_n_ops == 0) reduce_result_idx = 0;
+
+            // Map E's leaf indices to merged indices
+            u32 ek_leaf_remap[FUSE_MAX_LEAVES];
+            u32 n_post_leaves = 0;
+            for (u32 li = 0; li < ek->n_leaves; li++) {
+                u32 lid = ek->leaf_ids[li];
+                // Check if this leaf references the consumer's output (the reduce result)
+                int is_reduce_ref = 0;
+                if (lid == 0 || LEAF_IS_LAZY(lid)) {
+                    Term lt = ek->leaf_terms[li];
+                    while (term_tag(lt)==TAG_TOP && is_view_op(term_ext(lt))) {
+                        Term nx = heap_read(ctx, term_val(lt));
+                        if (term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1) nx=heap_read(ctx,term_val(nx));
+                        lt = nx;
+                    }
+                    if (term_tag(lt)==TAG_TOP && term_ext(lt)==UOP_FUSING) {
+                        u64 fl = term_val(lt);
+                        Term kt = heap_read(ctx, fl+1);
+                        if (term_tag(kt)==TAG_NUM && (u32)term_val(kt)==consumer_kid)
+                            is_reduce_ref = 1;
+                    }
+                }
+                if (is_reduce_ref) {
+                    // This leaf reads the reduce result → remap to reduce_result_idx
+                    ek_leaf_remap[li] = reduce_result_idx;
+                } else {
+                    // Add as post-reduce leaf
+                    u32 new_li = ck->n_leaves;
+                    if (new_li >= FUSE_MAX_LEAVES) goto skip_merge;
+                    ck->leaf_ids[new_li] = ek->leaf_ids[li];
+                    ck->leaf_views[new_li] = ek->leaf_views[li];
+                    ck->leaf_terms[new_li] = ek->leaf_terms[li];
+                    ck->leaf_sts[new_li] = ek->leaf_sts[li];
+                    ek_leaf_remap[li] = new_li;
+                    ck->n_leaves++;
+                    n_post_leaves++;
+                }
+            }
+
+            // Record post-reduce start
+            ck->reduce.post_reduce_start = pre_n_ops;
+            ck->reduce.n_post_leaves = n_post_leaves;
+
+            // Append E's ops, remapping references
+            for (u32 oi = 0; oi < ek->n_ops; oi++) {
+                u32 new_oi = ck->n_ops;
+                FusedOp op = ek->ops[oi];
+                // Remap arg_a
+                if (op.arg_a < ek->n_leaves) op.arg_a = ek_leaf_remap[op.arg_a];
+                else op.arg_a = op.arg_a - ek->n_leaves + pre_n_leaves + pre_n_ops;
+                // Remap arg_b
+                if (op.arg_b < ek->n_leaves) op.arg_b = ek_leaf_remap[op.arg_b];
+                else op.arg_b = op.arg_b - ek->n_leaves + pre_n_leaves + pre_n_ops;
+                ck->ops[new_oi] = op;
+                ck->n_ops++;
+            }
+
+            // Kill E
+            ek->n_ops = 0; ek->n_leaves = 0; ek->has_reduce = 0;
+            n_merged++;
+            continue;
+            skip_merge:;
+        }
+        if (n_merged && getenv("THVM_SCHED_DIAG"))
+            fprintf(stderr, "POST_REDUCE_MERGE: merged %u ew kernels\n", n_merged);
+    }
 
     fuse_no_lazy_resolve = 0;
     return total;
@@ -461,6 +690,30 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
                 sched_kernel_count, n_reduce, n_ew, n_fallback, max_ops, max_leaves);
         fprintf(stderr, "after sched: "); sched_dump_heap(ctx);
     }
+    if (getenv("THVM_KERN_DUMP")) {
+        for (u32 ki = 0; ki < sched_kernel_count; ki++) {
+            KernelEntry *k = &sched_kernels[ki];
+            const char *ktype = k->has_reduce ? "reduce" : (k->n_ops > 0 ? "ew" : "pass");
+            fprintf(stderr, "K[%2u] %-6s ops=%u lv=%u full=[", ki, ktype, k->n_ops, k->n_leaves);
+            for (u32 d = 0; d < k->full_shape.rank; d++)
+                fprintf(stderr, "%u%s", k->full_shape.dims[d], d+1<k->full_shape.rank?",":"");
+            fprintf(stderr, "] out=[");
+            for (u32 d = 0; d < k->out_shape.rank; d++)
+                fprintf(stderr, "%u%s", k->out_shape.dims[d], d+1<k->out_shape.rank?",":"");
+            fprintf(stderr, "]");
+            if (k->has_reduce) {
+                fprintf(stderr, " ax=[");
+                for (u32 d = 0; d < MAX_DIM; d++)
+                    if (k->reduce.is_reduce[d]) fprintf(stderr, "%u,", d);
+                fprintf(stderr, "]");
+            }
+            fprintf(stderr, " leaves=[");
+            for (u32 li = 0; li < k->n_leaves; li++)
+                fprintf(stderr, "%u%s", k->leaf_ids[li], li+1<k->n_leaves?",":"");
+            fprintf(stderr, "]");
+            fprintf(stderr, "\n");
+        }
+    }
 
     { Backend *be = ctx_default_backend(ctx);
       if (be && be->end_batch) be->end_batch(); }
@@ -474,11 +727,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         }
     }
 
-    return term_era();
-}
-
-#if 0 // Deleted: memory analysis, restore, ENSURE stats
-    if (getenv("THVM_MEM_DIAG")) {
+    if (getenv("THVM_MEM_DIAG")) { // Memory analysis
         u32 alive[SCHED_MAX_KERNELS], n_alive = 0;
         for (u32 ki = 0; ki < sched_kernel_count; ki++) {
             KernelEntry *k = &sched_kernels[ki];
@@ -705,7 +954,10 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         fprintf(stderr,"  with_reuse: slots=%u need=%.2fMB saved=%.2fMB (%.0f%%)\n",
                 slot_count,(double)slot_bytes/1e6,(double)reuse_saved/1e6,
                 total_bytes>0?100.0*reuse_saved/total_bytes:0.0);
-#endif // dead merge passes + memory analysis
+    } // end THVM_MEM_DIAG
+
+    return term_era();
+}
 
 Term thvm_schedule(TinyHVM *ctx, Term t) {
     return thvm_eval(ctx, t);

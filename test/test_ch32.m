@@ -7,14 +7,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-static Term mkw(TinyHVM*c,Shape s,u32 fi){u32 n=1;for(u32 i=0;i<s.rank;i++)n*=s.dims[i];f32*d=malloc(n*4);f32 b=1.f/sqrtf((f32)fi);for(u32 i=0;i<n;i++)d[i]=b*((f32)rand()/(f32)RAND_MAX*2-1);Term t=thvm_tensor(c,d,s);free(d);return t;}
+static Term mkw(TinyHVM*c,Shape s,u32 fi){
+    // Lazy randn (creates ew kernel like tinygrad)
+    Term r = thvm_randn(c, s);
+    f32 scale = 1.f/sqrtf((f32)fi);
+    return thvm_op(c, UOP_MUL, r, thvm_scalar(c, scale));
+}
 static Term mkz(TinyHVM*c,u32 n){f32*z=calloc(n,4);Term t=thvm_tensor(c,z,SHAPE(n));free(z);return t;}
 static Term mkones(TinyHVM*c,u32 n){f32*o=malloc(n*4);for(u32 i=0;i<n;i++)o[i]=1.f;Term t=thvm_tensor(c,o,SHAPE(n));free(o);return t;}
 static void test(const char *dev){
     srand(42);TinyHVM*ctx=thvm_init(dev);u32 BS=4,Cin=1,H=14,W=14,Cout=32,K=3;
     u32 xn=BS*Cin*H*W,wn=Cout*Cin*K*K,wn2=Cout*Cout*K*K;
-    f32 *xd=malloc(xn*4);for(u32 i=0;i<xn;i++)xd[i]=(f32)rand()/(f32)RAND_MAX*2-1;
-    Term x=thvm_tensor(ctx,xd,(Shape){.dims={BS,Cin,H,W},.rank=4});free(xd);thvm_set_requires_grad(ctx,x);
+    Term x=thvm_randn(ctx,(Shape){.dims={BS,Cin,H,W},.rank=4});thvm_set_requires_grad(ctx,x);
     Term w=mkw(ctx,(Shape){.dims={Cout,Cin,K,K},.rank=4},Cin*K*K);thvm_set_requires_grad(ctx,w);
     Term b1=mkz(ctx,Cout);thvm_set_requires_grad(ctx,b1);
     Term w2=mkw(ctx,(Shape){.dims={Cout,Cout,K,K},.rank=4},Cout*K*K);thvm_set_requires_grad(ctx,w2);

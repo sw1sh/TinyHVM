@@ -170,10 +170,15 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         fuse_leaf_sts[idx] = st_from_view(ctx->tensors[tid].view);
         return (int)(WALK_LEAF_BASE + idx);
     }
-    // DP0/DP1: look through to the shared value in the DUP node
+    // DP0/DP1: look through to the shared value in the DUP node.
+    // DUP means 2+ consumers → don't absorb reduces through DUP
+    // (they should be standalone kernels shared by both consumers).
     if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1) {
         Term shared = heap_read(ctx, term_val(t));
+        int saved_absorb = _fuse_can_absorb_reduce;
+        _fuse_can_absorb_reduce = 0; // prevent absorption through DUP
         int r = fuse_walk_inner(ctx, shared, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+        _fuse_can_absorb_reduce = saved_absorb;
         if (r < 0 && getenv("THVM_SCHED_DIAG"))
             fprintf(stderr, "  dp_walk_fail: dp%u@%llu → tag%u/%s\n",
                     (term_tag(t)==TAG_DP1)?1:0, term_val(t),
@@ -218,16 +223,13 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 can_walk = (di_uop == UOP_FUSING || is_elementwise(di_uop) || is_view_op(di_uop));
             }
         }
-        // Rank-changing RESHAPE wrapping ew/view ops: boundary.
-        // Walking through would create 8D leaves from inner walk but sibling
-        // branches produce 4D leaves → rank mismatch at broadcast check.
-        // Only block OP-result case; leaf-result (TAG_TEN inner) is fine.
+        // Rank-changing RESHAPE: boundary when inner op produces different rank.
+        // Walking through would create mixed-rank leaves → broadcast failure.
         if (can_walk && uop == UOP_RESHAPE) {
             Term vi_check = view_input;
             if (term_tag(vi_check) == TAG_DP0 || term_tag(vi_check) == TAG_DP1)
                 vi_check = heap_read(ctx, term_val(vi_check));
-            if (term_tag(vi_check) == TAG_TOP &&
-                (is_elementwise(term_ext(vi_check)) || is_view_op(term_ext(vi_check)))) {
+            if (term_tag(vi_check) == TAG_TOP) {
                 Term rarg = heap_read(ctx, loc + 1);
                 if (term_tag(rarg) == TAG_DP0 || term_tag(rarg) == TAG_DP1)
                     rarg = heap_read(ctx, term_val(rarg));
@@ -240,18 +242,33 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             }
         }
         if (!can_walk) {
-            // Check if the inner is an absorbable reduce (SUM/RMAX)
+            // Check if the inner (possibly through view chain) is an absorbable reduce
             if (_fuse_can_absorb_reduce) {
                 Term vi = view_input;
                 if (term_tag(vi)==TAG_DP0||term_tag(vi)==TAG_DP1) vi = heap_read(ctx, term_val(vi));
+                // Unwrap through view ops to find SUM/RMAX
+                Term reduce_found = term_era();
+                Term vi_walk = vi;
+                for (int _vd = 0; _vd < 10; _vd++) {
+                    if (term_tag(vi_walk) != TAG_TOP) break;
+                    u32 vi_uop = term_ext(vi_walk);
+                    if (vi_uop == UOP_SUM || vi_uop == UOP_RMAX) {
+                        reduce_found = vi_walk; break;
+                    }
+                    if (!is_view_op(vi_uop)) break;
+                    Term nx = heap_read(ctx, term_val(vi_walk));
+                    if (term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1) nx = heap_read(ctx, term_val(nx));
+                    vi_walk = nx;
+                }
                 if (getenv("THVM_SCHED_DIAG2"))
-                    fprintf(stderr, "  absorb_check: uop=%s vi_tag=%u vi_ext=%u\n",
-                            uop_names[uop], term_tag(vi), term_tag(vi)==TAG_TOP?term_ext(vi):0);
-                if (term_tag(vi)==TAG_TOP && (term_ext(vi)==UOP_SUM||term_ext(vi)==UOP_RMAX)) {
-                    _fuse_absorbed_reshape = t;
-                    _fuse_absorbed_reduce = vi;
+                    fprintf(stderr, "  absorb_check: uop=%s vi_tag=%u vi_ext=%u found=%d\n",
+                            uop_names[uop], term_tag(vi), term_tag(vi)==TAG_TOP?term_ext(vi):0,
+                            term_tag(reduce_found)==TAG_TOP);
+                if (term_tag(reduce_found) == TAG_TOP) {
+                    _fuse_absorbed_reshape = t; // outermost view wrapper
+                    _fuse_absorbed_reduce = reduce_found;
                     _fuse_can_absorb_reduce = 0;
-                    Term ri = heap_read(ctx, term_val(vi));
+                    Term ri = heap_read(ctx, term_val(reduce_found));
                     if (term_tag(ri)==TAG_DP0||term_tag(ri)==TAG_DP1) ri = heap_read(ctx, term_val(ri));
                     return fuse_walk_inner(ctx, ri, ops, n_ops, leaf_ids, leaf_views, n_leaves);
                 }
@@ -621,19 +638,27 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         return (int)(WALK_LEAF_BASE + new_idx);
     }
 
-    // Absorb unscheduled reduce: walk INTO SUM/RMAX instead of boundary
+    // Absorb unscheduled reduce: walk INTO SUM/RMAX instead of boundary.
+    // Handles direct SUM/RMAX or view-wrapped: RESHAPE(SUM), PERMUTE(SUM), etc.
     if (!is_elementwise(uop) && _fuse_can_absorb_reduce) {
         if (getenv("THVM_SCHED_DIAG2"))
             fprintf(stderr, "  absorb_direct: uop=%s\n", uop < UOP_COUNT ? uop_names[uop] : "?");
         int is_absorbable = (uop == UOP_SUM || uop == UOP_RMAX);
         Term rt = t;
-        if (!is_absorbable && uop == UOP_RESHAPE) {
-            Term _ri = heap_read(ctx, term_val(t));
-            if (term_tag(_ri)==TAG_DP0||term_tag(_ri)==TAG_DP1) _ri = heap_read(ctx, term_val(_ri));
-            if (term_tag(_ri)==TAG_TOP && (term_ext(_ri)==UOP_SUM||term_ext(_ri)==UOP_RMAX)) {
-                is_absorbable = 1;
-                _fuse_absorbed_reshape = t;
-                rt = _ri;
+        // Unwrap through view ops to find SUM/RMAX
+        if (!is_absorbable && is_view_op(uop)) {
+            Term _cur = t;
+            for (int _vd = 0; _vd < 10; _vd++) {
+                Term _ri = heap_read(ctx, term_val(_cur));
+                if (term_tag(_ri)==TAG_DP0||term_tag(_ri)==TAG_DP1) _ri = heap_read(ctx, term_val(_ri));
+                if (term_tag(_ri)==TAG_TOP && (term_ext(_ri)==UOP_SUM||term_ext(_ri)==UOP_RMAX)) {
+                    is_absorbable = 1;
+                    _fuse_absorbed_reshape = t; // outermost view
+                    rt = _ri;
+                    break;
+                }
+                if (term_tag(_ri) != TAG_TOP || !is_view_op(term_ext(_ri))) break;
+                _cur = _ri;
             }
         }
         if (is_absorbable) {
@@ -759,12 +784,15 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     int walk_result = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views_p, &n_leaves);
     if (walk_result < 0) { _fuse_can_absorb_reduce = 0; ke->fail_code = 1; return 0; }
     fuse_remap(ops, n_ops, n_leaves);
-    // If a reduce was absorbed during the walk, record it
+    // If a reduce was absorbed during the walk, record it + mark absorbed
     if (term_tag(_fuse_absorbed_reduce) == TAG_TOP) {
         has_reduce = term_ext(_fuse_absorbed_reduce);
         sum_term = _fuse_absorbed_reduce;
-        if (term_tag(_fuse_absorbed_reshape) != TAG_ERA)
+        fuse_mark_absorbed(_fuse_absorbed_reduce);
+        if (term_tag(_fuse_absorbed_reshape) != TAG_ERA) {
             reshape_term = _fuse_absorbed_reshape;
+            fuse_mark_absorbed(_fuse_absorbed_reshape);
+        }
     }
     _fuse_can_absorb_reduce = 0;
 
@@ -794,6 +822,50 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
         if (!ew_init) { ew_view = *leaf_views_p[i]; ew_init = 1; continue; }
         View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
         if (!view_broadcast(&ew_view, leaf_views_p[i], &av_bc, &bv_bc, bc_shape, &bc_ndim)) {
+            // Rank mismatch: try expanding lower-rank leaf with singleton dims.
+            // E.g. [4,32,10,10] in an 8D iteration space [4,1,32,10,10,1,1,1]
+            // → insert 1s to match: [4,1,32,10,10,1,1,1] with stride 0 for new dims.
+            const View *lo = leaf_views_p[i], *hi = &ew_view;
+            int lo_is_leaf = 1;
+            if (lo->shape.rank > hi->shape.rank) { lo = &ew_view; hi = leaf_views_p[i]; lo_is_leaf = 0; }
+            if (lo->shape.rank < hi->shape.rank && lo->numel <= hi->numel) {
+                // Try to map lo's dims into hi's dims by matching products
+                View expanded = {0};
+                expanded.shape.rank = hi->shape.rank;
+                expanded.offset = lo->offset;
+                u32 li_d = 0; int ok = 1;
+                for (u32 hd = 0; hd < hi->shape.rank; hd++) {
+                    if (li_d < lo->shape.rank && lo->shape.dims[li_d] == hi->shape.dims[hd]) {
+                        expanded.shape.dims[hd] = lo->shape.dims[li_d];
+                        expanded.strides[hd] = lo->strides[li_d];
+                        li_d++;
+                    } else if (hi->shape.dims[hd] == 1) {
+                        expanded.shape.dims[hd] = 1;
+                        expanded.strides[hd] = 0;
+                    } else if (li_d < lo->shape.rank && lo->shape.dims[li_d] == 1) {
+                        // lo has a 1 that doesn't align — skip it
+                        expanded.shape.dims[hd] = hi->shape.dims[hd];
+                        expanded.strides[hd] = 0; // broadcast
+                        // Don't advance li_d — try matching at next hd
+                    } else {
+                        ok = 0; break;
+                    }
+                }
+                if (ok && li_d == lo->shape.rank) {
+                    expanded.numel = hi->numel;
+                    if (lo_is_leaf) {
+                        fuse_composed_views[i] = expanded;
+                        leaf_views_p[i] = &fuse_composed_views[i];
+                    } else {
+                        ew_view = expanded;
+                    }
+                    // Retry broadcast
+                    if (view_broadcast(&ew_view, leaf_views_p[i], &av_bc, &bv_bc, bc_shape, &bc_ndim)) {
+                        ew_view = view_create(shape_of(bc_shape, bc_ndim));
+                        continue;
+                    }
+                }
+            }
             ke->fail_code = 6;
             if (getenv("THVM_SCHED_DIAG")) {
                 fprintf(stderr, "  bc_fail: n_leaves=%u i=%u lid%u=%u lid%u=%u ew_shape=[", n_leaves, i, i-1, leaf_ids[i-1], i, leaf_ids[i]);

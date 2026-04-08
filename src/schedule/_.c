@@ -695,13 +695,74 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         for (u64 h = 1; h < ctx->heap_pos; h++) {
             Term ht = ctx->heap[h];
             if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD) {
+                u64 gl = term_val(ht);
                 ctx->heap[h] = thvm_reduce(ctx, ht);
+                // Recursively erase dead GRAD subtree — prevents phantom DP refs
+                u64 erase_stk[64]; u32 es = 0;
+                for (u32 ci = 0; ci < 3; ci++) erase_stk[es++] = gl + ci;
+                while (es > 0) {
+                    u64 pos = erase_stk[--es];
+                    Term et = ctx->heap[pos];
+                    ctx->heap[pos] = term_era();
+                    u8 etag = term_tag(et);
+                    if (etag == TAG_TOP && es < 60) {
+                        u32 ear = (term_ext(et) == UOP_GRAD) ? 3 : 2;
+                        u64 eb = term_val(et);
+                        for (u32 ci = 0; ci < ear; ci++) erase_stk[es++] = eb + ci;
+                    }
+                }
                 found = 1;
             }
         }
         if (!found) break;
     }
-    // DUP nodes persist for atoms (TEN/NUM) to maintain single-output invariant.
+    // Collapse single-consumer DUPs using reachability from the graph dumper's
+    // BFS. Collect live DP refs (reachable from TAG_TOP children on heap),
+    // then collapse DUPs where only one port has live consumers.
+    {
+        #define DP_MAX 256
+        struct { u64 pos; u8 tag; u64 dup_loc; } live_dp[DP_MAX];
+        u32 n_live = 0;
+        // Walk all TAG_TOP on heap, collect their DP children
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            Term ht = ctx->heap[h];
+            if (term_tag(ht) != TAG_TOP) continue;
+            u32 ar = (term_ext(ht) == UOP_GRAD) ? 3 : 2;
+            u64 base = term_val(ht);
+            for (u32 ci = 0; ci < ar; ci++) {
+                Term c = ctx->heap[base + ci];
+                u8 ct = term_tag(c);
+                if ((ct == TAG_DP0 || ct == TAG_DP1) && n_live < DP_MAX)
+                    live_dp[n_live].pos = base+ci;
+                    live_dp[n_live].tag = ct;
+                    live_dp[n_live].dup_loc = term_val(c);
+                    n_live++;
+            }
+        }
+        // For each DUP location, check if both ports have live consumers
+        for (int _pass = 0; _pass < 5; _pass++) {
+            int collapsed = 0;
+            for (u32 i = 0; i < n_live; i++) {
+                if (live_dp[i].tag == 0) continue; // already collapsed
+                u64 dl = live_dp[i].dup_loc;
+                u8 other = (live_dp[i].tag == TAG_DP0) ? TAG_DP1 : TAG_DP0;
+                int has_other = 0;
+                for (u32 j = 0; j < n_live; j++) {
+                    if (j == i || live_dp[j].tag == 0) continue;
+                    if (live_dp[j].dup_loc == dl && live_dp[j].tag == other)
+                        { has_other = 1; break; }
+                }
+                if (!has_other) {
+                    // Only this port — collapse: DP → shared value
+                    ctx->heap[live_dp[i].pos] = heap_read(ctx, dl);
+                    live_dp[i].tag = 0; // mark collapsed
+                    collapsed++;
+                }
+            }
+            if (!collapsed) break;
+        }
+        #undef DP_MAX
+    }
     // DUP⊳atom fires during reduction (both ports get the value) but the DUP
     // node stays on the heap as a structural sharing marker.
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }

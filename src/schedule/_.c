@@ -683,9 +683,10 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     sched_kernel_count = 0;
     for (u32 i = 0; i < SCHED_MAX_KERNELS; i++) kid_results[i] = term_era();
 
+    // Phase 0 graph: before reduce — GRAD nodes visible
+    if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_0_pre_reduce.dot");
+
     // Phase 1: Pure IC reduce — GRAD fires, compute/movement ops stay TAG_TOP (WNF).
-    // Binary backward (BG) puts one branch on the heap as a pending GRAD term.
-    // Scan and reduce pending GRADs until no more appear.
     t = thvm_reduce(ctx, t);
     for (u32 _gi = 0; _gi < 100; _gi++) {
         int found = 0;
@@ -699,11 +700,13 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         if (!found) break;
     }
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }
-    if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_pre_sched.dot");
+    // Phase 1 graph: after reduce — pure TAG_TOPs + combinators
+    if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_1_post_reduce.dot");
 
     // Phase 2: schedule compute ops → FUSING, resolve view ops → TAG_TEN aliases.
     sched_all(ctx);
-    if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_post_sched.dot");
+    // Phase 2 graph: after scheduling — FUSING kernels
+    if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_2_post_sched.dot");
     if (getenv("THVM_SCHED_DIAG")) {
         u32 n_reduce=0, n_ew=0, n_fallback=0;
         u32 max_ops=0, max_leaves=0;
@@ -785,6 +788,8 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             ctx->heap[h] = r;
         }
     }
+    // Phase 3 graph: after dispatch — materialized tensors + remaining combinators
+    if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_3_post_dispatch.dot");
 
     if (getenv("THVM_MEM_DIAG")) { // Memory analysis
         u32 alive[SCHED_MAX_KERNELS], n_alive = 0;

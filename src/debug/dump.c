@@ -96,6 +96,42 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
         if (nn < HDOT_MAX) nodes[nn++] = (HNode){t, h};
     }
 
+    // Filter: remove nodes with no consumers (disconnected islands)
+    // Keep: ASSIGN, FUSING, nodes referenced by other nodes as children
+    {
+        u8 has_consumer[HDOT_MAX]; memset(has_consumer, 0, nn);
+        // Mark roots (ASSIGN, FUSING)
+        for (u32 i = 0; i < nn; i++) {
+            u8 tag = term_tag(nodes[i].term);
+            u32 ext = term_ext(nodes[i].term);
+            if (tag == TAG_TOP && (ext == UOP_ASSIGN || ext == UOP_FUSING))
+                has_consumer[i] = 1;
+            if (tag == TAG_APP || tag == TAG_LAM) // IC combinators are roots
+                has_consumer[i] = 1;
+        }
+        // Mark nodes that are children of other nodes
+        for (u32 i = 0; i < nn; i++) {
+            u64 loc = term_val(nodes[i].term);
+            u32 ar = tag_arity(term_tag(nodes[i].term), term_ext(nodes[i].term));
+            for (u32 ai = 0; ai < ar; ai++) {
+                Term child = heap_read(ctx, loc + ai);
+                // Resolve through DP
+                if (term_tag(child) == TAG_DP0 || term_tag(child) == TAG_DP1)
+                    child = heap_read(ctx, term_val(child));
+                if (term_tag(child) != TAG_TOP && term_tag(child) != TAG_APP &&
+                    term_tag(child) != TAG_LAM && term_tag(child) != TAG_SUP) continue;
+                u64 cloc = term_val(child);
+                for (u32 j = 0; j < nn; j++)
+                    if (term_val(nodes[j].term) == cloc) has_consumer[j] = 1;
+            }
+        }
+        // Compact: remove nodes without consumers
+        u32 new_nn = 0;
+        for (u32 i = 0; i < nn; i++)
+            if (has_consumer[i]) nodes[new_nn++] = nodes[i];
+        nn = new_nn;
+    }
+
     // Helper: emit a tensor leaf node (deduped by tid)
     #define EMIT_TEN(tid) do { \
         char _sh[64] = ""; int _p = 0; \

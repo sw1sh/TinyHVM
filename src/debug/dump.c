@@ -63,6 +63,116 @@ static void thvm_dump_dot(TinyHVM *ctx, const char *path) {
     fprintf(stderr, "dump_dot: wrote %u tensors to %s\n", ctx->tensor_count, path);
 }
 
+// Dump live heap compute graph as DOT (tinygrad-style: clean, compact, colored by op type).
+// Walks TAG_TOP nodes on heap. Skips view ops (shows as edge labels).
+// Colors: blue=ew, red=reduce, green=FUSING, yellow=view, gray=tensor, purple=DUP.
+static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "heap_dot: can't open %s\n", path); return; }
+    fprintf(f, "digraph G {\n");
+    fprintf(f, "  rankdir=BT;\n");
+    fprintf(f, "  node [fontname=\"Helvetica\", fontsize=10, style=filled, shape=box, margin=\"0.1,0.05\"];\n");
+    fprintf(f, "  edge [fontsize=8, fontname=\"Helvetica\"];\n\n");
+
+    // Collect unique terms on the heap (skip duplicates from multi-consumer propagation)
+    #define HDOT_MAX 4096
+    typedef struct { Term term; u64 loc; } HNode;
+    HNode nodes[HDOT_MAX]; u32 nn = 0;
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term t = ctx->heap[h];
+        u8 tag = term_tag(t);
+        if (tag != TAG_TOP) continue;
+        u32 ext = term_ext(t);
+        if (ext == UOP_ASSIGN || ext == UOP_GRAD) continue;
+        // Dedup: skip if same term already recorded
+        int dup = 0;
+        for (u32 i = 0; i < nn; i++) if (nodes[i].term == t) { dup = 1; break; }
+        if (dup) continue;
+        if (nn < HDOT_MAX) nodes[nn++] = (HNode){t, h};
+    }
+
+    // Emit nodes
+    for (u32 ni = 0; ni < nn; ni++) {
+        Term t = nodes[ni].term;
+        u64 loc = term_val(t);
+        u32 ext = term_ext(t);
+        const char *opn = (ext < UOP_COUNT) ? uop_names[ext] : "?";
+
+        // Shape from shape table
+        const View *v = st_get(loc);
+        char shape[80] = "";
+        if (v) {
+            int p = 0;
+            for (u32 d = 0; d < v->shape.rank && p < 70; d++)
+                p += snprintf(shape+p, sizeof(shape)-p, "%s%u", d?",":"", v->shape.dims[d]);
+        }
+
+        // Color by op type
+        const char *color;
+        if (is_elementwise(ext))                  color = "#cce5ff"; // blue
+        else if (ext == UOP_SUM || ext == UOP_RMAX) color = "#ffcccc"; // red
+        else if (ext == UOP_FUSING)               color = "#ccffcc"; // green
+        else if (is_view_op(ext))                 color = "#fff3cd"; // yellow
+        else if (ext == UOP_MM)                   color = "#ffccff"; // pink
+        else                                      color = "#f0f0f0"; // gray
+
+        fprintf(f, "  n%llu [label=\"%s\\n[%s]\", fillcolor=\"%s\"];\n",
+                loc, opn, shape, color);
+
+        // Edges: walk children
+        u32 arity = (ext == UOP_WHERE) ? 3 : 2;
+        for (u32 ai = 0; ai < arity; ai++) {
+            Term child = heap_read(ctx, loc + ai);
+            // Walk through DP nodes
+            while (term_tag(child) == TAG_DP0 || term_tag(child) == TAG_DP1) {
+                // Emit DUP node
+                u64 dp_loc = term_val(child);
+                int dp_port = (term_tag(child) == TAG_DP1) ? 1 : 0;
+                fprintf(f, "  dp%llu_%d [label=\"DUP.%d\", shape=diamond, fillcolor=\"#e8d5f5\", fontsize=8];\n",
+                        dp_loc, dp_port, dp_port);
+                fprintf(f, "  dp%llu_%d -> n%llu;\n", dp_loc, dp_port, loc);
+                child = heap_read(ctx, dp_loc);
+                // Now child is the shared value
+                loc = 0; // don't add another edge below
+                if (term_tag(child) == TAG_TOP) {
+                    u64 cloc = term_val(child);
+                    fprintf(f, "  n%llu -> dp%llu_%d;\n", cloc, dp_loc, dp_port);
+                } else if (term_tag(child) == TAG_TEN) {
+                    u32 tid = (u32)term_val(child);
+                    char sh[64] = ""; int p = 0;
+                    if (tid < ctx->tensor_count) {
+                        TensorMeta *m = &ctx->tensors[tid];
+                        for (u32 d = 0; d < m->view.shape.rank; d++)
+                            p += snprintf(sh+p, sizeof(sh)-p, "%s%u", d?",":"", m->view.shape.dims[d]);
+                    }
+                    fprintf(f, "  t%u [label=\"t%u\\n[%s]\", shape=ellipse, fillcolor=\"#e0e0e0\"];\n", tid, tid, sh);
+                    fprintf(f, "  t%u -> dp%llu_%d;\n", tid, dp_loc, dp_port);
+                }
+                goto next_arg;
+            }
+            if (term_tag(child) == TAG_TOP) {
+                fprintf(f, "  n%llu -> n%llu;\n", term_val(child), term_val(nodes[ni].term));
+            } else if (term_tag(child) == TAG_TEN) {
+                u32 tid = (u32)term_val(child);
+                char sh[64] = ""; int p = 0;
+                if (tid < ctx->tensor_count) {
+                    TensorMeta *m = &ctx->tensors[tid];
+                    for (u32 d = 0; d < m->view.shape.rank; d++)
+                        p += snprintf(sh+p, sizeof(sh)-p, "%s%u", d?",":"", m->view.shape.dims[d]);
+                }
+                fprintf(f, "  t%u [label=\"t%u\\n[%s]\", shape=ellipse, fillcolor=\"#e0e0e0\"];\n", tid, tid, sh);
+                fprintf(f, "  t%u -> n%llu;\n", tid, term_val(nodes[ni].term));
+            }
+            next_arg:;
+        }
+    }
+
+    fprintf(f, "}\n");
+    fclose(f);
+    fprintf(stderr, "heap_dot: %u nodes → %s\n", nn, path);
+    #undef HDOT_MAX
+}
+
 static void thvm_dump_json(TinyHVM *ctx, const char *path) {
     FILE *f = fopen(path, "w");
     if (!f) { fprintf(stderr, "dump_json: can't open %s\n", path); return; }

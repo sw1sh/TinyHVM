@@ -1,3 +1,6 @@
+// Forward declaration (defined in debug/dump.c, included after this file)
+static void thvm_heap_dot(TinyHVM *ctx, const char *path);
+
 // schedule/_.c — Three-phase eval: reduce → schedule(rewrite) → reduce
 //
 // Phase 1: thvm_reduce — pure IC. GRAD fires, compute ops stay TAG_TOP.
@@ -696,9 +699,11 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         if (!found) break;
     }
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }
+    if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_pre_sched.dot");
 
     // Phase 2: schedule compute ops → FUSING, resolve view ops → TAG_TEN aliases.
     sched_all(ctx);
+    if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_post_sched.dot");
     if (getenv("THVM_SCHED_DIAG")) {
         u32 n_reduce=0, n_ew=0, n_fallback=0;
         u32 max_ops=0, max_leaves=0;

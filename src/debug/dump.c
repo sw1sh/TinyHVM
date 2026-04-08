@@ -314,10 +314,15 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         }
     }
 
-    // FUSING kernel leaf edges (these are the data dependencies, not heap children)
+    // FUSING kernel leaf edges — data dependencies from kernel's leaf_terms.
+    // Track output counts to emit DUP nodes for multi-consumer values.
     {
         extern KernelEntry sched_kernels[];
         extern u32 sched_kernel_count;
+        // First pass: count consumers per source
+        #define FUSE_EDGE_MAX 256
+        typedef struct { u64 src; int is_ten; u64 dst; } FE;
+        FE fedges[FUSE_EDGE_MAX]; u32 n_fe = 0;
         for (u32 ni = 0; ni < nn; ni++) {
             Term t = nodes[ni].term;
             if (term_tag(t) != TAG_TOP || term_ext(t) != UOP_FUSING) continue;
@@ -329,7 +334,6 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             KernelEntry *ke = &sched_kernels[kid];
             for (u32 li = 0; li < ke->n_leaves; li++) {
                 Term lt = ke->leaf_terms[li];
-                // Resolve through views/DP
                 for (int _r = 0; _r < 10; _r++) {
                     if (term_tag(lt)==TAG_DP0||term_tag(lt)==TAG_DP1)
                         { lt = heap_read(ctx, term_val(lt)); continue; }
@@ -337,12 +341,50 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                         { lt = heap_read(ctx, term_val(lt)); continue; }
                     break;
                 }
-                if (term_tag(lt) == TAG_TOP)
-                    fprintf(f, "  n%llu -> n%llu [style=dashed, color=\"#009900\"];\n", term_val(lt), loc);
-                else if (term_tag(lt) == TAG_TEN)
-                    fprintf(f, "  t%u -> n%llu [style=dashed, color=\"#009900\"];\n", (u32)term_val(lt), loc);
+                u64 src = term_val(lt);
+                int is_ten = (term_tag(lt) == TAG_TEN);
+                if (term_tag(lt) != TAG_TOP && !is_ten) continue;
+                // Skip if this source already connects to this kernel via DUP/edge pass
+                int already = 0;
+                if (is_ten) {
+                    for (u32 ei = 0; ei < n_dup_edges; ei++)
+                        if (dup_edges[ei].consumer_loc == loc) { already = 1; break; }
+                }
+                if (already) continue;
+                if (n_fe < FUSE_EDGE_MAX) fedges[n_fe++] = (FE){src, is_ten, loc};
             }
         }
+        // Emit edges, inserting DUP for multi-consumer sources
+        for (u32 i = 0; i < n_fe; i++) {
+            // Count how many kernels read this source
+            u32 n_con = 0;
+            for (u32 j = 0; j < n_fe; j++)
+                if (fedges[j].src == fedges[i].src && fedges[j].is_ten == fedges[i].is_ten) n_con++;
+            if (n_con <= 1) {
+                // Single consumer: direct edge
+                if (fedges[i].is_ten)
+                    fprintf(f, "  t%u -> n%llu [style=dashed,color=\"#009900\"];\n", (u32)fedges[i].src, fedges[i].dst);
+                else
+                    fprintf(f, "  n%llu -> n%llu [style=dashed,color=\"#009900\"];\n", fedges[i].src, fedges[i].dst);
+            } else {
+                // Multi-consumer: emit DUP (once per source)
+                int dup_emitted = 0;
+                for (u32 j = 0; j < i; j++)
+                    if (fedges[j].src == fedges[i].src && fedges[j].is_ten == fedges[i].is_ten) dup_emitted = 1;
+                if (!dup_emitted) {
+                    // Emit DUP node
+                    fprintf(f, "  fdup%llu_%d [label=\"DUP\",shape=invtriangle,fillcolor=\"#d4b8e8\",fontsize=8,width=0.5,height=0.4];\n",
+                            fedges[i].src, fedges[i].is_ten);
+                    if (fedges[i].is_ten)
+                        fprintf(f, "  t%u -> fdup%llu_%d [style=dashed,color=\"#009900\"];\n", (u32)fedges[i].src, fedges[i].src, fedges[i].is_ten);
+                    else
+                        fprintf(f, "  n%llu -> fdup%llu_%d [style=dashed,color=\"#009900\"];\n", fedges[i].src, fedges[i].src, fedges[i].is_ten);
+                }
+                fprintf(f, "  fdup%llu_%d -> n%llu [style=dashed,color=\"#009900\"];\n",
+                        fedges[i].src, fedges[i].is_ten, fedges[i].dst);
+            }
+        }
+        #undef FUSE_EDGE_MAX
     }
 
     fprintf(f, "}\n");

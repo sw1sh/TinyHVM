@@ -961,20 +961,36 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             MEM_FIND_OR_ADD(oid, osz*4, ai);
             for (u32 b=0;b<n_bufs;b++) if(bufs[b].id==oid){bufs[b].is_output=1;break;}
         }
-        // Fusable intermediate elimination: output buffers consumed by exactly
-        // 1 later kernel could be fused away (intermediate never materialized).
-        // Simple heuristic: death == birth + 1 means single consumer.
-        // Also: ANY output consumed only within a short window is fusable.
+        // Dead-chain elimination: if a kernel's output feeds ONLY into dead kernels,
+        // its output is also unnecessary. Mark the kernel dead and zero its output.
+        // Repeat until stable (chains of dead consumers propagate).
         u32 n_fused_away = 0;
-        for (u32 b = 0; b < n_bufs; b++) {
-            if (!bufs[b].is_output) continue;
-            if (bufs[b].birth == bufs[b].death) continue; // final output, keep
-            // Single consumer: death == birth + 1 (consumed by immediately next kernel)
-            // Short-lived: death - birth <= 2 (consumed within 2 kernel steps)
-            if (bufs[b].death - bufs[b].birth <= 2) {
-                bufs[b].size = 0;
-                n_fused_away++;
+        for (u32 _dc = 0; _dc < 20; _dc++) {
+            u32 n_dc = 0;
+            for (u32 ai = 0; ai < n_alive; ai++) {
+                u32 ki = alive[ai];
+                KernelEntry *k = &sched_kernels[ki];
+                if (k->n_ops == 0 && k->n_leaves == 0) continue; // already dead
+                // Check: is this kernel's output consumed by any ALIVE kernel?
+                int has_alive_consumer = 0;
+                u32 out_id = 0x40000000u | ki;
+                for (u32 b = 0; b < n_bufs; b++) {
+                    if (bufs[b].id == out_id && bufs[b].death > bufs[b].birth)
+                        has_alive_consumer = 1; // someone references it after birth
+                }
+                // If no alive consumer and this kernel's output is referenced only
+                // by dead kernels, mark its output buffer as zero-size
+                if (!has_alive_consumer) {
+                    for (u32 b = 0; b < n_bufs; b++) {
+                        if (bufs[b].id == out_id && bufs[b].size > 0) {
+                            bufs[b].size = 0;
+                            n_fused_away++;
+                            n_dc++;
+                        }
+                    }
+                }
             }
+            if (n_dc == 0) break;
         }
         u32 peak_live=0; u64 peak_bytes=0;
         for (u32 ai=0;ai<n_alive;ai++) {

@@ -91,6 +91,23 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
         if (nn < HDOT_MAX) nodes[nn++] = (HNode){t, h};
     }
 
+    // Helper: emit a tensor leaf node (deduped by tid)
+    #define EMIT_TEN(tid) do { \
+        char _sh[64] = ""; int _p = 0; \
+        if ((tid) < ctx->tensor_count) { \
+            TensorMeta *_m = &ctx->tensors[tid]; \
+            for (u32 _d = 0; _d < _m->view.shape.rank; _d++) \
+                _p += snprintf(_sh+_p, sizeof(_sh)-_p, "%s%u", _d?",":"", _m->view.shape.dims[_d]); \
+        } \
+        fprintf(f, "  t%u [label=\"t%u\\n[%s]\", shape=ellipse, fillcolor=\"#e0e0e0\"];\n", (tid), (tid), _sh); \
+    } while(0)
+
+    // Helper: get the node ID string for a term (resolves to n<loc>, t<tid>, or dup<loc>)
+    // Returns the node id in buf. Emits the node definition if needed.
+    // For DP0/DP1: emits a single DUP diamond at the shared location.
+    #define HDOT_DUP_MAX 512
+    u64 dup_emitted[HDOT_DUP_MAX]; u32 n_dup_emitted = 0;
+
     // Emit nodes
     for (u32 ni = 0; ni < nn; ni++) {
         Term t = nodes[ni].term;
@@ -109,63 +126,53 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
 
         // Color by op type
         const char *color;
-        if (is_elementwise(ext))                  color = "#cce5ff"; // blue
+        if (is_elementwise(ext))                    color = "#cce5ff"; // blue
         else if (ext == UOP_SUM || ext == UOP_RMAX) color = "#ffcccc"; // red
-        else if (ext == UOP_FUSING)               color = "#ccffcc"; // green
-        else if (is_view_op(ext))                 color = "#fff3cd"; // yellow
-        else if (ext == UOP_MM)                   color = "#ffccff"; // pink
-        else                                      color = "#f0f0f0"; // gray
+        else if (ext == UOP_FUSING)                 color = "#ccffcc"; // green
+        else if (is_view_op(ext))                   color = "#fff3cd"; // yellow
+        else if (ext == UOP_MM)                     color = "#ffccff"; // pink
+        else                                        color = "#f0f0f0"; // gray
 
         fprintf(f, "  n%llu [label=\"%s\\n[%s]\", fillcolor=\"%s\"];\n",
                 loc, opn, shape, color);
 
-        // Edges: walk children
+        // Edges: walk children, render DUP as single 1-in-2-out diamond
         u32 arity = (ext == UOP_WHERE) ? 3 : 2;
         for (u32 ai = 0; ai < arity; ai++) {
             Term child = heap_read(ctx, loc + ai);
-            // Walk through DP nodes
-            while (term_tag(child) == TAG_DP0 || term_tag(child) == TAG_DP1) {
-                // Emit DUP node
+
+            if (term_tag(child) == TAG_DP0 || term_tag(child) == TAG_DP1) {
                 u64 dp_loc = term_val(child);
-                int dp_port = (term_tag(child) == TAG_DP1) ? 1 : 0;
-                fprintf(f, "  dp%llu_%d [label=\"DUP.%d\", shape=diamond, fillcolor=\"#e8d5f5\", fontsize=8];\n",
-                        dp_loc, dp_port, dp_port);
-                fprintf(f, "  dp%llu_%d -> n%llu;\n", dp_loc, dp_port, loc);
-                child = heap_read(ctx, dp_loc);
-                // Now child is the shared value
-                loc = 0; // don't add another edge below
-                if (term_tag(child) == TAG_TOP) {
-                    u64 cloc = term_val(child);
-                    fprintf(f, "  n%llu -> dp%llu_%d;\n", cloc, dp_loc, dp_port);
-                } else if (term_tag(child) == TAG_TEN) {
-                    u32 tid = (u32)term_val(child);
-                    char sh[64] = ""; int p = 0;
-                    if (tid < ctx->tensor_count) {
-                        TensorMeta *m = &ctx->tensors[tid];
-                        for (u32 d = 0; d < m->view.shape.rank; d++)
-                            p += snprintf(sh+p, sizeof(sh)-p, "%s%u", d?",":"", m->view.shape.dims[d]);
+                const char *port = (term_tag(child) == TAG_DP1) ? "dp1" : "dp0";
+
+                // Emit single DUP node at dp_loc (once)
+                int already = 0;
+                for (u32 di = 0; di < n_dup_emitted; di++)
+                    if (dup_emitted[di] == dp_loc) { already = 1; break; }
+                if (!already && n_dup_emitted < HDOT_DUP_MAX) {
+                    dup_emitted[n_dup_emitted++] = dp_loc;
+                    fprintf(f, "  dup%llu [label=\"DUP\", shape=diamond, fillcolor=\"#e8d5f5\", "
+                            "fontsize=9, width=0.5, height=0.4];\n", dp_loc);
+                    // Input edge: shared value → DUP
+                    Term shared = heap_read(ctx, dp_loc);
+                    if (term_tag(shared) == TAG_TOP)
+                        fprintf(f, "  n%llu -> dup%llu;\n", term_val(shared), dp_loc);
+                    else if (term_tag(shared) == TAG_TEN) {
+                        EMIT_TEN((u32)term_val(shared));
+                        fprintf(f, "  t%u -> dup%llu;\n", (u32)term_val(shared), dp_loc);
                     }
-                    fprintf(f, "  t%u [label=\"t%u\\n[%s]\", shape=ellipse, fillcolor=\"#e0e0e0\"];\n", tid, tid, sh);
-                    fprintf(f, "  t%u -> dp%llu_%d;\n", tid, dp_loc, dp_port);
                 }
-                goto next_arg;
-            }
-            if (term_tag(child) == TAG_TOP) {
+                // Output edge: DUP → consumer (this node), labeled dp0/dp1
+                fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n", dp_loc, term_val(nodes[ni].term), port);
+            } else if (term_tag(child) == TAG_TOP) {
                 fprintf(f, "  n%llu -> n%llu;\n", term_val(child), term_val(nodes[ni].term));
             } else if (term_tag(child) == TAG_TEN) {
-                u32 tid = (u32)term_val(child);
-                char sh[64] = ""; int p = 0;
-                if (tid < ctx->tensor_count) {
-                    TensorMeta *m = &ctx->tensors[tid];
-                    for (u32 d = 0; d < m->view.shape.rank; d++)
-                        p += snprintf(sh+p, sizeof(sh)-p, "%s%u", d?",":"", m->view.shape.dims[d]);
-                }
-                fprintf(f, "  t%u [label=\"t%u\\n[%s]\", shape=ellipse, fillcolor=\"#e0e0e0\"];\n", tid, tid, sh);
-                fprintf(f, "  t%u -> n%llu;\n", tid, term_val(nodes[ni].term));
+                EMIT_TEN((u32)term_val(child));
+                fprintf(f, "  t%u -> n%llu;\n", (u32)term_val(child), term_val(nodes[ni].term));
             }
-            next_arg:;
         }
     }
+    #undef EMIT_TEN
 
     fprintf(f, "}\n");
     fclose(f);

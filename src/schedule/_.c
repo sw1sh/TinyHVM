@@ -515,6 +515,68 @@ static u32 sched_all(TinyHVM *ctx) {
     break; // just diagnostic for now
     }
 
+    // Pass 6: shared-input reduce merge.
+    // Find pairs of reduce kernels that share the same input (e.g., BN mean+var).
+    // Merge into multi-reduce: reduce1(input) + ew + reduce2(result1, input, ...).
+    for (u32 ki = 0; ki < sched_kernel_count; ki++) {
+        KernelEntry *k1 = &sched_kernels[ki];
+        if (!k1->has_reduce) continue;
+        if (k1->n_ops == 0 && k1->n_leaves == 0) continue; // dead
+        if (k1->reduce.reduce2_type) continue; // already multi-reduce
+        // Find another reduce kernel that shares a leaf with k1
+        for (u32 kj = ki + 1; kj < sched_kernel_count; kj++) {
+            KernelEntry *k2 = &sched_kernels[kj];
+            if (!k2->has_reduce) continue;
+            if (k2->n_ops == 0 && k2->n_leaves == 0) continue;
+            if (k2->reduce.reduce2_type) continue;
+            // Check if k2 has a FUSING leaf pointing to k1's FUSING
+            // (k2 consumes k1's output → chain merge, not shared-input)
+            // Instead check if k1 and k2 share a concrete leaf buffer
+            int shared_leaf = -1;
+            for (u32 l1 = 0; l1 < k1->n_leaves; l1++) {
+                if (k1->leaf_ids[l1] == 0 || LEAF_IS_LAZY(k1->leaf_ids[l1])) continue;
+                for (u32 l2 = 0; l2 < k2->n_leaves; l2++) {
+                    if (k2->leaf_ids[l2] == k1->leaf_ids[l1]) {
+                        shared_leaf = (int)l1; break;
+                    }
+                }
+                if (shared_leaf >= 0) break;
+            }
+            if (shared_leaf < 0) continue;
+            // Merge k2 into k1 as reduce2 (multi-reduce)
+            if (k1->n_ops + k2->n_ops > FUSE_MAX_OPS) continue;
+            if (k1->n_leaves + k2->n_leaves > FUSE_MAX_LEAVES) continue;
+            // Set reduce2 spec from k2
+            k1->reduce.reduce2_type = k2->has_reduce;
+            k1->reduce.reduce2_start = k1->n_ops;
+            memcpy(k1->reduce.is_reduce2, k2->reduce.is_reduce, sizeof(k2->reduce.is_reduce));
+            // Append k2's ops with remapped leaf references
+            u32 leaf_offset = k1->n_leaves;
+            for (u32 j = 0; j < k2->n_ops; j++) {
+                FusedOp op = k2->ops[j];
+                if (op.arg_a < k2->n_leaves) op.arg_a += leaf_offset;
+                else op.arg_a = op.arg_a - k2->n_leaves + k1->n_leaves + k2->n_leaves + k1->n_ops;
+                if (op.arg_b < k2->n_leaves) op.arg_b += leaf_offset;
+                else op.arg_b = op.arg_b - k2->n_leaves + k1->n_leaves + k2->n_leaves + k1->n_ops;
+                k1->ops[k1->n_ops++] = op;
+            }
+            // Append k2's leaves
+            for (u32 j = 0; j < k2->n_leaves; j++) {
+                k1->leaf_ids[k1->n_leaves] = k2->leaf_ids[j];
+                k1->leaf_views[k1->n_leaves] = k2->leaf_views[j];
+                k1->leaf_terms[k1->n_leaves] = k2->leaf_terms[j];
+                k1->leaf_sts[k1->n_leaves] = k2->leaf_sts[j];
+                k1->n_leaves++;
+            }
+            // Mark k2 as dead
+            k2->n_ops = 0; k2->n_leaves = 0; k2->has_reduce = 0;
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "  multi_reduce_merge: k1=%u + k2=%u → ops=%u leaves=%u\n",
+                        ki, kj, k1->n_ops, k1->n_leaves);
+            break; // one merge per k1
+        }
+    }
+
     fuse_no_lazy_resolve = 0;
     return total;
 }

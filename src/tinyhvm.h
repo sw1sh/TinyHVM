@@ -480,7 +480,7 @@ static inline const View *st_get(u64 heap_loc) {
 // ============================================================
 // Fused Op / ReduceSpec (used by fuser + codegen + scheduler)
 // ============================================================
-#define FUSE_MAX_OPS    32
+#define FUSE_MAX_OPS    64
 #define FUSE_MAX_LEAVES 64
 
 typedef struct { u32 uop; u32 arg_a; u32 arg_b; } FusedOp;

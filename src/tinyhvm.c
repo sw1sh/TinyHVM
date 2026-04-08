@@ -147,6 +147,6 @@ static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel)
 #include "schedule/_.c"
 
 // ── debug/ — graph dump (DOT/JSON) ──────────────────────────────────────────
-#include "debug/dump.c"
 #include "debug/graph.c"
+#include "debug/dump.c"
 

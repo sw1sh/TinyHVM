@@ -74,17 +74,22 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
     fprintf(f, "  node [fontname=\"Helvetica\", fontsize=10, style=filled, shape=box, margin=\"0.1,0.05\"];\n");
     fprintf(f, "  edge [fontsize=8, fontname=\"Helvetica\"];\n\n");
 
-    // Collect unique terms on the heap (skip duplicates from multi-consumer propagation)
+    // Collect unique terms on the heap — all combinators, not just TAG_TOP
     #define HDOT_MAX 4096
     typedef struct { Term term; u64 loc; } HNode;
     HNode nodes[HDOT_MAX]; u32 nn = 0;
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term t = ctx->heap[h];
         u8 tag = term_tag(t);
-        if (tag != TAG_TOP) continue;
-        u32 ext = term_ext(t);
-        if (ext == UOP_ASSIGN || ext == UOP_GRAD) continue;
-        // Dedup: skip if same term already recorded
+        // Skip pure leaves and already-visited terms
+        if (tag == TAG_ERA || tag == TAG_NUM || tag == TAG_VAR || tag == TAG_ANY) continue;
+        if (tag == TAG_TEN) continue; // emitted inline when referenced
+        if (tag == TAG_DP0 || tag == TAG_DP1) continue; // handled by DUP pass
+        if (tag == TAG_TOP && term_ext(t) == UOP_GRAD) continue;
+        // Need a heap location to walk children
+        u32 arity = tag_arity(tag, term_ext(t));
+        if (arity == 0) continue;
+        // Dedup
         int dup = 0;
         for (u32 i = 0; i < nn; i++) if (nodes[i].term == t) { dup = 1; break; }
         if (dup) continue;
@@ -159,36 +164,56 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
     // Pass 3: emit compute nodes + direct edges (non-DUP children)
     for (u32 ni = 0; ni < nn; ni++) {
         Term t = nodes[ni].term;
+        u8 tag = term_tag(t);
         u64 loc = term_val(t);
         u32 ext = term_ext(t);
-        const char *opn = (ext < UOP_COUNT) ? uop_names[ext] : "?";
-
-        const View *v = st_get(loc);
-        char shape[80] = "";
-        if (v) {
-            int p = 0;
-            for (u32 d = 0; d < v->shape.rank && p < 70; d++)
-                p += snprintf(shape+p, sizeof(shape)-p, "%s%u", d?",":"", v->shape.dims[d]);
+        // Label and color by tag
+        char label[96]; const char *color; const char *nshape = "box";
+        if (tag == TAG_TOP) {
+            const char *opn = (ext < UOP_COUNT) ? uop_names[ext] : "?";
+            const View *v = st_get(loc);
+            char sh[64] = "";
+            if (v) { int p = 0; for (u32 d = 0; d < v->shape.rank && p < 50; d++)
+                p += snprintf(sh+p, sizeof(sh)-p, "%s%u", d?",":"", v->shape.dims[d]); }
+            snprintf(label, sizeof(label), "%s\\n[%s]", opn, sh);
+            if (ext == UOP_ASSIGN)                      color = "#ffd700";
+            else if (is_elementwise(ext))               color = "#cce5ff";
+            else if (ext == UOP_SUM || ext == UOP_RMAX) color = "#ffcccc";
+            else if (ext == UOP_FUSING)                 color = "#ccffcc";
+            else if (is_view_op(ext))                   color = "#fff3cd";
+            else if (ext == UOP_MM)                     color = "#ffccff";
+            else                                        color = "#f0f0f0";
+        } else if (tag == TAG_APP) {
+            snprintf(label, sizeof(label), "APP"); color = "#fce4d6"; // orange
+        } else if (tag == TAG_LAM) {
+            snprintf(label, sizeof(label), "LAM"); color = "#d6fce4"; // mint
+        } else if (tag == TAG_SUP) {
+            snprintf(label, sizeof(label), "SUP\\n#%u", ext); color = "#e4d6fc"; // lavender
+            nshape = "hexagon";
+        } else if (tag == TAG_OP2) {
+            snprintf(label, sizeof(label), "OP2"); color = "#d6e4fc";
+        } else if (tag == TAG_USP) {
+            snprintf(label, sizeof(label), "USP\\n#%u", ext); color = "#fcd6e4";
+        } else if (tag == TAG_MAT) {
+            snprintf(label, sizeof(label), "MAT"); color = "#e4fcd6";
+        } else if (tag == TAG_CTR) {
+            snprintf(label, sizeof(label), "CTR/%u", ext); color = "#d6fcd6";
+        } else {
+            snprintf(label, sizeof(label), "tag%u", tag); color = "#f0f0f0";
         }
 
-        const char *color;
-        if (is_elementwise(ext))                    color = "#cce5ff";
-        else if (ext == UOP_SUM || ext == UOP_RMAX) color = "#ffcccc";
-        else if (ext == UOP_FUSING)                 color = "#ccffcc";
-        else if (is_view_op(ext))                   color = "#fff3cd";
-        else if (ext == UOP_MM)                     color = "#ffccff";
-        else                                        color = "#f0f0f0";
+        fprintf(f, "  n%llu [label=\"%s\", shape=%s, fillcolor=\"%s\"];\n",
+                loc, label, nshape, color);
 
-        fprintf(f, "  n%llu [label=\"%s\\n[%s]\", fillcolor=\"%s\"];\n",
-                loc, opn, shape, color);
-
-        // Direct edges
-        u32 arity = (ext == UOP_WHERE) ? 3 : 2;
+        // Edges to children
+        u32 arity = tag_arity(tag, ext);
         for (u32 ai = 0; ai < arity; ai++) {
             Term child = heap_read(ctx, loc + ai);
-            if (term_tag(child) == TAG_DP0 || term_tag(child) == TAG_DP1) {
-                // Check if this DUP has both consumers (rendered as triangle above)
-                u64 dp_loc = term_val(child);
+            u8 ctag = term_tag(child);
+            u64 cval = term_val(child);
+            if (ctag == TAG_DP0 || ctag == TAG_DP1) {
+                // Check if DUP triangle exists (both consumers present)
+                u64 dp_loc = cval;
                 int has_both = 0;
                 for (u32 di = 0; di < n_dups; di++)
                     if (dups[di].loc == dp_loc && dups[di].dp0_consumer && dups[di].dp1_consumer)
@@ -196,19 +221,28 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
                 if (has_both) continue; // handled by DUP pass
                 // Single-output DUP: draw direct edge from shared value
                 Term shared = heap_read(ctx, dp_loc);
-                if (term_tag(shared) == TAG_TOP)
-                    fprintf(f, "  n%llu -> n%llu;\n", term_val(shared), loc);
-                else if (term_tag(shared) == TAG_TEN) {
+                u8 stag = term_tag(shared);
+                if (stag == TAG_TEN) {
                     EMIT_TEN((u32)term_val(shared));
                     fprintf(f, "  t%u -> n%llu;\n", (u32)term_val(shared), loc);
-                }
-                continue;
-            }
-            if (term_tag(child) == TAG_TOP) {
-                fprintf(f, "  n%llu -> n%llu;\n", term_val(child), loc);
-            } else if (term_tag(child) == TAG_TEN) {
-                EMIT_TEN((u32)term_val(child));
-                fprintf(f, "  t%u -> n%llu;\n", (u32)term_val(child), loc);
+                } else if (stag != TAG_ERA && stag != TAG_NUM)
+                    fprintf(f, "  n%llu -> n%llu;\n", term_val(shared), loc);
+            } else if (ctag == TAG_TEN) {
+                EMIT_TEN((u32)cval);
+                fprintf(f, "  t%u -> n%llu;\n", (u32)cval, loc);
+            } else if (ctag == TAG_ERA) {
+                fprintf(f, "  era%llu_%u [label=\"ERA\", shape=point, width=0.15];\n", loc, ai);
+                fprintf(f, "  era%llu_%u -> n%llu;\n", loc, ai, loc);
+            } else if (ctag == TAG_NUM) {
+                f32 fv; u32 bv = (u32)cval; memcpy(&fv, &bv, 4);
+                fprintf(f, "  num%llu_%u [label=\"%.3g\", shape=plaintext, fontsize=8];\n", loc, ai, fv);
+                fprintf(f, "  num%llu_%u -> n%llu;\n", loc, ai, loc);
+            } else if (ctag == TAG_VAR) {
+                fprintf(f, "  var%llu [label=\"VAR\", shape=circle, fillcolor=\"#ffffcc\", width=0.3, fontsize=8];\n", cval);
+                fprintf(f, "  var%llu -> n%llu;\n", cval, loc);
+            } else {
+                // Other combinator: link by heap location
+                fprintf(f, "  n%llu -> n%llu;\n", cval, loc);
             }
         }
     }

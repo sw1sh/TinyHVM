@@ -282,6 +282,7 @@
             if (term_tag(val) == TAG_ERA) return val;
             if (term_tag(val) == TAG_NUM) return val;
             if (term_tag(val) == TAG_ANY) return val;
+            if (term_tag(val) == TAG_CTR) return val; // grad target encoding — atom
             // DUP ⊳ TOP: WNF compute ops are read-only (shared lazily, like TAG_TEN).
             // GRAD reads them as y-arguments; both projections get the same TAG_TOP.
             if (term_tag(val) == TAG_TOP) return val;

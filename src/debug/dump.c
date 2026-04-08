@@ -115,10 +115,11 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             HDOT_ENQ(ht);
         }
     }
-    // BFS: walk ALL children
+    // BFS: walk children (skip FUSING metadata)
     while (qh < qt) {
         Term t = bfs[qh++];
         u8 tag = term_tag(t); u32 ext = term_ext(t);
+        if (tag == TAG_TOP && ext == UOP_FUSING) continue; // FUSING heap children are metadata
         u32 arity = tag_arity(tag, ext);
         u64 loc = term_val(t);
         for (u32 ai = 0; ai < arity; ai++) {
@@ -251,8 +252,9 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             fprintf(stderr, "\n");
         }
 
-        // --- Child edges (faithful: every child) ---
+        // --- Child edges ---
         u32 arity = tag_arity(tag, ext);
+        if (tag == TAG_TOP && ext == UOP_FUSING) arity = 0; // FUSING heap slots are metadata
         for (u32 ai = 0; ai < arity; ai++) {
             Term child = heap_read(ctx, loc + ai);
             u8 ctag = term_tag(child); u64 cval = term_val(child);

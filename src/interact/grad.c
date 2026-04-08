@@ -78,24 +78,16 @@
                     // Chain gradients: both branches must fire (side-effect ASSIGNs).
                     // DUP all shared terms (at, bt, gy, x) so each branch gets its own port.
                     // _gb continues inline, _ga is placed on heap for Phase 1 scan.
-                    // DUP a term for two-branch consumption: returns (dp0, dp1)
-                    #define DUP2(t, v0, v1) do { \
-                        u64 _dl = heap_alloc(ctx, 1); heap_set(ctx, _dl, (t)); \
-                        v0 = term_new(TAG_DP0, 0, _dl); v1 = term_new(TAG_DP1, 0, _dl); \
-                    } while(0)
+                    // Binary gradient: both branches share at, bt, gy, x.
+                    // Only DUP gy (used in both da_expr and db_expr).
+                    // at/bt/x are NOT DUP'd: at goes to branch A (GRAD target),
+                    // bt goes to branch B (GRAD target), x goes to branch B.
+                    // Branch A's _ga is placed on heap; Branch B's _gb continues inline.
                     #define BG(da_expr, db_expr) do { \
-                        /* DUP shared terms: each branch gets one port */ \
-                        Term gy0, gy1; DUP2(gy, gy0, gy1); \
-                        Term at0, at1; DUP2(at, at0, at1); \
-                        Term bt0, bt1; DUP2(bt, bt0, bt1); \
-                        Term x0,  x1;  DUP2(x,  x0,  x1); \
-                        /* Compute da (branch A) using dp0 copies */ \
-                        Term _da; { Term gy=gy0, at=at0, bt=bt0; (void)gy; (void)at; (void)bt; _da = (da_expr); } \
-                        /* Compute db (branch B) using dp1 copies */ \
-                        Term _db; { Term gy=gy1, at=at1, bt=bt1; (void)gy; (void)at; (void)bt; _db = (db_expr); } \
-                        /* GRAD nodes: branch A follows at, branch B follows bt */ \
-                        Term _ga = GRAD3_H(at0, _da, x0); \
-                        Term _gb = GRAD3_H(bt1, _db, x1); \
+                        Term _da = (da_expr); \
+                        Term _db = (db_expr); \
+                        Term _ga = GRAD3_H(at, _da, x); \
+                        Term _gb = GRAD3_H(bt, _db, x); \
                         u64 _ph = heap_alloc(ctx, 1); \
                         heap_set(ctx, _ph, _ga); \
                         GRAD_STEP(_gb); \
@@ -156,6 +148,13 @@
 
                     // Multi-target: x = TAG_CTR encoding (param, slot) pairs.
                     // When y matches a param, deposit gy via ASSIGN into the slot.
+                    // x may be DP0/DP1 reference (from BG DUP) — resolve through.
+                    { Term _xr = x;
+                      while (term_tag(_xr) == TAG_DP0 || term_tag(_xr) == TAG_DP1)
+                          _xr = heap_read(ctx, term_val(_xr));
+                      x = _xr; }
+                    if (getenv("THVM_SCHED_DIAG") && y_id < 10)
+                        fprintf(stderr, "  GRAD_TEN_X: y_id=%u x_tag=%u x_ext=%u\n", y_id, term_tag(x), term_ext(x));
                     if (term_tag(x) == TAG_CTR) {
                         u64 tgt_loc = term_val(x);
                         u32 n_tgt = term_as_u32(heap_read(ctx, tgt_loc));

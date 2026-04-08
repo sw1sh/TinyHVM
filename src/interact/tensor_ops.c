@@ -1,9 +1,9 @@
             // === Phase 3 inet ops ===
 
             if (uop == UOP_ASSIGN) {
-                // Args WNF from trampoline. When reached via inet_step
-                // (combinator chain), args may be unreduced — return t
-                // so the trampoline re-enters and reduces args.
+                // ASSIGN is WNF until phase 3 explicitly enables it.
+                { extern int _assign_dispatch_enabled;
+                  if (!_assign_dispatch_enabled) return t; }
                 Term dst_r = heap_read(ctx, loc);
                 Term src_t = heap_read(ctx, loc + 1);
                 if (getenv("THVM_SCHED_DIAG"))

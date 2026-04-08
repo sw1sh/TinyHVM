@@ -16,6 +16,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 // NO flags. Compute ops are WNF because interact handler returns t.
 
 int fuse_no_lazy_resolve = 0;
+int _assign_dispatch_enabled = 0;
 
 // Global kernel table: scheduler writes, UOP_FUSING handler reads.
 KernelEntry sched_kernels[SCHED_MAX_KERNELS];
@@ -781,7 +782,8 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     { Backend *be = ctx_default_backend(ctx);
       if (be && be->end_batch) be->end_batch(); }
 
-    // Phase 3: Fire ASSIGNs.
+    // Phase 3: Fire ASSIGNs (enable dispatch, then reduce each).
+    _assign_dispatch_enabled = 1;
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
@@ -789,6 +791,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             ctx->heap[h] = r;
         }
     }
+    _assign_dispatch_enabled = 0;
     // Phase 3 graph: after dispatch — materialized tensors + remaining combinators
     if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_3_post_dispatch.dot");
 

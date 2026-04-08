@@ -75,13 +75,27 @@
                           else if (term_tag(_gt)==TAG_TOP) _gv=st_get(term_val(_gt)); \
                           if (_gv) st_set(_l, _gv); } \
                         term_new(TAG_TOP, UOP_GRAD, _l); })
-                    // Chain gradients: SUP wraps both. DUP then evaluates each.
-                    // Binary backward: both branches must fire (side-effect ASSIGNs).
-                    // _gb continues inline via GRAD_STEP (trampoline follows it).
-                    // _ga is placed on the heap as a pending GRAD term.
-                    // thvm_eval's Phase 1 scan finds and reduces pending GRADs.
-                    #define BG(da_,db_) do { \
-                        Term _ga=GRAD3_H(at,da_,x), _gb=GRAD3_H(bt,db_,x); \
+                    // Chain gradients: both branches must fire (side-effect ASSIGNs).
+                    // DUP all shared terms (at, bt, gy, x) so each branch gets its own port.
+                    // _gb continues inline, _ga is placed on heap for Phase 1 scan.
+                    // DUP a term for two-branch consumption: returns (dp0, dp1)
+                    #define DUP2(t, v0, v1) do { \
+                        u64 _dl = heap_alloc(ctx, 1); heap_set(ctx, _dl, (t)); \
+                        v0 = term_new(TAG_DP0, 0, _dl); v1 = term_new(TAG_DP1, 0, _dl); \
+                    } while(0)
+                    #define BG(da_expr, db_expr) do { \
+                        /* DUP shared terms: each branch gets one port */ \
+                        Term gy0, gy1; DUP2(gy, gy0, gy1); \
+                        Term at0, at1; DUP2(at, at0, at1); \
+                        Term bt0, bt1; DUP2(bt, bt0, bt1); \
+                        Term x0,  x1;  DUP2(x,  x0,  x1); \
+                        /* Compute da (branch A) using dp0 copies */ \
+                        Term _da; { Term gy=gy0, at=at0, bt=bt0; (void)gy; (void)at; (void)bt; _da = (da_expr); } \
+                        /* Compute db (branch B) using dp1 copies */ \
+                        Term _db; { Term gy=gy1, at=at1, bt=bt1; (void)gy; (void)at; (void)bt; _db = (db_expr); } \
+                        /* GRAD nodes: branch A follows at, branch B follows bt */ \
+                        Term _ga = GRAD3_H(at0, _da, x0); \
+                        Term _gb = GRAD3_H(bt1, _db, x1); \
                         u64 _ph = heap_alloc(ctx, 1); \
                         heap_set(ctx, _ph, _ga); \
                         GRAD_STEP(_gb); \

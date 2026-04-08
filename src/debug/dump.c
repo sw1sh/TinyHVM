@@ -83,8 +83,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     // BFS from roots — collect ALL reachable terms
     #define HDOT_MAX 4096
     typedef struct { Term term; } HNode;
-    HNode nodes[HDOT_MAX]; u32 nn = 0;
-    Term bfs[HDOT_MAX]; u32 qh = 0, qt = 0;
+    HNode *nodes = (HNode*)malloc(HDOT_MAX * sizeof(HNode)); u32 nn = 0;
+    Term *bfs = (Term*)malloc(HDOT_MAX * sizeof(Term)); u32 qh = 0, qt = 0;
 
     #define HDOT_ENQ(t) do { \
         Term _t = (t); \
@@ -144,10 +144,10 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     // Collect DUP info — each DP reference becomes an output edge
     #define HDOT_DUP_MAX 512
     #define HDOT_DUP_EDGE_MAX 1024
-    typedef struct { u64 dp_loc; u64 consumer_loc; int is_dp1; } DupEdge;
-    DupEdge dup_edges[HDOT_DUP_EDGE_MAX]; u32 n_dup_edges = 0;
+    typedef struct { u64 dp_loc; u64 consumer_loc; int is_dp1; u32 child_idx; u8 consumer_tag; u32 consumer_ext; } DupEdge;
+    DupEdge *dup_edges = (DupEdge*)malloc(HDOT_DUP_EDGE_MAX * sizeof(DupEdge)); u32 n_dup_edges = 0;
     // Unique DUP locations
-    u64 dup_locs[HDOT_DUP_MAX]; u32 n_dup_locs = 0;
+    u64 *dup_locs = (u64*)malloc(HDOT_DUP_MAX * sizeof(u64)); u32 n_dup_locs = 0;
 
     for (u32 ni = 0; ni < nn; ni++) {
         Term t = nodes[ni].term;
@@ -159,7 +159,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             u64 dl = term_val(c);
             // Record edge
             if (n_dup_edges < HDOT_DUP_EDGE_MAX)
-                dup_edges[n_dup_edges++] = (DupEdge){dl, loc, term_tag(c) == TAG_DP1};
+                dup_edges[n_dup_edges++] = (DupEdge){dl, loc, term_tag(c) == TAG_DP1, ai, term_tag(t), term_ext(t)};
             // Record unique location
             int found = 0;
             for (u32 di = 0; di < n_dup_locs; di++) if (dup_locs[di] == dl) { found = 1; break; }
@@ -190,7 +190,21 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         int has_dp0 = 0, has_dp1 = 0;
         for (u32 ei = 0; ei < n_dup_edges; ei++) {
             if (dup_edges[ei].dp_loc != dl) continue;
-            const char *lbl = dup_edges[ei].is_dp1 ? "dp1" : "dp0";
+            // Combined label: dp0/dp1 + child role
+            char lbl[32];
+            const char *port = dup_edges[ei].is_dp1 ? "dp1" : "dp0";
+            const char *role = "";
+            u8 ctag = dup_edges[ei].consumer_tag;
+            u32 cext = dup_edges[ei].consumer_ext;
+            u32 ci = dup_edges[ei].child_idx;
+            if (ctag == TAG_TOP) {
+                if (cext == UOP_ASSIGN) role = ci==0 ? "-tgt" : "-src";
+                else if (cext >= UOP_RESHAPE && cext <= UOP_PAD) role = ci==0 ? "-in" : "-shape";
+                else if (cext == UOP_SUM || cext == UOP_RMAX) role = ci==0 ? "-in" : "-axes";
+                else if (cext == UOP_GRAD) role = ci==0 ? "-y" : ci==1 ? "-gy" : "-x";
+                else if (is_binary(cext)) role = ci==0 ? "-a" : "-b";
+            } else if (ctag == TAG_APP) role = ci==0 ? "-fn" : "-arg";
+            snprintf(lbl, sizeof(lbl), "%s%s", port, role);
             fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n", dl, dup_edges[ei].consumer_loc, lbl);
             if (dup_edges[ei].is_dp1) has_dp1 = 1; else has_dp0 = 1;
         }
@@ -389,6 +403,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
 
     fprintf(f, "}\n");
     fclose(f);
+    free(dup_edges); free(dup_locs); free(nodes); free(bfs);
     fprintf(stderr, "heap_dot: %u nodes → %s\n", nn, path);
     #undef HDOT_MAX
     #undef HDOT_DUP_MAX

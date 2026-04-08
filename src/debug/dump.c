@@ -252,7 +252,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 if (cval < ctx->tensor_count) { TensorMeta *_m=&ctx->tensors[cval];
                     for (u32 _d=0;_d<_m->view.shape.rank;_d++)
                         _p+=snprintf(_sh+_p,sizeof(_sh)-_p,"%s%u",_d?",":"",_m->view.shape.dims[_d]); }
-                fprintf(f, "  t%u [label=\"t%u\\n[%s]\",shape=ellipse,fillcolor=\"#e0e0e0\"];\n",(u32)cval,(u32)cval,_sh);
+                fprintf(f, "  t%u [label=\"t%u\\n[%s]\",shape=triangle,fillcolor=\"#e0e0e0\"];\n",(u32)cval,(u32)cval,_sh);
                 fprintf(f, "  t%u -> n%llu;\n", (u32)cval, loc);
             } else if (ctag == TAG_ERA) {
                 fprintf(f, "  era%llu_%u [label=\"\",shape=point,width=0.1];\n", loc, ai);

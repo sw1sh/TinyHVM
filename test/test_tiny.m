@@ -22,7 +22,6 @@ int main(void) {
     // Forward: loss = sum(relu(x * w))
     Term h = thvm_op(ctx, UOP_MUL, x, w);
     h = thvm_op(ctx, UOP_RELU, h, term_era());
-    extern Term thvm_sum_axes(TinyHVM*, Term, const u32*, u32);
     Term loss = thvm_sum_axes(ctx, h, (u32[]){0, 1}, 2);
 
     // Backward

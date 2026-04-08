@@ -66,7 +66,11 @@ static void thvm_dump_dot(TinyHVM *ctx, const char *path) {
 // Dump live heap compute graph as DOT (tinygrad-style: clean, compact, colored by op type).
 // Walks TAG_TOP nodes on heap. Skips view ops (shows as edge labels).
 // Colors: blue=ew, red=reduce, green=FUSING, yellow=view, gray=tensor, purple=DUP.
+static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
+    thvm_heap_dot_root(ctx, path, term_era());
+}
+static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     FILE *f = fopen(path, "w");
     if (!f) { fprintf(stderr, "heap_dot: can't open %s\n", path); return; }
     fprintf(f, "digraph G {\n");
@@ -74,63 +78,53 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
     fprintf(f, "  node [fontname=\"Helvetica\", fontsize=10, style=filled, shape=box, margin=\"0.1,0.05\"];\n");
     fprintf(f, "  edge [fontsize=8, fontname=\"Helvetica\"];\n\n");
 
-    // Collect unique terms on the heap — all combinators, not just TAG_TOP
+    // BFS from roots to collect reachable nodes
     #define HDOT_MAX 4096
     typedef struct { Term term; u64 loc; } HNode;
     HNode nodes[HDOT_MAX]; u32 nn = 0;
-    for (u64 h = 1; h < ctx->heap_pos; h++) {
-        Term t = ctx->heap[h];
-        u8 tag = term_tag(t);
-        // Skip pure leaves and already-visited terms
-        if (tag == TAG_ERA || tag == TAG_NUM || tag == TAG_VAR || tag == TAG_ANY) continue;
-        if (tag == TAG_TEN) continue; // emitted inline when referenced
-        if (tag == TAG_DP0 || tag == TAG_DP1) continue; // handled by DUP pass
-        if (tag == TAG_TOP && term_ext(t) == UOP_GRAD) continue;
-        // Need a heap location to walk children
-        u32 arity = tag_arity(tag, term_ext(t));
-        if (arity == 0) continue;
-        // Dedup
-        int dup = 0;
-        for (u32 i = 0; i < nn; i++) if (nodes[i].term == t) { dup = 1; break; }
-        if (dup) continue;
-        if (nn < HDOT_MAX) nodes[nn++] = (HNode){t, h};
-    }
+    Term queue[HDOT_MAX]; u32 qh = 0, qt = 0;
 
-    // Filter: remove nodes with no consumers (disconnected islands)
-    // Keep: ASSIGN, FUSING, nodes referenced by other nodes as children
-    {
-        u8 has_consumer[HDOT_MAX]; memset(has_consumer, 0, nn);
-        // Mark roots (ASSIGN, FUSING)
-        for (u32 i = 0; i < nn; i++) {
-            u8 tag = term_tag(nodes[i].term);
-            u32 ext = term_ext(nodes[i].term);
-            if (tag == TAG_TOP && (ext == UOP_ASSIGN || ext == UOP_FUSING))
-                has_consumer[i] = 1;
-            if (tag == TAG_APP || tag == TAG_LAM) // IC combinators are roots
-                has_consumer[i] = 1;
-        }
-        // Mark nodes that are children of other nodes
-        for (u32 i = 0; i < nn; i++) {
-            u64 loc = term_val(nodes[i].term);
-            u32 ar = tag_arity(term_tag(nodes[i].term), term_ext(nodes[i].term));
-            for (u32 ai = 0; ai < ar; ai++) {
-                Term child = heap_read(ctx, loc + ai);
-                // Resolve through DP
-                if (term_tag(child) == TAG_DP0 || term_tag(child) == TAG_DP1)
-                    child = heap_read(ctx, term_val(child));
-                if (term_tag(child) != TAG_TOP && term_tag(child) != TAG_APP &&
-                    term_tag(child) != TAG_LAM && term_tag(child) != TAG_SUP) continue;
-                u64 cloc = term_val(child);
-                for (u32 j = 0; j < nn; j++)
-                    if (term_val(nodes[j].term) == cloc) has_consumer[j] = 1;
+    // Helper: add term to BFS queue + nodes (deduped)
+    #define HDOT_ENQUEUE(t) do { \
+        Term _t = (t); u8 _tag = term_tag(_t); \
+        if (_tag == TAG_ERA || _tag == TAG_NUM || _tag == TAG_TEN || \
+            _tag == TAG_VAR || _tag == TAG_ANY) break; \
+        int _dup = 0; \
+        for (u32 _i = 0; _i < nn; _i++) if (nodes[_i].term == _t) { _dup = 1; break; } \
+        if (!_dup && nn < HDOT_MAX) { \
+            nodes[nn] = (HNode){_t, term_val(_t)}; nn++; \
+            if (qt < HDOT_MAX) queue[qt++] = _t; \
+        } \
+    } while(0)
+
+    // Seed: explicit root term
+    if (term_tag(root) != TAG_ERA) HDOT_ENQUEUE(root);
+    // Seed: all live TAG_TOP terms on the heap (not just ASSIGN/FUSING)
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) == TAG_TOP && term_ext(ht) != UOP_GRAD)
+            HDOT_ENQUEUE(ht);
+    }
+    // BFS: walk children
+    while (qh < qt) {
+        Term t = queue[qh++];
+        u8 tag = term_tag(t);
+        u32 ext = term_ext(t);
+        if (tag == TAG_TOP && ext == UOP_FUSING) continue; // FUSING children are metadata
+        u32 arity = tag_arity(tag, ext);
+        u64 loc = term_val(t);
+        for (u32 ai = 0; ai < arity; ai++) {
+            Term child = heap_read(ctx, loc + ai);
+            // Resolve DP to shared value (the DUP itself is handled separately)
+            if (term_tag(child) == TAG_DP0 || term_tag(child) == TAG_DP1) {
+                Term shared = heap_read(ctx, term_val(child));
+                HDOT_ENQUEUE(shared);
+            } else {
+                HDOT_ENQUEUE(child);
             }
         }
-        // Compact: remove nodes without consumers
-        u32 new_nn = 0;
-        for (u32 i = 0; i < nn; i++)
-            if (has_consumer[i]) nodes[new_nn++] = nodes[i];
-        nn = new_nn;
     }
+    #undef HDOT_ENQUEUE
 
     // Helper: emit a tensor leaf node (deduped by tid)
     #define EMIT_TEN(tid) do { \

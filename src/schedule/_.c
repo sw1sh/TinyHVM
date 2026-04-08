@@ -1,5 +1,6 @@
-// Forward declaration (defined in debug/dump.c, included after this file)
+// Forward declarations (defined in debug/graph.c + debug/dump.c, included after this file)
 static void thvm_heap_dot(TinyHVM *ctx, const char *path);
+static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 
 // schedule/_.c — Three-phase eval: reduce → schedule(rewrite) → reduce
 //
@@ -683,8 +684,8 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     sched_kernel_count = 0;
     for (u32 i = 0; i < SCHED_MAX_KERNELS; i++) kid_results[i] = term_era();
 
-    // Phase 0 graph: before reduce — GRAD nodes visible
-    if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_0_pre_reduce.dot");
+    // Phase 0 graph: before reduce — full graph from root term t
+    if (getenv("THVM_GRAPH")) thvm_heap_dot_root(ctx, "/tmp/thvm_0_pre_reduce.dot", t);
 
     // Phase 1: Pure IC reduce — GRAD fires, compute/movement ops stay TAG_TOP (WNF).
     t = thvm_reduce(ctx, t);

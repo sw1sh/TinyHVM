@@ -111,14 +111,38 @@
                     RETURN_REDUCED(kid_results[kid]);
                 KernelEntry *ke = &sched_kernels[kid];
 
-                // Dead kernel: redirect to absorber
+                // Dead kernel: redirect to absorber (force absorber dispatch if needed)
                 if (ke->n_ops == 0 && ke->n_leaves == 0) {
                     extern u32 sched_absorber[];
                     u32 abs_kid = sched_absorber[kid];
-                    if (abs_kid < sched_kernel_count &&
-                        term_tag(kid_results[abs_kid]) != TAG_ERA) {
-                        kid_results[kid] = kid_results[abs_kid];
-                        RETURN_REDUCED(kid_results[abs_kid]);
+                    // Follow absorber chain
+                    while (abs_kid < sched_kernel_count &&
+                           sched_kernels[abs_kid].n_ops == 0 &&
+                           sched_kernels[abs_kid].n_leaves == 0 &&
+                           sched_absorber[abs_kid] < sched_kernel_count) {
+                        abs_kid = sched_absorber[abs_kid];
+                    }
+                    if (abs_kid < sched_kernel_count) {
+                        if (term_tag(kid_results[abs_kid]) != TAG_ERA) {
+                            kid_results[kid] = kid_results[abs_kid];
+                            RETURN_REDUCED(kid_results[abs_kid]);
+                        }
+                        // Absorber not dispatched yet — mark dead kernel as "pending" to break cycles
+                        kid_results[kid] = term_new(TAG_NUM, 0, 0); // placeholder to prevent re-entry
+                        for (u64 _ah = 1; _ah < ctx->heap_pos; _ah++) {
+                            Term _at = ctx->heap[_ah];
+                            if (term_tag(_at)==TAG_TOP && term_ext(_at)==UOP_FUSING) {
+                                Term _akt = heap_read(ctx, term_val(_at)+1);
+                                if (term_tag(_akt)==TAG_NUM && (u32)term_val(_akt)==abs_kid) {
+                                    Term _ar = thvm_reduce(ctx, _at);
+                                    if (term_tag(_ar)==TAG_TEN) {
+                                        kid_results[kid] = _ar;
+                                        RETURN_REDUCED(_ar);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                     }
                     RETURN_REDUCED(term_era());
                 }
@@ -146,9 +170,20 @@
                                 Term _ht = ctx->heap[_sh];
                                 if (term_tag(_ht) == TAG_TOP && term_ext(_ht) == UOP_FUSING) {
                                     extern KernelEntry sched_kernels[];
+                                    extern u32 sched_absorber[];
                                     Term _kid_t = heap_read(ctx, term_val(_ht) + 1);
                                     u32 _kid = (u32)term_val(_kid_t);
                                     if (_kid < sched_kernel_count && sched_kernels[_kid].original_term == lt) {
+                                        // Follow absorber chain for dead kernels
+                                        while (_kid < sched_kernel_count &&
+                                               sched_kernels[_kid].n_ops == 0 &&
+                                               sched_kernels[_kid].n_leaves == 0 &&
+                                               sched_absorber[_kid] < sched_kernel_count) {
+                                            _kid = sched_absorber[_kid];
+                                        }
+                                        if (term_tag(kid_results[_kid]) != TAG_ERA) {
+                                            lid = (u32)term_val(kid_results[_kid]); break;
+                                        }
                                         lr = thvm_reduce(ctx, _ht);
                                         if (term_tag(lr) == TAG_TEN) { lid = (u32)term_val(lr); break; }
                                     }
@@ -172,14 +207,35 @@
                                 // Try to dispatch the inner term
                                 Term _ir = thvm_reduce(ctx, _inner);
                                 if (term_tag(_ir) != TAG_TEN) {
-                                    // Scan heap for FUSING that replaced inner
+                                    // Scan heap for FUSING that replaced inner (follow absorber chain)
+                                    extern u32 sched_absorber[];
                                     for (u64 _sh2 = 1; _sh2 < ctx->heap_pos; _sh2++) {
                                         Term _ht2 = ctx->heap[_sh2];
                                         if (term_tag(_ht2) == TAG_TOP && term_ext(_ht2) == UOP_FUSING) {
                                             Term _kid_t2 = heap_read(ctx, term_val(_ht2) + 1);
                                             u32 _kid2 = (u32)term_val(_kid_t2);
                                             if (_kid2 < sched_kernel_count && sched_kernels[_kid2].original_term == _inner) {
-                                                _ir = thvm_reduce(ctx, _ht2);
+                                                // Follow absorber chain for dead kernels
+                                                while (_kid2 < sched_kernel_count &&
+                                                       sched_kernels[_kid2].n_ops == 0 &&
+                                                       sched_kernels[_kid2].n_leaves == 0 &&
+                                                       sched_absorber[_kid2] < sched_kernel_count) {
+                                                    _kid2 = sched_absorber[_kid2];
+                                                }
+                                                if (term_tag(kid_results[_kid2]) != TAG_ERA) {
+                                                    _ir = kid_results[_kid2]; break;
+                                                }
+                                                // Find absorber's FUSING on heap and reduce it
+                                                for (u64 _sh3 = 1; _sh3 < ctx->heap_pos; _sh3++) {
+                                                    Term _ht3 = ctx->heap[_sh3];
+                                                    if (term_tag(_ht3)==TAG_TOP && term_ext(_ht3)==UOP_FUSING) {
+                                                        Term _kt3 = heap_read(ctx, term_val(_ht3)+1);
+                                                        if (term_tag(_kt3)==TAG_NUM && (u32)term_val(_kt3)==_kid2) {
+                                                            _ir = thvm_reduce(ctx, _ht3);
+                                                            if (term_tag(_ir)==TAG_TEN) break;
+                                                        }
+                                                    }
+                                                }
                                                 if (term_tag(_ir) == TAG_TEN) break;
                                             }
                                         }

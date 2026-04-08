@@ -334,21 +334,25 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             KernelEntry *ke = &sched_kernels[kid];
             for (u32 li = 0; li < ke->n_leaves; li++) {
                 Term lt = ke->leaf_terms[li];
+                // Resolve through views only (NOT through DP — DUP pass handles those)
                 for (int _r = 0; _r < 10; _r++) {
-                    if (term_tag(lt)==TAG_DP0||term_tag(lt)==TAG_DP1)
-                        { lt = heap_read(ctx, term_val(lt)); continue; }
                     if (term_tag(lt)==TAG_TOP && is_view_op(term_ext(lt)))
                         { lt = heap_read(ctx, term_val(lt)); continue; }
                     break;
                 }
+                // If leaf is a DP reference, the DUP triangle handles it — skip
+                if (term_tag(lt)==TAG_DP0 || term_tag(lt)==TAG_DP1) continue;
                 u64 src = term_val(lt);
                 int is_ten = (term_tag(lt) == TAG_TEN);
                 if (term_tag(lt) != TAG_TOP && !is_ten) continue;
-                // Skip if this source already connects to this kernel via DUP/edge pass
+                // Skip if tensor already appears as a DUP input (shared by another path)
                 int already = 0;
                 if (is_ten) {
-                    for (u32 ei = 0; ei < n_dup_edges; ei++)
-                        if (dup_edges[ei].consumer_loc == loc) { already = 1; break; }
+                    for (u32 di = 0; di < n_dup_locs; di++) {
+                        Term shared = heap_read(ctx, dup_locs[di]);
+                        if (term_tag(shared) == TAG_TEN && term_val(shared) == src)
+                            { already = 1; break; }
+                    }
                 }
                 if (already) continue;
                 if (n_fe < FUSE_EDGE_MAX) fedges[n_fe++] = (FE){src, is_ten, loc};

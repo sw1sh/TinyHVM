@@ -307,8 +307,7 @@ static u32 sched_all(TinyHVM *ctx) {
         if (era_progress == 0) break;
     }
 
-    // Two-pass: reduces first (absorb ew children), then remaining ew.
-    // Pass 1: reduce roots (SUM, RMAX, RESHAPE(SUM/RMAX))
+    // Pass 1: reduces first (absorb ew children)
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) != TAG_TOP) continue;
@@ -322,7 +321,7 @@ static u32 sched_all(TinyHVM *ctx) {
         if (!is_reduce_root) continue;
         sched_one(ctx, ht, h);
     }
-    // Pass 2: remaining compute ops (skip absorbed — they're fused into reduce kernels)
+    // Pass 2: remaining ew ops (skip absorbed)
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) != TAG_TOP) continue;

@@ -711,6 +711,129 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     if (walk_result < 0) { ke->fail_code = 1; return 0; }
     fuse_remap(ops, n_ops, n_leaves);
 
+    // Post-reduce ew fusion: if we're an ew-only kernel and one leaf is a
+    // SUM/RMAX (or RESHAPE(SUM/RMAX)), absorb it as the kernel's reduce.
+    // The current ops become post-reduce; the reduce's ew input becomes pre-reduce.
+    if (!has_reduce && n_ops > 0) {
+        for (u32 li = 0; li < n_leaves; li++) {
+            if (!LEAF_IS_LAZY(leaf_ids[li]) && leaf_ids[li] != 0) continue;
+            Term lt = fuse_leaf_terms[li];
+            if (term_tag(lt) != TAG_TOP) continue;
+            u32 lt_uop = term_ext(lt);
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "  prf_check: li=%u lt_uop=%s lazy=%d\n", li,
+                        lt_uop < UOP_COUNT ? uop_names[lt_uop] : "?", LEAF_IS_LAZY(leaf_ids[li]));
+            Term reduce_t = term_era(), reshape_t2 = term_era();
+            if (lt_uop == UOP_SUM || lt_uop == UOP_RMAX) {
+                reduce_t = lt;
+            } else if (is_view_op(lt_uop)) {
+                // Walk through view chain to find reduce
+                Term inner_lt = lt;
+                while (term_tag(inner_lt) == TAG_TOP && is_view_op(term_ext(inner_lt))) {
+                    Term nx = heap_read(ctx, term_val(inner_lt));
+                    if (term_tag(nx) == TAG_DP0 || term_tag(nx) == TAG_DP1)
+                        nx = heap_read(ctx, term_val(nx));
+                    if (getenv("THVM_SCHED_DIAG"))
+                        fprintf(stderr, "  prf_viewwalk: nx_tag=%u nx_ext=%s\n",
+                                term_tag(nx), (term_tag(nx)==TAG_TOP && term_ext(nx)<UOP_COUNT) ? uop_names[term_ext(nx)] : "?");
+                    if (term_tag(nx) == TAG_TOP && (term_ext(nx)==UOP_SUM||term_ext(nx)==UOP_RMAX)) {
+                        reshape_t2 = lt; reduce_t = nx; break;
+                    }
+                    inner_lt = nx;
+                }
+            }
+            if (term_tag(reduce_t) != TAG_TOP) continue;
+            // Found reduce leaf at index li. Absorb it.
+            // Save post-reduce state
+            u32 post_n_ops = n_ops, post_n_leaves = n_leaves;
+            FusedOp post_ops[FUSE_MAX_OPS];
+            memcpy(post_ops, ops, post_n_ops * sizeof(FusedOp));
+            u32 post_leaf_ids[FUSE_MAX_LEAVES];
+            const View *post_leaf_views[FUSE_MAX_LEAVES];
+            Term post_leaf_terms[FUSE_MAX_LEAVES];
+            ShapeTracker post_leaf_sts[FUSE_MAX_LEAVES];
+            for (u32 j = 0; j < post_n_leaves; j++) {
+                post_leaf_ids[j] = leaf_ids[j];
+                post_leaf_views[j] = leaf_views_p[j];
+                post_leaf_terms[j] = fuse_leaf_terms[j];
+                post_leaf_sts[j] = fuse_leaf_sts[j];
+            }
+            // Walk the reduce's ew input for pre-reduce ops
+            has_reduce = term_ext(reduce_t);
+            sum_term = reduce_t;
+            reshape_term = reshape_t2;
+            u64 sum_loc = term_val(reduce_t);
+            Term reduce_input = heap_read(ctx, sum_loc);
+            if (term_tag(reduce_input) == TAG_DP0 || term_tag(reduce_input) == TAG_DP1)
+                reduce_input = heap_read(ctx, term_val(reduce_input));
+            n_ops = 0; n_leaves = 0;
+            int pre_walk = fuse_walk_inner(ctx, reduce_input, ops, &n_ops, leaf_ids, leaf_views_p, &n_leaves);
+            if (pre_walk < 0) {
+                // Can't walk reduce input — revert
+                has_reduce = 0; sum_term = term_era(); reshape_term = term_era();
+                n_ops = post_n_ops; n_leaves = post_n_leaves;
+                memcpy(ops, post_ops, post_n_ops * sizeof(FusedOp));
+                for (u32 j = 0; j < post_n_leaves; j++) {
+                    leaf_ids[j] = post_leaf_ids[j];
+                    leaf_views_p[j] = post_leaf_views[j];
+                    fuse_leaf_terms[j] = post_leaf_terms[j];
+                    fuse_leaf_sts[j] = post_leaf_sts[j];
+                }
+                continue;
+            }
+            fuse_remap(ops, n_ops, n_leaves);
+            // Append post-reduce ops after pre-reduce ops.
+            // Post-reduce leaf references need remapping: leaf li (the reduce output)
+            // becomes a virtual reference to the reduce result.
+            u32 pre_n_ops = n_ops, pre_n_leaves = n_leaves;
+            ke->reduce.post_reduce_start = pre_n_ops;
+            // Append post-reduce leaves (skip the reduce leaf li)
+            u32 post_leaf_remap[FUSE_MAX_LEAVES];
+            u32 n_post_added = 0;
+            for (u32 j = 0; j < post_n_leaves; j++) {
+                if (j == li) {
+                    // The reduce leaf — maps to the reduce result (virtual)
+                    // In dispatch, the reduce result is stored in a temp and read back
+                    post_leaf_remap[j] = 0xFFFFFFFEu; // special: reduce result
+                    continue;
+                }
+                if (n_leaves >= FUSE_MAX_LEAVES) break;
+                post_leaf_remap[j] = n_leaves;
+                leaf_ids[n_leaves] = post_leaf_ids[j];
+                leaf_views_p[n_leaves] = post_leaf_views[j];
+                fuse_leaf_terms[n_leaves] = post_leaf_terms[j];
+                fuse_leaf_sts[n_leaves] = post_leaf_sts[j];
+                n_leaves++;
+                n_post_added++;
+            }
+            ke->reduce.n_post_leaves = n_post_added;
+            // Append post-reduce ops with remapped leaf references
+            for (u32 j = 0; j < post_n_ops; j++) {
+                if (n_ops >= FUSE_MAX_OPS) break;
+                FusedOp po = post_ops[j];
+                // Remap args: leaf refs use post_leaf_remap, op refs shift
+                if (po.arg_a < post_n_leaves)
+                    po.arg_a = (post_leaf_remap[po.arg_a] == 0xFFFFFFFEu)
+                        ? (pre_n_leaves + pre_n_ops) // reduce result = last pre-reduce op
+                        : post_leaf_remap[po.arg_a];
+                else
+                    po.arg_a = po.arg_a - post_n_leaves + n_leaves + pre_n_ops;
+                if (po.arg_b < post_n_leaves)
+                    po.arg_b = (post_leaf_remap[po.arg_b] == 0xFFFFFFFEu)
+                        ? (pre_n_leaves + pre_n_ops)
+                        : post_leaf_remap[po.arg_b];
+                else
+                    po.arg_b = po.arg_b - post_n_leaves + n_leaves + pre_n_ops;
+                ops[n_ops++] = po;
+            }
+            walk_result = (int)(WALK_LEAF_BASE * 2 + n_ops - 1);
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "  post_reduce_fuse: pre_ops=%u post_ops=%u pre_leaves=%u post_leaves=%u\n",
+                        pre_n_ops, post_n_ops, pre_n_leaves, n_post_added);
+            break; // only absorb one reduce
+        }
+    }
+
     // Lazy leaves (TAG_TOP non-ew inputs): allowed if they have known shapes
     // from st_get. The dispatch handler resolves them via thvm_reduce(leaf_term).
     // leaf_id has bit 31 set as a lazy marker; cleared at dispatch time.

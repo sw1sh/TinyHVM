@@ -111,6 +111,11 @@
                     RETURN_REDUCED(kid_results[kid]);
                 KernelEntry *ke = &sched_kernels[kid];
 
+                // Skip dead kernels (absorbed by merge passes)
+                if (ke->n_ops == 0 && ke->n_leaves == 0) {
+                    RETURN_REDUCED(term_era());
+                }
+
                 // Allocate output buffer
                 u32 dst_id = tensor_create(ctx, ke->out_shape, DTYPE_F32);
                 TensorMeta *md = &ctx->tensors[dst_id];

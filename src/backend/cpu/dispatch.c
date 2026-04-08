@@ -180,14 +180,20 @@ void cpu_dispatch_kernel_rs(
                 vals[i] = leaf_read(leaf_ptrs[i], leaf_views[i], coords, rank);
         }
 
-        // Evaluate FusedOp DAG
-        for (u32 i = 0; i < n_ops; i++) {
-            f32 a = vals[ops[i].arg_a];
-            f32 b = vals[ops[i].arg_b];
+        // Evaluate FusedOp DAG (pre-reduce ops only if post_reduce_start set)
+        u32 eval_n_ops = (has_reduce && reduce->post_reduce_start) ? reduce->post_reduce_start : n_ops;
+        for (u32 i = 0; i < eval_n_ops; i++) {
+            u32 aa = ops[i].arg_a, bb = ops[i].arg_b;
+            if (aa >= n_leaves + eval_n_ops || bb >= n_leaves + eval_n_ops) {
+                if (flat == 0) fprintf(stderr, "OOB: op[%u] a=%u b=%u max=%u\n", i, aa, bb, n_leaves+eval_n_ops-1);
+                break;
+            }
+            f32 a = vals[aa];
+            f32 b = vals[bb];
             vals[n_leaves + i] = eval_uop(ops[i].uop, a, b);
         }
 
-        f32 result = (n_ops > 0) ? vals[n_leaves + n_ops - 1] : vals[0];
+        f32 result = (eval_n_ops > 0) ? vals[n_leaves + eval_n_ops - 1] : vals[0];
 
         // Write or accumulate
         if (has_reduce) {
@@ -203,6 +209,68 @@ void cpu_dispatch_kernel_rs(
                 out[oi] = result > out[oi] ? result : out[oi];
         } else {
             out[flat] = result;
+        }
+    }
+
+    // Post-reduce ew ops: iterate over the REDUCED output shape,
+    // evaluate post-reduce ops that read the reduce result + post-reduce leaves.
+    if (has_reduce && reduce->post_reduce_start && reduce->post_reduce_start < n_ops) {
+        u32 post_start = reduce->post_reduce_start;
+        // The reduce result for each output element is in out[oi].
+        // Post-reduce ops can reference it via the pre-reduce result index.
+        // Pre-reduce leaves: [0..n_leaves-n_post_leaves-1]
+        // Post-reduce leaves: [n_leaves-n_post_leaves..n_leaves-1]
+        // The reduce result index in vals: n_leaves + post_start - 1 (last pre-reduce op)
+        // BUT post-reduce ops were remapped to reference this index.
+
+        // Compute out_strides for output iteration
+        u32 out_strides2[MAX_DIM];
+        out_strides2[rank - 1] = 1;
+        for (i32 d = (i32)rank - 2; d >= 0; d--)
+            out_strides2[d] = out_strides2[d + 1] * out_shape[d + 1];
+
+        for (u32 oi = 0; oi < out_numel; oi++) {
+            // Decompose output index → coordinates in out_shape
+            u32 coords[MAX_DIM], rem = oi;
+            for (u32 d = 0; d < rank; d++) {
+                coords[d] = rem / out_strides2[d];
+                rem %= out_strides2[d];
+            }
+
+            // Read the reduce result for this output position
+            f32 reduce_result = out[oi];
+
+            // Read post-reduce leaf values
+            // Post-reduce leaves are at the END of the leaf array
+            u32 n_pre_leaves = n_leaves - reduce->n_post_leaves;
+            for (u32 i = 0; i < n_leaves; i++) {
+                if (i < n_pre_leaves) {
+                    // Pre-reduce leaf: the reduce result maps to the last pre-reduce op
+                    // Post-reduce ops reference this via their remapped arg indices
+                    vals[i] = 0; // not used by post-reduce ops (they use reduce result)
+                } else {
+                    // Post-reduce leaf: read from buffer
+                    if (leaf_sts && leaf_sts[i] && leaf_sts[i]->n_views >= 2)
+                        vals[i] = leaf_read_st(leaf_ptrs[i], leaf_sts[i], coords, rank, &(Shape){.rank=rank, .dims={0}});
+                    else
+                        vals[i] = leaf_read(leaf_ptrs[i], leaf_views[i], coords, rank);
+                }
+            }
+
+            // The reduce result is at index (n_pre_leaves + post_start - 1) in vals
+            // (that's where post-reduce ops expect to find it based on merge remapping)
+            if (post_start > 0)
+                vals[n_leaves + post_start - 1] = reduce_result;
+
+            // Evaluate post-reduce ops
+            for (u32 i = post_start; i < n_ops; i++) {
+                f32 a = vals[ops[i].arg_a];
+                f32 b = vals[ops[i].arg_b];
+                vals[n_leaves + i] = eval_uop(ops[i].uop, a, b);
+            }
+
+            f32 post_result = vals[n_leaves + n_ops - 1];
+            out[oi] = post_result;
         }
     }
 }

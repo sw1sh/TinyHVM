@@ -367,7 +367,8 @@ static u32 sched_all(TinyHVM *ctx) {
         }
     }
 
-    // Save pre-merge state — merge passes are analysis-only until dispatch supports them.
+    // Merge passes modify sched_kernels for dispatch.
+    // Save pre-merge count for restore if Metal codegen can't handle merged kernels.
     pre_merge_count = sched_kernel_count;
     memcpy(pre_merge_kernels_store, sched_kernels, sched_kernel_count * sizeof(KernelEntry));
 
@@ -1141,8 +1142,10 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         #undef MEM_MAX_BUFS
     }
 
-    // Restore pre-merge kernels for dispatch
-    sched_restore_pre_merge();
+    // Restore pre-merge kernels for Metal (codegen doesn't handle merged yet).
+    // CPU dispatch handles post_reduce_start.
+    if (!getenv("THVM_MERGED_DISPATCH"))
+        sched_restore_pre_merge();
 
     { Backend *be = ctx_default_backend(ctx);
       if (be && be->end_batch) be->end_batch(); }

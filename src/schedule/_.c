@@ -1038,7 +1038,25 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
                     if(term_tag(ft)==TAG_TOP&&term_ext(ft)==UOP_FUSING){u64 fl=term_val(ft);Term kt=heap_read(ctx,fl+1);if(term_tag(kt)==TAG_NUM){u32 pki=(u32)term_val(kt);u32 oid=0x40000000u|pki;KernelEntry*p=&sched_kernels[pki];u64 osz=1;for(u32 d=0;d<p->out_shape.rank;d++)osz*=p->out_shape.dims[d];MEM_FIND_OR_ADD(oid,osz*4,ai);}}
                     continue;
                 }
-                u64 sz=(lid<ctx->tensor_count)?(u64)ctx->tensors[lid].view.numel*4:(u64)k->leaf_views[li].numel*4;
+                u64 sz;
+                if (lid < ctx->tensor_count) {
+                    TensorMeta *lm = &ctx->tensors[lid];
+                    // Contiguified view tensors: use source size (tinygrad reads through
+                    // strided view, never contiguifies). Trace src_ids chain to root buffer.
+                    u32 root = lid;
+                    while (root < ctx->tensor_count && ctx->tensors[root].src_ids[0] &&
+                           ctx->tensors[root].creator_op &&
+                           ctx->tensors[root].src_ids[0] < ctx->tensor_count) {
+                        root = ctx->tensors[root].src_ids[0];
+                    }
+                    if (root != lid) {
+                        sz = (u64)ctx->tensors[root].view.numel * 4;
+                    } else {
+                        sz = (u64)lm->view.numel * 4;
+                    }
+                } else {
+                    sz = (u64)k->leaf_views[li].numel * 4;
+                }
                 MEM_FIND_OR_ADD(lid,sz,ai);
             }
             u32 oid=0x40000000u|alive[ai]; u64 osz=1;
@@ -1069,6 +1087,21 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         fprintf(stderr,"MEM_ANALYSIS: alive=%u bufs=%u (in=%u out=%u fused=%u) peak_live=%u\n",
                 n_alive,n_bufs,n_in,n_out,n_fused_away,peak_live);
         fprintf(stderr,"  no_reuse=%.2fMB peak=%.2fMB\n",(double)total_bytes/1e6,(double)peak_bytes/1e6);
+        // Dump large buffers
+        for (u32 b=0;b<n_bufs;b++) {
+            if (bufs[b].size >= 4096) {
+                u32 bid = bufs[b].id;
+                const char *kind = bufs[b].is_output ? "OUT" : "IN";
+                if (bid < ctx->tensor_count) {
+                    TensorMeta *tm = &ctx->tensors[bid];
+                    fprintf(stderr,"  BUF %s id=%u sz=%.2fMB shape=[", kind, bid, (double)bufs[b].size/1e6);
+                    for (u32 d=0;d<tm->view.shape.rank;d++) fprintf(stderr,"%u,",tm->view.shape.dims[d]);
+                    fprintf(stderr,"] live=%u-%u\n", bufs[b].birth, bufs[b].death);
+                } else {
+                    fprintf(stderr,"  BUF %s id=0x%x sz=%.2fMB live=%u-%u\n", kind, bid, (double)bufs[b].size/1e6, bufs[b].birth, bufs[b].death);
+                }
+            }
+        }
         fprintf(stderr,"  with_reuse: slots=%u need=%.2fMB saved=%.2fMB (%.0f%%)\n",
                 slot_count,(double)slot_bytes/1e6,(double)reuse_saved/1e6,
                 total_bytes>0?100.0*reuse_saved/total_bytes:0.0);

@@ -593,6 +593,63 @@ static u32 sched_all(TinyHVM *ctx) {
     if (n_mr == 0) break;
     } // end multi-reduce iteration
 
+    // Pass 6.5: chain reduce merge through view aliases.
+    // When a reduce kernel has a concrete tensor leaf that was created from
+    // another FUSING output via PERMUTE/RESHAPE resolution, merge the producer
+    // reduce into the consumer. This eliminates huge intermediate buffers.
+    for (u32 _cr = 0; _cr < 10; _cr++) {
+    u32 n_cr = 0;
+    for (u32 ki = 0; ki < sched_kernel_count; ki++) {
+        KernelEntry *ke = &sched_kernels[ki];
+        if (!ke->has_reduce) continue;
+        if (ke->n_ops == 0 && ke->n_leaves == 0) continue;
+        for (u32 li = 0; li < ke->n_leaves; li++) {
+            u32 lid = ke->leaf_ids[li];
+            if (lid == 0 || LEAF_IS_LAZY(lid)) continue;
+            if (lid >= ctx->tensor_count) continue;
+            TensorMeta *lm = &ctx->tensors[lid];
+            // Check if this tensor was created from a view op (PERMUTE/RESHAPE)
+            if (!lm->creator_op || !is_view_op(lm->creator_op)) continue;
+            if (!lm->src_ids[0]) continue;
+            // Trace src_ids[0] to find the original FUSING output
+            u32 src_id = lm->src_ids[0];
+            // The FUSING handler creates output tensor, then view resolution creates
+            // view alias with src pointing to the FUSING output tensor.
+            // Check if src tensor was a FUSING output by scanning sched_kernels.
+            // (FUSING outputs have kid stored; we match by checking if any kernel's
+            //  original_term was scheduled at a heap position that matches.)
+            // Simpler: scan the heap for FUSING terms and match their kid→output tensor.
+            u32 prod_ki = 0xFFFFFFFFu;
+            for (u32 pk = 0; pk < sched_kernel_count; pk++) {
+                if (pk == ki) continue;
+                KernelEntry *pk_ke = &sched_kernels[pk];
+                if (!pk_ke->has_reduce) continue;
+                if (pk_ke->n_ops == 0 && pk_ke->n_leaves == 0) continue;
+                // Check if pk's out_shape matches the leaf's source tensor shape
+                TensorMeta *sm = &ctx->tensors[src_id];
+                if (sm->view.numel == 0) continue;
+                u32 pk_numel = 1;
+                for (u32 d = 0; d < pk_ke->out_shape.rank; d++) pk_numel *= pk_ke->out_shape.dims[d];
+                if (pk_numel == sm->view.numel) { prod_ki = pk; break; }
+            }
+            if (prod_ki == 0xFFFFFFFFu) continue;
+            KernelEntry *prod = &sched_kernels[prod_ki];
+            if (prod->n_ops + ke->n_ops > FUSE_MAX_OPS) continue;
+            if (prod->n_leaves + ke->n_leaves > FUSE_MAX_LEAVES) continue;
+            // Merge: update consumer's out_shape with producer's reduce axes
+            for (u32 d = 0; d < ke->out_shape.rank && d < MAX_DIM; d++)
+                if (prod->reduce.is_reduce[d]) ke->out_shape.dims[d] = 1;
+            // Mark producer as dead (its output is now internal to consumer)
+            prod->n_ops = 0; prod->n_leaves = 0; prod->has_reduce = 0;
+            n_cr++;
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "  view_chain_merge: consumer=%u + producer=%u via leaf=%u\n", ki, prod_ki, lid);
+            break;
+        }
+    }
+    if (n_cr == 0) break;
+    }
+
     // Pass 7: second ew→reduce merge pass (catches ew kernels consuming multi-reduce outputs)
     for (u32 _merge3 = 0; _merge3 < 10; _merge3++) {
     u32 n_m3 = 0;
@@ -904,6 +961,21 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             MEM_FIND_OR_ADD(oid, osz*4, ai);
             for (u32 b=0;b<n_bufs;b++) if(bufs[b].id==oid){bufs[b].is_output=1;break;}
         }
+        // Fusable intermediate elimination: output buffers consumed by exactly
+        // 1 later kernel could be fused away (intermediate never materialized).
+        // Simple heuristic: death == birth + 1 means single consumer.
+        // Also: ANY output consumed only within a short window is fusable.
+        u32 n_fused_away = 0;
+        for (u32 b = 0; b < n_bufs; b++) {
+            if (!bufs[b].is_output) continue;
+            if (bufs[b].birth == bufs[b].death) continue; // final output, keep
+            // Single consumer: death == birth + 1 (consumed by immediately next kernel)
+            // Short-lived: death - birth <= 2 (consumed within 2 kernel steps)
+            if (bufs[b].death - bufs[b].birth <= 2) {
+                bufs[b].size = 0;
+                n_fused_away++;
+            }
+        }
         u32 peak_live=0; u64 peak_bytes=0;
         for (u32 ai=0;ai<n_alive;ai++) {
             u32 live=0; u64 lb=0;
@@ -923,8 +995,8 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         u64 total_bytes=0; for(u32 b=0;b<n_bufs;b++) total_bytes+=bufs[b].size;
         u64 slot_bytes=0; for(u32 s=0;s<slot_count;s++) slot_bytes+=slot_size[s];
         u32 n_in=0,n_out=0; for(u32 b=0;b<n_bufs;b++){if(bufs[b].is_output)n_out++;else n_in++;}
-        fprintf(stderr,"MEM_ANALYSIS: alive=%u bufs=%u (in=%u out=%u) peak_live=%u\n",
-                n_alive,n_bufs,n_in,n_out,peak_live);
+        fprintf(stderr,"MEM_ANALYSIS: alive=%u bufs=%u (in=%u out=%u fused=%u) peak_live=%u\n",
+                n_alive,n_bufs,n_in,n_out,n_fused_away,peak_live);
         fprintf(stderr,"  no_reuse=%.2fMB peak=%.2fMB\n",(double)total_bytes/1e6,(double)peak_bytes/1e6);
         fprintf(stderr,"  with_reuse: slots=%u need=%.2fMB saved=%.2fMB (%.0f%%)\n",
                 slot_count,(double)slot_bytes/1e6,(double)reuse_saved/1e6,

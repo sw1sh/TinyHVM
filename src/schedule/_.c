@@ -458,8 +458,8 @@ static u32 sched_all(TinyHVM *ctx) {
                     po.arg_b = po.arg_b - ew_ke->n_leaves + merged.n_leaves + merged.n_ops;
                 merged.ops[merged.n_ops++] = po;
             }
-            // Output shape from ew kernel
-            merged.out_shape = ew_ke->out_shape;
+            // Output shape from the reduce kernel (the actual output after reduction)
+            merged.out_shape = r_ke->out_shape;
             merged.original_term = ew_ke->original_term;
             // Replace ew kernel with merged, mark reduce kernel as dead
             *ew_ke = merged;
@@ -578,6 +578,9 @@ static u32 sched_all(TinyHVM *ctx) {
                 k1->leaf_sts[k1->n_leaves] = k2->leaf_sts[j];
                 k1->n_leaves++;
             }
+            // Update out_shape: apply k2's reduce axes
+            for (u32 d = 0; d < k1->out_shape.rank && d < MAX_DIM; d++)
+                if (k2->reduce.is_reduce[d]) k1->out_shape.dims[d] = 1;
             // Mark k2 as dead
             k2->n_ops = 0; k2->n_leaves = 0; k2->has_reduce = 0;
             if (getenv("THVM_SCHED_DIAG"))
@@ -890,7 +893,14 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             }
             u32 oid = 0x40000000u|alive[ai];
             u64 osz = 1;
-            for (u32 d=0;d<k->out_shape.rank;d++) osz*=k->out_shape.dims[d];
+            // Use reshape target shape if set (actual materialized output is smaller)
+            if (term_tag(k->reshape_term) != TAG_ERA) {
+                const View *rv = st_get(term_val(k->reshape_term));
+                if (rv) { for (u32 d=0;d<rv->shape.rank;d++) osz*=rv->shape.dims[d]; }
+                else { for (u32 d=0;d<k->out_shape.rank;d++) osz*=k->out_shape.dims[d]; }
+            } else {
+                for (u32 d=0;d<k->out_shape.rank;d++) osz*=k->out_shape.dims[d];
+            }
             MEM_FIND_OR_ADD(oid, osz*4, ai);
             for (u32 b=0;b<n_bufs;b++) if(bufs[b].id==oid){bufs[b].is_output=1;break;}
         }

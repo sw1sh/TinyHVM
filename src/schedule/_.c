@@ -391,7 +391,20 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
 
     // Phase 2: schedule compute ops → FUSING, resolve view ops → TAG_TEN aliases.
     sched_all(ctx);
-    if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after sched: "); sched_dump_heap(ctx); }
+    if (getenv("THVM_SCHED_DIAG")) {
+        u32 n_reduce=0, n_ew=0, n_fallback=0;
+        u32 max_ops=0, max_leaves=0;
+        for (u32 ki=0; ki<sched_kernel_count; ki++) {
+            if (sched_kernels[ki].has_reduce) n_reduce++;
+            else if (sched_kernels[ki].n_ops > 0) n_ew++;
+            else n_fallback++;
+            if (sched_kernels[ki].n_ops > max_ops) max_ops = sched_kernels[ki].n_ops;
+            if (sched_kernels[ki].n_leaves > max_leaves) max_leaves = sched_kernels[ki].n_leaves;
+        }
+        fprintf(stderr, "sched_kernel_count=%u (reduce=%u ew=%u passthru=%u max_ops=%u max_leaves=%u)\n",
+                sched_kernel_count, n_reduce, n_ew, n_fallback, max_ops, max_leaves);
+        fprintf(stderr, "after sched: "); sched_dump_heap(ctx);
+    }
 
     { Backend *be = ctx_default_backend(ctx);
       if (be && be->end_batch) be->end_batch(); }

@@ -337,7 +337,12 @@ static u32 sched_all(TinyHVM *ctx) {
                 }
             }
         }
-        if (has_ew_consumer) continue;
+        if (has_ew_consumer) {
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "  skip_reduce_for_ew: %s@%llu\n",
+                        uop < UOP_COUNT ? uop_names[uop] : "?", (unsigned long long)h);
+            continue;
+        }
         sched_one(ctx, ht, h);
     }
     // Pass 2: ew ops (absorb unscheduled reduces via _fuse_can_absorb_reduce)

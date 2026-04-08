@@ -240,6 +240,19 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             }
         }
         if (!can_walk) {
+            // Check if the inner is an absorbable reduce (SUM/RMAX)
+            if (_fuse_can_absorb_reduce) {
+                Term vi = view_input;
+                if (term_tag(vi)==TAG_DP0||term_tag(vi)==TAG_DP1) vi = heap_read(ctx, term_val(vi));
+                if (term_tag(vi)==TAG_TOP && (term_ext(vi)==UOP_SUM||term_ext(vi)==UOP_RMAX)) {
+                    _fuse_absorbed_reshape = t;
+                    _fuse_absorbed_reduce = vi;
+                    _fuse_can_absorb_reduce = 0;
+                    Term ri = heap_read(ctx, term_val(vi));
+                    if (term_tag(ri)==TAG_DP0||term_tag(ri)==TAG_DP1) ri = heap_read(ctx, term_val(ri));
+                    return fuse_walk_inner(ctx, ri, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+                }
+            }
             // Non-ew, non-view TAG_TOP (e.g. SUM): lazy leaf boundary
             const View *sv = st_get(loc);
             if (!sv) return -1;

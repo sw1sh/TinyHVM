@@ -701,6 +701,20 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         }
         if (!found) break;
     }
+    // Graph cleanup: resolve DP references to shared values for visualization.
+    // This is semantically safe for atoms/TOP (DUP is identity) but only runs
+    // for graph dumps to avoid interfering with the reducer's cached terms.
+    if (getenv("THVM_GRAPH")) {
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            Term ht = ctx->heap[h];
+            if (term_tag(ht) != TAG_DP0 && term_tag(ht) != TAG_DP1) continue;
+            Term shared = heap_read(ctx, term_val(ht));
+            u8 stag = term_tag(shared);
+            if (stag == TAG_TEN || stag == TAG_ERA || stag == TAG_NUM ||
+                stag == TAG_CTR || stag == TAG_TOP)
+                ctx->heap[h] = shared;
+        }
+    }
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }
     // Phase 1 graph: after reduce — pure TAG_TOPs + combinators
     if (getenv("THVM_GRAPH")) thvm_heap_dot_root(ctx, "/tmp/thvm_1_post_reduce.dot", t);

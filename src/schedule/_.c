@@ -702,7 +702,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     }
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }
     // Phase 1 graph: after reduce — pure TAG_TOPs + combinators
-    if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_1_post_reduce.dot");
+    if (getenv("THVM_GRAPH")) thvm_heap_dot_root(ctx, "/tmp/thvm_1_post_reduce.dot", t);
 
     // Phase 2: schedule compute ops → FUSING, resolve view ops → TAG_TEN aliases.
     sched_all(ctx);

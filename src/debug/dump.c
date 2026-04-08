@@ -93,15 +93,27 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         if (!_dup && nn < HDOT_MAX) { nodes[nn++].term = _t; bfs[qt++] = _t; } \
     } while(0)
 
-    // Seed: root term + all heap terms (except pure leaves)
+    // Seed from roots: explicit root term + ASSIGN/FUSING on heap
     if (term_tag(root) != TAG_ERA) HDOT_ENQ(root);
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
-        u8 tag = term_tag(ht);
-        if (tag == TAG_ERA || tag == TAG_NUM || tag == TAG_VAR || tag == TAG_ANY) continue;
-        if (tag == TAG_TEN || tag == TAG_DP0 || tag == TAG_DP1) continue;
-        if (tag == TAG_TOP && term_ext(ht) == UOP_GRAD) continue;
-        HDOT_ENQ(ht);
+        if (term_tag(ht) == TAG_TOP) {
+            u32 ext = term_ext(ht);
+            if (ext == UOP_ASSIGN || ext == UOP_FUSING)
+                HDOT_ENQ(ht);
+        }
+    }
+    // If no roots found (all reduced), seed ALL non-leaf heap terms
+    if (nn == 0) {
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            Term ht = ctx->heap[h];
+            u8 tag = term_tag(ht);
+            if (tag == TAG_ERA || tag == TAG_NUM || tag == TAG_TEN ||
+                tag == TAG_VAR || tag == TAG_ANY || tag == TAG_DP0 ||
+                tag == TAG_DP1 || tag >= TAG_COUNT) continue;
+            if (tag == TAG_TOP && term_ext(ht) == UOP_GRAD) continue;
+            HDOT_ENQ(ht);
+        }
     }
     // BFS: walk ALL children
     while (qh < qt) {

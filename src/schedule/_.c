@@ -522,7 +522,7 @@ static u32 sched_all(TinyHVM *ctx) {
         KernelEntry *k1 = &sched_kernels[ki];
         if (!k1->has_reduce) continue;
         if (k1->n_ops == 0 && k1->n_leaves == 0) continue; // dead
-        if (k1->reduce.reduce2_type) continue; // already multi-reduce
+        // Allow merging into already-multi-reduce kernels (triple+ reduces)
         // Find another reduce kernel that shares a leaf with k1
         for (u32 kj = ki + 1; kj < sched_kernel_count; kj++) {
             KernelEntry *k2 = &sched_kernels[kj];

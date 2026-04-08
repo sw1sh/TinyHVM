@@ -35,6 +35,16 @@ static void fuse_mark_absorbed(Term t) {
     if (fuse_n_absorbed < FUSE_MAX_ABSORBED) fuse_absorbed[fuse_n_absorbed++] = t;
 }
 
+// Shared absorbed terms registry (populated by sched_one, checked by fuse_walk_inner)
+#define SCHED_ABSORBED_MAX 4096
+static Term _sched_absorbed[SCHED_ABSORBED_MAX];
+static u32  _sched_n_absorbed = 0;
+static int _sched_is_absorbed(Term t) {
+    for (u32 i = 0; i < _sched_n_absorbed; i++)
+        if (_sched_absorbed[i] == t) return 1;
+    return 0;
+}
+
 // Per-fuse state: PERMUTE between ew and reduce (set by fuse_walk_inner)
 static f32 _fuse_perm[MAX_DIM];
 static u32 _fuse_perm_rank = 0;
@@ -44,6 +54,11 @@ static int _fuse_has_perm = 0;
 static int _fuse_can_absorb_reduce = 0;
 static Term _fuse_absorbed_reduce;
 static Term _fuse_absorbed_reshape;
+
+// Per-fuse: DUP shared locations traversed during walk (for heap replacement)
+#define FUSE_MAX_DUP_LOCS 64
+static u64 _fuse_dup_locs[FUSE_MAX_DUP_LOCS];
+static u32 _fuse_n_dup_locs = 0;
 
 // Compute a broadcast leaf's target shape in a reshaped iteration space.
 // For each OP dim, consume RESHAPE dims until product matches, then:
@@ -176,7 +191,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
     if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1) {
         Term shared = heap_read(ctx, term_val(t));
         int saved_absorb = _fuse_can_absorb_reduce;
-        _fuse_can_absorb_reduce = 0; // prevent absorption through DUP
+        _fuse_can_absorb_reduce = 0;
         int r = fuse_walk_inner(ctx, shared, ops, n_ops, leaf_ids, leaf_views, n_leaves);
         _fuse_can_absorb_reduce = saved_absorb;
         if (r < 0 && getenv("THVM_SCHED_DIAG"))
@@ -264,7 +279,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                     fprintf(stderr, "  absorb_check: uop=%s vi_tag=%u vi_ext=%u found=%d\n",
                             uop_names[uop], term_tag(vi), term_tag(vi)==TAG_TOP?term_ext(vi):0,
                             term_tag(reduce_found)==TAG_TOP);
-                if (term_tag(reduce_found) == TAG_TOP) {
+                if (term_tag(reduce_found) == TAG_TOP && !_sched_is_absorbed(reduce_found)) {
                     _fuse_absorbed_reshape = t; // outermost view wrapper
                     _fuse_absorbed_reduce = reduce_found;
                     _fuse_can_absorb_reduce = 0;
@@ -640,6 +655,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
 
     // Absorb unscheduled reduce: walk INTO SUM/RMAX instead of boundary.
     // Handles direct SUM/RMAX or view-wrapped: RESHAPE(SUM), PERMUTE(SUM), etc.
+    // Check sched_absorbed to prevent double-absorption through DUP.
     if (!is_elementwise(uop) && _fuse_can_absorb_reduce) {
         if (getenv("THVM_SCHED_DIAG2"))
             fprintf(stderr, "  absorb_direct: uop=%s\n", uop < UOP_COUNT ? uop_names[uop] : "?");
@@ -661,7 +677,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 _cur = _ri;
             }
         }
-        if (is_absorbable) {
+        if (is_absorbable && !_sched_is_absorbed(rt)) {
             _fuse_absorbed_reduce = rt;
             _fuse_can_absorb_reduce = 0;
             Term ri = heap_read(ctx, term_val(rt));
@@ -774,8 +790,9 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
         return 0; // MM, ASSIGN, etc. — not handled by fuser
     }
 
-    // Walk the tree (reset absorbed tracking)
+    // Walk the tree (reset absorbed + dup tracking)
     fuse_n_absorbed = 0;
+    _fuse_n_dup_locs = 0;
     _fuse_can_absorb_reduce = (!has_reduce && is_elementwise(top_uop)) ? 1 : 0;
     _fuse_absorbed_reduce = term_era();
     _fuse_absorbed_reshape = term_era();

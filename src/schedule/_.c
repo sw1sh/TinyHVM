@@ -48,15 +48,11 @@ static Term sched_unwrap_views(TinyHVM *ctx, Term t) {
     return t;
 }
 
-// Absorbed terms: ew ops fused into reduce kernels (pass 1). Pass 2 skips these.
-#define ABSORBED_MAX 4096
-static Term sched_absorbed_terms[ABSORBED_MAX];
-static u32  sched_n_absorbed = 0;
-static int sched_is_absorbed(Term t) {
-    for (u32 i = 0; i < sched_n_absorbed; i++)
-        if (sched_absorbed_terms[i] == t) return 1;
-    return 0;
-}
+// Absorbed terms: alias to shared registry in fuse/_.c
+#define sched_absorbed_terms _sched_absorbed
+#define sched_n_absorbed _sched_n_absorbed
+#define sched_is_absorbed _sched_is_absorbed
+#define ABSORBED_MAX SCHED_ABSORBED_MAX
 
 // Schedule a single TAG_TOP as a FUSING kernel. Returns the FUSING term, or ERA on failure.
 static Term sched_one(TinyHVM *ctx, Term ht, u64 h) {
@@ -221,12 +217,23 @@ static Term sched_one(TinyHVM *ctx, Term ht, u64 h) {
     ctx->heap[h] = ft;
     for (u64 ph = 1; ph < ctx->heap_pos; ph++)
         if (ph != h && ctx->heap[ph] == ht) ctx->heap[ph] = ft;
-    // Record absorbed ew ops (pass 2 skips them via sched_is_absorbed).
+    // Record absorbed ew ops AND absorbed reduce/reshape terms.
+    // The fuse_walk_inner checks sched_is_absorbed before absorbing a reduce,
+    // preventing double-absorption through DUP.
     extern Term fuse_absorbed[];
     extern u32 fuse_n_absorbed;
     for (u32 ai = 0; ai < fuse_n_absorbed; ai++)
         if (sched_n_absorbed < ABSORBED_MAX)
             sched_absorbed_terms[sched_n_absorbed++] = fuse_absorbed[ai];
+    // Record absorbed reduce + reshape terms
+    if (term_tag(ke.sum_term) == TAG_TOP)
+        if (sched_n_absorbed < ABSORBED_MAX)
+            sched_absorbed_terms[sched_n_absorbed++] = ke.sum_term;
+    if (term_tag(ke.reshape_term) == TAG_TOP)
+        if (sched_n_absorbed < ABSORBED_MAX)
+            sched_absorbed_terms[sched_n_absorbed++] = ke.reshape_term;
+    // Note: we do NOT replace DUP shared locations on heap — that crashes the
+    // IC reducer. Instead, _sched_is_absorbed prevents double absorption.
     return ft;
 }
 
@@ -424,10 +431,12 @@ static u32 sched_all(TinyHVM *ctx) {
             u32 _lid = (ke)->leaf_ids[li]; u32 _key = _lid; \
             if (_lid == 0 || LEAF_IS_LAZY(_lid)) { \
                 Term _lt = (ke)->leaf_terms[li]; \
-                while (term_tag(_lt)==TAG_TOP && is_view_op(term_ext(_lt))) { \
-                    Term _nx = heap_read(ctx, term_val(_lt)); \
-                    if (term_tag(_nx)==TAG_DP0||term_tag(_nx)==TAG_DP1) _nx=heap_read(ctx,term_val(_nx)); \
-                    _lt = _nx; \
+                for (int _rd = 0; _rd < 20; _rd++) { \
+                    if (term_tag(_lt)==TAG_DP0||term_tag(_lt)==TAG_DP1) \
+                        { _lt = heap_read(ctx, term_val(_lt)); continue; } \
+                    if (term_tag(_lt)==TAG_TOP && is_view_op(term_ext(_lt))) \
+                        { Term _nx = heap_read(ctx, term_val(_lt)); _lt = _nx; continue; } \
+                    break; \
                 } \
                 if (term_tag(_lt)==TAG_TOP && term_ext(_lt)==UOP_FUSING) { \
                     u64 _fl = term_val(_lt); Term _kt = heap_read(ctx, _fl+1); \

@@ -1158,6 +1158,12 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     }
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "after assign: "); sched_dump_heap(ctx); }
 
+    if (getenv("THVM_MEM_DIAG")) {
+        extern u32 _ensure_count, _ensure_alloc_count;
+        fprintf(stderr, "ENSURE_STATS: calls=%u allocs=%u\n", _ensure_count, _ensure_alloc_count);
+        _ensure_count = 0; _ensure_alloc_count = 0;
+    }
+
     return term_era();
 }
 

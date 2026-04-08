@@ -88,7 +88,8 @@ Term thvm_dsu(TinyHVM *ctx, Term label_expr, Term a, Term b);
 Term thvm_ddu(TinyHVM *ctx, Term label_expr, Term val, Term bod);
 Term thvm_inc(TinyHVM *ctx, Term term);
 Term thvm_mm(TinyHVM *ctx, Term a, Term b);
-#define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0&&c->tensors[t].creator_op)tensor_materialize(c,t);}while(0)
+static u32 _ensure_count = 0, _ensure_alloc_count = 0;
+#define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0&&c->tensors[t].creator_op){_ensure_count++;tensor_materialize(c,t);if(c->tensors[t].buf_id)_ensure_alloc_count++;}}while(0)
 
 // Read strided view to contiguous host buffer
 static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel) {

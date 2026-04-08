@@ -151,8 +151,8 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
                     if (dup_emitted[di] == dp_loc) { already = 1; break; }
                 if (!already && n_dup_emitted < HDOT_DUP_MAX) {
                     dup_emitted[n_dup_emitted++] = dp_loc;
-                    fprintf(f, "  dup%llu [label=\"DUP\", shape=diamond, fillcolor=\"#e8d5f5\", "
-                            "fontsize=9, width=0.5, height=0.4];\n", dp_loc);
+                    fprintf(f, "  dup%llu [label=\"DUP\", shape=triangle, fillcolor=\"#d4b8e8\", "
+                            "fontsize=9, width=0.6, height=0.5];\n", dp_loc);
                     // Input edge: shared value → DUP
                     Term shared = heap_read(ctx, dp_loc);
                     if (term_tag(shared) == TAG_TOP)
@@ -160,6 +160,30 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
                     else if (term_tag(shared) == TAG_TEN) {
                         EMIT_TEN((u32)term_val(shared));
                         fprintf(f, "  t%u -> dup%llu;\n", (u32)term_val(shared), dp_loc);
+                    } else if (term_tag(shared) == TAG_DP0 || term_tag(shared) == TAG_DP1) {
+                        // Nested DUP: shared value is itself a DP ref
+                        u64 inner_loc = term_val(shared);
+                        fprintf(f, "  dup%llu -> dup%llu;\n", inner_loc, dp_loc);
+                    }
+                    // Scan heap for BOTH dp0 and dp1 consumers to ensure 2 outputs
+                    // (the current node provides one; find the other)
+                    for (u64 _ch = 1; _ch < ctx->heap_pos; _ch++) {
+                        Term _ct = ctx->heap[_ch];
+                        if (term_tag(_ct) != TAG_TOP) continue;
+                        u32 _ce = term_ext(_ct);
+                        if (_ce == UOP_ASSIGN || _ce == UOP_GRAD) continue;
+                        u64 _cl = term_val(_ct);
+                        u32 _ca = (_ce == UOP_WHERE) ? 3 : 2;
+                        for (u32 _ai = 0; _ai < _ca; _ai++) {
+                            Term _cc = heap_read(ctx, _cl + _ai);
+                            if ((term_tag(_cc) == TAG_DP0 || term_tag(_cc) == TAG_DP1) &&
+                                term_val(_cc) == dp_loc && _ct != nodes[ni].term) {
+                                // Found the other consumer
+                                const char *_op = (term_tag(_cc) == TAG_DP1) ? "dp1" : "dp0";
+                                fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n",
+                                        dp_loc, _cl, _op);
+                            }
+                        }
                     }
                 }
                 // Output edge: DUP → consumer (this node), labeled dp0/dp1

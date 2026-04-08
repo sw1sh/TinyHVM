@@ -371,8 +371,8 @@ static u32 sched_all(TinyHVM *ctx) {
     u32 n_merges = 0;
     for (u32 ew_ki = 0; ew_ki < sched_kernel_count; ew_ki++) {
         KernelEntry *ew_ke = &sched_kernels[ew_ki];
-        if (ew_ke->has_reduce) continue; // already a reduce kernel
-        if (ew_ke->n_ops == 0) continue;
+        if (ew_ke->n_ops == 0 && ew_ke->n_leaves == 0) continue; // dead
+        if (ew_ke->has_reduce) continue; // only merge ew→reduce for now
         // Find a FUSING leaf that points to a reduce kernel
         for (u32 li = 0; li < ew_ke->n_leaves; li++) {
             if (ew_ke->leaf_ids[li] != 0) continue; // only FUSING placeholder leaves
@@ -472,7 +472,48 @@ static u32 sched_all(TinyHVM *ctx) {
         }
     }
     if (n_merges == 0) break; // no more merges possible
-    } // end merge iteration loop
+    } // end ew→reduce merge iteration loop
+
+    // Pass 5: merged kernel → reduce merge (absorb reduce into pre-reduce of merged kernel)
+    // A merged kernel (has_reduce + post_reduce_start > 0) may have FUSING reduce leaves
+    // in its pre-reduce ops. Absorb: the leaf reduce's ops+leaves prepend, becoming reduce2.
+    for (u32 _merge2 = 0; _merge2 < 10; _merge2++) {
+    u32 n_merges2 = 0;
+    for (u32 ki = 0; ki < sched_kernel_count; ki++) {
+        KernelEntry *ke = &sched_kernels[ki];
+        if (!ke->has_reduce) continue;
+        if (ke->n_ops == 0 && ke->n_leaves == 0) continue;
+        if (ke->reduce.reduce2_type) continue; // already multi-reduce
+        for (u32 li = 0; li < ke->n_leaves; li++) {
+            if (ke->leaf_ids[li] != 0) continue;
+            Term lt = ke->leaf_terms[li];
+            Term fusing_t = lt;
+            while (term_tag(fusing_t) == TAG_TOP && is_view_op(term_ext(fusing_t))) {
+                Term nx = heap_read(ctx, term_val(fusing_t));
+                if (term_tag(nx) == TAG_DP0 || term_tag(nx) == TAG_DP1)
+                    nx = heap_read(ctx, term_val(nx));
+                fusing_t = nx;
+            }
+            if (term_tag(fusing_t) != TAG_TOP || term_ext(fusing_t) != UOP_FUSING) continue;
+            u32 r2_ki = 0xFFFFFFFFu;
+            { u64 floc = term_val(fusing_t);
+              Term kid_term = heap_read(ctx, floc + 1);
+              if (term_tag(kid_term) == TAG_NUM) r2_ki = (u32)term_val(kid_term);
+            }
+            if (r2_ki == 0xFFFFFFFFu || r2_ki >= sched_kernel_count) continue;
+            KernelEntry *r2_ke = &sched_kernels[r2_ki];
+            if (!r2_ke->has_reduce) continue;
+            if (r2_ke->n_ops == 0 && r2_ke->n_leaves == 0) continue;
+            // Would merge: but multi-reduce dispatch isn't implemented.
+            // For now, just count potential merges for diagnostics.
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "  potential_multi_reduce: ki=%u leaf=%u → r2=%u (r2_ops=%u r2_leaves=%u)\n",
+                        ki, li, r2_ki, r2_ke->n_ops, r2_ke->n_leaves);
+            break;
+        }
+    }
+    break; // just diagnostic for now
+    }
 
     fuse_no_lazy_resolve = 0;
     return total;

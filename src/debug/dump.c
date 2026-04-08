@@ -102,20 +102,67 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
         fprintf(f, "  t%u [label=\"t%u\\n[%s]\", shape=ellipse, fillcolor=\"#e0e0e0\"];\n", (tid), (tid), _sh); \
     } while(0)
 
-    // Helper: get the node ID string for a term (resolves to n<loc>, t<tid>, or dup<loc>)
-    // Returns the node id in buf. Emits the node definition if needed.
-    // For DP0/DP1: emits a single DUP diamond at the shared location.
+    // Pass 1: collect all DUP locations and their consumers
     #define HDOT_DUP_MAX 512
-    u64 dup_emitted[HDOT_DUP_MAX]; u32 n_dup_emitted = 0;
+    typedef struct { u64 loc; u64 dp0_consumer; u64 dp1_consumer; } DupInfo;
+    DupInfo dups[HDOT_DUP_MAX]; u32 n_dups = 0;
 
-    // Emit nodes
+    for (u32 ni = 0; ni < nn; ni++) {
+        u64 loc = term_val(nodes[ni].term);
+        u32 ext = term_ext(nodes[ni].term);
+        u32 arity = (ext == UOP_WHERE) ? 3 : 2;
+        for (u32 ai = 0; ai < arity; ai++) {
+            Term child = heap_read(ctx, loc + ai);
+            if (term_tag(child) != TAG_DP0 && term_tag(child) != TAG_DP1) continue;
+            u64 dp_loc = term_val(child);
+            int is_dp1 = (term_tag(child) == TAG_DP1);
+            // Find or create DupInfo
+            u32 di;
+            for (di = 0; di < n_dups; di++) if (dups[di].loc == dp_loc) break;
+            if (di == n_dups && n_dups < HDOT_DUP_MAX) {
+                dups[n_dups++] = (DupInfo){dp_loc, 0, 0};
+            }
+            if (di < n_dups) {
+                if (is_dp1 && !dups[di].dp1_consumer) dups[di].dp1_consumer = loc;
+                if (!is_dp1 && !dups[di].dp0_consumer) dups[di].dp0_consumer = loc;
+            }
+        }
+    }
+
+    // Pass 2: emit DUP triangles — only those with BOTH dp0 and dp1 consumers
+    for (u32 di = 0; di < n_dups; di++) {
+        DupInfo *d = &dups[di];
+        if (!d->dp0_consumer || !d->dp1_consumer) continue; // skip dead/single-output DUPs
+        fprintf(f, "  dup%llu [label=\"DUP\", shape=invtriangle, fillcolor=\"#d4b8e8\", "
+                "fontsize=9, width=0.7, height=0.5];\n", d->loc);
+        // Input: shared value → DUP
+        Term shared = heap_read(ctx, d->loc);
+        if (term_tag(shared) == TAG_TOP)
+            fprintf(f, "  n%llu -> dup%llu;\n", term_val(shared), d->loc);
+        else if (term_tag(shared) == TAG_TEN) {
+            EMIT_TEN((u32)term_val(shared));
+            fprintf(f, "  t%u -> dup%llu;\n", (u32)term_val(shared), d->loc);
+        } else if (term_tag(shared) == TAG_DP0 || term_tag(shared) == TAG_DP1) {
+            // Nested: input comes from another DUP
+            u64 inner_loc = term_val(shared);
+            fprintf(f, "  dup%llu -> dup%llu [label=\"%s\"];\n", inner_loc, d->loc,
+                    term_tag(shared)==TAG_DP1 ? "dp1" : "dp0");
+        }
+        // Output dp0
+        if (d->dp0_consumer)
+            fprintf(f, "  dup%llu -> n%llu [label=\"dp0\"];\n", d->loc, d->dp0_consumer);
+        // Output dp1
+        if (d->dp1_consumer)
+            fprintf(f, "  dup%llu -> n%llu [label=\"dp1\"];\n", d->loc, d->dp1_consumer);
+    }
+
+    // Pass 3: emit compute nodes + direct edges (non-DUP children)
     for (u32 ni = 0; ni < nn; ni++) {
         Term t = nodes[ni].term;
         u64 loc = term_val(t);
         u32 ext = term_ext(t);
         const char *opn = (ext < UOP_COUNT) ? uop_names[ext] : "?";
 
-        // Shape from shape table
         const View *v = st_get(loc);
         char shape[80] = "";
         if (v) {
@@ -124,75 +171,44 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
                 p += snprintf(shape+p, sizeof(shape)-p, "%s%u", d?",":"", v->shape.dims[d]);
         }
 
-        // Color by op type
         const char *color;
-        if (is_elementwise(ext))                    color = "#cce5ff"; // blue
-        else if (ext == UOP_SUM || ext == UOP_RMAX) color = "#ffcccc"; // red
-        else if (ext == UOP_FUSING)                 color = "#ccffcc"; // green
-        else if (is_view_op(ext))                   color = "#fff3cd"; // yellow
-        else if (ext == UOP_MM)                     color = "#ffccff"; // pink
-        else                                        color = "#f0f0f0"; // gray
+        if (is_elementwise(ext))                    color = "#cce5ff";
+        else if (ext == UOP_SUM || ext == UOP_RMAX) color = "#ffcccc";
+        else if (ext == UOP_FUSING)                 color = "#ccffcc";
+        else if (is_view_op(ext))                   color = "#fff3cd";
+        else if (ext == UOP_MM)                     color = "#ffccff";
+        else                                        color = "#f0f0f0";
 
         fprintf(f, "  n%llu [label=\"%s\\n[%s]\", fillcolor=\"%s\"];\n",
                 loc, opn, shape, color);
 
-        // Edges: walk children, render DUP as single 1-in-2-out diamond
+        // Direct edges
         u32 arity = (ext == UOP_WHERE) ? 3 : 2;
         for (u32 ai = 0; ai < arity; ai++) {
             Term child = heap_read(ctx, loc + ai);
-
             if (term_tag(child) == TAG_DP0 || term_tag(child) == TAG_DP1) {
+                // Check if this DUP has both consumers (rendered as triangle above)
                 u64 dp_loc = term_val(child);
-                const char *port = (term_tag(child) == TAG_DP1) ? "dp1" : "dp0";
-
-                // Emit single DUP node at dp_loc (once)
-                int already = 0;
-                for (u32 di = 0; di < n_dup_emitted; di++)
-                    if (dup_emitted[di] == dp_loc) { already = 1; break; }
-                if (!already && n_dup_emitted < HDOT_DUP_MAX) {
-                    dup_emitted[n_dup_emitted++] = dp_loc;
-                    fprintf(f, "  dup%llu [label=\"DUP\", shape=triangle, fillcolor=\"#d4b8e8\", "
-                            "fontsize=9, width=0.6, height=0.5];\n", dp_loc);
-                    // Input edge: shared value → DUP
-                    Term shared = heap_read(ctx, dp_loc);
-                    if (term_tag(shared) == TAG_TOP)
-                        fprintf(f, "  n%llu -> dup%llu;\n", term_val(shared), dp_loc);
-                    else if (term_tag(shared) == TAG_TEN) {
-                        EMIT_TEN((u32)term_val(shared));
-                        fprintf(f, "  t%u -> dup%llu;\n", (u32)term_val(shared), dp_loc);
-                    } else if (term_tag(shared) == TAG_DP0 || term_tag(shared) == TAG_DP1) {
-                        // Nested DUP: shared value is itself a DP ref
-                        u64 inner_loc = term_val(shared);
-                        fprintf(f, "  dup%llu -> dup%llu;\n", inner_loc, dp_loc);
-                    }
-                    // Scan heap for BOTH dp0 and dp1 consumers to ensure 2 outputs
-                    // (the current node provides one; find the other)
-                    for (u64 _ch = 1; _ch < ctx->heap_pos; _ch++) {
-                        Term _ct = ctx->heap[_ch];
-                        if (term_tag(_ct) != TAG_TOP) continue;
-                        u32 _ce = term_ext(_ct);
-                        if (_ce == UOP_ASSIGN || _ce == UOP_GRAD) continue;
-                        u64 _cl = term_val(_ct);
-                        u32 _ca = (_ce == UOP_WHERE) ? 3 : 2;
-                        for (u32 _ai = 0; _ai < _ca; _ai++) {
-                            Term _cc = heap_read(ctx, _cl + _ai);
-                            if ((term_tag(_cc) == TAG_DP0 || term_tag(_cc) == TAG_DP1) &&
-                                term_val(_cc) == dp_loc && _ct != nodes[ni].term) {
-                                // Found the other consumer
-                                const char *_op = (term_tag(_cc) == TAG_DP1) ? "dp1" : "dp0";
-                                fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n",
-                                        dp_loc, _cl, _op);
-                            }
-                        }
-                    }
+                int has_both = 0;
+                for (u32 di = 0; di < n_dups; di++)
+                    if (dups[di].loc == dp_loc && dups[di].dp0_consumer && dups[di].dp1_consumer)
+                        { has_both = 1; break; }
+                if (has_both) continue; // handled by DUP pass
+                // Single-output DUP: draw direct edge from shared value
+                Term shared = heap_read(ctx, dp_loc);
+                if (term_tag(shared) == TAG_TOP)
+                    fprintf(f, "  n%llu -> n%llu;\n", term_val(shared), loc);
+                else if (term_tag(shared) == TAG_TEN) {
+                    EMIT_TEN((u32)term_val(shared));
+                    fprintf(f, "  t%u -> n%llu;\n", (u32)term_val(shared), loc);
                 }
-                // Output edge: DUP → consumer (this node), labeled dp0/dp1
-                fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n", dp_loc, term_val(nodes[ni].term), port);
-            } else if (term_tag(child) == TAG_TOP) {
-                fprintf(f, "  n%llu -> n%llu;\n", term_val(child), term_val(nodes[ni].term));
+                continue;
+            }
+            if (term_tag(child) == TAG_TOP) {
+                fprintf(f, "  n%llu -> n%llu;\n", term_val(child), loc);
             } else if (term_tag(child) == TAG_TEN) {
                 EMIT_TEN((u32)term_val(child));
-                fprintf(f, "  t%u -> n%llu;\n", (u32)term_val(child), term_val(nodes[ni].term));
+                fprintf(f, "  t%u -> n%llu;\n", (u32)term_val(child), loc);
             }
         }
     }

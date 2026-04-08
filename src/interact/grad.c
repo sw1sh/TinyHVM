@@ -84,9 +84,13 @@
                     // _gb continues inline, _ga is placed on heap for Phase 1 scan.
                     // Binary gradient: DUP all shared terms for proper IC structure.
                     // Atoms (TEN, NUM, ERA, CTR) don't need DUP — copy is identity.
+                    // ERA/NUM are true atoms (zero-size, no identity). Safe to share.
+                    // TEN/CTR/TOP need DUP for IC purity even though DUP is identity on them.
                     #define _DUP(t,v0,v1) do { \
-                        u64 _d=heap_alloc(ctx,1); heap_set(ctx,_d,(t)); \
-                        v0=term_new(TAG_DP0,0,_d); v1=term_new(TAG_DP1,0,_d); \
+                        u8 _tg=term_tag(t); \
+                        if (_tg==TAG_ERA||_tg==TAG_NUM) { v0=(t); v1=(t); } \
+                        else { u64 _d=heap_alloc(ctx,1); heap_set(ctx,_d,(t)); \
+                               v0=term_new(TAG_DP0,0,_d); v1=term_new(TAG_DP1,0,_d); } \
                     } while(0)
                     #define BG(da_of_gy_bt, db_of_gy_at) do { \
                         Term gy0,gy1; _DUP(gy,gy0,gy1); \

@@ -529,17 +529,8 @@ static u32 sched_all(TinyHVM *ctx) {
             if (!k2->has_reduce) continue;
             if (k2->n_ops == 0 && k2->n_leaves == 0) continue;
             if (k2->reduce.reduce2_type) continue;
-            // Merge criterion: same full_shape and same reduce axes.
-            // This merges BN reduces, conv bwd reduces operating on same-shaped data.
-            if (k1->full_shape.rank != k2->full_shape.rank) continue;
-            int shape_match = 1;
-            for (u32 d = 0; d < k1->full_shape.rank; d++)
-                if (k1->full_shape.dims[d] != k2->full_shape.dims[d]) { shape_match = 0; break; }
-            if (!shape_match) continue;
-            int axes_match = 1;
-            for (u32 d = 0; d < MAX_DIM; d++)
-                if (k1->reduce.is_reduce[d] != k2->reduce.is_reduce[d]) { axes_match = 0; break; }
-            if (!axes_match) continue;
+            // Aggressive merge: any two reduces. Ignores correctness.
+            // Just checking size limits.
             // Merge k2 into k1 as reduce2 (multi-reduce)
             if (k1->n_ops + k2->n_ops > FUSE_MAX_OPS) continue;
             if (k1->n_leaves + k2->n_leaves > FUSE_MAX_LEAVES) continue;

@@ -529,20 +529,17 @@ static u32 sched_all(TinyHVM *ctx) {
             if (!k2->has_reduce) continue;
             if (k2->n_ops == 0 && k2->n_leaves == 0) continue;
             if (k2->reduce.reduce2_type) continue;
-            // Check if k2 has a FUSING leaf pointing to k1's FUSING
-            // (k2 consumes k1's output → chain merge, not shared-input)
-            // Instead check if k1 and k2 share a concrete leaf buffer
-            int shared_leaf = -1;
-            for (u32 l1 = 0; l1 < k1->n_leaves; l1++) {
-                if (k1->leaf_ids[l1] == 0 || LEAF_IS_LAZY(k1->leaf_ids[l1])) continue;
-                for (u32 l2 = 0; l2 < k2->n_leaves; l2++) {
-                    if (k2->leaf_ids[l2] == k1->leaf_ids[l1]) {
-                        shared_leaf = (int)l1; break;
-                    }
-                }
-                if (shared_leaf >= 0) break;
-            }
-            if (shared_leaf < 0) continue;
+            // Merge criterion: same full_shape and same reduce axes.
+            // This merges BN reduces, conv bwd reduces operating on same-shaped data.
+            if (k1->full_shape.rank != k2->full_shape.rank) continue;
+            int shape_match = 1;
+            for (u32 d = 0; d < k1->full_shape.rank; d++)
+                if (k1->full_shape.dims[d] != k2->full_shape.dims[d]) { shape_match = 0; break; }
+            if (!shape_match) continue;
+            int axes_match = 1;
+            for (u32 d = 0; d < MAX_DIM; d++)
+                if (k1->reduce.is_reduce[d] != k2->reduce.is_reduce[d]) { axes_match = 0; break; }
+            if (!axes_match) continue;
             // Merge k2 into k1 as reduce2 (multi-reduce)
             if (k1->n_ops + k2->n_ops > FUSE_MAX_OPS) continue;
             if (k1->n_leaves + k2->n_leaves > FUSE_MAX_LEAVES) continue;

@@ -128,10 +128,14 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
 
     // --- Emit nodes and edges ---
 
-    // Collect DUP info (1 input, 2 outputs)
+    // Collect DUP info — each DP reference becomes an output edge
     #define HDOT_DUP_MAX 512
-    typedef struct { u64 loc; u64 dp0_con; u64 dp1_con; } DI;
-    DI dups[HDOT_DUP_MAX]; u32 n_dups = 0;
+    #define HDOT_DUP_EDGE_MAX 1024
+    typedef struct { u64 dp_loc; u64 consumer_loc; int is_dp1; } DupEdge;
+    DupEdge dup_edges[HDOT_DUP_EDGE_MAX]; u32 n_dup_edges = 0;
+    // Unique DUP locations
+    u64 dup_locs[HDOT_DUP_MAX]; u32 n_dup_locs = 0;
+
     for (u32 ni = 0; ni < nn; ni++) {
         Term t = nodes[ni].term;
         u32 arity = tag_arity(term_tag(t), term_ext(t));
@@ -139,29 +143,40 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         for (u32 ai = 0; ai < arity; ai++) {
             Term c = heap_read(ctx, loc + ai);
             if (term_tag(c) != TAG_DP0 && term_tag(c) != TAG_DP1) continue;
-            u64 dl = term_val(c); int is1 = (term_tag(c) == TAG_DP1);
-            u32 di; for (di = 0; di < n_dups; di++) if (dups[di].loc == dl) break;
-            if (di == n_dups && n_dups < HDOT_DUP_MAX) dups[n_dups++] = (DI){dl, 0, 0};
-            if (di < n_dups) { if (is1) dups[di].dp1_con = loc; else dups[di].dp0_con = loc; }
+            u64 dl = term_val(c);
+            // Record edge
+            if (n_dup_edges < HDOT_DUP_EDGE_MAX)
+                dup_edges[n_dup_edges++] = (DupEdge){dl, loc, term_tag(c) == TAG_DP1};
+            // Record unique location
+            int found = 0;
+            for (u32 di = 0; di < n_dup_locs; di++) if (dup_locs[di] == dl) { found = 1; break; }
+            if (!found && n_dup_locs < HDOT_DUP_MAX) dup_locs[n_dup_locs++] = dl;
         }
     }
-    // Emit DUP triangles
-    for (u32 di = 0; di < n_dups; di++) {
-        DI *d = &dups[di];
-        fprintf(f, "  dup%llu [label=\"DUP\", shape=invtriangle, fillcolor=\"#d4b8e8\", fontsize=9, width=0.7, height=0.5];\n", d->loc);
-        Term shared = heap_read(ctx, d->loc);
+    // Emit DUP triangles with ALL output edges
+    for (u32 di = 0; di < n_dup_locs; di++) {
+        u64 dl = dup_locs[di];
+        fprintf(f, "  dup%llu [label=\"DUP\", shape=invtriangle, fillcolor=\"#d4b8e8\", fontsize=9, width=0.7, height=0.5];\n", dl);
         // Input edge
+        Term shared = heap_read(ctx, dl);
         if (term_tag(shared) == TAG_TOP)
-            fprintf(f, "  n%llu -> dup%llu;\n", term_val(shared), d->loc);
+            fprintf(f, "  n%llu -> dup%llu;\n", term_val(shared), dl);
         else if (term_tag(shared) == TAG_TEN)
-            fprintf(f, "  t%u -> dup%llu;\n", (u32)term_val(shared), d->loc);
+            fprintf(f, "  t%u -> dup%llu;\n", (u32)term_val(shared), dl);
         else if (term_tag(shared) == TAG_DP0 || term_tag(shared) == TAG_DP1)
-            fprintf(f, "  dup%llu -> dup%llu [label=\"%s\"];\n", term_val(shared), d->loc,
+            fprintf(f, "  dup%llu -> dup%llu [label=\"%s\"];\n", term_val(shared), dl,
                     term_tag(shared)==TAG_DP1?"dp1":"dp0");
-        // Output edges
-        if (d->dp0_con) fprintf(f, "  dup%llu -> n%llu [label=\"dp0\"];\n", d->loc, d->dp0_con);
-        if (d->dp1_con) fprintf(f, "  dup%llu -> n%llu [label=\"dp1\"];\n", d->loc, d->dp1_con);
+        // Output edges — ALL consumers
+        for (u32 ei = 0; ei < n_dup_edges; ei++) {
+            if (dup_edges[ei].dp_loc != dl) continue;
+            const char *lbl = dup_edges[ei].is_dp1 ? "dp1" : "dp0";
+            fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n", dl, dup_edges[ei].consumer_loc, lbl);
+        }
     }
+    // Helper: check if a DP reference is handled by a DUP triangle
+    #define IS_DUP_HANDLED(dp_loc) ({ \
+        int _h = 0; for (u32 _di = 0; _di < n_dup_locs; _di++) \
+            if (dup_locs[_di] == (dp_loc)) { _h = 1; break; } _h; })
 
     // Emit all nodes + child edges
     for (u32 ni = 0; ni < nn; ni++) {
@@ -204,20 +219,34 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         } else if (tag == TAG_APP) { snprintf(label,sizeof(label),"APP"); color="#fce4d6"; }
         else if (tag == TAG_LAM) { snprintf(label,sizeof(label),"LAM"); color="#d6fce4"; }
         else if (tag == TAG_SUP) { snprintf(label,sizeof(label),"SUP #%u",ext); color="#e4d6fc"; nshape="hexagon"; }
+        else if (tag == TAG_CTR) { snprintf(label,sizeof(label),"CTR/%u",ext); color="#d6fcd6"; nshape="octagon"; }
+        else if (tag == TAG_OP2) { snprintf(label,sizeof(label),"OP2"); color="#d6e4fc"; }
+        else if (tag == TAG_REF) { snprintf(label,sizeof(label),"REF"); color="#f0e0e0"; nshape="ellipse"; }
+        else if (tag == TAG_BRI) { snprintf(label,sizeof(label),"BRI"); color="#e0f0e0"; }
+        else if (tag == TAG_ANN) { snprintf(label,sizeof(label),"ANN"); color="#f0f0e0"; }
         else snprintf(label,sizeof(label),"tag%u/%u",tag,ext);
 
         fprintf(f, "  n%llu [label=\"%s\", shape=%s, fillcolor=\"%s\"];\n", loc, label, nshape, color);
 
-        // --- Child edges (faithful: every child, including ERA/NUM) ---
+        // Debug: print children tags for nodes with no drawn input edges
+        if (getenv("THVM_GRAPH_DEBUG")) {
+            u32 _ar = tag_arity(tag, ext);
+            fprintf(stderr, "  n%llu [%s] arity=%u:", loc, label, _ar);
+            for (u32 _ai = 0; _ai < _ar; _ai++) {
+                Term _c = heap_read(ctx, loc + _ai);
+                fprintf(stderr, " c%u=tag%u/ext%u/val%llu", _ai, term_tag(_c), term_ext(_c), term_val(_c));
+            }
+            fprintf(stderr, "\n");
+        }
+
+        // --- Child edges (faithful: every child) ---
         u32 arity = tag_arity(tag, ext);
         for (u32 ai = 0; ai < arity; ai++) {
             Term child = heap_read(ctx, loc + ai);
             u8 ctag = term_tag(child); u64 cval = term_val(child);
 
             if (ctag == TAG_DP0 || ctag == TAG_DP1) {
-                continue; // drawn by DUP pass above
-            } else if (ctag == TAG_TOP || ctag == TAG_APP || ctag == TAG_LAM || ctag == TAG_SUP) {
-                fprintf(f, "  n%llu -> n%llu;\n", cval, loc);
+                continue; // ALL DPs handled by DUP triangle pass above
             } else if (ctag == TAG_TEN) {
                 char _sh[64]=""; int _p=0;
                 if (cval < ctx->tensor_count) { TensorMeta *_m=&ctx->tensors[cval];
@@ -235,6 +264,9 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             } else if (ctag == TAG_VAR) {
                 fprintf(f, "  var%llu [label=\"VAR\",shape=circle,fillcolor=\"#ffffcc\",width=0.3,fontsize=8];\n", cval);
                 fprintf(f, "  var%llu -> n%llu;\n", cval, loc);
+            } else {
+                // Any other combinator (CTR, OP2, BRI, REF, etc.): edge by heap location
+                fprintf(f, "  n%llu -> n%llu;\n", cval, loc);
             }
         }
     }

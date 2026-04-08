@@ -111,40 +111,25 @@
                     RETURN_REDUCED(kid_results[kid]);
                 KernelEntry *ke = &sched_kernels[kid];
 
-                // Dead kernel: redirect to absorber (force absorber dispatch if needed)
+                // Dead kernel (absorbed by merge): return absorber's result.
+                // If absorber not dispatched yet, it will be dispatched when
+                // encountered later. For now, return the FUSING term itself
+                // (WNF) so the caller retries later.
                 if (ke->n_ops == 0 && ke->n_leaves == 0) {
                     extern u32 sched_absorber[];
                     u32 abs_kid = sched_absorber[kid];
-                    // Follow absorber chain
                     while (abs_kid < sched_kernel_count &&
                            sched_kernels[abs_kid].n_ops == 0 &&
                            sched_kernels[abs_kid].n_leaves == 0 &&
-                           sched_absorber[abs_kid] < sched_kernel_count) {
+                           sched_absorber[abs_kid] < sched_kernel_count)
                         abs_kid = sched_absorber[abs_kid];
+                    if (abs_kid < sched_kernel_count &&
+                        term_tag(kid_results[abs_kid]) != TAG_ERA) {
+                        kid_results[kid] = kid_results[abs_kid];
+                        RETURN_REDUCED(kid_results[abs_kid]);
                     }
-                    if (abs_kid < sched_kernel_count) {
-                        if (term_tag(kid_results[abs_kid]) != TAG_ERA) {
-                            kid_results[kid] = kid_results[abs_kid];
-                            RETURN_REDUCED(kid_results[abs_kid]);
-                        }
-                        // Absorber not dispatched yet — mark dead kernel as "pending" to break cycles
-                        kid_results[kid] = term_new(TAG_NUM, 0, 0); // placeholder to prevent re-entry
-                        for (u64 _ah = 1; _ah < ctx->heap_pos; _ah++) {
-                            Term _at = ctx->heap[_ah];
-                            if (term_tag(_at)==TAG_TOP && term_ext(_at)==UOP_FUSING) {
-                                Term _akt = heap_read(ctx, term_val(_at)+1);
-                                if (term_tag(_akt)==TAG_NUM && (u32)term_val(_akt)==abs_kid) {
-                                    Term _ar = thvm_reduce(ctx, _at);
-                                    if (term_tag(_ar)==TAG_TEN) {
-                                        kid_results[kid] = _ar;
-                                        RETURN_REDUCED(_ar);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    RETURN_REDUCED(term_era());
+                    // Absorber not ready — return self (WNF, will retry)
+                    RETURN_REDUCED(t);
                 }
 
                 // Allocate output buffer
@@ -197,7 +182,12 @@
                                 u64 _vlocs[16]; u32 _vn = 0;
                                 while (term_tag(_inner) == TAG_TOP && _vn < 16) {
                                     u32 _vu = term_ext(_inner);
-                                    if (!is_view_op(_vu)) break;
+                                    if (!is_view_op(_vu)) {
+                                        if (getenv("THVM_MERGED_DISPATCH"))
+                                            fprintf(stderr, "  viewwalk_stop: ext=%u inner_tag=%u inner_ext=%u\n",
+                                                    _vu, term_tag(_inner), _vu);
+                                        break;
+                                    }
                                     _vlocs[_vn++] = term_val(_inner);
                                     Term _next = heap_read(ctx, term_val(_inner));
                                     if (term_tag(_next) == TAG_DP0 || term_tag(_next) == TAG_DP1)
@@ -206,6 +196,35 @@
                                 }
                                 // Try to dispatch the inner term
                                 Term _ir = thvm_reduce(ctx, _inner);
+                                // If inner is a dead FUSING, follow absorber chain directly
+                                if (term_tag(_ir) == TAG_TOP && term_ext(_ir) == UOP_FUSING) {
+                                    extern u32 sched_absorber[];
+                                    Term _fk = heap_read(ctx, term_val(_ir) + 1);
+                                    if (term_tag(_fk) == TAG_NUM) {
+                                        u32 _fkid = (u32)term_val(_fk);
+                                        // Follow absorber chain
+                                        while (_fkid < sched_kernel_count &&
+                                               sched_kernels[_fkid].n_ops == 0 &&
+                                               sched_kernels[_fkid].n_leaves == 0 &&
+                                               sched_absorber[_fkid] < sched_kernel_count)
+                                            _fkid = sched_absorber[_fkid];
+                                        if (term_tag(kid_results[_fkid]) != TAG_ERA) {
+                                            _ir = kid_results[_fkid];
+                                        } else {
+                                            // Dispatch absorber
+                                            for (u64 _ah = 1; _ah < ctx->heap_pos; _ah++) {
+                                                Term _at = ctx->heap[_ah];
+                                                if (term_tag(_at)==TAG_TOP && term_ext(_at)==UOP_FUSING) {
+                                                    Term _akt = heap_read(ctx, term_val(_at)+1);
+                                                    if (term_tag(_akt)==TAG_NUM && (u32)term_val(_akt)==_fkid) {
+                                                        _ir = thvm_reduce(ctx, _at);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 if (term_tag(_ir) != TAG_TEN) {
                                     // Scan heap for FUSING that replaced inner (follow absorber chain)
                                     extern u32 sched_absorber[];

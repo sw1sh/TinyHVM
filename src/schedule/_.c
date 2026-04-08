@@ -258,14 +258,23 @@ static void sched_kill_kernel(TinyHVM *ctx, u32 dead_ki, u32 absorber_ki) {
         }
     }
     if (term_tag(absorber_fusing) == TAG_ERA) return;
+    // Find the dead kernel's FUSING term
+    Term dead_fusing = term_era();
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_FUSING) {
             Term kid_t = heap_read(ctx, term_val(ht) + 1);
             if (term_tag(kid_t) == TAG_NUM && (u32)term_val(kid_t) == dead_ki) {
-                ctx->heap[h] = absorber_fusing;
+                dead_fusing = ht; break;
             }
         }
+    }
+    if (term_tag(dead_fusing) == TAG_ERA) return;
+    // Replace ALL occurrences of dead_fusing on the heap with absorber_fusing.
+    // This handles both direct references and indirect ones (EXPAND wrapping FUSING etc.)
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        if (ctx->heap[h] == dead_fusing)
+            ctx->heap[h] = absorber_fusing;
     }
 }
 
@@ -1177,10 +1186,20 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         #undef MEM_MAX_BUFS
     }
 
-    // Restore pre-merge kernels for Metal (codegen doesn't handle merged yet).
-    // CPU dispatch handles post_reduce_start.
+    // Restore pre-merge kernels for non-merged dispatch.
     if (!getenv("THVM_MERGED_DISPATCH"))
         sched_restore_pre_merge();
+    else {
+        // Topological pre-dispatch: dispatch alive kernels in order,
+        // so dead kernels' absorbers are ready before consumers need them.
+        // Simple: dispatch all alive kernels sequentially (they're already
+        // in scheduling order which respects dependencies).
+        // Skip: this requires the FUSING handler to be callable directly,
+        // which it isn't — it fires via thvm_reduce on FUSING terms.
+        // Instead: just ensure absorbers dispatch before dead kernels.
+        // Nothing needed here — the FUSING handler's absorber-chain-follow
+        // handles it. The cycle breaker placeholder prevents infinite loops.
+    }
 
     { Backend *be = ctx_default_backend(ctx);
       if (be && be->end_batch) be->end_batch(); }

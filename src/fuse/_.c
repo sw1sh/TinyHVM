@@ -244,6 +244,9 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             if (_fuse_can_absorb_reduce) {
                 Term vi = view_input;
                 if (term_tag(vi)==TAG_DP0||term_tag(vi)==TAG_DP1) vi = heap_read(ctx, term_val(vi));
+                if (getenv("THVM_SCHED_DIAG2"))
+                    fprintf(stderr, "  absorb_check: uop=%s vi_tag=%u vi_ext=%u\n",
+                            uop_names[uop], term_tag(vi), term_tag(vi)==TAG_TOP?term_ext(vi):0);
                 if (term_tag(vi)==TAG_TOP && (term_ext(vi)==UOP_SUM||term_ext(vi)==UOP_RMAX)) {
                     _fuse_absorbed_reshape = t;
                     _fuse_absorbed_reduce = vi;
@@ -620,6 +623,8 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
 
     // Absorb unscheduled reduce: walk INTO SUM/RMAX instead of boundary
     if (!is_elementwise(uop) && _fuse_can_absorb_reduce) {
+        if (getenv("THVM_SCHED_DIAG2"))
+            fprintf(stderr, "  absorb_direct: uop=%s\n", uop < UOP_COUNT ? uop_names[uop] : "?");
         int is_absorbable = (uop == UOP_SUM || uop == UOP_RMAX);
         Term rt = t;
         if (!is_absorbable && uop == UOP_RESHAPE) {

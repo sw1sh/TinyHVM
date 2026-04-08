@@ -423,8 +423,11 @@ static u32 sched_all(TinyHVM *ctx) {
     // CSE: deduplicate kernels that compute the same thing.
     // DUP in the IC graph creates identical reduce/ew terms on separate branches.
     // Match by: ops structure + leaf equivalence (concrete IDs or lazy→FUSING kid).
+    // Run multiple rounds: deduping a leaf kernel may make dependent kernels match.
     {
         u32 n_deduped = 0;
+        for (u32 _cse_round = 0; _cse_round < 10; _cse_round++) {
+        u32 round_deduped = 0;
         // Helper: resolve a leaf to a canonical key for comparison.
         // Concrete leaf → tensor ID. Lazy FUSING leaf → kernel kid. Lazy TAG_TOP → heap loc.
         #define LEAF_KEY(ke, li) ({ \
@@ -440,12 +443,20 @@ static u32 sched_all(TinyHVM *ctx) {
                 } \
                 if (term_tag(_lt)==TAG_TOP && term_ext(_lt)==UOP_FUSING) { \
                     u64 _fl = term_val(_lt); Term _kt = heap_read(ctx, _fl+1); \
-                    if (term_tag(_kt)==TAG_NUM) _key = 0xC0000000u|(u32)term_val(_kt); \
+                    if (term_tag(_kt)==TAG_NUM) { \
+                        u32 _kid = (u32)term_val(_kt); \
+                        while (_kid < sched_kernel_count && canonical[_kid] != _kid) _kid = canonical[_kid]; \
+                        _key = 0xC0000000u|_kid; \
+                    } \
                 } else _key = (u32)(term_val(_lt) | 0x80000000u); \
             } \
             _key; })
 
-        // Find ka's FUSING term on heap (cache per ki)
+        // Dedup map: canonical[ki] = canonical kid for ki (follows dedup chain)
+        u32 canonical[SCHED_MAX_KERNELS];
+        for (u32 ki = 0; ki < sched_kernel_count; ki++) canonical[ki] = ki;
+
+        // Find ka's FUSING term on heap (rebuild each CSE round)
         Term fusing_terms[SCHED_MAX_KERNELS];
         for (u32 ki = 0; ki < sched_kernel_count; ki++) {
             fusing_terms[ki] = term_era();
@@ -506,9 +517,12 @@ static u32 sched_all(TinyHVM *ctx) {
                     }
                 }
                 kb->n_ops = 0; kb->n_leaves = 0; kb->has_reduce = 0;
-                n_deduped++;
+                canonical[kj] = ki; // record dedup mapping
+                n_deduped++; round_deduped++;
             }
         }
+        if (round_deduped == 0) break;
+        } // end CSE rounds
         #undef LEAF_KEY
         if (n_deduped && getenv("THVM_SCHED_DIAG"))
             fprintf(stderr, "CSE: deduped %u kernels\n", n_deduped);
@@ -700,28 +714,59 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         fprintf(stderr, "after sched: "); sched_dump_heap(ctx);
     }
     if (getenv("THVM_KERN_DUMP")) {
+        u64 total_flops = 0, total_mem_r = 0, total_mem_w = 0;
+        u32 n_live = 0;
         for (u32 ki = 0; ki < sched_kernel_count; ki++) {
             KernelEntry *k = &sched_kernels[ki];
-            const char *ktype = k->has_reduce ? "reduce" : (k->n_ops > 0 ? "ew" : "pass");
-            fprintf(stderr, "K[%2u] %-6s ops=%u lv=%u full=[", ki, ktype, k->n_ops, k->n_leaves);
-            for (u32 d = 0; d < k->full_shape.rank; d++)
-                fprintf(stderr, "%u%s", k->full_shape.dims[d], d+1<k->full_shape.rank?",":"");
-            fprintf(stderr, "] out=[");
-            for (u32 d = 0; d < k->out_shape.rank; d++)
-                fprintf(stderr, "%u%s", k->out_shape.dims[d], d+1<k->out_shape.rank?",":"");
-            fprintf(stderr, "]");
-            if (k->has_reduce) {
-                fprintf(stderr, " ax=[");
-                for (u32 d = 0; d < MAX_DIM; d++)
-                    if (k->reduce.is_reduce[d]) fprintf(stderr, "%u,", d);
-                fprintf(stderr, "]");
+            if (k->n_ops == 0 && k->n_leaves == 0) continue; // dead
+            n_live++;
+            // Compute FLOPs: full_numel * n_ops (ew ops per element) + reduce accumulation
+            u64 full_numel = 1;
+            for (u32 d = 0; d < k->full_shape.rank; d++) full_numel *= k->full_shape.dims[d];
+            u64 out_numel = 1;
+            for (u32 d = 0; d < k->out_shape.rank; d++) out_numel *= k->out_shape.dims[d];
+            // ew FLOPs: each element of full_shape does n_ops operations
+            // reduce FLOPs: each element of full_shape does 1 accumulate
+            u64 ew_flops = full_numel * (k->n_ops > 0 ? k->n_ops : 0);
+            u64 reduce_flops = k->has_reduce ? full_numel : 0;
+            u64 flops = ew_flops + reduce_flops;
+            if (flops == 0) flops = full_numel; // passthrough
+            // Memory: reads = sum of leaf numels, write = out_numel
+            u64 mem_r = 0;
+            for (u32 li = 0; li < k->n_leaves; li++) {
+                u64 ln = 1;
+                for (u32 d = 0; d < k->leaf_views[li].shape.rank; d++)
+                    ln *= k->leaf_views[li].shape.dims[d];
+                mem_r += ln * 4;
             }
-            fprintf(stderr, " leaves=[");
+            u64 mem_w = out_numel * 4;
+            total_flops += flops;
+            total_mem_r += mem_r;
+            total_mem_w += mem_w;
+            // Format: tinygrad-style
+            const char *ktype = k->has_reduce ? "r" : "E";
+            fprintf(stderr, "*** K %3u  %s_", ki, ktype);
+            // Shape encoding (tinygrad style: bold=full, colored=out for reduces)
+            for (u32 d = 0; d < k->full_shape.rank; d++)
+                fprintf(stderr, "%u%s", k->full_shape.dims[d], d+1<k->full_shape.rank?"_":"");
+            if (k->has_reduce) {
+                fprintf(stderr, " → ");
+                for (u32 d = 0; d < k->out_shape.rank; d++)
+                    fprintf(stderr, "%u%s", k->out_shape.dims[d], d+1<k->out_shape.rank?"_":"");
+            }
+            // Stats
+            fprintf(stderr, "  arg %2u  ops %2u  flops %8llu  mem_r %7.2fKB  mem_w %7.2fKB  lv=[",
+                    k->n_leaves, k->n_ops, flops,
+                    (double)mem_r/1024.0, (double)mem_w/1024.0);
             for (u32 li = 0; li < k->n_leaves; li++)
                 fprintf(stderr, "%u%s", k->leaf_ids[li], li+1<k->n_leaves?",":"");
-            fprintf(stderr, "]");
-            fprintf(stderr, "\n");
+            fprintf(stderr, "]\n");
         }
+        fprintf(stderr, "--- TOTAL: %u live kernels  flops=%llu (%.2f MFLOP)  "
+                "mem_r=%.2fMB  mem_w=%.2fMB  mem_total=%.2fMB\n",
+                n_live, total_flops, (double)total_flops/1e6,
+                (double)total_mem_r/1e6, (double)total_mem_w/1e6,
+                (double)(total_mem_r+total_mem_w)/1e6);
     }
 
     { Backend *be = ctx_default_backend(ctx);

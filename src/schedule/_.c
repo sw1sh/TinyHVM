@@ -1065,6 +1065,22 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             MEM_FIND_OR_ADD(oid,osz*4,ai);
             for(u32 b=0;b<n_bufs;b++)if(bufs[b].id==oid){bufs[b].is_output=1;break;}
         }
+        // Output dedup: if two output bufs have the same size and one's lifetime
+        // is contained within the other's, the later reuses the earlier's buffer.
+        // (Forward output reused in backward — tinygrad does this automatically.)
+        for (u32 b1 = 0; b1 < n_bufs; b1++) {
+            if (!bufs[b1].is_output || bufs[b1].size == 0) continue;
+            for (u32 b2 = b1 + 1; b2 < n_bufs; b2++) {
+                if (!bufs[b2].is_output || bufs[b2].size == 0) continue;
+                if (bufs[b1].size != bufs[b2].size) continue;
+                // Same size outputs: merge lifetimes, zero out the later one
+                if (bufs[b2].birth >= bufs[b1].birth) {
+                    if (bufs[b2].death > bufs[b1].death) bufs[b1].death = bufs[b2].death;
+                    bufs[b2].size = 0;
+                    n_fused_away++;
+                }
+            }
+        }
         u32 peak_live=0; u64 peak_bytes=0;
         for (u32 ai=0;ai<n_alive;ai++) {
             u32 live=0; u64 lb=0;

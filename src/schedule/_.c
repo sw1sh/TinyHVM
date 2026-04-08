@@ -701,18 +701,9 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         }
         if (!found) break;
     }
-    // DUP⊳atom cleanup: resolve DP refs where shared value is an atom.
-    // In IC nets, DUP⊳TEN/NUM/ERA fires immediately — both ports get the value.
-    // The trampoline returns the value but leaves the DUP node on the heap.
-    // Resolve: replace DP refs with the shared value, erase the DUP.
-    for (u64 h = 1; h < ctx->heap_pos; h++) {
-        Term ht = ctx->heap[h];
-        if (term_tag(ht) != TAG_DP0 && term_tag(ht) != TAG_DP1) continue;
-        Term shared = heap_read(ctx, term_val(ht));
-        u8 st = term_tag(shared);
-        if (st == TAG_TEN || st == TAG_NUM || st == TAG_ERA || st == TAG_CTR || st == TAG_ANY)
-            ctx->heap[h] = shared; // resolve DP → atom directly
-    }
+    // DUP nodes persist for atoms (TEN/NUM) to maintain single-output invariant.
+    // DUP⊳atom fires during reduction (both ports get the value) but the DUP
+    // node stays on the heap as a structural sharing marker.
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }
     // Phase 1 graph: after reduce — pure TAG_TOPs + combinators
     if (getenv("THVM_GRAPH")) thvm_heap_dot_root(ctx, "/tmp/thvm_1_post_reduce.dot", t);

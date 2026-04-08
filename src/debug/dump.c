@@ -175,14 +175,45 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
             char sh[64] = "";
             if (v) { int p = 0; for (u32 d = 0; d < v->shape.rank && p < 50; d++)
                 p += snprintf(sh+p, sizeof(sh)-p, "%s%u", d?",":"", v->shape.dims[d]); }
-            snprintf(label, sizeof(label), "%s\\n[%s]", opn, sh);
-            if (ext == UOP_ASSIGN)                      color = "#ffd700";
-            else if (is_elementwise(ext))               color = "#cce5ff";
-            else if (ext == UOP_SUM || ext == UOP_RMAX) color = "#ffcccc";
-            else if (ext == UOP_FUSING)                 color = "#ccffcc";
-            else if (is_view_op(ext))                   color = "#fff3cd";
-            else if (ext == UOP_MM)                     color = "#ffccff";
-            else                                        color = "#f0f0f0";
+            if (ext == UOP_FUSING) {
+                // Show kernel ID + fused op summary
+                Term kid_t = heap_read(ctx, loc + 1);
+                u32 kid = (term_tag(kid_t) == TAG_NUM) ? (u32)term_val(kid_t) : 0;
+                extern KernelEntry sched_kernels[];
+                KernelEntry *ke = &sched_kernels[kid];
+                char ops_str[64] = "";
+                if (ke->n_ops > 0 || ke->has_reduce) {
+                    int p = 0;
+                    if (ke->has_reduce) {
+                        const char *rn = (ke->has_reduce == UOP_SUM) ? "SUM" :
+                                         (ke->has_reduce == UOP_RMAX) ? "RMAX" : "?";
+                        p += snprintf(ops_str+p, sizeof(ops_str)-p, "%s", rn);
+                        if (ke->n_ops > 0) p += snprintf(ops_str+p, sizeof(ops_str)-p, "+");
+                    }
+                    // Unique op names in the kernel
+                    u8 seen[UOP_COUNT] = {0};
+                    for (u32 oi = 0; oi < ke->n_ops && p < 50; oi++) {
+                        u32 u = ke->ops[oi].uop;
+                        if (u < UOP_COUNT && !seen[u]) {
+                            seen[u] = 1;
+                            if (p > 0 && ops_str[p-1] != '+')
+                                p += snprintf(ops_str+p, sizeof(ops_str)-p, "+");
+                            p += snprintf(ops_str+p, sizeof(ops_str)-p, "%s", uop_names[u]);
+                        }
+                    }
+                }
+                snprintf(label, sizeof(label), "K%u: %s\\n[%s]\\nops=%u lv=%u",
+                         kid, ops_str, sh, ke->n_ops, ke->n_leaves);
+                color = "#ccffcc"; nshape = "box";
+            } else {
+                snprintf(label, sizeof(label), "%s\\n[%s]", opn, sh);
+                if (ext == UOP_ASSIGN)                      color = "#ffd700";
+                else if (is_elementwise(ext))               color = "#cce5ff";
+                else if (ext == UOP_SUM || ext == UOP_RMAX) color = "#ffcccc";
+                else if (is_view_op(ext))                   color = "#fff3cd";
+                else if (ext == UOP_MM)                     color = "#ffccff";
+                else                                        color = "#f0f0f0";
+            }
         } else if (tag == TAG_APP) {
             snprintf(label, sizeof(label), "APP"); color = "#fce4d6"; // orange
         } else if (tag == TAG_LAM) {
@@ -205,12 +236,14 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
         fprintf(f, "  n%llu [label=\"%s\", shape=%s, fillcolor=\"%s\"];\n",
                 loc, label, nshape, color);
 
-        // Edges to children
+        // Edges to children (skip FUSING internal metadata)
         u32 arity = tag_arity(tag, ext);
+        if (tag == TAG_TOP && ext == UOP_FUSING) arity = 0; // FUSING children are metadata, not data
         for (u32 ai = 0; ai < arity; ai++) {
             Term child = heap_read(ctx, loc + ai);
             u8 ctag = term_tag(child);
             u64 cval = term_val(child);
+            if (ctag == TAG_ERA) continue; // skip ERA children (clutter)
             if (ctag == TAG_DP0 || ctag == TAG_DP1) {
                 // Check if DUP triangle exists (both consumers present)
                 u64 dp_loc = cval;
@@ -234,15 +267,46 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
                 fprintf(f, "  era%llu_%u [label=\"ERA\", shape=point, width=0.15];\n", loc, ai);
                 fprintf(f, "  era%llu_%u -> n%llu;\n", loc, ai, loc);
             } else if (ctag == TAG_NUM) {
-                f32 fv; u32 bv = (u32)cval; memcpy(&fv, &bv, 4);
-                fprintf(f, "  num%llu_%u [label=\"%.3g\", shape=plaintext, fontsize=8];\n", loc, ai, fv);
-                fprintf(f, "  num%llu_%u -> n%llu;\n", loc, ai, loc);
+                continue; // skip scalar constants (clutter)
             } else if (ctag == TAG_VAR) {
                 fprintf(f, "  var%llu [label=\"VAR\", shape=circle, fillcolor=\"#ffffcc\", width=0.3, fontsize=8];\n", cval);
                 fprintf(f, "  var%llu -> n%llu;\n", cval, loc);
             } else {
                 // Other combinator: link by heap location
                 fprintf(f, "  n%llu -> n%llu;\n", cval, loc);
+            }
+        }
+    }
+    // Pass 4: FUSING leaf edges — connect each FUSING kernel to its data dependencies
+    {
+        extern KernelEntry sched_kernels[];
+        extern u32 sched_kernel_count;
+        for (u32 ni = 0; ni < nn; ni++) {
+            Term t = nodes[ni].term;
+            if (term_tag(t) != TAG_TOP || term_ext(t) != UOP_FUSING) continue;
+            u64 loc = term_val(t);
+            Term kid_t = heap_read(ctx, loc + 1);
+            if (term_tag(kid_t) != TAG_NUM) continue;
+            u32 kid = (u32)term_val(kid_t);
+            if (kid >= sched_kernel_count) continue;
+            KernelEntry *ke = &sched_kernels[kid];
+            for (u32 li = 0; li < ke->n_leaves; li++) {
+                Term lt = ke->leaf_terms[li];
+                // Resolve through views/DP to find the source node
+                for (int _r = 0; _r < 10; _r++) {
+                    if (term_tag(lt)==TAG_DP0||term_tag(lt)==TAG_DP1)
+                        { lt = heap_read(ctx, term_val(lt)); continue; }
+                    if (term_tag(lt)==TAG_TOP && is_view_op(term_ext(lt)))
+                        { lt = heap_read(ctx, term_val(lt)); continue; }
+                    break;
+                }
+                if (term_tag(lt) == TAG_TOP) {
+                    fprintf(f, "  n%llu -> n%llu;\n", term_val(lt), loc);
+                } else if (term_tag(lt) == TAG_TEN) {
+                    u32 tid = (u32)term_val(lt);
+                    EMIT_TEN(tid);
+                    fprintf(f, "  t%u -> n%llu;\n", tid, loc);
+                }
             }
         }
     }

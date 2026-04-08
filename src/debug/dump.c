@@ -166,7 +166,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (!found && n_dup_locs < HDOT_DUP_MAX) dup_locs[n_dup_locs++] = dl;
         }
     }
-    // Emit DUP triangles with ALL output edges
+    // Emit ALL DUP triangles — always show 1 input + dp0 + dp1
+    // Missing consumers show as dangling stubs (structural error visible)
     for (u32 di = 0; di < n_dup_locs; di++) {
         u64 dl = dup_locs[di];
         fprintf(f, "  dup%llu [label=\"DUP\", shape=invtriangle, fillcolor=\"#d4b8e8\", fontsize=9, width=0.7, height=0.5];\n", dl);
@@ -179,11 +180,22 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         else if (term_tag(shared) == TAG_DP0 || term_tag(shared) == TAG_DP1)
             fprintf(f, "  dup%llu -> dup%llu [label=\"%s\"];\n", term_val(shared), dl,
                     term_tag(shared)==TAG_DP1?"dp1":"dp0");
-        // Output edges — ALL consumers
+        // Output edges — find dp0 and dp1 consumers
+        int has_dp0 = 0, has_dp1 = 0;
         for (u32 ei = 0; ei < n_dup_edges; ei++) {
             if (dup_edges[ei].dp_loc != dl) continue;
             const char *lbl = dup_edges[ei].is_dp1 ? "dp1" : "dp0";
             fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n", dl, dup_edges[ei].consumer_loc, lbl);
+            if (dup_edges[ei].is_dp1) has_dp1 = 1; else has_dp0 = 1;
+        }
+        // Dangling stubs for missing ports
+        if (!has_dp0) {
+            fprintf(f, "  dang%llu_0 [label=\"?\",shape=plain,fontsize=8,fontcolor=red];\n", dl);
+            fprintf(f, "  dup%llu -> dang%llu_0 [label=\"dp0\",style=dotted,color=red];\n", dl, dl);
+        }
+        if (!has_dp1) {
+            fprintf(f, "  dang%llu_1 [label=\"?\",shape=plain,fontsize=8,fontcolor=red];\n", dl);
+            fprintf(f, "  dup%llu -> dang%llu_1 [label=\"dp1\",style=dotted,color=red];\n", dl, dl);
         }
     }
     // Helper: check if a DP reference is handled by a DUP triangle
@@ -252,35 +264,44 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             fprintf(stderr, "\n");
         }
 
-        // --- Child edges ---
+        // --- Child edges with labels ---
         u32 arity = tag_arity(tag, ext);
-        if (tag == TAG_TOP && ext == UOP_FUSING) arity = 0; // FUSING heap slots are metadata
+        if (tag == TAG_TOP && ext == UOP_FUSING) arity = 0;
         for (u32 ai = 0; ai < arity; ai++) {
             Term child = heap_read(ctx, loc + ai);
             u8 ctag = term_tag(child); u64 cval = term_val(child);
+            // Edge label based on parent op + child index
+            const char *elbl = "";
+            if (tag == TAG_TOP) {
+                if (ext == UOP_ASSIGN) elbl = ai==0 ? "tgt" : "src";
+                else if (ext >= UOP_RESHAPE && ext <= UOP_PAD) elbl = ai==0 ? "in" : "shape";
+                else if (ext == UOP_SUM || ext == UOP_RMAX) elbl = ai==0 ? "in" : "axes";
+                else if (ext == UOP_GRAD) elbl = ai==0 ? "y" : ai==1 ? "gy" : "x";
+                else if (is_binary(ext)) elbl = ai==0 ? "a" : "b";
+            } else if (tag == TAG_APP) elbl = ai==0 ? "fn" : "arg";
+            else if (tag == TAG_LAM) elbl = ai==0 ? "var" : "body";
 
             if (ctag == TAG_DP0 || ctag == TAG_DP1) {
-                continue; // ALL DPs handled by DUP triangle pass above
+                continue; // handled by DUP triangle pass
             } else if (ctag == TAG_TEN) {
                 char _sh[64]=""; int _p=0;
                 if (cval < ctx->tensor_count) { TensorMeta *_m=&ctx->tensors[cval];
                     for (u32 _d=0;_d<_m->view.shape.rank;_d++)
                         _p+=snprintf(_sh+_p,sizeof(_sh)-_p,"%s%u",_d?",":"",_m->view.shape.dims[_d]); }
                 fprintf(f, "  t%u [label=\"t%u\\n[%s]\",shape=triangle,fillcolor=\"#e0e0e0\"];\n",(u32)cval,(u32)cval,_sh);
-                fprintf(f, "  t%u -> n%llu;\n", (u32)cval, loc);
+                fprintf(f, "  t%u -> n%llu [label=\"%s\"];\n", (u32)cval, loc, elbl);
             } else if (ctag == TAG_ERA) {
                 fprintf(f, "  era%llu_%u [label=\"\",shape=point,width=0.1];\n", loc, ai);
-                fprintf(f, "  era%llu_%u -> n%llu;\n", loc, ai, loc);
+                fprintf(f, "  era%llu_%u -> n%llu [label=\"%s\"];\n", loc, ai, loc, elbl);
             } else if (ctag == TAG_NUM) {
                 f32 fv; u32 bv=(u32)cval; memcpy(&fv,&bv,4);
                 fprintf(f, "  num%llu_%u [label=\"%.4g\",shape=plaintext,fontsize=8];\n", loc, ai, fv);
-                fprintf(f, "  num%llu_%u -> n%llu;\n", loc, ai, loc);
+                fprintf(f, "  num%llu_%u -> n%llu [label=\"%s\"];\n", loc, ai, loc, elbl);
             } else if (ctag == TAG_VAR) {
                 fprintf(f, "  var%llu [label=\"VAR\",shape=circle,fillcolor=\"#ffffcc\",width=0.3,fontsize=8];\n", cval);
-                fprintf(f, "  var%llu -> n%llu;\n", cval, loc);
+                fprintf(f, "  var%llu -> n%llu [label=\"%s\"];\n", cval, loc, elbl);
             } else {
-                // Any other combinator (CTR, OP2, BRI, REF, etc.): edge by heap location
-                fprintf(f, "  n%llu -> n%llu;\n", cval, loc);
+                fprintf(f, "  n%llu -> n%llu [label=\"%s\"];\n", cval, loc, elbl);
             }
         }
     }

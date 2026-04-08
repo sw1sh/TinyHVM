@@ -673,6 +673,124 @@ static u32 sched_all(TinyHVM *ctx) {
     if (n_m3 == 0) break;
     }
 
+    // Pass 8: ew+ew merge — combine ew kernels sharing concrete leaves.
+    // Two ew kernels reading the same buffer → one bigger ew kernel with both ops.
+    for (u32 _ee = 0; _ee < 10; _ee++) {
+    u32 n_ee = 0;
+    for (u32 ki = 0; ki < sched_kernel_count; ki++) {
+        KernelEntry *k1 = &sched_kernels[ki];
+        if (k1->has_reduce) continue;
+        if (k1->n_ops == 0 && k1->n_leaves == 0) continue;
+        for (u32 kj = ki + 1; kj < sched_kernel_count; kj++) {
+            KernelEntry *k2 = &sched_kernels[kj];
+            if (k2->has_reduce) continue;
+            if (k2->n_ops == 0 && k2->n_leaves == 0) continue;
+            // Check shared concrete leaf
+            int shared = 0;
+            for (u32 l1 = 0; l1 < k1->n_leaves && !shared; l1++) {
+                if (k1->leaf_ids[l1] == 0 || LEAF_IS_LAZY(k1->leaf_ids[l1])) continue;
+                for (u32 l2 = 0; l2 < k2->n_leaves; l2++) {
+                    if (k2->leaf_ids[l2] == k1->leaf_ids[l1]) { shared = 1; break; }
+                }
+            }
+            if (!shared) continue;
+            if (k1->n_ops + k2->n_ops > FUSE_MAX_OPS) continue;
+            if (k1->n_leaves + k2->n_leaves > FUSE_MAX_LEAVES) continue;
+            // Same output shape required (both write to same-shaped buffer)
+            if (k1->out_shape.rank != k2->out_shape.rank) continue;
+            // Merge k2 into k1 as parallel ew ops
+            u32 loff = k1->n_leaves;
+            for (u32 j = 0; j < k2->n_leaves; j++) {
+                k1->leaf_ids[k1->n_leaves] = k2->leaf_ids[j];
+                k1->leaf_views[k1->n_leaves] = k2->leaf_views[j];
+                k1->leaf_terms[k1->n_leaves] = k2->leaf_terms[j];
+                k1->leaf_sts[k1->n_leaves] = k2->leaf_sts[j];
+                k1->n_leaves++;
+            }
+            for (u32 j = 0; j < k2->n_ops; j++) {
+                FusedOp op = k2->ops[j];
+                if (op.arg_a < k2->n_leaves) op.arg_a += loff;
+                else op.arg_a = op.arg_a - k2->n_leaves + k1->n_leaves + k1->n_ops;
+                if (op.arg_b < k2->n_leaves) op.arg_b += loff;
+                else op.arg_b = op.arg_b - k2->n_leaves + k1->n_leaves + k1->n_ops;
+                k1->ops[k1->n_ops++] = op;
+            }
+            k2->n_ops = 0; k2->n_leaves = 0;
+            n_ee++;
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "  ew_ew_merge: k1=%u + k2=%u → ops=%u leaves=%u\n", ki, kj, k1->n_ops, k1->n_leaves);
+            break;
+        }
+    }
+    if (n_ee == 0) break;
+    }
+
+    // Pass 9: reduce absorb ew producer.
+    // If a reduce kernel has a FUSING leaf that points to an ew kernel,
+    // absorb the ew kernel's ops as additional pre-reduce ops.
+    for (u32 ki = 0; ki < sched_kernel_count; ki++) {
+        KernelEntry *r_ke = &sched_kernels[ki];
+        if (!r_ke->has_reduce) continue;
+        if (r_ke->n_ops == 0 && r_ke->n_leaves == 0) continue;
+        for (u32 li = 0; li < r_ke->n_leaves; li++) {
+            if (r_ke->leaf_ids[li] != 0) continue; // FUSING placeholder
+            Term lt = r_ke->leaf_terms[li];
+            Term fusing_t = lt;
+            while (term_tag(fusing_t) == TAG_TOP && is_view_op(term_ext(fusing_t))) {
+                Term nx = heap_read(ctx, term_val(fusing_t));
+                if (term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1) nx = heap_read(ctx, term_val(nx));
+                fusing_t = nx;
+            }
+            if (term_tag(fusing_t) != TAG_TOP || term_ext(fusing_t) != UOP_FUSING) continue;
+            u32 ew_ki = 0xFFFFFFFFu;
+            { u64 floc = term_val(fusing_t);
+              Term kid_t = heap_read(ctx, floc + 1);
+              if (term_tag(kid_t) == TAG_NUM) ew_ki = (u32)term_val(kid_t);
+            }
+            if (ew_ki == 0xFFFFFFFFu || ew_ki >= sched_kernel_count) continue;
+            KernelEntry *ew_ke = &sched_kernels[ew_ki];
+            if (ew_ke->has_reduce) continue; // only absorb pure ew
+            if (ew_ke->n_ops == 0 && ew_ke->n_leaves == 0) continue;
+            if (r_ke->n_ops + ew_ke->n_ops > FUSE_MAX_OPS) continue;
+            if (r_ke->n_leaves + ew_ke->n_leaves > FUSE_MAX_LEAVES) continue;
+            // Absorb: ew ops become additional pre-reduce ops
+            // Replace the FUSING leaf[li] with ew_ke's ops+leaves
+            u32 loff = r_ke->n_leaves;
+            // Add ew leaves
+            for (u32 j = 0; j < ew_ke->n_leaves; j++) {
+                r_ke->leaf_ids[r_ke->n_leaves] = ew_ke->leaf_ids[j];
+                r_ke->leaf_views[r_ke->n_leaves] = ew_ke->leaf_views[j];
+                r_ke->leaf_terms[r_ke->n_leaves] = ew_ke->leaf_terms[j];
+                r_ke->leaf_sts[r_ke->n_leaves] = ew_ke->leaf_sts[j];
+                r_ke->n_leaves++;
+            }
+            // The FUSING leaf[li] now maps to the ew kernel's last op result
+            u32 ew_result_idx = loff + ew_ke->n_leaves + ew_ke->n_ops - 1;
+            // Insert ew ops at current n_ops position (before existing ops, shifting them)
+            // Actually simpler: just append and remap leaf[li] references
+            u32 pre_rops = r_ke->n_ops;
+            for (u32 j = 0; j < ew_ke->n_ops; j++) {
+                FusedOp op = ew_ke->ops[j];
+                if (op.arg_a < ew_ke->n_leaves) op.arg_a += loff;
+                else op.arg_a = op.arg_a - ew_ke->n_leaves + r_ke->n_leaves + r_ke->n_ops;
+                if (op.arg_b < ew_ke->n_leaves) op.arg_b += loff;
+                else op.arg_b = op.arg_b - ew_ke->n_leaves + r_ke->n_leaves + r_ke->n_ops;
+                r_ke->ops[r_ke->n_ops++] = op;
+            }
+            // Remap existing reduce ops that referenced leaf[li]
+            ew_result_idx = r_ke->n_leaves + r_ke->n_ops - 1; // last appended ew op
+            for (u32 j = 0; j < pre_rops; j++) {
+                if (r_ke->ops[j].arg_a == li) r_ke->ops[j].arg_a = ew_result_idx;
+                if (r_ke->ops[j].arg_b == li) r_ke->ops[j].arg_b = ew_result_idx;
+            }
+            ew_ke->n_ops = 0; ew_ke->n_leaves = 0;
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "  reduce_absorb_ew: r=%u + ew=%u → ops=%u leaves=%u\n",
+                        ki, ew_ki, r_ke->n_ops, r_ke->n_leaves);
+            break;
+        }
+    }
+
     fuse_no_lazy_resolve = 0;
     return total;
 }

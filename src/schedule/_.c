@@ -504,15 +504,37 @@ static u32 sched_all(TinyHVM *ctx) {
             KernelEntry *r2_ke = &sched_kernels[r2_ki];
             if (!r2_ke->has_reduce) continue;
             if (r2_ke->n_ops == 0 && r2_ke->n_leaves == 0) continue;
-            // Would merge: but multi-reduce dispatch isn't implemented.
-            // For now, just count potential merges for diagnostics.
+            // Chain merge: absorb r2_ke into ke as additional reduce phase
+            if (r2_ke->n_ops + ke->n_ops > FUSE_MAX_OPS) continue;
+            if (r2_ke->n_leaves + ke->n_leaves > FUSE_MAX_LEAVES) continue;
+            // Append r2's ops+leaves into ke
+            u32 leaf_off = ke->n_leaves;
+            for (u32 j = 0; j < r2_ke->n_leaves; j++) {
+                ke->leaf_ids[ke->n_leaves] = r2_ke->leaf_ids[j];
+                ke->leaf_views[ke->n_leaves] = r2_ke->leaf_views[j];
+                ke->leaf_terms[ke->n_leaves] = r2_ke->leaf_terms[j];
+                ke->leaf_sts[ke->n_leaves] = r2_ke->leaf_sts[j];
+                ke->n_leaves++;
+            }
+            // Remap leaf[li] (the FUSING input) to r2's reduce result
+            // For now just append ops with shifted refs
+            for (u32 j = 0; j < r2_ke->n_ops; j++) {
+                FusedOp op = r2_ke->ops[j];
+                if (op.arg_a < r2_ke->n_leaves) op.arg_a += leaf_off;
+                else op.arg_a = op.arg_a - r2_ke->n_leaves + ke->n_leaves + ke->n_ops;
+                if (op.arg_b < r2_ke->n_leaves) op.arg_b += leaf_off;
+                else op.arg_b = op.arg_b - r2_ke->n_leaves + ke->n_leaves + ke->n_ops;
+                ke->ops[ke->n_ops++] = op;
+            }
+            r2_ke->n_ops = 0; r2_ke->n_leaves = 0; r2_ke->has_reduce = 0;
+            n_merges2++;
             if (getenv("THVM_SCHED_DIAG"))
-                fprintf(stderr, "  potential_multi_reduce: ki=%u leaf=%u → r2=%u (r2_ops=%u r2_leaves=%u)\n",
-                        ki, li, r2_ki, r2_ke->n_ops, r2_ke->n_leaves);
+                fprintf(stderr, "  chain_merge: ki=%u + r2=%u → ops=%u leaves=%u\n",
+                        ki, r2_ki, ke->n_ops, ke->n_leaves);
             break;
         }
     }
-    break; // just diagnostic for now
+    if (n_merges2 == 0) break;
     }
 
     // Pass 6: shared-input reduce merge (iterative).

@@ -735,31 +735,35 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     } else {
         t = thvm_reduce(ctx, t);
     }
-    for (u32 _gi = 0; _gi < 100; _gi++) {
-        int found = 0;
+    // Iterative GRAD worklist: each GRAD fires ONE rule via thvm_interact,
+    // placing sub-GRADs on the heap. Worklist processes them in order.
+    {
+        #define GRAD_WL_MAX 8192
+        u64 wl[GRAD_WL_MAX]; u32 wl_h = 0, wl_t = 0;
+        // Seed: find all GRADs currently on heap
         for (u64 h = 1; h < ctx->heap_pos; h++) {
             Term ht = ctx->heap[h];
-            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD) {
-                u64 gl = term_val(ht);
-                ctx->heap[h] = thvm_reduce(ctx, ht);
-                // Recursively erase dead GRAD subtree — prevents phantom DP refs
-                u64 erase_stk[64]; u32 es = 0;
-                for (u32 ci = 0; ci < 3; ci++) erase_stk[es++] = gl + ci;
-                while (es > 0) {
-                    u64 pos = erase_stk[--es];
-                    Term et = ctx->heap[pos];
-                    ctx->heap[pos] = term_era();
-                    u8 etag = term_tag(et);
-                    if (etag == TAG_TOP && es < 60) {
-                        u32 ear = (term_ext(et) == UOP_GRAD) ? 3 : 2;
-                        u64 eb = term_val(et);
-                        for (u32 ci = 0; ci < ear; ci++) erase_stk[es++] = eb + ci;
-                    }
-                }
-                found = 1;
+            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD && wl_t < GRAD_WL_MAX)
+                wl[wl_t++] = h;
+        }
+        if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "GRAD worklist: %u initial items\n", wl_t);
+        // Process worklist
+        while (wl_h < wl_t) {
+            u64 h = wl[wl_h++];
+            Term ht = ctx->heap[h];
+            if (term_tag(ht) != TAG_TOP || term_ext(ht) != UOP_GRAD) continue;
+            u64 hp_before = ctx->heap_pos;
+            ctx->heap[h] = thvm_interact(ctx, ht);
+            if (wl_h % 1000 == 0 && getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "  GRAD wl: processed=%u total=%u hp=%llu\n", wl_h, wl_t, ctx->heap_pos);
+            // Scan NEW heap entries for sub-GRADs created by this interaction
+            for (u64 h2 = hp_before; h2 < ctx->heap_pos && wl_t < GRAD_WL_MAX; h2++) {
+                Term ht2 = ctx->heap[h2];
+                if (term_tag(ht2) == TAG_TOP && term_ext(ht2) == UOP_GRAD)
+                    wl[wl_t++] = h2;
             }
         }
-        if (!found) break;
+        #undef GRAD_WL_MAX
     }
     // Collapse single-consumer DUPs using reachability from the graph dumper's
     // BFS. Collect live DP refs (reachable from TAG_TOP children on heap),

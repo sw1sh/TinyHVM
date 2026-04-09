@@ -87,9 +87,10 @@
                     // at/bt/x are NOT DUP'd: at goes to branch A (GRAD target),
                     // bt goes to branch B (GRAD target), x goes to branch B.
                     // Branch A's _ga is placed on heap; Branch B's _gb continues inline.
+                    // Iterative chain rule: place ALL sub-GRADs on heap.
+                    // Phase 1 worklist processes them without recursive goto.
                     #define BG(da_of_gy_bt, db_of_gy_at) do { \
-                        /* DUP shared terms. Atoms (TEN/ERA/NUM/CTR) shared directly. */ \
-                        u64 _ds = heap_alloc(ctx, 5); u32 _di = 0; \
+                        u64 _ds = heap_alloc(ctx, 6); u32 _di = 0; \
                         Term gy0,gy1,at0,at1,bt0,bt1,x0,x1; \
                         if(term_tag(gy)==TAG_TEN||term_tag(gy)==TAG_ERA||term_tag(gy)==TAG_NUM||term_tag(gy)==TAG_CTR){gy0=gy;gy1=gy;} \
                         else{heap_set(ctx,_ds+_di,gy);gy0=term_new(TAG_DP0,0,_ds+_di);gy1=term_new(TAG_DP1,0,_ds+_di);_di++;} \
@@ -102,9 +103,11 @@
                         Term _da; { Term gy=gy0,bt=bt0; (void)gy;(void)bt; _da=(da_of_gy_bt); } \
                         Term _db; { Term gy=gy1,at=at1; (void)gy;(void)at; _db=(db_of_gy_at); } \
                         Term _ga=GRAD3_H(at0,_da,x0), _gb=GRAD3_H(bt1,_db,x1); \
-                        heap_set(ctx, _ds+4, _ga); /* pending slot (was separate alloc) */ \
-                        GRAD_STEP(_gb); \
+                        heap_set(ctx, _ds+4, _ga); \
+                        heap_set(ctx, _ds+5, _gb); \
+                        GRAD_RETURN(term_era()); \
                     } while(0)
+                    // UG chains inline — unary ops don't split branches
                     #define UG(da_) do { Term _u=GRAD3_H(at,da_,x); if(term_tag(_u)==TAG_TOP) GRAD_STEP(_u); GRAD_RETURN(_u); } while(0)
 
                     switch (cop) {
@@ -198,10 +201,16 @@
 
                     // Movement ops fire eagerly → TAG_TEN with creator_op.
                     // Walk backward through provenance for movement ops only.
-                    // (Compute ops stay TAG_TOP, handled by GRAD_TOP above.)
                     {
                         u32 cop = my->creator_op;
                         u32 aid = my->src_ids[0], bid = my->src_ids[1];
+                        // Cycle detection: break provenance loops
+                        { int _cyc = 0;
+                          for (u32 _vi = 0; _vi < _grad_nv; _vi++)
+                              if (_grad_visited[_vi] == y_id) { _cyc = 1; break; }
+                          if (_cyc) { _grad_nv = 0; GRAD_RETURN(term_era()); }
+                          if (_grad_nv < 64) _grad_visited[_grad_nv++] = y_id;
+                        }
                         Term at = term_ten(aid, ctx->tensors[aid].dtype);
 
                         // Rebuild GRAD(input, backward_gy, x) and recurse
@@ -209,6 +218,7 @@
                             u64 _l = heap_alloc(ctx, 3); \
                             heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
                             term_new(TAG_TOP, UOP_GRAD, _l); })
+                        // WALK chains inline — movement ops don't split branches
                         #define WALK(da_) do { \
                             Term _w = GRAD3_TEN(at, da_, x); \
                             if (term_tag(_w) == TAG_TOP) GRAD_STEP(_w); \

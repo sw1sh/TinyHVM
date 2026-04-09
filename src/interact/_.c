@@ -23,6 +23,8 @@ static Term thvm_interact(TinyHVM *ctx, Term t) {
     #define GRAD_STEP(result) do { t = (result); goto inet_step; } while(0)
 
     u32 tag;
+    // GRAD_TEN cycle detection: track visited tensor IDs in WALK chains
+    u32 _grad_visited[64]; u32 _grad_nv = 0;
 inet_step:
     tag = term_tag(t);
 

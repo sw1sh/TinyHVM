@@ -722,9 +722,32 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             Term ht = ctx->heap[h];
             if (term_tag(ht) != TAG_TOP || term_ext(ht) != UOP_GRAD) continue;
             u64 gl = term_val(ht);
+            // Save GRAD children + y-op's bt before interact erases them
+            Term gc[4];
+            gc[0] = heap_read(ctx, gl);     // y
+            gc[1] = heap_read(ctx, gl+1);   // gy
+            gc[2] = heap_read(ctx, gl+2);   // x
+            // If y is TAG_TOP, save its bt (aux port that gets ERA'd)
+            gc[3] = term_era();
+            if (term_tag(gc[0]) == TAG_TOP && term_ext(gc[0]) != UOP_GRAD)
+                gc[3] = heap_read(ctx, term_val(gc[0]) + 1);
             u64 hp_before = ctx->heap_pos;
             ctx->heap[h] = thvm_interact(ctx, ht);
-            // GRAD handler now erases consumed slots internally
+            // DUP⊳ERA: collapse all single-consumer DUPs on the heap.
+            // After GRAD fires, some DUPs lost a port. Scan and collapse.
+            for (u64 dh = 1; dh < ctx->heap_pos; dh++) {
+                Term dt = ctx->heap[dh];
+                if (term_tag(dt) != TAG_DP0 && term_tag(dt) != TAG_DP1) continue;
+                u64 dl = term_val(dt);
+                u8 other = (term_tag(dt) == TAG_DP0) ? TAG_DP1 : TAG_DP0;
+                int has_other = 0;
+                for (u64 dh2 = 1; dh2 < ctx->heap_pos && !has_other; dh2++) {
+                    if (dh2 == dh) continue;
+                    if (term_tag(ctx->heap[dh2]) == other && term_val(ctx->heap[dh2]) == dl)
+                        has_other = 1;
+                }
+                if (!has_other) ctx->heap[dh] = heap_read(ctx, dl); // collapse
+            }
             // Step graph: dump after each GRAD interaction
             if (step_graph && step_n < 200) {
                 char p[256]; snprintf(p, sizeof(p), "%s/step_%03u.dot", _sg_dir, step_n++);

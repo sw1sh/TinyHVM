@@ -37,7 +37,7 @@ static u32 tag_arity(u32 tag, u32 ext) {
         case TAG_DP0: case TAG_DP1: return 1; // 1-slot DUP: only heap[val]
         case TAG_OP2: return 2;
         case TAG_TOP:
-            if (ext == UOP_WHERE) return 3;
+            if (ext == UOP_WHERE || ext == UOP_GRAD) return 3;
             return 2;
         case TAG_USP: return 2;
         case TAG_UDP: return 1;

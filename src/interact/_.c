@@ -19,12 +19,9 @@ static Term thvm_interact(TinyHVM *ctx, Term t) {
     // via `next = r; goto enter;` (no need to force-reduce here).
     // Return directly — trampoline handles TAG_TOP via goto enter
     #define RETURN_REDUCED(result) do { return (result); } while(0)
-    // GRAD iterative step: loop back to inet_step in the same frame.
-    #define GRAD_STEP(result) do { t = (result); goto inet_step; } while(0)
+    // No GRAD_STEP — all GRAD sub-terms are placed on heap iteratively
 
     u32 tag;
-    // GRAD_TEN cycle detection: track visited tensor IDs in WALK chains
-    u32 _grad_visited[64]; u32 _grad_nv = 0;
 inet_step:
     tag = term_tag(t);
 

@@ -107,8 +107,15 @@
                         heap_set(ctx, _ds+5, _gb); \
                         GRAD_RETURN(term_era()); \
                     } while(0)
-                    // UG chains inline — unary ops don't split branches
-                    #define UG(da_) do { Term _u=GRAD3_H(at,da_,x); if(term_tag(_u)==TAG_TOP) GRAD_STEP(_u); GRAD_RETURN(_u); } while(0)
+                    // UG: place sub-GRAD on heap — one interaction per step
+                    #define UG(da_) do { \
+                        Term _u=GRAD3_H(at,da_,x); \
+                        if(term_tag(_u)==TAG_TOP) { \
+                            u64 _slot = heap_alloc(ctx, 1); \
+                            heap_set(ctx, _slot, _u); \
+                        } \
+                        GRAD_RETURN(term_era()); \
+                    } while(0)
 
                     switch (cop) {
                         case UOP_ADD: BG(sum_to_shape(ctx,gy,y_shape,a_shape), sum_to_shape(ctx,gy,y_shape,b_shape));
@@ -204,13 +211,8 @@
                     {
                         u32 cop = my->creator_op;
                         u32 aid = my->src_ids[0], bid = my->src_ids[1];
-                        // Cycle detection: break provenance loops
-                        { int _cyc = 0;
-                          for (u32 _vi = 0; _vi < _grad_nv; _vi++)
-                              if (_grad_visited[_vi] == y_id) { _cyc = 1; break; }
-                          if (_cyc) { _grad_nv = 0; GRAD_RETURN(term_era()); }
-                          if (_grad_nv < 64) _grad_visited[_grad_nv++] = y_id;
-                        }
+                        // Cycle detection: provenance must go to earlier tensors
+                        if (aid >= y_id || aid >= ctx->tensor_count) GRAD_RETURN(term_era());
                         Term at = term_ten(aid, ctx->tensors[aid].dtype);
 
                         // Rebuild GRAD(input, backward_gy, x) and recurse
@@ -218,11 +220,14 @@
                             u64 _l = heap_alloc(ctx, 3); \
                             heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
                             term_new(TAG_TOP, UOP_GRAD, _l); })
-                        // WALK chains inline — movement ops don't split branches
+                        // WALK: place sub-GRAD on heap — one interaction per step
                         #define WALK(da_) do { \
                             Term _w = GRAD3_TEN(at, da_, x); \
-                            if (term_tag(_w) == TAG_TOP) GRAD_STEP(_w); \
-                            GRAD_RETURN(_w); \
+                            if (term_tag(_w) == TAG_TOP) { \
+                                u64 _slot = heap_alloc(ctx, 1); \
+                                heap_set(ctx, _slot, _w); \
+                            } \
+                            GRAD_RETURN(term_era()); \
                         } while(0)
 
                         switch (cop) {

@@ -703,6 +703,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     } else {
         t = thvm_reduce(ctx, t);
     }
+    // term_use_table NOT cleared — forward DUPs are legitimate sharing
     {
         #define GRAD_WL_MAX 8192
         u64 wl[GRAD_WL_MAX]; u32 wl_h = 0, wl_t = 0;
@@ -721,6 +722,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             u64 h = wl[wl_h++];
             Term ht = ctx->heap[h];
             if (term_tag(ht) != TAG_TOP || term_ext(ht) != UOP_GRAD) continue;
+            // (term_use_table cleared once before worklist, not per interaction)
             u64 gl = term_val(ht);
             // Save GRAD children + y-op's bt before interact erases them
             u64 hp_before = ctx->heap_pos;

@@ -689,52 +689,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     if (getenv("THVM_GRAPH")) thvm_heap_dot_root(ctx, "/tmp/thvm_0_pre_reduce.dot", t);
 
     // Phase 1: Pure IC reduce — GRAD fires, compute/movement ops stay TAG_TOP (WNF).
-    if (getenv("THVM_STEP_GRAPH")) {
-        // Step-by-step graph dumps: one graph per interaction
-        char dir[256]; snprintf(dir, sizeof(dir), "/tmp/thvm_steps");
-        char cmd[300]; snprintf(cmd, sizeof(cmd), "mkdir -p %s && rm -f %s/*.dot %s/*.png", dir, dir, dir);
-        system(cmd);
-        for (u32 step = 0; step < 200; step++) {
-            char path[256]; snprintf(path, sizeof(path), "%s/step_%03u.dot", dir, step);
-            thvm_heap_dot_root(ctx, path, t);
-            t = thvm_reduce_steps(ctx, t, 1);
-            // Check if fully reduced (no more interactions)
-            if (ctx->steps_taken == 0) {
-                // Dump final state
-                snprintf(path, sizeof(path), "%s/step_%03u_final.dot", dir, step + 1);
-                thvm_heap_dot_root(ctx, path, t);
-                break;
-            }
-        }
-        // Also scan pending GRADs
-        for (u32 _gi = 0; _gi < 100; _gi++) {
-            int found = 0;
-            for (u64 h = 1; h < ctx->heap_pos; h++) {
-                Term ht = ctx->heap[h];
-                if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD) {
-                    char path[256]; snprintf(path, sizeof(path), "/tmp/thvm_steps/grad_%llu_before.dot", h);
-                    thvm_heap_dot_root(ctx, path, ht);
-                    ctx->heap[h] = thvm_reduce_steps(ctx, ht, 1);
-                    if (ctx->steps_taken > 0) {
-                        snprintf(path, sizeof(path), "/tmp/thvm_steps/grad_%llu_after.dot", h);
-                        thvm_heap_dot_root(ctx, path, ctx->heap[h]);
-                    }
-                    // Keep reducing this GRAD to completion
-                    while (ctx->steps_taken > 0 && term_tag(ctx->heap[h]) == TAG_TOP) {
-                        ctx->heap[h] = thvm_reduce_steps(ctx, ctx->heap[h], 1);
-                    }
-                    found = 1;
-                }
-            }
-            if (!found) break;
-        }
-        // Render all DOTs to PNG
-        snprintf(cmd, sizeof(cmd), "for f in %s/*.dot; do dot -Tpng -Gdpi=150 \"$f\" -o \"${f%%.dot}.png\" 2>/dev/null; done", dir);
-        system(cmd);
-        fprintf(stderr, "Step graphs → %s/\n", dir);
-    } else {
-        t = thvm_reduce(ctx, t);
-    }
+    t = thvm_reduce(ctx, t);
     // Iterative GRAD worklist: each GRAD fires ONE rule via thvm_interact,
     // placing sub-GRADs on the heap. Worklist processes them in order.
     {
@@ -746,7 +701,17 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD && wl_t < GRAD_WL_MAX)
                 wl[wl_t++] = h;
         }
+        int step_graph = (getenv("THVM_STEP_GRAPH") != NULL);
+        char _sg_dir[] = "/tmp/thvm_steps";
+        if (step_graph) {
+            char cmd[256]; snprintf(cmd, sizeof(cmd), "mkdir -p %s && rm -f %s/*.dot %s/*.png", _sg_dir, _sg_dir, _sg_dir);
+            system(cmd);
+            // Dump step 0: state before any GRAD fires
+            char p[256]; snprintf(p, sizeof(p), "%s/step_000.dot", _sg_dir);
+            thvm_heap_dot_root(ctx, p, t);
+        }
         if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "GRAD worklist: %u initial items\n", wl_t);
+        u32 step_n = 1;
         // Process worklist
         while (wl_h < wl_t) {
             u64 h = wl[wl_h++];
@@ -754,14 +719,26 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             if (term_tag(ht) != TAG_TOP || term_ext(ht) != UOP_GRAD) continue;
             u64 hp_before = ctx->heap_pos;
             ctx->heap[h] = thvm_interact(ctx, ht);
-            if (wl_h % 1000 == 0 && getenv("THVM_SCHED_DIAG"))
-                fprintf(stderr, "  GRAD wl: processed=%u total=%u hp=%llu\n", wl_h, wl_t, ctx->heap_pos);
+            // Step graph: dump after each GRAD interaction
+            if (step_graph && step_n < 200) {
+                char p[256]; snprintf(p, sizeof(p), "%s/step_%03u.dot", _sg_dir, step_n++);
+                thvm_heap_dot_root(ctx, p, t);
+            }
             // Scan NEW heap entries for sub-GRADs created by this interaction
             for (u64 h2 = hp_before; h2 < ctx->heap_pos && wl_t < GRAD_WL_MAX; h2++) {
                 Term ht2 = ctx->heap[h2];
                 if (term_tag(ht2) == TAG_TOP && term_ext(ht2) == UOP_GRAD)
                     wl[wl_t++] = h2;
             }
+        }
+        if (step_graph) {
+            // Final state
+            char p[256]; snprintf(p, sizeof(p), "%s/step_%03u_final.dot", _sg_dir, step_n);
+            thvm_heap_dot_root(ctx, p, t);
+            // Render all to PNG
+            char cmd[256]; snprintf(cmd, sizeof(cmd), "for f in %s/*.dot; do dot -Tpng -Gdpi=150 \"$f\" -o \"${f%%.dot}.png\" 2>/dev/null; done", _sg_dir);
+            system(cmd);
+            fprintf(stderr, "Step graphs (%u steps) → %s/\n", step_n - 1, _sg_dir);
         }
         #undef GRAD_WL_MAX
     }

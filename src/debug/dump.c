@@ -99,7 +99,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) == TAG_TOP) {
             u32 ext = term_ext(ht);
-            if (ext == UOP_ASSIGN || ext == UOP_FUSING)
+            if (ext == UOP_ASSIGN || ext == UOP_FUSING || ext == UOP_GRAD)
                 HDOT_ENQ(ht);
         }
     }
@@ -111,7 +111,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (tag == TAG_ERA || tag == TAG_NUM || tag == TAG_TEN ||
                 tag == TAG_VAR || tag == TAG_ANY || tag == TAG_DP0 ||
                 tag == TAG_DP1 || tag >= TAG_COUNT) continue;
-            if (tag == TAG_TOP && term_ext(ht) == UOP_GRAD) continue;
+            // Show all TAG_TOPs including GRAD
             HDOT_ENQ(ht);
         }
     }
@@ -250,6 +250,25 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                         p+=snprintf(ops_s+p,sizeof(ops_s)-p,"%s",uop_names[u]); }}
                 snprintf(label,sizeof(label),"K%u: %s\\n[%s]\\nops=%u lv=%u",kid,ops_s,sh,ke->n_ops,ke->n_leaves);
                 color = "#ccffcc";
+            } else if (ext == UOP_GRAD) {
+                // GRAD label: show target parameter (from x argument = CTR)
+                Term gx = heap_read(ctx, loc + 2); // x = CTR with target tensor IDs
+                // Resolve DP chains on x
+                for (int _dp=0; _dp<10 && (term_tag(gx)==TAG_DP0||term_tag(gx)==TAG_DP1); _dp++)
+                    gx = heap_read(ctx, term_val(gx));
+                char tgt[32] = "any";
+                if (term_tag(gx) == TAG_CTR) {
+                    u64 cl = term_val(gx);
+                    u32 nt = term_as_u32(heap_read(ctx, cl));
+                    int p = 0;
+                    for (u32 gi = 0; gi < nt && p < 24; gi++) {
+                        Term pt = heap_read(ctx, cl + 1 + 2*gi);
+                        if (term_tag(pt) == TAG_TEN)
+                            p += snprintf(tgt+p, sizeof(tgt)-p, "%st%u", gi?",":"", (u32)term_val(pt));
+                    }
+                } else if (term_tag(gx) == TAG_ERA) snprintf(tgt, sizeof(tgt), "done");
+                snprintf(label, sizeof(label), "GRAD d/d(%s)\\n[%s]", tgt, sh);
+                color = "#e8d0ff"; nshape = "octagon";
             } else {
                 snprintf(label, sizeof(label), "%s\\n[%s]", opn, sh);
                 if (ext == UOP_ASSIGN) color = "#ffd700";

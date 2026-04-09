@@ -687,29 +687,33 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
 
     // Phase 0 graph: before reduce — full graph from root term t
     if (getenv("THVM_GRAPH")) thvm_heap_dot_root(ctx, "/tmp/thvm_0_pre_reduce.dot", t);
+    // Step graph: dump step 0 BEFORE any GRAD fires (shows root GRAD node)
+    if (getenv("THVM_STEP_GRAPH")) {
+        char cmd[256]; snprintf(cmd, sizeof(cmd), "mkdir -p thvm_steps && rm -f thvm_steps/*.dot thvm_steps/*.png");
+        system(cmd);
+        thvm_heap_dot_root(ctx, "thvm_steps/step_000.dot", t);
+    }
 
-    // Phase 1: Pure IC reduce — GRAD fires, compute/movement ops stay TAG_TOP (WNF).
-    t = thvm_reduce(ctx, t);
-    // Iterative GRAD worklist: each GRAD fires ONE rule via thvm_interact,
-    // placing sub-GRADs on the heap. Worklist processes them in order.
+    // Phase 1: Iterative GRAD worklist — each fires ONE chain rule step.
+    // If root term t is a GRAD, place it on the heap for uniform processing.
+    if (term_tag(t) == TAG_TOP && term_ext(t) == UOP_GRAD) {
+        u64 slot = heap_alloc(ctx, 1);
+        heap_set(ctx, slot, t);
+        t = term_era();
+    } else {
+        t = thvm_reduce(ctx, t);
+    }
     {
         #define GRAD_WL_MAX 8192
         u64 wl[GRAD_WL_MAX]; u32 wl_h = 0, wl_t = 0;
-        // Seed: find all GRADs currently on heap
+        // Seed: find all GRADs on heap (including root if placed above)
         for (u64 h = 1; h < ctx->heap_pos; h++) {
             Term ht = ctx->heap[h];
             if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD && wl_t < GRAD_WL_MAX)
                 wl[wl_t++] = h;
         }
         int step_graph = (getenv("THVM_STEP_GRAPH") != NULL);
-        char _sg_dir[] = "/tmp/thvm_steps";
-        if (step_graph) {
-            char cmd[256]; snprintf(cmd, sizeof(cmd), "mkdir -p %s && rm -f %s/*.dot %s/*.png", _sg_dir, _sg_dir, _sg_dir);
-            system(cmd);
-            // Dump step 0: state before any GRAD fires
-            char p[256]; snprintf(p, sizeof(p), "%s/step_000.dot", _sg_dir);
-            thvm_heap_dot_root(ctx, p, t);
-        }
+        char _sg_dir[] = "thvm_steps";
         if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "GRAD worklist: %u initial items\n", wl_t);
         u32 step_n = 1;
         // Process worklist
@@ -717,8 +721,10 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             u64 h = wl[wl_h++];
             Term ht = ctx->heap[h];
             if (term_tag(ht) != TAG_TOP || term_ext(ht) != UOP_GRAD) continue;
+            u64 gl = term_val(ht);
             u64 hp_before = ctx->heap_pos;
             ctx->heap[h] = thvm_interact(ctx, ht);
+            // GRAD handler now erases consumed slots internally
             // Step graph: dump after each GRAD interaction
             if (step_graph && step_n < 200) {
                 char p[256]; snprintf(p, sizeof(p), "%s/step_%03u.dot", _sg_dir, step_n++);

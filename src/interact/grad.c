@@ -19,10 +19,8 @@
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
                 Term x  = heap_read(ctx, loc + 2);
-                // Explicitly consume GRAD's own ports (y, gy, x read into locals)
-                heap_set(ctx, loc, term_era());
-                heap_set(ctx, loc + 1, term_era());
-                heap_set(ctx, loc + 2, term_era());
+                // GRAD's children (y, gy, x) read into locals.
+                // Slots left intact — graph shows consumed ports honestly.
                 // Resolve DP0/DP1 on y and x (from BG DUP)
                 for (int _dp=0; _dp<20 && (term_tag(y)==TAG_DP0||term_tag(y)==TAG_DP1); _dp++)
                     y = heap_read(ctx, term_val(y));
@@ -63,11 +61,7 @@
                     u64 y_loc = term_val(y);
                     Term at = heap_read(ctx, y_loc);
                     Term bt = heap_read(ctx, y_loc + 1);
-                    // Explicitly consume y-op's aux port (bt is consumed, at carried forward)
-                    // heap[y_loc] = at (carried forward into sub-GRAD)
-                    heap_set(ctx, y_loc + 1, term_era()); // bt consumed (axes/second arg)
-                    // GRAD's own slots consumed after handler reads them
-                    // (deferred to after BG/UG — they use gy/x through locals)
+                    // y-op's children: at carried forward, bt stays on heap (consumed but visible)
                     const View *yv = st_get(y_loc);
                     Shape y_shape = yv ? yv->shape : SHAPE(1);
                     Shape a_shape = SHAPE(1), b_shape = SHAPE(1);

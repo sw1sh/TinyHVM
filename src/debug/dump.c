@@ -139,6 +139,9 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     }
     #undef HDOT_ENQ
 
+    // Track which tensor IDs were emitted (to detect orphans)
+    u8 ten_seen[256]; memset(ten_seen, 0, sizeof(ten_seen));
+
     // --- Emit nodes and edges ---
 
     // Collect DUP info — each DP reference becomes an output edge
@@ -187,6 +190,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 _gr=_m->requires_grad; if(_gr) _fc="#ffe0e0"; }
             fprintf(f, "  t%u [label=\"t%u\\n[%s]\\n%s %s%s\",shape=triangle,fillcolor=\"%s\"];\n",
                     _tv,_tv,_sh,_dt,_bk,_gr?" grad":"",_fc);
+            if (_tv < 256) ten_seen[_tv] = 1;
             fprintf(f, "  t%u -> dup%llu;\n", _tv, dl);
         }
         else if (stag == TAG_DP0 || stag == TAG_DP1)
@@ -332,6 +336,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     _gr=_m->requires_grad; if(_gr) _fc="#ffe0e0"; }
                 fprintf(f, "  t%u [label=\"t%u\\n[%s]\\n%s %s%s\",shape=triangle,fillcolor=\"%s\"];\n",
                         _tv,_tv,_sh,_dt,_bk,_gr?" grad":"",_fc);
+                if (_tv < 256) ten_seen[_tv] = 1;
                 fprintf(f, "  t%u -> n%llu [label=\"%s\"];\n", _tv, loc, elbl);
             } else if (ctag == TAG_ERA) {
                 fprintf(f, "  era%llu_%u [label=\"\",shape=point,width=0.1];\n", loc, ai);
@@ -424,6 +429,24 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             }
         }
         #undef FUSE_EDGE_MAX
+    }
+
+    // Orphaned tensors: TAG_TEN refs on the heap not shown by BFS.
+    // These are consumed but not yet GC'd — show as dimmed disconnected nodes.
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) == TAG_TEN) {
+            u32 tid = (u32)term_val(ht);
+            if (tid < 256 && !ten_seen[tid] && tid < ctx->tensor_count) {
+                ten_seen[tid] = 1;
+                TensorMeta *m = &ctx->tensors[tid];
+                char sh[64]=""; int p=0;
+                for (u32 d=0;d<m->view.shape.rank;d++)
+                    p+=snprintf(sh+p,sizeof(sh)-p,"%s%u",d?",":"",m->view.shape.dims[d]);
+                fprintf(f, "  t%u [label=\"t%u\\n[%s]\\nconsumed\",shape=triangle,"
+                    "fillcolor=\"#d0d0d0\",style=\"filled,dashed\",fontcolor=\"#888888\"];\n", tid, tid, sh);
+            }
+        }
     }
 
     fprintf(f, "}\n");

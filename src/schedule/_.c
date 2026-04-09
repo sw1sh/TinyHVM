@@ -725,22 +725,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             u64 gl = term_val(ht);
             u64 hp_before = ctx->heap_pos;
             ctx->heap[h] = thvm_interact(ctx, ht);
-            // Save GRAD children before ERA, then fire ERA⊳term for each.
-            { Term gc[3]; for (u32 ci=0;ci<3;ci++) gc[ci] = ctx->heap[gl+ci];
-              // ERA GRAD's direct slots
-              for (u32 ci=0;ci<3;ci++) {
-                  ctx->heap[gl+ci] = term_era();
-                  // ERA⊳DP: collapse surviving port
-                  if (term_tag(gc[ci])==TAG_DP0||term_tag(gc[ci])==TAG_DP1) {
-                      u64 dl=term_val(gc[ci]);
-                      u8 ot=(term_tag(gc[ci])==TAG_DP0)?TAG_DP1:TAG_DP0;
-                      for (u64 dh=1;dh<ctx->heap_pos;dh++)
-                          if (term_tag(ctx->heap[dh])==ot&&term_val(ctx->heap[dh])==dl)
-                              { ctx->heap[dh]=heap_read(ctx,dl); break; }
-                  }
-              }
-              // y-op's bt NOT erased here — may be shared with sub-GRADs
-            }
+            // ERA handled inside GRAD handler (y, gy consumed; bt consumed; x, at kept)
             // (DUP collapse handled by ERA⊳DP in propagation above)
             {
             }

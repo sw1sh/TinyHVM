@@ -19,9 +19,12 @@
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
                 Term x  = heap_read(ctx, loc + 2);
-                // GRAD's child slots (y, gy, x) left intact for ERA propagation.
-                // The worklist replaces heap[h] with ERA. A separate pass
-                // fires ERA⊳TEN/TOP to clean consumed subtrees.
+                // ERA consumed GRAD ports immediately:
+                // - loc+0 (y): the op being differentiated — consumed
+                // - loc+1 (gy): gradient seed — consumed
+                // - loc+2 (x): target — NOT consumed (carried forward)
+                heap_set(ctx, loc, term_era());     // y consumed
+                heap_set(ctx, loc + 1, term_era()); // gy consumed
                 // Resolve DP0/DP1 on y and x (from BG DUP)
                 for (int _dp=0; _dp<20 && (term_tag(y)==TAG_DP0||term_tag(y)==TAG_DP1); _dp++)
                     y = heap_read(ctx, term_val(y));
@@ -62,7 +65,10 @@
                     u64 y_loc = term_val(y);
                     Term at = heap_read(ctx, y_loc);
                     Term bt = heap_read(ctx, y_loc + 1);
-                    // y-op's children left in place — consumed but visible in graph
+                    // ERA consumed y-op slots: at carried forward, bt consumed
+                    // y_loc+0 (at) NOT erased — carried forward into sub-GRAD
+                    // bt NOT erased — causes incorrect values (unknown sharing)
+                    // TODO: investigate why ERA'ing bt breaks even for atoms
                     const View *yv = st_get(y_loc);
                     Shape y_shape = yv ? yv->shape : SHAPE(1);
                     Shape a_shape = SHAPE(1), b_shape = SHAPE(1);

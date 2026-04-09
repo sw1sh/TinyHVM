@@ -725,11 +725,55 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             u64 gl = term_val(ht);
             u64 hp_before = ctx->heap_pos;
             ctx->heap[h] = thvm_interact(ctx, ht);
-            // ERA handled inside GRAD handler (y, gy consumed; bt consumed; x, at kept)
-            // (DUP collapse handled by ERA⊳DP in propagation above)
+            // Heap GC: ERA all unreachable positions.
+            // BFS from live roots (GRAD, ASSIGN, TAG_TOP on heap), ERA the rest.
             {
+                #define GC_MAX 4096
+                u8 gc_live[GC_MAX]; memset(gc_live, 0, sizeof(gc_live));
+                // BFS from all live roots
+                u64 gc_q[GC_MAX]; u32 gc_h = 0, gc_t = 0;
+                #define GC_MARK(p) do { if ((p)<GC_MAX && !gc_live[p]) { gc_live[p]=1; gc_q[gc_t++]=p; } } while(0)
+                for (u64 gh = 1; gh < ctx->heap_pos && gh < GC_MAX; gh++) {
+                    Term gt = ctx->heap[gh];
+                    u8 gtag = term_tag(gt);
+                    if (gtag == TAG_TOP || gtag == TAG_SUP || gtag == TAG_APP || gtag == TAG_CTR) {
+                        GC_MARK(gh);
+                    }
+                }
+                while (gc_h < gc_t) {
+                    u64 pos = gc_q[gc_h++];
+                    Term gt = ctx->heap[pos];
+                    u8 gtag = term_tag(gt);
+                    u32 ar = 0;
+                    if (gtag == TAG_TOP) ar = (term_ext(gt)==UOP_GRAD)?3:2;
+                    else if (gtag == TAG_SUP || gtag == TAG_APP) ar = 2;
+                    else if (gtag == TAG_CTR) {
+                        // Walk CTR children
+                        u64 cl = term_val(gt);
+                        Term nt = ctx->heap[cl]; if (cl < GC_MAX) gc_live[cl] = 1;
+                        u32 n = (term_tag(nt)==TAG_NUM) ? (u32)term_val(nt) : 0;
+                        for (u32 gi=0; gi<n && gi<16; gi++) {
+                            GC_MARK(cl+1+2*gi); GC_MARK(cl+1+2*gi+1);
+                        }
+                        continue;
+                    }
+                    u64 base = term_val(gt);
+                    for (u32 ci = 0; ci < ar; ci++) {
+                        u64 cp = base + ci; GC_MARK(cp);
+                        Term ct = ctx->heap[cp];
+                        if (term_tag(ct)==TAG_DP0||term_tag(ct)==TAG_DP1)
+                            GC_MARK(term_val(ct)); // mark DUP shared value
+                    }
+                }
+                // ERA unreachable non-ERA positions
+                for (u64 gh = 1; gh < ctx->heap_pos && gh < GC_MAX; gh++) {
+                    if (!gc_live[gh] && term_tag(ctx->heap[gh]) != TAG_ERA)
+                        ctx->heap[gh] = term_era();
+                }
+                #undef GC_MARK
+                #undef GC_MAX
             }
-            // Step graph: dump after each GRAD interaction
+            // Step graph: dump after each GRAD interaction + GC
             if (step_graph && step_n < 200) {
                 char p[256]; snprintf(p, sizeof(p), "%s/step_%03u.dot", _sg_dir, step_n++);
                 thvm_heap_dot_root(ctx, p, t);

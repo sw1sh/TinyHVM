@@ -725,7 +725,30 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             // Save GRAD children + y-op's bt before interact erases them
             u64 hp_before = ctx->heap_pos;
             ctx->heap[h] = thvm_interact(ctx, ht);
-            // DUP⊳ERA now handled inside GRAD handler via ERA_PORT
+            // DUP⊳ERA: collapse orphaned DUPs after each GRAD interaction.
+            // A DUP is orphaned if one port has no consumer on the heap.
+            // Scan: for each DP ref, check if the OTHER port exists.
+            for (int _dp_pass = 0; _dp_pass < 3; _dp_pass++) {
+                int _collapsed = 0;
+                for (u64 dh = 1; dh < ctx->heap_pos; dh++) {
+                    Term dt = ctx->heap[dh];
+                    u8 dtag = term_tag(dt);
+                    if (dtag != TAG_DP0 && dtag != TAG_DP1) continue;
+                    u64 dl = term_val(dt);
+                    u8 other = (dtag == TAG_DP0) ? TAG_DP1 : TAG_DP0;
+                    int has_other = 0;
+                    for (u64 dh2 = 1; dh2 < ctx->heap_pos && !has_other; dh2++) {
+                        if (dh2 == dh) continue;
+                        if (term_tag(ctx->heap[dh2]) == other && term_val(ctx->heap[dh2]) == dl)
+                            has_other = 1;
+                    }
+                    if (!has_other) {
+                        ctx->heap[dh] = heap_read(ctx, dl);
+                        _collapsed++;
+                    }
+                }
+                if (!_collapsed) break;
+            }
             // Step graph: dump after each GRAD interaction
             if (step_graph && step_n < 200) {
                 char p[256]; snprintf(p, sizeof(p), "%s/step_%03u.dot", _sg_dir, step_n++);

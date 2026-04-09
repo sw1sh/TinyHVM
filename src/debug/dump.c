@@ -431,23 +431,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         #undef FUSE_EDGE_MAX
     }
 
-    // Orphaned tensors: TAG_TEN refs on the heap not shown by BFS.
-    // These are consumed but not yet GC'd — show as dimmed disconnected nodes.
-    for (u64 h = 1; h < ctx->heap_pos; h++) {
-        Term ht = ctx->heap[h];
-        if (term_tag(ht) == TAG_TEN) {
-            u32 tid = (u32)term_val(ht);
-            if (tid < 256 && !ten_seen[tid] && tid < ctx->tensor_count) {
-                ten_seen[tid] = 1;
-                TensorMeta *m = &ctx->tensors[tid];
-                char sh[64]=""; int p=0;
-                for (u32 d=0;d<m->view.shape.rank;d++)
-                    p+=snprintf(sh+p,sizeof(sh)-p,"%s%u",d?",":"",m->view.shape.dims[d]);
-                fprintf(f, "  t%u [label=\"t%u\\n[%s]\\nconsumed\",shape=triangle,"
-                    "fillcolor=\"#d0d0d0\",style=\"filled,dashed\",fontcolor=\"#888888\"];\n", tid, tid, sh);
-            }
-        }
-    }
+    // No orphan scan — graph shows only BFS-reachable nodes honestly.
 
     fprintf(f, "}\n");
     fclose(f);

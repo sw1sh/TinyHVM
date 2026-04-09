@@ -19,35 +19,24 @@
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
                 Term x  = heap_read(ctx, loc + 2);
-                // ERA consumed GRAD ports + fire DUP⊳ERA for any DP refs
-                // ERA a heap position. If it held a DP ref, fire DUP⊳ERA:
-                // find the surviving port (as a child of any TAG_TOP) and collapse.
-                #define ERA_PORT(pos) do { \
-                    Term _old = ctx->heap[pos]; \
-                    ctx->heap[pos] = term_era(); \
-                    if (term_tag(_old)==TAG_DP0||term_tag(_old)==TAG_DP1) { \
-                        u64 _dl = term_val(_old); \
-                        u8 _ot = (term_tag(_old)==TAG_DP0) ? TAG_DP1 : TAG_DP0; \
-                        int _found = 0; \
-                        for (u64 _h=1; _h<ctx->heap_pos && !_found; _h++) { \
-                            /* Direct match */ \
-                            if (term_tag(ctx->heap[_h])==_ot && term_val(ctx->heap[_h])==_dl) { \
-                                ctx->heap[_h] = heap_read(ctx, _dl); _found=1; break; \
-                            } \
-                            /* Check as child of TAG_TOP */ \
-                            if (term_tag(ctx->heap[_h])==TAG_TOP) { \
-                                u32 _ar = (term_ext(ctx->heap[_h])==UOP_GRAD)?3:2; \
-                                u64 _b = term_val(ctx->heap[_h]); \
-                                for (u32 _ci=0; _ci<_ar; _ci++) { \
-                                    if (term_tag(ctx->heap[_b+_ci])==_ot && term_val(ctx->heap[_b+_ci])==_dl) { \
-                                        ctx->heap[_b+_ci] = heap_read(ctx, _dl); _found=1; break; \
-                                    } \
-                                } \
-                            } \
-                        } \
-                    } \
-                } while(0)
-                ERA_PORT(loc); ERA_PORT(loc+1); ERA_PORT(loc+2);
+                // ERA consumed GRAD ports + fire DUP⊳ERA
+                // Erase heap[pos], then if it was a DP ref, collapse the DUP.
+                for (u32 _ei = 0; _ei < 3; _ei++) {
+                    u64 _ep = loc + _ei;
+                    Term _old = ctx->heap[_ep];
+                    ctx->heap[_ep] = term_era();
+                    if (term_tag(_old) != TAG_DP0 && term_tag(_old) != TAG_DP1) continue;
+                    // DUP⊳ERA: find and collapse the surviving port
+                    u64 _dl = term_val(_old);
+                    u8 _ot = (term_tag(_old) == TAG_DP0) ? TAG_DP1 : TAG_DP0;
+                    // Scan ALL heap positions (including nested TAG_TOP children)
+                    for (u64 _h = 1; _h < ctx->heap_pos; _h++) {
+                        Term _ht = ctx->heap[_h];
+                        if (term_tag(_ht) == _ot && term_val(_ht) == _dl) {
+                            ctx->heap[_h] = heap_read(ctx, _dl); break;
+                        }
+                    }
+                }
                 // Resolve DP0/DP1 on y and x (from BG DUP)
                 for (int _dp=0; _dp<20 && (term_tag(y)==TAG_DP0||term_tag(y)==TAG_DP1); _dp++)
                     y = heap_read(ctx, term_val(y));
@@ -89,7 +78,15 @@
                     Term at = heap_read(ctx, y_loc);
                     Term bt = heap_read(ctx, y_loc + 1);
                     // DUP⊳ERA: consume y-op's aux port (bt). at is carried forward.
-                    ERA_PORT(y_loc + 1);
+                    { Term _old_bt = ctx->heap[y_loc + 1];
+                      ctx->heap[y_loc + 1] = term_era();
+                      if (term_tag(_old_bt)==TAG_DP0||term_tag(_old_bt)==TAG_DP1) {
+                        u64 _dl=term_val(_old_bt);
+                        u8 _ot=(term_tag(_old_bt)==TAG_DP0)?TAG_DP1:TAG_DP0;
+                        for (u64 _h=1;_h<ctx->heap_pos;_h++)
+                            if (term_tag(ctx->heap[_h])==_ot&&term_val(ctx->heap[_h])==_dl)
+                                { ctx->heap[_h]=heap_read(ctx,_dl); break; }
+                    } }
                     const View *yv = st_get(y_loc);
                     Shape y_shape = yv ? yv->shape : SHAPE(1);
                     Shape a_shape = SHAPE(1), b_shape = SHAPE(1);

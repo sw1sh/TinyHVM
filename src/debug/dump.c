@@ -115,18 +115,34 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             HDOT_ENQ(ht);
         }
     }
+    // Track which tensor IDs are reachable (for orphan detection)
+    u8 ten_seen[256]; memset(ten_seen, 0, sizeof(ten_seen));
     // BFS: walk children (skip FUSING metadata)
     while (qh < qt) {
         Term t = bfs[qh++];
         u8 tag = term_tag(t); u32 ext = term_ext(t);
-        if (tag == TAG_TOP && ext == UOP_FUSING) continue; // FUSING heap children are metadata
+        if (tag == TAG_TOP && ext == UOP_FUSING) continue;
         u32 arity = tag_arity(tag, ext);
         u64 loc = term_val(t);
+        // CTR: walk target tensor pairs (stored as n_targets + pairs)
+        if (tag == TAG_CTR) {
+            Term nt = heap_read(ctx, loc);
+            u32 n = (term_tag(nt) == TAG_NUM) ? (u32)term_val(nt) : 0;
+            for (u32 gi = 0; gi < n && gi < 16; gi++) {
+                // Mark tensor refs inside CTR as "seen" (they're alive)
+                Term p = heap_read(ctx, loc + 1 + 2*gi);     // param tensor
+                Term s = heap_read(ctx, loc + 1 + 2*gi + 1); // grad slot tensor
+                if (term_tag(p) == TAG_TEN && (u32)term_val(p) < 256) ten_seen[(u32)term_val(p)] = 1;
+                if (term_tag(s) == TAG_TEN && (u32)term_val(s) < 256) ten_seen[(u32)term_val(s)] = 1;
+            }
+            continue;
+        }
         for (u32 ai = 0; ai < arity; ai++) {
             Term child = heap_read(ctx, loc + ai);
             u8 ctag = term_tag(child);
+            // Mark tensor refs as seen
+            if (ctag == TAG_TEN && term_val(child) < 256) ten_seen[term_val(child)] = 1;
             if (ctag == TAG_DP0 || ctag == TAG_DP1) {
-                // Enqueue the shared value behind the DUP
                 Term shared = heap_read(ctx, term_val(child));
                 if (term_tag(shared) != TAG_ERA && term_tag(shared) != TAG_NUM &&
                     term_tag(shared) != TAG_TEN && term_tag(shared) != TAG_VAR)
@@ -139,8 +155,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     }
     #undef HDOT_ENQ
 
-    // Track which tensor IDs were emitted (to detect orphans)
-    u8 ten_seen[256]; memset(ten_seen, 0, sizeof(ten_seen));
+    // ten_seen declared before BFS (used during BFS + orphan scan)
 
     // --- Emit nodes and edges ---
 
@@ -431,7 +446,21 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         #undef FUSE_EDGE_MAX
     }
 
-    // No orphan scan — graph shows only BFS-reachable nodes honestly.
+    // Orphaned tensors: TAG_TEN refs on heap not reached by BFS.
+    // These were consumed by an interaction — show as dimmed with ERA marker.
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) != TAG_TEN) continue;
+        u32 tid = (u32)term_val(ht);
+        if (tid >= 256 || ten_seen[tid] || tid >= ctx->tensor_count) continue;
+        ten_seen[tid] = 1;
+        TensorMeta *m = &ctx->tensors[tid];
+        char sh[64]=""; int p=0;
+        for (u32 d=0;d<m->view.shape.rank;d++)
+            p+=snprintf(sh+p,sizeof(sh)-p,"%s%u",d?",":"",m->view.shape.dims[d]);
+        fprintf(f, "  t%u [label=\"t%u\\n[%s]\\n\\u22B3 ERA\",shape=triangle,"
+            "fillcolor=\"#d0d0d0\",style=\"filled,dashed\",fontcolor=\"#888888\"];\n", tid, tid, sh);
+    }
 
     fprintf(f, "}\n");
     fclose(f);

@@ -122,21 +122,21 @@
 
                     switch (cop) {
                         case UOP_ADD: BG(sum_to_shape(ctx,gy,y_shape,a_shape), sum_to_shape(ctx,gy,y_shape,b_shape));
-                        case UOP_SUB: BG(sum_to_shape(ctx,gy,y_shape,a_shape), thvm_op(ctx,UOP_NEG,sum_to_shape(ctx,gy,y_shape,b_shape),term_era()));
-                        case UOP_MUL: BG(sum_to_shape(ctx,thvm_op(ctx,UOP_MUL,gy,bt),y_shape,a_shape), sum_to_shape(ctx,thvm_op(ctx,UOP_MUL,gy,at),y_shape,b_shape));
-                        case UOP_NEG: UG(thvm_op(ctx,UOP_NEG,gy,term_era()));
-                        case UOP_RELU: { f32 z=0; UG(thvm_op(ctx,UOP_MUL,gy,thvm_op(ctx,UOP_CMP,y,thvm_tensor(ctx,&z,SHAPE(1))))); }
-                        case UOP_EXP: UG(thvm_op(ctx,UOP_MUL,gy,y));
-                        case UOP_LOG: UG(thvm_op(ctx,UOP_DIV,gy,at));
-                        case UOP_SQRT: { f32 two=2; UG(thvm_op(ctx,UOP_DIV,gy,thvm_op(ctx,UOP_MUL,thvm_tensor(ctx,&two,SHAPE(1)),y))); }
-                        case UOP_DIV: { Term ng=thvm_op(ctx,UOP_NEG,gy,term_era()); BG(thvm_op(ctx,UOP_DIV,gy,bt), thvm_op(ctx,UOP_DIV,thvm_op(ctx,UOP_MUL,ng,at),thvm_op(ctx,UOP_MUL,bt,bt))); }
-                        case UOP_MAX: { Term mask=thvm_op(ctx,UOP_CMP,at,bt); f32 one=1; Term inv=thvm_op(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),mask);
-                            BG(sum_to_shape(ctx,thvm_op(ctx,UOP_MUL,gy,mask),y_shape,a_shape), sum_to_shape(ctx,thvm_op(ctx,UOP_MUL,gy,inv),y_shape,b_shape)); }
+                        case UOP_SUB: BG(sum_to_shape(ctx,gy,y_shape,a_shape), thvm_op_raw(ctx,UOP_NEG,sum_to_shape(ctx,gy,y_shape,b_shape),term_era()));
+                        case UOP_MUL: BG(sum_to_shape(ctx,thvm_op_raw(ctx,UOP_MUL,gy,bt),y_shape,a_shape), sum_to_shape(ctx,thvm_op_raw(ctx,UOP_MUL,gy,at),y_shape,b_shape));
+                        case UOP_NEG: UG(thvm_op_raw(ctx,UOP_NEG,gy,term_era()));
+                        case UOP_RELU: { f32 z=0; UG(thvm_op_raw(ctx,UOP_MUL,gy,thvm_op_raw(ctx,UOP_CMP,y,thvm_tensor(ctx,&z,SHAPE(1))))); }
+                        case UOP_EXP: UG(thvm_op_raw(ctx,UOP_MUL,gy,y));
+                        case UOP_LOG: UG(thvm_op_raw(ctx,UOP_DIV,gy,at));
+                        case UOP_SQRT: { f32 two=2; UG(thvm_op_raw(ctx,UOP_DIV,gy,thvm_op_raw(ctx,UOP_MUL,thvm_tensor(ctx,&two,SHAPE(1)),y))); }
+                        case UOP_DIV: { Term ng=thvm_op_raw(ctx,UOP_NEG,gy,term_era()); BG(thvm_op_raw(ctx,UOP_DIV,gy,bt), thvm_op_raw(ctx,UOP_DIV,thvm_op_raw(ctx,UOP_MUL,ng,at),thvm_op_raw(ctx,UOP_MUL,bt,bt))); }
+                        case UOP_MAX: { Term mask=thvm_op_raw(ctx,UOP_CMP,at,bt); f32 one=1; Term inv=thvm_op_raw(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),mask);
+                            BG(sum_to_shape(ctx,thvm_op_raw(ctx,UOP_MUL,gy,mask),y_shape,a_shape), sum_to_shape(ctx,thvm_op_raw(ctx,UOP_MUL,gy,inv),y_shape,b_shape)); }
                         case UOP_CMP: GRAD_RETURN(term_era());
                         case UOP_SUM: { Term gy_rs=thvm_reshape(ctx,gy,y_shape); UG(thvm_expand(ctx,gy_rs,a_shape)); }
                         case UOP_RMAX: { Term max_bc=thvm_expand(ctx,thvm_reshape(ctx,y,y_shape),a_shape); f32 one=1;
-                            Term mask=thvm_op(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),thvm_op(ctx,UOP_CMP,max_bc,at));
-                            UG(thvm_op(ctx,UOP_MUL,thvm_expand(ctx,gy,a_shape),mask)); }
+                            Term mask=thvm_op_raw(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),thvm_op_raw(ctx,UOP_CMP,max_bc,at));
+                            UG(thvm_op_raw(ctx,UOP_MUL,thvm_expand(ctx,gy,a_shape),mask)); }
                         case UOP_RESHAPE: UG(thvm_reshape(ctx,gy,a_shape));
                         case UOP_PERMUTE: {
                             if (term_tag(bt)==TAG_TEN) { u32 pid=(u32)term_val(bt); TensorMeta *mp=&ctx->tensors[pid];
@@ -193,7 +193,7 @@
                                 heap_set(ctx, _sd, slot);
                                 Term slot0 = term_new(TAG_DP0, 0, _sd);
                                 Term slot1 = term_new(TAG_DP1, 0, _sd);
-                                Term accum = thvm_op(ctx, UOP_ADD, slot0, gy);
+                                Term accum = thvm_op_raw(ctx, UOP_ADD, slot0, gy);
                                 u64 _ah = _sd + 1;
                                 heap_set(ctx, _ah, thvm_assign(ctx, slot1, accum));
                                 if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  ASSIGN_CREATE: target=%u slot=%u\n", y_id, _gi);

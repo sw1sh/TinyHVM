@@ -722,34 +722,27 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             u64 h = wl[wl_h++];
             Term ht = ctx->heap[h];
             if (term_tag(ht) != TAG_TOP || term_ext(ht) != UOP_GRAD) continue;
-            // (term_use_table cleared once before worklist, not per interaction)
             u64 gl = term_val(ht);
-            // Save GRAD children + y-op's bt before interact erases them
             u64 hp_before = ctx->heap_pos;
             ctx->heap[h] = thvm_interact(ctx, ht);
-            // DUP⊳ERA: collapse orphaned DUPs after each GRAD interaction.
-            // A DUP is orphaned if one port has no consumer on the heap.
-            // Scan: for each DP ref, check if the OTHER port exists.
-            for (int _dp_pass = 0; _dp_pass < 3; _dp_pass++) {
-                int _collapsed = 0;
-                for (u64 dh = 1; dh < ctx->heap_pos; dh++) {
-                    Term dt = ctx->heap[dh];
-                    u8 dtag = term_tag(dt);
-                    if (dtag != TAG_DP0 && dtag != TAG_DP1) continue;
-                    u64 dl = term_val(dt);
-                    u8 other = (dtag == TAG_DP0) ? TAG_DP1 : TAG_DP0;
-                    int has_other = 0;
-                    for (u64 dh2 = 1; dh2 < ctx->heap_pos && !has_other; dh2++) {
-                        if (dh2 == dh) continue;
-                        if (term_tag(ctx->heap[dh2]) == other && term_val(ctx->heap[dh2]) == dl)
-                            has_other = 1;
-                    }
-                    if (!has_other) {
-                        ctx->heap[dh] = heap_read(ctx, dl);
-                        _collapsed++;
-                    }
-                }
-                if (!_collapsed) break;
+            // Save GRAD children before ERA, then fire ERA⊳term for each.
+            { Term gc[3]; for (u32 ci=0;ci<3;ci++) gc[ci] = ctx->heap[gl+ci];
+              // ERA GRAD's direct slots
+              for (u32 ci=0;ci<3;ci++) {
+                  ctx->heap[gl+ci] = term_era();
+                  // ERA⊳DP: collapse surviving port
+                  if (term_tag(gc[ci])==TAG_DP0||term_tag(gc[ci])==TAG_DP1) {
+                      u64 dl=term_val(gc[ci]);
+                      u8 ot=(term_tag(gc[ci])==TAG_DP0)?TAG_DP1:TAG_DP0;
+                      for (u64 dh=1;dh<ctx->heap_pos;dh++)
+                          if (term_tag(ctx->heap[dh])==ot&&term_val(ctx->heap[dh])==dl)
+                              { ctx->heap[dh]=heap_read(ctx,dl); break; }
+                  }
+              }
+              // y-op's bt NOT erased here — may be shared with sub-GRADs
+            }
+            // (DUP collapse handled by ERA⊳DP in propagation above)
+            {
             }
             // Step graph: dump after each GRAD interaction
             if (step_graph && step_n < 200) {

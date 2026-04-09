@@ -19,8 +19,9 @@
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
                 Term x  = heap_read(ctx, loc + 2);
-                // GRAD ports (y, gy, x) are consumed — left in place for graph visibility.
-                // The GRAD term at heap[h] gets replaced with ERA by the worklist caller.
+                // GRAD's child slots (y, gy, x) left intact for ERA propagation.
+                // The worklist replaces heap[h] with ERA. A separate pass
+                // fires ERA⊳TEN/TOP to clean consumed subtrees.
                 // Resolve DP0/DP1 on y and x (from BG DUP)
                 for (int _dp=0; _dp<20 && (term_tag(y)==TAG_DP0||term_tag(y)==TAG_DP1); _dp++)
                     y = heap_read(ctx, term_val(y));

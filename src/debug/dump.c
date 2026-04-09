@@ -446,8 +446,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         #undef FUSE_EDGE_MAX
     }
 
-    // Orphaned tensors: TAG_TEN refs on heap not reached by BFS.
-    // These were consumed by an interaction — show as dimmed with ERA marker.
+    // Orphaned tensors: if ERA propagation missed any, show as dimmed.
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) != TAG_TEN) continue;
@@ -458,7 +457,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         char sh[64]=""; int p=0;
         for (u32 d=0;d<m->view.shape.rank;d++)
             p+=snprintf(sh+p,sizeof(sh)-p,"%s%u",d?",":"",m->view.shape.dims[d]);
-        fprintf(f, "  t%u [label=\"t%u\\n[%s]\\n\\u22B3 ERA\",shape=triangle,"
+        fprintf(f, "  t%u [label=\"t%u\\n[%s]\\norphan\",shape=triangle,"
             "fillcolor=\"#d0d0d0\",style=\"filled,dashed\",fontcolor=\"#888888\"];\n", tid, tid, sh);
     }
 

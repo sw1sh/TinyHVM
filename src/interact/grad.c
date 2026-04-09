@@ -19,10 +19,35 @@
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
                 Term x  = heap_read(ctx, loc + 2);
-                // ERA consumed GRAD ports (y, gy, x)
-                heap_set(ctx, loc, term_era());
-                heap_set(ctx, loc + 1, term_era());
-                heap_set(ctx, loc + 2, term_era());
+                // ERA consumed GRAD ports + fire DUP⊳ERA for any DP refs
+                // ERA a heap position. If it held a DP ref, fire DUP⊳ERA:
+                // find the surviving port (as a child of any TAG_TOP) and collapse.
+                #define ERA_PORT(pos) do { \
+                    Term _old = ctx->heap[pos]; \
+                    ctx->heap[pos] = term_era(); \
+                    if (term_tag(_old)==TAG_DP0||term_tag(_old)==TAG_DP1) { \
+                        u64 _dl = term_val(_old); \
+                        u8 _ot = (term_tag(_old)==TAG_DP0) ? TAG_DP1 : TAG_DP0; \
+                        int _found = 0; \
+                        for (u64 _h=1; _h<ctx->heap_pos && !_found; _h++) { \
+                            /* Direct match */ \
+                            if (term_tag(ctx->heap[_h])==_ot && term_val(ctx->heap[_h])==_dl) { \
+                                ctx->heap[_h] = heap_read(ctx, _dl); _found=1; break; \
+                            } \
+                            /* Check as child of TAG_TOP */ \
+                            if (term_tag(ctx->heap[_h])==TAG_TOP) { \
+                                u32 _ar = (term_ext(ctx->heap[_h])==UOP_GRAD)?3:2; \
+                                u64 _b = term_val(ctx->heap[_h]); \
+                                for (u32 _ci=0; _ci<_ar; _ci++) { \
+                                    if (term_tag(ctx->heap[_b+_ci])==_ot && term_val(ctx->heap[_b+_ci])==_dl) { \
+                                        ctx->heap[_b+_ci] = heap_read(ctx, _dl); _found=1; break; \
+                                    } \
+                                } \
+                            } \
+                        } \
+                    } \
+                } while(0)
+                ERA_PORT(loc); ERA_PORT(loc+1); ERA_PORT(loc+2);
                 // Resolve DP0/DP1 on y and x (from BG DUP)
                 for (int _dp=0; _dp<20 && (term_tag(y)==TAG_DP0||term_tag(y)==TAG_DP1); _dp++)
                     y = heap_read(ctx, term_val(y));
@@ -63,8 +88,8 @@
                     u64 y_loc = term_val(y);
                     Term at = heap_read(ctx, y_loc);
                     Term bt = heap_read(ctx, y_loc + 1);
-                    // ERA consumed y-op aux port (bt consumed, at carried forward)
-                    heap_set(ctx, y_loc + 1, term_era());
+                    // DUP⊳ERA: consume y-op's aux port (bt). at is carried forward.
+                    ERA_PORT(y_loc + 1);
                     const View *yv = st_get(y_loc);
                     Shape y_shape = yv ? yv->shape : SHAPE(1);
                     Shape a_shape = SHAPE(1), b_shape = SHAPE(1);

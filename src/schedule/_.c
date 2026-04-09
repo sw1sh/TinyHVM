@@ -723,31 +723,9 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             if (term_tag(ht) != TAG_TOP || term_ext(ht) != UOP_GRAD) continue;
             u64 gl = term_val(ht);
             // Save GRAD children + y-op's bt before interact erases them
-            Term gc[4];
-            gc[0] = heap_read(ctx, gl);     // y
-            gc[1] = heap_read(ctx, gl+1);   // gy
-            gc[2] = heap_read(ctx, gl+2);   // x
-            // If y is TAG_TOP, save its bt (aux port that gets ERA'd)
-            gc[3] = term_era();
-            if (term_tag(gc[0]) == TAG_TOP && term_ext(gc[0]) != UOP_GRAD)
-                gc[3] = heap_read(ctx, term_val(gc[0]) + 1);
             u64 hp_before = ctx->heap_pos;
             ctx->heap[h] = thvm_interact(ctx, ht);
-            // DUP⊳ERA: collapse all single-consumer DUPs on the heap.
-            // After GRAD fires, some DUPs lost a port. Scan and collapse.
-            for (u64 dh = 1; dh < ctx->heap_pos; dh++) {
-                Term dt = ctx->heap[dh];
-                if (term_tag(dt) != TAG_DP0 && term_tag(dt) != TAG_DP1) continue;
-                u64 dl = term_val(dt);
-                u8 other = (term_tag(dt) == TAG_DP0) ? TAG_DP1 : TAG_DP0;
-                int has_other = 0;
-                for (u64 dh2 = 1; dh2 < ctx->heap_pos && !has_other; dh2++) {
-                    if (dh2 == dh) continue;
-                    if (term_tag(ctx->heap[dh2]) == other && term_val(ctx->heap[dh2]) == dl)
-                        has_other = 1;
-                }
-                if (!has_other) ctx->heap[dh] = heap_read(ctx, dl); // collapse
-            }
+            // DUP⊳ERA now handled inside GRAD handler via ERA_PORT
             // Step graph: dump after each GRAD interaction
             if (step_graph && step_n < 200) {
                 char p[256]; snprintf(p, sizeof(p), "%s/step_%03u.dot", _sg_dir, step_n++);
@@ -771,53 +749,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         }
         #undef GRAD_WL_MAX
     }
-    // Collapse single-consumer DUPs using reachability from the graph dumper's
-    // BFS. Collect live DP refs (reachable from TAG_TOP children on heap),
-    // then collapse DUPs where only one port has live consumers.
-    {
-        #define DP_MAX 256
-        struct { u64 pos; u8 tag; u64 dup_loc; } live_dp[DP_MAX];
-        u32 n_live = 0;
-        // Walk all TAG_TOP on heap, collect their DP children
-        for (u64 h = 1; h < ctx->heap_pos; h++) {
-            Term ht = ctx->heap[h];
-            if (term_tag(ht) != TAG_TOP) continue;
-            u32 ar = (term_ext(ht) == UOP_GRAD) ? 3 : 2;
-            u64 base = term_val(ht);
-            for (u32 ci = 0; ci < ar; ci++) {
-                Term c = ctx->heap[base + ci];
-                u8 ct = term_tag(c);
-                if ((ct == TAG_DP0 || ct == TAG_DP1) && n_live < DP_MAX)
-                    live_dp[n_live].pos = base+ci;
-                    live_dp[n_live].tag = ct;
-                    live_dp[n_live].dup_loc = term_val(c);
-                    n_live++;
-            }
-        }
-        // For each DUP location, check if both ports have live consumers
-        for (int _pass = 0; _pass < 5; _pass++) {
-            int collapsed = 0;
-            for (u32 i = 0; i < n_live; i++) {
-                if (live_dp[i].tag == 0) continue; // already collapsed
-                u64 dl = live_dp[i].dup_loc;
-                u8 other = (live_dp[i].tag == TAG_DP0) ? TAG_DP1 : TAG_DP0;
-                int has_other = 0;
-                for (u32 j = 0; j < n_live; j++) {
-                    if (j == i || live_dp[j].tag == 0) continue;
-                    if (live_dp[j].dup_loc == dl && live_dp[j].tag == other)
-                        { has_other = 1; break; }
-                }
-                if (!has_other) {
-                    // Only this port — collapse: DP → shared value
-                    ctx->heap[live_dp[i].pos] = heap_read(ctx, dl);
-                    live_dp[i].tag = 0; // mark collapsed
-                    collapsed++;
-                }
-            }
-            if (!collapsed) break;
-        }
-        #undef DP_MAX
-    }
+    // DUP⊳ERA handled inside GRAD handler via ERA_PORT.
     // DUP⊳atom fires during reduction (both ports get the value) but the DUP
     // node stays on the heap as a structural sharing marker.
     if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }

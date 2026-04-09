@@ -687,13 +687,6 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
 
     // Phase 0 graph: before reduce — full graph from root term t
     if (getenv("THVM_GRAPH")) thvm_heap_dot_root(ctx, "/tmp/thvm_0_pre_reduce.dot", t);
-    // Step graph: dump step 0 BEFORE any GRAD fires (shows root GRAD node)
-    if (getenv("THVM_STEP_GRAPH")) {
-        char cmd[256]; snprintf(cmd, sizeof(cmd), "mkdir -p thvm_steps && rm -f thvm_steps/*.dot thvm_steps/*.png");
-        system(cmd);
-        thvm_heap_dot_root(ctx, "thvm_steps/step_000.dot", t);
-    }
-
     // Phase 1: Iterative GRAD worklist — each fires ONE chain rule step.
     // If root term t is a GRAD, place it on the heap for uniform processing.
     if (term_tag(t) == TAG_TOP && term_ext(t) == UOP_GRAD) {
@@ -703,7 +696,13 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     } else {
         t = thvm_reduce(ctx, t);
     }
-    // term_use_table NOT cleared — forward DUPs are legitimate sharing
+    // Step graph: dump step 0 AFTER GRAD placed on heap (shows initial state)
+    if (getenv("THVM_STEP_GRAPH")) {
+        char cmd[256]; snprintf(cmd, sizeof(cmd), "mkdir -p thvm_steps && rm -f thvm_steps/*.dot thvm_steps/*.png");
+        system(cmd);
+        thvm_heap_dot_root(ctx, "thvm_steps/step_000.dot", t);
+    }
+    // term_use_table NOT cleared — linear_use validates first_loc before patching
     {
         #define GRAD_WL_MAX 8192
         u64 wl[GRAD_WL_MAX]; u32 wl_h = 0, wl_t = 0;
@@ -721,68 +720,116 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         while (wl_h < wl_t) {
             u64 h = wl[wl_h++];
             Term ht = ctx->heap[h];
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "  wl[%u]@%llu: tag=%u ext=%u\n", wl_h-1, h, term_tag(ht), term_ext(ht));
             if (term_tag(ht) != TAG_TOP || term_ext(ht) != UOP_GRAD) continue;
             u64 gl = term_val(ht);
+            // Read what op GRAD will consume (for step graph labels)
+            Term _gy = heap_read(ctx, gl);
+            for (int _dp=0; _dp<10 && (term_tag(_gy)==TAG_DP0||term_tag(_gy)==TAG_DP1); _dp++)
+                _gy = heap_read(ctx, term_val(_gy));
+            const char *_cop_name = "?";
+            if (term_tag(_gy)==TAG_TOP && term_ext(_gy)<UOP_COUNT) _cop_name = uop_names[term_ext(_gy)];
+            else if (term_tag(_gy)==TAG_TEN) _cop_name = "TEN";
             u64 hp_before = ctx->heap_pos;
             ctx->heap[h] = thvm_interact(ctx, ht);
-            // Heap GC: ERA all unreachable positions.
-            // BFS from live roots (GRAD, ASSIGN, TAG_TOP on heap), ERA the rest.
+            // Step: GRAD interaction — dump BEFORE cleanup.
+            if (step_graph && step_n < 200) {
+                char p[256]; snprintf(p, sizeof(p), "%s/step_%03u_grad_%s.dot", _sg_dir, step_n++, _cop_name);
+                thvm_heap_dot_root(ctx, p, t);
+            }
+            // ERA propagation: fire ERA interactions one at a time.
+            // BFS from live roots to find unreachable positions, then ERA each.
             {
                 #define GC_MAX 4096
                 u8 gc_live[GC_MAX]; memset(gc_live, 0, sizeof(gc_live));
-                // BFS from all live roots
-                u64 gc_q[GC_MAX]; u32 gc_h = 0, gc_t = 0;
-                #define GC_MARK(p) do { if ((p)<GC_MAX && !gc_live[p]) { gc_live[p]=1; gc_q[gc_t++]=p; } } while(0)
+                u64 gc_q[GC_MAX]; u32 gc_h2 = 0, gc_t2 = 0;
+                #define GC_MARK(p) do { if ((p)<GC_MAX && !gc_live[p]) { gc_live[p]=1; if(gc_t2<GC_MAX)gc_q[gc_t2++]=p; } } while(0)
                 for (u64 gh = 1; gh < ctx->heap_pos && gh < GC_MAX; gh++) {
-                    Term gt = ctx->heap[gh];
-                    u8 gtag = term_tag(gt);
-                    if (gtag == TAG_TOP || gtag == TAG_SUP || gtag == TAG_APP || gtag == TAG_CTR) {
-                        GC_MARK(gh);
-                    }
+                    Term gt = ctx->heap[gh]; u8 gtag = term_tag(gt);
+                    if (gtag == TAG_TOP && (term_ext(gt)==UOP_GRAD||term_ext(gt)==UOP_ASSIGN)) GC_MARK(gh);
+                    else if (gtag == TAG_CTR || gtag == TAG_SUP) GC_MARK(gh);
                 }
-                while (gc_h < gc_t) {
-                    u64 pos = gc_q[gc_h++];
-                    Term gt = ctx->heap[pos];
-                    u8 gtag = term_tag(gt);
-                    u32 ar = 0;
-                    if (gtag == TAG_TOP) ar = (term_ext(gt)==UOP_GRAD)?3:2;
-                    else if (gtag == TAG_SUP || gtag == TAG_APP) ar = 2;
-                    else if (gtag == TAG_CTR) {
-                        // Walk CTR children
-                        u64 cl = term_val(gt);
-                        Term nt = ctx->heap[cl]; if (cl < GC_MAX) gc_live[cl] = 1;
-                        u32 n = (term_tag(nt)==TAG_NUM) ? (u32)term_val(nt) : 0;
-                        for (u32 gi=0; gi<n && gi<16; gi++) {
-                            GC_MARK(cl+1+2*gi); GC_MARK(cl+1+2*gi+1);
-                        }
+                while (gc_h2 < gc_t2) {
+                    u64 pos = gc_q[gc_h2++]; Term gt = ctx->heap[pos]; u8 gtag = term_tag(gt);
+                    if (gtag == TAG_DP0 || gtag == TAG_DP1) { GC_MARK(term_val(gt)); continue; }
+                    if (gtag == TAG_CTR) {
+                        u64 cl = term_val(gt); if (cl < GC_MAX) gc_live[cl] = 1;
+                        Term nt = ctx->heap[cl]; u32 n = (term_tag(nt)==TAG_NUM)?(u32)term_val(nt):0;
+                        for (u32 gi=0; gi<n && gi<16; gi++) { GC_MARK(cl+1+2*gi); GC_MARK(cl+1+2*gi+1); }
                         continue;
                     }
+                    u32 ar = 0;
+                    if (gtag == TAG_TOP) ar = (term_ext(gt)==UOP_GRAD||term_ext(gt)==UOP_WHERE)?3:2;
+                    else if (gtag == TAG_SUP || gtag == TAG_APP) ar = 2;
+                    else continue;
                     u64 base = term_val(gt);
                     for (u32 ci = 0; ci < ar; ci++) {
-                        u64 cp = base + ci; GC_MARK(cp);
-                        Term ct = ctx->heap[cp];
-                        if (term_tag(ct)==TAG_DP0||term_tag(ct)==TAG_DP1)
-                            GC_MARK(term_val(ct)); // mark DUP shared value
+                        u64 cp = base + ci; GC_MARK(cp); Term ct = ctx->heap[cp];
+                        if (term_tag(ct)==TAG_DP0||term_tag(ct)==TAG_DP1) GC_MARK(term_val(ct));
+                        else if (term_tag(ct)==TAG_TOP||term_tag(ct)==TAG_SUP||
+                                 term_tag(ct)==TAG_APP||term_tag(ct)==TAG_CTR) {
+                            u64 cb = term_val(ct);
+                            u32 ca = (term_tag(ct)==TAG_TOP)?((term_ext(ct)==UOP_GRAD||term_ext(ct)==UOP_WHERE)?3:2):2;
+                            for (u32 cj = 0; cj < ca; cj++) GC_MARK(cb + cj);
+                        }
                     }
                 }
-                // ERA unreachable non-ERA positions
+                // Collect unreachable non-ERA positions into ERA worklist
+                #define ERA_WL_MAX 256
+                u64 era_wl[ERA_WL_MAX]; u32 era_h2 = 0, era_t2 = 0;
                 for (u64 gh = 1; gh < ctx->heap_pos && gh < GC_MAX; gh++) {
-                    if (!gc_live[gh] && term_tag(ctx->heap[gh]) != TAG_ERA)
-                        ctx->heap[gh] = term_era();
+                    if (!gc_live[gh] && term_tag(ctx->heap[gh]) != TAG_ERA && era_t2 < ERA_WL_MAX) {
+                        era_wl[era_t2++] = gh;
+                        if (getenv("THVM_SCHED_DIAG")) {
+                            Term _dt = ctx->heap[gh];
+                            fprintf(stderr, "  ERA_SEED: pos=%llu tag=%u ext=%u val=%llu\n", gh, term_tag(_dt), term_ext(_dt), term_val(_dt));
+                        }
+                    }
+                }
+                // Fire all ERA interactions, then dump one graph
+                u32 n_era = 0;
+                for (u32 ei = 0; ei < era_t2; ei++) {
+                    u64 epos = era_wl[ei];
+                    Term old = ctx->heap[epos];
+                    if (term_tag(old) == TAG_ERA) continue;
+                    ctx->heap[epos] = term_era(); n_era++;
+                    // DUP collapse: if ERA'd a DP port, other port gets shared value
+                    if (term_tag(old) == TAG_DP0 || term_tag(old) == TAG_DP1) {
+                        u64 dl = term_val(old);
+                        if (dl < ctx->heap_pos) {
+                            u8 want = (term_tag(old)==TAG_DP0) ? TAG_DP1 : TAG_DP0;
+                            for (u64 gh2 = 1; gh2 < ctx->heap_pos; gh2++) {
+                                if (term_tag(ctx->heap[gh2]) == want && term_val(ctx->heap[gh2]) == dl) {
+                                    ctx->heap[gh2] = ctx->heap[dl];
+                                    ctx->heap[dl] = term_era();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (step_graph && step_n < 200 && n_era > 0) {
+                    if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  ERA propagation: %u positions erased\n", n_era);
+                    char p[256]; snprintf(p, sizeof(p), "%s/step_%03u_era_%s.dot", _sg_dir, step_n++, _cop_name);
+                    thvm_heap_dot_root(ctx, p, t);
                 }
                 #undef GC_MARK
                 #undef GC_MAX
-            }
-            // Step graph: dump after each GRAD interaction + GC
-            if (step_graph && step_n < 200) {
-                char p[256]; snprintf(p, sizeof(p), "%s/step_%03u.dot", _sg_dir, step_n++);
-                thvm_heap_dot_root(ctx, p, t);
+                #undef ERA_WL_MAX
             }
             // Scan NEW heap entries for sub-GRADs created by this interaction
-            for (u64 h2 = hp_before; h2 < ctx->heap_pos && wl_t < GRAD_WL_MAX; h2++) {
-                Term ht2 = ctx->heap[h2];
-                if (term_tag(ht2) == TAG_TOP && term_ext(ht2) == UOP_GRAD)
-                    wl[wl_t++] = h2;
+            {
+                u32 _found = 0;
+                for (u64 h2 = hp_before; h2 < ctx->heap_pos && wl_t < GRAD_WL_MAX; h2++) {
+                    Term ht2 = ctx->heap[h2];
+                    if (term_tag(ht2) == TAG_TOP && term_ext(ht2) == UOP_GRAD) {
+                        wl[wl_t++] = h2;
+                        _found++;
+                    }
+                }
+                if (getenv("THVM_SCHED_DIAG") && _found)
+                    fprintf(stderr, "  worklist: +%u GRADs (hp %llu..%llu, wl=%u)\n", _found, hp_before, ctx->heap_pos, wl_t);
             }
         }
         if (step_graph) {

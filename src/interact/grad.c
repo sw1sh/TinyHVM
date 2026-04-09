@@ -1,4 +1,5 @@
             if (uop == UOP_GRAD) {
+                // (linear_use validates first_loc before patching)
                 // Disable rewrite fusion during backward: let deferred chains grow
                 // longer. Without this, rewrite_apply materializes each backward
                 // formula immediately (1 dispatch per formula = 82 dispatches).
@@ -19,17 +20,22 @@
                 Term y  = heap_read(ctx, loc);
                 Term gy = heap_read(ctx, loc + 1);
                 Term x  = heap_read(ctx, loc + 2);
-                // ERA consumed GRAD ports immediately:
-                // - loc+0 (y): the op being differentiated — consumed
-                // - loc+1 (gy): gradient seed — consumed
-                // - loc+2 (x): target — NOT consumed (carried forward)
-                heap_set(ctx, loc, term_era());     // y consumed
-                heap_set(ctx, loc + 1, term_era()); // gy consumed
+                if (getenv("THVM_SCHED_DIAG")) {
+                    static int _re=0; _re++; if (_re<=20)
+                    fprintf(stderr, "  GRAD_ENTRY[%d]: y_tag=%u y_val=%llu gy_tag=%u x_tag=%u\n",
+                        _re, term_tag(y), term_val(y), term_tag(gy), term_tag(x));
+                }
+                // GRAD's y and gy at loc/loc+1 are orphaned after GRAD fires.
+                // ERA propagation in the worklist will consume them.
                 // Resolve DP0/DP1 on y and x (from BG DUP)
                 for (int _dp=0; _dp<20 && (term_tag(y)==TAG_DP0||term_tag(y)==TAG_DP1); _dp++)
                     y = heap_read(ctx, term_val(y));
                 for (int _dp=0; _dp<20 && (term_tag(x)==TAG_DP0||term_tag(x)==TAG_DP1); _dp++)
                     x = heap_read(ctx, term_val(x));
+                if (getenv("THVM_SCHED_DIAG")) {
+                    static int _yc=0; _yc++; if (_yc<=20)
+                    fprintf(stderr, "  GRAD_RESOLVE[%d]: y_tag=%u y_ext=%u y_val=%llu gy_tag=%u\n", _yc, term_tag(y), term_ext(y), term_val(y), term_tag(gy));
+                }
 
                 // GRAD-SUP: gradient through superposition
                 // GRAD(&L{y0,y1}, gy, x) → &L{GRAD(y0, DP0_L(gy), DP0_L(x)), ...}
@@ -65,10 +71,13 @@
                     u64 y_loc = term_val(y);
                     Term at = heap_read(ctx, y_loc);
                     Term bt = heap_read(ctx, y_loc + 1);
-                    // ERA consumed y-op slots: at carried forward, bt consumed
-                    // y_loc+0 (at) NOT erased — carried forward into sub-GRAD
-                    // bt NOT erased — causes incorrect values (unknown sharing)
-                    // TODO: investigate why ERA'ing bt breaks even for atoms
+                    // DUP at: dp0 stays at y_loc (consumed path), dp1 to sub-GRAD.
+                    {
+                        u64 _ad = heap_alloc(ctx, 1);
+                        heap_set(ctx, _ad, at);
+                        heap_set(ctx, y_loc, term_new(TAG_DP0, 0, _ad));
+                        at = term_new(TAG_DP1, 0, _ad);
+                    }
                     const View *yv = st_get(y_loc);
                     Shape y_shape = yv ? yv->shape : SHAPE(1);
                     Shape a_shape = SHAPE(1), b_shape = SHAPE(1);
@@ -89,29 +98,17 @@
                           else if (term_tag(_gt)==TAG_TOP) _gv=st_get(term_val(_gt)); \
                           if (_gv) st_set(_l, _gv); } \
                         term_new(TAG_TOP, UOP_GRAD, _l); })
-                    // Chain gradients: both branches must fire (side-effect ASSIGNs).
-                    // DUP all shared terms (at, bt, gy, x) so each branch gets its own port.
-                    // _gb continues inline, _ga is placed on heap for Phase 1 scan.
-                    // Binary gradient: both branches share at, bt, gy, x.
-                    // Only DUP gy (used in both da_expr and db_expr).
-                    // at/bt/x are NOT DUP'd: at goes to branch A (GRAD target),
-                    // bt goes to branch B (GRAD target), x goes to branch B.
-                    // Branch A's _ga is placed on heap; Branch B's _gb continues inline.
-                    // Iterative chain rule: place ALL sub-GRADs on heap.
-                    // Phase 1 worklist processes them without recursive goto.
+                    // BG: DUP at/bt/gy/x for two branches.
                     #define BG(da_of_gy_bt, db_of_gy_at) do { \
-                        u64 _ds = heap_alloc(ctx, 6); u32 _di = 0; \
+                        u64 _ds = heap_alloc(ctx, 6); \
                         Term gy0,gy1,at0,at1,bt0,bt1,x0,x1; \
-                        if(term_tag(gy)==TAG_TEN||term_tag(gy)==TAG_ERA||term_tag(gy)==TAG_NUM||term_tag(gy)==TAG_CTR){gy0=gy;gy1=gy;} \
-                        else{heap_set(ctx,_ds+_di,gy);gy0=term_new(TAG_DP0,0,_ds+_di);gy1=term_new(TAG_DP1,0,_ds+_di);_di++;} \
-                        if(term_tag(at)==TAG_TEN||term_tag(at)==TAG_ERA||term_tag(at)==TAG_NUM||term_tag(at)==TAG_CTR){at0=at;at1=at;} \
-                        else{heap_set(ctx,_ds+_di,at);at0=term_new(TAG_DP0,0,_ds+_di);at1=term_new(TAG_DP1,0,_ds+_di);_di++;} \
-                        if(term_tag(bt)==TAG_TEN||term_tag(bt)==TAG_ERA||term_tag(bt)==TAG_NUM||term_tag(bt)==TAG_CTR){bt0=bt;bt1=bt;} \
-                        else{heap_set(ctx,_ds+_di,bt);bt0=term_new(TAG_DP0,0,_ds+_di);bt1=term_new(TAG_DP1,0,_ds+_di);_di++;} \
-                        if(term_tag(x)==TAG_TEN||term_tag(x)==TAG_ERA||term_tag(x)==TAG_NUM||term_tag(x)==TAG_CTR){x0=x;x1=x;} \
-                        else{heap_set(ctx,_ds+_di,x);x0=term_new(TAG_DP0,0,_ds+_di);x1=term_new(TAG_DP1,0,_ds+_di);_di++;} \
+                        heap_set(ctx,_ds+0,gy); gy0=term_new(TAG_DP0,0,_ds+0); gy1=term_new(TAG_DP1,0,_ds+0); \
+                        heap_set(ctx,_ds+1,at); at0=term_new(TAG_DP0,0,_ds+1); at1=term_new(TAG_DP1,0,_ds+1); \
+                        heap_set(ctx,_ds+2,bt); bt0=term_new(TAG_DP0,0,_ds+2); bt1=term_new(TAG_DP1,0,_ds+2); \
+                        heap_set(ctx,_ds+3,x);  x0=term_new(TAG_DP0,0,_ds+3);  x1=term_new(TAG_DP1,0,_ds+3); \
                         Term _da; { Term gy=gy0,bt=bt0; (void)gy;(void)bt; _da=(da_of_gy_bt); } \
                         Term _db; { Term gy=gy1,at=at1; (void)gy;(void)at; _db=(db_of_gy_at); } \
+                        /* table cleared at GRAD entry */ \
                         Term _ga=GRAD3_H(at0,_da,x0), _gb=GRAD3_H(bt1,_db,x1); \
                         heap_set(ctx, _ds+4, _ga); \
                         heap_set(ctx, _ds+5, _gb); \
@@ -119,7 +116,8 @@
                     } while(0)
                     // UG: place sub-GRAD on heap — one interaction per step
                     #define UG(da_) do { \
-                        Term _u=GRAD3_H(at,da_,x); \
+                        Term _da_ug = (da_); \
+                        Term _u=GRAD3_H(at,_da_ug,x); \
                         if(term_tag(_u)==TAG_TOP) { \
                             u64 _slot = heap_alloc(ctx, 1); \
                             heap_set(ctx, _slot, _u); \
@@ -191,6 +189,14 @@
                     if (term_tag(x) == TAG_CTR) {
                         u64 tgt_loc = term_val(x);
                         u32 n_tgt = term_as_u32(heap_read(ctx, tgt_loc));
+                        if (getenv("THVM_SCHED_DIAG")) {
+                            fprintf(stderr, "  CTR_CHECK: y_id=%u n_tgt=%u tgt_loc=%llu\n", y_id, n_tgt, tgt_loc);
+                            for (u32 _dbg=0; _dbg<n_tgt; _dbg++) {
+                                Term _p = heap_read(ctx, tgt_loc+1+2*_dbg);
+                                Term _s = heap_read(ctx, tgt_loc+1+2*_dbg+1);
+                                fprintf(stderr, "    [%u] param=tag%u/val%llu slot=tag%u/val%llu\n", _dbg, term_tag(_p), term_val(_p), term_tag(_s), term_val(_s));
+                            }
+                        }
                         for (u32 _gi = 0; _gi < n_tgt; _gi++) {
                             Term p = heap_read(ctx, tgt_loc + 1 + 2*_gi);
                             if (term_tag(p) == TAG_TEN && (u32)term_val(p) == y_id) {
@@ -221,7 +227,9 @@
                     {
                         u32 cop = my->creator_op;
                         u32 aid = my->src_ids[0], bid = my->src_ids[1];
+                        // (term_use_table cleared at GRAD entry)
                         // Cycle detection: provenance must go to earlier tensors
+                        if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  PROV: y_id=%u cop=%u aid=%u bid=%u tc=%u\n", y_id, cop, aid, bid, ctx->tensor_count);
                         if (aid >= y_id || aid >= ctx->tensor_count) GRAD_RETURN(term_era());
                         Term at = term_ten(aid, ctx->tensors[aid].dtype);
 
@@ -232,10 +240,17 @@
                             term_new(TAG_TOP, UOP_GRAD, _l); })
                         // WALK: place sub-GRAD on heap — one interaction per step
                         #define WALK(da_) do { \
-                            Term _w = GRAD3_TEN(at, da_, x); \
+                            Term _da_val = (da_); \
+                            /* table cleared at GRAD entry */ \
+                            Term _w = GRAD3_TEN(at, _da_val, x); \
                             if (term_tag(_w) == TAG_TOP) { \
                                 u64 _slot = heap_alloc(ctx, 1); \
                                 heap_set(ctx, _slot, _w); \
+                                if (getenv("THVM_SCHED_DIAG")) { \
+                                    u64 _gl = term_val(_w); \
+                                    fprintf(stderr, "  WALK: slot=%llu grad_loc=%llu y_tag=%u y_val=%llu\n", \
+                                        _slot, _gl, term_tag(ctx->heap[_gl]), term_val(ctx->heap[_gl])); \
+                                } \
                             } \
                             GRAD_RETURN(term_era()); \
                         } while(0)
@@ -282,6 +297,7 @@
                     }
                 }
                 // y is TAG_TOP but not handled by GRAD_TOP above → ERA
+                if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  GRAD_FALLTHROUGH: y_tag=%u y_ext=%u y_val=%llu\n", term_tag(y), term_ext(y), term_val(y));
                 GRAD_RETURN(term_era());
                 #undef GRAD_RETURN
             }

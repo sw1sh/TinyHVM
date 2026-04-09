@@ -34,7 +34,7 @@ TinyHVM *thvm_init(const char *default_device) {
 // DUP use tracking (used by thvm_reset, thvm_free, and linear_use)
 #define TERM_USE_SIZE 4096
 static struct { Term term; u64 first_loc; u64 dup_loc; } term_use_table[TERM_USE_SIZE];
-static void term_use_clear(void) { memset(term_use_table, 0, sizeof(term_use_table)); }
+void term_use_clear(void) { memset(term_use_table, 0, sizeof(term_use_table)); }
 
 void thvm_free(TinyHVM *ctx) {
     // Free GPU buffers via each tensor's own backend
@@ -164,11 +164,19 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
             u64 dl = term_use_table[idx].dup_loc;
             if (!dl) {
                 // Create 1-slot DUP: just the shared value.
+                // Verify first_loc still holds this term (stale entries
+                // from previous GRAD steps may point to reused positions).
+                u64 fl = term_use_table[idx].first_loc;
+                if (ctx->heap[fl] != t) {
+                    // Stale entry — treat as first use at new location
+                    term_use_table[idx].first_loc = dest_loc;
+                    return t;
+                }
                 dl = heap_alloc(ctx, 1);
                 heap_set(ctx, dl, t);
                 term_use_table[idx].dup_loc = dl;
                 // Patch first use site to DP0
-                heap_set(ctx, term_use_table[idx].first_loc, term_new(TAG_DP0, 0, dl));
+                heap_set(ctx, fl, term_new(TAG_DP0, 0, dl));
             }
             // N-way sharing: all 2nd+ uses get DP1 to the same 1-slot node.
             // First projection to reduce forces the value and caches the result;

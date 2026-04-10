@@ -146,23 +146,14 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             Term a1 = heap_read(ctx, loc + 1);
             u8 a1t2 = term_tag(a1);
 
-            // GRAD: skip arg1 (gy stays lazy), reduce arg2 (x) via TAG_TOP2.
-            // Chain rule formulas just wrap gy in new lazy ops — no reduction needed.
+            // GRAD: gy stays lazy and target spec is kept outside heap.
+            // Fire immediately once y is in WNF.
             if (term_ext(frame) == UOP_GRAD) {
-                // arg0 (y) is done. arg1 (gy) stays lazy. Now reduce arg2 (x).
-                Term a2 = heap_read(ctx, loc + 2);
-                u8 a2t = term_tag(a2);
-                if (a2t == TAG_TEN || a2t == TAG_ERA || a2t == TAG_NUM || a2t == TAG_CTR) {
-                    // arg2 already WNF — fire immediately
-                    Term r = thvm_interact(ctx, frame);
-                    if (r == frame) { whnf = frame; continue; }
-                    TRACE_STEP(frame, r);
-                    top_decref_inputs(ctx, loc, term_ext(frame), r);
-                    next = r; goto enter;
-                }
-                // arg2 not ready: push TAG_TOP2, reduce arg2
-                PUSH(term_new(TAG_TOP2, (u8)term_ext(frame), loc));
-                next = a2;
+                Term r = thvm_interact(ctx, frame);
+                if (r == frame) { whnf = frame; continue; }
+                TRACE_STEP(frame, r);
+                top_decref_inputs(ctx, loc, term_ext(frame), r);
+                next = r;
                 goto enter;
             }
 
@@ -198,7 +189,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 Term a2 = heap_read(ctx, loc + 2);
                 u8 a2t = term_tag(a2);
                 if (a2t != TAG_TEN && a2t != TAG_ERA && a2t != TAG_NUM &&
-                    a2t != TAG_CTR && a2t != TAG_LAM && a2t != TAG_SUP) {
+                    a2t != TAG_CTR && a2t != TAG_ANY && a2t != TAG_LAM && a2t != TAG_SUP) {
                     PUSH(term_new(TAG_TOP2, (u8)_uop1, loc));
                     next = a2;
                     goto enter;
@@ -217,7 +208,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             u64 loc = term_val(frame);
             u8 w2t = term_tag(whnf);
             if (w2t != TAG_TEN && w2t != TAG_ERA && w2t != TAG_NUM &&
-                w2t != TAG_LAM && w2t != TAG_SUP && w2t != TAG_CTR) { whnf = frame; continue; }
+                w2t != TAG_LAM && w2t != TAG_SUP && w2t != TAG_CTR && w2t != TAG_ANY) { whnf = frame; continue; }
             heap_set(ctx, loc + 2, whnf);  // store arg2 result
             // All needed args ready — fire interact
             Term top_frame = term_new(TAG_TOP, term_ext(frame), loc);
@@ -259,7 +250,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 Term arg = heap_read(ctx, floc + 1);
                 u8 at = term_tag(arg);
                 if (at == TAG_TEN || at == TAG_ERA || at == TAG_NUM ||
-                    at == TAG_SUP || at == TAG_CTR) {
+                    at == TAG_SUP || at == TAG_CTR || at == TAG_ANY) {
                     heap_set(ctx, floc + 1, arg);
                     goto fire_comb;
                 }
@@ -289,7 +280,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             Term a1 = heap_read(ctx, floc + 1);
             u8 a1t = term_tag(a1);
             if (a1t == TAG_TEN || a1t == TAG_ERA || a1t == TAG_NUM ||
-                a1t == TAG_SUP || a1t == TAG_CTR) {
+                a1t == TAG_SUP || a1t == TAG_CTR || a1t == TAG_ANY) {
                 // arg1 already WNF
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
@@ -307,7 +298,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             u64 floc = term_val(frame);
             u8 w1t = term_tag(whnf);
             if (w1t != TAG_TEN && w1t != TAG_ERA && w1t != TAG_NUM &&
-                w1t != TAG_SUP && w1t != TAG_CTR) { whnf = frame; continue; }
+                w1t != TAG_SUP && w1t != TAG_CTR && w1t != TAG_ANY) { whnf = frame; continue; }
             heap_set(ctx, floc + 1, whnf);
             // Reconstruct original frame
             u8 orig_tag = (ftag == TAG_OP2_1) ? TAG_OP2 :
@@ -410,4 +401,3 @@ void thvm_print_term(TinyHVM *ctx, Term t) {
 
 // Device registry
 extern Backend cpu_backend;
-

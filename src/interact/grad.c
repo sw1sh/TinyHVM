@@ -10,35 +10,48 @@
                 ctx->no_fuse = 0;
                 ctx->no_grad_alloc = 1;
 
+                // Every GRAD interaction must leave consumed inputs explicitly erased.
+                // We seal the consumed y/gy ports with ERA agents before returning.
+                Term y_src  = heap_read(ctx, loc);
+                Term gy_src = heap_read(ctx, loc + 1);
+                Term y  = y_src;
+                Term gy = gy_src;
+                u8 _sealed_inputs = 0;
+                #define GRAD_SEAL_INPUTS() do { \
+                    if (!_sealed_inputs) { \
+                        u64 _ey = heap_alloc(ctx, 1); \
+                        u64 _eg = heap_alloc(ctx, 1); \
+                        heap_set(ctx, _ey, y_src); \
+                        heap_set(ctx, _eg, gy_src); \
+                        heap_set(ctx, loc,     term_era_at(_ey)); \
+                        heap_set(ctx, loc + 1, term_era_at(_eg)); \
+                        _sealed_inputs = 1; \
+                    } \
+                } while (0)
                 // Restore flags, return directly — trampoline reduces TAG_TOP results
                 #define GRAD_RETURN(r) do { \
+                    GRAD_SEAL_INPUTS(); \
                     ctx->no_fuse = _saved_nf; \
                     ctx->no_grad_alloc = _saved_nga; \
                     /* don't set dispatch_mode — let lazy trampoline handle gradient TAG_TOPs */ \
                     return (r); \
                 } while(0)
-                Term y  = heap_read(ctx, loc);
-                Term gy = heap_read(ctx, loc + 1);
-                Term x  = heap_read(ctx, loc + 2);
+                Term x  = thvm_grad_target_get(ctx, loc);
                 if (getenv("THVM_SCHED_DIAG")) {
                     static int _re=0; _re++; if (_re<=20)
                     fprintf(stderr, "  GRAD_ENTRY[%d]: y_tag=%u y_val=%llu gy_tag=%u x_tag=%u\n",
                         _re, term_tag(y), term_val(y), term_tag(gy), term_tag(x));
                 }
-                // GRAD's y and gy at loc/loc+1 are orphaned after GRAD fires.
-                // ERA propagation in the worklist will consume them.
-                // Resolve DP0/DP1 on y and x (from BG DUP)
+                // Resolve DP0/DP1 on y (from BG DUP)
                 for (int _dp=0; _dp<20 && (term_tag(y)==TAG_DP0||term_tag(y)==TAG_DP1); _dp++)
                     y = heap_read(ctx, term_val(y));
-                for (int _dp=0; _dp<20 && (term_tag(x)==TAG_DP0||term_tag(x)==TAG_DP1); _dp++)
-                    x = heap_read(ctx, term_val(x));
                 if (getenv("THVM_SCHED_DIAG")) {
                     static int _yc=0; _yc++; if (_yc<=20)
                     fprintf(stderr, "  GRAD_RESOLVE[%d]: y_tag=%u y_ext=%u y_val=%llu gy_tag=%u\n", _yc, term_tag(y), term_ext(y), term_val(y), term_tag(gy));
                 }
 
                 // GRAD-SUP: gradient through superposition
-                // GRAD(&L{y0,y1}, gy, x) → &L{GRAD(y0, DP0_L(gy), DP0_L(x)), ...}
+                // GRAD(&L{y0,y1}, gy) → &L{GRAD(y0, DP0_L(gy)), ...}
                 if (term_tag(y) == TAG_SUP) {
                     u32 lab = term_ext(y);
                     u64 sup_loc = term_val(y);
@@ -46,17 +59,15 @@
                     Term y1 = heap_read(ctx, sup_loc + 1);
                     u64 gy_dup = heap_alloc(ctx, 1);
                     heap_set(ctx, gy_dup, gy);
-                    u64 x_dup = heap_alloc(ctx, 1);
-                    heap_set(ctx, x_dup, x);
-                    // Inline GRAD3 (macro not yet in scope)
-                    u64 _l0 = heap_alloc(ctx, 3);
+                    // Inline GRAD2 (macro not yet in scope)
+                    u64 _l0 = heap_alloc(ctx, 2);
                     heap_set(ctx, _l0, y0);
                     heap_set(ctx, _l0+1, term_new(TAG_DP0, lab, gy_dup));
-                    heap_set(ctx, _l0+2, term_new(TAG_DP0, lab, x_dup));
-                    u64 _l1 = heap_alloc(ctx, 3);
+                    thvm_grad_target_set(ctx, _l0, x);
+                    u64 _l1 = heap_alloc(ctx, 2);
                     heap_set(ctx, _l1, y1);
                     heap_set(ctx, _l1+1, term_new(TAG_DP1, lab, gy_dup));
-                    heap_set(ctx, _l1+2, term_new(TAG_DP1, lab, x_dup));
+                    thvm_grad_target_set(ctx, _l1, x);
                     ctx->itrs++;
                     GRAD_RETURN(thvm_sup(ctx, lab,
                         term_new(TAG_TOP, UOP_GRAD, _l0),
@@ -90,34 +101,33 @@
                       if (term_tag(_bt)==TAG_TEN) b_shape=ctx->tensors[(u32)term_val(_bt)].view.shape;
                       else if (term_tag(_bt)==TAG_TOP) { const View *bv=st_get(term_val(_bt)); if(bv) b_shape=bv->shape; } }
 
-                    #define GRAD3_H(y_,gy_,x_) ({ \
-                        u64 _l = heap_alloc(ctx, 3); \
-                        heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
+                    #define GRAD2_H(y_,gy_,x_) ({ \
+                        u64 _l = heap_alloc(ctx, 2); \
+                        heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); thvm_grad_target_set(ctx, _l, x_); \
                         { const View *_gv = NULL; Term _gt = (gy_); \
                           if (term_tag(_gt)==TAG_TEN && (u32)term_val(_gt)<ctx->tensor_count) _gv=&ctx->tensors[(u32)term_val(_gt)].view; \
                           else if (term_tag(_gt)==TAG_TOP) _gv=st_get(term_val(_gt)); \
                           if (_gv) st_set(_l, _gv); } \
                         term_new(TAG_TOP, UOP_GRAD, _l); })
-                    // BG: DUP at/bt/gy/x for two branches.
+                    // BG: DUP at/bt/gy for two branches.
                     #define BG(da_of_gy_bt, db_of_gy_at) do { \
-                        u64 _ds = heap_alloc(ctx, 6); \
-                        Term gy0,gy1,at0,at1,bt0,bt1,x0,x1; \
+                        u64 _ds = heap_alloc(ctx, 5); \
+                        Term gy0,gy1,at0,at1,bt0,bt1; \
                         heap_set(ctx,_ds+0,gy); gy0=term_new(TAG_DP0,0,_ds+0); gy1=term_new(TAG_DP1,0,_ds+0); \
                         heap_set(ctx,_ds+1,at); at0=term_new(TAG_DP0,0,_ds+1); at1=term_new(TAG_DP1,0,_ds+1); \
                         heap_set(ctx,_ds+2,bt); bt0=term_new(TAG_DP0,0,_ds+2); bt1=term_new(TAG_DP1,0,_ds+2); \
-                        heap_set(ctx,_ds+3,x);  x0=term_new(TAG_DP0,0,_ds+3);  x1=term_new(TAG_DP1,0,_ds+3); \
                         Term _da; { Term gy=gy0,bt=bt0; (void)gy;(void)bt; _da=(da_of_gy_bt); } \
                         Term _db; { Term gy=gy1,at=at1; (void)gy;(void)at; _db=(db_of_gy_at); } \
                         /* table cleared at GRAD entry */ \
-                        Term _ga=GRAD3_H(at0,_da,x0), _gb=GRAD3_H(bt1,_db,x1); \
-                        heap_set(ctx, _ds+4, _ga); \
-                        heap_set(ctx, _ds+5, _gb); \
+                        Term _ga=GRAD2_H(at0,_da,x), _gb=GRAD2_H(bt1,_db,x); \
+                        heap_set(ctx, _ds+3, _ga); \
+                        heap_set(ctx, _ds+4, _gb); \
                         GRAD_RETURN(term_era()); \
                     } while(0)
                     // UG: place sub-GRAD on heap — one interaction per step
                     #define UG(da_) do { \
                         Term _da_ug = (da_); \
-                        Term _u=GRAD3_H(at,_da_ug,x); \
+                        Term _u=GRAD2_H(at,_da_ug,x); \
                         if(term_tag(_u)==TAG_TOP) { \
                             u64 _slot = heap_alloc(ctx, 1); \
                             heap_set(ctx, _slot, _u); \
@@ -164,7 +174,7 @@
                             } else GRAD_RETURN(term_era()); }
                         default: GRAD_RETURN(term_era());
                     }
-                    #undef GRAD3_H
+                    #undef GRAD2_H
                     #undef BG
                     #undef UG
                 }
@@ -177,8 +187,8 @@
                         GRAD_RETURN(gy);
                     }
 
-                    // Multi-target: x = TAG_CTR encoding (param, slot) pairs.
-                    // When y matches a param, deposit gy via ASSIGN into the slot.
+                    // Multi-target: x = ANY pattern. Param->slot mapping lives in
+                    // the internal GRAD target table and is resolved at TAG_TEN leaves.
                     // x may be DP0/DP1 reference (from BG DUP) — resolve through.
                     { Term _xr = x;
                       while (term_tag(_xr) == TAG_DP0 || term_tag(_xr) == TAG_DP1)
@@ -186,36 +196,31 @@
                       x = _xr; }
                     if (getenv("THVM_SCHED_DIAG") && y_id < 10)
                         fprintf(stderr, "  GRAD_TEN_X: y_id=%u x_tag=%u x_ext=%u\n", y_id, term_tag(x), term_ext(x));
-                    if (term_tag(x) == TAG_CTR) {
-                        u64 tgt_loc = term_val(x);
-                        u32 n_tgt = term_as_u32(heap_read(ctx, tgt_loc));
-                        if (getenv("THVM_SCHED_DIAG")) {
-                            fprintf(stderr, "  CTR_CHECK: y_id=%u n_tgt=%u tgt_loc=%llu\n", y_id, n_tgt, tgt_loc);
-                            for (u32 _dbg=0; _dbg<n_tgt; _dbg++) {
-                                Term _p = heap_read(ctx, tgt_loc+1+2*_dbg);
-                                Term _s = heap_read(ctx, tgt_loc+1+2*_dbg+1);
-                                fprintf(stderr, "    [%u] param=tag%u/val%llu slot=tag%u/val%llu\n", _dbg, term_tag(_p), term_val(_p), term_tag(_s), term_val(_s));
-                            }
-                        }
-                        for (u32 _gi = 0; _gi < n_tgt; _gi++) {
-                            Term p = heap_read(ctx, tgt_loc + 1 + 2*_gi);
-                            if (term_tag(p) == TAG_TEN && (u32)term_val(p) == y_id) {
-                                Term slot = heap_read(ctx, tgt_loc + 1 + 2*_gi + 1);
-                                // DUP slot for ADD (reads old) + ASSIGN (writes new)
-                                u64 _sd = heap_alloc(ctx, 2); // 1 for slot DUP + 1 for pending
-                                heap_set(ctx, _sd, slot);
-                                Term slot0 = term_new(TAG_DP0, 0, _sd);
-                                Term slot1 = term_new(TAG_DP1, 0, _sd);
-                                Term accum = thvm_op_raw(ctx, UOP_ADD, slot0, gy);
-                                u64 _ah = _sd + 1;
-                                heap_set(ctx, _ah, thvm_assign(ctx, slot1, accum));
-                                if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  ASSIGN_CREATE: target=%u slot=%u\n", y_id, _gi);
-                                GRAD_RETURN(term_era());
-                            }
+                    if (term_tag(x) == TAG_ANY) {
+                        Term slot = term_era();
+                        if (thvm_grad_targets_find_slot(ctx, y_id, &slot)) {
+                            // DUP slot for ADD (reads old) + ASSIGN (writes new)
+                            u64 _sd = heap_alloc(ctx, 2); // 1 for slot DUP + 1 for pending
+                            heap_set(ctx, _sd, slot);
+                            Term slot0 = term_new(TAG_DP0, 0, _sd);
+                            Term slot1 = term_new(TAG_DP1, 0, _sd);
+                            Term accum = thvm_op_raw(ctx, UOP_ADD, slot0, gy);
+                            u64 _ah = _sd + 1;
+                            heap_set(ctx, _ah, thvm_assign(ctx, slot1, accum));
+                            if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  ASSIGN_CREATE: target_tid=%u\n", y_id);
+                            GRAD_RETURN(term_era());
                         }
                     }
 
                     TensorMeta *my = &ctx->tensors[y_id];
+
+                    // "all params" pattern: only requires_grad leaves survive.
+                    // If this leaf is not in the explicit multi-target table,
+                    // gy itself is the leaf gradient value.
+                    if (term_tag(x) == TAG_ANY) {
+                        if (my->requires_grad) GRAD_RETURN(gy);
+                        GRAD_RETURN(term_era());
+                    }
 
                     // Leaf (no provenance, not target) → ERA
                     if (!my->creator_op) {
@@ -233,16 +238,16 @@
                         if (aid >= y_id || aid >= ctx->tensor_count) GRAD_RETURN(term_era());
                         Term at = term_ten(aid, ctx->tensors[aid].dtype);
 
-                        // Rebuild GRAD(input, backward_gy, x) and recurse
-                        #define GRAD3_TEN(y_,gy_,x_) ({ \
-                            u64 _l = heap_alloc(ctx, 3); \
-                            heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); heap_set(ctx, _l+2, x_); \
+                        // Rebuild GRAD(input, backward_gy) and recurse
+                        #define GRAD2_TEN(y_,gy_,x_) ({ \
+                            u64 _l = heap_alloc(ctx, 2); \
+                            heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); thvm_grad_target_set(ctx, _l, x_); \
                             term_new(TAG_TOP, UOP_GRAD, _l); })
                         // WALK: place sub-GRAD on heap — one interaction per step
                         #define WALK(da_) do { \
                             Term _da_val = (da_); \
                             /* table cleared at GRAD entry */ \
-                            Term _w = GRAD3_TEN(at, _da_val, x); \
+                            Term _w = GRAD2_TEN(at, _da_val, x); \
                             if (term_tag(_w) == TAG_TOP) { \
                                 u64 _slot = heap_alloc(ctx, 1); \
                                 heap_set(ctx, _slot, _w); \
@@ -292,12 +297,13 @@
                             }
                             default: GRAD_RETURN(term_era());
                         }
-                        #undef GRAD3_TEN
+                        #undef GRAD2_TEN
                         #undef WALK
                     }
                 }
                 // y is TAG_TOP but not handled by GRAD_TOP above → ERA
                 if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  GRAD_FALLTHROUGH: y_tag=%u y_ext=%u y_val=%llu\n", term_tag(y), term_ext(y), term_val(y));
                 GRAD_RETURN(term_era());
+                #undef GRAD_SEAL_INPUTS
                 #undef GRAD_RETURN
             }

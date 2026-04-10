@@ -43,6 +43,7 @@ py/tinyhvm/shaders.metallib
 *.tmp
 *.swp
 *~
+thvm_steps/
 
 # Logs
 *.log

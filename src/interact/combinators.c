@@ -132,6 +132,40 @@
         case TAG_LAM:
             return t;
 
+        // TAG_ERA: active eraser (val = slot containing the erased target)
+        // ERA(0) is inert.
+        case TAG_ERA: {
+            u64 era_loc = term_val(t);
+            if (era_loc == 0 || era_loc >= ctx->heap_pos) return t;
+
+            Term val = heap_read(ctx, era_loc);
+            u8 vtag = term_tag(val);
+
+            // DUP collapse: if ERA consumes one DP port, project shared value
+            // to the opposite port and clear the shared slot.
+            if (vtag == TAG_DP0 || vtag == TAG_DP1) {
+                u64 dl = term_val(val);
+                if (dl < ctx->heap_pos) {
+                    u8 want = (vtag == TAG_DP0) ? TAG_DP1 : TAG_DP0;
+                    for (u64 h2 = 1; h2 < ctx->heap_pos; h2++) {
+                        Term p = ctx->heap[h2];
+                        if (term_tag(p) == want && term_val(p) == dl) {
+                            ctx->heap[h2] = ctx->heap[dl];
+                            ctx->heap[dl] = term_era();
+                            break;
+                        }
+                    }
+                }
+                heap_set(ctx, era_loc, term_era());
+                ctx->itrs++;
+                return term_era();
+            }
+
+            heap_set(ctx, era_loc, term_era());
+            ctx->itrs++;
+            return term_era();
+        }
+
         // TAG_REF: unfold definition — deep-clone body (ALO semantics).
         // Each unfold gets fresh heap nodes so recursive defs work correctly.
         case TAG_REF: {

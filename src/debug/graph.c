@@ -1,5 +1,6 @@
 // graph.c — BFS heap walker for inet graph visualization
 // Returns node/edge arrays suitable for WL Graph construction.
+static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 
 // Simple open-addressing hash set for visited Term values
 typedef struct {
@@ -37,7 +38,8 @@ static u32 tag_arity(u32 tag, u32 ext) {
         case TAG_DP0: case TAG_DP1: return 1; // 1-slot DUP: only heap[val]
         case TAG_OP2: return 2;
         case TAG_TOP:
-            if (ext == UOP_WHERE || ext == UOP_GRAD) return 3;
+            if (ext == UOP_WHERE) return 3;
+            if (ext == UOP_GRAD) return 2;
             return 2;
         case TAG_USP: return 2;
         case TAG_UDP: return 1;
@@ -144,4 +146,42 @@ void thvm_heap_graph(TinyHVM *ctx, Term root,
     *out_n_nodes = nn;
     *out_edges = edges;
     *out_n_edges = ne;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase-1 step-graph helpers (GRAD/ERA tracing)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static int thvm_step_graph_start(TinyHVM *ctx, Term root, const char *dir, u32 *step_n) {
+    if (!getenv("THVM_STEP_GRAPH")) return 0;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s && rm -f %s/*.dot %s/*.png", dir, dir, dir);
+    system(cmd);
+    char p[256];
+    snprintf(p, sizeof(p), "%s/step_%03u_state_init.dot", dir, 0u);
+    thvm_heap_dot_root(ctx, p, root);
+    *step_n = 1;
+    return 1;
+}
+
+static void thvm_step_graph_dump_grad(TinyHVM *ctx, Term root, int step_graph,
+                                      const char *dir, u32 *step_n, const char *cop_name) {
+    if (!step_graph || *step_n >= 200) return;
+    char p[256];
+    snprintf(p, sizeof(p), "%s/step_%03u_interact_grad_on_%s.dot", dir, (*step_n)++, cop_name);
+    thvm_heap_dot_root(ctx, p, root);
+}
+
+static void thvm_step_graph_finish(TinyHVM *ctx, Term root, int step_graph,
+                                   const char *dir, u32 step_n) {
+    if (!step_graph) return;
+    char p[256];
+    snprintf(p, sizeof(p), "%s/step_%03u_state_final.dot", dir, step_n);
+    thvm_heap_dot_root(ctx, p, root);
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "for f in %s/*.dot; do dot -Tpng -Gdpi=150 \"$f\" -o \"${f%%.dot}.png\" 2>/dev/null; done",
+             dir);
+    system(cmd);
+    fprintf(stderr, "Step graphs (%u steps) → %s/\n", step_n - 1, dir);
 }

@@ -865,6 +865,16 @@ f32      thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
 // Returns a lazy Term — when reduced, computes ∂y/∂x.
 // Gradient ops go through thvm_op → get taped → grad(grad(f)) works.
 Term     thvm_grad(TinyHVM *ctx, Term y, Term x);
+Term     thvm_grad_multi(TinyHVM *ctx, Term loss, Term *params, Term *grad_slots, u32 n_params);
+
+// Internal GRAD target registry used by phase-1 GRAD interactions and debug labels.
+void     thvm_grad_targets_clear(TinyHVM *ctx);
+void     thvm_grad_target_set(TinyHVM *ctx, u64 grad_loc, Term x);
+Term     thvm_grad_target_get(TinyHVM *ctx, u64 grad_loc);
+void     thvm_grad_targets_set(TinyHVM *ctx, Term *params, Term *grad_slots, u32 n_params);
+int      thvm_grad_targets_find_slot(TinyHVM *ctx, u32 tid, Term *out_slot);
+u32      thvm_grad_targets_count(TinyHVM *ctx);
+u32      thvm_grad_targets_get_tid(TinyHVM *ctx, u32 index);
 
 // Movement ops
 Term     thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim);

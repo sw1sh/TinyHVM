@@ -26,6 +26,34 @@ static inline int uop_allocates_fresh(u32 uop) {
     }
 }
 
+static inline u32 reduce_top_arity(u32 uop) {
+    if (uop == UOP_FUSING) return 0;
+    if (uop == UOP_WHERE || uop == UOP_IFZ) return 3;
+    if (uop == UOP_GRAD) return 2;
+    if (!is_binary(uop) && is_elementwise(uop)) return 1;
+    return 2;
+}
+
+static inline int reduce_top_has_era_arg(TinyHVM *ctx, Term t) {
+    if (term_tag(t) != TAG_TOP) return 0;
+    u64 loc = term_val(t);
+    u32 arity = reduce_top_arity(term_ext(t));
+    for (u32 i = 0; i < arity; i++) {
+        Term child = heap_read(ctx, loc + i);
+        if (term_tag(child) == TAG_ERA && term_val(child) != 0) return 1;
+    }
+    return 0;
+}
+
+static inline int reduce_top_has_add_zero_arg(TinyHVM *ctx, Term t) {
+    if (term_tag(t) != TAG_TOP || term_ext(t) != UOP_ADD) return 0;
+    u64 loc = term_val(t);
+    Term a = heap_read(ctx, loc + 0);
+    Term b = heap_read(ctx, loc + 1);
+    return (term_tag(a) == TAG_NUM && term_as_f32(a) == 0.0f) ||
+           (term_tag(b) == TAG_NUM && term_as_f32(b) == 0.0f);
+}
+
 // Decref input tensors after a TOP fires and produces a fresh output.
 // Skip if the OUTPUT is grad-tracked — GRAD walks src_ids backward through
 // the entire forward tape, so all intermediate tensors must stay alive.
@@ -65,8 +93,10 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
 
     Term next = root;
     Term whnf;
+    int budget_exhausted = 0;
 
     #define PUSH(f_)  do { if (sp >= REDUCE_SLICE) { fprintf(stderr, "SP_OVERFLOW sp=%d depth=%d\n", sp, depth); fflush(stderr); assert(0); } stk[sp++] = (f_); } while(0)
+    #define BUDGET_HIT() (ctx->step_budget > 0 && ctx->steps_taken >= ctx->step_budget)
     #define TRACE_STEP(before, result) do { \
         if (ctx->trace_enabled && ctx->trace_count < ctx->trace_cap) { \
             struct InteractionTrace *_tr = &ctx->trace_buf[ctx->trace_count++]; \
@@ -79,7 +109,9 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             _tr->rule_id = term_tag(before); \
         } \
         if (ctx->step_budget > 0 && ++ctx->steps_taken >= ctx->step_budget) { \
-            reduce_depth--; return (result); \
+            budget_exhausted = 1; \
+            whnf = (result); \
+            goto apply; \
         } \
     } while(0)
 
@@ -87,15 +119,34 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     u8 tag = term_tag(next);
 
     // Already WNF atoms → go directly to apply
-    if (tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
+    if (tag == TAG_TEN || tag == TAG_NUM ||
         tag == TAG_LAM || tag == TAG_SUP || tag == TAG_BRI ||
         tag == TAG_MAT || tag == TAG_ANY || tag == TAG_USP) { whnf = next; goto apply; }
+
+    // ERA: inert ERA(0) is WNF; active ERA(val!=0) must interact.
+    if (tag == TAG_ERA) {
+        if (term_val(next) == 0) { whnf = next; goto apply; }
+        if (BUDGET_HIT()) { whnf = next; goto apply; }
+        Term r = thvm_interact(ctx, next);
+        if (r == next) { whnf = next; goto apply; }
+        TRACE_STEP(next, r);
+        next = r;
+        goto enter;
+    }
 
     // TAG_TOP: ALL compute and movement ops are WNF. Nothing fires eagerly.
     // Only ASSIGN, GRAD, IFZ, LOG_PRINT, TODEVICE, WHERE, FUSING fire.
     // Movement ops are resolved by the scheduler in Phase 2.
     if (tag == TAG_TOP) {
         u32 _uop = term_ext(next);
+        if (reduce_top_has_era_arg(ctx, next) || reduce_top_has_add_zero_arg(ctx, next)) {
+            if (BUDGET_HIT()) { whnf = next; goto apply; }
+            Term r = thvm_interact(ctx, next);
+            if (r == next) { whnf = next; goto apply; }
+            TRACE_STEP(next, r);
+            next = r;
+            goto enter;
+        }
         if (_uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
             _uop != UOP_LOG_PRINT && _uop != UOP_TODEVICE && _uop != UOP_WHERE &&
             _uop != UOP_FUSING) {
@@ -103,8 +154,9 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         }
         // Non-compute: reduce args then fire interact
         u64 loc = term_val(next);
+        Term a0 = heap_read(ctx, loc + 0);
         PUSH(next);
-        next = heap_read(ctx, loc + 0);
+        next = a0;
         goto enter;
     }
 
@@ -119,6 +171,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     }
 
     {
+        if (BUDGET_HIT()) { whnf = next; goto apply; }
         Term r = thvm_interact(ctx, next);
         if (r == next) { whnf = next; goto apply; }
         TRACE_STEP(next, r);
@@ -142,13 +195,10 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             }
             heap_set(ctx, loc + 0, whnf);  // store arg0 result
 
-            // Check arg1: is it already ready?
-            Term a1 = heap_read(ctx, loc + 1);
-            u8 a1t2 = term_tag(a1);
-
             // GRAD: gy stays lazy and target spec is kept outside heap.
             // Fire immediately once y is in WNF.
             if (term_ext(frame) == UOP_GRAD) {
+                if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
                 TRACE_STEP(frame, r);
@@ -157,10 +207,15 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 goto enter;
             }
 
+            // Check arg1: is it already ready?
+            Term a1 = heap_read(ctx, loc + 1);
+            u8 a1t2 = term_tag(a1);
+
             // Any WNF in arg1 slot is "ready"
             if (a1t2 == TAG_TEN || a1t2 == TAG_ERA || a1t2 == TAG_NUM ||
                 a1t2 == TAG_LAM || a1t2 == TAG_SUP) {
                 // Both args ready — fire
+                if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
                 TRACE_STEP(frame, r);
@@ -196,6 +251,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 }
             }
             Term top_frame = term_new(TAG_TOP, _uop1, loc);
+            if (budget_exhausted || BUDGET_HIT()) { whnf = top_frame; continue; }
             Term r = thvm_interact(ctx, top_frame);
             if (r == top_frame) { whnf = top_frame; continue; }
             TRACE_STEP(top_frame, r);
@@ -212,31 +268,12 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             heap_set(ctx, loc + 2, whnf);  // store arg2 result
             // All needed args ready — fire interact
             Term top_frame = term_new(TAG_TOP, term_ext(frame), loc);
+            if (budget_exhausted || BUDGET_HIT()) { whnf = top_frame; continue; }
             Term r = thvm_interact(ctx, top_frame);
             if (r == top_frame) { whnf = top_frame; continue; }
             TRACE_STEP(top_frame, r);
             top_decref_inputs(ctx, loc, term_ext(frame), r);
             next = r; goto enter;
-        }
-
-        // Combinator frames (APP, DP0, DP1)
-        {
-            u64 floc = term_val(frame);
-            if (ftag == TAG_APP) {
-                heap_set(ctx, floc + 0, whnf);
-                Term r = thvm_interact(ctx, frame);
-                if (r == frame) { whnf = frame; continue; }
-                TRACE_STEP(frame, r);
-                next = r; goto enter;
-            }
-            if (ftag == TAG_DP0 || ftag == TAG_DP1) {
-                heap_set(ctx, floc + 0, whnf);
-                Term r = thvm_interact(ctx, frame);
-                if (r == frame) { whnf = frame; continue; }
-                TRACE_STEP(frame, r);
-                next = r; goto enter;
-            }
-            whnf = frame; continue;
         }
 
         // Combinator frames — arg0 reduced, store and fire (or reduce arg1)
@@ -259,6 +296,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 goto enter;
             }
             fire_comb:;
+            if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
             Term r = thvm_interact(ctx, frame);
             if (r == frame) { whnf = frame; continue; }
             TRACE_STEP(frame, r);
@@ -271,6 +309,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             heap_set(ctx, floc + 0, whnf);
             if (term_tag(whnf) == TAG_SUP) {
                 // SUP distribution: handler uses lazy arg1 for DUP
+                if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
                 TRACE_STEP(frame, r);
@@ -282,6 +321,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             if (a1t == TAG_TEN || a1t == TAG_ERA || a1t == TAG_NUM ||
                 a1t == TAG_SUP || a1t == TAG_CTR || a1t == TAG_ANY) {
                 // arg1 already WNF
+                if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
                 TRACE_STEP(frame, r);
@@ -305,6 +345,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                           (ftag == TAG_EQL_1) ? TAG_EQL : TAG_APP;
             u32 orig_ext = (ftag == TAG_OP2_1) ? term_ext(frame) : 0;
             Term orig = term_new(orig_tag, orig_ext, floc);
+            if (budget_exhausted || BUDGET_HIT()) { whnf = orig; continue; }
             Term r = thvm_interact(ctx, orig);
             if (r == orig) { whnf = orig; continue; }
             TRACE_STEP(orig, r);
@@ -318,6 +359,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
 
     reduce_depth--;
     #undef PUSH
+    #undef BUDGET_HIT
     #undef TRACE_STEP
     return whnf;
 }

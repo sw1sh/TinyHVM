@@ -34,6 +34,24 @@ static GradTargetSet *grad_targets_get(TinyHVM *ctx, int create) {
     return NULL;
 }
 
+static int grad_loc_index(GradTargetSet *s, u64 grad_loc) {
+    if (!s) return -1;
+    for (u32 i = 0; i < s->n_loc; i++) {
+        if (s->locs[i] == grad_loc) return (int)i;
+    }
+    return -1;
+}
+
+static int grad_loc_ensure(GradTargetSet *s, u64 grad_loc) {
+    int idx = grad_loc_index(s, grad_loc);
+    if (idx >= 0) return idx;
+    if (!s || s->n_loc >= GRAD_LOC_MAX) return -1;
+    idx = (int)s->n_loc++;
+    s->locs[idx] = grad_loc;
+    s->xs[idx] = thvm_any();
+    return idx;
+}
+
 void thvm_grad_targets_clear(TinyHVM *ctx) {
     GradTargetSet *s = grad_targets_get(ctx, 0);
     if (!s) return;
@@ -44,24 +62,16 @@ void thvm_grad_targets_clear(TinyHVM *ctx) {
 void thvm_grad_target_set(TinyHVM *ctx, u64 grad_loc, Term x) {
     GradTargetSet *s = grad_targets_get(ctx, 1);
     if (!s) return;
-    for (u32 i = 0; i < s->n_loc; i++) {
-        if (s->locs[i] == grad_loc) {
-            s->xs[i] = x;
-            return;
-        }
-    }
-    if (s->n_loc >= GRAD_LOC_MAX) return;
-    s->locs[s->n_loc] = grad_loc;
-    s->xs[s->n_loc] = x;
-    s->n_loc++;
+    int idx = grad_loc_ensure(s, grad_loc);
+    if (idx < 0) return;
+    s->xs[idx] = x;
 }
 
 Term thvm_grad_target_get(TinyHVM *ctx, u64 grad_loc) {
     GradTargetSet *s = grad_targets_get(ctx, 0);
     if (!s) return thvm_any();
-    for (u32 i = 0; i < s->n_loc; i++) {
-        if (s->locs[i] == grad_loc) return s->xs[i];
-    }
+    int idx = grad_loc_index(s, grad_loc);
+    if (idx >= 0) return s->xs[idx];
     return thvm_any();
 }
 
@@ -69,6 +79,7 @@ void thvm_grad_targets_set(TinyHVM *ctx, Term *params, Term *grad_slots, u32 n_p
     GradTargetSet *s = grad_targets_get(ctx, 1);
     if (!s) return;
     s->n = 0;
+    s->n_loc = 0;
     for (u32 i = 0; i < n_params && s->n < GRAD_TARGETS_MAX; i++) {
         if (term_tag(params[i]) != TAG_TEN) continue;
         s->tids[s->n] = (u32)term_val(params[i]);
@@ -103,12 +114,10 @@ u32 thvm_grad_targets_get_tid(TinyHVM *ctx, u32 index) {
 Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
     // Single-target mode: no global target table.
     thvm_grad_targets_clear(ctx);
-    // GRAD seed is a scalar tensor to keep UOP inputs tensor-typed in the heap graph.
-    f32 one = 1.0f;
-    Term seed = thvm_tensor(ctx, &one, SHAPE(1));
-
+    Term seed = term_num_f32(1.0f);
     u64 loc = heap_alloc(ctx, 2);
-    heap_set(ctx, loc,     y);
+    y = linear_use(ctx, y, loc);
+    heap_set(ctx, loc, y);
     heap_set(ctx, loc + 1, seed);
     thvm_grad_target_set(ctx, loc, x);
     return term_new(TAG_TOP, UOP_GRAD, loc);
@@ -119,10 +128,9 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
 // when GRAD reaches TAG_TEN leaves.
 Term thvm_grad_multi(TinyHVM *ctx, Term loss, Term *params, Term *grad_slots, u32 n_params) {
     thvm_grad_targets_set(ctx, params, grad_slots, n_params);
-    // Same scalar tensor seed rule for multi-target.
-    f32 one = 1.0f;
-    Term seed = thvm_tensor(ctx, &one, SHAPE(1));
+    Term seed = term_num_f32(1.0f);
     u64 loc = heap_alloc(ctx, 2);
+    loss = linear_use(ctx, loss, loc);
     heap_set(ctx, loc, loss);
     heap_set(ctx, loc + 1, seed);
     thvm_grad_target_set(ctx, loc, thvm_any());

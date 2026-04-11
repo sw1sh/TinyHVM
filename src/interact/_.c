@@ -14,11 +14,42 @@
 static int is_view_op(u32 uop);
 static int is_elementwise(u32 uop);
 
+static Term thvm_era_payload(TinyHVM *ctx, Term item) {
+    while (term_tag(item) == TAG_ERA) {
+        u64 el = term_val(item);
+        if (el == 0 || el >= ctx->heap_pos) return term_era();
+        item = heap_read(ctx, el);
+    }
+    return item;
+}
+
+static Term thvm_make_active_era(TinyHVM *ctx, Term item) {
+    item = thvm_era_payload(ctx, item);
+    if (term_tag(item) == TAG_ERA && term_val(item) == 0) return term_era();
+    u64 el = heap_alloc(ctx, 1);
+    heap_set(ctx, el, item);
+    return term_era_at(el);
+}
+
+static void thvm_spawn_detached_era(TinyHVM *ctx, Term item) {
+    Term era = thvm_make_active_era(ctx, item);
+    if (term_tag(era) == TAG_ERA && term_val(era) != 0) {
+        u64 slot = heap_alloc(ctx, 1);
+        heap_set(ctx, slot, era);
+    }
+}
+
 static Term thvm_interact(TinyHVM *ctx, Term t) {
     // Return result directly — the trampoline handles TAG_TOP results
     // via `next = r; goto enter;` (no need to force-reduce here).
     // Return directly — trampoline handles TAG_TOP via goto enter
     #define RETURN_REDUCED(result) do { return (result); } while(0)
+    // In step-budget mode (used by phase-1 step dumps), keep each interact()
+    // call to exactly one local rewrite.
+    #define INET_RECURSE() do { \
+        if (ctx->step_budget > 0) return t; \
+        goto inet_step; \
+    } while (0)
     // No GRAD_STEP — all GRAD sub-terms are placed on heap iteratively
 
     u32 tag;
@@ -41,8 +72,10 @@ inet_step:
 #include "combinators.c"
 
         default:
+            #undef INET_RECURSE
             return t;
     }
+    #undef INET_RECURSE
     return t;
 }
 

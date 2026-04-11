@@ -1,11 +1,12 @@
-// Forward declarations (defined in debug/graph.c + debug/dump.c, included after this file)
+// Forward declarations (defined in debug/dump.c, included after this file)
 static void thvm_heap_dot(TinyHVM *ctx, const char *path);
 static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
-static int thvm_step_graph_start(TinyHVM *ctx, Term root, const char *dir, u32 *step_n);
-static void thvm_step_graph_dump_grad(TinyHVM *ctx, Term root, int step_graph,
-                                      const char *dir, u32 *step_n, const char *cop_name);
-static void thvm_step_graph_finish(TinyHVM *ctx, Term root, int step_graph,
-                                   const char *dir, u32 step_n);
+static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root);
+static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term root);
+static void thvm_step_graph_finalize(TinyHVM *ctx);
+static void thvm_step_graph_set_before_grad_y(Term y);
+static void thvm_step_graph_set_before_era_payload(Term payload);
+static void thvm_step_graph_set_before_top_era(int had_era);
 
 // schedule/_.c — Three-phase eval: reduce → schedule(rewrite) → reduce
 //
@@ -30,6 +31,460 @@ u32 sched_kernel_count = 0;
 // kid_results: TAG_TEN result for each dispatched kid (ERA = not yet dispatched).
 // Shared with UOP_FUSING handler in tensor_ops.c.
 Term kid_results[SCHED_MAX_KERNELS];
+static u64 phase1_root_slot = 0;
+
+static u32 phase1_top_arity(u32 ext) {
+    if (ext == UOP_FUSING) return 0;
+    if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
+    if (ext == UOP_GRAD) return 2;
+    if (!is_binary(ext) && is_elementwise(ext)) return 1;
+    return 2;
+}
+
+static u32 phase1_term_arity(Term t);
+static int phase1_has_parent_ref(TinyHVM *ctx, Term target);
+
+static int phase1_top_has_era_arg(TinyHVM *ctx, Term t, u64 *slot_out, Term *term_out) {
+    if (term_tag(t) != TAG_TOP) return 0;
+    u64 loc = term_val(t);
+    u32 arity = phase1_top_arity(term_ext(t));
+    for (u32 i = 0; i < arity; i++) {
+        Term child = heap_read(ctx, loc + i);
+        if (term_tag(child) == TAG_ERA && term_val(child) != 0) {
+            if (slot_out) *slot_out = loc + i;
+            if (term_out) *term_out = child;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int phase1_top_has_add_zero_arg(TinyHVM *ctx, Term t, u64 *slot_out, Term *term_out) {
+    if (term_tag(t) != TAG_TOP || term_ext(t) != UOP_ADD) return 0;
+    u64 loc = term_val(t);
+    for (u32 i = 0; i < 2; i++) {
+        Term child = heap_read(ctx, loc + i);
+        if (term_tag(child) == TAG_NUM && term_as_f32(child) == 0.0f) {
+            if (slot_out) *slot_out = loc + i;
+            if (term_out) *term_out = child;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int phase1_term_maybe_active(TinyHVM *ctx, Term t) {
+    u8 tag = term_tag(t);
+    if (tag == TAG_TOP) {
+        return term_ext(t) == UOP_GRAD ||
+               phase1_top_has_era_arg(ctx, t, NULL, NULL) ||
+               phase1_top_has_add_zero_arg(ctx, t, NULL, NULL);
+    }
+    if (tag == TAG_ERA) return term_val(t) != 0 && !phase1_has_parent_ref(ctx, t);
+    if (tag == TAG_TEN || tag == TAG_NUM || tag == TAG_LAM || tag == TAG_SUP ||
+        tag == TAG_BRI || tag == TAG_MAT || tag == TAG_ANY || tag == TAG_USP)
+        return 0;
+    return 1;
+}
+
+static int phase1_term_first_reachable_occurrence(TinyHVM *ctx, u64 h, Term t, const u8 *reach) {
+    for (u64 i = 1; i < h; i++) {
+        if (reach && !reach[i]) continue;
+        if (ctx->heap[i] == t) return 0;
+    }
+    return 1;
+}
+
+static u32 phase1_term_arity(Term t) {
+    u8 tag = term_tag(t);
+    u32 ext = term_ext(t);
+    switch (tag) {
+        case TAG_TOP:
+            if (ext == UOP_FUSING) return 0;
+            if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
+            if (ext == UOP_GRAD) return 2;
+            if (!is_binary(ext) && is_elementwise(ext)) return 1;
+            return 2;
+        case TAG_APP:
+        case TAG_LAM:
+        case TAG_BRI:
+        case TAG_SUP:
+        case TAG_USP:
+        case TAG_OP2:
+        case TAG_EQL:
+        case TAG_AND:
+        case TAG_OR:
+        case TAG_MAT:
+        case TAG_ANN:
+            return 2;
+        case TAG_DSU:
+        case TAG_DDU:
+            return 3;
+        case TAG_DP0:
+        case TAG_DP1:
+        case TAG_UDP:
+        case TAG_ERA:
+        case TAG_VAR:
+        case TAG_INC:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int phase1_has_parent_ref(TinyHVM *ctx, Term target) {
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term p = ctx->heap[h];
+        u32 ar = phase1_term_arity(p);
+        u64 loc = term_val(p);
+        if (ar == 0 || loc == 0 || loc + ar > ctx->heap_pos) continue;
+        for (u32 i = 0; i < ar; i++) {
+            if (heap_read(ctx, loc + i) == target) return 1;
+        }
+    }
+    return 0;
+}
+
+static void phase1_mark_reachable_slots(TinyHVM *ctx, Term root, u8 *reach) {
+    if (!reach || ctx->heap_pos == 0) return;
+    memset(reach, 0, (size_t)ctx->heap_pos);
+    u8 *seen_slot = (u8 *)calloc((size_t)ctx->heap_pos, 1);
+    u8 *seen_dup  = (u8 *)calloc((size_t)ctx->heap_pos, 1);
+    u64 work_cap = ctx->heap_pos ? (ctx->heap_pos * 8) : 0;
+    Term *work = work_cap ? (Term *)malloc(sizeof(Term) * (size_t)work_cap) : NULL;
+    u64 wp = 0;
+    #define P1_PUSH(_tt) do { \
+        if (work && wp < work_cap) work[wp++] = (_tt); \
+    } while (0)
+
+    if (!(term_tag(root) == TAG_ERA && term_val(root) == 0)) P1_PUSH(root);
+    if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
+        P1_PUSH(heap_read(ctx, phase1_root_slot));
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) == TAG_ERA && term_val(ht) != 0) {
+            reach[h] = 1;
+            P1_PUSH(ht);
+        }
+    }
+
+    while (work && wp > 0) {
+        Term tt = work[--wp];
+        u8 tg = term_tag(tt);
+        u64 tv = term_val(tt);
+
+        if (tg == TAG_DP0 || tg == TAG_DP1) {
+            u64 dl = tv;
+            if (dl == 0 || dl >= ctx->heap_pos || (seen_dup && seen_dup[dl])) continue;
+            if (seen_dup) seen_dup[dl] = 1;
+            reach[dl] = 1;
+            P1_PUSH(heap_read(ctx, dl));
+            continue;
+        }
+
+        if (tg == TAG_ERA) {
+            if (tv == 0 || tv >= ctx->heap_pos) continue;
+            if (!seen_slot || !seen_slot[tv]) {
+                if (seen_slot) seen_slot[tv] = 1;
+                reach[tv] = 1;
+                P1_PUSH(heap_read(ctx, tv));
+            }
+            continue;
+        }
+
+        if (tg == TAG_CTR) {
+            if (tv == 0 || tv >= ctx->heap_pos) continue;
+            if (!seen_slot || !seen_slot[tv]) {
+                if (seen_slot) seen_slot[tv] = 1;
+                reach[tv] = 1;
+                P1_PUSH(heap_read(ctx, tv));
+            }
+            Term nt = heap_read(ctx, tv);
+            u32 n = (term_tag(nt) == TAG_NUM) ? (u32)term_val(nt) : 0;
+            if (n > 64) n = 64;
+            for (u32 i = 0; i < 2 * n; i++) {
+                u64 p = tv + 1 + i;
+                if (p < ctx->heap_pos && (!seen_slot || !seen_slot[p])) {
+                    if (seen_slot) seen_slot[p] = 1;
+                    reach[p] = 1;
+                    P1_PUSH(heap_read(ctx, p));
+                }
+            }
+            continue;
+        }
+
+        u32 ar = phase1_term_arity(tt);
+        for (u32 i = 0; i < ar; i++) {
+            u64 p = tv + i;
+            if (p < ctx->heap_pos && (!seen_slot || !seen_slot[p])) {
+                if (seen_slot) seen_slot[p] = 1;
+                reach[p] = 1;
+                P1_PUSH(heap_read(ctx, p));
+            }
+        }
+    }
+
+    free(work);
+    free(seen_dup);
+    free(seen_slot);
+    #undef P1_PUSH
+}
+
+static int phase1_term_is_whnf_atom(Term t) {
+    u8 tag = term_tag(t);
+    return tag == TAG_TEN || tag == TAG_NUM || tag == TAG_LAM || tag == TAG_SUP ||
+           tag == TAG_BRI || tag == TAG_MAT || tag == TAG_ANY || tag == TAG_USP;
+}
+
+static int phase1_grad_y_ready(Term t) {
+    u8 tag = term_tag(t);
+    return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
+           tag == TAG_SUP || tag == TAG_TOP;
+}
+
+static int phase1_top_arg0_ready(Term t) {
+    u8 tag = term_tag(t);
+    return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM || tag == TAG_SUP;
+}
+
+static int phase1_dp_can_fire_on(Term t) {
+    switch (term_tag(t)) {
+        case TAG_SUP:
+        case TAG_LAM:
+        case TAG_BRI:
+        case TAG_ANN:
+        case TAG_TEN:
+        case TAG_ERA:
+        case TAG_NUM:
+        case TAG_ANY:
+        case TAG_CTR:
+        case TAG_TOP:
+        case TAG_USP:
+        case TAG_OP2:
+        case TAG_APP:
+        case TAG_EQL:
+        case TAG_AND:
+        case TAG_OR:
+        case TAG_MAT:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before, Term *out_whnf) {
+    u8 tag = term_tag(t);
+    if (phase1_term_is_whnf_atom(t)) {
+        if (out_whnf) *out_whnf = t;
+        return 0;
+    }
+
+    if (tag == TAG_ERA) {
+        if (term_val(t) == 0) {
+            if (out_whnf) *out_whnf = t;
+            return 0;
+        }
+        if (out_before) *out_before = t;
+        return 1;
+    }
+
+    if (tag == TAG_TOP) {
+        u32 uop = term_ext(t);
+        u64 loc = term_val(t);
+        if (uop == UOP_GRAD) {
+            Term y = heap_read(ctx, loc + 0);
+            Term wy = y;
+            if (thvm_phase1_predict_next_redex(ctx, y, out_before, &wy))
+                return 1;
+            if (phase1_grad_y_ready(wy)) {
+                if (out_before) *out_before = t;
+                return 1;
+            }
+            if (out_whnf) *out_whnf = t;
+            return 0;
+        }
+
+        if (phase1_top_has_era_arg(ctx, t, NULL, NULL) ||
+            phase1_top_has_add_zero_arg(ctx, t, NULL, NULL)) {
+            if (out_before) *out_before = t;
+            return 1;
+        }
+        if (out_whnf) *out_whnf = t;
+        return 0;
+    }
+
+    if (tag == TAG_DP0 || tag == TAG_DP1) {
+        u64 loc = term_val(t);
+        if (loc == 0 || loc >= ctx->heap_pos) {
+            if (out_whnf) *out_whnf = t;
+            return 0;
+        }
+        Term val = heap_read(ctx, loc);
+        Term wv = val;
+        if (thvm_phase1_predict_next_redex(ctx, val, out_before, &wv))
+            return 1;
+        if (phase1_dp_can_fire_on(wv)) {
+            if (out_before) *out_before = t;
+            return 1;
+        }
+        if (out_whnf) *out_whnf = t;
+        return 0;
+    }
+
+    if (out_whnf) *out_whnf = t;
+    return 0;
+}
+
+static int thvm_phase1_find_next_actual(TinyHVM *ctx, Term root,
+                                        u64 *out_source_slot, Term *out_before) {
+    Term before = 0;
+    Term whnf = root;
+    if (thvm_phase1_predict_next_redex(ctx, root, &before, &whnf)) {
+        if (out_source_slot) *out_source_slot = phase1_root_slot;
+        if (out_before) *out_before = before;
+        return 1;
+    }
+
+    u8 *reach = (u8 *)calloc((size_t)ctx->heap_pos, 1);
+    phase1_mark_reachable_slots(ctx, root, reach);
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        if (h == phase1_root_slot) continue;
+        if (reach && !reach[h]) continue;
+        Term ht = ctx->heap[h];
+        if (!phase1_term_maybe_active(ctx, ht)) continue;
+        if ((term_tag(ht) == TAG_DP0 || term_tag(ht) == TAG_DP1) &&
+            !phase1_term_first_reachable_occurrence(ctx, h, ht, reach)) {
+            continue;
+        }
+        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD &&
+            !phase1_term_first_reachable_occurrence(ctx, h, ht, reach)) {
+            continue;
+        }
+        Term w = ht;
+        if (thvm_phase1_predict_next_redex(ctx, ht, &before, &w)) {
+            if (out_source_slot) *out_source_slot = h;
+            if (out_before) *out_before = before;
+            free(reach);
+            return 1;
+        }
+    }
+    free(reach);
+    return 0;
+}
+
+static int thvm_phase1_fire_one(TinyHVM *ctx, Term in, Term *out_term, Term *out_before) {
+    if (term_tag(in) == TAG_TOP && term_ext(in) == UOP_GRAD) {
+        u64 gl = term_val(in);
+        if (gl + 1 < ctx->heap_pos) thvm_step_graph_set_before_grad_y(heap_read(ctx, gl + 0));
+        else thvm_step_graph_set_before_grad_y(term_era());
+    } else {
+        thvm_step_graph_set_before_grad_y(term_era());
+    }
+    if (term_tag(in) == TAG_TOP && term_ext(in) != UOP_GRAD)
+        thvm_step_graph_set_before_top_era(phase1_top_has_era_arg(ctx, in, NULL, NULL));
+    else
+        thvm_step_graph_set_before_top_era(0);
+    if (term_tag(in) == TAG_ERA) {
+        u64 el = term_val(in);
+        Term payload = (el > 0 && el < ctx->heap_pos) ? heap_read(ctx, el) : term_era();
+        thvm_step_graph_set_before_era_payload(payload);
+    } else {
+        thvm_step_graph_set_before_era_payload(term_era());
+    }
+
+    struct InteractionTrace tr = {0};
+    struct InteractionTrace *saved_buf = ctx->trace_buf;
+    u32 saved_count = ctx->trace_count;
+    u32 saved_cap = ctx->trace_cap;
+    u8 saved_en = ctx->trace_enabled;
+
+    ctx->trace_buf = &tr;
+    ctx->trace_count = 0;
+    ctx->trace_cap = 1;
+    ctx->trace_enabled = 1;
+
+    u64 itrs_before = ctx->itrs;
+    Term r = thvm_reduce_steps(ctx, in, 1);
+    int traced = (ctx->steps_taken > 0) && (ctx->trace_count > 0);
+    int fired = traced || (ctx->itrs != itrs_before);
+    Term before = in;
+    if (traced) {
+        before = term_new((u8)tr.before_tag, tr.before_ext, tr.before_loc);
+    }
+
+    ctx->trace_buf = saved_buf;
+    ctx->trace_count = saved_count;
+    ctx->trace_cap = saved_cap;
+    ctx->trace_enabled = saved_en;
+
+    if (out_term) *out_term = r;
+    if (out_before) *out_before = before;
+    return fired;
+}
+
+static Term thvm_phase1_seed_root_grad(TinyHVM *ctx, Term t) {
+    // Keep one mirrored heap cell for the current phase-1 root term.
+    // Dumping code is heap-driven; without this, newly returned roots can disappear.
+    if (phase1_root_slot == 0 || phase1_root_slot >= ctx->heap_pos)
+        phase1_root_slot = heap_alloc(ctx, 1);
+    heap_set(ctx, phase1_root_slot, t);
+    return t;
+}
+
+static Term thvm_phase1_structural_nf(TinyHVM *ctx, Term t) {
+    u8 *reach = (u8 *)calloc((size_t)ctx->heap_pos, 1);
+    for (u32 guard = 0; guard < 100000; guard++) {
+        Term tr = t;
+        Term before = t;
+        if (phase1_term_maybe_active(ctx, t) &&
+            thvm_phase1_fire_one(ctx, t, &tr, &before)) {
+            t = tr;
+            if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
+                heap_set(ctx, phase1_root_slot, t);
+            thvm_step_graph_after_interaction(ctx, before, t);
+            continue;
+        }
+
+        // Otherwise fire one interaction from phase-1 heap agents.
+        // No priority classes here: with correct local rules, order should
+        // not change structural validity.
+        int fired = 0;
+        phase1_mark_reachable_slots(ctx, t, reach);
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            if (h == phase1_root_slot) continue;
+            if (reach && !reach[h]) continue;
+            Term ht = ctx->heap[h];
+            if (!phase1_term_maybe_active(ctx, ht)) continue;
+            if ((term_tag(ht) == TAG_DP0 || term_tag(ht) == TAG_DP1) &&
+                !phase1_term_first_reachable_occurrence(ctx, h, ht, reach)) {
+                continue;
+            }
+            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD &&
+                !phase1_term_first_reachable_occurrence(ctx, h, ht, reach)) {
+                continue;
+            }
+            Term hr = ht;
+            Term before_h = ht;
+            if (thvm_phase1_fire_one(ctx, ht, &hr, &before_h)) {
+                if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD) {
+                    for (u64 i = 1; i < ctx->heap_pos; i++) {
+                        if (ctx->heap[i] == ht) ctx->heap[i] = hr;
+                    }
+                } else {
+                    ctx->heap[h] = hr;
+                }
+                if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
+                    heap_set(ctx, phase1_root_slot, t);
+                thvm_step_graph_after_interaction(ctx, before_h, t);
+                fired = 1;
+                break;
+            }
+        }
+        if (!fired) break;
+    }
+    free(reach);
+    return t;
+}
 
 static void sched_dump_heap(TinyHVM *ctx) {
     u32 counts[UOP_COUNT] = {0};
@@ -689,395 +1144,27 @@ static u32 sched_all(TinyHVM *ctx) {
 Term thvm_eval(TinyHVM *ctx, Term t) {
     sched_kernel_count = 0;
     for (u32 i = 0; i < SCHED_MAX_KERNELS; i++) kid_results[i] = term_era();
-    const char *step_graph_dir = "thvm_steps";
-    u32 step_n = 1;
-    int step_graph = 0;
 
-    // Phase 0 graph: before reduce — full graph from root term t
+    if (getenv("THVM_STEP_GRAPH")) {
+        phase1_root_slot = 0;
+        t = thvm_phase1_seed_root_grad(ctx, t);
+        thvm_step_graph_eval_begin(ctx, t);
+        t = thvm_phase1_structural_nf(ctx, t);
+        thvm_step_graph_finalize(ctx);
+        phase1_root_slot = 0;
+        return t;
+    }
+
     if (getenv("THVM_GRAPH")) thvm_heap_dot_root(ctx, "/tmp/thvm_0_pre_reduce.dot", t);
-    // Phase 1: Iterative GRAD worklist — each fires ONE chain rule step.
-    // If root term t is a GRAD, place it on the heap for uniform processing.
-    if (term_tag(t) == TAG_TOP && term_ext(t) == UOP_GRAD) {
-        u64 slot = heap_alloc(ctx, 1);
-        heap_set(ctx, slot, t);
-        t = term_era();
-    } else {
-        t = thvm_reduce(ctx, t);
-    }
-    step_graph = thvm_step_graph_start(ctx, t, step_graph_dir, &step_n);
-    // term_use_table NOT cleared — linear_use validates first_loc before patching
-    {
-        #define GRAD_WL_MAX 8192
-        u64 wl[GRAD_WL_MAX]; u32 wl_h = 0, wl_t = 0;
-        // Seed: find all GRADs on heap (including root if placed above)
-        for (u64 h = 1; h < ctx->heap_pos; h++) {
-            Term ht = ctx->heap[h];
-            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD && wl_t < GRAD_WL_MAX)
-                wl[wl_t++] = h;
-        }
-        if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "GRAD worklist: %u initial items\n", wl_t);
-        // Process worklist
-        while (wl_h < wl_t) {
-            u64 h = wl[wl_h++];
-            Term ht = ctx->heap[h];
-            if (getenv("THVM_SCHED_DIAG"))
-                fprintf(stderr, "  wl[%u]@%llu: tag=%u ext=%u\n", wl_h-1, h, term_tag(ht), term_ext(ht));
-            if (term_tag(ht) != TAG_TOP || term_ext(ht) != UOP_GRAD) continue;
-            u64 gl = term_val(ht);
-            // Read what op GRAD will consume (for step graph labels)
-            Term _gy = heap_read(ctx, gl);
-            for (int _dp=0; _dp<10 && (term_tag(_gy)==TAG_DP0||term_tag(_gy)==TAG_DP1); _dp++)
-                _gy = heap_read(ctx, term_val(_gy));
-            const char *_cop_name = "?";
-            if (term_tag(_gy)==TAG_TOP && term_ext(_gy)<UOP_COUNT) _cop_name = uop_names[term_ext(_gy)];
-            else if (term_tag(_gy)==TAG_TEN) _cop_name = "TEN";
-            u64 hp_before = ctx->heap_pos;
-            ctx->heap[h] = thvm_interact(ctx, ht);
-            thvm_step_graph_dump_grad(ctx, t, step_graph, step_graph_dir, &step_n, _cop_name);
-            // Scan NEW heap entries for sub-GRADs created by this interaction
-            {
-                u32 _found = 0;
-                for (u64 h2 = hp_before; h2 < ctx->heap_pos && wl_t < GRAD_WL_MAX; h2++) {
-                    Term ht2 = ctx->heap[h2];
-                    if (term_tag(ht2) == TAG_TOP && term_ext(ht2) == UOP_GRAD) {
-                        wl[wl_t++] = h2;
-                        _found++;
-                    }
-                }
-                if (getenv("THVM_SCHED_DIAG") && _found)
-                    fprintf(stderr, "  worklist: +%u GRADs (hp %llu..%llu, wl=%u)\n", _found, hp_before, ctx->heap_pos, wl_t);
-            }
-        }
-        thvm_step_graph_finish(ctx, t, step_graph, step_graph_dir, step_n);
-        #undef GRAD_WL_MAX
-    }
-    // DUP⊳ERA handled inside GRAD handler via ERA_PORT.
-    // DUP⊳atom fires during reduction (both ports get the value) but the DUP
-    // node stays on the heap as a structural sharing marker.
-    if (getenv("THVM_SCHED_DIAG")) { fprintf(stderr, "phase1: "); sched_dump_heap(ctx); }
-    // Phase 1 graph: after reduce — pure TAG_TOPs + combinators
+    t = thvm_reduce(ctx, t);
     if (getenv("THVM_GRAPH")) thvm_heap_dot_root(ctx, "/tmp/thvm_1_post_reduce.dot", t);
 
-    // Phase 2: schedule compute ops → FUSING, resolve view ops → TAG_TEN aliases.
     sched_all(ctx);
-    // Phase 2 graph: after scheduling — FUSING kernels
     if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_2_post_sched.dot");
-    if (getenv("THVM_SCHED_DIAG")) {
-        u32 n_reduce=0, n_ew=0, n_fallback=0;
-        u32 max_ops=0, max_leaves=0;
-        for (u32 ki=0; ki<sched_kernel_count; ki++) {
-            if (sched_kernels[ki].has_reduce) n_reduce++;
-            else if (sched_kernels[ki].n_ops > 0) n_ew++;
-            else n_fallback++;
-            if (sched_kernels[ki].n_ops > max_ops) max_ops = sched_kernels[ki].n_ops;
-            if (sched_kernels[ki].n_leaves > max_leaves) max_leaves = sched_kernels[ki].n_leaves;
-        }
-        fprintf(stderr, "sched_kernel_count=%u (reduce=%u ew=%u passthru=%u max_ops=%u max_leaves=%u)\n",
-                sched_kernel_count, n_reduce, n_ew, n_fallback, max_ops, max_leaves);
-        fprintf(stderr, "after sched: "); sched_dump_heap(ctx);
-    }
-    if (getenv("THVM_KERN_DUMP")) {
-        u64 total_flops = 0, total_mem_r = 0, total_mem_w = 0;
-        u32 n_live = 0;
-        for (u32 ki = 0; ki < sched_kernel_count; ki++) {
-            KernelEntry *k = &sched_kernels[ki];
-            if (k->n_ops == 0 && k->n_leaves == 0) continue; // dead
-            n_live++;
-            // Compute FLOPs: full_numel * n_ops (ew ops per element) + reduce accumulation
-            u64 full_numel = 1;
-            for (u32 d = 0; d < k->full_shape.rank; d++) full_numel *= k->full_shape.dims[d];
-            u64 out_numel = 1;
-            for (u32 d = 0; d < k->out_shape.rank; d++) out_numel *= k->out_shape.dims[d];
-            // ew FLOPs: each element of full_shape does n_ops operations
-            // reduce FLOPs: each element of full_shape does 1 accumulate
-            u64 ew_flops = full_numel * (k->n_ops > 0 ? k->n_ops : 0);
-            u64 reduce_flops = k->has_reduce ? full_numel : 0;
-            u64 flops = ew_flops + reduce_flops;
-            if (flops == 0) flops = full_numel; // passthrough
-            // Memory: reads = sum of leaf numels, write = out_numel
-            u64 mem_r = 0;
-            for (u32 li = 0; li < k->n_leaves; li++) {
-                u64 ln = 1;
-                for (u32 d = 0; d < k->leaf_views[li].shape.rank; d++)
-                    ln *= k->leaf_views[li].shape.dims[d];
-                mem_r += ln * 4;
-            }
-            u64 mem_w = out_numel * 4;
-            total_flops += flops;
-            total_mem_r += mem_r;
-            total_mem_w += mem_w;
-            // Format: tinygrad-style
-            const char *ktype = k->has_reduce ? "r" : "E";
-            fprintf(stderr, "*** K %3u  %s_", ki, ktype);
-            // Shape encoding (tinygrad style: bold=full, colored=out for reduces)
-            for (u32 d = 0; d < k->full_shape.rank; d++)
-                fprintf(stderr, "%u%s", k->full_shape.dims[d], d+1<k->full_shape.rank?"_":"");
-            if (k->has_reduce) {
-                fprintf(stderr, " → ");
-                for (u32 d = 0; d < k->out_shape.rank; d++)
-                    fprintf(stderr, "%u%s", k->out_shape.dims[d], d+1<k->out_shape.rank?"_":"");
-            }
-            // Stats
-            fprintf(stderr, "  arg %2u  ops %2u  flops %8llu  mem_r %7.2fKB  mem_w %7.2fKB  lv=[",
-                    k->n_leaves, k->n_ops, flops,
-                    (double)mem_r/1024.0, (double)mem_w/1024.0);
-            for (u32 li = 0; li < k->n_leaves; li++)
-                fprintf(stderr, "%u%s", k->leaf_ids[li], li+1<k->n_leaves?",":"");
-            fprintf(stderr, "]\n");
-        }
-        fprintf(stderr, "--- TOTAL: %u live kernels  flops=%llu (%.2f MFLOP)  "
-                "mem_r=%.2fMB  mem_w=%.2fMB  mem_total=%.2fMB\n",
-                n_live, total_flops, (double)total_flops/1e6,
-                (double)total_mem_r/1e6, (double)total_mem_w/1e6,
-                (double)(total_mem_r+total_mem_w)/1e6);
-    }
 
-    { Backend *be = ctx_default_backend(ctx);
-      if (be && be->end_batch) be->end_batch(); }
-
-    // Phase 3: Fire ASSIGNs (enable dispatch, then reduce each).
-    _assign_dispatch_enabled = 1;
-    for (u64 h = 1; h < ctx->heap_pos; h++) {
-        Term ht = ctx->heap[h];
-        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
-            Term r = thvm_reduce(ctx, ht);
-            ctx->heap[h] = r;
-        }
-    }
-    _assign_dispatch_enabled = 0;
-    // Phase 3 graph: after dispatch — materialized tensors + remaining combinators
+    t = thvm_reduce(ctx, t);
     if (getenv("THVM_GRAPH")) thvm_heap_dot(ctx, "/tmp/thvm_3_post_dispatch.dot");
-
-    if (getenv("THVM_MEM_DIAG")) { // Memory analysis
-        u32 alive[SCHED_MAX_KERNELS], n_alive = 0;
-        for (u32 ki = 0; ki < sched_kernel_count; ki++) {
-            KernelEntry *k = &sched_kernels[ki];
-            if (k->n_ops == 0 && k->n_leaves == 0) continue;
-            alive[n_alive++] = ki;
-        }
-        #define MEM_MAX_BUFS 2048
-        typedef struct { u32 id; u64 size; u32 birth; u32 death; int is_output; } MemBuf;
-        MemBuf bufs[MEM_MAX_BUFS]; u32 n_bufs = 0;
-        #define MEM_FIND_OR_ADD(bid, sz, b_ai) do { \
-            u32 _bi = 0xFFFFFFFFu; \
-            for (u32 _b = 0; _b < n_bufs; _b++) \
-                if (bufs[_b].id == (bid)) { _bi = _b; break; } \
-            if (_bi == 0xFFFFFFFFu && n_bufs < MEM_MAX_BUFS) { \
-                _bi = n_bufs++; \
-                bufs[_bi] = (MemBuf){.id=(bid), .size=(sz), .birth=(b_ai), .death=(b_ai), .is_output=0}; \
-            } \
-            if (_bi != 0xFFFFFFFFu) { \
-                if ((b_ai) < bufs[_bi].birth) bufs[_bi].birth = (b_ai); \
-                if ((b_ai) > bufs[_bi].death) bufs[_bi].death = (b_ai); \
-                if ((sz) > bufs[_bi].size) bufs[_bi].size = (sz); \
-            } \
-        } while(0)
-        for (u32 ai = 0; ai < n_alive; ai++) {
-            KernelEntry *k = &sched_kernels[alive[ai]];
-            for (u32 li = 0; li < k->n_leaves; li++) {
-                u32 lid = k->leaf_ids[li];
-                if (lid == 0 || LEAF_IS_LAZY(lid)) {
-                    Term lt = k->leaf_terms[li], ft = lt;
-                    while (term_tag(ft)==TAG_TOP && is_view_op(term_ext(ft))) {
-                        Term nx = heap_read(ctx, term_val(ft));
-                        if (term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1) nx=heap_read(ctx,term_val(nx));
-                        ft = nx;
-                    }
-                    if (term_tag(ft)==TAG_TOP && term_ext(ft)==UOP_FUSING) {
-                        u64 floc = term_val(ft);
-                        Term kid_t = heap_read(ctx, floc+1);
-                        if (term_tag(kid_t)==TAG_NUM) {
-                            u32 pki = (u32)term_val(kid_t);
-                            u32 oid = 0x40000000u|pki;
-                            KernelEntry *p = &sched_kernels[pki];
-                            u64 osz = 1;
-                            for (u32 d=0;d<p->out_shape.rank;d++) osz*=p->out_shape.dims[d];
-                            MEM_FIND_OR_ADD(oid, osz*4, ai);
-                        }
-                    }
-                    continue;
-                }
-                u64 sz = (lid < ctx->tensor_count)
-                    ? (u64)ctx->tensors[lid].view.numel * 4
-                    : (u64)k->leaf_views[li].numel * 4;
-                MEM_FIND_OR_ADD(lid, sz, ai);
-            }
-            u32 oid = 0x40000000u|alive[ai];
-            u64 osz = 1;
-            // Use reshape target shape if set (actual materialized output is smaller)
-            if (term_tag(k->reshape_term) != TAG_ERA) {
-                const View *rv = st_get(term_val(k->reshape_term));
-                if (rv) { for (u32 d=0;d<rv->shape.rank;d++) osz*=rv->shape.dims[d]; }
-                else { for (u32 d=0;d<k->out_shape.rank;d++) osz*=k->out_shape.dims[d]; }
-            } else {
-                for (u32 d=0;d<k->out_shape.rank;d++) osz*=k->out_shape.dims[d];
-            }
-            MEM_FIND_OR_ADD(oid, osz*4, ai);
-            for (u32 b=0;b<n_bufs;b++) if(bufs[b].id==oid){bufs[b].is_output=1;break;}
-        }
-        // Dead-chain propagation: if a kernel's output feeds ONLY into dead kernels,
-        // kill the kernel too. Propagate until stable.
-        u32 n_fused_away = 0;
-        for (u32 _dc = 0; _dc < 20; _dc++) {
-            u32 n_dc = 0;
-            // Rebuild alive list
-            n_alive = 0;
-            for (u32 ki = 0; ki < sched_kernel_count; ki++) {
-                KernelEntry *k = &sched_kernels[ki];
-                if (k->n_ops == 0 && k->n_leaves == 0) continue;
-                alive[n_alive++] = ki;
-            }
-            for (u32 ai = 0; ai < n_alive; ai++) {
-                u32 ki = alive[ai];
-                // Check: does any OTHER alive kernel consume this kernel's output?
-                int has_alive_consumer = 0;
-                for (u32 aj = 0; aj < n_alive && !has_alive_consumer; aj++) {
-                    if (aj == ai) continue;
-                    KernelEntry *ck = &sched_kernels[alive[aj]];
-                    for (u32 li = 0; li < ck->n_leaves; li++) {
-                        u32 lid = ck->leaf_ids[li];
-                        // Concrete leaf: check if tensor was derived from ki's output
-                        if (lid != 0 && !LEAF_IS_LAZY(lid) && lid < ctx->tensor_count) {
-                            TensorMeta *lm = &ctx->tensors[lid];
-                            if (lm->src_ids[0]) {
-                                // Trace back: src tensor numel matches ki's out_shape?
-                                KernelEntry *pk = &sched_kernels[ki];
-                                u32 pk_numel = 1;
-                                for (u32 d=0;d<pk->out_shape.rank;d++) pk_numel*=pk->out_shape.dims[d];
-                                TensorMeta *sm = &ctx->tensors[lm->src_ids[0]];
-                                if (sm->view.numel == pk_numel) { has_alive_consumer = 1; break; }
-                            }
-                        }
-                        // FUSING leaf: check kid
-                        if (lid == 0 || LEAF_IS_LAZY(lid)) {
-                            Term lt = ck->leaf_terms[li], ft = lt;
-                            while (term_tag(ft)==TAG_TOP && is_view_op(term_ext(ft))) {
-                                Term nx=heap_read(ctx,term_val(ft));
-                                if(term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1) nx=heap_read(ctx,term_val(nx));
-                                ft=nx;
-                            }
-                            if (term_tag(ft)==TAG_TOP && term_ext(ft)==UOP_FUSING) {
-                                u64 fl=term_val(ft); Term kt=heap_read(ctx,fl+1);
-                                if (term_tag(kt)==TAG_NUM && (u32)term_val(kt)==ki)
-                                    { has_alive_consumer = 1; break; }
-                            }
-                        }
-                    }
-                }
-                if (!has_alive_consumer) {
-                    sched_kernels[ki].n_ops = 0;
-                    sched_kernels[ki].n_leaves = 0;
-                    sched_kernels[ki].has_reduce = 0; // analysis-only kill
-                    n_dc++; n_fused_away++;
-                }
-            }
-            if (n_dc == 0) break;
-        }
-        // Rebuild alive list after dead-chain propagation
-        n_alive = 0;
-        for (u32 ki = 0; ki < sched_kernel_count; ki++) {
-            KernelEntry *k = &sched_kernels[ki];
-            if (k->n_ops == 0 && k->n_leaves == 0) continue;
-            alive[n_alive++] = ki;
-        }
-        // Rebuild buf registry with only alive kernels
-        n_bufs = 0;
-        for (u32 ai = 0; ai < n_alive; ai++) {
-            KernelEntry *k = &sched_kernels[alive[ai]];
-            for (u32 li = 0; li < k->n_leaves; li++) {
-                u32 lid = k->leaf_ids[li];
-                if (lid == 0 || LEAF_IS_LAZY(lid)) {
-                    Term lt=k->leaf_terms[li],ft=lt;
-                    while(term_tag(ft)==TAG_TOP&&is_view_op(term_ext(ft))){Term nx=heap_read(ctx,term_val(ft));if(term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1)nx=heap_read(ctx,term_val(nx));ft=nx;}
-                    if(term_tag(ft)==TAG_TOP&&term_ext(ft)==UOP_FUSING){u64 fl=term_val(ft);Term kt=heap_read(ctx,fl+1);if(term_tag(kt)==TAG_NUM){u32 pki=(u32)term_val(kt);u32 oid=0x40000000u|pki;KernelEntry*p=&sched_kernels[pki];u64 osz=1;for(u32 d=0;d<p->out_shape.rank;d++)osz*=p->out_shape.dims[d];MEM_FIND_OR_ADD(oid,osz*4,ai);}}
-                    continue;
-                }
-                u64 sz;
-                if (lid < ctx->tensor_count) {
-                    TensorMeta *lm = &ctx->tensors[lid];
-                    // Contiguified view tensors: use source size (tinygrad reads through
-                    // strided view, never contiguifies). Trace src_ids chain to root buffer.
-                    u32 root = lid;
-                    while (root < ctx->tensor_count && ctx->tensors[root].src_ids[0] &&
-                           ctx->tensors[root].creator_op &&
-                           ctx->tensors[root].src_ids[0] < ctx->tensor_count) {
-                        root = ctx->tensors[root].src_ids[0];
-                    }
-                    if (root != lid) {
-                        sz = (u64)ctx->tensors[root].view.numel * 4;
-                    } else {
-                        sz = (u64)lm->view.numel * 4;
-                    }
-                } else {
-                    sz = (u64)k->leaf_views[li].numel * 4;
-                }
-                MEM_FIND_OR_ADD(lid,sz,ai);
-            }
-            u32 oid=0x40000000u|alive[ai]; u64 osz=1;
-            if(term_tag(k->reshape_term)!=TAG_ERA){const View*rv=st_get(term_val(k->reshape_term));if(rv){for(u32 d=0;d<rv->shape.rank;d++)osz*=rv->shape.dims[d];}else{for(u32 d=0;d<k->out_shape.rank;d++)osz*=k->out_shape.dims[d];}}
-            else{for(u32 d=0;d<k->out_shape.rank;d++)osz*=k->out_shape.dims[d];}
-            MEM_FIND_OR_ADD(oid,osz*4,ai);
-            for(u32 b=0;b<n_bufs;b++)if(bufs[b].id==oid){bufs[b].is_output=1;break;}
-        }
-        // Output dedup: if two output bufs have the same size and one's lifetime
-        // is contained within the other's, the later reuses the earlier's buffer.
-        // (Forward output reused in backward — tinygrad does this automatically.)
-        for (u32 b1 = 0; b1 < n_bufs; b1++) {
-            if (!bufs[b1].is_output || bufs[b1].size == 0) continue;
-            for (u32 b2 = b1 + 1; b2 < n_bufs; b2++) {
-                if (!bufs[b2].is_output || bufs[b2].size == 0) continue;
-                if (bufs[b1].size != bufs[b2].size) continue;
-                // Same size outputs: merge lifetimes, zero out the later one
-                if (bufs[b2].birth >= bufs[b1].birth) {
-                    if (bufs[b2].death > bufs[b1].death) bufs[b1].death = bufs[b2].death;
-                    bufs[b2].size = 0;
-                    n_fused_away++;
-                }
-            }
-        }
-        u32 peak_live=0; u64 peak_bytes=0;
-        for (u32 ai=0;ai<n_alive;ai++) {
-            u32 live=0; u64 lb=0;
-            for (u32 b=0;b<n_bufs;b++)
-                if(bufs[b].birth<=ai&&bufs[b].death>=ai){live++;lb+=bufs[b].size;}
-            if(live>peak_live)peak_live=live;
-            if(lb>peak_bytes)peak_bytes=lb;
-        }
-        u32 slot_count=0; u32 slot_end[MEM_MAX_BUFS]; u64 slot_size[MEM_MAX_BUFS]; u64 reuse_saved=0;
-        for (u32 b=0;b<n_bufs;b++) {
-            int found=-1;
-            for (u32 s=0;s<slot_count;s++)
-                if(slot_end[s]<bufs[b].birth && slot_size[s]>=bufs[b].size){found=(int)s;break;}
-            if(found>=0){slot_end[found]=bufs[b].death;if(bufs[b].size>slot_size[found])slot_size[found]=bufs[b].size;reuse_saved+=bufs[b].size;}
-            else if(slot_count<MEM_MAX_BUFS){slot_end[slot_count]=bufs[b].death;slot_size[slot_count]=bufs[b].size;slot_count++;}
-        }
-        u64 total_bytes=0; for(u32 b=0;b<n_bufs;b++) total_bytes+=bufs[b].size;
-        u64 slot_bytes=0; for(u32 s=0;s<slot_count;s++) slot_bytes+=slot_size[s];
-        u32 n_in=0,n_out=0; for(u32 b=0;b<n_bufs;b++){if(bufs[b].is_output)n_out++;else n_in++;}
-        fprintf(stderr,"MEM_ANALYSIS: alive=%u bufs=%u (in=%u out=%u fused=%u) peak_live=%u\n",
-                n_alive,n_bufs,n_in,n_out,n_fused_away,peak_live);
-        fprintf(stderr,"  no_reuse=%.2fMB peak=%.2fMB\n",(double)total_bytes/1e6,(double)peak_bytes/1e6);
-        // Dump large buffers
-        for (u32 b=0;b<n_bufs;b++) {
-            if (bufs[b].size >= 4096) {
-                u32 bid = bufs[b].id;
-                const char *kind = bufs[b].is_output ? "OUT" : "IN";
-                if (bid < ctx->tensor_count) {
-                    TensorMeta *tm = &ctx->tensors[bid];
-                    fprintf(stderr,"  BUF %s id=%u sz=%.2fMB shape=[", kind, bid, (double)bufs[b].size/1e6);
-                    for (u32 d=0;d<tm->view.shape.rank;d++) fprintf(stderr,"%u,",tm->view.shape.dims[d]);
-                    fprintf(stderr,"] live=%u-%u\n", bufs[b].birth, bufs[b].death);
-                } else {
-                    fprintf(stderr,"  BUF %s id=0x%x sz=%.2fMB live=%u-%u\n", kind, bid, (double)bufs[b].size/1e6, bufs[b].birth, bufs[b].death);
-                }
-            }
-        }
-        fprintf(stderr,"  with_reuse: slots=%u need=%.2fMB saved=%.2fMB (%.0f%%)\n",
-                slot_count,(double)slot_bytes/1e6,(double)reuse_saved/1e6,
-                total_bytes>0?100.0*reuse_saved/total_bytes:0.0);
-    } // end THVM_MEM_DIAG
-
-    return term_era();
+    return t;
 }
 
 Term thvm_schedule(TinyHVM *ctx, Term t) {

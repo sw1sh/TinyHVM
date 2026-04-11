@@ -138,13 +138,59 @@
             u64 era_loc = term_val(t);
             if (era_loc == 0 || era_loc >= ctx->heap_pos) return t;
 
-            Term val = heap_read(ctx, era_loc);
-            u8 vtag = term_tag(val);
+            Term cur = thvm_era_payload(ctx, heap_read(ctx, era_loc));
+            #define ERA_TERM_ARITY(_tg, _ext) ({ \
+                u32 _ar = 0; \
+                switch ((_tg)) { \
+                    case TAG_TOP: \
+                        if ((_ext) == UOP_FUSING) _ar = 0; \
+                        else if ((_ext) == UOP_WHERE || (_ext) == UOP_IFZ) _ar = 3; \
+                        else if ((_ext) == UOP_GRAD) _ar = 2; \
+                        else if (!is_binary((_ext)) && is_elementwise((_ext))) _ar = 1; \
+                        else _ar = 2; \
+                        break; \
+                    case TAG_APP: \
+                    case TAG_LAM: \
+                    case TAG_BRI: \
+                    case TAG_SUP: \
+                    case TAG_USP: \
+                    case TAG_OP2: \
+                    case TAG_EQL: \
+                    case TAG_AND: \
+                    case TAG_OR: \
+                    case TAG_MAT: \
+                    case TAG_ANN: \
+                        _ar = 2; \
+                        break; \
+                    case TAG_DSU: \
+                    case TAG_DDU: \
+                        _ar = 3; \
+                        break; \
+                    case TAG_DP0: \
+                    case TAG_DP1: \
+                    case TAG_UDP: \
+                    case TAG_ERA: \
+                    case TAG_VAR: \
+                    case TAG_INC: \
+                        _ar = 1; \
+                        break; \
+                    default: \
+                        _ar = 0; \
+                        break; \
+                } \
+                _ar; \
+            })
+
+            u8 vtag = term_tag(cur);
+            u32 vext = term_ext(cur);
+            u64 vval = term_val(cur);
+            Term next = term_era();
+            int have_next = 0;
 
             // DUP collapse: if ERA consumes one DP port, project shared value
             // to the opposite port and clear the shared slot.
             if (vtag == TAG_DP0 || vtag == TAG_DP1) {
-                u64 dl = term_val(val);
+                u64 dl = vval;
                 if (dl < ctx->heap_pos) {
                     u8 want = (vtag == TAG_DP0) ? TAG_DP1 : TAG_DP0;
                     for (u64 h2 = 1; h2 < ctx->heap_pos; h2++) {
@@ -156,14 +202,56 @@
                         }
                     }
                 }
-                heap_set(ctx, era_loc, term_era());
-                ctx->itrs++;
-                return term_era();
+                goto era_done;
+            } else if (vtag == TAG_TEN) {
+                tensor_release(ctx, (u32)vval);
+                goto era_done;
+            } else if (vtag == TAG_CTR) {
+                // CTR helper nodes can carry nested terms in heap slots.
+                if (vval < ctx->heap_pos) {
+                    Term nt = heap_read(ctx, vval);
+                    u32 n = (term_tag(nt) == TAG_NUM) ? (u32)term_val(nt) : 0;
+                    if (n > 64) n = 64;
+                    for (u32 i = 0; i < n; i++) {
+                        for (u32 j = 0; j < 2; j++) {
+                            Term child = thvm_era_payload(ctx, heap_read(ctx, vval + 1 + 2 * i + j));
+                            if (term_tag(child) == TAG_ERA && term_val(child) == 0) continue;
+                            if (!have_next) {
+                                next = child;
+                                have_next = 1;
+                            } else {
+                                thvm_spawn_detached_era(ctx, child);
+                            }
+                        }
+                    }
+                    if (have_next) goto era_continue;
+                }
+            } else {
+                u32 ar = ERA_TERM_ARITY(vtag, vext);
+                if (ar > 0 && vval < ctx->heap_pos) {
+                    for (u32 i = 0; i < ar; i++) {
+                        Term child = thvm_era_payload(ctx, heap_read(ctx, vval + i));
+                        if (term_tag(child) == TAG_ERA && term_val(child) == 0) continue;
+                        if (!have_next) {
+                            next = child;
+                            have_next = 1;
+                        } else {
+                                thvm_spawn_detached_era(ctx, child);
+                        }
+                    }
+                    if (have_next) goto era_continue;
+                }
             }
-
+era_done:
             heap_set(ctx, era_loc, term_era());
             ctx->itrs++;
+            #undef ERA_TERM_ARITY
             return term_era();
+era_continue:
+            heap_set(ctx, era_loc, next);
+            ctx->itrs++;
+            #undef ERA_TERM_ARITY
+            return term_new(TAG_ERA, term_ext(t) ^ 1u, era_loc);
         }
 
         // TAG_REF: unfold definition — deep-clone body (ALO semantics).
@@ -190,25 +278,30 @@
             u64 dup_loc = term_val(t);
             Term val = heap_read(ctx, dup_loc); // WNF from trampoline
             heap_set(ctx, dup_loc, val);
+            #define DUP_STATE_RETURN(_src, _dp0v, _dp1v) do { \
+                Term _v0 = (_dp0v); \
+                Term _v1 = (_dp1v); \
+                Term _dp0 = term_new(TAG_DP0, dup_label, dup_loc); \
+                Term _dp1 = term_new(TAG_DP1, dup_label, dup_loc); \
+                for (u64 _rh = 1; _rh < ctx->heap_pos; _rh++) { \
+                    if (ctx->heap[_rh] == _dp0) ctx->heap[_rh] = _v0; \
+                    else if (ctx->heap[_rh] == _dp1) ctx->heap[_rh] = _v1; \
+                } \
+                heap_set(ctx, dup_loc, term_era()); \
+                ctx->itrs++; \
+                RETURN_REDUCED(dp_index == 0 ? _v0 : _v1); \
+            } while (0)
 
             // DUP ⊳ SUP
             if (term_tag(val) == TAG_SUP) {
                 u32 sup_label = term_ext(val);
                 u64 sup_loc = term_val(val);
-                ctx->itrs++;
 
                 if (dup_label == sup_label) {
                     // ANNIHILATION: same label — project directly
                     Term tm0 = heap_read(ctx, sup_loc + 0);
                     Term tm1 = heap_read(ctx, sup_loc + 1);
-                    if (dp_index == 0) {
-                        heap_set(ctx, dup_loc, tm1); // other projection gets tm1
-                        t = tm0;
-                    } else {
-                        heap_set(ctx, dup_loc, tm0); // other projection gets tm0
-                        t = tm1;
-                    }
-                    goto inet_step;
+                    DUP_STATE_RETURN(val, tm0, tm1);
                 } else {
                     // COMMUTATION: different label — pass through, preserve both labels
                     Term b = heap_read(ctx, sup_loc + 1);
@@ -225,14 +318,7 @@
                     heap_set(ctx, su1 + 1, term_new(TAG_DP1, dup_label, du1));
                     Term new_sup0 = term_new(TAG_SUP, sup_label, su0);
                     Term new_sup1 = term_new(TAG_SUP, sup_label, su1);
-                    if (dp_index == 0) {
-                        heap_set(ctx, dup_loc, new_sup1);
-                        t = new_sup0;
-                    } else {
-                        heap_set(ctx, dup_loc, new_sup0);
-                        t = new_sup1;
-                    }
-                    goto inet_step;
+                    DUP_STATE_RETURN(val, new_sup0, new_sup1);
                 }
             }
 
@@ -252,15 +338,7 @@
                 heap_set(ctx, vsup + 0, var0);
                 heap_set(ctx, vsup + 1, var1);
                 heap_set(ctx, lam_loc, term_new(TAG_SUP, dup_label, vsup));
-                ctx->itrs++;
-                if (dp_index == 0) {
-                    heap_set(ctx, dup_loc, lam1);
-                    t = lam0;
-                } else {
-                    heap_set(ctx, dup_loc, lam0);
-                    t = lam1;
-                }
-                goto inet_step;
+                DUP_STATE_RETURN(val, lam0, lam1);
             }
 
             // DUP ⊳ BRI: commutation — duplicate bridge (same as DUP-LAM but TAG_BRI)
@@ -276,15 +354,7 @@
                 heap_set(ctx, vsup + 0, var0);
                 heap_set(ctx, vsup + 1, var1);
                 heap_set(ctx, bri_loc, term_new(TAG_SUP, dup_label, vsup));
-                ctx->itrs++;
-                if (dp_index == 0) {
-                    heap_set(ctx, dup_loc, bri1);
-                    t = bri0;
-                } else {
-                    heap_set(ctx, dup_loc, bri0);
-                    t = bri1;
-                }
-                goto inet_step;
+                DUP_STATE_RETURN(val, bri0, bri1);
             }
 
             // DUP ⊳ ANN: dup through annotation — DUP both term and type
@@ -300,26 +370,56 @@
                                         term_new(TAG_DP0, dup_label, tdup));
                 Term a1 = thvm_ann(ctx, term_new(TAG_DP1, dup_label, idup),
                                         term_new(TAG_DP1, dup_label, tdup));
-                ctx->itrs++;
-                if (dp_index == 0) {
-                    heap_set(ctx, dup_loc, a1);
-                    t = a0;
-                } else {
-                    heap_set(ctx, dup_loc, a0);
-                    t = a1;
-                }
-                goto inet_step;
+                DUP_STATE_RETURN(val, a0, a1);
             }
 
             // DUP ⊳ atoms: copy (both projections get same value)
-            if (term_tag(val) == TAG_TEN) return val;
-            if (term_tag(val) == TAG_ERA) return val;
-            if (term_tag(val) == TAG_NUM) return val;
-            if (term_tag(val) == TAG_ANY) return val;
-            if (term_tag(val) == TAG_CTR) return val; // grad target encoding — atom
-            // DUP ⊳ TOP: WNF compute ops are read-only (shared lazily, like TAG_TEN).
-            // GRAD reads them as y-arguments; both projections get the same TAG_TOP.
-            if (term_tag(val) == TAG_TOP) return val;
+            if (term_tag(val) == TAG_TEN) DUP_STATE_RETURN(val, val, val);
+            if (term_tag(val) == TAG_ERA) DUP_STATE_RETURN(val, val, val);
+            if (term_tag(val) == TAG_NUM) DUP_STATE_RETURN(val, val, val);
+            if (term_tag(val) == TAG_ANY) DUP_STATE_RETURN(val, val, val);
+            if (term_tag(val) == TAG_CTR) DUP_STATE_RETURN(val, val, val); // grad target encoding — atom
+	            // DUP ⊳ TOP: commute by duplicating the node and splitting children.
+	            if (term_tag(val) == TAG_TOP) {
+	                u32 uop = term_ext(val);
+	                if (uop == UOP_FUSING) DUP_STATE_RETURN(val, val, val);
+	                u64 val_loc = term_val(val);
+	                u32 arity = (uop == UOP_WHERE || uop == UOP_IFZ) ? 3 : 2;
+	                if (!is_binary(uop) && is_elementwise(uop)) arity = 1;
+
+	                u64 r0 = heap_alloc(ctx, arity);
+	                u64 r1 = heap_alloc(ctx, arity);
+	                for (u32 i = 0; i < arity; i++) {
+	                    Term child = heap_read(ctx, val_loc + i);
+	                    u8 ct = term_tag(child);
+	                    // Copyable atoms commute by shared reference.
+	                    if (ct == TAG_TEN || ct == TAG_NUM || ct == TAG_ERA ||
+	                        ct == TAG_ANY || ct == TAG_CTR) {
+	                        heap_set(ctx, r0 + i, child);
+	                        heap_set(ctx, r1 + i, child);
+	                    } else {
+	                        u64 cdup = heap_alloc(ctx, 1);
+	                        heap_set(ctx, cdup, child);
+	                        heap_set(ctx, r0 + i, term_new(TAG_DP0, dup_label, cdup));
+	                        heap_set(ctx, r1 + i, term_new(TAG_DP1, dup_label, cdup));
+	                    }
+	                }
+
+	                Term n0 = term_new(TAG_TOP, uop, r0);
+	                Term n1 = term_new(TAG_TOP, uop, r1);
+	                const View *vv = st_get(val_loc);
+	                if (vv) {
+	                    st_set(r0, vv);
+	                    st_set(r1, vv);
+	                }
+	                if (uop == UOP_GRAD) {
+	                    Term gx = thvm_grad_target_get(ctx, val_loc);
+	                    thvm_grad_target_set(ctx, r0, gx);
+	                    thvm_grad_target_set(ctx, r1, gx);
+	                }
+
+	                DUP_STATE_RETURN(val, n0, n1);
+	            }
 
             // DUP ⊳ USP: commutation (same as DUP-SUP but preserves TAG_USP)
             if (term_tag(val) == TAG_USP) {
@@ -337,15 +437,7 @@
                 heap_set(ctx, su1 + 1, term_new(TAG_DP1, dup_label, du1));
                 Term new_usp0 = term_new(TAG_USP, usp_label, su0);
                 Term new_usp1 = term_new(TAG_USP, usp_label, su1);
-                ctx->itrs++;
-                if (dp_index == 0) {
-                    heap_set(ctx, dup_loc, new_usp1);
-                    t = new_usp0;
-                } else {
-                    heap_set(ctx, dup_loc, new_usp0);
-                    t = new_usp1;
-                }
-                goto inet_step;
+                DUP_STATE_RETURN(val, new_usp0, new_usp1);
             }
 
             // DUP ⊳ EQL/AND/OR/MAT: generic 2-slot compound duplication (same as DUP-OP2)
@@ -365,18 +457,11 @@
                 }
                 Term n0 = term_new(term_tag(val), term_ext(val), r0);
                 Term n1 = term_new(term_tag(val), term_ext(val), r1);
-                ctx->itrs++;
-                if (dp_index == 0) {
-                    heap_set(ctx, dup_loc, n1);
-                    t = n0;
-                } else {
-                    heap_set(ctx, dup_loc, n0);
-                    t = n1;
-                }
-                goto inet_step;
+                DUP_STATE_RETURN(val, n0, n1);
             }
 
             // Not yet reducible — return DUP as-is
+            #undef DUP_STATE_RETURN
             return t;
         }
 

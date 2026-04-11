@@ -49,6 +49,7 @@ thvm_steps/
 *.log
 
 # AI agents
+.codex/
 .gemini/
 .agent/
 .agents/

@@ -71,6 +71,7 @@ static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target)
 static u32 reduce_id(TinyHVM *ctx, Term t);
 static int is_elementwise(u32 uop);
 static int is_binary(u32 uop);
+static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc);
 static void tensor_materialize(TinyHVM *ctx, u32 tid);
 static void tensor_materialize_chain(TinyHVM *ctx, u32 tid);
 static int  tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf, const ReduceSpec *rs);
@@ -149,4 +150,3 @@ static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel)
 // ── debug/ — graph dump (DOT/JSON) ──────────────────────────────────────────
 #include "debug/graph.c"
 #include "debug/dump.c"
-

@@ -367,6 +367,56 @@
                 b = heap_read(ctx, loc + 1);
                 heap_set(ctx, loc + 1, b);
             }
+            Term b_arg = (is_binary || is_movement || is_reduce) ? heap_read(ctx, loc + 1) : term_era();
+
+            // Strict ERA commutation for lazy UOP nodes:
+            // if any aux port is ERA, the UOP disappears and ERA propagates to
+            // all remaining aux payloads as explicit future interactions.
+            if (term_tag(a) == TAG_ERA ||
+                ((is_binary || is_movement || is_reduce) && term_tag(b_arg) == TAG_ERA)) {
+                int a_is_era = term_tag(a) == TAG_ERA && term_val(a) != 0;
+                int b_is_era = (is_binary || is_movement || is_reduce) &&
+                               term_tag(b_arg) == TAG_ERA && term_val(b_arg) != 0;
+                Term keep = a_is_era ? a : b_arg;
+                Term other = a_is_era ? b_arg : a;
+                // ADD treats an erased branch as additive zero: drop the ADD,
+                // preserve the other branch, and let the ERA continue erasing
+                // its own payload as a detached interaction.
+                if (uop == UOP_ADD) {
+                    heap_set(ctx, loc + 0, term_era());
+                    heap_set(ctx, loc + 1, term_era());
+                    if (a_is_era && b_is_era) {
+                        thvm_spawn_detached_era(ctx, b_arg);
+                        ctx->itrs++;
+                        RETURN_REDUCED(a);
+                    }
+                    thvm_spawn_detached_era(ctx, keep);
+                    ctx->itrs++;
+                    RETURN_REDUCED(other);
+                }
+                if (is_binary || is_movement || is_reduce)
+                    thvm_spawn_detached_era(ctx, other);
+                heap_set(ctx, loc + 0, term_era());
+                if (is_binary || is_movement || is_reduce)
+                    heap_set(ctx, loc + 1, term_era());
+                ctx->itrs++;
+                RETURN_REDUCED(keep);
+            }
+
+            // ADD with a literal zero branch is algebraically transparent.
+            // Fire this eagerly in phase 1 so zero gradients don't leave
+            // dead lazy ADD nodes in the step graph.
+            if (uop == UOP_ADD) {
+                int a_zero = term_tag(a) == TAG_NUM && term_as_f32(a) == 0.0f;
+                int b_zero = term_tag(b) == TAG_NUM && term_as_f32(b) == 0.0f;
+                if (a_zero || b_zero) {
+                    heap_set(ctx, loc + 0, term_era());
+                    heap_set(ctx, loc + 1, term_era());
+                    ctx->itrs++;
+                    if (a_zero && b_zero) RETURN_REDUCED(a);
+                    RETURN_REDUCED(a_zero ? b : a);
+                }
+            }
 
             // === TOP-SUP: distribute tensor op across superposition ===
             // TOP(op, &L{a0,a1}, b) → &L{TOP(op,a0,DP0_L(b)), TOP(op,a1,DP1_L(b))}
@@ -423,35 +473,6 @@
             }
             num_skip:
 
-            // ERA-as-identity for grad domain: ADD/SUB/MUL/DIV with ERA operands
-            // ADD(ERA,x)→x, ADD(x,ERA)→x, ADD(ERA,ERA)→ERA, MUL(*,ERA)→ERA
-            // tensor_release: ERA-discarded tensors are genuinely dead — no GRAD
-            // handler will traverse them (gradient signal is dead).
-            if (is_binary) {
-                Term b_check = heap_read(ctx, loc + 1);
-                u8 at = term_tag(a), bt2 = term_tag(b_check);
-                int a_era = (at == TAG_ERA), b_era = (bt2 == TAG_ERA);
-                int a_ten = (at == TAG_TEN), b_ten = (bt2 == TAG_TEN);
-                if (a_era || b_era) {
-                    // Both ERA → ERA
-                    if (a_era && b_era) RETURN_REDUCED(term_era());
-                    // ERA+TEN or TEN+ERA: identity returns the survivor
-                    if (uop == UOP_ADD) RETURN_REDUCED(a_era ? b_check : a);
-                    if (uop == UOP_SUB) {
-                        if (a_era && b_ten) tensor_release(ctx, (u32)term_val(b_check));
-                        RETURN_REDUCED(a_era ? term_era() : a);
-                    }
-                    if (uop == UOP_MUL || uop == UOP_DIV) {
-                        if (!a_era && a_ten) tensor_release(ctx, (u32)term_val(a));
-                        if (!b_era && b_ten) tensor_release(ctx, (u32)term_val(b_check));
-                        RETURN_REDUCED(term_era());
-                    }
-                    (void)a_ten; (void)b_ten;
-                }
-            }
-            // ERA-TOP (Phase 0): any non-binary op with ERA arg0 → ERA
-            // Dead gradient branches self-eliminate through ERA propagation.
-            if (!is_binary && term_tag(a) == TAG_ERA) RETURN_REDUCED(term_era());
             if (term_tag(a) != TAG_TEN) return t;
             if (is_binary && term_tag(b) != TAG_TEN) return t;
 
@@ -694,21 +715,6 @@
             skip_movement:;
 
             if (!ctx_default_backend(ctx)) return t;
-
-            // ERA propagation for compute ops (Phase 0, ic_native_backprop.md):
-            // Dead GRAD branches produce ERA. These must be absorbed:
-            //   ADD(ERA, x) → x,  ADD(x, ERA) → x     (identity)
-            //   MUL(ERA, x) → ERA, SUB(ERA, x) → ERA   (annihilation)
-            //   Unary(ERA) → ERA                        (propagation)
-            if (term_tag(a) == TAG_ERA) {
-                if (!is_binary) RETURN_REDUCED(term_era());
-                if (uop == UOP_ADD) RETURN_REDUCED(b);
-                RETURN_REDUCED(term_era());
-            }
-            if (is_binary && term_tag(b) == TAG_ERA) {
-                if (uop == UOP_ADD || uop == UOP_SUB) RETURN_REDUCED(a);
-                RETURN_REDUCED(term_era());
-            }
 
             // Compute ops stay as TAG_TOP. Scheduler rewrites to UOP_FUSING.
             return t;

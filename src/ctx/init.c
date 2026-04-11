@@ -33,7 +33,13 @@ TinyHVM *thvm_init(const char *default_device) {
 
 // DUP use tracking (used by thvm_reset, thvm_free, and linear_use)
 #define TERM_USE_SIZE 4096
-static struct { Term term; u64 first_loc; u64 dup_loc; } term_use_table[TERM_USE_SIZE];
+static struct {
+    Term term;
+    u64 first_loc;
+    u64 dup_loc;
+    u64 tail_loc;
+    u64 tail_dup;
+} term_use_table[TERM_USE_SIZE];
 void term_use_clear(void) { memset(term_use_table, 0, sizeof(term_use_table)); }
 
 void thvm_free(TinyHVM *ctx) {
@@ -157,32 +163,51 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
             term_use_table[idx].term = t;
             term_use_table[idx].first_loc = dest_loc;
             term_use_table[idx].dup_loc = 0;
+            term_use_table[idx].tail_loc = 0;
+            term_use_table[idx].tail_dup = 0;
             return t;
         }
         if (term_use_table[idx].term == t) {
-            // Second+ use: create or reuse DUP node
+            // Second+ use: maintain a binary right-branching DUP chain.
+            // This guarantees each DUP port has at most one direct consumer.
             u64 dl = term_use_table[idx].dup_loc;
             if (!dl) {
-                // Create 1-slot DUP: just the shared value.
-                // Verify first_loc still holds this term (stale entries
-                // from previous GRAD steps may point to reused positions).
                 u64 fl = term_use_table[idx].first_loc;
-                if (ctx->heap[fl] != t) {
-                    // Stale entry — treat as first use at new location
+                if (fl == 0 || fl >= ctx->heap_pos || ctx->heap[fl] != t) {
+                    // Stale entry — restart tracking at this use site.
                     term_use_table[idx].first_loc = dest_loc;
+                    term_use_table[idx].dup_loc = 0;
+                    term_use_table[idx].tail_loc = 0;
+                    term_use_table[idx].tail_dup = 0;
                     return t;
                 }
                 dl = heap_alloc(ctx, 1);
                 heap_set(ctx, dl, t);
                 term_use_table[idx].dup_loc = dl;
-                // Patch first use site to DP0
+                term_use_table[idx].tail_dup = dl;
+                term_use_table[idx].tail_loc = dest_loc;
                 heap_set(ctx, fl, term_new(TAG_DP0, 0, dl));
+                return term_new(TAG_DP1, 0, dl);
             }
-            // N-way sharing: all 2nd+ uses get DP1 to the same 1-slot node.
-            // First projection to reduce forces the value and caches the result;
-            // all subsequent projections read the cache. This gives optimal sharing
-            // for atoms (TEN, NUM) — equivalent to a binary SUP tree but simpler.
-            return term_new(TAG_DP1, 0, dl);
+
+            u64 tail_loc = term_use_table[idx].tail_loc;
+            u64 tail_dup = term_use_table[idx].tail_dup ? term_use_table[idx].tail_dup : dl;
+            Term expect_tail = term_new(TAG_DP1, 0, tail_dup);
+            if (tail_loc == 0 || tail_loc >= ctx->heap_pos || ctx->heap[tail_loc] != expect_tail) {
+                // Stale chain (heap evolved) — restart at this site.
+                term_use_table[idx].first_loc = dest_loc;
+                term_use_table[idx].dup_loc = 0;
+                term_use_table[idx].tail_loc = 0;
+                term_use_table[idx].tail_dup = 0;
+                return t;
+            }
+
+            u64 nd = heap_alloc(ctx, 1);
+            heap_set(ctx, nd, expect_tail);
+            heap_set(ctx, tail_loc, term_new(TAG_DP0, 0, nd));
+            term_use_table[idx].tail_dup = nd;
+            term_use_table[idx].tail_loc = dest_loc;
+            return term_new(TAG_DP1, 0, nd);
         }
     }
     return t; // table full
@@ -419,6 +444,7 @@ Term thvm_rmax_axes(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes) {
 
 Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
     if (term_tag(t) == TAG_TEN) {
+        if (ctx->no_grad_alloc) goto lazy;
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
         // Use view_reshape's merge-split algorithm to compute new strides.
@@ -452,6 +478,7 @@ lazy:;
 
 Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
     if (term_tag(t) == TAG_TEN) {
+        if (ctx->no_grad_alloc) goto expand_lazy;
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
         // Expand: set stride=0 where dim goes from 1→N
@@ -503,6 +530,7 @@ expand_lazy:;
 
 Term thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank) {
     if (term_tag(t) == TAG_TEN) {
+        if (ctx->no_grad_alloc) goto permute_lazy;
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
         u32 id = ctx->tensor_count++;
@@ -535,6 +563,7 @@ permute_lazy:;
 // Pad: pairs = [before0, after0, before1, after1, ...]
 Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
     if (term_tag(t) == TAG_TEN) {
+        if (ctx->no_grad_alloc) goto pad_lazy;
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
         u32 pad_before[MAX_DIM], pad_after[MAX_DIM];
@@ -574,6 +603,7 @@ pad_lazy:;
 // Shrink: pairs = [start0, end0, start1, end1, ...]
 Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
     if (term_tag(t) == TAG_TEN) {
+        if (ctx->no_grad_alloc) goto shrink_lazy;
         u32 src_id = (u32)term_val(t);
         TensorMeta *m = &ctx->tensors[src_id];
         // Shrink = adjust offset + shape (zero-copy if contiguous, otherwise materialize)
@@ -626,4 +656,3 @@ shrink_lazy:;
 // Full implementation: handles k>s (complex/repeat) and k<=s (simple)
 // From tensor.py:2278-2301
 // ============================================================
-

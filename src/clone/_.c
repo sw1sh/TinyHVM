@@ -186,7 +186,7 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
         case TAG_TOP: {
             u32 uop = term_ext(t);
             u64 old_loc = term_val(t);
-            u32 arity = (uop == UOP_GRAD || uop == UOP_WHERE || uop == UOP_IFZ) ? 3 : 2;
+            u32 arity = (uop == UOP_WHERE || uop == UOP_IFZ) ? 3 : 2;
             u64 new_loc = heap_alloc(ctx, arity);
             for (u32 i = 0; i < arity; i++)
                 heap_set(ctx, new_loc + i,

@@ -13,6 +13,9 @@ LABEL_RE = re.compile(r'label="([^"]*)"')
 STEP_RE = re.compile(r'^step_(\d+)(?:_(.*))?\.dot$')
 TENSOR_LABEL_RE = re.compile(r'^t\d+$')
 RAW_HEAP_NODE_RE = re.compile(r'^h\d+$')
+SHAPE_LABEL_RE = re.compile(r'\\n\[([0-9?,]+)\]')
+PREV_RE = re.compile(r'^\s*//\s*PREV_INTERACTION:\s*(.+?)\s*$')
+NEXT_RE = re.compile(r'^\s*//\s*NEXT_INTERACTION:\s*(.+?)\s*$')
 
 BINARY_OPS = {
     "ADD", "SUB", "MUL", "DIV", "MAX", "CMP", "MM",
@@ -27,6 +30,8 @@ class DotGraph:
     path: str
     step: int
     suffix: str
+    prev_interaction: str = ""
+    next_interaction: str = ""
     nodes: Dict[str, str] = field(default_factory=dict)
     edges: List[Tuple[str, str, str]] = field(default_factory=list)
 
@@ -59,6 +64,14 @@ def parse_dot(path: str) -> DotGraph:
     g = DotGraph(path=path, step=step, suffix=suffix)
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
+            pm = PREV_RE.match(line)
+            if pm:
+                g.prev_interaction = pm.group(1).strip()
+                continue
+            xm = NEXT_RE.match(line)
+            if xm:
+                g.next_interaction = xm.group(1).strip()
+                continue
             nm = NODE_RE.match(line)
             if nm:
                 nid, attrs = nm.groups()
@@ -92,6 +105,17 @@ def edge_label(attrs: str) -> str:
         lbl = lbl[:dp]
     return lbl.strip()
 
+def edge_dp_port(attrs: str) -> str:
+    m = LABEL_RE.search(attrs or "")
+    if not m:
+        return ""
+    lbl = m.group(1)
+    if "dp0" in lbl:
+        return "dp0"
+    if "dp1" in lbl:
+        return "dp1"
+    return ""
+
 
 def has_erase_path_from_tensor(g: DotGraph, tensor_node: str,
                                out_map: Dict[str, List[Tuple[str, str, str]]]) -> bool:
@@ -110,9 +134,43 @@ def has_erase_path_from_tensor(g: DotGraph, tensor_node: str,
     return False
 
 
+def prev_interaction_name(g: DotGraph) -> str:
+    if g.prev_interaction:
+        return g.prev_interaction
+    if g.suffix.startswith("state_init"):
+        return "state_init"
+    if g.suffix and not g.suffix.startswith("state_"):
+        return g.suffix
+    return ""
+
+
 def check_graphs(graphs: List[DotGraph]) -> List[str]:
     errs: List[str] = []
+    g0 = graphs[0]
+    has_init_grad = any(lbl.split("\\n", 1)[0] == "GRAD" for lbl in g0.nodes.values())
+    if not has_init_grad:
+        errs.append(f"{os.path.basename(g0.path)}: init graph must contain a GRAD node before any interaction")
+
+    gl = graphs[-1]
+    has_final_grad = any(lbl.split("\\n", 1)[0] == "GRAD" for lbl in gl.nodes.values())
+    if has_final_grad:
+        errs.append(f"{os.path.basename(gl.path)}: phase-1 final graph still contains GRAD nodes")
+    if not gl.suffix.startswith("state_final"):
+        errs.append(f"{os.path.basename(gl.path)}: phase-1 graph sequence must end with explicit state_final")
+    if not prev_interaction_name(g0):
+        errs.append(f"{os.path.basename(g0.path)}: missing PREV_INTERACTION metadata")
+    if len(graphs) > 1 and not gl.prev_interaction:
+        errs.append(f"{os.path.basename(gl.path)}: final graph must record PREV_INTERACTION metadata")
+
     for g in graphs:
+        if g.suffix.startswith("state_no_highlight"):
+            errs.append(f"{os.path.basename(g.path)}: hidden next interaction (state_no_highlight artifact)")
+
+        # 0) every interaction step should mark the next reducible edge in red
+        if g.step > 0 and not g.suffix.startswith("state_"):
+            if not any("#cc0000" in attrs for _, _, attrs in g.edges):
+                errs.append(f"{os.path.basename(g.path)}: missing highlighted next-interaction edge")
+
         # 1) no undeclared node refs
         for src, dst, _ in g.edges:
             if src not in g.nodes:
@@ -131,6 +189,13 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
             if g.kind(nid) != "NODE":
                 continue
             op = g.nodes[nid].split("\\n", 1)[0].strip().upper()
+            if "\\n[]" in g.nodes[nid]:
+                errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has empty shape label []")
+            sm = SHAPE_LABEL_RE.search(g.nodes[nid])
+            if sm:
+                toks = [t.strip() for t in sm.group(1).split(",") if t.strip()]
+                if any(t == "0" for t in toks):
+                    errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has zero dimension in shape [{sm.group(1)}]")
             incoming = in_map.get(nid, [])
             in_labels = {edge_label(attrs) for _, _, attrs in incoming}
             in_count = len(incoming)
@@ -141,41 +206,90 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                 miss = need - in_labels
                 if miss:
                     errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' missing inputs {sorted(miss)}")
+                if in_count != 2:
+                    errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has {in_count} inputs (expected 2)")
             elif op in VIEW_OPS:
                 need = {"in", "shape"}
                 miss = need - in_labels
                 if miss:
                     errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' missing inputs {sorted(miss)}")
+                if in_count != 2:
+                    errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has {in_count} inputs (expected 2)")
             elif op == "ASSIGN":
                 need = {"tgt", "src"}
                 miss = need - in_labels
                 if miss:
                     errs.append(f"{os.path.basename(g.path)}: ASSIGN node '{nid}' missing inputs {sorted(miss)}")
+                if in_count != 2:
+                    errs.append(f"{os.path.basename(g.path)}: ASSIGN node '{nid}' has {in_count} inputs (expected 2)")
             elif op == "GRAD":
-                if "y" not in in_labels:
-                    errs.append(f"{os.path.basename(g.path)}: GRAD node '{nid}' missing 'y' input")
+                need = {"y", "gy"}
+                miss = need - in_labels
+                if miss:
+                    errs.append(f"{os.path.basename(g.path)}: GRAD node '{nid}' missing inputs {sorted(miss)}")
+                if in_count != 2:
+                    errs.append(f"{os.path.basename(g.path)}: GRAD node '{nid}' has {in_count} inputs (expected 2)")
+                for src, _, attrs in incoming:
+                    if edge_label(attrs) == "gy" and g.kind(src) == "TEN":
+                        errs.append(f"{os.path.basename(g.path)}: GRAD node '{nid}' uses tensor '{src}' as visible gy seed")
             elif op in BINARY_OPS:
-                if in_count < 2:
-                    errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has {in_count} inputs (expected >=2)")
+                if in_count != 2:
+                    errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has {in_count} inputs (expected 2)")
             elif op in UNARY_OPS:
-                if in_count < 1:
-                    errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has {in_count} inputs (expected >=1)")
+                if in_count != 1:
+                    errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has {in_count} inputs (expected 1)")
 
-        # 2) ERA is single-principal in visualization: one incoming, no outgoing
+            # IC principal-port invariant: non-dup combinators are single-output.
+            # In child->parent orientation this means at most one outgoing edge.
+            out_count = len(out_map.get(nid, []))
+            if out_count > 1:
+                errs.append(
+                    f"{os.path.basename(g.path)}: {op} node '{nid}' has {out_count} outputs (expected <=1); missing commute/split"
+                )
+
+        # 2) ERA is single-principal: no auxiliary fanout.
         for nid in g.nodes:
             if g.kind(nid) != "ERA":
                 continue
-            n_in = len(in_map.get(nid, []))
-            n_out = len(out_map.get(nid, []))
-            if n_in != 1:
-                errs.append(f"{os.path.basename(g.path)}: ERA node '{nid}' has {n_in} incoming edges (expected 1)")
-            if n_out != 0:
-                errs.append(f"{os.path.basename(g.path)}: ERA node '{nid}' has {n_out} outgoing edges (expected 0)")
+            ins = in_map.get(nid, [])
+            outs = out_map.get(nid, [])
+            n_in = len(ins)
+            n_out = len(outs)
+            incident = n_in + n_out
+            if incident == 0:
+                errs.append(f"{os.path.basename(g.path)}: ERA node '{nid}' is isolated")
+                continue
+            labels = []
+            payload_edges = 0
+            parent_edges = 0
+            for _, _, attrs in ins + outs:
+                lbl = edge_label(attrs)
+                if lbl:
+                    labels.append(lbl)
+                if lbl in ("p", "dp0", "dp1"):
+                    payload_edges += 1
+                else:
+                    parent_edges += 1
+            # Detached active ERA: payload -> ERA
+            if incident == 1:
+                if payload_edges != 1 or parent_edges != 0:
+                    errs.append(
+                        f"{os.path.basename(g.path)}: ERA node '{nid}' has invalid single-edge form "
+                        f"(labels={labels})"
+                    )
+                continue
+            # Inline active ERA under a parent op: payload -> ERA -> parent
+            if incident == 2 and payload_edges == 1 and parent_edges == 1:
+                continue
+            errs.append(
+                f"{os.path.basename(g.path)}: ERA node '{nid}' has {incident} incident edges "
+                f"(labels={labels}); invalid ERA form"
+            )
 
         # 3) No plain node/tensor fanout directly to ERA and another target.
         for nid in g.nodes:
             k = g.kind(nid)
-            if k in ("ERA", "DUP"):
+            if k in ("ERA", "DUP", "TEN", "NUM", "ANY", "CTR"):
                 continue
             if RAW_HEAP_NODE_RE.match(nid):
                 continue
@@ -195,52 +309,101 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
             if not outs:
                 errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' has no outgoing edges")
                 continue
+            ports = {edge_dp_port(attrs) for _, _, attrs in outs}
+            port_counts = {"dp0": 0, "dp1": 0}
+            port_self_counts = {"dp0": 0, "dp1": 0}
+            for src, dst, attrs in outs:
+                p = edge_dp_port(attrs)
+                if p in port_counts:
+                    # Self-loop DUP->DUP edges are placeholders for unresolved alias ports.
+                    # They satisfy "port exists" but should not count as extra consumers.
+                    if src == nid and dst == nid:
+                        port_self_counts[p] += 1
+                    else:
+                        port_counts[p] += 1
+            has_dp0 = ("dp0" in ports) or (port_self_counts["dp0"] > 0)
+            has_dp1 = ("dp1" in ports) or (port_self_counts["dp1"] > 0)
+            if port_counts["dp0"] > 1:
+                errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' has {port_counts['dp0']} dp0 consumers (expected <=1)")
+            if port_counts["dp1"] > 1:
+                errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' has {port_counts['dp1']} dp1 consumers (expected <=1)")
+            if not has_dp0:
+                errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' is missing dp0 output")
+            if not has_dp1:
+                errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' is missing dp1 output")
             has_era = any(g.kind(dst) == "ERA" for _, dst, _ in outs)
             has_non_era = any(g.kind(dst) != "ERA" for _, dst, _ in outs)
             if has_era and not has_non_era:
                 errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' has only ERA output")
 
-        # 4a) Disconnected non-ERA components with operation nodes are suspicious.
-        adj: Dict[str, List[str]] = {}
+        # 4b) Isolated tensors indicate heap-dump artifacts or broken links.
         for nid in g.nodes:
-            if RAW_HEAP_NODE_RE.match(nid):
+            if g.kind(nid) != "TEN":
                 continue
-            adj[nid] = []
-        for src, dst, _ in g.edges:
-            if src not in adj or dst not in adj:
-                continue
-            adj[src].append(dst)
-            adj[dst].append(src)
-        comps: List[List[str]] = []
-        seen_nodes = set()
-        for nid in adj:
-            if nid in seen_nodes:
-                continue
-            q = [nid]
-            seen_nodes.add(nid)
-            comp = []
-            while q:
-                cur = q.pop(0)
-                comp.append(cur)
-                for nx in adj[cur]:
-                    if nx in seen_nodes:
-                        continue
-                    seen_nodes.add(nx)
-                    q.append(nx)
-            comps.append(comp)
-        if comps:
-            main_comp = max(comps, key=len)
-            main_set = set(main_comp)
-            for comp in comps:
-                cset = set(comp)
-                if cset == main_set:
+            if len(in_map.get(nid, [])) == 0 and len(out_map.get(nid, [])) == 0:
+                errs.append(f"{os.path.basename(g.path)}: tensor '{nid}' is isolated")
+
+        # 4a) Disconnected non-ERA components with operation nodes are suspicious.
+        # Skip strict disconnectedness on explicit ERA-interaction steps:
+        # these snapshots may temporarily isolate pending-erasure subnets.
+        if not g.suffix.startswith("interact_era_on_"):
+            adj: Dict[str, List[str]] = {}
+            for nid in g.nodes:
+                if RAW_HEAP_NODE_RE.match(nid):
                     continue
-                has_era = any(g.kind(n) == "ERA" for n in comp)
-                has_op = any(g.kind(n) == "NODE" for n in comp)
-                if has_op and not has_era:
-                    errs.append(
-                        f"{os.path.basename(g.path)}: disconnected non-ERA component with ops: {sorted(comp)[:4]}"
-                    )
+                adj[nid] = []
+            for src, dst, _ in g.edges:
+                if src not in adj or dst not in adj:
+                    continue
+                adj[src].append(dst)
+                adj[dst].append(src)
+            comps: List[List[str]] = []
+            seen_nodes = set()
+            for nid in adj:
+                if nid in seen_nodes:
+                    continue
+                q = [nid]
+                seen_nodes.add(nid)
+                comp = []
+                while q:
+                    cur = q.pop(0)
+                    comp.append(cur)
+                    for nx in adj[cur]:
+                        if nx in seen_nodes:
+                            continue
+                        seen_nodes.add(nx)
+                        q.append(nx)
+                comps.append(comp)
+            if comps:
+                main_comp = max(comps, key=len)
+                main_set = set(main_comp)
+                for comp in comps:
+                    cset = set(comp)
+                    if cset == main_set:
+                        continue
+                    has_erase = any(g.kind(n) == "ERA" for n in comp)
+                    has_op = any(g.kind(n) == "NODE" for n in comp)
+                    has_assign = any(g.nodes.get(n, "").split("\\n", 1)[0] == "ASSIGN" for n in comp)
+                    if has_op and not has_erase and not has_assign:
+                        errs.append(
+                            f"{os.path.basename(g.path)}: disconnected non-ERA component with ops: {sorted(comp)[:4]}"
+                        )
+
+    # 4c) Highlighted next interaction metadata must match the interaction
+    # that actually produced the following step.
+    for a, b in zip(graphs, graphs[1:]):
+        b_prev = prev_interaction_name(b)
+        if not a.next_interaction:
+            errs.append(f"{os.path.basename(a.path)}: missing NEXT_INTERACTION metadata")
+            continue
+        if not b_prev:
+            errs.append(f"{os.path.basename(b.path)}: missing PREV_INTERACTION metadata")
+            continue
+        if a.next_interaction != b_prev:
+            errs.append(
+                f"{os.path.basename(a.path)}: highlighted next interaction '{a.next_interaction}' "
+                f"does not match following step '{b_prev}'"
+            )
 
     # 5) no identical consecutive steps
     for a, b in zip(graphs, graphs[1:]):
@@ -252,6 +415,10 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
     # 6) Tensor disappearance must be justified by explicit ERA interaction
     # in that same step graph (directly or through DUP path to ERA).
     for a, b in zip(graphs, graphs[1:]):
+        # ERA interaction steps are allowed to remove tensors as part of
+        # principal-port erasure even if the source-side path is not rendered.
+        if b.suffix.startswith("interact_era_on_"):
+            continue
         out_map: Dict[str, List[Tuple[str, str, str]]] = {}
         for e in a.edges:
             out_map.setdefault(e[0], []).append(e)

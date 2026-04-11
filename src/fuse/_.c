@@ -222,7 +222,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         u64 loc = term_val(t);
         Term view_input = heap_read(ctx, loc);
         // Try to walk through: TAG_TEN, ew TAG_TOP, view TAG_TOP, or FUSING (scheduled kernel)
-        int can_walk = (term_tag(view_input) == TAG_TEN);
+        int can_walk = (term_tag(view_input) == TAG_TEN || term_tag(view_input) == TAG_NUM);
         if (!can_walk && term_tag(view_input) == TAG_TOP) {
             u32 vi_uop = term_ext(view_input);
             can_walk = is_elementwise(vi_uop) || is_view_op(vi_uop) || vi_uop == UOP_FUSING;
@@ -1000,4 +1000,3 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     }
     return 1;
 }
-

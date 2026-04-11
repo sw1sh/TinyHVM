@@ -1,0 +1,52 @@
+digraph G {
+  // PREV_INTERACTION: interact_DP1
+  // NEXT_INTERACTION: interact_grad_on_ADD
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n1 [label="MUL\n[2,3,4]", shape=box, fillcolor="#cce5ff"];
+  t5 [label="t5\n[2,3,4]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t5 -> n1 [label="a"];
+  t7 [label="t7\n[2,3,4]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t7 -> n1 [label="b"];
+  n5 [label="SUM\n[2,1,4]", shape=box, fillcolor="#ffcccc"];
+  n1 -> n5 [label="in"];
+  t8 [label="t8\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t8 -> n5 [label="axes"];
+  n9 [label="RESHAPE\n[2,4]", shape=box, fillcolor="#fff3cd"];
+  n5 -> n9 [label="in"];
+  t9 [label="t9\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t9 -> n9 [label="shape"];
+  n45 [label="GRAD\nd/d(t2,t3)", shape=box, fillcolor="#e8d0ff"];
+  n49 -> n45 [label="y",color="#cc0000",penwidth=2.0];
+  n43 -> n45 [label="gy"];
+  era33 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  t12 [label="t12\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t12 -> era33 [label="p"];
+  n28 [label="RESHAPE\n[1,1]", shape=box, fillcolor="#fff3cd"];
+  num28_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num28_0 -> n28 [label="in"];
+  t15 [label="t15\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t15 -> n28 [label="shape"];
+  n47 [label="ADD\n[2,4]", shape=box, fillcolor="#cce5ff"];
+  dup51 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];
+  n9 -> dup51;
+  dup51 -> n47 [label="a (dp0)"];
+  t11 [label="t11\n[2,4]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t11 -> n47 [label="b"];
+  n34 [label="EXPAND\n[2,4]", shape=box, fillcolor="#fff3cd"];
+  n28 -> n34 [label="in"];
+  t16 [label="t16\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t16 -> n34 [label="shape"];
+  n41 [label="CMP\n[2,4]", shape=box, fillcolor="#cce5ff"];
+  n47 -> n41 [label="a"];
+  t17 [label="t17\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t17 -> n41 [label="b"];
+  n49 [label="ADD\n[2,4]", shape=box, fillcolor="#cce5ff"];
+  dup51 -> n49 [label="a (dp1)"];
+  t11 -> n49 [label="b"];
+  n43 [label="MUL\n[2,4]", shape=box, fillcolor="#cce5ff"];
+  n34 -> n43 [label="a"];
+  n41 -> n43 [label="b"];
+}

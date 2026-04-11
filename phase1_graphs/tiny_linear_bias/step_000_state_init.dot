@@ -1,0 +1,35 @@
+digraph G {
+  // PREV_INTERACTION: state_init
+  // NEXT_INTERACTION: interact_grad_on_SUM
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n1 [label="MUL\n[2,3,4]", shape=box, fillcolor="#cce5ff"];
+  t5 [label="t5\n[2,3,4]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t5 -> n1 [label="a"];
+  t7 [label="t7\n[2,3,4]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t7 -> n1 [label="b"];
+  n5 [label="SUM\n[2,1,4]", shape=box, fillcolor="#ffcccc"];
+  n1 -> n5 [label="in"];
+  t8 [label="t8\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t8 -> n5 [label="axes"];
+  n9 [label="RESHAPE\n[2,4]", shape=box, fillcolor="#fff3cd"];
+  n5 -> n9 [label="in"];
+  t9 [label="t9\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t9 -> n9 [label="shape"];
+  n13 [label="ADD\n[2,4]", shape=box, fillcolor="#cce5ff"];
+  n9 -> n13 [label="a"];
+  t11 [label="t11\n[2,4]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t11 -> n13 [label="b"];
+  n17 [label="RELU\n[2,4]", shape=box, fillcolor="#cce5ff"];
+  n13 -> n17 [label=""];
+  n21 [label="SUM\n[1,1]", shape=box, fillcolor="#ffcccc"];
+  n17 -> n21 [label="in"];
+  t12 [label="t12\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t12 -> n21 [label="axes"];
+  n25 [label="GRAD\nd/d(t2,t3)", shape=box, fillcolor="#e8d0ff"];
+  n21 -> n25 [label="y",color="#cc0000",penwidth=2.0];
+  num25_1 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num25_1 -> n25 [label="gy"];
+}

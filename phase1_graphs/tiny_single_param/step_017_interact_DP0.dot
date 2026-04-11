@@ -1,0 +1,57 @@
+digraph G {
+  // PREV_INTERACTION: interact_DP0
+  // NEXT_INTERACTION: interact_era_on_RESHAPE
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n50 [label="RESHAPE\n[3]", shape=box, fillcolor="#fff3cd"];
+  n46 -> n50 [label="in"];
+  t8 [label="t8\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t8 -> n50 [label="shape"];
+  n35 [label="MUL\n[2,3]", shape=box, fillcolor="#cce5ff"];
+  t1 [label="t1\n[2,3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t1 -> n35 [label="a"];
+  t2 [label="t2\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t2 -> n35 [label="b"];
+  n62 [label="MUL\n[2,3]", shape=box, fillcolor="#cce5ff"];
+  n70 -> n62 [label="a"];
+  n75 -> n62 [label="b"];
+  n44 [label="MUL\n[2,3]", shape=box, fillcolor="#cce5ff"];
+  n62 -> n44 [label="a"];
+  t1 -> n44 [label="b"];
+  n46 [label="SUM\n[1,3]", shape=box, fillcolor="#ffcccc"];
+  n44 -> n46 [label="in"];
+  t7 [label="t7\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t7 -> n46 [label="axes"];
+  n73 [label="CMP\n[2,3]", shape=box, fillcolor="#cce5ff"];
+  dup77 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];
+  n35 -> dup77;
+  dup77 -> n73 [label="a (dp0)"];
+  t6 [label="t6\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t6 -> n73 [label="b"];
+  n70 [label="EXPAND\n[2,3]", shape=box, fillcolor="#fff3cd"];
+  n86 -> n70 [label="in"];
+  t5 [label="t5\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t5 -> n70 [label="shape"];
+  n75 [label="CMP\n[2,3]", shape=box, fillcolor="#cce5ff"];
+  dup77 -> n75 [label="a (dp1)"];
+  t6 -> n75 [label="b"];
+  n84 [label="RESHAPE\n[1,1]", shape=box, fillcolor="#fff3cd"];
+  num84_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num84_0 -> n84 [label="in"];
+  t4 [label="t4\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 -> n84 [label="shape"];
+  era67 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  n84 -> era67 [label="p",color="#cc0000",penwidth=2.0];
+  n86 [label="RESHAPE\n[1,1]", shape=box, fillcolor="#fff3cd"];
+  num86_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num86_0 -> n86 [label="in"];
+  t4 -> n86 [label="shape"];
+  era79 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  t2 -> era79 [label="p"];
+  era81 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  n73 -> era81 [label="p"];
+  era83 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  t5 -> era83 [label="p"];
+}

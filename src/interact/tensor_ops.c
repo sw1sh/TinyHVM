@@ -247,33 +247,46 @@
             // all remaining aux payloads as explicit future interactions.
             if (term_tag(a) == TAG_ERA ||
                 ((is_binary || is_movement || is_reduce) && term_tag(b_arg) == TAG_ERA)) {
-                int a_is_era = term_tag(a) == TAG_ERA && term_val(a) != 0;
-                int b_is_era = (is_binary || is_movement || is_reduce) &&
-                               term_tag(b_arg) == TAG_ERA && term_val(b_arg) != 0;
-                Term keep = a_is_era ? a : b_arg;
-                Term other = a_is_era ? b_arg : a;
+                int a_has_era = term_tag(a) == TAG_ERA;
+                int b_has_era = (is_binary || is_movement || is_reduce) &&
+                                term_tag(b_arg) == TAG_ERA;
+                int a_is_active_era = a_has_era && term_val(a) != 0;
+                int b_is_active_era = b_has_era && term_val(b_arg) != 0;
+                Term era_term = a_has_era ? a : b_arg;
+                Term other = a_has_era ? b_arg : a;
                 // ADD treats an erased branch as additive zero: drop the ADD,
                 // preserve the other branch, and let the ERA continue erasing
                 // its own payload as a detached interaction.
                 if (uop == UOP_ADD) {
                     heap_set(ctx, loc + 0, term_era());
                     heap_set(ctx, loc + 1, term_era());
-                    if (a_is_era && b_is_era) {
-                        thvm_spawn_detached_era(ctx, b_arg);
+                    if (a_has_era && b_has_era) {
+                        if (a_is_active_era && b_is_active_era)
+                            thvm_spawn_detached_era(ctx, b_arg);
                         ctx->itrs++;
-                        RETURN_REDUCED(a);
+                        if (a_is_active_era) RETURN_REDUCED(a);
+                        if (b_is_active_era) RETURN_REDUCED(b_arg);
+                        RETURN_REDUCED(term_era());
                     }
-                    thvm_spawn_detached_era(ctx, keep);
+                    if (a_is_active_era || b_is_active_era)
+                        thvm_spawn_detached_era(ctx, era_term);
                     ctx->itrs++;
                     RETURN_REDUCED(other);
                 }
-                if (is_binary || is_movement || is_reduce)
+                if ((is_binary || is_movement || is_reduce) && !(a_has_era && b_has_era))
                     thvm_spawn_detached_era(ctx, other);
                 heap_set(ctx, loc + 0, term_era());
                 if (is_binary || is_movement || is_reduce)
                     heap_set(ctx, loc + 1, term_era());
                 ctx->itrs++;
-                RETURN_REDUCED(keep);
+                if (a_has_era && b_has_era) {
+                    if (a_is_active_era && b_is_active_era)
+                        thvm_spawn_detached_era(ctx, b_arg);
+                    if (a_is_active_era) RETURN_REDUCED(a);
+                    if (b_is_active_era) RETURN_REDUCED(b_arg);
+                    RETURN_REDUCED(term_era());
+                }
+                RETURN_REDUCED(era_term);
             }
 
             // ADD with a literal zero branch is algebraically transparent.

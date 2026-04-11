@@ -35,7 +35,7 @@ int main(void) {
 
     Term grad = thvm_grad_multi(ctx, loss, (Term[]){w, b}, NULL, 2);
     Term log_loss = thvm_log_print(ctx, loss);
-    Term program = thvm_app(ctx, log_loss, grad);
+    Term program = thvm_app(ctx, grad, log_loss);
     thvm_eval(ctx, program);
 
     thvm_free(ctx);

@@ -16,6 +16,15 @@ Term thvm_app(TinyHVM *ctx, Term fun, Term arg) {
     return term_new(TAG_APP, 0, loc);
 }
 
+Term thvm_ctr(TinyHVM *ctx, const Term *items, u32 n) {
+    if (n == 0) return term_new(TAG_CTR, 0, 0);
+    assert(n < 256 && "CTR arity exceeds TAG_CTR ext range");
+    u64 loc = heap_alloc(ctx, n);
+    for (u32 i = 0; i < n; i++)
+        heap_set(ctx, loc + i, items[i]);
+    return term_new(TAG_CTR, (u8)n, loc);
+}
+
 static inline u32 hc_hash_pair(Term f, Term x) {
     u64 h = f * 0x9E3779B97F4A7C15ULL + x;
     h ^= h >> 30;

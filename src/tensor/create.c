@@ -1,8 +1,6 @@
 // tensor/create.c — tensor_create() / tensor_view_of()
 
-// Allocate a new tensor slot with a fresh GPU/CPU buffer.
-// When n_threads > 1: per-thread tensor ID range (zero contention).
-static u32 tensor_create(TinyHVM *ctx, Shape s, u32 dtype) {
+static u32 tensor_alloc_slot(TinyHVM *ctx, Shape s, u32 dtype, int allocate_buf) {
   u32 id;
   if (ctx->n_threads > 1) {
     ThvmThread *ts = &ctx->threads[tl_thread_id];
@@ -22,13 +20,25 @@ static u32 tensor_create(TinyHVM *ctx, Shape s, u32 dtype) {
   m->refcount = 1;
   m->view    = view_create(s);
   m->backend = ctx_default_backend(ctx);
-  if (m->backend) {
+  if (allocate_buf && m->backend) {
     u64 bytes = (u64)m->view.numel * dtype_size(dtype);
     m->buf_id = m->backend->buf_alloc(bytes);
   }
   thvm_prof_tensor_created(0);
   thvm_prof_update_watermarks(ctx->tensor_count, ctx->heap_pos);
   return id;
+}
+
+// Allocate a new tensor slot with a fresh GPU/CPU buffer.
+// When n_threads > 1: per-thread tensor ID range (zero contention).
+static u32 tensor_create(TinyHVM *ctx, Shape s, u32 dtype) {
+  return tensor_alloc_slot(ctx, s, dtype, 1);
+}
+
+// Allocate tensor metadata only. Used by phase-2 scheduling so buffer placement
+// is decided by the dispatch-time memory planner instead of the scheduler.
+static u32 tensor_create_unbacked(TinyHVM *ctx, Shape s, u32 dtype) {
+  return tensor_alloc_slot(ctx, s, dtype, 0);
 }
 
 // Create a view alias: shares the buffer, but has a different View.

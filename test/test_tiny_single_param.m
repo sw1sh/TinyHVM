@@ -1,5 +1,5 @@
 // test_tiny.m — minimal graph for visual debugging
-// loss = sum(relu(x * w)), backward for w
+// loss = sum(relu(x * w)); plain GRAD is drop-mode unless explicitly kept
 #include "../src/tinyhvm.c"
 #include "../src/backend/cpu/_.c"
 #ifdef __APPLE__
@@ -24,12 +24,11 @@ int main(void) {
     h = thvm_op(ctx, UOP_RELU, h, term_era());
     Term loss = thvm_sum_axes(ctx, h, (u32[]){0, 1}, 2);
 
-    // Keep loss as a live forward consumer: LOG_PRINT is a sink, so
-    // APP(LOG_PRINT(loss), grad) sequences forward loss observation before
-    // the backward branch.
+    // Plain GRAD is drop-mode here. Sequence it first so the dead backward
+    // branch disappears before the surviving forward LOG_PRINT sink.
     Term grad = thvm_grad_multi(ctx, loss, (Term[]){w}, NULL, 1);
     Term log_loss = thvm_log_print(ctx, loss);
-    Term program = thvm_app(ctx, log_loss, grad);
+    Term program = thvm_ctr(ctx, (Term[]){grad, log_loss}, 2);
     thvm_eval(ctx, program);
 
     thvm_free(ctx);

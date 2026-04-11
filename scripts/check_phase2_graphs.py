@@ -92,7 +92,13 @@ def main() -> int:
 
     errs: List[str] = []
 
-    if len(g_sched.nodes) >= len(g_reduce.nodes):
+    if len(g_reduce.nodes) == 0:
+        if len(g_sched.nodes) != 0:
+            errs.append(
+                f"{os.path.basename(post_sched)}: post_reduce is empty, expected empty post_sched "
+                f"but found {len(g_sched.nodes)} nodes"
+            )
+    elif len(g_sched.nodes) >= len(g_reduce.nodes):
         errs.append(
             f"{os.path.basename(post_sched)}: post_sched has {len(g_sched.nodes)} nodes, "
             f"expected fewer than post_reduce's {len(g_reduce.nodes)}"

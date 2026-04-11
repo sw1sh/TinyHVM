@@ -1,5 +1,5 @@
 // test_tiny.m — phase-1 graph case for a tiny linear layer with bias
-// loss = sum(relu(x @ W + b)), backward for W and b
+// loss = sum(relu(x @ W + b)); plain GRAD is drop-mode unless explicitly kept
 #include "../src/tinyhvm.c"
 #include "../src/backend/cpu/_.c"
 #ifdef __APPLE__
@@ -35,7 +35,7 @@ int main(void) {
 
     Term grad = thvm_grad_multi(ctx, loss, (Term[]){w, b}, NULL, 2);
     Term log_loss = thvm_log_print(ctx, loss);
-    Term program = thvm_app(ctx, log_loss, grad);
+    Term program = thvm_ctr(ctx, (Term[]){grad, log_loss}, 2);
     thvm_eval(ctx, program);
 
     thvm_free(ctx);

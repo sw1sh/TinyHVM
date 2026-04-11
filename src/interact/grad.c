@@ -49,11 +49,15 @@
 	                    GRAD_RETURN(term_era()); \
 	                } while (0)
 	                Term x  = thvm_grad_target_get(ctx, loc);
-                    int keep_bundle = thvm_grad_targets_has_keep_bundle(ctx);
+                    u32 grad_mode = thvm_grad_mode_get(ctx, loc);
+                    int keep_bundle = (grad_mode == GRAD_MODE_KEEP) && thvm_grad_targets_has_keep_bundle(ctx);
                 if (getenv("THVM_SCHED_DIAG")) {
                     static int _re=0; _re++; if (_re<=20)
                     fprintf(stderr, "  GRAD_ENTRY[%d]: y_tag=%u y_val=%llu gy_tag=%u x_tag=%u\n",
                         _re, term_tag(y), term_val(y), term_tag(gy), term_tag(x));
+                }
+                if (grad_mode == GRAD_MODE_DROP) {
+                    GRAD_RETURN(GRAD_ERASE2(y_src, gy_src));
                 }
                 // Resolve DP0/DP1 on y (from BG DUP)
                 for (int _dp=0; _dp<20 && (term_tag(y)==TAG_DP0||term_tag(y)==TAG_DP1); _dp++)
@@ -240,8 +244,11 @@
                         }
                         GRAD_ZERO(gy);
                     }
-                    // Base case: y == x → return grad_y (trampoline reduces)
+                    // Base case: y == x.
                     if (term_tag(x) == TAG_TEN && (u32)term_val(x) == y_id) {
+                        if (grad_mode == GRAD_MODE_DROP) {
+                            GRAD_DROP(gy);
+                        }
                         GRAD_RETURN(gy);
                     }
 
@@ -258,7 +265,8 @@
                         Term slot = term_era();
                         u32 target_index = 0;
 	                        if (thvm_grad_targets_find_index(ctx, y_id, &target_index, &slot)) {
-	                            if (!(term_tag(slot) == TAG_ERA && term_val(slot) == 0)) {
+	                            if (grad_mode == GRAD_MODE_SLOT &&
+                                    !(term_tag(slot) == TAG_ERA && term_val(slot) == 0)) {
 	                                u64 _sd = heap_alloc(ctx, 1);
 	                                heap_set(ctx, _sd, slot);
 	                                Term slot0 = term_new(TAG_DP0, 0, _sd);
@@ -269,15 +277,12 @@
 	                                if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  ASSIGN_CREATE: target_tid=%u\n", y_id);
 	                                GRAD_RETURN(term_era());
 	                            }
-                                if (keep_bundle) {
+                                if (grad_mode == GRAD_MODE_KEEP && keep_bundle) {
                                     thvm_grad_bundle_accum(ctx, target_index, gy);
-                                    GRAD_RETURN(term_num_f32(0.0f));
+                                    GRAD_RETURN(term_era());
                                 }
-                                // Single-target no-slot mode should behave like
-                                // plain thvm_grad: the matched leaf returns the
-                                // live backward branch instead of dropping it.
-                                if (thvm_grad_targets_count(ctx) == 1) {
-                                    GRAD_RETURN(gy);
+                                if (grad_mode == GRAD_MODE_DROP) {
+                                    GRAD_DROP(gy);
                                 }
                                 GRAD_ZERO(gy);
 	                        }

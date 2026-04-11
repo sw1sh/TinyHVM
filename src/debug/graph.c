@@ -170,6 +170,7 @@ static Term step_graph_root_term = 0;
 static Term step_graph_before_grad_y = 0;
 static Term step_graph_before_era_payload = 0;
 static int step_graph_before_top_had_era = 0;
+static int step_graph_before_top_had_add_zero = 0;
 static char step_graph_last_prev_name[96] = {0};
 
 static const char *thvm_step_graph_dir(void) {
@@ -187,6 +188,10 @@ static void thvm_step_graph_set_before_era_payload(Term payload) {
 
 static void thvm_step_graph_set_before_top_era(int had_era) {
     step_graph_before_top_had_era = had_era;
+}
+
+static void thvm_step_graph_set_before_top_add_zero(int had_add_zero) {
+    step_graph_before_top_had_add_zero = had_add_zero;
 }
 
 static u64 thvm_step_graph_sig(TinyHVM *ctx) {
@@ -265,7 +270,7 @@ static int thvm_step_top_has_era_arg(TinyHVM *ctx, Term t, u64 *slot_out, Term *
     u32 arity = thvm_step_top_arity(term_ext(t));
     for (u32 i = 0; i < arity; i++) {
         Term child = heap_read(ctx, loc + i);
-        if (term_tag(child) == TAG_ERA && term_val(child) != 0) {
+        if (term_tag(child) == TAG_ERA) {
             if (slot_out) *slot_out = loc + i;
             if (term_out) *term_out = child;
             return 1;
@@ -479,6 +484,20 @@ static int thvm_step_candidate_visible(TinyHVM *ctx, u64 slot, Term t) {
 static int thvm_step_graph_highlight_from_before(TinyHVM *ctx, u64 source_slot, Term before,
                                                  u64 *out_slot, Term *out_term) {
     u8 tag = term_tag(before);
+    if (tag == TAG_CTR) {
+        u64 loc = term_val(before);
+        if (loc == 0 || loc >= ctx->heap_pos) return 0;
+        *out_slot = loc + 0;
+        *out_term = heap_read(ctx, loc + 0);
+        return 1;
+    }
+    if (tag == TAG_APP) {
+        u64 loc = term_val(before);
+        if (loc == 0 || loc >= ctx->heap_pos) return 0;
+        *out_slot = loc + 0;
+        *out_term = heap_read(ctx, loc + 0);
+        return (*out_slot != 0 && *out_slot < ctx->heap_pos);
+    }
     if (tag == TAG_DP0 || tag == TAG_DP1) {
         *out_slot = term_val(before);
         *out_term = before;
@@ -538,6 +557,7 @@ static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root) {
     step_graph_before_grad_y = 0;
     step_graph_before_era_payload = 0;
     step_graph_before_top_had_era = 0;
+    step_graph_before_top_had_add_zero = 0;
     snprintf(step_graph_last_prev_name, sizeof(step_graph_last_prev_name), "%s", "state_init");
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "mkdir -p %s && rm -f %s/*.dot %s/*.png",
@@ -625,7 +645,10 @@ static const char *thvm_step_graph_interaction_name(TinyHVM *ctx, Term before,
             return buf;
         }
         if (ext < UOP_COUNT) {
-            if (thvm_step_top_has_era_arg(ctx, before, NULL, NULL))
+            if (step_graph_before_top_had_add_zero ||
+                thvm_step_top_has_add_zero_arg(ctx, before, NULL, NULL))
+                snprintf(buf, nbuf, "interact_%s", uop_names[ext]);
+            else if (thvm_step_top_has_era_arg(ctx, before, NULL, NULL))
                 snprintf(buf, nbuf, "interact_era_on_%s", uop_names[ext]);
             else if (step_graph_before_top_had_era)
                 snprintf(buf, nbuf, "interact_era_on_%s", uop_names[ext]);
@@ -663,6 +686,7 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term ro
     step_graph_before_grad_y = 0;
     step_graph_before_era_payload = 0;
     step_graph_before_top_had_era = 0;
+    step_graph_before_top_had_add_zero = 0;
     char tmp_struct[256];
     snprintf(tmp_struct, sizeof(tmp_struct), "%s/.tmp_step_struct.dot", step_graph_dir);
     thvm_heap_dot_set_highlight(0, 0);
@@ -698,6 +722,7 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term ro
         step_graph_before_grad_y = 0;
         step_graph_before_era_payload = 0;
         step_graph_before_top_had_era = 0;
+        step_graph_before_top_had_add_zero = 0;
         return;
     }
     thvm_step_graph_interaction_name(ctx, next_before, next_name, sizeof(next_name));
@@ -716,6 +741,7 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term ro
         step_graph_last_dot_sig = dot_sig;
         step_graph_before_grad_y = 0;
         step_graph_before_era_payload = 0;
+        step_graph_before_top_had_add_zero = 0;
         return;
     }
     char p[256];
@@ -727,6 +753,7 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term ro
     step_graph_before_grad_y = 0;
     step_graph_before_era_payload = 0;
     step_graph_before_top_had_era = 0;
+    step_graph_before_top_had_add_zero = 0;
 }
 
 static void thvm_step_graph_finalize(TinyHVM *ctx) {

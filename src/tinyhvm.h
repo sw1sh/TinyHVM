@@ -507,6 +507,12 @@ typedef enum {
     KERNEL_LEAF_NUM    = 2,
 } KernelLeafKind;
 
+typedef enum {
+    GRAD_MODE_DROP = 0,
+    GRAD_MODE_KEEP = 1,
+    GRAD_MODE_SLOT = 2,
+} GradMode;
+
 typedef struct {
     FusedOp    ops[FUSE_MAX_OPS]; u32 n_ops;
     u32        leaf_ids[FUSE_MAX_LEAVES];
@@ -526,6 +532,7 @@ typedef struct {
     Term       original_term;    // original TAG_TOP before scheduling (for multi-consumer propagation)
     u32        dep_kids[FUSE_MAX_LEAVES];
     u32        n_deps;
+    u32        output_slot;
     u32        raw_output_tid;
     u32        output_tid;
     int        fail_code;        // diagnostic: last failure reason from fuse_build_kernel
@@ -564,6 +571,7 @@ typedef struct {
     // Fusion metadata (only when creator_op == UOP_FUSING)
     u64         fusing_loc; // heap loc of the original subnet root TAG_TOP
     u32         fusing_uop; // UOP of the subnet root (e.g. UOP_SUM)
+    u32         planned_slot; // phase-2 planned storage slot (0 = none / not scheduled)
 
     // Conv backward metadata: enables specialized MPS matmul backward
     // instead of generic 8-dim unfuse+contiguify. Set by thvm_conv2d.
@@ -892,6 +900,7 @@ void     thvm_set_requires_grad(TinyHVM *ctx, Term t);
 // Lambda / inet combinators
 Term     thvm_lam(TinyHVM *ctx, Term *var_out, Term body);   // allocate LAM node
 Term     thvm_app(TinyHVM *ctx, Term fun, Term arg);         // allocate APP node
+Term     thvm_ctr(TinyHVM *ctx, const Term *items, u32 n);   // allocate CTR tuple/carrier
 Term     thvm_app_hc(TinyHVM *ctx, Term fun, Term arg);    // hash-consed APP
 void     thvm_hc_clear(TinyHVM *ctx);                      // clear HC table
 u32      thvm_define(TinyHVM *ctx, Term body);               // register def, return name id
@@ -1003,6 +1012,7 @@ int      thvm_grad_targets_find_slot(TinyHVM *ctx, u32 tid, Term *out_slot);
 int      thvm_grad_targets_find_index(TinyHVM *ctx, u32 tid, u32 *out_index, Term *out_slot);
 u32      thvm_grad_targets_count(TinyHVM *ctx);
 u32      thvm_grad_targets_get_tid(TinyHVM *ctx, u32 index);
+u32      thvm_grad_mode_get(TinyHVM *ctx, u64 grad_loc);
 int      thvm_grad_targets_has_keep_bundle(TinyHVM *ctx);
 Term     thvm_grad_targets_get_keep_bundle(TinyHVM *ctx);
 void     thvm_grad_bundle_accum(TinyHVM *ctx, u32 index, Term grad);

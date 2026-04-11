@@ -20,7 +20,7 @@
                 t = thvm_sup(ctx, lab,
                     thvm_app(ctx, f0, arg0),
                     thvm_app(ctx, f1, arg1));
-                goto inet_step;
+                INET_RECURSE();
             }
 
             // APP-BRI: (θx.body arg) → body[x ← arg]  (same beta rule as LAM)
@@ -30,7 +30,7 @@
                 heap_set(ctx, bri_loc, arg);
                 ctx->itrs++;
                 t = heap_read(ctx, bri_loc + 1);
-                goto inet_step;
+                INET_RECURSE();
             }
 
             // APP-LAM: beta reduction — (λx.body arg) → body[x ← arg]
@@ -40,27 +40,27 @@
                 heap_set(ctx, lam_loc, arg);      // link: write arg at var slot
                 ctx->itrs++;
                 t = heap_read(ctx, lam_loc + 1);  // body
-                goto inet_step;
+                INET_RECURSE();
             }
             // APP-TEN: discard tensor, return arg (sequencing)
             if (term_tag(fun) == TAG_TEN) {
                 tensor_release(ctx, (u32)term_val(fun));
                 ctx->itrs++;
                 t = heap_read(ctx, loc + 1);
-                goto inet_step;
+                INET_RECURSE();
             }
             // APP-NUM: numeric value in function position is a sequencing
             // terminal for graph/debug carriers such as grad bundles.
             if (term_tag(fun) == TAG_NUM) {
                 ctx->itrs++;
                 t = heap_read(ctx, loc + 1);
-                goto inet_step;
+                INET_RECURSE();
             }
             // APP-ERA: erasure propagation
             if (term_tag(fun) == TAG_ERA) {
                 ctx->itrs++;
                 t = heap_read(ctx, loc + 1);
-                goto inet_step;
+                INET_RECURSE();
             }
 
             // APP-MAT: pattern match — arg WNF from TAG_MAT_1 frame
@@ -79,7 +79,7 @@
                     t = thvm_sup(ctx, lab,
                         thvm_app(ctx, term_new(TAG_DP0, lab, dup), a),
                         thvm_app(ctx, term_new(TAG_DP1, lab, dup), b));
-                    goto inet_step;
+                    INET_RECURSE();
                 }
                 // APP-MAT-USP: same for unordered SUP
                 if (term_tag(arg) == TAG_USP) {
@@ -93,7 +93,7 @@
                     t = thvm_usp(ctx, lab,
                         thvm_app(ctx, term_new(TAG_UDP, lab, dup), a),
                         thvm_app(ctx, term_new(TAG_UDP, lab, dup), b));
-                    goto inet_step;
+                    INET_RECURSE();
                 }
 
                 // APP-MAT-NUM: match on numeric tag
@@ -107,7 +107,7 @@
                     } else {
                         t = thvm_app(ctx, heap_read(ctx, mat_loc + 1), arg);  // fallback(value)
                     }
-                    goto inet_step;
+                    INET_RECURSE();
                 }
 
                 // APP-MAT-ERA: erased argument → ERA
@@ -129,7 +129,7 @@
                 t = thvm_usp(ctx, lab,
                     thvm_app(ctx, f0, term_new(TAG_UDP, lab, dup_loc)),
                     thvm_app(ctx, f1, term_new(TAG_UDP, lab, dup_loc)));
-                goto inet_step;
+                INET_RECURSE();
             }
 
             return t;
@@ -260,7 +260,7 @@ era_continue:
             assert(name < ctx->def_count);
             ctx->itrs++;
             t = term_clone(ctx, ctx->defs[name]);
-            goto inet_step;
+            INET_RECURSE();
         }
 
         // TAG_SUP: superposition — returned as-is until projected by DP0/DP1
@@ -486,7 +486,7 @@ era_continue:
                 t = thvm_sup(ctx, lab,
                     thvm_op2(ctx, opr, x0, y0),
                     thvm_op2(ctx, opr, x1, y1));
-                goto inet_step;
+                INET_RECURSE();
             }
 
             Term y = heap_read(ctx, loc + 1); // WNF from TAG_OP2_1 frame
@@ -501,7 +501,7 @@ era_continue:
                 t = thvm_sup(ctx, lab,
                     thvm_op2(ctx, opr, x, y0),
                     thvm_op2(ctx, opr, x, y1));
-                goto inet_step;
+                INET_RECURSE();
             }
 
             if (term_tag(x) == TAG_NUM && term_tag(y) == TAG_NUM) {
@@ -537,7 +537,7 @@ era_continue:
             u64 loc = term_val(t);
             ctx->itrs++;
             t = heap_read(ctx, loc);  // the term (slot 0)
-            goto inet_step;
+            INET_RECURSE();
         }
 
         // TAG_DSU: dynamic SUP — reduce label_expr to NUM, then create normal SUP
@@ -551,7 +551,7 @@ era_continue:
             Term b = heap_read(ctx, loc + 2);
             ctx->itrs++;
             t = thvm_sup(ctx, label, a, b);
-            goto inet_step;
+            INET_RECURSE();
         }
 
         // TAG_DDU: dynamic DUP — reduce label_expr to NUM, then dup val, apply bod
@@ -569,7 +569,7 @@ era_continue:
             ctx->itrs++;
             // Apply bod to both copies: APP(APP(bod, dp0), dp1)
             t = thvm_app(ctx, thvm_app(ctx, bod, dp0), dp1);
-            goto inet_step;
+            INET_RECURSE();
         }
 
         // TAG_INC: priority wrapper — transparent during normal reduction
@@ -577,7 +577,7 @@ era_continue:
             u64 loc = term_val(t);
             ctx->itrs++;
             t = heap_read(ctx, loc);
-            goto inet_step;
+            INET_RECURSE();
         }
 
         // ── Type enumeration machinery ───────────────────────────────────
@@ -603,7 +603,7 @@ era_continue:
                 t = thvm_sup(ctx, lab,
                     thvm_eql(ctx, a0, term_new(TAG_DP0, lab, dup)),
                     thvm_eql(ctx, a1, term_new(TAG_DP1, lab, dup)));
-                goto inet_step;
+                INET_RECURSE();
             }
             // EQL-USP-L: same for unordered SUP
             if (term_tag(a) == TAG_USP) {
@@ -618,7 +618,7 @@ era_continue:
                 t = thvm_usp(ctx, lab,
                     thvm_eql(ctx, a0, term_new(TAG_UDP, lab, dup)),
                     thvm_eql(ctx, a1, term_new(TAG_UDP, lab, dup)));
-                goto inet_step;
+                INET_RECURSE();
             }
             // EQL-ERA-L: (ERA === b) → ERA
             if (term_tag(a) == TAG_ERA) return term_era();
@@ -630,7 +630,7 @@ era_continue:
                 Term b = heap_read(ctx, loc + 1);
                 ctx->itrs++;
                 t = thvm_inc(ctx, thvm_eql(ctx, inner_a, b));
-                goto inet_step;
+                INET_RECURSE();
             }
 
             Term b = heap_read(ctx, loc + 1); // WNF from TAG_EQL_1 frame
@@ -646,7 +646,7 @@ era_continue:
                 t = thvm_sup(ctx, lab,
                     thvm_eql(ctx, a, b0),
                     thvm_eql(ctx, a, b1));
-                goto inet_step;
+                INET_RECURSE();
             }
             // EQL-USP-R
             if (term_tag(b) == TAG_USP) {
@@ -658,7 +658,7 @@ era_continue:
                 t = thvm_usp(ctx, lab,
                     thvm_eql(ctx, a, b0),
                     thvm_eql(ctx, a, b1));
-                goto inet_step;
+                INET_RECURSE();
             }
             // EQL-ERA-R: (a === ERA) → ERA
             if (term_tag(b) == TAG_ERA) return term_era();
@@ -669,7 +669,7 @@ era_continue:
                 Term inner_b = heap_read(ctx, term_val(b));
                 ctx->itrs++;
                 t = thvm_inc(ctx, thvm_eql(ctx, a, inner_b));
-                goto inet_step;
+                INET_RECURSE();
             }
 
             // EQL-NUM: (#a === #b) → NUM(a == b ? 1 : 0)
@@ -690,7 +690,7 @@ era_continue:
                 heap_set(ctx, b_loc, fresh_var);  // substitute b's VAR
                 ctx->itrs++;
                 t = thvm_eql(ctx, a_body, b_body);
-                goto inet_step;
+                INET_RECURSE();
             }
             // Different types → not equal
             ctx->itrs++;
@@ -716,7 +716,7 @@ era_continue:
                 t = thvm_sup(ctx, lab,
                     thvm_and(ctx, a0, term_new(TAG_DP0, lab, dup)),
                     thvm_and(ctx, a1, term_new(TAG_DP1, lab, dup)));
-                goto inet_step;
+                INET_RECURSE();
             }
             if (term_tag(a) == TAG_USP) {
                 u32 lab = term_ext(a);
@@ -730,7 +730,7 @@ era_continue:
                 t = thvm_usp(ctx, lab,
                     thvm_and(ctx, a0, term_new(TAG_UDP, lab, dup)),
                     thvm_and(ctx, a1, term_new(TAG_UDP, lab, dup)));
-                goto inet_step;
+                INET_RECURSE();
             }
             // AND-ZER: short-circuit false
             if (term_tag(a) == TAG_NUM && term_as_u32(a) == 0) {
@@ -741,7 +741,7 @@ era_continue:
             if (term_tag(a) == TAG_NUM) {
                 ctx->itrs++;
                 t = heap_read(ctx, loc + 1);
-                goto inet_step;
+                INET_RECURSE();
             }
             // AND-ERA: erased → ERA
             if (term_tag(a) == TAG_ERA) return term_era();
@@ -767,7 +767,7 @@ era_continue:
                 t = thvm_sup(ctx, lab,
                     thvm_or(ctx, a0, term_new(TAG_DP0, lab, dup)),
                     thvm_or(ctx, a1, term_new(TAG_DP1, lab, dup)));
-                goto inet_step;
+                INET_RECURSE();
             }
             if (term_tag(a) == TAG_USP) {
                 u32 lab = term_ext(a);
@@ -781,13 +781,13 @@ era_continue:
                 t = thvm_usp(ctx, lab,
                     thvm_or(ctx, a0, term_new(TAG_UDP, lab, dup)),
                     thvm_or(ctx, a1, term_new(TAG_UDP, lab, dup)));
-                goto inet_step;
+                INET_RECURSE();
             }
             // OR-ZER: zero → pass through to b
             if (term_tag(a) == TAG_NUM && term_as_u32(a) == 0) {
                 ctx->itrs++;
                 t = heap_read(ctx, loc + 1);
-                goto inet_step;
+                INET_RECURSE();
             }
             // OR-ONE: nonzero → short-circuit true
             if (term_tag(a) == TAG_NUM) {
@@ -816,7 +816,7 @@ era_continue:
                 heap_set(ctx, udp_loc, b);
                 ctx->itrs++;
                 t = a;
-                goto inet_step;
+                INET_RECURSE();
             }
 
             // UDP ⊳ USP (different label): commutation
@@ -831,7 +831,7 @@ era_continue:
                 t = thvm_usp(ctx, usp_label,
                     term_new(TAG_UDP, udp_label, du_a),
                     term_new(TAG_UDP, udp_label, du_b));
-                goto inet_step;
+                INET_RECURSE();
             }
 
             // UDP ⊳ ordered SUP: commutation (distribute UDP over SUP branches)
@@ -846,7 +846,7 @@ era_continue:
                 t = thvm_sup(ctx, sup_label,
                     term_new(TAG_UDP, udp_label, du_a),
                     term_new(TAG_UDP, udp_label, du_b));
-                goto inet_step;
+                INET_RECURSE();
             }
 
             // UDP ⊳ atoms: return value directly (UDP vanishes)
@@ -869,7 +869,7 @@ era_continue:
                 heap_set(ctx, lam_loc, term_new(TAG_UDP, udp_label, vdup));
                 ctx->itrs++;
                 t = lam_new;
-                goto inet_step;
+                INET_RECURSE();
             }
 
             return t;  // stuck
@@ -878,6 +878,25 @@ era_continue:
         // TAG_USP: unordered superposition — WNF (like TAG_SUP)
         case TAG_USP:
             return t;
+
+        // TAG_CTR: output bundle carrier / sequencing tuple.
+        // - CTR(N=1){x} -> x
+        // - CTR(N>1){ERA, xs...} -> CTR(N-1){xs...}
+        case TAG_CTR: {
+            u32 ar = term_ext(t);
+            u64 loc = term_val(t);
+            if (ar == 0 || loc == 0 || loc >= ctx->heap_pos) return t;
+            Term head = heap_read(ctx, loc);
+            if (ar == 1) {
+                ctx->itrs++;
+                return head;
+            }
+            if (term_tag(head) == TAG_ERA) {
+                ctx->itrs++;
+                return term_new(TAG_CTR, (u8)(ar - 1), loc + 1);
+            }
+            return t;
+        }
 
         // TAG_MAT: pattern match — WNF atom (fired by APP)
         case TAG_MAT:

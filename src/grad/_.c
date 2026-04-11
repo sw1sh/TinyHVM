@@ -9,9 +9,11 @@
 
 typedef struct {
     TinyHVM *ctx;
+    u8 default_mode;
     u32 n;
     u32 tids[GRAD_TARGETS_MAX];
     Term slots[GRAD_TARGETS_MAX];
+    u8 modes[GRAD_LOC_MAX];
     u8 keep_bundle;
     Term bundle;
     u64 bundle_loc;
@@ -26,6 +28,7 @@ static void grad_targets_reset(GradTargetSet *s) {
     if (!s) return;
     s->n = 0;
     s->n_loc = 0;
+    s->default_mode = GRAD_MODE_DROP;
     s->keep_bundle = 0;
     s->bundle = term_era();
     s->bundle_loc = 0;
@@ -63,6 +66,7 @@ static int grad_loc_ensure(GradTargetSet *s, u64 grad_loc) {
     idx = (int)s->n_loc++;
     s->locs[idx] = grad_loc;
     s->xs[idx] = thvm_any();
+    s->modes[idx] = s->default_mode;
     return idx;
 }
 
@@ -76,7 +80,6 @@ static Term thvm_grad_bundle_new(TinyHVM *ctx, u32 n_params) {
 }
 
 static Term thvm_grad_bundle_whnf(TinyHVM *ctx, Term bundle) {
-    if (term_tag(bundle) == TAG_CTR) return bundle;
     return thvm_reduce(ctx, bundle);
 }
 
@@ -106,6 +109,7 @@ void thvm_grad_targets_set(TinyHVM *ctx, Term *params, Term *grad_slots, u32 n_p
     GradTargetSet *s = grad_targets_get(ctx, 1);
     if (!s) return;
     grad_targets_reset(s);
+    s->default_mode = grad_slots ? GRAD_MODE_SLOT : GRAD_MODE_DROP;
     for (u32 i = 0; i < n_params && s->n < GRAD_TARGETS_MAX; i++) {
         if (term_tag(params[i]) != TAG_TEN) continue;
         s->tids[s->n] = (u32)term_val(params[i]);
@@ -118,9 +122,10 @@ void thvm_grad_targets_set_keep(TinyHVM *ctx, Term *params, u32 n_params, Term b
     GradTargetSet *s = grad_targets_get(ctx, 1);
     if (!s) return;
     grad_targets_reset(s);
+    s->default_mode = GRAD_MODE_KEEP;
     s->keep_bundle = 1;
     s->bundle = bundle;
-    s->bundle_loc = term_tag(bundle) == TAG_CTR ? term_val(bundle) : 0;
+    s->bundle_loc = term_tag(bundle) == TAG_CTR ? (term_val(bundle) + (term_ext(bundle) > n_params ? 1 : 0)) : 0;
     for (u32 i = 0; i < n_params && s->n < GRAD_TARGETS_MAX; i++) {
         if (term_tag(params[i]) != TAG_TEN) continue;
         s->tids[s->n] = (u32)term_val(params[i]);
@@ -154,6 +159,14 @@ u32 thvm_grad_targets_get_tid(TinyHVM *ctx, u32 index) {
     GradTargetSet *s = grad_targets_get(ctx, 0);
     if (!s || index >= s->n) return ~0u;
     return s->tids[index];
+}
+
+u32 thvm_grad_mode_get(TinyHVM *ctx, u64 grad_loc) {
+    GradTargetSet *s = grad_targets_get(ctx, 0);
+    if (!s) return GRAD_MODE_DROP;
+    int idx = grad_loc_index(s, grad_loc);
+    if (idx >= 0) return s->modes[idx];
+    return s->default_mode;
 }
 
 int thvm_grad_targets_has_keep_bundle(TinyHVM *ctx) {
@@ -213,28 +226,36 @@ Term thvm_grad_keep(TinyHVM *ctx, Term y, Term x) {
 }
 
 Term thvm_grad_multi_keep(TinyHVM *ctx, Term loss, Term *params, u32 n_params) {
-    Term bundle = thvm_grad_bundle_new(ctx, n_params);
-    thvm_grad_targets_set_keep(ctx, params, n_params, bundle);
     term_use_clear();
     Term seed = term_num_f32(1.0f);
-    u64 loc = heap_alloc(ctx, 2);
-    loss = linear_use(ctx, loss, loc);
-    heap_set(ctx, loc, loss);
-    heap_set(ctx, loc + 1, seed);
-    thvm_grad_target_set(ctx, loc, thvm_any());
-    Term driver = term_new(TAG_TOP, UOP_GRAD, loc);
-    return thvm_app(ctx, driver, bundle);
+    u64 grad_loc = heap_alloc(ctx, 2);
+    loss = linear_use(ctx, loss, grad_loc);
+    heap_set(ctx, grad_loc + 0, loss);
+    heap_set(ctx, grad_loc + 1, seed);
+    Term driver = term_new(TAG_TOP, UOP_GRAD, grad_loc);
+
+    assert(n_params + 1 < 256 && "keep bundle arity exceeds TAG_CTR ext range");
+    u64 bundle_loc = heap_alloc(ctx, n_params + 1);
+    heap_set(ctx, bundle_loc + 0, driver);
+    for (u32 i = 0; i < n_params; i++)
+        heap_set(ctx, bundle_loc + 1 + i, term_num_f32(0.0f));
+    Term bundle = term_new(TAG_CTR, (u8)(n_params + 1), bundle_loc);
+
+    thvm_grad_targets_set_keep(ctx, params, n_params, bundle);
+    thvm_grad_target_set(ctx, grad_loc, thvm_any());
+    return bundle;
 }
 
 u32 thvm_grad_bundle_count(TinyHVM *ctx, Term bundle) {
     bundle = thvm_grad_bundle_whnf(ctx, bundle);
-    if (term_tag(bundle) != TAG_CTR) return 0;
-    return (u32)term_ext(bundle);
+    if (term_tag(bundle) == TAG_CTR) return (u32)term_ext(bundle);
+    if (term_tag(bundle) == TAG_ERA && term_val(bundle) == 0) return 0;
+    return 1;
 }
 
 Term thvm_grad_bundle_get(TinyHVM *ctx, Term bundle, u32 index) {
     bundle = thvm_grad_bundle_whnf(ctx, bundle);
-    if (term_tag(bundle) != TAG_CTR) return term_era();
+    if (term_tag(bundle) != TAG_CTR) return index == 0 ? bundle : term_era();
     if (index >= (u32)term_ext(bundle)) return term_era();
     u64 loc = term_val(bundle);
     if (loc == 0 || loc + index >= ctx->heap_pos) return term_era();

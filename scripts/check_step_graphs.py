@@ -186,45 +186,46 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
         init_out_map.setdefault(e[0], []).append(e)
     init_roots = sorted(nid for nid in g0.nodes if not init_out_map.get(nid))
     final_roots = sorted(nid for nid in gl.nodes if not final_out_map.get(nid))
-    min_final_roots = sum(1 for nid in init_roots if node_head(g0, nid) != "GRAD")
-    max_final_roots = len(init_roots)
-    if len(final_roots) < min_final_roots:
-        errs.append(
-            f"{os.path.basename(gl.path)}: final graph has {len(final_roots)} result roots "
-            f"(expected at least {min_final_roots} non-GRAD roots from init graph to remain live)"
-        )
-    if len(final_roots) > max_final_roots:
-        errs.append(
-            f"{os.path.basename(gl.path)}: final graph has {len(final_roots)} result roots "
-            f"(expected no more than {max_final_roots} init roots)"
-        )
-    if not final_roots:
-        errs.append(f"{os.path.basename(gl.path)}: final graph must retain at least one root")
-    final_era_nodes = sorted(nid for nid in gl.nodes if gl.kind(nid) == "ERA")
-    if final_era_nodes:
-        errs.append(
-            f"{os.path.basename(gl.path)}: final graph still contains ERA nodes {final_era_nodes[:6]}"
-        )
-    seen_final = set()
-    for nid in gl.nodes:
-        if nid in seen_final:
-            continue
-        q = [nid]
-        seen_final.add(nid)
-        comp = []
-        while q:
-            cur = q.pop(0)
-            comp.append(cur)
-            for nx in final_adj.get(cur, []):
-                if nx in seen_final:
-                    continue
-                seen_final.add(nx)
-                q.append(nx)
-        comp_roots = [n for n in comp if n in final_roots]
-        if not comp_roots:
+    if gl.nodes:
+        min_final_roots = sum(1 for nid in init_roots if node_head(g0, nid) != "GRAD")
+        max_final_roots = len(init_roots)
+        if len(final_roots) < min_final_roots:
             errs.append(
-                f"{os.path.basename(gl.path)}: final graph has rootless component {sorted(comp)[:6]}"
+                f"{os.path.basename(gl.path)}: final graph has {len(final_roots)} result roots "
+                f"(expected at least {min_final_roots} non-GRAD roots from init graph to remain live)"
             )
+        if len(final_roots) > max_final_roots:
+            errs.append(
+                f"{os.path.basename(gl.path)}: final graph has {len(final_roots)} result roots "
+                f"(expected no more than {max_final_roots} init roots)"
+            )
+        if not final_roots:
+            errs.append(f"{os.path.basename(gl.path)}: final graph must retain at least one root")
+        final_era_nodes = sorted(nid for nid in gl.nodes if gl.kind(nid) == "ERA")
+        if final_era_nodes:
+            errs.append(
+                f"{os.path.basename(gl.path)}: final graph still contains ERA nodes {final_era_nodes[:6]}"
+            )
+        seen_final = set()
+        for nid in gl.nodes:
+            if nid in seen_final:
+                continue
+            q = [nid]
+            seen_final.add(nid)
+            comp = []
+            while q:
+                cur = q.pop(0)
+                comp.append(cur)
+                for nx in final_adj.get(cur, []):
+                    if nx in seen_final:
+                        continue
+                    seen_final.add(nx)
+                    q.append(nx)
+            comp_roots = [n for n in comp if n in final_roots]
+            if not comp_roots:
+                errs.append(
+                    f"{os.path.basename(gl.path)}: final graph has rootless component {sorted(comp)[:6]}"
+                )
 
     for g in graphs:
         if g.suffix.startswith("state_no_highlight"):

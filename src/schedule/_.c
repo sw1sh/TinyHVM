@@ -7,6 +7,7 @@ static void thvm_step_graph_finalize(TinyHVM *ctx);
 static void thvm_step_graph_set_before_grad_y(Term y);
 static void thvm_step_graph_set_before_era_payload(Term payload);
 static void thvm_step_graph_set_before_top_era(int had_era);
+static void thvm_step_graph_set_before_top_add_zero(int had_add_zero);
 
 // schedule/_.c — Three-phase eval: reduce → schedule(rewrite) → reduce
 //
@@ -32,6 +33,99 @@ u32 sched_kernel_count = 0;
 // Shared with UOP_FUSING handler in tensor_ops.c.
 Term kid_results[SCHED_MAX_KERNELS];
 static u64 phase1_root_slot = 0;
+
+typedef struct {
+    Backend *backend;
+    u32      buf_id;
+    u64      bytes;
+    u8       detached;
+} SchedSlot;
+
+static u16 sched_output_remaining_uses[SCHED_MAX_KERNELS];
+static u8  sched_output_pinned[SCHED_MAX_KERNELS];
+static u32 sched_exec_order[SCHED_MAX_KERNELS];
+static u32 sched_exec_count = 0;
+static SchedSlot sched_slots[SCHED_MAX_KERNELS + 1];
+static u32 sched_slot_count = 0;
+
+static void sched_backend_release_buf(Backend *backend, u32 buf_id) {
+    if (!backend || buf_id == 0) return;
+    if (backend->buf_decref) backend->buf_decref(buf_id);
+    else if (backend->buf_free) backend->buf_free(buf_id);
+}
+
+static void sched_planner_release_detached_slots(void) {
+    for (u32 i = 1; i <= sched_slot_count; i++) {
+        SchedSlot *slot = &sched_slots[i];
+        if (!slot->detached || slot->buf_id == 0) continue;
+        sched_backend_release_buf(slot->backend, slot->buf_id);
+        slot->buf_id = 0;
+        slot->detached = 0;
+    }
+}
+
+static void sched_planner_reset_state(void) {
+    sched_planner_release_detached_slots();
+    memset(sched_output_remaining_uses, 0, sizeof(sched_output_remaining_uses));
+    memset(sched_output_pinned, 0, sizeof(sched_output_pinned));
+    memset(sched_exec_order, 0, sizeof(sched_exec_order));
+    memset(sched_slots, 0, sizeof(sched_slots));
+    sched_exec_count = 0;
+    sched_slot_count = 0;
+}
+
+static u32 sched_slot_bind_output(TinyHVM *ctx, u32 slot_id, u32 raw_tid, u32 out_tid) {
+    if (slot_id == 0 || slot_id > sched_slot_count || raw_tid == 0) return 0;
+    SchedSlot *slot = &sched_slots[slot_id];
+    if (!slot->backend) slot->backend = ctx_default_backend(ctx);
+    if (!slot->backend || slot->bytes == 0) return 0;
+    if (slot->buf_id == 0) {
+        slot->buf_id = slot->backend->buf_alloc(slot->bytes);
+        if (slot->buf_id == 0) return 0;
+    }
+    slot->detached = 0;
+    TensorMeta *raw_m = &ctx->tensors[raw_tid];
+    raw_m->backend = slot->backend;
+    raw_m->buf_id = slot->buf_id;
+    raw_m->planned_slot = slot_id;
+    if (!out_tid || out_tid == raw_tid) return slot->buf_id;
+    TensorMeta *out_m = &ctx->tensors[out_tid];
+    out_m->backend = raw_m->backend;
+    out_m->buf_id = slot->buf_id;
+    out_m->planned_slot = slot_id;
+    if (out_m->backend && out_m->backend->buf_incref)
+        out_m->backend->buf_incref(slot->buf_id);
+    return slot->buf_id;
+}
+
+static void sched_release_output_kid(TinyHVM *ctx, u32 kid) {
+    if (kid >= sched_kernel_count) return;
+    KernelEntry *ke = &sched_kernels[kid];
+    u32 slot_id = ke->output_slot;
+    u32 raw_tid = ke->raw_output_tid ? ke->raw_output_tid : ke->output_tid;
+    if (raw_tid == 0 || raw_tid >= ctx->tensor_count) return;
+    TensorMeta *raw_m = &ctx->tensors[raw_tid];
+    if (raw_m->buf_id == 0 || !raw_m->backend) return;
+
+    if (ke->output_tid && ke->output_tid != raw_tid && ke->output_tid < ctx->tensor_count) {
+        TensorMeta *out_m = &ctx->tensors[ke->output_tid];
+        if (out_m->buf_id && out_m->backend && out_m->backend->buf_decref)
+            out_m->backend->buf_decref(out_m->buf_id);
+        out_m->buf_id = 0;
+    }
+
+    if (slot_id > 0 && slot_id <= sched_slot_count) {
+        SchedSlot *slot = &sched_slots[slot_id];
+        slot->backend = raw_m->backend;
+        slot->buf_id = raw_m->buf_id;
+        slot->bytes = (u64)raw_m->view.numel * dtype_size(raw_m->dtype);
+        slot->detached = 1;
+    } else {
+        sched_backend_release_buf(raw_m->backend, raw_m->buf_id);
+    }
+
+    raw_m->buf_id = 0;
+}
 
 static const char *thvm_graph_dir(void) {
     const char *dir = getenv("THVM_GRAPH_DIR");
@@ -60,7 +154,7 @@ static int phase1_top_has_era_arg(TinyHVM *ctx, Term t, u64 *slot_out, Term *ter
     u32 arity = phase1_top_arity(term_ext(t));
     for (u32 i = 0; i < arity; i++) {
         Term child = heap_read(ctx, loc + i);
-        if (term_tag(child) == TAG_ERA && term_val(child) != 0) {
+        if (term_tag(child) == TAG_ERA) {
             if (slot_out) *slot_out = loc + i;
             if (term_out) *term_out = child;
             return 1;
@@ -83,10 +177,16 @@ static int phase1_top_has_add_zero_arg(TinyHVM *ctx, Term t, u64 *slot_out, Term
     return 0;
 }
 
+static int phase1_top_direct_uop(u32 uop) {
+    return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_IFZ ||
+           uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_WHERE ||
+           uop == UOP_FUSING;
+}
+
 static int phase1_term_maybe_active(TinyHVM *ctx, Term t) {
     u8 tag = term_tag(t);
     if (tag == TAG_TOP) {
-        return term_ext(t) == UOP_GRAD ||
+        return phase1_top_direct_uop(term_ext(t)) ||
                phase1_top_has_era_arg(ctx, t, NULL, NULL) ||
                phase1_top_has_add_zero_arg(ctx, t, NULL, NULL);
     }
@@ -242,6 +342,16 @@ static int phase1_top_arg0_ready(Term t) {
     return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM || tag == TAG_SUP;
 }
 
+static int phase1_log_print_arg_ready(Term t) {
+    return phase1_top_arg0_ready(t);
+}
+
+static int phase1_app_mat_arg_ready(Term t) {
+    u8 tag = term_tag(t);
+    return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
+           tag == TAG_SUP || tag == TAG_CTR || tag == TAG_ANY;
+}
+
 static int phase1_dp_can_fire_on(Term t) {
     switch (term_tag(t)) {
         case TAG_SUP:
@@ -283,6 +393,28 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
         return 1;
     }
 
+    if (tag == TAG_CTR) {
+        u32 ar = term_ext(t);
+        u64 loc = term_val(t);
+        if (ar == 0 || loc == 0 || loc >= ctx->heap_pos) {
+            if (out_whnf) *out_whnf = t;
+            return 0;
+        }
+        Term head = heap_read(ctx, loc + 0);
+        Term whead = head;
+        if (thvm_phase1_predict_next_redex(ctx, head, out_before, &whead))
+            return 1;
+        if (ar == 1 ||
+            term_tag(whead) == TAG_NUM ||
+            term_tag(whead) == TAG_ERA ||
+            term_tag(whead) == TAG_TEN) {
+            if (out_before) *out_before = t;
+            return 1;
+        }
+        if (out_whnf) *out_whnf = t;
+        return 0;
+    }
+
     if (tag == TAG_APP) {
         u64 loc = term_val(t);
         if (loc == 0 || loc + 1 >= ctx->heap_pos) {
@@ -298,6 +430,25 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
             Term warg = arg;
             if (thvm_phase1_predict_next_redex(ctx, arg, out_before, &warg))
                 return 1;
+            if (phase1_app_mat_arg_ready(warg)) {
+                if (out_before) *out_before = t;
+                return 1;
+            }
+            if (out_whnf) *out_whnf = t;
+            return 0;
+        }
+        switch (term_tag(wfun)) {
+            case TAG_SUP:
+            case TAG_BRI:
+            case TAG_LAM:
+            case TAG_TEN:
+            case TAG_NUM:
+            case TAG_ERA:
+            case TAG_USP:
+                if (out_before) *out_before = t;
+                return 1;
+            default:
+                break;
         }
         if (out_whnf) *out_whnf = t;
         return 0;
@@ -312,6 +463,19 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
             if (thvm_phase1_predict_next_redex(ctx, y, out_before, &wy))
                 return 1;
             if (phase1_grad_y_ready(wy)) {
+                if (out_before) *out_before = t;
+                return 1;
+            }
+            if (out_whnf) *out_whnf = t;
+            return 0;
+        }
+
+        if (uop == UOP_LOG_PRINT) {
+            Term a0 = heap_read(ctx, loc + 0);
+            Term wa0 = a0;
+            if (thvm_phase1_predict_next_redex(ctx, a0, out_before, &wa0))
+                return 1;
+            if (phase1_log_print_arg_ready(wa0)) {
                 if (out_before) *out_before = t;
                 return 1;
             }
@@ -387,25 +551,35 @@ static int thvm_phase1_find_next_actual(TinyHVM *ctx, Term root,
     return 0;
 }
 
-static int thvm_phase1_fire_one(TinyHVM *ctx, Term in, Term *out_term, Term *out_before) {
-    if (term_tag(in) == TAG_TOP && term_ext(in) == UOP_GRAD) {
-        u64 gl = term_val(in);
+static void thvm_phase1_capture_step_before_meta(TinyHVM *ctx, Term before) {
+    if (term_tag(before) == TAG_TOP && term_ext(before) == UOP_GRAD) {
+        u64 gl = term_val(before);
         if (gl + 1 < ctx->heap_pos) thvm_step_graph_set_before_grad_y(heap_read(ctx, gl + 0));
         else thvm_step_graph_set_before_grad_y(term_era());
     } else {
         thvm_step_graph_set_before_grad_y(term_era());
     }
-    if (term_tag(in) == TAG_TOP && term_ext(in) != UOP_GRAD)
-        thvm_step_graph_set_before_top_era(phase1_top_has_era_arg(ctx, in, NULL, NULL));
+    if (term_tag(before) == TAG_TOP && term_ext(before) != UOP_GRAD)
+        thvm_step_graph_set_before_top_era(phase1_top_has_era_arg(ctx, before, NULL, NULL));
     else
         thvm_step_graph_set_before_top_era(0);
-    if (term_tag(in) == TAG_ERA) {
-        u64 el = term_val(in);
+    if (term_tag(before) == TAG_TOP && term_ext(before) != UOP_GRAD)
+        thvm_step_graph_set_before_top_add_zero(phase1_top_has_add_zero_arg(ctx, before, NULL, NULL));
+    else
+        thvm_step_graph_set_before_top_add_zero(0);
+    if (term_tag(before) == TAG_ERA) {
+        u64 el = term_val(before);
         Term payload = (el > 0 && el < ctx->heap_pos) ? heap_read(ctx, el) : term_era();
         thvm_step_graph_set_before_era_payload(payload);
     } else {
         thvm_step_graph_set_before_era_payload(term_era());
     }
+}
+
+static int thvm_phase1_fire_one(TinyHVM *ctx, Term in, Term *out_term, Term *out_before) {
+    Term predicted_before = in;
+    thvm_phase1_predict_next_redex(ctx, in, &predicted_before, NULL);
+    thvm_phase1_capture_step_before_meta(ctx, predicted_before);
 
     struct InteractionTrace tr = {0};
     struct InteractionTrace *saved_buf = ctx->trace_buf;
@@ -733,7 +907,7 @@ static void sched_prepare_boundary_output(TinyHVM *ctx, SchedBoundary *b) {
     if (!raw_v) raw_v = sched_term_view(ctx, b->root_term);
     if (!raw_v) return;
 
-    u32 raw_tid = tensor_create(ctx, raw_v->shape, DTYPE_F32);
+    u32 raw_tid = tensor_create_unbacked(ctx, raw_v->shape, DTYPE_F32);
     TensorMeta *raw_m = &ctx->tensors[raw_tid];
     raw_m->creator_op = UOP_FUSING;
     raw_m->fusing_loc = term_val(b->compute_term);
@@ -753,6 +927,113 @@ static void sched_prepare_boundary_output(TinyHVM *ctx, SchedBoundary *b) {
         b->output_tid = out_tid;
     }
     sched_boundary_output_tids[b->kid] = b->output_tid;
+}
+
+static void sched_exec_order_visit(u32 kid, u8 *seen) {
+    if (kid >= sched_kernel_count || seen[kid]) return;
+    seen[kid] = 1;
+    KernelEntry *ke = &sched_kernels[kid];
+    for (u32 di = 0; di < ke->n_deps; di++)
+        sched_exec_order_visit(ke->dep_kids[di], seen);
+    if (sched_exec_count < SCHED_MAX_KERNELS)
+        sched_exec_order[sched_exec_count++] = kid;
+}
+
+static void sched_plan_output_liveness(TinyHVM *ctx) {
+    memset(sched_output_remaining_uses, 0, sizeof(sched_output_remaining_uses));
+    memset(sched_output_pinned, 0, sizeof(sched_output_pinned));
+    memset(sched_exec_order, 0, sizeof(sched_exec_order));
+    memset(sched_slots, 0, sizeof(sched_slots));
+    sched_exec_count = 0;
+    sched_slot_count = 0;
+
+    for (u32 i = 0; i < sched_boundary_count; i++) {
+        SchedBoundary *b = &sched_boundaries[i];
+        if (!b->is_boundary) continue;
+        if (b->kid < SCHED_MAX_KERNELS && b->external_count > 0)
+            sched_output_pinned[b->kid] = 1;
+    }
+
+    u8 seen[SCHED_MAX_KERNELS];
+    memset(seen, 0, sizeof(seen));
+    for (u32 i = 0; i < sched_boundary_count; i++) {
+        SchedBoundary *b = &sched_boundaries[i];
+        if (!b->is_boundary || b->kid >= sched_kernel_count) continue;
+        if (b->external_count > 0)
+            sched_exec_order_visit(b->kid, seen);
+    }
+    for (u32 kid = 0; kid < sched_kernel_count; kid++) {
+        if (!seen[kid])
+            sched_exec_order_visit(kid, seen);
+    }
+
+    u32 last_use[SCHED_MAX_KERNELS];
+    for (u32 pos = 0; pos < sched_exec_count; pos++) {
+        u32 kid = sched_exec_order[pos];
+        last_use[kid] = pos;
+    }
+    for (u32 kid = 0; kid < sched_kernel_count; kid++) {
+        KernelEntry *ke = &sched_kernels[kid];
+        for (u32 di = 0; di < ke->n_deps; di++) {
+            u32 dep_kid = ke->dep_kids[di];
+            if (dep_kid < SCHED_MAX_KERNELS) {
+                sched_output_remaining_uses[dep_kid]++;
+                for (u32 pos = 0; pos < sched_exec_count; pos++) {
+                    if (sched_exec_order[pos] == kid && pos > last_use[dep_kid]) {
+                        last_use[dep_kid] = pos;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    u32 slot_end[SCHED_MAX_KERNELS + 1];
+    u8 slot_pinned[SCHED_MAX_KERNELS + 1];
+    memset(slot_end, 0, sizeof(slot_end));
+    memset(slot_pinned, 0, sizeof(slot_pinned));
+
+    for (u32 pos = 0; pos < sched_exec_count; pos++) {
+        u32 kid = sched_exec_order[pos];
+        KernelEntry *ke = &sched_kernels[kid];
+        u32 raw_tid = ke->raw_output_tid ? ke->raw_output_tid : ke->output_tid;
+        if (raw_tid == 0 || raw_tid >= ctx->tensor_count) continue;
+
+        TensorMeta *raw_m = &ctx->tensors[raw_tid];
+        Backend *backend = raw_m->backend ? raw_m->backend : ctx_default_backend(ctx);
+        u64 bytes = (u64)raw_m->view.numel * dtype_size(raw_m->dtype);
+        u32 best_slot = 0;
+        u64 best_bytes = UINT64_MAX;
+
+        if (!sched_output_pinned[kid]) {
+            for (u32 sid = 1; sid <= sched_slot_count; sid++) {
+                if (slot_pinned[sid]) continue;
+                if (slot_end[sid] >= pos) continue;
+                if (sched_slots[sid].backend != backend) continue;
+                if (sched_slots[sid].bytes < bytes) continue;
+                if (sched_slots[sid].bytes < best_bytes) {
+                    best_slot = sid;
+                    best_bytes = sched_slots[sid].bytes;
+                }
+            }
+        }
+
+        if (best_slot == 0) {
+            if (sched_slot_count + 1 > SCHED_MAX_KERNELS) continue;
+            best_slot = ++sched_slot_count;
+            sched_slots[best_slot].backend = backend;
+            sched_slots[best_slot].bytes = bytes;
+            sched_slots[best_slot].buf_id = 0;
+            sched_slots[best_slot].detached = 0;
+            slot_pinned[best_slot] = sched_output_pinned[kid];
+        }
+
+        slot_end[best_slot] = sched_output_pinned[kid] ? UINT32_MAX : last_use[kid];
+        ke->output_slot = best_slot;
+        raw_m->planned_slot = best_slot;
+        if (ke->output_tid && ke->output_tid != raw_tid && ke->output_tid < ctx->tensor_count)
+            ctx->tensors[ke->output_tid].planned_slot = best_slot;
+    }
 }
 
 static void sched_replace_term_everywhere(TinyHVM *ctx, Term original, Term rewritten) {
@@ -796,6 +1077,16 @@ static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
     ENSURE(ctx, raw_tid);
     TensorMeta *md = &ctx->tensors[raw_tid];
 
+    if (md->buf_id == 0) {
+        if (sched_slot_bind_output(ctx, ke->output_slot, raw_tid, ke->output_tid) == 0)
+            return term_era();
+    } else if (ke->output_tid && ke->output_tid != raw_tid &&
+               ke->output_tid < ctx->tensor_count &&
+               ctx->tensors[ke->output_tid].buf_id == 0) {
+        if (sched_slot_bind_output(ctx, ke->output_slot, raw_tid, ke->output_tid) == 0)
+            return term_era();
+    }
+
     u32 bufs[FUSE_MAX_LEAVES];
     const View *views[FUSE_MAX_LEAVES];
     for (u32 i = 0; i < ke->n_leaves; i++) {
@@ -803,6 +1094,7 @@ static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
             u32 lid = ke->leaf_ids[i];
             if (lid == 0) return term_era();
             ENSURE(ctx, lid);
+            if (ctx->tensors[lid].buf_id == 0) return term_era();
             bufs[i] = ctx->tensors[lid].buf_id;
             views[i] = &ke->leaf_views[i];
             continue;
@@ -844,10 +1136,19 @@ static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
 
     Term result = term_ten(ke->output_tid ? ke->output_tid : raw_tid, DTYPE_F32);
     kid_results[kid] = result;
+
+    for (u32 di = 0; di < ke->n_deps; di++) {
+        u32 dep_kid = ke->dep_kids[di];
+        if (dep_kid >= SCHED_MAX_KERNELS || sched_output_remaining_uses[dep_kid] == 0) continue;
+        sched_output_remaining_uses[dep_kid]--;
+        if (sched_output_remaining_uses[dep_kid] == 0 && !sched_output_pinned[dep_kid])
+            sched_release_output_kid(ctx, dep_kid);
+    }
     return result;
 }
 
 static u32 sched_all(TinyHVM *ctx, Term root) {
+    sched_planner_reset_state();
     if (ctx->sched_rewrites)
         memset(ctx->sched_rewrites, 0, SCHED_REWRITE_CAP * sizeof(SchedRewriteEntry));
     memset(sched_kernel_locs, 0, sizeof(sched_kernel_locs));
@@ -893,6 +1194,7 @@ static u32 sched_all(TinyHVM *ctx, Term root) {
     fuse_clear_schedule_boundaries();
     fuse_no_lazy_resolve = 0;
     sched_kernel_count = selected;
+    sched_plan_output_liveness(ctx);
 
     for (u32 i = 0; i < sched_boundary_count; i++) {
         SchedBoundary *b = &sched_boundaries[i];
@@ -916,6 +1218,9 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         t = thvm_phase1_seed_root_grad(ctx, t);
         thvm_step_graph_eval_begin(ctx, t);
         t = thvm_phase1_structural_nf(ctx, t);
+        t = thvm_reduce(ctx, t);
+        if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
+            heap_set(ctx, phase1_root_slot, t);
         thvm_step_graph_finalize(ctx);
         phase1_root_slot = 0;
         return t;
@@ -967,6 +1272,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             heap_set(ctx, phase1_root_slot, term_era());
         phase1_root_slot = 0;
     }
+    sched_planner_release_detached_slots();
     return t;
 }
 

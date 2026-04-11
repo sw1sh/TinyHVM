@@ -22,12 +22,15 @@ digraph G {
   n13 -> n17 [label="in"];
   t5 [label="t5\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t5 -> n17 [label="axes"];
-  n23 [label="LOG_PRINT\n[1,1]", shape=box, fillcolor="#f0f0f0"];
+  n21 [label="GRAD\nd/d(t2)", shape=box, fillcolor="#e8d0ff"];
   dup24 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];
   n17 -> dup24;
-  dup24 -> n23 [label=" (dp1)"];
-  n21 [label="GRAD\nd/d(t2)", shape=box, fillcolor="#e8d0ff"];
   dup24 -> n21 [label="y (dp0)"];
   num21_1 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
   num21_1 -> n21 [label="gy"];
+  n23 [label="LOG_PRINT\n[1,1]", shape=box, fillcolor="#f0f0f0"];
+  dup24 -> n23 [label=" (dp1)"];
+  ctr25 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n21 -> ctr25 [label="c0"];
+  n23 -> ctr25 [label="c1"];
 }

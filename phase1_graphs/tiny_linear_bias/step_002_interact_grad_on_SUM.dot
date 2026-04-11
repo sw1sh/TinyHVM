@@ -1,6 +1,6 @@
 digraph G {
   // PREV_INTERACTION: interact_grad_on_SUM
-  // NEXT_INTERACTION: interact_DP0
+  // NEXT_INTERACTION: interact_era_on_SUM
   rankdir=BT;
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
@@ -50,24 +50,21 @@ digraph G {
   n37 -> n41 [label=""];
   n58 [label="SUM\n[1,1]", shape=box, fillcolor="#ffcccc"];
   dup60 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];
-  n41 -> dup60 [color="#cc0000",penwidth=2.0];
+  n41 -> dup60;
   dup60 -> n58 [label="in (dp1)"];
   t12 [label="t12\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t12 -> n58 [label="axes"];
+  era53 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  n56 -> era53 [label="p",color="#cc0000",penwidth=2.0];
   n51 [label="LOG_PRINT\n[1,1]", shape=box, fillcolor="#f0f0f0"];
   n58 -> n51 [label=""];
-  n71 [label="GRAD\nd/d(t2,t3)", shape=box, fillcolor="#e8d0ff"];
-  dup60 -> n71 [label="y (dp0)"];
-  n67 -> n71 [label="gy"];
-  era66 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  t12 -> era66 [label="p"];
-  n61 [label="RESHAPE\n[1,1]", shape=box, fillcolor="#fff3cd"];
-  num61_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num61_0 -> n61 [label="in"];
-  t13 [label="t13\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t13 -> n61 [label="shape"];
-  n67 [label="EXPAND\n[2,4]", shape=box, fillcolor="#fff3cd"];
-  n61 -> n67 [label="in"];
-  t14 [label="t14\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t14 -> n67 [label="shape"];
+  ctr53 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  era53 -> ctr53 [label="c0"];
+  n51 -> ctr53 [label="c1"];
+  era62 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  num_era62 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num_era62 -> era62 [label="p"];
+  n56 [label="SUM\n[1,1]", shape=box, fillcolor="#ffcccc"];
+  dup60 -> n56 [label="in (dp0)"];
+  t12 -> n56 [label="axes"];
 }

@@ -52,12 +52,15 @@ digraph G {
   n41 -> n45 [label="in"];
   t12 [label="t12\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t12 -> n45 [label="axes"];
-  n51 [label="LOG_PRINT\n[1,1]", shape=box, fillcolor="#f0f0f0"];
+  n49 [label="GRAD\nd/d(t2,t3)", shape=box, fillcolor="#e8d0ff"];
   dup52 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];
   n45 -> dup52 [color="#cc0000",penwidth=2.0];
-  dup52 -> n51 [label=" (dp1)"];
-  n49 [label="GRAD\nd/d(t2,t3)", shape=box, fillcolor="#e8d0ff"];
   dup52 -> n49 [label="y (dp0)"];
   num49_1 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
   num49_1 -> n49 [label="gy"];
+  n51 [label="LOG_PRINT\n[1,1]", shape=box, fillcolor="#f0f0f0"];
+  dup52 -> n51 [label=" (dp1)"];
+  ctr53 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n49 -> ctr53 [label="c0"];
+  n51 -> ctr53 [label="c1"];
 }

@@ -239,12 +239,23 @@
                       x = _xr; }
                     if (getenv("THVM_SCHED_DIAG") && y_id < 10)
                         fprintf(stderr, "  GRAD_TEN_X: y_id=%u x_tag=%u x_ext=%u\n", y_id, term_tag(x), term_ext(x));
-                    if (term_tag(x) == TAG_ANY) {
+	                    if (term_tag(x) == TAG_ANY) {
                         Term slot = term_era();
 	                        if (thvm_grad_targets_find_slot(ctx, y_id, &slot)) {
-	                            // Leaf target hit: materialize explicit gradient update.
-	                            // The GRAD branch itself disappears; gy now belongs to
-	                            // the detached ASSIGN side effect and must not be erased.
+	                            // Leaf target hit.
+	                            // If a real grad slot exists, materialize the explicit
+	                            // update side effect used by training/eval.
+	                            // In graph-only/no-slot mode, siphon the finished
+	                            // gradient into the detached output-root set, then
+	                            // return ERA so the live branch can collapse on the
+	                            // next explicit UOP/ERA cleanup interaction.
+	                            if (term_tag(slot) == TAG_ERA && term_val(slot) == 0) {
+                                    if (getenv("THVM_STEP_GRAPH")) {
+	                                    GRAD_RETURN(gy);
+                                    }
+	                                thvm_grad_output_add(ctx, y_id, gy);
+	                                GRAD_RETURN(term_era());
+	                            }
 	                            u64 _sd = heap_alloc(ctx, 1);
 	                            heap_set(ctx, _sd, slot);
 	                            Term slot0 = term_new(TAG_DP0, 0, _sd);

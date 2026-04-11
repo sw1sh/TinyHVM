@@ -160,6 +160,17 @@ static void phase1_mark_reachable_slots(TinyHVM *ctx, Term root, u8 *reach) {
     if (!(term_tag(root) == TAG_ERA && term_val(root) == 0)) P1_PUSH(root);
     if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
         P1_PUSH(heap_read(ctx, phase1_root_slot));
+    for (u32 gi = 0, gn = thvm_grad_detached_root_count(ctx); gi < gn; gi++) {
+        u64 gloc = thvm_grad_detached_root_loc_get(ctx, gi);
+        if (gloc > 0 && gloc < ctx->heap_pos) {
+            reach[gloc] = 1;
+            P1_PUSH(heap_read(ctx, gloc));
+            continue;
+        }
+        Term groot = thvm_grad_detached_root_get(ctx, gi);
+        if (!(term_tag(groot) == TAG_ERA && term_val(groot) == 0))
+            P1_PUSH(groot);
+    }
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term ht = ctx->heap[h];
         if (term_tag(ht) == TAG_ERA && term_val(ht) != 0) {
@@ -345,6 +356,19 @@ static int thvm_phase1_find_next_actual(TinyHVM *ctx, Term root,
         return 1;
     }
 
+    for (u32 gi = 0, gn = thvm_grad_detached_root_count(ctx); gi < gn; gi++) {
+        u64 gloc = thvm_grad_detached_root_loc_get(ctx, gi);
+        if (gloc == 0 || gloc >= ctx->heap_pos) continue;
+        Term gt = heap_read(ctx, gloc);
+        if (!phase1_term_maybe_active(ctx, gt)) continue;
+        Term gwhnf = gt;
+        if (thvm_phase1_predict_next_redex(ctx, gt, &before, &gwhnf)) {
+            if (out_source_slot) *out_source_slot = gloc;
+            if (out_before) *out_before = before;
+            return 1;
+        }
+    }
+
     u8 *reach = (u8 *)calloc((size_t)ctx->heap_pos, 1);
     phase1_mark_reachable_slots(ctx, root, reach);
     for (u64 h = 1; h < ctx->heap_pos; h++) {
@@ -445,10 +469,28 @@ static Term thvm_phase1_structural_nf(TinyHVM *ctx, Term t) {
             continue;
         }
 
+        int fired = 0;
+        for (u32 gi = 0, gn = thvm_grad_detached_root_count(ctx); gi < gn; gi++) {
+            u64 gloc = thvm_grad_detached_root_loc_get(ctx, gi);
+            if (gloc == 0 || gloc >= ctx->heap_pos) continue;
+            Term gt = heap_read(ctx, gloc);
+            if (!phase1_term_maybe_active(ctx, gt)) continue;
+            Term gr = gt;
+            Term before_g = gt;
+            if (thvm_phase1_fire_one(ctx, gt, &gr, &before_g)) {
+                heap_set(ctx, gloc, gr);
+                if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
+                    heap_set(ctx, phase1_root_slot, t);
+                thvm_step_graph_after_interaction(ctx, before_g, t);
+                fired = 1;
+                break;
+            }
+        }
+        if (fired) continue;
+
         // Otherwise fire one interaction from phase-1 heap agents.
         // No priority classes here: with correct local rules, order should
         // not change structural validity.
-        int fired = 0;
         phase1_mark_reachable_slots(ctx, t, reach);
         for (u64 h = 1; h < ctx->heap_pos; h++) {
             if (h == phase1_root_slot) continue;

@@ -355,6 +355,16 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
 
         if (!(term_tag(root) == TAG_ERA && term_val(root) == 0))
             PUSH_TERM(root);
+        for (u32 gi = 0, gn = thvm_grad_detached_root_count(ctx); gi < gn; gi++) {
+            Term groot = thvm_grad_detached_root_get(ctx, gi);
+            if (!(term_tag(groot) == TAG_ERA && term_val(groot) == 0))
+                PUSH_TERM(groot);
+        }
+        for (u32 gi = 0, gn = thvm_grad_output_count(ctx); gi < gn; gi++) {
+            Term gout = thvm_grad_output_get(ctx, gi);
+            if (!(term_tag(gout) == TAG_ERA && term_val(gout) == 0))
+                PUSH_TERM(gout);
+        }
         // Also seed explicit active ERA agents. GRAD interactions can drop
         // discarded metadata onto detached ERA components that still belong to
         // the literal heap state and must be visible/firable step-by-step.
@@ -506,7 +516,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 else if (_stag == TAG_TEN) { EMIT_TEN((u32)term_val(_shared)); fprintf(f, "  t%u -> dup%llu%s;\n", (u32)term_val(_shared), (unsigned long long)_cur, _hl_principal ? " [color=\"#cc0000\",penwidth=2.0]" : ""); } \
                 else if (_stag == TAG_CTR) { EMIT_CTR_NODE(term_val(_shared)); fprintf(f, "  ctr%llu -> dup%llu%s;\n", (unsigned long long)term_val(_shared), (unsigned long long)_cur, _hl_principal ? " [color=\"#cc0000\",penwidth=2.0]" : ""); } \
                 else if (_stag == TAG_NUM) { f32 _fv; u32 _bv=(u32)term_val(_shared); memcpy(&_fv,&_bv,4); \
-                    fprintf(f, "  num_d%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", (unsigned long long)_cur, _fv); \
+                    fprintf(f, "  num_d%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", (unsigned long long)_cur, (double)_fv); \
                     fprintf(f, "  num_d%llu -> dup%llu%s;\n", (unsigned long long)_cur, (unsigned long long)_cur, _hl_principal ? " [color=\"#cc0000\",penwidth=2.0]" : ""); } \
                 else if (_stag == TAG_ANY) { EMIT_ANY_NODE(_cur); fprintf(f, "  any%llu -> dup%llu%s;\n", (unsigned long long)_cur, (unsigned long long)_cur, _hl_principal ? " [color=\"#cc0000\",penwidth=2.0]" : ""); } \
                 else { EMIT_RAW_NODE(_cur, _shared); fprintf(f, "  h%llu -> dup%llu%s;\n", (unsigned long long)_cur, (unsigned long long)_cur, _hl_principal ? " [color=\"#cc0000\",penwidth=2.0]" : ""); } \
@@ -545,7 +555,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     fprintf(f, "  ctr%llu -> era%llu [label=\"p\"%s];\n", (unsigned long long)term_val(_src), (unsigned long long)(epos), EDGE_HL_LABEL(_ev)); \
                 } else if (_st == TAG_NUM) { \
                     f32 _fv; u32 _bv=(u32)term_val(_src); memcpy(&_fv,&_bv,4); \
-                    fprintf(f, "  num_era%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", (unsigned long long)(epos), _fv); \
+                    fprintf(f, "  num_era%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", (unsigned long long)(epos), (double)_fv); \
                     fprintf(f, "  num_era%llu -> era%llu [label=\"p\"%s];\n", (unsigned long long)(epos), (unsigned long long)(epos), EDGE_HL_LABEL(_ev)); \
                 } else if (_st == TAG_ANY) { \
                     EMIT_ANY_NODE(_ev); \
@@ -740,7 +750,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                                         fprintf(f, "  dup%llu -> ctr%llu [label=\"%s%s\"];\n", _dl, cval, (clbl), _ct==TAG_DP1 ? " (dp1)" : " (dp0)"); \
                                 } else if (_ct == TAG_NUM) { \
                                     f32 _fv; u32 _bv=(u32)_cv; memcpy(&_fv,&_bv,4); \
-                                    fprintf(f, "  num_ctr%llu_%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", cval, (unsigned long long)(cpos), _fv); \
+                                    fprintf(f, "  num_ctr%llu_%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", (unsigned long long)cval, (unsigned long long)(cpos), (double)_fv); \
                                     fprintf(f, "  num_ctr%llu_%llu -> ctr%llu [label=\"%s\"];\n", cval, (unsigned long long)(cpos), cval, (clbl)); \
                                 } else if (_ct == TAG_ERA) { \
                                     if (_cv != 0) { \
@@ -783,7 +793,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     }
                 } else if (ctag == TAG_NUM) {
                     f32 fv; u32 bv=(u32)cval; memcpy(&fv,&bv,4);
-                    fprintf(f, "  num%llu_%u [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", val, ai, fv);
+                    fprintf(f, "  num%llu_%u [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", (unsigned long long)val, ai, (double)fv);
                     if (edge_hl) fprintf(f, "  num%llu_%u -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", val, ai, val, elbl);
                     else         fprintf(f, "  num%llu_%u -> n%llu [label=\"%s\"];\n", val, ai, val, elbl);
                 } else if (ctag == TAG_TOP) {

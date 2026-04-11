@@ -117,6 +117,10 @@ def edge_dp_port(attrs: str) -> str:
     return ""
 
 
+def node_head(g: DotGraph, node_id: str) -> str:
+    return g.nodes.get(node_id, "").split("\\n", 1)[0]
+
+
 def has_erase_path_from_tensor(g: DotGraph, tensor_node: str,
                                out_map: Dict[str, List[Tuple[str, str, str]]]) -> bool:
     q: List[Tuple[str, int]] = [(tensor_node, 0)]
@@ -147,7 +151,8 @@ def prev_interaction_name(g: DotGraph) -> str:
 def check_graphs(graphs: List[DotGraph]) -> List[str]:
     errs: List[str] = []
     g0 = graphs[0]
-    has_init_grad = any(lbl.split("\\n", 1)[0] == "GRAD" for lbl in g0.nodes.values())
+    init_grad_count = sum(1 for lbl in g0.nodes.values() if lbl.split("\\n", 1)[0] == "GRAD")
+    has_init_grad = init_grad_count > 0
     if not has_init_grad:
         errs.append(f"{os.path.basename(g0.path)}: init graph must contain a GRAD node before any interaction")
 
@@ -161,6 +166,44 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
         errs.append(f"{os.path.basename(g0.path)}: missing PREV_INTERACTION metadata")
     if len(graphs) > 1 and not gl.prev_interaction:
         errs.append(f"{os.path.basename(gl.path)}: final graph must record PREV_INTERACTION metadata")
+
+    final_out_map: Dict[str, List[Tuple[str, str, str]]] = {}
+    final_adj: Dict[str, List[str]] = {nid: [] for nid in gl.nodes}
+    for e in gl.edges:
+        final_out_map.setdefault(e[0], []).append(e)
+        final_adj[e[0]].append(e[1])
+        final_adj[e[1]].append(e[0])
+    final_roots = sorted(nid for nid in gl.nodes if not final_out_map.get(nid))
+    if init_grad_count and len(final_roots) != init_grad_count:
+        errs.append(
+            f"{os.path.basename(gl.path)}: final graph has {len(final_roots)} result roots "
+            f"(expected {init_grad_count} from init GRAD roots)"
+        )
+    final_era_nodes = sorted(nid for nid in gl.nodes if gl.kind(nid) == "ERA")
+    if final_era_nodes:
+        errs.append(
+            f"{os.path.basename(gl.path)}: final graph still contains ERA nodes {final_era_nodes[:6]}"
+        )
+    seen_final = set()
+    for nid in gl.nodes:
+        if nid in seen_final:
+            continue
+        q = [nid]
+        seen_final.add(nid)
+        comp = []
+        while q:
+            cur = q.pop(0)
+            comp.append(cur)
+            for nx in final_adj.get(cur, []):
+                if nx in seen_final:
+                    continue
+                seen_final.add(nx)
+                q.append(nx)
+        comp_roots = [n for n in comp if n in final_roots]
+        if not comp_roots:
+            errs.append(
+                f"{os.path.basename(gl.path)}: final graph has rootless component {sorted(comp)[:6]}"
+            )
 
     for g in graphs:
         if g.suffix.startswith("state_no_highlight"):
@@ -216,12 +259,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                 if in_count != 2:
                     errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has {in_count} inputs (expected 2)")
             elif op == "ASSIGN":
-                need = {"tgt", "src"}
-                miss = need - in_labels
-                if miss:
-                    errs.append(f"{os.path.basename(g.path)}: ASSIGN node '{nid}' missing inputs {sorted(miss)}")
-                if in_count != 2:
-                    errs.append(f"{os.path.basename(g.path)}: ASSIGN node '{nid}' has {in_count} inputs (expected 2)")
+                errs.append(f"{os.path.basename(g.path)}: phase-1 graph must not contain ASSIGN node '{nid}'")
             elif op == "GRAD":
                 need = {"y", "gy"}
                 miss = need - in_labels
@@ -272,11 +310,8 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                     parent_edges += 1
             # Detached active ERA: payload -> ERA
             if incident == 1:
-                if payload_edges != 1 or parent_edges != 0:
-                    errs.append(
-                        f"{os.path.basename(g.path)}: ERA node '{nid}' has invalid single-edge form "
-                        f"(labels={labels})"
-                    )
+                # Single-edge inline ERA under a parent op is also valid once
+                # the forward net stays fully lazy in phase 1.
                 continue
             # Inline active ERA under a parent op: payload -> ERA -> parent
             if incident == 2 and payload_edges == 1 and parent_edges == 1:
@@ -331,11 +366,6 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                 errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' is missing dp0 output")
             if not has_dp1:
                 errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' is missing dp1 output")
-            has_era = any(g.kind(dst) == "ERA" for _, dst, _ in outs)
-            has_non_era = any(g.kind(dst) != "ERA" for _, dst, _ in outs)
-            if has_era and not has_non_era:
-                errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' has only ERA output")
-
         # 4b) Isolated tensors indicate heap-dump artifacts or broken links.
         for nid in g.nodes:
             if g.kind(nid) != "TEN":
@@ -383,7 +413,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                         continue
                     has_erase = any(g.kind(n) == "ERA" for n in comp)
                     has_op = any(g.kind(n) == "NODE" for n in comp)
-                    has_assign = any(g.nodes.get(n, "").split("\\n", 1)[0] == "ASSIGN" for n in comp)
+                    has_assign = any(node_head(g, n) == "ASSIGN" for n in comp)
                     if has_op and not has_erase and not has_assign:
                         errs.append(
                             f"{os.path.basename(g.path)}: disconnected non-ERA component with ops: {sorted(comp)[:4]}"

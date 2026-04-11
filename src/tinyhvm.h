@@ -875,6 +875,13 @@ void     thvm_grad_targets_set(TinyHVM *ctx, Term *params, Term *grad_slots, u32
 int      thvm_grad_targets_find_slot(TinyHVM *ctx, u32 tid, Term *out_slot);
 u32      thvm_grad_targets_count(TinyHVM *ctx);
 u32      thvm_grad_targets_get_tid(TinyHVM *ctx, u32 index);
+void     thvm_grad_output_add(TinyHVM *ctx, u32 tid, Term grad);
+u32      thvm_grad_output_count(TinyHVM *ctx);
+Term     thvm_grad_output_get(TinyHVM *ctx, u32 index);
+void     thvm_grad_detached_root_add(TinyHVM *ctx, Term root);
+u32      thvm_grad_detached_root_count(TinyHVM *ctx);
+Term     thvm_grad_detached_root_get(TinyHVM *ctx, u32 index);
+u64      thvm_grad_detached_root_loc_get(TinyHVM *ctx, u32 index);
 void     term_use_clear(void);
 
 // Movement ops

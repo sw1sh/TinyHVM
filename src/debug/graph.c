@@ -168,6 +168,7 @@ static Term step_graph_root_term = 0;
 static Term step_graph_before_grad_y = 0;
 static Term step_graph_before_era_payload = 0;
 static int step_graph_before_top_had_era = 0;
+static char step_graph_last_prev_name[96] = {0};
 
 static void thvm_step_graph_set_before_grad_y(Term y) {
     step_graph_before_grad_y = y;
@@ -186,6 +187,14 @@ static u64 thvm_step_graph_sig(TinyHVM *ctx) {
     #define STEP_MIX(_x) do { h ^= (u64)(_x); h *= 1099511628211ULL; } while (0)
     STEP_MIX(ctx->heap_pos);
     STEP_MIX(ctx->tensor_count);
+    u32 n_detached_root = thvm_grad_detached_root_count(ctx);
+    STEP_MIX(n_detached_root);
+    for (u32 i = 0; i < n_detached_root; i++)
+        STEP_MIX(thvm_grad_detached_root_get(ctx, i));
+    u32 n_grad_out = thvm_grad_output_count(ctx);
+    STEP_MIX(n_grad_out);
+    for (u32 i = 0; i < n_grad_out; i++)
+        STEP_MIX(thvm_grad_output_get(ctx, i));
     for (u64 i = 1; i < ctx->heap_pos; i++) STEP_MIX(ctx->heap[i]);
     for (u32 i = 0; i < ctx->tensor_count; i++) {
         TensorMeta *m = &ctx->tensors[i];
@@ -553,6 +562,7 @@ static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root) {
     step_graph_before_grad_y = 0;
     step_graph_before_era_payload = 0;
     step_graph_before_top_had_era = 0;
+    snprintf(step_graph_last_prev_name, sizeof(step_graph_last_prev_name), "%s", "state_init");
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "mkdir -p %s && rm -f %s/*.dot %s/*.png",
              step_graph_dir, step_graph_dir, step_graph_dir);
@@ -667,7 +677,7 @@ static const char *thvm_step_graph_interaction_name(TinyHVM *ctx, Term before,
 
 static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term root) {
     if (!getenv("THVM_STEP_GRAPH") || !step_graph_active) return;
-    if (step_graph_n >= 200) return;
+    if (step_graph_n >= 1000) return;
     step_graph_root_term = root;
     u64 sig = thvm_step_graph_sig(ctx);
     if (sig == step_graph_last_sig) return;
@@ -691,6 +701,7 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term ro
         return;
     }
     remove(tmp_struct);
+    snprintf(step_graph_last_prev_name, sizeof(step_graph_last_prev_name), "%s", prev_name);
 
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s/.tmp_step.dot", step_graph_dir);
@@ -759,24 +770,28 @@ static void thvm_step_graph_finalize(TinyHVM *ctx) {
             thvm_heap_dot_set_highlight(hs, ht);
         else
             thvm_heap_dot_set_highlight(0, 0);
-        thvm_heap_dot_set_step_meta("", "");
+        thvm_heap_dot_set_step_meta(step_graph_last_prev_name, "");
         thvm_heap_dot_root(ctx, tmp, step_graph_root_term);
         char p[256];
         snprintf(p, sizeof(p), "%s/step_%03u_state_final.dot", step_graph_dir, step_graph_n);
         rename(tmp, p);
+        step_graph_n++;
         step_graph_last_dot_sig = dot_sig;
     }
     step_graph_last_sig = sig;
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "for f in %s/*.dot; do dot -Tpng -Gdpi=150 \"$f\" -o \"${f%%.dot}.png\" 2>/dev/null; done",
-             step_graph_dir);
-    system(cmd);
+    if (!getenv("THVM_STEP_GRAPH_NO_PNG")) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd),
+                 "for f in %s/*.dot; do dot -Tpng -Gdpi=150 \"$f\" -o \"${f%%.dot}.png\" 2>/dev/null; done",
+                 step_graph_dir);
+        system(cmd);
+    }
     fprintf(stderr, "Step graphs (%u steps) → %s/\n", step_graph_n, step_graph_dir);
     thvm_heap_dot_set_highlight(0, 0);
     thvm_heap_dot_set_step_meta("", "");
     step_graph_before_grad_y = 0;
     step_graph_before_era_payload = 0;
     step_graph_active = 0;
+    step_graph_last_prev_name[0] = '\0';
     step_graph_n = 0;
 }

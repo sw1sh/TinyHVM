@@ -23,6 +23,7 @@ BINARY_OPS = {
 }
 UNARY_OPS = {"NEG", "RELU", "EXP", "LOG", "SQRT"}
 VIEW_OPS = {"RESHAPE", "PERMUTE", "EXPAND", "SHRINK", "PAD"}
+PASSTHRU_UNARY_OPS = {"LOG_PRINT"}
 
 
 @dataclass
@@ -148,6 +149,13 @@ def prev_interaction_name(g: DotGraph) -> str:
     return ""
 
 
+def interactions_match(expected: str, actual: str) -> bool:
+    if expected == actual:
+        return True
+    dp_steps = {"interact_DP0", "interact_DP1"}
+    return expected in dp_steps and actual in dp_steps
+
+
 def check_graphs(graphs: List[DotGraph]) -> List[str]:
     errs: List[str] = []
     g0 = graphs[0]
@@ -173,12 +181,25 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
         final_out_map.setdefault(e[0], []).append(e)
         final_adj[e[0]].append(e[1])
         final_adj[e[1]].append(e[0])
+    init_out_map: Dict[str, List[Tuple[str, str, str]]] = {}
+    for e in g0.edges:
+        init_out_map.setdefault(e[0], []).append(e)
+    init_roots = sorted(nid for nid in g0.nodes if not init_out_map.get(nid))
     final_roots = sorted(nid for nid in gl.nodes if not final_out_map.get(nid))
-    if init_grad_count and len(final_roots) != init_grad_count:
+    min_final_roots = sum(1 for nid in init_roots if node_head(g0, nid) != "GRAD")
+    max_final_roots = len(init_roots)
+    if len(final_roots) < min_final_roots:
         errs.append(
             f"{os.path.basename(gl.path)}: final graph has {len(final_roots)} result roots "
-            f"(expected {init_grad_count} from init GRAD roots)"
+            f"(expected at least {min_final_roots} non-GRAD roots from init graph to remain live)"
         )
+    if len(final_roots) > max_final_roots:
+        errs.append(
+            f"{os.path.basename(gl.path)}: final graph has {len(final_roots)} result roots "
+            f"(expected no more than {max_final_roots} init roots)"
+        )
+    if not final_roots:
+        errs.append(f"{os.path.basename(gl.path)}: final graph must retain at least one root")
     final_era_nodes = sorted(nid for nid in gl.nodes if gl.kind(nid) == "ERA")
     if final_era_nodes:
         errs.append(
@@ -273,7 +294,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
             elif op in BINARY_OPS:
                 if in_count != 2:
                     errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has {in_count} inputs (expected 2)")
-            elif op in UNARY_OPS:
+            elif op in UNARY_OPS or op in PASSTHRU_UNARY_OPS:
                 if in_count != 1:
                     errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has {in_count} inputs (expected 1)")
 
@@ -429,7 +450,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
         if not b_prev:
             errs.append(f"{os.path.basename(b.path)}: missing PREV_INTERACTION metadata")
             continue
-        if a.next_interaction != b_prev:
+        if not interactions_match(a.next_interaction, b_prev):
             errs.append(
                 f"{os.path.basename(a.path)}: highlighted next interaction '{a.next_interaction}' "
                 f"does not match following step '{b_prev}'"

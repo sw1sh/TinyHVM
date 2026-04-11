@@ -30,6 +30,7 @@ static inline u32 reduce_top_arity(u32 uop) {
     if (uop == UOP_FUSING) return 0;
     if (uop == UOP_WHERE || uop == UOP_IFZ) return 3;
     if (uop == UOP_GRAD) return 2;
+    if (uop == UOP_LOG_PRINT) return 1;
     if (!is_binary(uop) && is_elementwise(uop)) return 1;
     return 2;
 }
@@ -52,6 +53,204 @@ static inline int reduce_top_has_add_zero_arg(TinyHVM *ctx, Term t) {
     Term b = heap_read(ctx, loc + 1);
     return (term_tag(a) == TAG_NUM && term_as_f32(a) == 0.0f) ||
            (term_tag(b) == TAG_NUM && term_as_f32(b) == 0.0f);
+}
+
+static inline u32 reduce_net_term_arity(Term t) {
+    u8 tag = term_tag(t);
+    u32 ext = term_ext(t);
+    switch (tag) {
+        case TAG_TOP:
+            return reduce_top_arity(ext);
+        case TAG_APP:
+        case TAG_LAM:
+        case TAG_BRI:
+        case TAG_SUP:
+        case TAG_USP:
+        case TAG_OP2:
+        case TAG_EQL:
+        case TAG_AND:
+        case TAG_OR:
+        case TAG_MAT:
+        case TAG_ANN:
+            return 2;
+        case TAG_DSU:
+        case TAG_DDU:
+            return 3;
+        case TAG_CTR:
+            return ext;
+        case TAG_DP0:
+        case TAG_DP1:
+        case TAG_UDP:
+        case TAG_ERA:
+        case TAG_VAR:
+        case TAG_INC:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int reduce_net_has_parent_ref(TinyHVM *ctx, Term target) {
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term p = ctx->heap[h];
+        u32 ar = reduce_net_term_arity(p);
+        u64 loc = term_val(p);
+        if (ar == 0 || loc == 0 || loc + ar > ctx->heap_pos) continue;
+        for (u32 i = 0; i < ar; i++) {
+            if (heap_read(ctx, loc + i) == target) return 1;
+        }
+    }
+    return 0;
+}
+
+static void reduce_net_mark_reachable_slots(TinyHVM *ctx, Term root, u8 *reach) {
+    if (!reach || ctx->heap_pos == 0) return;
+    memset(reach, 0, (size_t)ctx->heap_pos);
+    u8 *seen_slot = (u8 *)calloc((size_t)ctx->heap_pos, 1);
+    u8 *seen_dup  = (u8 *)calloc((size_t)ctx->heap_pos, 1);
+    u64 work_cap = ctx->heap_pos ? (ctx->heap_pos * 8) : 0;
+    Term *work = work_cap ? (Term *)malloc(sizeof(Term) * (size_t)work_cap) : NULL;
+    u64 wp = 0;
+    #define REDUCE_PUSH(_tt) do { \
+        if (work && wp < work_cap) work[wp++] = (_tt); \
+    } while (0)
+
+    if (!(term_tag(root) == TAG_ERA && term_val(root) == 0)) REDUCE_PUSH(root);
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) == TAG_ERA && term_val(ht) != 0) {
+            reach[h] = 1;
+            REDUCE_PUSH(ht);
+        }
+    }
+
+    while (work && wp > 0) {
+        Term tt = work[--wp];
+        u8 tg = term_tag(tt);
+        u64 tv = term_val(tt);
+
+        if (tg == TAG_DP0 || tg == TAG_DP1) {
+            u64 dl = tv;
+            if (dl == 0 || dl >= ctx->heap_pos || (seen_dup && seen_dup[dl])) continue;
+            if (seen_dup) seen_dup[dl] = 1;
+            reach[dl] = 1;
+            REDUCE_PUSH(heap_read(ctx, dl));
+            continue;
+        }
+
+        if (tg == TAG_ERA) {
+            if (tv == 0 || tv >= ctx->heap_pos) continue;
+            if (!seen_slot || !seen_slot[tv]) {
+                if (seen_slot) seen_slot[tv] = 1;
+                reach[tv] = 1;
+                REDUCE_PUSH(heap_read(ctx, tv));
+            }
+            continue;
+        }
+
+        u32 ar = reduce_net_term_arity(tt);
+        for (u32 i = 0; i < ar; i++) {
+            u64 p = tv + i;
+            if (p < ctx->heap_pos && (!seen_slot || !seen_slot[p])) {
+                if (seen_slot) seen_slot[p] = 1;
+                reach[p] = 1;
+                REDUCE_PUSH(heap_read(ctx, p));
+            }
+        }
+    }
+
+    free(work);
+    free(seen_dup);
+    free(seen_slot);
+    #undef REDUCE_PUSH
+}
+
+static int reduce_net_term_first_reachable_occurrence(TinyHVM *ctx, u64 h, Term t, const u8 *reach) {
+    for (u64 i = 1; i < h; i++) {
+        if (reach && !reach[i]) continue;
+        if (ctx->heap[i] == t) return 0;
+    }
+    return 1;
+}
+
+static int reduce_net_term_maybe_active(TinyHVM *ctx, Term t) {
+    u8 tag = term_tag(t);
+    if (tag == TAG_TOP) {
+        return term_ext(t) == UOP_GRAD ||
+               reduce_top_has_era_arg(ctx, t) ||
+               reduce_top_has_add_zero_arg(ctx, t);
+    }
+    if (tag == TAG_ERA) return term_val(t) != 0 && !reduce_net_has_parent_ref(ctx, t);
+    if (tag == TAG_TEN || tag == TAG_NUM || tag == TAG_LAM || tag == TAG_SUP ||
+        tag == TAG_BRI || tag == TAG_MAT || tag == TAG_ANY || tag == TAG_USP)
+        return 0;
+    return 1;
+}
+
+static int reduce_net_term_needs_global_cleanup(TinyHVM *ctx, Term t) {
+    u8 tag = term_tag(t);
+    if (tag == TAG_ERA) return term_val(t) != 0 && !reduce_net_has_parent_ref(ctx, t);
+    if (tag != TAG_TOP) return 0;
+    return reduce_top_has_era_arg(ctx, t) || reduce_top_has_add_zero_arg(ctx, t);
+}
+
+static int reduce_net_fire_one(TinyHVM *ctx, Term in, Term *out_term) {
+    u64 itrs_before = ctx->itrs;
+    Term r = thvm_reduce_steps(ctx, in, 1);
+    int fired = (ctx->steps_taken > 0) || (ctx->itrs != itrs_before);
+    if (out_term) *out_term = r;
+    return fired;
+}
+
+static Term reduce_net_quiesce(TinyHVM *ctx, Term root) {
+    size_t reach_cap = (size_t)ctx->heap_pos;
+    u8 *reach = (u8 *)calloc(reach_cap ? reach_cap : 1, 1);
+    for (u32 guard = 0; guard < 100000; guard++) {
+        int fired = 0;
+        if ((size_t)ctx->heap_pos > reach_cap) {
+            size_t new_cap = (size_t)ctx->heap_pos;
+            u8 *new_reach = (u8 *)realloc(reach, new_cap);
+            if (!new_reach) break;
+            memset(new_reach + reach_cap, 0, new_cap - reach_cap);
+            reach = new_reach;
+            reach_cap = new_cap;
+        }
+        Term rr = root;
+        if (reduce_net_term_maybe_active(ctx, root)) {
+            if (reduce_net_fire_one(ctx, root, &rr)) {
+                root = rr;
+                continue;
+            }
+        }
+
+        reduce_net_mark_reachable_slots(ctx, root, reach);
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            Term ht = ctx->heap[h];
+            int reachable = !(reach && !reach[h]);
+            if (!reachable && !reduce_net_term_needs_global_cleanup(ctx, ht)) continue;
+            if (!reduce_net_term_maybe_active(ctx, ht)) continue;
+            if ((term_tag(ht) == TAG_DP0 || term_tag(ht) == TAG_DP1 ||
+                 (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD)) &&
+                reachable &&
+                !reduce_net_term_first_reachable_occurrence(ctx, h, ht, reach)) {
+                continue;
+            }
+            Term hr = ht;
+            if (!reduce_net_fire_one(ctx, ht, &hr)) continue;
+            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD) {
+                for (u64 i = 1; i < ctx->heap_pos; i++) {
+                    if (ctx->heap[i] == ht) heap_set(ctx, i, hr);
+                }
+            } else {
+                heap_set(ctx, h, hr);
+            }
+            fired = 1;
+            break;
+        }
+        if (!fired) break;
+    }
+    free(reach);
+    return root;
 }
 
 // Decref input tensors after a TOP fires and produces a fresh output.
@@ -361,6 +560,8 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     #undef PUSH
     #undef BUDGET_HIT
     #undef TRACE_STEP
+    if (depth == 0 && ctx->step_budget == 0)
+        whnf = reduce_net_quiesce(ctx, whnf);
     return whnf;
 }
 

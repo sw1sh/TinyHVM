@@ -101,147 +101,17 @@
             // UOP_FUSING: scheduled kernel — dispatch from KernelEntry.
             // Fired by second thvm_reduce. Reads kernel spec from global table.
             if (uop == UOP_FUSING) {
-                extern KernelEntry sched_kernels[];
                 extern Term kid_results[];
                 extern u32 sched_kernel_count;
                 Term kid_term = heap_read(ctx, loc + 1); // arg1 = kernel index
                 u32 kid = (u32)term_val(kid_term);
-                // Dedup: same kid fired only once (multi-consumer propagation).
                 if (kid < sched_kernel_count && term_tag(kid_results[kid]) != TAG_ERA)
                     RETURN_REDUCED(kid_results[kid]);
-                KernelEntry *ke = &sched_kernels[kid];
-
-                // Allocate output buffer
-                u32 dst_id = tensor_create(ctx, ke->out_shape, DTYPE_F32);
-                TensorMeta *md = &ctx->tensors[dst_id];
-
-                // Collect leaf buffers — resolve placeholder/lazy IDs from UOP_FUSING deps
-                u32 bufs[FUSE_MAX_LEAVES];
-                const View *views[FUSE_MAX_LEAVES];
-                for (u32 i = 0; i < ke->n_leaves; i++) {
-                    u32 lid = ke->leaf_ids[i];
-                    if (lid == 0 || (lid & 0x80000000u)) {
-                        // Placeholder (0) or lazy leaf (bit 31 set).
-                        // Try reducing the leaf term — FUSING leaves fire and return TAG_TEN.
-                        Term lt = ke->leaf_terms[i];
-                        Term lr = thvm_reduce(ctx, lt);
-                        if (term_tag(lr) == TAG_TEN) { lid = (u32)term_val(lr); }
-                        else {
-                            // WNF compute op: the scheduler replaced the TAG_TOP with FUSING
-                            // on the heap but leaf_terms holds the stale TAG_TOP.
-                            // Scan heap for the FUSING that replaced this TAG_TOP.
-                            for (u64 _sh = 1; _sh < ctx->heap_pos; _sh++) {
-                                Term _ht = ctx->heap[_sh];
-                                if (term_tag(_ht) == TAG_TOP && term_ext(_ht) == UOP_FUSING) {
-                                    extern KernelEntry sched_kernels[];
-                                    Term _kid_t = heap_read(ctx, term_val(_ht) + 1);
-                                    u32 _kid = (u32)term_val(_kid_t);
-                                    if (_kid < sched_kernel_count && sched_kernels[_kid].original_term == lt) {
-                                        lr = thvm_reduce(ctx, _ht);
-                                        if (term_tag(lr) == TAG_TEN) { lid = (u32)term_val(lr); break; }
-                                    }
-                                }
-                            }
-                            // View chain: leaf is RESHAPE/EXPAND/etc wrapping a compute op.
-                            // Walk through view ops, dispatch inner FUSING, create view aliases.
-                            if (!(lid && lid != (lid | 0x80000000u)) &&
-                                term_tag(lr) == TAG_TOP && is_view_op(term_ext(lr))) {
-                                Term _inner = lr;
-                                u64 _vlocs[16]; u32 _vn = 0;
-                                while (term_tag(_inner) == TAG_TOP && _vn < 16) {
-                                    u32 _vu = term_ext(_inner);
-                                    if (!is_view_op(_vu)) break;
-                                    _vlocs[_vn++] = term_val(_inner);
-                                    Term _next = heap_read(ctx, term_val(_inner));
-                                    if (term_tag(_next) == TAG_DP0 || term_tag(_next) == TAG_DP1)
-                                        _next = heap_read(ctx, term_val(_next));
-                                    _inner = _next;
-                                }
-                                // Try to dispatch the inner term
-                                Term _ir = thvm_reduce(ctx, _inner);
-                                if (term_tag(_ir) != TAG_TEN) {
-                                    // Scan heap for FUSING that replaced inner
-                                    for (u64 _sh2 = 1; _sh2 < ctx->heap_pos; _sh2++) {
-                                        Term _ht2 = ctx->heap[_sh2];
-                                        if (term_tag(_ht2) == TAG_TOP && term_ext(_ht2) == UOP_FUSING) {
-                                            Term _kid_t2 = heap_read(ctx, term_val(_ht2) + 1);
-                                            u32 _kid2 = (u32)term_val(_kid_t2);
-                                            if (_kid2 < sched_kernel_count && sched_kernels[_kid2].original_term == _inner) {
-                                                _ir = thvm_reduce(ctx, _ht2);
-                                                if (term_tag(_ir) == TAG_TEN) break;
-                                            }
-                                        }
-                                    }
-                                }
-                                if (term_tag(_ir) == TAG_TEN) {
-                                    // Resolve view chain bottom-up
-                                    u32 _tid = (u32)term_val(_ir);
-                                    for (int _vi = (int)_vn - 1; _vi >= 0; _vi--) {
-                                        const View *_sv = st_get(_vlocs[_vi]);
-                                        if (_sv) {
-                                            u32 _nvid = tensor_view_of(ctx, _tid, *_sv);
-                                            _tid = _nvid;
-                                        }
-                                    }
-                                    lid = _tid;
-                                }
-                            }
-                            if (!(lid && lid != (lid | 0x80000000u))) {
-                                fprintf(stderr, "FUSING: leaf %u unresolved (tag=%u ext=%u lt_tag=%u lt_ext=%u)\n",
-                                    i, term_tag(lr),
-                                    term_tag(lr)==TAG_TOP ? term_ext(lr) : 0,
-                                    term_tag(lt),
-                                    term_tag(lt)==TAG_TOP ? term_ext(lt) : 0);
-                                RETURN_REDUCED(term_era());
-                            }
-                        }
-                    }
-                    ENSURE(ctx, lid);
-                    bufs[i] = ctx->tensors[lid].buf_id;
-                    views[i] = &ke->leaf_views[i];
+                {
+                    Term result = thvm_sched_dispatch_kernel(ctx, kid);
+                    if (kid < sched_kernel_count) kid_results[kid] = result;
+                    RETURN_REDUCED(result);
                 }
-
-                // Build ST pointer array for multi-view leaves
-                const ShapeTracker *st_ptrs[FUSE_MAX_LEAVES];
-                int has_multiview = 0;
-                for (u32 i = 0; i < ke->n_leaves; i++) {
-                    st_ptrs[i] = &ke->leaf_sts[i];
-                    if (ke->leaf_sts[i].n_views >= 2) has_multiview = 1;
-                }
-                md->backend->dispatch_kernel_rs(
-                    md->buf_id, bufs, views,
-                    has_multiview ? st_ptrs : NULL, ke->n_leaves,
-                    ke->ops, ke->n_ops, &ke->full_shape,
-                    ke->has_reduce ? &ke->reduce : NULL,
-                    NULL, NULL, 0);
-
-
-                // Post-reduce reshape (if SUM was wrapped by RESHAPE)
-                if (ke->has_reduce && term_tag(ke->reshape_term) != TAG_ERA) {
-                    u64 rs_loc = term_val(ke->reshape_term);
-                    Term shape_t = heap_read(ctx, rs_loc + 1);
-                    if (term_tag(shape_t) == TAG_DP0 || term_tag(shape_t) == TAG_DP1)
-                        shape_t = heap_read(ctx, term_val(shape_t));
-                    if (term_tag(shape_t) == TAG_TEN) {
-                        TensorMeta *ms = &ctx->tensors[(u32)term_val(shape_t)];
-                        u32 rank = ms->view.numel;
-                        f32 dims_f[MAX_DIM];
-                        META_READ(ms->backend, ms->buf_id, dims_f, rank * sizeof(f32));
-                        Shape ns = {.rank = rank};
-                        for (u32 i = 0; i < rank; i++) ns.dims[i] = (u32)dims_f[i];
-                        u32 rs_id = tensor_view_of(ctx, dst_id, view_create(ns));
-                        ctx->tensors[rs_id].creator_op = UOP_RESHAPE;
-                        ctx->tensors[rs_id].src_ids[0] = dst_id;
-                        ctx->itrs++;
-                        Term result = term_ten(rs_id, DTYPE_F32);
-                        kid_results[kid] = result;
-                        RETURN_REDUCED(result);
-                    }
-                }
-                ctx->itrs++;
-                { Term result = term_ten(dst_id, DTYPE_F32);
-                  kid_results[kid] = result;
-                  RETURN_REDUCED(result); }
             }
 
             if (uop == UOP_TODEVICE) {
@@ -327,7 +197,7 @@
                 }
             }
 
-            // UOP_LOG_PRINT(tensor) — print scalar value, return tensor unchanged
+            // UOP_LOG_PRINT(tensor) — print and consume the branch
             if (uop == UOP_LOG_PRINT) {
                 Term t = heap_read(ctx, loc); // WNF from trampoline
                 ctx->itrs++;
@@ -337,8 +207,11 @@
                     u32 n = ctx->tensors[tid].view.numel;
                     if (n == 1) printf("  loss: %.6f\n", val[0]);
                     else        printf("  tensor[%u]: %.6f ...\n", n, val[0]);
+                    tensor_release(ctx, tid);
+                } else if (term_tag(t) == TAG_NUM) {
+                    printf("  loss: %.6f\n", term_as_f32(t));
                 }
-                RETURN_REDUCED(t);
+                RETURN_REDUCED(term_era());
             }
 
             // === Fusion handled by rewrite rules (rewrite/_.c) ===
@@ -487,6 +360,7 @@
                 u32 b_id = is_binary ? (u32)term_val(b) : 0;
                 TensorMeta *mb = is_binary ? &ctx->tensors[b_id] : NULL;
                 u32 out_shape[MAX_DIM]; u32 out_ndim;
+                const View *ov = st_get(loc);
                 if (is_reduce) {
                     out_ndim = ma->view.shape.rank;
                     for (u32 i = 0; i < out_ndim; i++) out_shape[i] = ma->view.shape.dims[i];
@@ -499,7 +373,13 @@
                         if (!b_id) b_id = ax_id;
                     } else { for (int d=(int)out_ndim-1;d>=0;d--) if(out_shape[d]>1){out_shape[d]=1;break;} }
                 } else if (is_binary) {
-                    View av, bv; view_broadcast(&ma->view, &mb->view, &av, &bv, out_shape, &out_ndim);
+                    if (ov) {
+                        out_ndim = ov->shape.rank;
+                        for (u32 i = 0; i < out_ndim; i++) out_shape[i] = ov->shape.dims[i];
+                    } else {
+                        out_ndim = ma->view.shape.rank;
+                        for (u32 i = 0; i < out_ndim; i++) out_shape[i] = ma->view.shape.dims[i];
+                    }
                 } else if (is_movement && term_tag(b)==TAG_TEN) {
                     u32 bv_id = (u32)term_val(b); b_id = bv_id;
                     TensorMeta *bm = &ctx->tensors[bv_id];

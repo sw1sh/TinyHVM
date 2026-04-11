@@ -633,14 +633,8 @@ dispatch_chain:
         if (is_binary(ops[i].uop)) {
             u32 b_buf = temp_bufs[ops[i].arg_b];
             const View *b_view = temp_views[ops[i].arg_b];
-            // Broadcast views to match output shape for CPU strided indexing
-            View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
-            if (view_broadcast(a_view, b_view, &av_bc, &bv_bc, bc_shape, &bc_ndim))
-                m->backend->op_binary(ops[i].uop, dst_buf, &dst_view,
-                                      a_buf, &av_bc, b_buf, &bv_bc);
-            else
-                m->backend->op_binary(ops[i].uop, dst_buf, &dst_view,
-                                      a_buf, a_view, b_buf, b_view);
+            m->backend->op_binary(ops[i].uop, dst_buf, &dst_view,
+                                  a_buf, a_view, b_buf, b_view);
         } else {
             // For unary ops, input view might not match output shape.
             // Use output shape with input strides for correct indexing.

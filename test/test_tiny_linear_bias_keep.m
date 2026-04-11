@@ -1,18 +1,14 @@
-// test_tiny.m — phase-1 graph case for a tiny linear layer with bias
-// loss = sum(relu(x @ W + b)), backward for W and b
+// test_tiny_linear_bias_keep.m — explicit multi-grad bundle readback
 #include "../src/tinyhvm.c"
 #include "../src/backend/cpu/_.c"
 #ifdef __APPLE__
   #include "../src/backend/metal/_.m"
 #endif
 #include <stdio.h>
-#include <math.h>
 
 int main(void) {
-    srand(42);
     TinyHVM *ctx = thvm_init("cpu");
 
-    // Tiny linear layer: x=[2,3], W=[3,4], b=[4]
     f32 xd[] = {1,2,3, 4,5,6};
     f32 wd[] = {
          0.10f, -0.20f,  0.30f,  0.40f,
@@ -26,17 +22,24 @@ int main(void) {
     thvm_set_requires_grad(ctx, w);
     thvm_set_requires_grad(ctx, b);
 
-    // Forward: loss = sum(relu(x @ W + b))
     Term logits = thvm_op(ctx, UOP_ADD,
         thvm_mm(ctx, x, w),
         thvm_expand(ctx, thvm_reshape(ctx, b, SHAPE(1,4)), SHAPE(2,4)));
     Term act = thvm_op(ctx, UOP_RELU, logits, term_era());
     Term loss = thvm_sum_axes(ctx, act, (u32[]){0, 1}, 2);
 
-    Term grad = thvm_grad_multi(ctx, loss, (Term[]){w, b}, NULL, 2);
-    Term log_loss = thvm_log_print(ctx, loss);
-    Term program = thvm_app(ctx, log_loss, grad);
-    thvm_eval(ctx, program);
+    Term params[] = {w, b};
+    Term bundle = thvm_eval(ctx, thvm_grad_multi_keep(ctx, loss, params, 2));
+    if (thvm_grad_bundle_count(ctx, bundle) == 2) {
+        f32 *dw = thvm_to_host(ctx, thvm_grad_bundle_get(ctx, bundle, 0));
+        f32 *db = thvm_to_host(ctx, thvm_grad_bundle_get(ctx, bundle, 1));
+        if (dw && db) {
+            printf("grad_w = [");
+            for (int i = 0; i < 12; i++) printf("%.2f%s", dw[i], i == 11 ? "" : ", ");
+            printf("]\n");
+            printf("grad_b = [%.2f, %.2f, %.2f, %.2f]\n", db[0], db[1], db[2], db[3]);
+        }
+    }
 
     thvm_free(ctx);
     return 0;

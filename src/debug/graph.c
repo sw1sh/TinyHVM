@@ -45,8 +45,11 @@ static u32 tag_arity(u32 tag, u32 ext) {
         case TAG_DP0: case TAG_DP1: return 1; // 1-slot DUP: only heap[val]
         case TAG_OP2: return 2;
         case TAG_TOP:
+            if (ext == UOP_FUSING) return 0;
             if (ext == UOP_WHERE) return 3;
             if (ext == UOP_GRAD) return 2;
+            if (ext == UOP_LOG_PRINT) return 1;
+            if (!is_binary(ext) && is_elementwise(ext)) return 1;
             return 2;
         case TAG_USP: return 2;
         case TAG_UDP: return 1;
@@ -161,7 +164,6 @@ void thvm_heap_graph(TinyHVM *ctx, Term root,
 
 static int step_graph_active = 0;
 static u32 step_graph_n = 0;
-static const char *step_graph_dir = "thvm_steps";
 static u64 step_graph_last_sig = 0;
 static u64 step_graph_last_dot_sig = 0; // signature of unhighlighted structural DOT
 static Term step_graph_root_term = 0;
@@ -169,6 +171,11 @@ static Term step_graph_before_grad_y = 0;
 static Term step_graph_before_era_payload = 0;
 static int step_graph_before_top_had_era = 0;
 static char step_graph_last_prev_name[96] = {0};
+
+static const char *thvm_step_graph_dir(void) {
+    const char *dir = getenv("THVM_STEP_GRAPH_DIR");
+    return (dir && dir[0]) ? dir : "thvm_steps";
+}
 
 static void thvm_step_graph_set_before_grad_y(Term y) {
     step_graph_before_grad_y = y;
@@ -187,14 +194,6 @@ static u64 thvm_step_graph_sig(TinyHVM *ctx) {
     #define STEP_MIX(_x) do { h ^= (u64)(_x); h *= 1099511628211ULL; } while (0)
     STEP_MIX(ctx->heap_pos);
     STEP_MIX(ctx->tensor_count);
-    u32 n_detached_root = thvm_grad_detached_root_count(ctx);
-    STEP_MIX(n_detached_root);
-    for (u32 i = 0; i < n_detached_root; i++)
-        STEP_MIX(thvm_grad_detached_root_get(ctx, i));
-    u32 n_grad_out = thvm_grad_output_count(ctx);
-    STEP_MIX(n_grad_out);
-    for (u32 i = 0; i < n_grad_out; i++)
-        STEP_MIX(thvm_grad_output_get(ctx, i));
     for (u64 i = 1; i < ctx->heap_pos; i++) STEP_MIX(ctx->heap[i]);
     for (u32 i = 0; i < ctx->tensor_count; i++) {
         TensorMeta *m = &ctx->tensors[i];
@@ -336,6 +335,8 @@ static u32 thvm_step_term_arity(Term t) {
         case TAG_DSU:
         case TAG_DDU:
             return 3;
+        case TAG_CTR:
+            return ext;
         case TAG_DP0:
         case TAG_DP1:
         case TAG_UDP:
@@ -393,27 +394,6 @@ static void thvm_step_mark_reachable_slots(TinyHVM *ctx, Term root, u8 *reach) {
             continue;
         }
 
-        if (tg == TAG_CTR) {
-            if (tv == 0 || tv >= ctx->heap_pos) continue;
-            if (!seen_slot || !seen_slot[tv]) {
-                if (seen_slot) seen_slot[tv] = 1;
-                reach[tv] = 1;
-                STEP_PUSH(heap_read(ctx, tv));
-            }
-            Term nt = heap_read(ctx, tv);
-            u32 n = (term_tag(nt) == TAG_NUM) ? (u32)term_val(nt) : 0;
-            if (n > 64) n = 64;
-            for (u32 i = 0; i < 2 * n; i++) {
-                u64 p = tv + 1 + i;
-                if (p < ctx->heap_pos && (!seen_slot || !seen_slot[p])) {
-                    if (seen_slot) seen_slot[p] = 1;
-                    reach[p] = 1;
-                    STEP_PUSH(heap_read(ctx, p));
-                }
-            }
-            continue;
-        }
-
         u32 ar = thvm_step_term_arity(tt);
         for (u32 i = 0; i < ar; i++) {
             u64 p = tv + i;
@@ -445,14 +425,9 @@ static int thvm_step_slot_is_rendered_parent_arg(TinyHVM *ctx, u64 slot) {
         }
         if (tag == TAG_CTR) {
             u64 cl = term_val(p);
-            if (cl >= ctx->heap_pos) continue;
-            Term nt = heap_read(ctx, cl);
-            u32 n = (term_tag(nt) == TAG_NUM) ? (u32)term_val(nt) : 0;
-            if (n > 64) n = 64;
-            for (u32 i = 0; i < n; i++) {
-                if (cl + 1 + 2*i == slot) return 1;
-                if (cl + 1 + 2*i + 1 == slot) return 1;
-            }
+            u32 arity = term_ext(p);
+            if (cl == 0 || cl + arity > ctx->heap_pos) continue;
+            for (u32 i = 0; i < arity; i++) if (cl + i == slot) return 1;
             continue;
         }
         if (tag == TAG_ERA && term_val(p) == slot) return 1;
@@ -558,6 +533,7 @@ static int thvm_step_graph_find_next_interaction(TinyHVM *ctx, u64 *out_slot, Te
 
 static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root) {
     if (!getenv("THVM_STEP_GRAPH") || step_graph_active) return;
+    const char *step_graph_dir = thvm_step_graph_dir();
     step_graph_root_term = root;
     step_graph_before_grad_y = 0;
     step_graph_before_era_payload = 0;
@@ -678,6 +654,7 @@ static const char *thvm_step_graph_interaction_name(TinyHVM *ctx, Term before,
 static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term root) {
     if (!getenv("THVM_STEP_GRAPH") || !step_graph_active) return;
     if (step_graph_n >= 1000) return;
+    const char *step_graph_dir = thvm_step_graph_dir();
     step_graph_root_term = root;
     u64 sig = thvm_step_graph_sig(ctx);
     if (sig == step_graph_last_sig) return;
@@ -754,6 +731,7 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term ro
 
 static void thvm_step_graph_finalize(TinyHVM *ctx) {
     if (!step_graph_active || !getenv("THVM_STEP_GRAPH")) return;
+    const char *step_graph_dir = thvm_step_graph_dir();
     u64 sig = thvm_step_graph_sig(ctx);
     char tmp_struct[256];
     snprintf(tmp_struct, sizeof(tmp_struct), "%s/.tmp_step_struct.dot", step_graph_dir);

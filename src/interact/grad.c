@@ -43,7 +43,13 @@
 	                    GRAD_SPAWN_ERA(_gz); \
 	                    GRAD_RETURN(term_num_f32(0.0f)); \
 	                } while (0)
+	                #define GRAD_DROP(term_to_drop) do { \
+	                    Term _gd = (term_to_drop); \
+	                    GRAD_SPAWN_ERA(_gd); \
+	                    GRAD_RETURN(term_era()); \
+	                } while (0)
 	                Term x  = thvm_grad_target_get(ctx, loc);
+                    int keep_bundle = thvm_grad_targets_has_keep_bundle(ctx);
                 if (getenv("THVM_SCHED_DIAG")) {
                     static int _re=0; _re++; if (_re<=20)
                     fprintf(stderr, "  GRAD_ENTRY[%d]: y_tag=%u y_val=%llu gy_tag=%u x_tag=%u\n",
@@ -92,12 +98,16 @@
 	                    const View *yv = st_get(y_loc);
                     Shape y_shape = yv ? yv->shape : SHAPE(1);
                     Shape a_shape = SHAPE(1), b_shape = SHAPE(1);
+                    #define GRAD_RESOLVE_DP(_tt) do { \
+                        for (int _i = 0; _i < 20 && (term_tag(_tt) == TAG_DP0 || term_tag(_tt) == TAG_DP1); _i++) \
+                            (_tt) = heap_read(ctx, term_val(_tt)); \
+                    } while (0)
                     { Term _at = at;
-                      if (term_tag(_at)==TAG_DP0||term_tag(_at)==TAG_DP1) _at=heap_read(ctx,term_val(_at));
+                      GRAD_RESOLVE_DP(_at);
                       if (term_tag(_at)==TAG_TEN) a_shape=ctx->tensors[(u32)term_val(_at)].view.shape;
                       else if (term_tag(_at)==TAG_TOP) { const View *av=st_get(term_val(_at)); if(av) a_shape=av->shape; } }
 	                    { Term _bt = bt;
-	                      if (term_tag(_bt)==TAG_DP0||term_tag(_bt)==TAG_DP1) _bt=heap_read(ctx,term_val(_bt));
+	                      GRAD_RESOLVE_DP(_bt);
 	                      if (term_tag(_bt)==TAG_TEN) b_shape=ctx->tensors[(u32)term_val(_bt)].view.shape;
 	                      else if (term_tag(_bt)==TAG_TOP) { const View *bv=st_get(term_val(_bt)); if(bv) b_shape=bv->shape; } }
 	                    // Split `at` only when a rule needs both consumed and
@@ -118,6 +128,7 @@
 	                        u64 _l = heap_alloc(ctx, 2); \
 	                        heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); thvm_grad_target_set(ctx, _l, x_); \
 	                        { const View *_gv = NULL; Term _gt = (gy_); \
+	                          GRAD_RESOLVE_DP(_gt); \
 	                          if (term_tag(_gt)==TAG_TEN && (u32)term_val(_gt)<ctx->tensor_count) _gv=&ctx->tensors[(u32)term_val(_gt)].view; \
 	                          else if (term_tag(_gt)==TAG_TOP) _gv=st_get(term_val(_gt)); \
 	                          if (_gv) st_set(_l, _gv); } \
@@ -209,10 +220,11 @@
 	                        default: GRAD_RETURN(GRAD_ERASE(gy));
 	                    }
 		                    #undef GRAD2_H
-		                    #undef BG_GY
-		                    #undef GRAD_SPLIT_AT
-		                    #undef BG
-		                    #undef UG
+	                    #undef BG_GY
+                        #undef GRAD_RESOLVE_DP
+	                    #undef GRAD_SPLIT_AT
+	                    #undef BG
+	                    #undef UG
 		                    #undef UG_DROP
                 }
 
@@ -223,6 +235,9 @@
                     // Non-grad tensors are constants: produce explicit zero,
                     // and erase the consumed incoming gy branch separately.
                     if (!my->requires_grad) {
+                        if (term_tag(x) == TAG_ANY && thvm_grad_targets_count(ctx) > 0) {
+                            GRAD_ZERO(gy);
+                        }
                         GRAD_ZERO(gy);
                     }
                     // Base case: y == x → return grad_y (trampoline reduces)
@@ -241,37 +256,40 @@
                         fprintf(stderr, "  GRAD_TEN_X: y_id=%u x_tag=%u x_ext=%u\n", y_id, term_tag(x), term_ext(x));
 	                    if (term_tag(x) == TAG_ANY) {
                         Term slot = term_era();
-	                        if (thvm_grad_targets_find_slot(ctx, y_id, &slot)) {
-	                            // Leaf target hit.
-	                            // If a real grad slot exists, materialize the explicit
-	                            // update side effect used by training/eval.
-	                            // In graph-only/no-slot mode, siphon the finished
-	                            // gradient into the detached output-root set, then
-	                            // return ERA so the live branch can collapse on the
-	                            // next explicit UOP/ERA cleanup interaction.
-	                            if (term_tag(slot) == TAG_ERA && term_val(slot) == 0) {
-                                    if (getenv("THVM_STEP_GRAPH")) {
-	                                    GRAD_RETURN(gy);
-                                    }
-	                                thvm_grad_output_add(ctx, y_id, gy);
+                        u32 target_index = 0;
+	                        if (thvm_grad_targets_find_index(ctx, y_id, &target_index, &slot)) {
+	                            if (!(term_tag(slot) == TAG_ERA && term_val(slot) == 0)) {
+	                                u64 _sd = heap_alloc(ctx, 1);
+	                                heap_set(ctx, _sd, slot);
+	                                Term slot0 = term_new(TAG_DP0, 0, _sd);
+	                                Term slot1 = term_new(TAG_DP1, 0, _sd);
+	                                Term accum = thvm_op_raw(ctx, UOP_ADD, slot0, gy);
+	                                u64 _ah = heap_alloc(ctx, 1);
+	                                heap_set(ctx, _ah, thvm_assign(ctx, slot1, accum));
+	                                if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  ASSIGN_CREATE: target_tid=%u\n", y_id);
 	                                GRAD_RETURN(term_era());
 	                            }
-	                            u64 _sd = heap_alloc(ctx, 1);
-	                            heap_set(ctx, _sd, slot);
-	                            Term slot0 = term_new(TAG_DP0, 0, _sd);
-	                            Term slot1 = term_new(TAG_DP1, 0, _sd);
-	                            Term accum = thvm_op_raw(ctx, UOP_ADD, slot0, gy);
-	                            u64 _ah = heap_alloc(ctx, 1);
-	                            heap_set(ctx, _ah, thvm_assign(ctx, slot1, accum));
-	                            if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  ASSIGN_CREATE: target_tid=%u\n", y_id);
-	                            GRAD_RETURN(term_era());
+                                if (keep_bundle) {
+                                    thvm_grad_bundle_accum(ctx, target_index, gy);
+                                    GRAD_RETURN(term_num_f32(0.0f));
+                                }
+                                // Single-target no-slot mode should behave like
+                                // plain thvm_grad: the matched leaf returns the
+                                // live backward branch instead of dropping it.
+                                if (thvm_grad_targets_count(ctx) == 1) {
+                                    GRAD_RETURN(gy);
+                                }
+                                GRAD_ZERO(gy);
 	                        }
 	                    }
 
                     // "all params" pattern: only requires_grad leaves survive.
-                    // If this leaf is not in the explicit multi-target table,
-                    // gy itself is the leaf gradient value.
+                    // If an explicit multi-target table exists and this leaf is
+                    // not in it, the local derivative is zero.
 	                    if (term_tag(x) == TAG_ANY) {
+                            if (thvm_grad_targets_count(ctx) > 0) {
+                                GRAD_ZERO(gy);
+                            }
 	                        if (my->requires_grad) GRAD_RETURN(gy);
 	                        GRAD_ZERO(gy);
 	                    }
@@ -357,6 +375,7 @@
 	                GRAD_RETURN(GRAD_ERASE(gy));
 	                #undef GRAD_SPAWN_ERA
 	                #undef GRAD_ZERO
+                    #undef GRAD_DROP
 	                #undef GRAD_ERASE
 	                #undef GRAD_ERASE2
 	                #undef GRAD_RETURN

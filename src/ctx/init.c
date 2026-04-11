@@ -2,6 +2,8 @@ TinyHVM *thvm_init(const char *default_device) {
     TinyHVM *ctx = calloc(1, sizeof(TinyHVM));
     ctx->tensors = calloc(MAX_TENSORS, sizeof(TensorMeta));
     ctx->heap = calloc(HEAP_CAP, sizeof(Term));
+    ctx->dup_ports = calloc(DUP_PORT_CAP, sizeof(DupPortEntry));
+    ctx->sched_rewrites = calloc(SCHED_REWRITE_CAP, sizeof(SchedRewriteEntry));
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();  // sentinel: prevent TAG_APP(0) self-loop
     ctx->tensor_count = 1;      // reserve tensor 0 as sentinel (0 = "no tensor")
@@ -27,6 +29,10 @@ TinyHVM *thvm_init(const char *default_device) {
     // Allocate trace buffer
     ctx->trace_cap = 1024;
     ctx->trace_buf = calloc(ctx->trace_cap, sizeof(struct InteractionTrace));
+    // Keep movement ops lazy by default. Explicit RESHAPE/EXPAND/PERMUTE/PAD/
+    // SHRINK terms are the real IR we want to reduce and schedule; eager
+    // TAG_TEN alias allocation only hides that structure from phase 1/2.
+    ctx->no_grad_alloc = 1;
 
     return ctx;
 }
@@ -59,6 +65,8 @@ void thvm_free(TinyHVM *ctx) {
     free(ctx->trace_buf);
     free(ctx->tensors);
     free(ctx->heap);
+    free(ctx->dup_ports);
+    free(ctx->sched_rewrites);
     free(ctx);
     // Clear stale DUP tracking — TAG_TEN terms encode low tensor IDs
     // (0,1,2...) that collide across ctx instances.
@@ -101,6 +109,8 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
     }
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();
+    if (ctx->dup_ports) memset(ctx->dup_ports, 0, DUP_PORT_CAP * sizeof(DupPortEntry));
+    if (ctx->sched_rewrites) memset(ctx->sched_rewrites, 0, SCHED_REWRITE_CAP * sizeof(SchedRewriteEntry));
     // Clear shape tracker — stale entries from old heap locs cause wrong
     // view compositions after heap reuse.
     memset(st_keys, 0, sizeof(st_keys));
@@ -124,7 +134,7 @@ Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {
 
 // Get the output view of any term (TAG_TEN or TAG_TOP with shape tracking)
 static const View *term_view(TinyHVM *ctx, Term t) {
-    if (term_tag(t) == TAG_TEN) return &ctx->tensors[(u32)term_val(t)].view;
+    if (term_tag(t) == TAG_TEN) return tensor_view_get(&ctx->tensors[(u32)term_val(t)]);
     if (term_tag(t) == TAG_TOP) return st_get(term_val(t));
     // Look through DUP nodes: DP0/DP1 share a value at heap[dl+0]
     if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1)
@@ -142,6 +152,62 @@ static const f32 *tensor_host_f32(TinyHVM *ctx, u32 tid) {
 // These are safe to FUSE because single-op backward works with standard rules.
 static int is_ew_single(Term t) {
     return (term_tag(t) == TAG_TOP && is_elementwise(term_ext(t)));
+}
+
+static int shape_eq(Shape a, Shape b) {
+    if (a.rank != b.rank) return 0;
+    for (u32 i = 0; i < a.rank; i++)
+        if (a.dims[i] != b.dims[i]) return 0;
+    return 1;
+}
+
+static Shape shape_left_pad_ones(Shape s, u32 rank) {
+    Shape out = {.rank = rank};
+    u32 pad = rank - s.rank;
+    for (u32 i = 0; i < pad; i++) out.dims[i] = 1;
+    for (u32 i = 0; i < s.rank; i++) out.dims[pad + i] = s.dims[i];
+    return out;
+}
+
+static Term thvm_explicit_broadcast_term(TinyHVM *ctx, Term t, Shape target) {
+    const View *tv = term_view(ctx, t);
+    if (!tv) return t;
+
+    Shape cur = tv->shape;
+    if (cur.rank > target.rank) return t;
+
+    if (cur.rank < target.rank) {
+        Shape padded = shape_left_pad_ones(cur, target.rank);
+        if (!shape_eq(cur, padded)) {
+            t = thvm_reshape(ctx, t, padded);
+            cur = padded;
+        }
+    }
+
+    if (!shape_eq(cur, target)) {
+        for (u32 i = 0; i < target.rank; i++) {
+            if (cur.dims[i] == target.dims[i]) continue;
+            if (!(cur.dims[i] == 1 && target.dims[i] > 1)) return t;
+        }
+        t = thvm_expand(ctx, t, target);
+    }
+    return t;
+}
+
+static void thvm_maybe_normalize_binary_broadcast(TinyHVM *ctx, u32 uop, Term *a, Term *b) {
+    if (!is_elementwise(uop) || !is_binary(uop)) return;
+
+    const View *va = term_view(ctx, *a);
+    const View *vb = term_view(ctx, *b);
+    if (!va || !vb) return;
+
+    View av_bc, bv_bc;
+    u32 bc_shape[MAX_DIM], bc_ndim;
+    if (!view_broadcast(va, vb, &av_bc, &bv_bc, bc_shape, &bc_ndim)) return;
+
+    Shape target = shape_of(bc_shape, bc_ndim);
+    *a = thvm_explicit_broadcast_term(ctx, *a, target);
+    *b = thvm_explicit_broadcast_term(ctx, *b, target);
 }
 
 // DUP tracking: detect when the same term is used in multiple op slots.
@@ -216,6 +282,7 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
 // Fast path: skip linear_use + shape tracking. For internal backward ops
 // Fast path: skip linear_use + shape tracking.
 Term thvm_op_raw(TinyHVM *ctx, u32 uop, Term a, Term b) {
+    thvm_maybe_normalize_binary_broadcast(ctx, uop, &a, &b);
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc, a);
     heap_set(ctx, loc + 1, b);
@@ -245,6 +312,8 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
             }
         }
     }
+
+    thvm_maybe_normalize_binary_broadcast(ctx, uop, &a, &b);
 
     u64 loc = heap_alloc(ctx, 4); // 0-1: args (trampoline overwrites), 2-3: shadow (preserved)
     a = linear_use(ctx, a, loc);

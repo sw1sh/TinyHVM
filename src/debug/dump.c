@@ -51,6 +51,62 @@ static int dot_shape_broadcast(Shape a, Shape b, Shape *out) {
     return 1;
 }
 
+static const char *dot_uop_port_name(u32 uop, u32 argi) {
+    if (uop == UOP_SUM || uop == UOP_RMAX) return argi == 0 ? "in" : "axes";
+    if (uop == UOP_GRAD) return argi == 0 ? "y" : "gy";
+    if (is_view_op(uop)) return argi == 0 ? "in" : "shape";
+    if (is_binary(uop) || uop == UOP_CMP || uop == UOP_MM) return argi == 0 ? "a" : "b";
+    if (uop == UOP_LOG_PRINT) return "in";
+    return "in";
+}
+
+static void dot_kernel_leaf_label(TinyHVM *ctx, const KernelEntry *ke, u32 leaf_idx,
+                                  char *buf, size_t bufsz) {
+    if (bufsz == 0) return;
+    buf[0] = '\0';
+    for (u32 oi = 0; oi < ke->n_ops; oi++) {
+        if (ke->ops[oi].arg_a == leaf_idx) {
+            u32 u = ke->ops[oi].uop;
+            snprintf(buf, bufsz, "%s:%s",
+                     (u < UOP_COUNT) ? uop_names[u] : "?",
+                     dot_uop_port_name(u, 0));
+            return;
+        }
+        if (ke->ops[oi].arg_b == leaf_idx) {
+            u32 u = ke->ops[oi].uop;
+            snprintf(buf, bufsz, "%s:%s",
+                     (u < UOP_COUNT) ? uop_names[u] : "?",
+                     dot_uop_port_name(u, 1));
+            return;
+        }
+    }
+    if (ke->has_reduce && term_tag(ke->sum_term) == TAG_TOP) {
+        Term axes = heap_read(ctx, term_val(ke->sum_term) + 1);
+        if (term_tag(axes) == TAG_DP0 || term_tag(axes) == TAG_DP1)
+            axes = heap_read(ctx, term_val(axes));
+        if (ke->leaf_kinds[leaf_idx] == KERNEL_LEAF_TENSOR &&
+            term_tag(axes) == TAG_TEN &&
+            ke->leaf_ids[leaf_idx] == (u32)term_val(axes)) {
+            snprintf(buf, bufsz, "%s:axes",
+                     ke->has_reduce == UOP_SUM ? "SUM" : "RMAX");
+            return;
+        }
+    }
+    if (ke->leaf_kinds[leaf_idx] == KERNEL_LEAF_NUM) snprintf(buf, bufsz, "const");
+    else snprintf(buf, bufsz, "leaf%u", leaf_idx);
+}
+
+static void dot_kernel_output_label(const KernelEntry *ke, char *buf, size_t bufsz) {
+    if (bufsz == 0) return;
+    if (term_tag(ke->original_term) == TAG_TOP) {
+        u32 u = term_ext(ke->original_term);
+        snprintf(buf, bufsz, "%s:out",
+                 (u < UOP_COUNT) ? uop_names[u] : "out");
+        return;
+    }
+    snprintf(buf, bufsz, "out");
+}
+
 static int dot_infer_top_shape(TinyHVM *ctx, u32 uop, u64 loc, Shape *out);
 
 static int dot_term_shape(TinyHVM *ctx, Term t, Shape *out) {
@@ -64,7 +120,7 @@ static int dot_term_shape(TinyHVM *ctx, Term t, Shape *out) {
         }
         if (tag == TAG_TEN) {
             u32 tid = (u32)term_val(t);
-            if (tid < ctx->tensor_count) { *out = ctx->tensors[tid].view.shape; return 1; }
+            if (tid < ctx->tensor_count) { *out = tensor_view_get(&ctx->tensors[tid])->shape; return 1; }
             return 0;
         }
         if (tag == TAG_TOP) {
@@ -173,6 +229,7 @@ static u32 dot_term_arity(Term t) {
             if (ext == UOP_FUSING) return 0;
             if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
             if (ext == UOP_GRAD) return 2;
+            if (ext == UOP_LOG_PRINT) return 1;
             if (!is_binary(ext) && is_elementwise(ext)) return 1;
             return 2;
         case TAG_APP:
@@ -190,6 +247,8 @@ static u32 dot_term_arity(Term t) {
         case TAG_DSU:
         case TAG_DDU:
             return 3;
+        case TAG_CTR:
+            return ext;
         case TAG_DP0:
         case TAG_DP1:
         case TAG_UDP:
@@ -309,6 +368,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     #define NODE_MARK(v) do { if(n_node_emitted<NODE_DEDUP_MAX) node_emitted[n_node_emitted++]=(v); } while(0)
     u8 *dp_slot_emitted = (u8 *)calloc((size_t)ctx->heap_pos, 1);
     u8 *top_live = (u8 *)calloc((size_t)ctx->heap_pos, 1);
+    u8 *ctr_children_emitted = (u8 *)calloc((size_t)ctx->heap_pos, 1);
     #define DP_SLOT_MARK(pos) do { if ((pos) < ctx->heap_pos) dp_slot_emitted[(pos)] = 1; } while(0)
     #define DP_SLOT_SEEN(pos) (((pos) < ctx->heap_pos) ? dp_slot_emitted[(pos)] : 0)
     #define RAW_NODE_KEY(v) ((v) + 0x200000)
@@ -325,13 +385,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     #define EMIT_CTR_NODE(cloc) do { \
         if (!NODE_SEEN(CTR_NODE_KEY(cloc))) { \
             NODE_MARK(CTR_NODE_KEY(cloc)); \
-            u32 _n = 0; \
-            if ((cloc) < ctx->heap_pos) { \
-                Term _nt = heap_read(ctx, (cloc)); \
-                if (term_tag(_nt) == TAG_NUM) _n = (u32)term_val(_nt); \
-            } \
-            fprintf(f, "  ctr%llu [label=\"CTR\\nN=%u\", shape=hexagon, fillcolor=\"#f3f3f3\", fontsize=9];\n", \
-                    (unsigned long long)(cloc), _n); \
+            fprintf(f, "  ctr%llu [label=\"CTR\", shape=hexagon, fillcolor=\"#f3f3f3\", fontsize=9];\n", \
+                    (unsigned long long)(cloc)); \
         } \
     } while(0)
     #define EMIT_ANY_NODE(apos) do { \
@@ -355,16 +410,6 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
 
         if (!(term_tag(root) == TAG_ERA && term_val(root) == 0))
             PUSH_TERM(root);
-        for (u32 gi = 0, gn = thvm_grad_detached_root_count(ctx); gi < gn; gi++) {
-            Term groot = thvm_grad_detached_root_get(ctx, gi);
-            if (!(term_tag(groot) == TAG_ERA && term_val(groot) == 0))
-                PUSH_TERM(groot);
-        }
-        for (u32 gi = 0, gn = thvm_grad_output_count(ctx); gi < gn; gi++) {
-            Term gout = thvm_grad_output_get(ctx, gi);
-            if (!(term_tag(gout) == TAG_ERA && term_val(gout) == 0))
-                PUSH_TERM(gout);
-        }
         // Also seed explicit active ERA agents. GRAD interactions can drop
         // discarded metadata onto detached ERA components that still belong to
         // the literal heap state and must be visible/firable step-by-step.
@@ -373,6 +418,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (term_tag(ht) == TAG_ERA && term_val(ht) != 0)
                 PUSH_TERM(ht);
             if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN)
+                PUSH_TERM(ht);
+            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_FUSING)
                 PUSH_TERM(ht);
         }
 
@@ -405,26 +452,6 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 if (!seen_slot || !seen_slot[tv]) {
                     if (seen_slot) seen_slot[tv] = 1;
                     PUSH_TERM(heap_read(ctx, tv));
-                }
-                continue;
-            }
-            if (tg == TAG_CTR) {
-                if (tv == 0 || tv >= ctx->heap_pos) continue;
-                if (!seen_slot || !seen_slot[tv]) {
-                    if (seen_slot) seen_slot[tv] = 1;
-                    PUSH_TERM(heap_read(ctx, tv));
-                }
-                Term nt = heap_read(ctx, tv);
-                if (term_tag(nt) == TAG_NUM) {
-                    u32 n = (u32)term_val(nt);
-                    if (n > 64) n = 64;
-                    for (u32 i = 0; i < 2 * n; i++) {
-                        u64 p = tv + 1 + i;
-                        if (p < ctx->heap_pos && (!seen_slot || !seen_slot[p])) {
-                            if (seen_slot) seen_slot[p] = 1;
-                            PUSH_TERM(heap_read(ctx, p));
-                        }
-                    }
                 }
                 continue;
             }
@@ -643,6 +670,11 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     if (u<UOP_COUNT && !seen_op[u]) { seen_op[u]=1;
                         if (p>0 && ops_s[p-1]!='+') p+=snprintf(ops_s+p,sizeof(ops_s)-p,"+");
                         p+=snprintf(ops_s+p,sizeof(ops_s)-p,"%s",uop_names[u]); }}
+                if (ops_s[0] == '\0' && term_tag(ke->original_term) == TAG_TOP) {
+                    u32 ou = term_ext(ke->original_term);
+                    snprintf(ops_s, sizeof(ops_s), "%s",
+                             (ou < UOP_COUNT) ? uop_names[ou] : "FUSING");
+                }
                 snprintf(label,sizeof(label),"K%u: %s\\n[%s]",kid,ops_s,sh);
                 color = "#ccffcc";
             } else if (ext == UOP_GRAD) {
@@ -657,7 +689,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     } else {
                         for (u32 gi = 0; gi < nt && p < 24; gi++) {
                             u32 tid = thvm_grad_targets_get_tid(ctx, gi);
-                            if (tid != ~0u) p += snprintf(tgt+p, sizeof(tgt)-p, "%st%u", gi?",":"", tid);
+                            if (tid != ~0u)
+                                p += snprintf(tgt + p, sizeof(tgt) - p, "%st%u", gi ? "," : "", tid);
                         }
                     }
                 } else if (term_tag(gx) == TAG_TEN) {
@@ -680,6 +713,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (ext == UOP_GRAD) arity = 2;
             else if (ext == UOP_WHERE) arity = 3;
             else if (ext == UOP_FUSING) arity = 0;
+            else if (ext == UOP_LOG_PRINT) arity = 1;
             else if (!is_binary(ext) && is_elementwise(ext)) arity = 1;
             for (u32 ai = 0; ai < arity; ai++) {
                 Term child = heap_read(ctx, val + ai);
@@ -723,47 +757,42 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     }
 
                     if (cval < ctx->heap_pos) {
-                        Term nt = heap_read(ctx, cval);
-                        u32 n_tgt = (term_tag(nt) == TAG_NUM) ? (u32)term_val(nt) : 0;
-                        if (n_tgt > 64) n_tgt = 64;
-                        for (u32 gi = 0; gi < n_tgt; gi++) {
-                            Term pterm = heap_read(ctx, cval + 1 + 2*gi);
-                            Term sterm = heap_read(ctx, cval + 1 + 2*gi + 1);
-                            char plbl[16], slbl[16];
-                            snprintf(plbl, sizeof(plbl), "p%u", gi);
-                            snprintf(slbl, sizeof(slbl), "slot%u", gi);
-                            #define EMIT_CTR_CHILD(cterm, clbl, cpos) do { \
-                                u8 _ct = term_tag((cterm)); \
-                                u64 _cv = term_val((cterm)); \
+                        u32 ctr_arity = term_ext(child);
+                        for (u32 gi = 0; gi < ctr_arity; gi++) {
+                            Term cterm = heap_read(ctx, cval + gi);
+                            char clbl[16];
+                            snprintf(clbl, sizeof(clbl), "c%u", gi);
+                            #define EMIT_CTR_CHILD(cterm_, clbl_, cpos_) do { \
+                                u8 _ct = term_tag((cterm_)); \
+                                u64 _cv = term_val((cterm_)); \
                                 if (_ct == TAG_TEN) { \
                                     EMIT_TEN((u32)_cv); \
-                                    fprintf(f, "  t%u -> ctr%llu [label=\"%s\"];\n", (u32)_cv, cval, (clbl)); \
+                                    fprintf(f, "  t%u -> ctr%llu [label=\"%s\"];\n", (u32)_cv, cval, (clbl_)); \
                                 } else if (_ct == TAG_TOP) { \
-                                    fprintf(f, "  n%llu -> ctr%llu [label=\"%s\"];\n", _cv, cval, (clbl)); \
+                                    fprintf(f, "  n%llu -> ctr%llu [label=\"%s\"];\n", _cv, cval, (clbl_)); \
                                 } else if (_ct == TAG_DP0 || _ct == TAG_DP1) { \
                                     u64 _dl = _cv; \
-                                    DP_SLOT_MARK(cpos); \
+                                    DP_SLOT_MARK(cpos_); \
                                     EMIT_DUP_CHAIN(_dl); \
-                                    if (heap_dot_hl_on && (u64)(cpos) == heap_dot_hl_slot) \
-                                        fprintf(f, "  dup%llu -> ctr%llu [label=\"%s%s\",color=\"#cc0000\",penwidth=2.0];\n", _dl, cval, (clbl), _ct==TAG_DP1 ? " (dp1)" : " (dp0)"); \
+                                    if (heap_dot_hl_on && (u64)(cpos_) == heap_dot_hl_slot) \
+                                        fprintf(f, "  dup%llu -> ctr%llu [label=\"%s%s\",color=\"#cc0000\",penwidth=2.0];\n", _dl, cval, (clbl_), _ct==TAG_DP1 ? " (dp1)" : " (dp0)"); \
                                     else \
-                                        fprintf(f, "  dup%llu -> ctr%llu [label=\"%s%s\"];\n", _dl, cval, (clbl), _ct==TAG_DP1 ? " (dp1)" : " (dp0)"); \
+                                        fprintf(f, "  dup%llu -> ctr%llu [label=\"%s%s\"];\n", _dl, cval, (clbl_), _ct==TAG_DP1 ? " (dp1)" : " (dp0)"); \
                                 } else if (_ct == TAG_NUM) { \
                                     f32 _fv; u32 _bv=(u32)_cv; memcpy(&_fv,&_bv,4); \
-                                    fprintf(f, "  num_ctr%llu_%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", (unsigned long long)cval, (unsigned long long)(cpos), (double)_fv); \
-                                    fprintf(f, "  num_ctr%llu_%llu -> ctr%llu [label=\"%s\"];\n", cval, (unsigned long long)(cpos), cval, (clbl)); \
+                                    fprintf(f, "  num_ctr%llu_%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", (unsigned long long)cval, (unsigned long long)(cpos_), (double)_fv); \
+                                    fprintf(f, "  num_ctr%llu_%llu -> ctr%llu [label=\"%s\"];\n", cval, (unsigned long long)(cpos_), cval, (clbl_)); \
                                 } else if (_ct == TAG_ERA) { \
                                     if (_cv != 0) { \
-                                        EMIT_ERA_NODE((cpos), (cterm)); \
-                                        fprintf(f, "  era%llu -> ctr%llu [label=\"%s\"];\n", (unsigned long long)(cpos), cval, (clbl)); \
+                                        EMIT_ERA_NODE((cpos_), (cterm_)); \
+                                        fprintf(f, "  era%llu -> ctr%llu [label=\"%s\"];\n", (unsigned long long)(cpos_), cval, (clbl_)); \
                                     } \
                                 } else { \
-                                    EMIT_RAW_NODE(_cv, (cterm)); \
-                                    fprintf(f, "  h%llu -> ctr%llu [label=\"%s\"];\n", (unsigned long long)_cv, cval, (clbl)); \
+                                    EMIT_RAW_NODE(_cv, (cterm_)); \
+                                    fprintf(f, "  h%llu -> ctr%llu [label=\"%s\"];\n", (unsigned long long)_cv, cval, (clbl_)); \
                                 } \
                             } while(0)
-                            EMIT_CTR_CHILD(pterm, plbl, cval + 1 + 2*gi);
-                            EMIT_CTR_CHILD(sterm, slbl, cval + 1 + 2*gi + 1);
+                            EMIT_CTR_CHILD(cterm, clbl, cval + gi);
                             #undef EMIT_CTR_CHILD
                         }
                     }
@@ -810,8 +839,70 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             continue;
         }
 
-        // --- CTR: skip (GRAD parameter, not standalone node) ---
-        if (tag == TAG_CTR) continue;
+        // --- CTR ---
+        if (tag == TAG_CTR) {
+            if (!NODE_SEEN(CTR_NODE_KEY(val))) {
+                NODE_MARK(CTR_NODE_KEY(val));
+                fprintf(f, "  ctr%llu [label=\"CTR\\nN=%u\", shape=hexagon, fillcolor=\"#f3f3f3\", fontsize=9];\n",
+                        (unsigned long long)val, ext);
+            }
+            if (val < ctx->heap_pos && (!ctr_children_emitted || !ctr_children_emitted[val])) {
+                if (ctr_children_emitted) ctr_children_emitted[val] = 1;
+                for (u32 gi = 0; gi < ext; gi++) {
+                    Term cterm = heap_read(ctx, val + gi);
+                    char clbl[16];
+                    snprintf(clbl, sizeof(clbl), "c%u", gi);
+                    u8 ctag = term_tag(cterm);
+                    u64 cval = term_val(cterm);
+                    u64 cpos = val + gi;
+                    if (ctag == TAG_TEN) {
+                        EMIT_TEN((u32)cval);
+                        fprintf(f, "  t%u -> ctr%llu [label=\"%s\"];\n", (u32)cval, (unsigned long long)val, clbl);
+                    } else if (ctag == TAG_TOP) {
+                        if (!NODE_SEEN(cval)) {
+                            NODE_MARK(cval);
+                            const char *opn = term_ext(cterm) < UOP_COUNT ? uop_names[term_ext(cterm)] : "?";
+                            fprintf(f, "  n%llu [label=\"%s\", shape=box, fillcolor=\"#f0f0f0\"];\n",
+                                    (unsigned long long)cval, opn);
+                        }
+                        fprintf(f, "  n%llu -> ctr%llu [label=\"%s\"];\n", (unsigned long long)cval, (unsigned long long)val, clbl);
+                    } else if (ctag == TAG_DP0 || ctag == TAG_DP1) {
+                        u64 dl = cval;
+                        DP_SLOT_MARK(cpos);
+                        EMIT_DUP_CHAIN(dl);
+                        fprintf(f, "  dup%llu -> ctr%llu [label=\"%s%s\"];\n",
+                                (unsigned long long)dl, (unsigned long long)val, clbl,
+                                ctag == TAG_DP1 ? " (dp1)" : " (dp0)");
+                    } else if (ctag == TAG_NUM) {
+                        f32 fv; u32 bv = (u32)cval; memcpy(&fv, &bv, 4);
+                        fprintf(f, "  num_ctr%llu_%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n",
+                                (unsigned long long)val, (unsigned long long)cpos, (double)fv);
+                        fprintf(f, "  num_ctr%llu_%llu -> ctr%llu [label=\"%s\"];\n",
+                                (unsigned long long)val, (unsigned long long)cpos, (unsigned long long)val, clbl);
+                    } else if (ctag == TAG_ERA) {
+                        if (cval != 0) {
+                            EMIT_ERA_NODE(cpos, cterm);
+                            fprintf(f, "  era%llu -> ctr%llu [label=\"%s\"];\n",
+                                    (unsigned long long)cpos, (unsigned long long)val, clbl);
+                        }
+                    } else if (ctag == TAG_ANY) {
+                        EMIT_ANY_NODE(cval);
+                        fprintf(f, "  any%llu -> ctr%llu [label=\"%s\"];\n",
+                                (unsigned long long)cval, (unsigned long long)val, clbl);
+                    } else if (ctag == TAG_CTR) {
+                        EMIT_CTR_NODE(cval);
+                        fprintf(f, "  ctr%llu -> ctr%llu [label=\"%s\"];\n",
+                                (unsigned long long)cval, (unsigned long long)val, clbl);
+                    } else {
+                        EMIT_RAW_NODE(cval, cterm);
+                        fprintf(f, "  h%llu -> ctr%llu [label=\"%s\"];\n",
+                                (unsigned long long)cval, (unsigned long long)val, clbl);
+                    }
+                }
+            }
+            nn++;
+            continue;
+        }
 
         // --- SUP ---
         if (tag == TAG_SUP) {
@@ -824,38 +915,212 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         // Skip TAG_TEN, TAG_NUM at heap positions (shown when referenced as children)
     }
 
+    u8 *fusing_leaf_done = ctx->heap_pos ? (u8 *)calloc((size_t)ctx->heap_pos, 1) : NULL;
+
+    #define EMIT_TOP_NODE_LABEL(_loc, _ext) do { \
+        if (!NODE_SEEN((_loc))) { \
+            NODE_MARK((_loc)); \
+            char label[128]; \
+            const char *color = "#f0f0f0"; \
+            const char *nshape = "box"; \
+            const char *opn = ((_ext) < UOP_COUNT) ? uop_names[(_ext)] : "?"; \
+            const View *v = st_get((_loc)); \
+            Shape shp = SHAPE(1); \
+            int has_shape = 0; \
+            if (v && dot_shape_is_valid(v->shape)) { \
+                shp = v->shape; \
+                has_shape = 1; \
+            } else if (dot_infer_top_shape(ctx, (_ext), (_loc), &shp) && \
+                       dot_shape_is_valid(shp)) { \
+                has_shape = 1; \
+            } \
+            char sh[64] = "?"; \
+            if (has_shape) { \
+                int p = 0; \
+                if (shp.rank == 0) { \
+                    snprintf(sh, sizeof(sh), "1"); \
+                } else { \
+                    sh[0] = '\0'; \
+                    for (u32 d = 0; d < shp.rank && p < 50; d++) \
+                        p += snprintf(sh + p, sizeof(sh) - p, "%s%u", d ? "," : "", shp.dims[d]); \
+                } \
+            } \
+            if ((_ext) == UOP_FUSING) { \
+                Term kid_t2 = heap_read(ctx, (_loc) + 1); \
+                u32 kid2 = (term_tag(kid_t2) == TAG_NUM) ? (u32)term_val(kid_t2) : 0; \
+                KernelEntry *ke2 = &sched_kernels[kid2]; \
+                char ops_s[64] = ""; int p = 0; \
+                if (ke2->has_reduce) { \
+                    p += snprintf(ops_s + p, sizeof(ops_s) - p, "%s", \
+                                  ke2->has_reduce == UOP_SUM ? "SUM" : "RMAX"); \
+                    if (ke2->n_ops) p += snprintf(ops_s + p, sizeof(ops_s) - p, "+"); \
+                } \
+                u8 seen_op[UOP_COUNT] = {0}; \
+                for (u32 oi = 0; oi < ke2->n_ops && p < 50; oi++) { \
+                    u32 u = ke2->ops[oi].uop; \
+                    if (u < UOP_COUNT && !seen_op[u]) { \
+                        seen_op[u] = 1; \
+                        if (p > 0 && ops_s[p - 1] != '+') \
+                            p += snprintf(ops_s + p, sizeof(ops_s) - p, "+"); \
+                        p += snprintf(ops_s + p, sizeof(ops_s) - p, "%s", uop_names[u]); \
+                    } \
+                } \
+                if (ops_s[0] == '\0' && term_tag(ke2->original_term) == TAG_TOP) { \
+                    u32 ou2 = term_ext(ke2->original_term); \
+                    snprintf(ops_s, sizeof(ops_s), "%s", \
+                             (ou2 < UOP_COUNT) ? uop_names[ou2] : "FUSING"); \
+                } \
+                snprintf(label, sizeof(label), "K%u: %s\\n[%s]", kid2, ops_s, sh); \
+                color = "#ccffcc"; \
+            } else if ((_ext) == UOP_GRAD) { \
+                Term gx = thvm_grad_target_get(ctx, (_loc)); \
+                char tgt[32] = "?"; \
+                if (term_tag(gx) == TAG_ANY) { \
+                    int p = 0; \
+                    u32 nt = thvm_grad_targets_count(ctx); \
+                    if (nt == 0) { \
+                        snprintf(tgt, sizeof(tgt), "all"); \
+                    } else { \
+                        for (u32 gi = 0; gi < nt && p < 24; gi++) { \
+                            u32 tid = thvm_grad_targets_get_tid(ctx, gi); \
+                            if (tid != ~0u) \
+                                p += snprintf(tgt + p, sizeof(tgt) - p, "%st%u", gi ? "," : "", tid); \
+                        } \
+                    } \
+                } else if (term_tag(gx) == TAG_TEN) { \
+                    snprintf(tgt, sizeof(tgt), "t%u", (u32)term_val(gx)); \
+                } \
+                snprintf(label, sizeof(label), "GRAD\\nd/d(%s)", tgt); \
+                color = "#e8d0ff"; \
+            } else { \
+                snprintf(label, sizeof(label), "%s\\n[%s]", opn, sh); \
+                if ((_ext) == UOP_ASSIGN) color = "#ffd700"; \
+                else if (is_elementwise((_ext))) color = "#cce5ff"; \
+                else if ((_ext) == UOP_SUM || (_ext) == UOP_RMAX) color = "#ffcccc"; \
+                else if (is_view_op((_ext))) color = "#fff3cd"; \
+                else if ((_ext) == UOP_MM) color = "#ffccff"; \
+            } \
+            fprintf(f, "  n%llu [label=\"%s\", shape=%s, fillcolor=\"%s\"];\n", \
+                    (unsigned long long)(_loc), label, nshape, color); \
+        } \
+    } while(0)
+
+    #define EMIT_FUSING_LEAF_CHILD(_child, _parent_loc, _edge_id, _label) do { \
+        Term _cterm = (_child); \
+        for (int _r = 0; _r < 10; _r++) { \
+            if (term_tag(_cterm) == TAG_DP0 || term_tag(_cterm) == TAG_DP1) { \
+                _cterm = heap_read(ctx, term_val(_cterm)); \
+                continue; \
+            } \
+            break; \
+        } \
+        u8 _ctag = term_tag(_cterm); \
+        u64 _cval = term_val(_cterm); \
+        if (_ctag == TAG_TEN) { \
+            EMIT_TEN((u32)_cval); \
+            fprintf(f, "  t%u -> n%llu [label=\"%s\"];\n", (u32)_cval, (unsigned long long)(_parent_loc), (_label)); \
+        } else if (_ctag == TAG_NUM) { \
+            f32 _fv; u32 _bv = (u32)_cval; memcpy(&_fv, &_bv, 4); \
+            fprintf(f, "  numleaf%llu_%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", \
+                    (unsigned long long)(_parent_loc), (unsigned long long)(_edge_id), (double)_fv); \
+            fprintf(f, "  numleaf%llu_%llu -> n%llu [label=\"%s\"];\n", \
+                    (unsigned long long)(_parent_loc), (unsigned long long)(_edge_id), \
+                    (unsigned long long)(_parent_loc), (_label)); \
+        } else if (_ctag == TAG_ERA) { \
+            u64 _epos = _cval ? _cval : ((u64)(_parent_loc) << 8) ^ (_edge_id); \
+            if (_cval != 0) EMIT_ERA_NODE(_epos, _cterm); \
+            else if (!ERA_SEEN(_epos)) { \
+                ERA_MARK(_epos); \
+                fprintf(f, "  era%llu [label=\"ERA\",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor=\"#ffb8b8\",fontsize=7];\n", \
+                        (unsigned long long)_epos); \
+            } \
+            fprintf(f, "  era%llu -> n%llu [label=\"%s\"];\n", \
+                    (unsigned long long)_epos, (unsigned long long)(_parent_loc), (_label)); \
+        } else if (_ctag == TAG_TOP) { \
+            EMIT_TOP_NODE_LABEL(_cval, term_ext(_cterm)); \
+            fprintf(f, "  n%llu -> n%llu [label=\"%s\"];\n", \
+                    (unsigned long long)_cval, (unsigned long long)(_parent_loc), (_label)); \
+        } else if (_ctag == TAG_CTR) { \
+            EMIT_CTR_NODE(_cval); \
+            fprintf(f, "  ctr%llu -> n%llu [label=\"%s\"];\n", \
+                    (unsigned long long)_cval, (unsigned long long)(_parent_loc), (_label)); \
+        } else if (_ctag == TAG_ANY) { \
+            EMIT_ANY_NODE(_cval); \
+            fprintf(f, "  any%llu -> n%llu [label=\"%s\"];\n", \
+                    (unsigned long long)_cval, (unsigned long long)(_parent_loc), (_label)); \
+        } else { \
+            EMIT_RAW_NODE(_cval, _cterm); \
+            fprintf(f, "  h%llu -> n%llu [label=\"%s\"];\n", \
+                    (unsigned long long)_cval, (unsigned long long)(_parent_loc), (_label)); \
+        } \
+    } while(0)
+
     // FUSING leaf edges (for post-schedule graphs)
     {
         extern KernelEntry sched_kernels[];
         extern u32 sched_kernel_count;
+        u8 output_used[SCHED_MAX_KERNELS];
+        memset(output_used, 0, sizeof(output_used));
+        for (u32 kid = 0; kid < sched_kernel_count; kid++) {
+            KernelEntry *consumer = &sched_kernels[kid];
+            for (u32 li = 0; li < consumer->n_leaves; li++) {
+                if (consumer->leaf_kinds[li] != KERNEL_LEAF_TENSOR) continue;
+                u32 lid = consumer->leaf_ids[li];
+                for (u32 pk = 0; pk < sched_kernel_count; pk++) {
+                    if (sched_kernels[pk].output_tid == lid) {
+                        output_used[pk] = 1;
+                        break;
+                    }
+                }
+            }
+        }
         for (u64 h = 1; h < ctx->heap_pos; h++) {
             Term t = ctx->heap[h];
             if (term_tag(t) != TAG_TOP || term_ext(t) != UOP_FUSING) continue;
             u64 loc = term_val(t);
+            if (top_live && (loc >= ctx->heap_pos || !top_live[loc])) continue;
+            if (fusing_leaf_done && loc < ctx->heap_pos) {
+                if (fusing_leaf_done[loc]) continue;
+                fusing_leaf_done[loc] = 1;
+            }
             Term kid_t = heap_read(ctx, loc + 1);
             if (term_tag(kid_t) != TAG_NUM) continue;
             u32 kid = (u32)term_val(kid_t);
             if (kid >= sched_kernel_count) continue;
             KernelEntry *ke = &sched_kernels[kid];
+            if (output_used[kid] && ke->output_tid) {
+                char out_lbl[48];
+                dot_kernel_output_label(ke, out_lbl, sizeof(out_lbl));
+                EMIT_TEN(ke->output_tid);
+                fprintf(f, "  n%llu -> t%u [style=dashed,color=\"#009900\",fontcolor=\"#006600\",label=\"%s\"];\n",
+                        (unsigned long long)loc, ke->output_tid, out_lbl);
+            }
             for (u32 li = 0; li < ke->n_leaves; li++) {
-                Term lt = ke->leaf_terms[li];
-                for (int _r = 0; _r < 10; _r++) {
-                    if (term_tag(lt)==TAG_TOP && is_view_op(term_ext(lt))) { lt = heap_read(ctx, term_val(lt)); continue; }
-                    if (term_tag(lt)==TAG_DP0||term_tag(lt)==TAG_DP1) { lt = heap_read(ctx, term_val(lt)); continue; }
-                    break;
+                char leaf_lbl[48];
+                dot_kernel_leaf_label(ctx, ke, li, leaf_lbl, sizeof(leaf_lbl));
+                if (ke->leaf_kinds[li] == KERNEL_LEAF_TENSOR) {
+                    EMIT_TEN(ke->leaf_ids[li]);
+                    fprintf(f, "  t%u -> n%llu [style=dashed,color=\"#009900\",fontcolor=\"#006600\",label=\"%s\"];\n",
+                            ke->leaf_ids[li], (unsigned long long)loc, leaf_lbl);
+                } else if (ke->leaf_kinds[li] == KERNEL_LEAF_NUM) {
+                    f32 fv = ke->leaf_nums[li];
+                    fprintf(f, "  numleaf%llu_%u [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n",
+                            (unsigned long long)loc, li, (double)fv);
+                    fprintf(f, "  numleaf%llu_%u -> n%llu [style=dashed,color=\"#009900\",fontcolor=\"#006600\",label=\"%s\"];\n",
+                            (unsigned long long)loc, li, (unsigned long long)loc, leaf_lbl);
                 }
-                if (term_tag(lt) == TAG_TEN) {
-                    EMIT_TEN((u32)term_val(lt));
-                    fprintf(f, "  t%u -> n%llu [style=dashed,color=\"#009900\"];\n", (u32)term_val(lt), loc);
-                } else if (term_tag(lt) == TAG_TOP)
-                    fprintf(f, "  n%llu -> n%llu [style=dashed,color=\"#009900\"];\n", term_val(lt), loc);
             }
         }
     }
 
+    #undef EMIT_FUSING_LEAF_CHILD
+    #undef EMIT_TOP_NODE_LABEL
+
     fprintf(f, "}\n");
     fclose(f);
     free(dp_slot_emitted);
+    free(ctr_children_emitted);
+    free(fusing_leaf_done);
     free(top_live);
     fprintf(stderr, "heap_dot: %u nodes → %s\n", nn, path);
     #undef EMIT_TEN

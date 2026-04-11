@@ -49,6 +49,13 @@
                 t = heap_read(ctx, loc + 1);
                 goto inet_step;
             }
+            // APP-NUM: numeric value in function position is a sequencing
+            // terminal for graph/debug carriers such as grad bundles.
+            if (term_tag(fun) == TAG_NUM) {
+                ctx->itrs++;
+                t = heap_read(ctx, loc + 1);
+                goto inet_step;
+            }
             // APP-ERA: erasure propagation
             if (term_tag(fun) == TAG_ERA) {
                 ctx->itrs++;
@@ -192,36 +199,28 @@
             if (vtag == TAG_DP0 || vtag == TAG_DP1) {
                 u64 dl = vval;
                 if (dl < ctx->heap_pos) {
-                    u8 want = (vtag == TAG_DP0) ? TAG_DP1 : TAG_DP0;
-                    for (u64 h2 = 1; h2 < ctx->heap_pos; h2++) {
-                        Term p = ctx->heap[h2];
-                        if (term_tag(p) == want && term_val(p) == dl) {
-                            ctx->heap[h2] = ctx->heap[dl];
-                            ctx->heap[dl] = term_era();
-                            break;
-                        }
-                    }
+                    u32 other_pi = (vtag == TAG_DP0) ? 1 : 0;
+                    u64 other_slot = thvm_dup_port_slot(ctx, dl, other_pi);
+                    if (other_slot > 0 && other_slot < ctx->heap_pos)
+                        heap_set(ctx, other_slot, heap_read(ctx, dl));
+                    thvm_dup_ports_clear_entry(ctx, dl);
+                    heap_set(ctx, dl, term_era());
                 }
                 goto era_done;
             } else if (vtag == TAG_TEN) {
                 tensor_release(ctx, (u32)vval);
                 goto era_done;
             } else if (vtag == TAG_CTR) {
-                // CTR helper nodes can carry nested terms in heap slots.
+                u32 ar = vext;
                 if (vval < ctx->heap_pos) {
-                    Term nt = heap_read(ctx, vval);
-                    u32 n = (term_tag(nt) == TAG_NUM) ? (u32)term_val(nt) : 0;
-                    if (n > 64) n = 64;
-                    for (u32 i = 0; i < n; i++) {
-                        for (u32 j = 0; j < 2; j++) {
-                            Term child = thvm_era_payload(ctx, heap_read(ctx, vval + 1 + 2 * i + j));
-                            if (term_tag(child) == TAG_ERA && term_val(child) == 0) continue;
-                            if (!have_next) {
-                                next = child;
-                                have_next = 1;
-                            } else {
-                                thvm_spawn_detached_era(ctx, child);
-                            }
+                    for (u32 i = 0; i < ar; i++) {
+                        Term child = thvm_era_payload(ctx, heap_read(ctx, vval + i));
+                        if (term_tag(child) == TAG_ERA && term_val(child) == 0) continue;
+                        if (!have_next) {
+                            next = child;
+                            have_next = 1;
+                        } else {
+                            thvm_spawn_detached_era(ctx, child);
                         }
                     }
                     if (have_next) goto era_continue;
@@ -281,12 +280,11 @@ era_continue:
             #define DUP_STATE_RETURN(_src, _dp0v, _dp1v) do { \
                 Term _v0 = (_dp0v); \
                 Term _v1 = (_dp1v); \
-                Term _dp0 = term_new(TAG_DP0, dup_label, dup_loc); \
-                Term _dp1 = term_new(TAG_DP1, dup_label, dup_loc); \
-                for (u64 _rh = 1; _rh < ctx->heap_pos; _rh++) { \
-                    if (ctx->heap[_rh] == _dp0) ctx->heap[_rh] = _v0; \
-                    else if (ctx->heap[_rh] == _dp1) ctx->heap[_rh] = _v1; \
-                } \
+                u64 _s0 = thvm_dup_port_slot(ctx, dup_loc, 0); \
+                u64 _s1 = thvm_dup_port_slot(ctx, dup_loc, 1); \
+                if (_s0 > 0 && _s0 < ctx->heap_pos) heap_set(ctx, _s0, _v0); \
+                if (_s1 > 0 && _s1 < ctx->heap_pos) heap_set(ctx, _s1, _v1); \
+                thvm_dup_ports_clear_entry(ctx, dup_loc); \
                 heap_set(ctx, dup_loc, term_era()); \
                 ctx->itrs++; \
                 RETURN_REDUCED(dp_index == 0 ? _v0 : _v1); \
@@ -378,7 +376,7 @@ era_continue:
             if (term_tag(val) == TAG_ERA) DUP_STATE_RETURN(val, val, val);
             if (term_tag(val) == TAG_NUM) DUP_STATE_RETURN(val, val, val);
             if (term_tag(val) == TAG_ANY) DUP_STATE_RETURN(val, val, val);
-            if (term_tag(val) == TAG_CTR) DUP_STATE_RETURN(val, val, val); // grad target encoding — atom
+            if (term_tag(val) == TAG_CTR) DUP_STATE_RETURN(val, val, val);
 	            // DUP ⊳ TOP: commute by duplicating the node and splitting children.
 	            if (term_tag(val) == TAG_TOP) {
 	                u32 uop = term_ext(val);

@@ -66,6 +66,7 @@ extern Backend metal_backend;
 static u32  tensor_fill(TinyHVM *ctx, Shape s, f32 val);
 static u32  tensor_transpose_2d(TinyHVM *ctx, u32 src_id);
 static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target);
+static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid);
 
 // Forward declarations for cross-module dependencies
 static u32 reduce_id(TinyHVM *ctx, Term t);

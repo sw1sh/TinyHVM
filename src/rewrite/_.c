@@ -76,8 +76,9 @@ static Term rule_sum_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b) {
 // ============================================================
 static Term rule_elementwise_fuse(TinyHVM *ctx, Term t, u64 loc, Term a, Term b) {
     (void)loc;
-    // During backward: ew chains must stay deferred for reduce fusion.
-    // Ew-only fusion materializes prematurely → SUM can't fuse with chain.
+    // With lazy-by-default view construction, keep ew-only chains deferred so
+    // later reduce/scheduler fusion still sees the full graph. Premature
+    // rewrite fusion here would collapse the chain before SUM/RMAX can absorb it.
     if (ctx->no_grad_alloc) return t;
     int chain = 0;
     if (term_tag(a) == TAG_TOP &&

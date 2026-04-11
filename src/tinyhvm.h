@@ -140,7 +140,7 @@ typedef u64 Term;
 #define UOP_WHERE     25  // elementwise select: WHERE(cond_ten, then_ten, else_ten)
 #define UOP_IFZ       26  // if-zero branch: IFZ(counter_ten, zero_case, succ_lam)
                           // counter==0 → zero_case; counter>0 → APP(succ_lam, counter-1)
-#define UOP_LOG_PRINT 27  // print scalar tensor value, return tensor unchanged
+#define UOP_LOG_PRINT 27  // print value and consume the branch
 
 #define UOP_GRAD      28   // IC gradient: DUP-op interaction in the reducer
 #define UOP_TODEVICE  29   // lazy device transfer: TODEVICE(tensor, device_idx_scalar)
@@ -501,19 +501,33 @@ typedef struct {
 // KernelEntry: scheduler's output — one fused kernel ready for dispatch.
 // Produced by fuse_build_kernel (pure walk), consumed by UOP_FUSING handler.
 #define SCHED_MAX_KERNELS 512
+typedef enum {
+    KERNEL_LEAF_NONE   = 0,
+    KERNEL_LEAF_TENSOR = 1,
+    KERNEL_LEAF_NUM    = 2,
+} KernelLeafKind;
+
 typedef struct {
     FusedOp    ops[FUSE_MAX_OPS]; u32 n_ops;
     u32        leaf_ids[FUSE_MAX_LEAVES];
+    u8         leaf_kinds[FUSE_MAX_LEAVES];
+    f32        leaf_nums[FUSE_MAX_LEAVES];
     View       leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves;
     ShapeTracker leaf_sts[FUSE_MAX_LEAVES]; // multi-view STs for cross-rank indexing
     Shape      full_shape;       // ew iteration domain
-    Shape      out_shape;        // output shape (after reduce)
+    Shape      raw_out_shape;    // raw kernel output shape before result view
+    Shape      out_shape;        // final logical output shape after result view
     ReduceSpec reduce;
     u32        has_reduce;       // 0 or UOP_SUM/UOP_RMAX
-    Term       reshape_term;     // post-reduce RESHAPE (or TAG_ERA)
+    u8         has_result_view;  // result view differs from raw_out_shape
+    View       result_view;      // final view applied to raw kernel output
+    ShapeTracker result_st;      // full result-side movement chain
     Term       sum_term;         // the SUM/RMAX TAG_TOP (for axes)
     Term       original_term;    // original TAG_TOP before scheduling (for multi-consumer propagation)
-    Term       leaf_terms[FUSE_MAX_LEAVES]; // original leaf terms (for resolving UOP_FUSING deps)
+    u32        dep_kids[FUSE_MAX_LEAVES];
+    u32        n_deps;
+    u32        raw_output_tid;
+    u32        output_tid;
     int        fail_code;        // diagnostic: last failure reason from fuse_build_kernel
 } KernelEntry;
 
@@ -568,6 +582,15 @@ typedef struct {
     u8          pool_stride[2];  // stride_h, stride_w
 
 } TensorMeta;
+
+static inline const ShapeTracker *tensor_st_get(const TensorMeta *m) {
+    return (m && m->st.n_views > 0) ? &m->st : NULL;
+}
+
+static inline const View *tensor_view_get(const TensorMeta *m) {
+    const ShapeTracker *st = tensor_st_get(m);
+    return st ? st_last_view(st) : (m ? &m->view : NULL);
+}
 
 // ============================================================
 // Interaction Trace (for single-step reduction debugging)
@@ -656,6 +679,18 @@ typedef struct {
     Term result;   // TAG_APP term (== heap loc since TAG_APP=0)
 } HCSlot;
 
+#define DUP_PORT_CAP (1U << 16)
+typedef struct {
+    u64 dup_loc;
+    u64 port_slot[2];
+} DupPortEntry;
+
+#define SCHED_REWRITE_CAP (1U << 16)
+typedef struct {
+    u64 top_loc;
+    Term rewritten;
+} SchedRewriteEntry;
+
 typedef struct {
     Term       *heap;
     u64         heap_pos;
@@ -668,7 +703,7 @@ typedef struct {
 
     u64         itrs;       // interaction count
     u8          no_fuse;    // (legacy, unused — compute ops always WNF)
-    u8          no_grad_alloc; // (legacy, unused)
+    u8          no_grad_alloc; // keep movement/view ops lazy instead of allocating TEN aliases
     u8          no_dup;     // 1 to skip linear_use DUP (used inside GRAD handler)
     u8          defer_all;   // (legacy, unused)
     u8          dispatch_mode; // (legacy, unused)
@@ -697,6 +732,8 @@ typedef struct {
 
     // Hash-consing table (NULL = disabled, lazy-allocated by thvm_app_hc)
     HCSlot     *hc_table;
+    DupPortEntry *dup_ports;
+    SchedRewriteEntry *sched_rewrites;
 
 } TinyHVM;
 
@@ -710,12 +747,97 @@ static inline Backend *ctx_default_backend(TinyHVM *ctx) {
     return ctx->backends[ctx->default_device];
 }
 
+// Term helpers are defined in term/*.c, but several runtime helpers below
+// need their declarations before the public API block.
+static inline Term term_new(u32 tag, u32 ext, u64 val);
+static inline Term term_era(void);
+static inline u32  term_tag(Term t);
+static inline u32  term_ext(Term t);
+static inline u64  term_val(Term t);
+
+static inline DupPortEntry *thvm_dup_ports_find(TinyHVM *ctx, u64 dup_loc, int create) {
+    if (!ctx || !ctx->dup_ports || dup_loc == 0) return NULL;
+    u32 idx = (u32)((dup_loc * 11400714819323198485ull) & (DUP_PORT_CAP - 1));
+    for (u32 probe = 0; probe < DUP_PORT_CAP; probe++, idx = (idx + 1) & (DUP_PORT_CAP - 1)) {
+        DupPortEntry *e = &ctx->dup_ports[idx];
+        if (e->dup_loc == dup_loc) return e;
+        if (e->dup_loc == 0) {
+            if (!create) return NULL;
+            e->dup_loc = dup_loc;
+            e->port_slot[0] = 0;
+            e->port_slot[1] = 0;
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static inline void thvm_dup_port_remember(TinyHVM *ctx, u64 slot, Term t) {
+    u8 tag = term_tag(t);
+    if (tag != TAG_DP0 && tag != TAG_DP1) return;
+    DupPortEntry *e = thvm_dup_ports_find(ctx, term_val(t), 1);
+    if (!e) return;
+    e->port_slot[tag == TAG_DP1 ? 1 : 0] = slot;
+}
+
+static inline void thvm_dup_port_forget(TinyHVM *ctx, u64 slot, Term t) {
+    u8 tag = term_tag(t);
+    if (tag != TAG_DP0 && tag != TAG_DP1) return;
+    DupPortEntry *e = thvm_dup_ports_find(ctx, term_val(t), 0);
+    if (!e) return;
+    u32 pi = (tag == TAG_DP1) ? 1 : 0;
+    if (e->port_slot[pi] == slot) e->port_slot[pi] = 0;
+}
+
+static inline u64 thvm_dup_port_slot(TinyHVM *ctx, u64 dup_loc, u32 port) {
+    DupPortEntry *e = thvm_dup_ports_find(ctx, dup_loc, 0);
+    if (!e || port > 1) return 0;
+    return e->port_slot[port];
+}
+
+static inline void thvm_dup_ports_clear_entry(TinyHVM *ctx, u64 dup_loc) {
+    DupPortEntry *e = thvm_dup_ports_find(ctx, dup_loc, 0);
+    if (!e) return;
+    e->port_slot[0] = 0;
+    e->port_slot[1] = 0;
+}
+
+static inline SchedRewriteEntry *thvm_sched_rewrites_find(TinyHVM *ctx, u64 top_loc, int create) {
+    if (!ctx || !ctx->sched_rewrites || top_loc == 0) return NULL;
+    u32 idx = (u32)((top_loc * 11400714819323198485ull) & (SCHED_REWRITE_CAP - 1));
+    for (u32 probe = 0; probe < SCHED_REWRITE_CAP; probe++, idx = (idx + 1) & (SCHED_REWRITE_CAP - 1)) {
+        SchedRewriteEntry *e = &ctx->sched_rewrites[idx];
+        if (e->top_loc == top_loc) return e;
+        if (e->top_loc == 0) {
+            if (!create) return NULL;
+            e->top_loc = top_loc;
+            e->rewritten = term_era();
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static inline void thvm_sched_rewrite_remember(TinyHVM *ctx, Term original, Term rewritten) {
+    if (term_tag(original) != TAG_TOP) return;
+    SchedRewriteEntry *e = thvm_sched_rewrites_find(ctx, term_val(original), 1);
+    if (!e) return;
+    e->rewritten = rewritten;
+}
+
+static inline Term thvm_sched_rewrite_get(TinyHVM *ctx, Term original) {
+    if (term_tag(original) != TAG_TOP) return term_era();
+    SchedRewriteEntry *e = thvm_sched_rewrites_find(ctx, term_val(original), 0);
+    return e ? e->rewritten : term_era();
+}
+
 // ============================================================
 // API
 // ============================================================
 
 // Term manipulation
 static inline Term term_new(u32 tag, u32 ext, u64 val);
+static inline Term term_era(void);
 static inline u32  term_tag(Term t);
 static inline u32  term_ext(Term t);
 static inline u64  term_val(Term t);
@@ -818,7 +940,7 @@ CollapseResult thvm_collapse_ordered(TinyHVM *ctx, Term t, u32 limit);
 Term     thvm_where(TinyHVM *ctx, Term cond, Term then_t, Term else_t);
 Term     thvm_assign(TinyHVM *ctx, Term dst, Term src);      // in-place weight update
 Term     thvm_ifz(TinyHVM *ctx, Term counter, Term zero_case, Term succ_lam); // if-zero branch
-Term     thvm_log_print(TinyHVM *ctx, Term tensor);  // print scalar value, return tensor
+Term     thvm_log_print(TinyHVM *ctx, Term tensor);  // print value, then reduce to ERA
 
 // Profiling (dispatches to backend->profile_report/reset)
 void     thvm_profile_report(TinyHVM *ctx);
@@ -866,22 +988,24 @@ f32      thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
 // Gradient ops go through thvm_op → get taped → grad(grad(f)) works.
 Term     thvm_grad(TinyHVM *ctx, Term y, Term x);
 Term     thvm_grad_multi(TinyHVM *ctx, Term loss, Term *params, Term *grad_slots, u32 n_params);
+Term     thvm_grad_keep(TinyHVM *ctx, Term y, Term x);
+Term     thvm_grad_multi_keep(TinyHVM *ctx, Term loss, Term *params, u32 n_params);
+u32      thvm_grad_bundle_count(TinyHVM *ctx, Term bundle);
+Term     thvm_grad_bundle_get(TinyHVM *ctx, Term bundle, u32 index);
 
 // Internal GRAD target registry used by phase-1 GRAD interactions and debug labels.
 void     thvm_grad_targets_clear(TinyHVM *ctx);
 void     thvm_grad_target_set(TinyHVM *ctx, u64 grad_loc, Term x);
 Term     thvm_grad_target_get(TinyHVM *ctx, u64 grad_loc);
 void     thvm_grad_targets_set(TinyHVM *ctx, Term *params, Term *grad_slots, u32 n_params);
+void     thvm_grad_targets_set_keep(TinyHVM *ctx, Term *params, u32 n_params, Term bundle);
 int      thvm_grad_targets_find_slot(TinyHVM *ctx, u32 tid, Term *out_slot);
+int      thvm_grad_targets_find_index(TinyHVM *ctx, u32 tid, u32 *out_index, Term *out_slot);
 u32      thvm_grad_targets_count(TinyHVM *ctx);
 u32      thvm_grad_targets_get_tid(TinyHVM *ctx, u32 index);
-void     thvm_grad_output_add(TinyHVM *ctx, u32 tid, Term grad);
-u32      thvm_grad_output_count(TinyHVM *ctx);
-Term     thvm_grad_output_get(TinyHVM *ctx, u32 index);
-void     thvm_grad_detached_root_add(TinyHVM *ctx, Term root);
-u32      thvm_grad_detached_root_count(TinyHVM *ctx);
-Term     thvm_grad_detached_root_get(TinyHVM *ctx, u32 index);
-u64      thvm_grad_detached_root_loc_get(TinyHVM *ctx, u32 index);
+int      thvm_grad_targets_has_keep_bundle(TinyHVM *ctx);
+Term     thvm_grad_targets_get_keep_bundle(TinyHVM *ctx);
+void     thvm_grad_bundle_accum(TinyHVM *ctx, u32 index, Term grad);
 void     term_use_clear(void);
 
 // Movement ops

@@ -110,9 +110,9 @@ Term thvm_ifz(TinyHVM *ctx, Term counter, Term zero_case, Term succ_lam) {
 }
 
 Term thvm_log_print(TinyHVM *ctx, Term tensor) {
-    u64 loc = heap_alloc(ctx, 2);
+    u64 loc = heap_alloc(ctx, 1);
+    tensor = linear_use(ctx, tensor, loc);
     heap_set(ctx, loc,     tensor);
-    heap_set(ctx, loc + 1, term_era());
     return term_new(TAG_TOP, UOP_LOG_PRINT, loc);
 }
 

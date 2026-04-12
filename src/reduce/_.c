@@ -448,8 +448,8 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 goto enter;
             }
 
-            // UOP_FUSE/UOP_SCHED: arity-1 signals — fire once payload is ready.
-            if (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED) {
+            // UOP_FUSE/UOP_SCHED/UOP_KERNEL: fire once entered (arity 0-1).
+            if (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED || frame_uop == UOP_KERNEL) {
                 if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }

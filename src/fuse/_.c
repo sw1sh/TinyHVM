@@ -38,7 +38,7 @@ static u64        fuse_root_compute_loc = 0;
 static u32        fuse_dep_kids[FUSE_MAX_LEAVES];
 static u32        fuse_n_dep_kids = 0;
 
-static void fuse_set_schedule_boundaries(const u64 *locs,
+void fuse_set_schedule_boundaries(const u64 *locs,
                                          const u32 *output_tids,
                                          const u32 *kids,
                                          u32 n_boundaries,
@@ -51,7 +51,7 @@ static void fuse_set_schedule_boundaries(const u64 *locs,
     fuse_n_dep_kids = 0;
 }
 
-static void fuse_clear_schedule_boundaries(void) {
+void fuse_clear_schedule_boundaries(void) {
     fuse_boundary_locs = NULL;
     fuse_boundary_output_tids = NULL;
     fuse_boundary_kids = NULL;
@@ -173,8 +173,8 @@ static u32  fuse_n_absorbed = 0;
 // Per-fuse state: ASSIGN terms encountered as leaf dependencies.
 // After kernel installation, these are wrapped in SEQ(ASSIGN, KERNEL) for ordering.
 #define FUSE_MAX_ASSIGN_DEPS 16
-static Term fuse_assign_deps[FUSE_MAX_ASSIGN_DEPS];
-static u32  fuse_n_assign_deps = 0;
+Term fuse_assign_deps[FUSE_MAX_ASSIGN_DEPS];
+u32  fuse_n_assign_deps = 0;
 static void fuse_mark_absorbed(Term t) {
     if (fuse_n_absorbed < FUSE_MAX_ABSORBED) fuse_absorbed[fuse_n_absorbed++] = t;
 }
@@ -994,7 +994,7 @@ static void kernel_capture_result_view(TinyHVM *ctx, Term root, Shape raw_out_sh
 // fuse_build_kernel: walk from any compute root, collect ops + leaves + reduce.
 // No pattern matching — accepts ew, SUM, RMAX, RESHAPE(SUM/RMAX), or ew chains.
 // Returns 1 on success (ke filled), 0 on failure.
-static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
+int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     _fuse_has_perm = 0;
     if (term_tag(t) != TAG_TOP) return 0;
     if (!ctx_default_backend(ctx)) return 0;

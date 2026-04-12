@@ -65,6 +65,14 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
                 if (relocs[i].old_loc == old_loc)
                     return term_new(TAG_VAR, term_ext(t), relocs[i].new_loc);
             }
+            if (old_loc < ctx->heap_pos) {
+                Term sub = heap_read(ctx, old_loc);
+                // If this variable is already substituted, clone the resolved
+                // value instead of retaining a live pointer into mutable net state.
+                if (!term_is_sub(sub)) {
+                    return term_clone_r(ctx, sub, relocs, n_relocs, lmap, n_labels, tmap, n_tmap);
+                }
+            }
             return t;  // external variable (not from a cloned LAM)
         }
 

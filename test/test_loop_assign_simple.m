@@ -1,8 +1,12 @@
 // test_loop_assign_simple.m — minimal loop: ASSIGN(w, w*2) N times
-// Tests Y-combinator style recursion with ASSIGN-based mutation.
-// No grad, no backward — just forward compute + ASSIGN + loop control.
+// Tests SEQ-based dependency ordering with ASSIGN mutation.
 //
-// train(n)(w) = IFZ(n, w, λm. train(m)(ASSIGN(w, w*2)))
+// train := λcounter. λw.
+//   IFZ(counter, w,
+//     λm. SEQ(ASSIGN(w, w*2), train(m)(w)))
+//
+// SEQ forces ASSIGN to fire before the recursive call.
+// The recursive call passes the same w tensor (buffer now updated).
 
 #include "../src/tinyhvm.c"
 #include "../src/backend/cpu/_.c"
@@ -16,7 +20,7 @@ static Term simple_loop(TinyHVM *ctx, Term w0, u32 n_steps) {
     u32 train_id = ctx->def_count++;
     assert(train_id < 256);
 
-    // train := λcounter. λw. IFZ(counter, w, λm. train(m)(ASSIGN(w, w*2)))
+    // train := λcounter. λw. IFZ(counter, w, λm. SEQ(ASSIGN(w, w*2), train(m)(w)))
     u64 l_counter = heap_alloc(ctx, 2);
     Term counter_var = term_new(TAG_VAR, 0, l_counter);
     heap_set(ctx, l_counter + 0, term_set_sub(counter_var));
@@ -30,28 +34,38 @@ static Term simple_loop(TinyHVM *ctx, Term w0, u32 n_steps) {
     Term next_counter = term_new(TAG_VAR, 0, l_next);
     heap_set(ctx, l_next + 0, term_set_sub(next_counter));
 
-    // DUP w for: compute (w*2), assign dst, base case return
-    Term w_compute, w_rest;
-    thvm_dup(ctx, thvm_fresh_label(ctx), w_var, &w_compute, &w_rest);
-    Term w_assign, w_done;
-    thvm_dup(ctx, thvm_fresh_label(ctx), w_rest, &w_assign, &w_done);
+    // DUP w for 4 uses: compute_src, assign_dst, recurse_param, base_case
+    Term w1, w2, w3, w4;
+    {
+        Term wa, wb;
+        thvm_dup(ctx, thvm_fresh_label(ctx), w_var, &wa, &wb);
+        thvm_dup(ctx, thvm_fresh_label(ctx), wa, &w1, &w2);
+        thvm_dup(ctx, thvm_fresh_label(ctx), wb, &w3, &w4);
+    }
+    // w1=compute_src (w*2), w2=assign_dst, w3=recurse_param, w4=base_case
 
     // w * 2
     Term two = thvm_expand(ctx, thvm_scalar(ctx, 2.0f), SHAPE(3));
-    Term doubled = thvm_op(ctx, UOP_MUL, w_compute, two);
+    Term doubled = thvm_op(ctx, UOP_MUL, w1, two);
 
-    // ASSIGN(w, w*2) — returns w (same tid) after update
-    Term assign = thvm_assign(ctx, w_assign, doubled);
+    // ASSIGN(w, w*2)
+    Term assign = thvm_assign(ctx, w2, doubled);
 
-    // Recursive: train(m)(ASSIGN(w, w*2))
+    // Recursive call: train(m)(w)
     Term rec = thvm_app(ctx,
                thvm_app(ctx, thvm_ref(ctx, train_id), next_counter),
-                        assign);
-    heap_set(ctx, l_next + 1, rec);
+                        w3);
+
+    // SEQ(ASSIGN(w, w*2), train(m)(w))
+    // Forces ASSIGN before recursion — ASSIGN fires in phase 3,
+    // then SEQ returns the recursive call which reads updated w.
+    Term seq_body = thvm_seq(ctx, assign, rec);
+
+    heap_set(ctx, l_next + 1, seq_body);
     Term succ_lam = term_new(TAG_LAM, 0, l_next);
 
     // IFZ(counter, w, succ_lam)
-    heap_set(ctx, l_w + 1, thvm_ifz(ctx, counter_var, w_done, succ_lam));
+    heap_set(ctx, l_w + 1, thvm_ifz(ctx, counter_var, w4, succ_lam));
     Term lam_w = term_new(TAG_LAM, 0, l_w);
     heap_set(ctx, l_counter + 1, lam_w);
     ctx->defs[train_id] = term_new(TAG_LAM, 0, l_counter);
@@ -82,7 +96,7 @@ int main(int argc, char **argv) {
            (u32)term_tag(result), (u32)term_ext(result),
            (unsigned long long)term_val(result));
 
-    // Read w's buffer directly (ASSIGN updates in place)
+    // Read w's buffer directly
     u32 dtype = DTYPE_F32;
     Shape sh = SHAPE(1);
     f32 *wf = thvm_to_host_raw(ctx, w, &dtype, &sh);

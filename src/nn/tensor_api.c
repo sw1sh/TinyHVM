@@ -17,6 +17,9 @@ Tensor tensor_from_f32(TinyHVM *ctx, const f32 *data, Shape s) {
 
 Tensor tensor_realize(Tensor x) {
     x.term = thvm_eval(x.ctx, x.term);
+    if (term_tag(x.term) == TAG_TOP) {
+        x.term = thvm_force_tensor_term(x.ctx, x.term);
+    }
     return x;
 }
 

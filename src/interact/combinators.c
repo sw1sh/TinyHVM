@@ -521,7 +521,8 @@ era_continue:
             // DUP ⊳ OP2/APP: generic compound node duplication (DUP-NOD)
             if (term_tag(val) == TAG_OP2 || term_tag(val) == TAG_APP ||
                 term_tag(val) == TAG_EQL || term_tag(val) == TAG_AND ||
-                term_tag(val) == TAG_OR  || term_tag(val) == TAG_MAT) {
+                term_tag(val) == TAG_OR  || term_tag(val) == TAG_MAT ||
+                term_tag(val) == TAG_SEQ) {
                 u64 val_loc = term_val(val);
                 u64 r0 = heap_alloc(ctx, 2);
                 u64 r1 = heap_alloc(ctx, 2);
@@ -884,6 +885,52 @@ era_continue:
             }
             // OR-ERA: erased → ERA
             if (term_tag(a) == TAG_ERA) return term_era();
+            return t;
+        }
+
+        // ── Sequencing ──────────────────────────────────────────────────
+
+        // TAG_SEQ: strict sequencing — reduce left, discard, return right.
+        // SEQ(a, b): forces a to WNF, then returns b. The value of a is discarded.
+        // Used for dependency ordering: SEQ(ASSIGN(w,...), kernel_reading_w).
+        case TAG_SEQ: {
+            u64 loc = term_val(t);
+            Term a = heap_read(ctx, loc); // WNF from trampoline
+
+            // SEQ-SUP: distribute through superposition
+            if (term_tag(a) == TAG_SUP) {
+                u32 lab = term_ext(a);
+                u64 sloc = term_val(a);
+                Term a0 = heap_read(ctx, sloc + 0);
+                Term a1 = heap_read(ctx, sloc + 1);
+                Term b = heap_read(ctx, loc + 1);
+                u64 dup = heap_alloc(ctx, 1);
+                heap_set(ctx, dup, b);
+                ctx->itrs++;
+                u64 s0loc = heap_alloc(ctx, 2);
+                heap_set(ctx, s0loc, a0);
+                heap_set(ctx, s0loc + 1, term_new(TAG_DP0, lab, dup));
+                u64 s1loc = heap_alloc(ctx, 2);
+                heap_set(ctx, s1loc, a1);
+                heap_set(ctx, s1loc + 1, term_new(TAG_DP1, lab, dup));
+                t = thvm_sup(ctx, lab,
+                    term_new(TAG_SEQ, 0, s0loc),
+                    term_new(TAG_SEQ, 0, s1loc));
+                INET_RECURSE();
+            }
+            // SEQ-ERA: erased left → return right (effect was erased)
+            if (term_tag(a) == TAG_ERA) {
+                ctx->itrs++;
+                t = heap_read(ctx, loc + 1);
+                INET_RECURSE();
+            }
+            // SEQ-val: left reached WNF (TEN, NUM, CTR, etc.) → discard, return right
+            if (term_tag(a) != TAG_TOP) {
+                ctx->itrs++;
+                t = heap_read(ctx, loc + 1);
+                INET_RECURSE();
+            }
+            // SEQ-TOP: left is still TAG_TOP (WNF compute op) → blocked, return as-is
             return t;
         }
 

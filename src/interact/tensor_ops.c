@@ -145,9 +145,10 @@
             // Future: tinygrad-style memory planner as interaction.
             if (uop == UOP_SCHED) {
                 Term payload = heap_read(ctx, loc);
-                // TODO: implement memory planning as interaction
-                // For now, just enable dispatch and return payload
                 extern int _assign_dispatch_enabled;
+                if (getenv("THVM_SCHED_DIAG"))
+                    fprintf(stderr, "UOP_SCHED: payload_tag=%u payload_ext=%u dispatch=%d\n",
+                            term_tag(payload), term_ext(payload), _assign_dispatch_enabled);
                 _assign_dispatch_enabled = 1;
                 RETURN_REDUCED(payload);
             }

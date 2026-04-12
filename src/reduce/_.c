@@ -396,7 +396,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
 
     if (tag == TAG_APP || tag == TAG_DP0 || tag == TAG_DP1 ||
         tag == TAG_OP2 || tag == TAG_EQL || tag == TAG_AND || tag == TAG_OR ||
-        tag == TAG_DSU || tag == TAG_DDU || tag == TAG_UDP) {
+        tag == TAG_DSU || tag == TAG_DDU || tag == TAG_UDP || tag == TAG_SEQ) {
         u64 loc = term_val(next);
         PUSH(next);
         next = heap_read(ctx, loc + 0);
@@ -444,6 +444,16 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 if (r == frame) { whnf = frame; continue; }
                 TRACE_STEP(frame, r);
                 top_decref_inputs(ctx, loc, frame_uop, r);
+                next = r;
+                goto enter;
+            }
+
+            // UOP_FUSE/UOP_SCHED: arity-1 signals — fire once payload is ready.
+            if (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED) {
+                if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
+                Term r = thvm_interact(ctx, frame);
+                if (r == frame) { whnf = frame; continue; }
+                TRACE_STEP(frame, r);
                 next = r;
                 goto enter;
             }
@@ -551,7 +561,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
 
         if (ftag == TAG_APP || ftag == TAG_DP0 || ftag == TAG_DP1 ||
             ftag == TAG_DSU || ftag == TAG_DDU || ftag == TAG_UDP ||
-            ftag == TAG_AND || ftag == TAG_OR) {
+            ftag == TAG_AND || ftag == TAG_OR  || ftag == TAG_SEQ) {
             u64 floc = term_val(frame);
             heap_set(ctx, floc + 0, whnf);
             // APP sequencing/application must keep descending through active TOP
@@ -670,7 +680,7 @@ static const char *tag_names[] = {
     "APP", "LAM", "VAR", "SUP", "DP0", "DP1", "ERA",
     "NUM", "REF", "OP2", "TEN", "TOP", "CTR",
     "BRI", "ANN", "DSU", "DDU", "INC",
-    "EQL", "AND", "OR", "MAT", "ANY", "USP", "UDP"
+    "EQL", "AND", "OR", "MAT", "ANY", "USP", "UDP", "SEQ"
 };
 
 // uop_names now in tinyhvm.h

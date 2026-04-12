@@ -193,6 +193,14 @@ Term thvm_or(TinyHVM *ctx, Term a, Term b) {
     return term_new(TAG_OR, 0, loc);
 }
 
+// SEQ: strict sequencing — heap [effect, continuation]
+Term thvm_seq(TinyHVM *ctx, Term effect, Term continuation) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc,     effect);
+    heap_set(ctx, loc + 1, continuation);
+    return term_new(TAG_SEQ, 0, loc);
+}
+
 // MAT: pattern match — heap [handler, fallback], EXT = match_tag
 Term thvm_mat(TinyHVM *ctx, u32 match_tag, Term handler, Term fallback) {
     u64 loc = heap_alloc(ctx, 2);

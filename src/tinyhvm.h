@@ -91,7 +91,10 @@ typedef u64 Term;
 #define TAG_USP  23  // Unordered SUP: %L{a, b}. Heap: [a, b], EXT = label. {a,b}=={b,a}.
 #define TAG_UDP  24  // Unordered DUP: !%L{x}=v. Heap: [val], EXT = label. Single output port.
 
-#define TAG_COUNT 25
+// Sequencing (dependency ordering):
+#define TAG_SEQ  25  // SEQ(a, b): strict on a, discard result, return b. Heap: [a, b].
+
+#define TAG_COUNT 26
 
 // ============================================================
 // UOps — Minimal tensor operations (tinygrad-inspired)

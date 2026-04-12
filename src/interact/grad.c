@@ -17,12 +17,17 @@
 	                Term gy = gy_src;
 	                // Restore flags, return directly — trampoline reduces TAG_TOP results
 	                #define GRAD_RETURN(r) do { \
+                        Term _gr = (r); \
+                        if (thvm_grad_mode_get(ctx, loc) == GRAD_MODE_KEEP && \
+                            term_tag(_gr) == TAG_ERA && term_val(_gr) == 0) { \
+                            _gr = term_num_f32(0.0f); \
+                        } \
 	                    heap_set(ctx, loc, term_era()); \
 	                    heap_set(ctx, loc + 1, term_era()); \
 	                    ctx->no_fuse = _saved_nf; \
 	                    ctx->no_grad_alloc = _saved_nga; \
 	                    /* don't set dispatch_mode — let lazy trampoline handle gradient TAG_TOPs */ \
-	                    return (r); \
+	                    return _gr; \
 	                } while(0)
 	                #define GRAD_ERASE(term_to_erase) ({ \
 	                    Term _ge = (term_to_erase); \
@@ -166,6 +171,7 @@
                         if (grad_mode == GRAD_MODE_KEEP && has_keep_bundle) {
                             Term gy_keep = gy;
                             GRAD_RESOLVE_ALIAS(gy_keep);
+                            gy_keep = thvm_force_tensor_term(ctx, gy_keep);
                             thvm_grad_bundle_accum(ctx, loc, target_index, gy_keep);
                             GRAD_RETURN(term_num_f32(0.0f));
                         }
@@ -325,7 +331,7 @@
                         case UOP_MAX: { Term mask=thvm_op_raw(ctx,UOP_CMP,at,bt); f32 one=1; Term inv=thvm_op_raw(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),mask);
                             BG(sum_to_shape(ctx,thvm_op_raw(ctx,UOP_MUL,gy,mask),y_shape,a_shape), sum_to_shape(ctx,thvm_op_raw(ctx,UOP_MUL,gy,inv),y_shape,b_shape)); }
 	                        case UOP_CMP: GRAD_RETURN(GRAD_ERASE(gy));
-                        case UOP_SUM: { Term gy_rs=thvm_reshape(ctx,gy,y_shape); UG_DROP(bt, thvm_expand(ctx,gy_rs,a_shape)); }
+                        case UOP_SUM: { UG_DROP(bt, thvm_expand(ctx, gy, a_shape)); }
                         case UOP_RMAX: { Term max_bc=thvm_expand(ctx,thvm_reshape(ctx,y,y_shape),a_shape); f32 one=1;
                             Term mask=thvm_op_raw(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),thvm_op_raw(ctx,UOP_CMP,max_bc,at));
                             UG_DROP(bt, thvm_op_raw(ctx,UOP_MUL,thvm_expand(ctx,gy,a_shape),mask)); }
@@ -394,6 +400,7 @@
                                 if (grad_mode == GRAD_MODE_KEEP && has_keep_bundle) {
                                     Term gy_keep = gy;
                                     GRAD_RESOLVE_ALIAS(gy_keep);
+                                    gy_keep = thvm_force_tensor_term(ctx, gy_keep);
                                     thvm_grad_bundle_accum(ctx, loc, target_index, gy_keep);
                                     GRAD_RETURN(term_num_f32(0.0f));
                                 }

@@ -162,6 +162,44 @@ static Term thvm_grad_bundle_new(TinyHVM *ctx, u32 n_params) {
 }
 
 static Term thvm_grad_bundle_whnf(TinyHVM *ctx, Term bundle) {
+    if (getenv("THVM_LOOP_DIAG")) {
+        fprintf(stderr, "BUNDLE_WHNF in tag=%u ext=%u val=%llu\n",
+                (u32)term_tag(bundle), (u32)term_ext(bundle),
+                (unsigned long long)term_val(bundle));
+    }
+    // thvm_grad_keep/thvm_grad_multi_keep are often eagerly evaluated by callers.
+    // The keep driver then collapses to ERA after depositing into side bundles.
+    // Recover the single active keep-bundle from the target table in that case.
+    if (term_tag(bundle) == TAG_ERA && term_val(bundle) == 0) {
+        GradTargetSet *s = grad_targets_get(ctx, 0);
+        if (s) {
+            Term only = term_era();
+            u32 best_arity = 0;
+            for (u32 i = 0; i < s->n_loc; i++) {
+                Term b = s->bundles[i];
+                if (term_tag(b) != TAG_CTR) continue;
+                u32 arity = (u32)term_ext(b);
+                if (term_tag(only) != TAG_CTR) {
+                    only = b;
+                    best_arity = arity;
+                    continue;
+                }
+                // Shared target propagation can replicate identical terms.
+                if (only == b) continue;
+                // Prefer non-empty bundles if both are present.
+                if (arity > best_arity) {
+                    only = b;
+                    best_arity = arity;
+                    continue;
+                }
+                if (arity < best_arity) continue;
+                // Two distinct bundles with the same arity: ambiguous.
+                only = term_era();
+                break;
+            }
+            if (term_tag(only) == TAG_CTR) return only;
+        }
+    }
     if (term_tag(bundle) == TAG_APP) {
         u64 app_loc = term_val(bundle);
         if (app_loc + 1 < ctx->heap_pos) {
@@ -176,7 +214,39 @@ static Term thvm_grad_bundle_whnf(TinyHVM *ctx, Term bundle) {
     // generic CTR reduction collapses arity-1 containers to their head term,
     // which destroys bundle structure for single-parameter keep mode.
     if (term_tag(bundle) == TAG_CTR) return bundle;
-    return thvm_reduce(ctx, bundle);
+    Term out = thvm_reduce(ctx, bundle);
+    if (getenv("THVM_LOOP_DIAG")) {
+        fprintf(stderr, "BUNDLE_WHNF out tag=%u ext=%u val=%llu\n",
+                (u32)term_tag(out), (u32)term_ext(out),
+                (unsigned long long)term_val(out));
+    }
+    return out;
+}
+
+static Term thvm_grad_force_slot_expr(TinyHVM *ctx, Term t, u32 depth) {
+    if (depth > 16) return t;
+    if (term_tag(t) == TAG_TEN || term_tag(t) == TAG_NUM || term_tag(t) == TAG_ERA) return t;
+    if (term_tag(t) != TAG_TOP) return t;
+
+    u32 uop = term_ext(t);
+    u64 loc = term_val(t);
+    if (loc >= ctx->heap_pos) return t;
+
+    // Recursively materialize common elementwise slot expressions.
+    if (uop == UOP_ADD || uop == UOP_SUB || uop == UOP_MUL || uop == UOP_DIV || uop == UOP_MAX) {
+        Term a = thvm_grad_force_slot_expr(ctx, heap_read(ctx, loc + 0), depth + 1);
+        Term b = thvm_grad_force_slot_expr(ctx, heap_read(ctx, loc + 1), depth + 1);
+        if (term_tag(a) == TAG_TEN && term_tag(b) == TAG_TEN) {
+            return thvm_force_tensor_term(ctx, thvm_op(ctx, uop, a, b));
+        }
+    }
+    if (uop == UOP_NEG || uop == UOP_EXP || uop == UOP_LOG || uop == UOP_RELU || uop == UOP_SQRT) {
+        Term a = thvm_grad_force_slot_expr(ctx, heap_read(ctx, loc + 0), depth + 1);
+        if (term_tag(a) == TAG_TEN) {
+            return thvm_force_tensor_term(ctx, thvm_op(ctx, uop, a, term_era()));
+        }
+    }
+    return t;
 }
 
 void thvm_grad_targets_clear(TinyHVM *ctx) {
@@ -365,12 +435,16 @@ void thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad) {
     // in-flight backward net can collapse when other consumers reduce; cloning
     // decouples each accumulated slot from that shared reduction state.
     Term kept_grad = term_clone(ctx, grad);
+    // Keep bundle slots materializable: store realized tensor leaves, not
+    // lazy graph fragments that can collapse to ERA after backward completes.
+    kept_grad = thvm_force_tensor_term(ctx, kept_grad);
     if (term_tag(prev) == TAG_NUM && term_as_f32(prev) == 0.0f) {
         heap_set(ctx, loc + index, kept_grad);
         return;
     }
     if (term_tag(kept_grad) == TAG_NUM && term_as_f32(kept_grad) == 0.0f) return;
-    heap_set(ctx, loc + index, thvm_op_raw(ctx, UOP_ADD, prev, kept_grad));
+    Term prev_kept = thvm_force_tensor_term(ctx, prev);
+    heap_set(ctx, loc + index, thvm_op(ctx, UOP_ADD, prev_kept, kept_grad));
 }
 
 Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
@@ -437,9 +511,37 @@ u32 thvm_grad_bundle_count(TinyHVM *ctx, Term bundle) {
 
 Term thvm_grad_bundle_get(TinyHVM *ctx, Term bundle, u32 index) {
     bundle = thvm_grad_bundle_whnf(ctx, bundle);
+    if (getenv("THVM_LOOP_DIAG")) {
+        fprintf(stderr, "BUNDLE_GET whnf tag=%u ext=%u val=%llu idx=%u\n",
+                (u32)term_tag(bundle), (u32)term_ext(bundle),
+                (unsigned long long)term_val(bundle), index);
+    }
     if (term_tag(bundle) != TAG_CTR) return index == 0 ? bundle : term_era();
     if (index >= (u32)term_ext(bundle)) return term_era();
     u64 loc = term_val(bundle);
     if (loc == 0 || loc + index >= ctx->heap_pos) return term_era();
-    return thvm_eval(ctx, heap_read(ctx, loc + index));
+    if (getenv("THVM_LOOP_DIAG")) {
+        Term raw = heap_read(ctx, loc + index);
+        fprintf(stderr, "BUNDLE_GET raw slot=%llu tag=%u ext=%u val=%llu\n",
+                (unsigned long long)(loc + index),
+                (u32)term_tag(raw), (u32)term_ext(raw),
+                (unsigned long long)term_val(raw));
+        if (term_tag(raw) == TAG_TOP && term_ext(raw) == UOP_ADD) {
+            u64 rloc = term_val(raw);
+            if (rloc + 1 < ctx->heap_pos) {
+                Term ra = heap_read(ctx, rloc + 0);
+                Term rb = heap_read(ctx, rloc + 1);
+                fprintf(stderr, "BUNDLE_GET raw_add a=(tag=%u ext=%u val=%llu) b=(tag=%u ext=%u val=%llu)\n",
+                        (u32)term_tag(ra), (u32)term_ext(ra), (unsigned long long)term_val(ra),
+                        (u32)term_tag(rb), (u32)term_ext(rb), (unsigned long long)term_val(rb));
+            }
+        }
+    }
+    Term raw = heap_read(ctx, loc + index);
+    Term out = thvm_force_tensor_term(ctx, raw);
+    if (term_tag(out) == TAG_ERA && term_val(out) == 0) {
+        Term rebuilt = thvm_grad_force_slot_expr(ctx, raw, 0);
+        if (!(term_tag(rebuilt) == TAG_ERA && term_val(rebuilt) == 0)) return rebuilt;
+    }
+    return out;
 }

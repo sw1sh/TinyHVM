@@ -10,17 +10,18 @@ static void thvm_step_graph_set_before_era_payload(Term payload);
 static void thvm_step_graph_set_before_top_era(int had_era);
 static void thvm_step_graph_set_before_top_add_zero(int had_add_zero);
 
-// schedule/_.c — Three-phase eval: reduce → schedule(rewrite) → reduce
+// schedule/_.c — Unified IC eval: reduce is always pure phase 1.
 //
-// Phase 1: thvm_reduce — pure IC. GRAD fires, compute ops stay TAG_TOP.
-// Phase 2: UOP_FUSE interaction → sched_all → TAG_TOPs → UOP_KERNEL specs on heap.
-//          Fusion walks compute region, builds kernels, installs UOP_KERNEL nodes.
-// Phase 3: UOP_SCHED interaction → enables dispatch → trampoline fires KERNEL chain
-//          bottom-up → GPU dispatch → TAG_TEN → ASSIGN copies gradient.
+// thvm_reduce(t) — pure IC reduction. Stops at WNF:
+//   GRAD fires, combinators fire, compute ops stay TAG_TOP (WNF).
 //
+// thvm_eval(t) — injects scheduling signals after reduce reaches WNF:
+//   1. thvm_reduce(t)                  — phase 1: pure IC to WNF
+//   2. thvm_reduce(UOP_FUSE(t))        — phase 2: fusion as interaction
+//   3. thvm_reduce(UOP_SCHED(t))       — phase 3: plan + dispatch as interaction
+//
+// The choice: call thvm_reduce for phase 1 only, call thvm_eval for full pipeline.
 // UOP_KERNEL interact handler deduplicates by kid: same kid fired only once.
-//
-// NO flags. Compute ops are WNF because interact handler returns t.
 
 int fuse_no_lazy_resolve = 0;
 int _assign_dispatch_enabled = 0;

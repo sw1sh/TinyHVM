@@ -1,57 +1,16 @@
             // === Phase 3 inet ops ===
 
             if (uop == UOP_ASSIGN) {
-                // ASSIGN is WNF until dispatch is enabled.
-                { extern int _assign_dispatch_enabled;
-                  if (!_assign_dispatch_enabled) return t; }
+                // ASSIGN: pure interaction. Both args must be TAG_TEN.
+                // No nested reduce — the reducer handles arg reduction.
                 Term dst_r = heap_read(ctx, loc);
                 Term src_t = heap_read(ctx, loc + 1);
                 if (getenv("THVM_SCHED_DIAG"))
                     fprintf(stderr, "ASSIGN: dst_tag=%u src_tag=%u src_ext=%u\n",
                         term_tag(dst_r), term_tag(src_t),
                         term_tag(src_t)==TAG_TOP?term_ext(src_t):0);
-                // Resolve WNF view chain on src: dispatch inner FUSINGs,
-                // then create TAG_TEN view aliases for the view ops.
-                if (term_tag(src_t) == TAG_TOP && term_ext(src_t) != UOP_ASSIGN) {
-                    u32 _su = term_ext(src_t);
-                    int _is_view = (_su >= UOP_RESHAPE && _su <= UOP_PAD);
-                    if (_is_view) {
-                        // Walk through view chain to find the innermost non-view term
-                        Term _inner = src_t;
-                        u64 _locs[16]; u32 _terms_n = 0;
-                        while (term_tag(_inner) == TAG_TOP && _terms_n < 16) {
-                            u32 _iu = term_ext(_inner);
-                            if (_iu < UOP_RESHAPE || _iu > UOP_PAD) break;
-                            _locs[_terms_n++] = term_val(_inner);
-                            Term _next = heap_read(ctx, term_val(_inner));
-                            if (term_tag(_next) == TAG_DP0 || term_tag(_next) == TAG_DP1)
-                                _next = heap_read(ctx, term_val(_next));
-                            _inner = _next;
-                        }
-                        // Dispatch the inner term (FUSING or compute op)
-                        if (getenv("THVM_SCHED_DIAG"))
-                            fprintf(stderr, "ASSIGN_WALK: depth=%u inner_tag=%u inner_ext=%u\n",
-                                _terms_n, term_tag(_inner), term_tag(_inner)==TAG_TOP?term_ext(_inner):0);
-                        if (term_tag(_inner) == TAG_TOP) {
-                            Term _r = thvm_reduce(ctx, _inner);
-                            if (term_tag(_r) == TAG_TEN) {
-                                // Now resolve view chain bottom-up using st_get
-                                u32 _tid = (u32)term_val(_r);
-                                for (int _vi = (int)_terms_n - 1; _vi >= 0; _vi--) {
-                                    const View *_sv = st_get(_locs[_vi]);
-                                    if (_sv) {
-                                        u32 _nvid = tensor_view_of(ctx, _tid, *_sv);
-                                        _tid = _nvid;
-                                    }
-                                }
-                                heap_set(ctx, loc + 1, term_ten(_tid, ctx->tensors[_tid].dtype));
-                                src_t = heap_read(ctx, loc + 1);
-                            }
-                        }
-                    }
-                }
                 if (term_tag(dst_r) != TAG_TEN || term_tag(src_t) != TAG_TEN)
-                    return t;  // trampoline will re-enter and reduce args
+                    return t;  // not ready — reducer will reduce args first
                 {
                     u32 dst_id = (u32)term_val(dst_r);
                     u32 src_id = (u32)term_val(src_t);

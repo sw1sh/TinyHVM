@@ -502,8 +502,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             // Accept any WNF as "ready". Also accept TAG_TOP for ASSIGN:
             // ASSIGN handler resolves WNF view chains via dispatch.
             if (w1t != TAG_TEN && w1t != TAG_ERA && w1t != TAG_NUM &&
-                w1t != TAG_LAM && w1t != TAG_SUP &&
-                !(w1t == TAG_TOP && term_ext(frame) == UOP_ASSIGN)) { whnf = frame; continue; }
+                w1t != TAG_LAM && w1t != TAG_SUP) { whnf = frame; continue; }
             heap_set(ctx, loc + 1, whnf);  // store arg1 result
             // 3-arg ops (WHERE, IFZ): reduce arg2 before firing
             u32 _uop1 = term_ext(frame);

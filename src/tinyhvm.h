@@ -981,6 +981,7 @@ void     jit_replay(void);
 // Reduction
 Term     thvm_reduce(TinyHVM *ctx, Term t);
 Term     thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps);
+Term     thvm_eval(TinyHVM *ctx, Term t);
 
 // Tensor API
 Term     thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s);
@@ -1130,12 +1131,15 @@ void     thvm_grad_targets_set(TinyHVM *ctx, Term *params, Term *grad_slots, u32
 void     thvm_grad_targets_set_keep(TinyHVM *ctx, Term *params, u32 n_params, Term bundle);
 int      thvm_grad_targets_find_slot(TinyHVM *ctx, u32 tid, Term *out_slot);
 int      thvm_grad_targets_find_index(TinyHVM *ctx, u32 tid, u32 *out_index, Term *out_slot);
+int      thvm_grad_targets_find_term(TinyHVM *ctx, Term t, u32 *out_index, Term *out_slot);
 u32      thvm_grad_targets_count(TinyHVM *ctx);
 u32      thvm_grad_targets_get_tid(TinyHVM *ctx, u32 index);
 u32      thvm_grad_mode_get(TinyHVM *ctx, u64 grad_loc);
 int      thvm_grad_targets_has_keep_bundle(TinyHVM *ctx);
 Term     thvm_grad_targets_get_keep_bundle(TinyHVM *ctx);
-void     thvm_grad_bundle_accum(TinyHVM *ctx, u32 index, Term grad);
+void     thvm_grad_keep_bundle_set(TinyHVM *ctx, u64 grad_loc, Term bundle);
+Term     thvm_grad_keep_bundle_get(TinyHVM *ctx, u64 grad_loc);
+void     thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad);
 void     term_use_clear(void);
 
 // Movement ops
@@ -1148,5 +1152,52 @@ Term     thvm_pool(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_,
 Term     thvm_conv2d(TinyHVM *ctx, Term x, Term w, Term bias,
                      u32 groups, const u32 *stride_, const u32 *padding_);
 Term     thvm_maxpool2d(TinyHVM *ctx, Term x, const u32 *kernel, const u32 *stride_);
+
+// ---------------------------------------------------------------------------
+// tinygrad-style helpers (see `src/nn/tg_tensor.c`; tinygrad submodule:
+// `tensor.py` Tensor.linear / Tensor.dot, `nn/__init__.py` Linear)
+// ---------------------------------------------------------------------------
+Term     thvm_tg_matmul(TinyHVM *ctx, Term a, Term b);
+Term     thvm_tg_add(TinyHVM *ctx, Term a, Term b);
+Term     thvm_tg_mul(TinyHVM *ctx, Term a, Term b);
+Term     thvm_tg_relu(TinyHVM *ctx, Term x);
+Term     thvm_tg_sum(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes);
+// `weight` shape [in_features, out_features]; `bias_opt` NULL or ERA = no bias.
+// `x` must be TAG_TEN so batch leading dims can be read (matches nn.Linear batching).
+Term     thvm_tg_linear(TinyHVM *ctx, Term x, Term weight, const Term *bias_opt);
+
+// ---------------------------------------------------------------------------
+// Concise high-level C API (Python-like naming): Tensor + Linear
+// ---------------------------------------------------------------------------
+typedef struct {
+    TinyHVM *ctx;
+    Term     term;
+} Tensor;
+
+typedef struct {
+    Tensor weight;   // [in_features, out_features]
+    Tensor bias;     // [out_features] when has_bias=1; ERA otherwise
+    int    has_bias;
+} Linear;
+
+Tensor tensor_from_term(TinyHVM *ctx, Term t);
+Tensor tensor_from_f32(TinyHVM *ctx, const f32 *data, Shape s);
+Tensor tensor_realize(Tensor x);
+f32   *tensor_to_host_f32(Tensor x);
+Tensor tensor_matmul(Tensor a, Tensor b);
+Tensor tensor_add(Tensor a, Tensor b);
+Tensor tensor_mul(Tensor a, Tensor b);
+Tensor tensor_relu(Tensor x);
+Tensor tensor_sum_axes(Tensor x, const u32 *axes, u32 n_axes);
+
+// Backprop keep-bundle ergonomics.
+Tensor tensor_backward_keep(Tensor y, Tensor x);
+u32    tensor_bundle_count(Tensor bundle);
+Tensor tensor_bundle_get(Tensor bundle, u32 index);
+
+// Layer helper mirroring tinygrad Linear semantics.
+void   linear_init_uniform(Linear *layer, TinyHVM *ctx, u32 in_features,
+                           u32 out_features, int has_bias);
+Tensor linear_forward(Linear *layer, Tensor x);
 
 #endif // TINYHVM_H

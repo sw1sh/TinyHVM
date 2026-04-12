@@ -97,6 +97,7 @@ Term thvm_ann(TinyHVM *ctx, Term term, Term type);
 Term thvm_dsu(TinyHVM *ctx, Term label_expr, Term a, Term b);
 Term thvm_ddu(TinyHVM *ctx, Term label_expr, Term val, Term bod);
 Term thvm_inc(TinyHVM *ctx, Term term);
+Term thvm_eval(TinyHVM *ctx, Term t);
 Term thvm_mm(TinyHVM *ctx, Term a, Term b);
 static u32 _ensure_count = 0, _ensure_alloc_count = 0;
 #define ENSURE(c,t) do{if((t)&&c->tensors[t].buf_id==0&&c->tensors[t].creator_op){_ensure_count++;tensor_materialize(c,t);if(c->tensors[t].buf_id)_ensure_alloc_count++;}}while(0)
@@ -135,6 +136,11 @@ static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel)
 // ── ctx/ — init, free, device, reset, tensor, profiling ──────────────────────
 #include "ctx/init.c"
 #include "tensor/scalar.c"
+
+// ── nn/tg_tensor.c — tinygrad-style matmul/linear/relu (after tensor + op builders)
+#include "nn/tg_tensor.c"
+// ── nn/tensor_api.c — concise Tensor / Linear wrappers
+#include "nn/tensor_api.c"
 
 // ── ops/ — thvm_realize, supporting kernel functions ─────────────────────────
 #include "ops/_.c"

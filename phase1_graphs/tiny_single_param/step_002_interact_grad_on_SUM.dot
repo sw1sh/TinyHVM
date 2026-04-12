@@ -8,11 +8,11 @@ digraph G {
   n1 [label="RESHAPE\n[1,3]", shape=box, fillcolor="#fff3cd"];
   t2 [label="t2\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
   t2 -> n1 [label="in"];
-  t3 [label="t3\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 [label="t3\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t3 -> n1 [label="shape"];
   n5 [label="EXPAND\n[2,3]", shape=box, fillcolor="#fff3cd"];
   n1 -> n5 [label="in"];
-  t4 [label="t4\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 [label="t4\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t4 -> n5 [label="shape"];
   n9 [label="MUL\n[2,3]", shape=box, fillcolor="#cce5ff"];
   t1 [label="t1\n[2,3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
@@ -24,7 +24,7 @@ digraph G {
   dup32 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];
   n13 -> dup32;
   dup32 -> n30 [label="in (dp1)"];
-  t5 [label="t5\n[2]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t5 [label="t5\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t5 -> n30 [label="axes"];
   era25 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
   n28 -> era25 [label="p",color="#cc0000",penwidth=2.0];
@@ -34,8 +34,8 @@ digraph G {
   era25 -> ctr25 [label="c0"];
   n23 -> ctr25 [label="c1"];
   era34 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  num_era34 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num_era34 -> era34 [label="p"];
+  t6 [label="t6\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t6 -> era34 [label="p"];
   n28 [label="SUM\n[1,1]", shape=box, fillcolor="#ffcccc"];
   dup32 -> n28 [label="in (dp0)"];
   t5 -> n28 [label="axes"];

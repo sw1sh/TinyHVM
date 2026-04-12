@@ -7,13 +7,13 @@ digraph G {
   n66 [label="K0: SUM+ADD+RELU\n[1,1]", shape=box, fillcolor="#ccffcc"];
   n51 [label="LOG_PRINT\n[1,1]", shape=box, fillcolor="#f0f0f0"];
   n66 -> n51 [label=""];
-  t15 [label="t15\n[2,4]\nf32 cpu\nslot1 planned",shape=box,fillcolor="#d9f2e6"];
-  n68 -> t15 [style=dashed,color="#009900",fontcolor="#006600",label="RESHAPE:out"];
+  t16 [label="t16\n[2,4]\nf32 cpu\nslot1 planned",shape=box,fillcolor="#d9f2e6"];
+  n68 -> t16 [style=dashed,color="#009900",fontcolor="#006600",label="RESHAPE:out"];
   t1 [label="t1\n[2,3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t1 -> n68 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:a"];
   t2 [label="t2\n[3,4]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
   t2 -> n68 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:b"];
-  t15 -> n66 [style=dashed,color="#009900",fontcolor="#006600",label="ADD:a"];
+  t16 -> n66 [style=dashed,color="#009900",fontcolor="#006600",label="ADD:a"];
   t3 [label="t3\n[4]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
   t3 -> n66 [style=dashed,color="#009900",fontcolor="#006600",label="ADD:b"];
 }

@@ -1,0 +1,39 @@
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n474 [label="K0: SUM+MUL\n[3,4]\nmtl", shape=box, fillcolor="#ccffcc"];
+  n476 [label="K1: SUM+ADD+CMP+MUL\n[4]\nmtl", shape=box, fillcolor="#ccffcc"];
+  ctr52 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n474 -> ctr52 [label="c0"];
+  n476 -> ctr52 [label="c1"];
+  n480 [label="K3: ADD+CMP+MUL\n[2,3,4]\nmtl", shape=box, fillcolor="#ccffcc"];
+  n478 [label="K2: SUM+MUL\n[2,4]\nmtl", shape=box, fillcolor="#ccffcc"];
+  n482 [label="K4: SUM+MUL\n[2,4]\nmtl", shape=box, fillcolor="#ccffcc"];
+  t35 [label="t35\n[2,3,4]\nf32 mtl\nslot2 planned",shape=box,fillcolor="#d9f2e6"];
+  t35 -> n474 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:a"];
+  t1 [label="t1\n[2,3]\nf32 mtl",shape=box,fillcolor="#e0e0e0"];
+  t1 -> n474 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:b"];
+  t13 [label="t13\n[1]\nf32 mtl",shape=box,fillcolor="#e0e0e0"];
+  t13 -> n476 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:a"];
+  t34 [label="t34\n[2,4]\nf32 mtl\nslot1 planned",shape=box,fillcolor="#d9f2e6"];
+  t34 -> n476 [style=dashed,color="#009900",fontcolor="#006600",label="ADD:a"];
+  t3 [label="t3\n[4]\nf32 mtl grad",shape=box,fillcolor="#ffe0e0"];
+  t3 -> n476 [style=dashed,color="#009900",fontcolor="#006600",label="ADD:b"];
+  t16 [label="t16\n[1]\nf32 mtl",shape=box,fillcolor="#e0e0e0"];
+  t16 -> n476 [style=dashed,color="#009900",fontcolor="#006600",label="CMP:b"];
+  n480 -> t35 [style=dashed,color="#009900",fontcolor="#006600",label="EXPAND:out"];
+  t13 -> n480 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:a"];
+  t37 [label="t37\n[2,4]\nf32 mtl\nslot1 planned",shape=box,fillcolor="#d9f2e6"];
+  t37 -> n480 [style=dashed,color="#009900",fontcolor="#006600",label="ADD:a"];
+  t3 -> n480 [style=dashed,color="#009900",fontcolor="#006600",label="ADD:b"];
+  t16 -> n480 [style=dashed,color="#009900",fontcolor="#006600",label="CMP:b"];
+  n478 -> t34 [style=dashed,color="#009900",fontcolor="#006600",label="RESHAPE:out"];
+  t1 -> n478 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:a"];
+  t2 [label="t2\n[3,4]\nf32 mtl grad",shape=box,fillcolor="#ffe0e0"];
+  t2 -> n478 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:b"];
+  n482 -> t37 [style=dashed,color="#009900",fontcolor="#006600",label="RESHAPE:out"];
+  t1 -> n482 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:a"];
+  t2 -> n482 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:b"];
+}

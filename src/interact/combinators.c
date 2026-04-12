@@ -203,7 +203,7 @@
                 u32 _ar = 0; \
                 switch ((_tg)) { \
                     case TAG_TOP: \
-                        if ((_ext) == UOP_FUSING) _ar = 0; \
+                        if ((_ext) == UOP_KERNEL) _ar = 0; \
                         else if ((_ext) == UOP_WHERE || (_ext) == UOP_IFZ) _ar = 3; \
                         else if ((_ext) == UOP_GRAD) _ar = 2; \
                         else if ((_ext) == UOP_LOG_PRINT || (_ext) == UOP_DETACH) _ar = 1; \
@@ -434,7 +434,7 @@ era_continue:
 	            // DUP ⊳ TOP: commute by duplicating the node and splitting children.
 	            if (term_tag(val) == TAG_TOP) {
 	                u32 uop = term_ext(val);
-	                if (uop == UOP_FUSING) DUP_STATE_RETURN(val, val, val);
+	                if (uop == UOP_KERNEL) DUP_STATE_RETURN(val, val, val);
                     if (uop == UOP_DETACH) {
                         Term forced = thvm_eval(ctx, val);
                         if (getenv("THVM_LOOP_DIAG")) {

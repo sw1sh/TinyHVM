@@ -347,7 +347,7 @@ static u32 dot_term_arity(Term t) {
     u32 ext = term_ext(t);
     switch (tag) {
         case TAG_TOP:
-            if (ext == UOP_FUSING) return 0;
+            if (ext == UOP_KERNEL) return 0;
             if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
             if (ext == UOP_GRAD) return 2;
             if (ext == UOP_LOG_PRINT) return 1;
@@ -421,7 +421,7 @@ static void thvm_dump_dot(TinyHVM *ctx, const char *path) {
         // Color
         const char *color = "white";
         u32 planned_slot = dot_tensor_planned_slot(ctx, i);
-        int planned = (m->creator_op == UOP_FUSING && m->buf_id == 0 && planned_slot != 0);
+        int planned = (m->creator_op == UOP_KERNEL && m->buf_id == 0 && planned_slot != 0);
         if (m->requires_grad) color = "#e8f4e8";
         if (m->view.has_mask) color = "#fff0e0";
         if (!m->creator_op && m->requires_grad) color = "#e0e8ff"; // param
@@ -486,7 +486,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             const char *_dt=dtype_name(_m->dtype); \
             const char *_bk=_m->backend?((_m->backend==ctx->backends[0])?"cpu":"mtl"):"?"; \
             u32 _pslot = dot_tensor_planned_slot(ctx, (tid)); \
-            int _planned = (_m->creator_op == UOP_FUSING && _m->buf_id == 0 && _pslot != 0); \
+            int _planned = (_m->creator_op == UOP_KERNEL && _m->buf_id == 0 && _pslot != 0); \
             const char *_fc=_planned ? "#d9f2e6" : (_m->requires_grad?"#ffe0e0":"#e0e0e0"); \
             char _slot[32]=""; \
             if (_pslot) snprintf(_slot, sizeof(_slot), "\\nslot%u%s", _pslot, _planned ? " planned" : ""); \
@@ -582,7 +582,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 PUSH_TERM(ht);
             }
             if (heap_dot_include_sched_kernels &&
-                term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_FUSING) {
+                term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_KERNEL) {
                 slot_live[h] = 1;
                 PUSH_TERM(ht);
             }
@@ -846,7 +846,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                         p += snprintf(sh + p, sizeof(sh) - p, "%s%u", d ? "," : "", shp.dims[d]);
                 }
             }
-            if (ext == UOP_FUSING) {
+            if (ext == UOP_KERNEL) {
                 Term kid_t = heap_read(ctx, val + 1);
                 u32 kid = (term_tag(kid_t) == TAG_NUM) ? (u32)term_val(kid_t) : 0;
                 extern KernelEntry sched_kernels[];
@@ -902,7 +902,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             u32 arity = 2;
             if (ext == UOP_GRAD) arity = 2;
             else if (ext == UOP_WHERE || ext == UOP_IFZ) arity = 3;
-            else if (ext == UOP_FUSING) arity = 0;
+            else if (ext == UOP_KERNEL) arity = 0;
             else if (ext == UOP_LOG_PRINT) arity = 1;
             else if (ext == UOP_DETACH) arity = 1;
             else if (!is_binary(ext) && is_elementwise(ext)) arity = 1;
@@ -1357,7 +1357,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                         p += snprintf(sh + p, sizeof(sh) - p, "%s%u", d ? "," : "", shp.dims[d]); \
                 } \
             } \
-            if ((_ext) == UOP_FUSING) { \
+            if ((_ext) == UOP_KERNEL) { \
                 Term kid_t2 = heap_read(ctx, (_loc) + 1); \
                 u32 kid2 = (term_tag(kid_t2) == TAG_NUM) ? (u32)term_val(kid_t2) : 0; \
                 KernelEntry *ke2 = &sched_kernels[kid2]; \
@@ -1489,7 +1489,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         }
         for (u64 h = 1; h < ctx->heap_pos; h++) {
             Term t = ctx->heap[h];
-            if (term_tag(t) != TAG_TOP || term_ext(t) != UOP_FUSING) continue;
+            if (term_tag(t) != TAG_TOP || term_ext(t) != UOP_KERNEL) continue;
             u64 loc = term_val(t);
             if (top_live && (loc >= ctx->heap_pos || !top_live[loc])) continue;
             if (fusing_leaf_done && loc < ctx->heap_pos) {

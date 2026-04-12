@@ -13,25 +13,24 @@ static void thvm_step_graph_set_before_top_add_zero(int had_add_zero);
 // schedule/_.c — Three-phase eval: reduce → schedule(rewrite) → reduce
 //
 // Phase 1: thvm_reduce — pure IC. GRAD fires, compute ops stay TAG_TOP.
-// Phase 2: sched_all — pure rewrite. TAG_TOPs → UOP_FUSING specs on heap.
-//          Each pass: scan heap, convert schedulable ops to UOP_FUSING.
-//          Multi-consumer propagation: same term at multiple positions → same FUSING.
-// Phase 3: ASSIGN loop → thvm_reduce(assign) → trampoline fires FUSING chain
+// Phase 2: UOP_FUSE interaction → sched_all → TAG_TOPs → UOP_KERNEL specs on heap.
+//          Fusion walks compute region, builds kernels, installs UOP_KERNEL nodes.
+// Phase 3: UOP_SCHED interaction → enables dispatch → trampoline fires KERNEL chain
 //          bottom-up → GPU dispatch → TAG_TEN → ASSIGN copies gradient.
 //
-// UOP_FUSING interact handler deduplicates by kid: same kid fired only once.
+// UOP_KERNEL interact handler deduplicates by kid: same kid fired only once.
 //
 // NO flags. Compute ops are WNF because interact handler returns t.
 
 int fuse_no_lazy_resolve = 0;
 int _assign_dispatch_enabled = 0;
 
-// Global kernel table: scheduler writes, UOP_FUSING handler reads.
+// Global kernel table: scheduler writes, UOP_KERNEL handler reads.
 KernelEntry sched_kernels[SCHED_MAX_KERNELS];
 u32 sched_kernel_count = 0;
 
 // kid_results: TAG_TEN result for each dispatched kid (ERA = not yet dispatched).
-// Shared with UOP_FUSING handler in tensor_ops.c.
+// Shared with UOP_KERNEL handler in tensor_ops.c.
 Term kid_results[SCHED_MAX_KERNELS];
 static u64 phase1_root_slot = 0;
 
@@ -138,7 +137,7 @@ static void thvm_graph_dump_path(char *buf, size_t nbuf, const char *name) {
 }
 
 static u32 phase1_top_arity(u32 ext) {
-    if (ext == UOP_FUSING) return 0;
+    if (ext == UOP_KERNEL) return 0;
     if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
     if (ext == UOP_GRAD) return 2;
     if (ext == UOP_LOG_PRINT) return 1;
@@ -183,7 +182,7 @@ static int phase1_top_direct_uop(u32 uop) {
     return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_IFZ ||
            uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_DETACH ||
            uop == UOP_WHERE ||
-           uop == UOP_FUSING;
+           uop == UOP_KERNEL;
 }
 
 static int phase1_term_maybe_active(TinyHVM *ctx, Term t) {
@@ -987,7 +986,7 @@ static void sched_prepare_boundary_output(TinyHVM *ctx, SchedBoundary *b) {
 
     u32 raw_tid = tensor_create_unbacked(ctx, raw_v->shape, sched_term_dtype(ctx, b->compute_term));
     TensorMeta *raw_m = &ctx->tensors[raw_tid];
-    raw_m->creator_op = UOP_FUSING;
+    raw_m->creator_op = UOP_KERNEL;
     raw_m->fusing_loc = term_val(b->compute_term);
 
     b->raw_output_tid = raw_tid;
@@ -998,7 +997,7 @@ static void sched_prepare_boundary_output(TinyHVM *ctx, SchedBoundary *b) {
     if (root_v && (!shape_eq(root_v->shape, raw_v->shape) || (root_st && root_st->n_views > 1))) {
         u32 out_tid = tensor_view_of(ctx, raw_tid, *root_v);
         TensorMeta *out_m = &ctx->tensors[out_tid];
-        out_m->creator_op = UOP_FUSING;
+        out_m->creator_op = UOP_KERNEL;
         out_m->src_ids[0] = raw_tid;
         out_m->fusing_loc = term_val(b->compute_term);
         if (root_st && root_st->n_views > 0) out_m->st = *root_st;
@@ -1124,7 +1123,7 @@ static Term sched_install_kernel(TinyHVM *ctx, SchedBoundary *b, KernelEntry *ke
     ctx->heap_pos += 2;
     heap_set(ctx, floc, term_era());
     heap_set(ctx, floc + 1, term_num_u32(b->kid));
-    Term ft = term_new(TAG_TOP, UOP_FUSING, floc);
+    Term ft = term_new(TAG_TOP, UOP_KERNEL, floc);
     sched_kernel_locs[b->kid] = floc;
 
     const ShapeTracker *out_st = tensor_st_get(&ctx->tensors[b->output_tid]);
@@ -1202,12 +1201,12 @@ static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
         ke->has_reduce ? &ke->reduce : NULL,
         NULL, NULL, 0, ke->leaf_dtypes, md->dtype);
     ctx->itrs++;
-    md->creator_op = UOP_FUSING;
+    md->creator_op = UOP_KERNEL;
     md->fusing_loc = sched_kernel_locs[kid];
 
     if (ke->output_tid && ke->output_tid != raw_tid) {
         TensorMeta *out_m = &ctx->tensors[ke->output_tid];
-        out_m->creator_op = UOP_FUSING;
+        out_m->creator_op = UOP_KERNEL;
         out_m->src_ids[0] = raw_tid;
         out_m->fusing_loc = sched_kernel_locs[kid];
     }
@@ -1225,7 +1224,7 @@ static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
     return result;
 }
 
-static u32 sched_all(TinyHVM *ctx, Term root) {
+u32 sched_all(TinyHVM *ctx, Term root) {
     sched_planner_reset_state();
     if (ctx->sched_rewrites)
         memset(ctx->sched_rewrites, 0, SCHED_REWRITE_CAP * sizeof(SchedRewriteEntry));
@@ -1335,11 +1334,12 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             heap_set(ctx, phase1_root_slot, term_era());
     }
 
-    sched_all(ctx, t);
+    // Phase 2: wrap in UOP_FUSE and reduce — fires fusion as interaction
     {
-        Term rt = thvm_sched_rewrite_get(ctx, t);
-        if (!(term_tag(rt) == TAG_ERA && term_val(rt) == 0))
-            t = rt;
+        u64 fuse_loc = heap_alloc(ctx, 1);
+        heap_set(ctx, fuse_loc, t);
+        Term fuse_term = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
+        t = thvm_reduce(ctx, fuse_term);
     }
     if (run_coarse_graph) {
         t = thvm_phase1_seed_root_grad(ctx, t);
@@ -1351,9 +1351,14 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             heap_set(ctx, phase1_root_slot, term_era());
     }
 
-    _assign_dispatch_enabled = 1;
-    t = thvm_reduce(ctx, t);
-    _assign_dispatch_enabled = 0;
+    // Phase 3: wrap in UOP_SCHED and reduce — fires planning + dispatch
+    {
+        u64 sched_loc = heap_alloc(ctx, 1);
+        heap_set(ctx, sched_loc, t);
+        Term sched_term = term_new(TAG_TOP, UOP_SCHED, sched_loc);
+        t = thvm_reduce(ctx, sched_term);
+        _assign_dispatch_enabled = 0;
+    }
     if (run_coarse_graph) {
         t = thvm_phase1_seed_root_grad(ctx, t);
         char path[512];

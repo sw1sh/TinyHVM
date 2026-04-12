@@ -111,9 +111,9 @@
                 }
             }
 
-            // UOP_FUSING: scheduled kernel — dispatch from KernelEntry.
+            // UOP_KERNEL: scheduled kernel — dispatch from KernelEntry.
             // Fired by second thvm_reduce. Reads kernel spec from global table.
-            if (uop == UOP_FUSING) {
+            if (uop == UOP_KERNEL) {
                 extern Term kid_results[];
                 extern u32 sched_kernel_count;
                 Term kid_term = heap_read(ctx, loc + 1); // arg1 = kernel index
@@ -125,6 +125,31 @@
                     if (kid < sched_kernel_count) kid_results[kid] = result;
                     RETURN_REDUCED(result);
                 }
+            }
+
+            // UOP_FUSE: lowering request — walks exposed blocked compute,
+            // chooses boundaries, replaces with UOP_KERNEL nodes.
+            // Fires during phase 2 reduction. Payload is the compute root to fuse.
+            if (uop == UOP_FUSE) {
+                Term payload = heap_read(ctx, loc); // the compute subgraph root
+                extern u32 sched_all(TinyHVM *ctx, Term root);
+                sched_all(ctx, payload);
+                Term result = thvm_sched_rewrite_get(ctx, payload);
+                if (term_tag(result) == TAG_ERA && term_val(result) == 0)
+                    result = payload; // no rewrite found, pass through
+                RETURN_REDUCED(result);
+            }
+
+            // UOP_SCHED: planning signal — walks kernel DAG, assigns buffer slots.
+            // For now: pass-through (planning integrated in dispatch).
+            // Future: tinygrad-style memory planner as interaction.
+            if (uop == UOP_SCHED) {
+                Term payload = heap_read(ctx, loc);
+                // TODO: implement memory planning as interaction
+                // For now, just enable dispatch and return payload
+                extern int _assign_dispatch_enabled;
+                _assign_dispatch_enabled = 1;
+                RETURN_REDUCED(payload);
             }
 
             if (uop == UOP_TODEVICE) {
@@ -571,7 +596,7 @@
             if (is_binary && term_tag(b) != TAG_TEN) return t;
             if (uop == UOP_CAST && term_tag(b) != TAG_TEN) return t;
 
-            // Compute ops: return t (stay TAG_TOP). Scheduler rewrites to UOP_FUSING.
+            // Compute ops: return t (stay TAG_TOP). Scheduler rewrites to UOP_KERNEL.
             // Movement ops fire immediately when args are TAG_TEN.
 
             u32 a_id = (u32)term_val(a);
@@ -850,5 +875,5 @@
 
             if (!ctx_default_backend(ctx)) return t;
 
-            // Compute ops stay as TAG_TOP. Scheduler rewrites to UOP_FUSING.
+            // Compute ops stay as TAG_TOP. Scheduler rewrites to UOP_KERNEL.
             return t;

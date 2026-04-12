@@ -45,7 +45,7 @@ static u32 tag_arity(u32 tag, u32 ext) {
         case TAG_DP0: case TAG_DP1: return 1; // 1-slot DUP: only heap[val]
         case TAG_OP2: return 2;
         case TAG_TOP:
-            if (ext == UOP_FUSING) return 0;
+            if (ext == UOP_KERNEL) return 0;
             if (ext == UOP_WHERE) return 3;
             if (ext == UOP_GRAD) return 2;
             if (ext == UOP_LOG_PRINT) return 1;
@@ -255,7 +255,7 @@ static int thvm_file_has_substr(const char *path, const char *needle) {
 }
 
 static u32 thvm_step_top_arity(u32 ext) {
-    if (ext == UOP_FUSING) return 0;
+    if (ext == UOP_KERNEL) return 0;
     if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
     if (ext == UOP_GRAD) return 2;
     if (ext == UOP_DETACH) return 1;
@@ -322,7 +322,7 @@ static u32 thvm_step_term_arity(Term t) {
     u32 ext = term_ext(t);
     switch (tag) {
         case TAG_TOP:
-            if (ext == UOP_FUSING) return 0;
+            if (ext == UOP_KERNEL) return 0;
             if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
             if (ext == UOP_GRAD) return 2;
             if (ext == UOP_DETACH) return 1;
@@ -427,7 +427,7 @@ static int thvm_step_slot_is_rendered_parent_arg(TinyHVM *ctx, u64 slot) {
             u64 loc = term_val(p);
             u32 arity = 2;
             if (term_ext(p) == UOP_WHERE || term_ext(p) == UOP_IFZ) arity = 3;
-            if (term_ext(p) == UOP_FUSING) arity = 0;
+            if (term_ext(p) == UOP_KERNEL) arity = 0;
             for (u32 i = 0; i < arity; i++) if (loc + i == slot) return 1;
             continue;
         }

@@ -135,7 +135,8 @@ typedef u64 Term;
 
 // Fusion: wraps any fused subgraph. Realized tensor carries the original subnet
 // heap root in src_ids, so GRAD can walk back through the unfused lazy graph.
-#define UOP_FUSING    23  // fused kernel (SUM(MUL) etc); see ic_fusion.md
+#define UOP_KERNEL    23  // fused kernel (SUM(MUL) etc); see docs/eval.md
+#define UOP_FUSING    UOP_KERNEL  // back-compat alias (deprecated)
 #define UOP_ASSIGN    24  // in-place weight update: blit src buf into dst buf
 #define UOP_WHERE     25  // elementwise select: WHERE(cond_ten, then_ten, else_ten)
 #define UOP_IFZ       26  // if-zero branch: IFZ(counter_ten, zero_case, succ_lam)
@@ -145,7 +146,12 @@ typedef u64 Term;
 #define UOP_GRAD      28   // IC gradient: DUP-op interaction in the reducer
 #define UOP_TODEVICE  29   // lazy device transfer: TODEVICE(tensor, device_idx_scalar)
 #define UOP_DETACH    30   // realize current value and return a provenance-free tensor leaf
-#define UOP_COUNT     31
+
+// Scheduling signals (interact to drive phase transitions):
+#define UOP_FUSE      31   // lowering request: boundary walk → create UOP_KERNEL nodes
+#define UOP_SCHED     32   // planning signal: memory layout walk, assign buffer slots
+
+#define UOP_COUNT     33
 
 // (LAYER_OP_POOL_GATHER and LAYER_OP_BATCHNORM removed — both are now
 // composed from standard UOps with standard backward rules.)
@@ -154,8 +160,8 @@ typedef u64 Term;
 static const char *uop_names[] = {
     "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
-    "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","FUSING","ASSIGN","WHERE",
-    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH"
+    "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","KERNEL","ASSIGN","WHERE",
+    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","SCHED"
 };
 
 // ============================================================
@@ -600,7 +606,7 @@ typedef struct {
 } ReduceSpec;
 
 // KernelEntry: scheduler's output — one fused kernel ready for dispatch.
-// Produced by fuse_build_kernel (pure walk), consumed by UOP_FUSING handler.
+// Produced by fuse_build_kernel (pure walk), consumed by UOP_KERNEL handler.
 #define SCHED_MAX_KERNELS 512
 typedef enum {
     KERNEL_LEAF_NONE   = 0,
@@ -670,7 +676,7 @@ typedef struct {
 
     u32         assign_target; // ASSIGN elision: write fused output here instead of new buf
 
-    // Fusion metadata (only when creator_op == UOP_FUSING)
+    // Fusion metadata (only when creator_op == UOP_KERNEL)
     u64         fusing_loc; // heap loc of the original subnet root TAG_TOP
     u32         fusing_uop; // UOP of the subnet root (e.g. UOP_SUM)
     u32         planned_slot; // phase-2 planned storage slot (0 = none / not scheduled)

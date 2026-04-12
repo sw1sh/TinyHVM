@@ -21,6 +21,8 @@ static inline int uop_allocates_fresh(u32 uop) {
         case UOP_IFZ:
         case UOP_LOG_PRINT:
         case UOP_DETACH:
+        case UOP_FUSE:
+        case UOP_SCHED:
             return 0;  // returns sub-terms / passthrough, not a fresh tensor
         default:
             return 1;  // compute ops: ADD, SUB, MUL, MM, SUM, etc.
@@ -28,7 +30,8 @@ static inline int uop_allocates_fresh(u32 uop) {
 }
 
 static inline u32 reduce_top_arity(u32 uop) {
-    if (uop == UOP_FUSING) return 0;
+    if (uop == UOP_KERNEL) return 0;
+    if (uop == UOP_FUSE || uop == UOP_SCHED) return 1; // single payload
     if (uop == UOP_WHERE || uop == UOP_IFZ) return 3;
     if (uop == UOP_GRAD) return 2;
     if (uop == UOP_LOG_PRINT) return 1;
@@ -62,7 +65,8 @@ static inline int reduce_top_direct_uop(u32 uop) {
            uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_CAST ||
            uop == UOP_DETACH ||
            uop == UOP_WHERE ||
-           uop == UOP_FUSING;
+           uop == UOP_KERNEL ||
+           uop == UOP_FUSE || uop == UOP_SCHED;
 }
 
 static inline u32 reduce_net_term_arity(Term t) {

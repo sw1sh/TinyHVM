@@ -464,7 +464,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         int can_walk = (term_tag(vi0) == TAG_TEN || term_tag(vi0) == TAG_NUM);
         if (!can_walk && term_tag(vi0) == TAG_TOP) {
             u32 vi_uop = term_ext(vi0);
-            can_walk = is_elementwise(vi_uop) || is_view_op(vi_uop) || vi_uop == UOP_FUSING;
+            can_walk = is_elementwise(vi_uop) || is_view_op(vi_uop) || vi_uop == UOP_KERNEL;
         }
         // DP0/DP1: deref to check what they point to.
         // can_walk when deref → TAG_TEN, FUSING, or ew/view TAG_TOP.
@@ -475,7 +475,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             if (term_tag(dp_inner) == TAG_TEN) can_walk = 1;
             else if (term_tag(dp_inner) == TAG_TOP) {
                 u32 di_uop = term_ext(dp_inner);
-                can_walk = (di_uop == UOP_FUSING || is_elementwise(di_uop) || is_view_op(di_uop));
+                can_walk = (di_uop == UOP_KERNEL || is_elementwise(di_uop) || is_view_op(di_uop));
             }
         }
         // Rank-changing RESHAPE: boundary when inner op produces different rank.
@@ -882,7 +882,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         }
     }
 
-    // Non-elementwise TAG_TOP (SUM, pool RESHAPE, UOP_FUSING, etc.): leaf boundary.
+    // Non-elementwise TAG_TOP (SUM, pool RESHAPE, UOP_KERNEL, etc.): leaf boundary.
     if (!is_elementwise(uop)) {
         const View *sv = st_get(term_val(t));
         if (!sv) {

@@ -2,7 +2,7 @@
 
             if (uop == UOP_ASSIGN) {
                 // ASSIGN: pure interaction. Both args must be TAG_TEN.
-                // No nested reduce — the reducer handles arg reduction.
+                // No gate, no nested reduce. Fires when args are ready.
                 Term dst_r = heap_read(ctx, loc);
                 Term src_t = heap_read(ctx, loc + 1);
                 if (getenv("THVM_SCHED_DIAG"))
@@ -77,11 +77,9 @@
 
             // UOP_KERNEL: scheduled kernel — dispatch from KernelEntry.
             // Fired by second thvm_reduce. Reads kernel spec from global table.
-            // UOP_KERNEL: scheduled kernel — dispatch from KernelEntry.
-            // Gated: WNF until dispatch enabled. SEQ chains enforce ordering.
+            // UOP_KERNEL: scheduled kernel — dispatch immediately.
+            // Created by local UOP_FUSE. SEQ chains enforce ordering.
             if (uop == UOP_KERNEL) {
-                extern int _assign_dispatch_enabled;
-                if (!_assign_dispatch_enabled) return t;
                 extern Term kid_results[];
                 extern u32 sched_kernel_count;
                 extern u32 buf_epoch[];
@@ -289,17 +287,11 @@
                 RETURN_REDUCED(payload);
             }
 
-            // UOP_SCHED: planning signal — walks kernel DAG, assigns buffer slots.
-            // For now: pass-through (planning integrated in dispatch).
-            // Future: tinygrad-style memory planner as interaction.
+            // UOP_SCHED: pass-through. With local FUSE + clean ASSIGN + SEQ,
+            // scheduling signals are unnecessary — KERNEL fires immediately,
+            // ASSIGN fires when args are TAG_TEN, SEQ handles ordering.
             if (uop == UOP_SCHED) {
-                Term payload = heap_read(ctx, loc);
-                extern int _assign_dispatch_enabled;
-                if (getenv("THVM_SCHED_DIAG"))
-                    fprintf(stderr, "UOP_SCHED: payload_tag=%u payload_ext=%u dispatch=%d\n",
-                            term_tag(payload), term_ext(payload), _assign_dispatch_enabled);
-                _assign_dispatch_enabled = 1;
-                RETURN_REDUCED(payload);
+                RETURN_REDUCED(heap_read(ctx, loc));
             }
 
             if (uop == UOP_TODEVICE) {

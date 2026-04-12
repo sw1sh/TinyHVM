@@ -10,18 +10,18 @@ static void thvm_step_graph_set_before_era_payload(Term payload);
 static void thvm_step_graph_set_before_top_era(int had_era);
 static void thvm_step_graph_set_before_top_add_zero(int had_add_zero);
 
-// schedule/_.c — Unified IC eval: reduce is always pure phase 1.
+// schedule/_.c — Unified IC eval: reduce + fuse in two passes.
 //
 // thvm_reduce(t) — pure IC reduction. Stops at WNF:
 //   GRAD fires, combinators fire, compute ops stay TAG_TOP (WNF).
 //
-// thvm_eval(t) — injects scheduling signals after reduce reaches WNF:
-//   1. thvm_reduce(t)                  — phase 1: pure IC to WNF
-//   2. thvm_reduce(UOP_FUSE(t))        — phase 2: fusion as interaction
-//   3. thvm_reduce(UOP_SCHED(t))       — phase 3: plan + dispatch as interaction
+// thvm_eval(t) — reduce then fuse:
+//   1. thvm_reduce(t)             — pure IC to WNF
+//   2. thvm_reduce(UOP_FUSE(t))   — local fusion + dispatch + ASSIGN
 //
-// The choice: call thvm_reduce for phase 1 only, call thvm_eval for full pipeline.
-// UOP_KERNEL interact handler deduplicates by kid: same kid fired only once.
+// UOP_FUSE distributes through SEQ/CTR/ASSIGN, fuses compute ops into
+// UOP_KERNEL. KERNEL fires immediately. ASSIGN fires when both args TAG_TEN.
+// SEQ handles dependency ordering. No separate scheduling phase needed.
 
 int fuse_no_lazy_resolve = 0;
 int _assign_dispatch_enabled = 0;
@@ -1348,7 +1348,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
             heap_set(ctx, phase1_root_slot, term_era());
     }
-    _assign_dispatch_enabled = 0;
+    // Phase 1: pure IC reduction — combinators fire, compute ops are WNF
     t = run_coarse_graph ? thvm_phase1_structural_nf(ctx, t)
                          : thvm_reduce(ctx, t);
     if (run_coarse_graph) {
@@ -1361,7 +1361,9 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             heap_set(ctx, phase1_root_slot, term_era());
     }
 
-    // Phase 2: wrap in UOP_FUSE and reduce — fires fusion as interaction
+    // Phase 2: wrap in UOP_FUSE and reduce — fuses compute + dispatches + fires ASSIGN
+    // Local FUSE creates KERNELs that fire immediately. SEQ handles ordering.
+    // No separate UOP_SCHED phase — everything happens in one reduce pass.
     {
         u64 fuse_loc = heap_alloc(ctx, 1);
         heap_set(ctx, fuse_loc, t);
@@ -1371,25 +1373,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     if (run_coarse_graph) {
         t = thvm_phase1_seed_root_grad(ctx, t);
         char path[512];
-        thvm_graph_dump_path(path, sizeof(path), "thvm_2_post_sched.dot");
-        thvm_heap_dot_set_sched_kernels(1);
-        thvm_heap_dot_root(ctx, path, t);
-        if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
-            heap_set(ctx, phase1_root_slot, term_era());
-    }
-
-    // Phase 3: wrap in UOP_SCHED and reduce — fires planning + dispatch
-    {
-        u64 sched_loc = heap_alloc(ctx, 1);
-        heap_set(ctx, sched_loc, t);
-        Term sched_term = term_new(TAG_TOP, UOP_SCHED, sched_loc);
-        t = thvm_reduce(ctx, sched_term);
-        _assign_dispatch_enabled = 0;
-    }
-    if (run_coarse_graph) {
-        t = thvm_phase1_seed_root_grad(ctx, t);
-        char path[512];
-        thvm_graph_dump_path(path, sizeof(path), "thvm_3_post_dispatch.dot");
+        thvm_graph_dump_path(path, sizeof(path), "thvm_2_post_dispatch.dot");
         thvm_heap_dot_set_sched_kernels(0);
         thvm_heap_dot_root(ctx, path, t);
         if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)

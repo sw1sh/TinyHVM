@@ -1,4 +1,4 @@
-// test_tiny_linear_sgd_loop.m — functional recursive SGD on a tiny linear layer
+// test_tiny_linear_sgd_loop.m — functional recursive SGD with ASSIGN-based param updates
 #include "../src/tinyhvm.c"
 #include "../src/backend/cpu/_.c"
 #ifdef __APPLE__
@@ -8,53 +8,58 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void split3(TinyHVM *ctx, Term z, Term *a, Term *b, Term *c) {
-    Term tail;
-    thvm_dup(ctx, thvm_fresh_label(ctx), z, a, &tail);
-    thvm_dup(ctx, thvm_fresh_label(ctx), tail, b, c);
+// Split a term into N copies via DUP chain
+static void dup_n(TinyHVM *ctx, Term t, Term *out, u32 n) {
+    assert(n >= 1);
+    if (n == 1) { out[0] = t; return; }
+    Term rest;
+    thvm_dup(ctx, thvm_fresh_label(ctx), t, &out[0], &rest);
+    dup_n(ctx, rest, out + 1, n - 1);
 }
 
+// Build the training loop as a recursive IC program.
+// Parameters w, b are persistent tensor slots updated via ASSIGN.
+// GRAD targets always match because w, b have fixed tensor IDs.
+//
+// train := λcounter.
+//   IFZ(counter,
+//       CTR(w, b),                          // base case
+//       λm.
+//           loss = MSE(x @ w + b, y)
+//           grads = GRAD_KEEP(loss, [w, b])  // → CTR(gw, gb)
+//           MAT grads λgw. λgb.
+//               seq(ASSIGN(w, w - lr*gw),    // update w in place
+//               seq(ASSIGN(b, b - lr*gb),    // update b in place
+//               train(m)))                   // recurse
+
 static Term tiny_linear_sgd_loop(TinyHVM *ctx,
-                                 Term w0, Term b0,
+                                 Term w, Term b,
                                  Term x, Term y,
                                  Term lr,
                                  u32 n_steps) {
     u32 train_id = ctx->def_count++;
     assert(train_id < 256);
 
-    // train := λcounter. λw. λb.
-    //   IFZ(counter,
-    //       CTR(w, b),
-    //       λm. (GRAD_KEEP(loss(w,b), [w,b]) (λgw. λgb. train(m)(w-lr*gw)(b-lr*gb))))
     u64 l_counter = heap_alloc(ctx, 2);
     Term counter_var = term_new(TAG_VAR, 0, l_counter);
     heap_set(ctx, l_counter + 0, term_set_sub(counter_var));
-
-    u64 l_w = heap_alloc(ctx, 2);
-    Term w_var = term_new(TAG_VAR, 0, l_w);
-    heap_set(ctx, l_w + 0, term_set_sub(w_var));
-    thvm_hint_shape(ctx, w_var, SHAPE(3, 4));
-
-    u64 l_b = heap_alloc(ctx, 2);
-    Term b_var = term_new(TAG_VAR, 0, l_b);
-    heap_set(ctx, l_b + 0, term_set_sub(b_var));
-    thvm_hint_shape(ctx, b_var, SHAPE(4));
 
     u64 l_next = heap_alloc(ctx, 2);
     Term next_counter = term_new(TAG_VAR, 0, l_next);
     heap_set(ctx, l_next + 0, term_set_sub(next_counter));
 
-    Term w_loss, w_sgd, w_done;
-    Term b_loss, b_sgd, b_done;
-    split3(ctx, w_var, &w_loss, &w_sgd, &w_done);
-    split3(ctx, b_var, &b_loss, &b_sgd, &b_done);
+    // w is used in: forward, grad_target, sgd_update_src, assign_dst, base_case
+    // b is used in: forward, grad_target, sgd_update_src, assign_dst, base_case
+    Term ws[5]; dup_n(ctx, w, ws, 5);
+    Term bs[5]; dup_n(ctx, b, bs, 5);
+    // ws[0]=forward, ws[1]=grad_target, ws[2]=sgd_src, ws[3]=assign_dst, ws[4]=base
 
     // Forward: pred = x @ w + b
     Term pred = thvm_op(ctx, UOP_ADD,
-        thvm_mm(ctx, x, w_loss),
-        thvm_expand(ctx, thvm_reshape(ctx, b_loss, SHAPE(1, 4)), SHAPE(2, 4)));
+        thvm_mm(ctx, x, ws[0]),
+        thvm_expand(ctx, thvm_reshape(ctx, bs[0], SHAPE(1, 4)), SHAPE(2, 4)));
 
-    // Mean squared error over all 8 outputs.
+    // Mean squared error
     Term diff = thvm_op(ctx, UOP_SUB, pred, y);
     Term sq = thvm_op(ctx, UOP_MUL, diff, diff);
     Term loss = thvm_sum_axes(ctx, sq, (u32[]){0, 1}, 2);
@@ -62,10 +67,11 @@ static Term tiny_linear_sgd_loop(TinyHVM *ctx,
     Term inv_n = thvm_reshape(ctx, thvm_scalar(ctx, 1.0f / 8.0f), SHAPE(1, 1));
     loss = thvm_op(ctx, UOP_MUL, loss, inv_n);
 
-    // Pure kept gradients: APP(driver, CTR(grad_w, grad_b)).
-    Term params[] = {w_var, b_var};
+    // Backward: GRAD_KEEP(loss, [w, b]) → CTR(gw, gb)
+    Term params[] = {ws[1], bs[1]};
     Term grads = thvm_grad_multi_keep(ctx, loss, params, 2);
 
+    // MAT destructs CTR(gw, gb) → apply λgw. λgb. ...
     u64 l_gw = heap_alloc(ctx, 2);
     Term gw_var = term_new(TAG_VAR, 0, l_gw);
     heap_set(ctx, l_gw + 0, term_set_sub(gw_var));
@@ -76,19 +82,29 @@ static Term tiny_linear_sgd_loop(TinyHVM *ctx,
     heap_set(ctx, l_gb + 0, term_set_sub(gb_var));
     thvm_hint_shape(ctx, gb_var, SHAPE(4));
 
+    // SGD update via ASSIGN: ASSIGN(dst, src) returns dst tensor in phase 3
     Term lr_w = thvm_expand(ctx, thvm_reshape(ctx, lr, SHAPE(1, 1)), SHAPE(3, 4));
     Term lr_b = thvm_expand(ctx, lr, SHAPE(4));
-    Term next_w = thvm_op(ctx, UOP_SUB, w_sgd, thvm_op(ctx, UOP_MUL, lr_w, gw_var));
-    Term next_b = thvm_op(ctx, UOP_SUB, b_sgd, thvm_op(ctx, UOP_MUL, lr_b, gb_var));
-    // No DETACH: pass lazy TAG_TOP update expressions directly.
-    // Phase 1 unrolls all iterations structurally as lazy TAG_TOP chains.
-    // Phase 2 fuses and deduplicates kernels across iterations.
+    Term update_w = thvm_op(ctx, UOP_SUB, ws[2], thvm_op(ctx, UOP_MUL, lr_w, gw_var));
+    Term update_b = thvm_op(ctx, UOP_SUB, bs[2], thvm_op(ctx, UOP_MUL, lr_b, gb_var));
+    Term assign_w = thvm_assign(ctx, ws[3], update_w);
+    Term assign_b = thvm_assign(ctx, bs[3], update_b);
+
+    // Recursive call: train(m)(assign_w)(assign_b)
+    // ASSIGN returns dst tensor (TAG_TEN) in phase 3.
+    // Passing ASSIGN results as args forces them to reduce before the body fires.
+    // In phase 1: ASSIGN is WNF (TAG_TOP) — blocks APP from fully reducing.
+    // In phase 3: ASSIGN fires → TAG_TEN → APP-LAM substitutes → body continues.
+    // The lambda body ignores these args (uses same w,b slots).
     Term rec = thvm_app(ctx,
                thvm_app(ctx,
                thvm_app(ctx, thvm_ref(ctx, train_id), next_counter),
-                        next_w),
-                        next_b);
+                        assign_w),
+                        assign_b);
+    // train now takes 3 args: λcounter. λ_aw. λ_ab. IFZ(...)
+    // _aw and _ab are dummy — they force ASSIGN evaluation via APP reduction.
 
+    // Wire into gradient bundle match
     heap_set(ctx, l_gb + 1, rec);
     Term lam_gb = term_new(TAG_LAM, 0, l_gb);
     heap_set(ctx, l_gw + 1, lam_gb);
@@ -99,19 +115,27 @@ static Term tiny_linear_sgd_loop(TinyHVM *ctx,
     heap_set(ctx, l_next + 1, succ_body);
     Term succ_lam = term_new(TAG_LAM, 0, l_next);
 
-    Term done = thvm_ctr(ctx, (Term[]){w_done, b_done}, 2);
-    heap_set(ctx, l_b + 1, thvm_ifz(ctx, counter_var, done, succ_lam));
-    Term lam_b = term_new(TAG_LAM, 0, l_b);
-    heap_set(ctx, l_w + 1, lam_b);
-    Term lam_w = term_new(TAG_LAM, 0, l_w);
-    heap_set(ctx, l_counter + 1, lam_w);
+    // Base case: return final param values
+    Term done = thvm_ctr(ctx, (Term[]){ws[4], bs[4]}, 2);
+    Term ifz = thvm_ifz(ctx, counter_var, done, succ_lam);
+
+    // train takes 3 args: λcounter. λ_aw. λ_ab. IFZ(counter, done, succ)
+    // _aw, _ab are dummy args that force ASSIGN evaluation before body fires.
+    u64 l_aw = heap_alloc(ctx, 2);
+    heap_set(ctx, l_aw + 0, term_set_sub(term_new(TAG_VAR, 0, l_aw)));
+    heap_set(ctx, l_aw + 1, ifz);
+    u64 l_ab = heap_alloc(ctx, 2);
+    heap_set(ctx, l_ab + 0, term_set_sub(term_new(TAG_VAR, 0, l_ab)));
+    heap_set(ctx, l_ab + 1, term_new(TAG_LAM, 0, l_aw));
+    heap_set(ctx, l_counter + 1, term_new(TAG_LAM, 0, l_ab));
     ctx->defs[train_id] = term_new(TAG_LAM, 0, l_counter);
 
+    // Initial call: train(n_steps)(ERA)(ERA) — no ASSIGNs on first entry
     return thvm_app(ctx,
            thvm_app(ctx,
            thvm_app(ctx, thvm_ref(ctx, train_id), thvm_scalar_u32(ctx, n_steps)),
-                    w0),
-                    b0);
+                    term_era()),
+                    term_era());
 }
 
 int main(int argc, char **argv) {
@@ -148,51 +172,43 @@ int main(int argc, char **argv) {
 
     Term x  = thvm_tensor(ctx, xd,  (Shape){.dims={2,3}, .rank=2});
     Term y  = thvm_tensor(ctx, yd,  (Shape){.dims={2,4}, .rank=2});
-    Term w0 = thvm_tensor(ctx, wd,  (Shape){.dims={3,4}, .rank=2});
+    Term w  = thvm_tensor(ctx, wd,  (Shape){.dims={3,4}, .rank=2});
     Term b0 = thvm_tensor(ctx, bd,  (Shape){.dims={4},   .rank=1});
     Term lr = thvm_scalar(ctx, lr_val);
 
-    thvm_set_requires_grad(ctx, w0);
+    thvm_set_requires_grad(ctx, w);
     thvm_set_requires_grad(ctx, b0);
 
-    Term program = tiny_linear_sgd_loop(ctx, w0, b0, x, y, lr, n_steps);
+    Term program = tiny_linear_sgd_loop(ctx, w, b0, x, y, lr, n_steps);
     Term result = thvm_eval(ctx, program);
 
-    if (getenv("THVM_LOOP_DIAG") && term_tag(result) == TAG_CTR) {
+    printf("result_tag=%u ext=%u val=%llu\n",
+           (u32)term_tag(result), (u32)term_ext(result), (unsigned long long)term_val(result));
+
+    if (term_tag(result) == TAG_CTR) {
         u64 rloc = term_val(result);
         for (u32 i = 0; i < 2; i++) {
             Term child = heap_read(ctx, rloc + i);
-            printf("bundle_child[%u]_tag=%u ext=%u val=%llu\n",
+            printf("result[%u] tag=%u ext=%u val=%llu\n",
                    i, (u32)term_tag(child), (u32)term_ext(child), (unsigned long long)term_val(child));
         }
     }
 
-    Term final_w_t = thvm_grad_bundle_get(ctx, result, 0);
-    Term final_b_t = thvm_grad_bundle_get(ctx, result, 1);
+    // Read final parameter values directly from the tensor slots
     u32 w_dtype = DTYPE_F32, b_dtype = DTYPE_F32;
     Shape w_shape = SHAPE(1), b_shape = SHAPE(1);
-    void *w_raw = thvm_to_host_raw(ctx, final_w_t, &w_dtype, &w_shape);
-    void *b_raw = thvm_to_host_raw(ctx, final_b_t, &b_dtype, &b_shape);
-    final_w_t = thvm_reduce(ctx, final_w_t);
-    final_b_t = thvm_reduce(ctx, final_b_t);
+    void *w_raw = thvm_to_host_raw(ctx, w, &w_dtype, &w_shape);
+    void *b_raw = thvm_to_host_raw(ctx, b0, &b_dtype, &b_shape);
 
-    printf("result_tag=%u ext=%u val=%llu\n",
-           (u32)term_tag(result), (u32)term_ext(result), (unsigned long long)term_val(result));
-    printf("final_w_tag=%u ext=%u val=%llu\n",
-           (u32)term_tag(final_w_t), (u32)term_ext(final_w_t), (unsigned long long)term_val(final_w_t));
-    printf("final_b_tag=%u ext=%u val=%llu\n",
-           (u32)term_tag(final_b_t), (u32)term_ext(final_b_t), (unsigned long long)term_val(final_b_t));
     f32 *wf = (w_raw && w_dtype == DTYPE_F32) ? (f32 *)w_raw : NULL;
     f32 *bf = (b_raw && b_dtype == DTYPE_F32) ? (f32 *)b_raw : NULL;
-    if (wf && bf) {
+    if (wf) {
         printf("final_w = [");
         for (int i = 0; i < 12; i++) printf("%.4f%s", wf[i], i == 11 ? "" : ", ");
         printf("]\n");
-        printf("final_b = [%.4f, %.4f, %.4f, %.4f]\n", bf[0], bf[1], bf[2], bf[3]);
     }
-
-    if (term_tag(result) == TAG_CTR) {
-        printf("result_bundle = %u\n", (u32)term_ext(result));
+    if (bf) {
+        printf("final_b = [%.4f, %.4f, %.4f, %.4f]\n", bf[0], bf[1], bf[2], bf[3]);
     }
 
     thvm_free(ctx);

@@ -428,7 +428,9 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 term_tag(whnf) == TAG_NUM ||
                 term_tag(whnf) == TAG_SUP ||
                 (term_tag(whnf) == TAG_TOP && frame_uop == UOP_GRAD) ||
-                (term_tag(whnf) == TAG_VAR && frame_uop == UOP_DETACH);
+                (term_tag(whnf) == TAG_VAR && frame_uop == UOP_DETACH) ||
+                // UOP_FUSE/UOP_SCHED accept any WNF payload (pass-through signals)
+                (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED);
             if (!arg0_ready) {
                 heap_set(ctx, loc+0, whnf); whnf = frame; continue;
             }

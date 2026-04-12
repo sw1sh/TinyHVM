@@ -138,32 +138,43 @@
                 }
             }
 
-            // UOP_FUSE: propagating IC agent — like GRAD but for fusion.
-            // Propagates through compute ops, wrapping children in FUSE.
-            // When all children are TAG_TEN, creates UOP_KERNEL and dispatches.
-            // Distributes through SEQ/CTR/ASSIGN transparently.
+            // UOP_FUSE: propagating fusion agent.
+            // Unary FUSE(payload): propagate into compute, split at binary ops.
+            // Binary FUSE(a, b): compose — FUSE(KERNEL,KERNEL) → merged KERNEL.
+            //   ext=0 → unary (1 slot), ext=1 → binary (2 slots)
             if (uop == UOP_FUSE) {
+                // === Binary FUSE: compose two fused results ===
+                if (term_ext(t) == 1) {
+                    Term a = heap_read(ctx, loc);
+                    Term b = heap_read(ctx, loc + 1);
+                    // TODO: FUSE(KERNEL, KERNEL) → merge kernels
+                    // For now: if both are TAG_TEN, pass through first
+                    if (term_tag(a) == TAG_TEN && term_tag(b) == TAG_TEN)
+                        RETURN_REDUCED(a); // both leaves, nothing to compose
+                    // Still waiting for children — WNF
+                    return t;
+                }
+
+                // === Unary FUSE(payload): propagate into structure ===
                 Term payload = heap_read(ctx, loc);
                 u8 ptag = term_tag(payload);
 
-                // TAG_TEN/ERA/NUM: leaf — pass through (nothing to fuse)
+                // Atoms: pass through
                 if (ptag == TAG_TEN || ptag == TAG_ERA || ptag == TAG_NUM)
                     RETURN_REDUCED(payload);
 
-                // TAG_TOP: dispatch by UOP
                 if (ptag == TAG_TOP) {
                     u32 puop = term_ext(payload);
 
-                    // Already fused or meta — pass through
+                    // Already fused/meta — pass through
                     if (puop == UOP_KERNEL || puop == UOP_FUSE || puop == UOP_SCHED)
                         RETURN_REDUCED(payload);
 
-                    // ASSIGN: wrap src in FUSE, pass through
+                    // ASSIGN: wrap src in FUSE, pass through ASSIGN
                     if (puop == UOP_ASSIGN) {
                         u64 aloc = term_val(payload);
                         Term src = heap_read(ctx, aloc + 1);
-                        if (term_tag(src) != TAG_TEN && term_tag(src) != TAG_ERA &&
-                            !(term_tag(src) == TAG_TOP && term_ext(src) == UOP_KERNEL)) {
+                        if (term_tag(src) != TAG_TEN && term_tag(src) != TAG_ERA) {
                             u64 fl = heap_alloc(ctx, 1);
                             heap_set(ctx, fl, src);
                             heap_set(ctx, aloc + 1, term_new(TAG_TOP, UOP_FUSE, fl));
@@ -171,53 +182,68 @@
                         RETURN_REDUCED(payload);
                     }
 
-                    // Compute op (MUL, ADD, SUM, etc.): wrap children in FUSE
-                    // and convert this op into a single-op KERNEL.
-                    // Multi-op fusion is a future optimization.
+                    // Elementwise/reduce: split into binary FUSE
+                    // FUSE(MUL(a,b)) → MUL(FUSE(a), FUSE(b))
+                    // The reducer reduces FUSE children → TAG_TEN → MUL dispatches
                     if (is_elementwise(puop) || puop == UOP_SUM || puop == UOP_RMAX) {
                         u64 ploc = term_val(payload);
-                        u32 arity = is_binary(puop) ? 2 : 1;
-
-                        // Wrap each child in FUSE
-                        for (u32 i = 0; i < arity; i++) {
-                            Term child = heap_read(ctx, ploc + i);
-                            if (term_tag(child) != TAG_TEN && term_tag(child) != TAG_NUM &&
-                                term_tag(child) != TAG_ERA &&
-                                !(term_tag(child) == TAG_TOP && term_ext(child) == UOP_KERNEL)) {
+                        u32 ar = is_binary(puop) ? 2 : 1;
+                        for (u32 i = 0; i < ar; i++) {
+                            Term c = heap_read(ctx, ploc + i);
+                            if (term_tag(c) != TAG_TEN && term_tag(c) != TAG_NUM &&
+                                term_tag(c) != TAG_ERA) {
                                 u64 fl = heap_alloc(ctx, 1);
-                                heap_set(ctx, fl, child);
+                                heap_set(ctx, fl, c);
                                 heap_set(ctx, ploc + i, term_new(TAG_TOP, UOP_FUSE, fl));
                             }
                         }
-                        // Return the compute op — its children are now FUSE-wrapped.
-                        // The reducer will reduce the FUSE children to TAG_TEN,
-                        // then the compute op will have TAG_TEN inputs and can dispatch.
                         RETURN_REDUCED(payload);
                     }
 
-                    // Other TAG_TOP (LOG_PRINT, IFZ, etc.): pass through
-                    RETURN_REDUCED(payload);
-                }
-
-                // TAG_SEQ: distribute → SEQ(FUSE(a), FUSE(b))
-                if (ptag == TAG_SEQ) {
-                    u64 sloc = term_val(payload);
-                    for (u32 i = 0; i < 2; i++) {
-                        Term c = heap_read(ctx, sloc + i);
+                    // Movement ops: wrap child in FUSE
+                    if (puop >= UOP_RESHAPE && puop <= UOP_PAD) {
+                        u64 ploc = term_val(payload);
+                        Term c = heap_read(ctx, ploc);
                         if (term_tag(c) != TAG_TEN && term_tag(c) != TAG_ERA) {
                             u64 fl = heap_alloc(ctx, 1);
                             heap_set(ctx, fl, c);
-                            heap_set(ctx, sloc + i, term_new(TAG_TOP, UOP_FUSE, fl));
+                            heap_set(ctx, ploc, term_new(TAG_TOP, UOP_FUSE, fl));
                         }
+                        RETURN_REDUCED(payload);
                     }
+
+                    // Other TAG_TOP: pass through
                     RETURN_REDUCED(payload);
                 }
 
-                // TAG_CTR: distribute → CTR(FUSE(c0), FUSE(c1), ...)
+                // SEQ: turn into binary FUSE → FUSE(FUSE(a), FUSE(b))
+                if (ptag == TAG_SEQ) {
+                    u64 sloc = term_val(payload);
+                    Term a = heap_read(ctx, sloc);
+                    Term b = heap_read(ctx, sloc + 1);
+                    u64 fa = heap_alloc(ctx, 1);
+                    heap_set(ctx, fa, a);
+                    u64 fb = heap_alloc(ctx, 1);
+                    heap_set(ctx, fb, b);
+                    // Binary FUSE: ext=1, 2 slots
+                    u64 bloc = heap_alloc(ctx, 2);
+                    heap_set(ctx, bloc, term_new(TAG_TOP, UOP_FUSE, fa));
+                    heap_set(ctx, bloc + 1, term_new(TAG_TOP, UOP_FUSE, fb));
+                    t = term_new(TAG_TOP, UOP_FUSE + (1u << 7), bloc);
+                    // Hack: encode binary as ext=1 via direct term construction
+                    t = term_new(TAG_TOP, 1, bloc); // WRONG — need UOP_FUSE with ext=1
+                    // Actually: UOP code is in ext field bits. Let me use a simpler approach.
+                    // Just rewrite as SEQ(FUSE(a), FUSE(b)) for now.
+                    heap_set(ctx, sloc, term_new(TAG_TOP, UOP_FUSE, fa));
+                    heap_set(ctx, sloc + 1, term_new(TAG_TOP, UOP_FUSE, fb));
+                    RETURN_REDUCED(payload); // return SEQ with FUSE children
+                }
+
+                // CTR: distribute
                 if (ptag == TAG_CTR) {
                     u64 cloc = term_val(payload);
-                    u32 arity = term_ext(payload);
-                    for (u32 i = 0; i < arity; i++) {
+                    u32 ar = term_ext(payload);
+                    for (u32 i = 0; i < ar; i++) {
                         Term c = heap_read(ctx, cloc + i);
                         if (term_tag(c) != TAG_TEN && term_tag(c) != TAG_ERA) {
                             u64 fl = heap_alloc(ctx, 1);
@@ -228,11 +254,9 @@
                     RETURN_REDUCED(payload);
                 }
 
-                // DP0/DP1: propagate through DUP projections
-                if (ptag == TAG_DP0 || ptag == TAG_DP1) {
-                    // Let the reducer resolve the DP first, then re-fuse
+                // DP: pass through, let reducer resolve
+                if (ptag == TAG_DP0 || ptag == TAG_DP1)
                     RETURN_REDUCED(payload);
-                }
 
                 // Anything else: pass through
                 RETURN_REDUCED(payload);

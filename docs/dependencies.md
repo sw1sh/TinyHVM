@@ -137,14 +137,37 @@ The scheduler enforces it via dependency analysis. Both are needed:
 - Data flow: tells the scheduler WHAT the intended order is
 - Dependency analysis: ensures the scheduler RESPECTS that order
 
-## HVM4 Mechanisms (Not Directly Applicable)
+## HVM4 Mechanisms
 
 - **INC**: priority hint for collapse enumeration, not execution ordering
-- **AND/OR**: short-circuit boolean — could serve as sequencing primitive
-  but only for numeric values (zero-check)
+- **AND/OR**: short-circuit boolean — inspired TAG_SEQ design
 - **Strict fields**: OP2, EQL, DSU, DDU force left-to-right evaluation
   in WNF reduction — relevant for eager sub-expressions but not for
   cross-kernel scheduling
+
+## BRI (Bridge) and Dependent Types — Future Research
+
+BRI (θx.body) is the contra-variant dual of lambda. It binds the *producer*
+in the consumer's scope:
+
+```
+λx.body  — body receives x     (covariant: caller → callee)
+θf.body  — body describes f    (contra-variant: value → type)
+```
+
+Self-types let the type reference its own producer recursively:
+`Ind = λA λB θf λx {(f {x:A}): (B f x)}`
+
+**Relevance to dependency tracking**: BRI could encode "consumer knows who
+produced this buffer" — `θproducer.consumer` binds the write operation in
+the read operation's type. ANN-BRI annihilation (`{value : θf.T} → T[f:=value]`)
+resolves the dependency by substituting the actual producer.
+
+This is type-theoretic verification of buffer safety: proving at the type
+level that reads happen after writes. Much heavier than SEQ for practical
+ordering, but could be valuable for compile-time verification of kernel DAGs.
+
+See: `resources/icc_bridges.md` for full ICC theory.
 
 ## Files
 

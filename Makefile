@@ -32,4 +32,9 @@ clean:
 	rm -rf $(BIN) shaders.metallib
 	rm -rf *.dSYM
 
-.PHONY: test test_metal test_train test_train_metal clean
+# README snippet regression (forward + autograd bundle); see test/test_readme_verify.m
+readme-verify: $(BIN) shaders.metallib test/test_readme_verify.m src/tinyhvm.c src/tinyhvm.h
+	$(CC) $(CFLAGS) $(FW) -DDEVICE='"cpu"' -o $(BIN)/test_readme_verify test/test_readme_verify.m && $(BIN)/test_readme_verify
+	$(CC) $(CFLAGS) $(FW) -DDEVICE='"metal"' -o $(BIN)/test_readme_verify test/test_readme_verify.m && $(BIN)/test_readme_verify
+
+.PHONY: test test_metal test_train test_train_metal readme-verify clean

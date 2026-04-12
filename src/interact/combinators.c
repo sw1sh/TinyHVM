@@ -307,8 +307,8 @@ era_continue:
             return term_new(TAG_ERA, term_ext(t) ^ 1u, era_loc);
         }
 
-        // TAG_REF: unfold definition — deep-clone body (ALO semantics).
-        // Each unfold gets fresh heap nodes so recursive defs work correctly.
+        // TAG_REF: unfold definition — clone body for fresh variable bindings.
+        // TODO: optimize for loops — clone only lambda scaffolding, share compute.
         case TAG_REF: {
             u32 name = (u32)term_ext(t);
             assert(name < ctx->def_count);
@@ -434,7 +434,15 @@ era_continue:
 	            // DUP ⊳ TOP: commute by duplicating the node and splitting children.
 	            if (term_tag(val) == TAG_TOP) {
 	                u32 uop = term_ext(val);
-	                if (uop == UOP_KERNEL) DUP_STATE_RETURN(val, val, val);
+	                if (uop == UOP_KERNEL) {
+	                    // Create independent dispatch instance: same kid, fresh heap slot.
+	                    // One copy consumed this iteration, the other survives for next.
+	                    u64 old_loc = term_val(val);
+	                    u64 new_loc = heap_alloc(ctx, 1);
+	                    heap_set(ctx, new_loc, heap_read(ctx, old_loc)); // copy kid
+	                    Term copy = term_new(TAG_TOP, UOP_KERNEL, new_loc);
+	                    DUP_STATE_RETURN(val, val, copy);
+	                }
                     if (uop == UOP_DETACH) {
                         Term forced = thvm_eval(ctx, val);
                         if (getenv("THVM_LOOP_DIAG")) {

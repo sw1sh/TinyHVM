@@ -254,6 +254,11 @@ static int fuse_leaf_reshape_target(Shape op_shape, Shape rs_shape,
 static int fuse_walk_inner(TinyHVM *ctx, Term t,
                            FusedOp *ops, u32 *n_ops,
                            u32 *leaf_ids, const View **leaf_views, u32 *n_leaves) {
+    if (getenv("THVM_SCHED_DIAG") && term_tag(t) == TAG_TOP)
+        fprintf(stderr, "  fuse_walk: %s@%llu bidx=%d\n",
+                term_ext(t) < UOP_COUNT ? uop_names[term_ext(t)] : "?",
+                (unsigned long long)term_val(t),
+                fuse_boundary_index_for_loc(term_val(t)));
     if (term_tag(t) == TAG_TOP) {
         int bidx = fuse_boundary_index_for_loc(term_val(t));
         if (bidx >= 0 && term_val(t) != fuse_root_compute_loc) {
@@ -880,6 +885,34 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             Term ri = fuse_deref_links(ctx, heap_read(ctx, term_val(rt)));
             return fuse_walk_inner(ctx, ri, ops, n_ops, leaf_ids, leaf_views, n_leaves);
         }
+    }
+
+    // ASSIGN: leaf boundary — treat its output as a tensor with dst's shape.
+    // ASSIGN returns dst_r (same tensor), so use dst's view metadata.
+    if (uop == UOP_ASSIGN) {
+        // Chase through DP0/DP1 and nested ASSIGN to find the root tensor.
+        Term dst = heap_read(ctx, term_val(t));
+        if (getenv("THVM_SCHED_DIAG"))
+            fprintf(stderr, "  assign_chase: loc=%llu dst_tag=%u dst_ext=%u dst_val=%llu\n",
+                    (unsigned long long)term_val(t), term_tag(dst), term_ext(dst), (unsigned long long)term_val(dst));
+        for (int depth = 0; depth < 32; depth++) {
+            while (term_tag(dst) == TAG_DP0 || term_tag(dst) == TAG_DP1)
+                dst = heap_read(ctx, term_val(dst));
+            if (term_tag(dst) == TAG_TOP && term_ext(dst) == UOP_ASSIGN)
+                dst = heap_read(ctx, term_val(dst)); // chase into nested ASSIGN's dst
+            else break;
+        }
+        if (term_tag(dst) == TAG_TEN) {
+            u32 tid = (u32)term_val(dst);
+            if (tid < ctx->tensor_count) {
+                // Use dst tensor directly as the leaf — ASSIGN resolves to this tensor.
+                return fuse_append_leaf_tensor(ctx, tid,
+                    tensor_view_get(&ctx->tensors[tid]),
+                    tensor_st_get(&ctx->tensors[tid]),
+                    leaf_ids, leaf_views, n_leaves);
+            }
+        }
+        // fallthrough
     }
 
     // Non-elementwise TAG_TOP (SUM, pool RESHAPE, UOP_KERNEL, etc.): leaf boundary.

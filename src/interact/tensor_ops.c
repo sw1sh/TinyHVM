@@ -105,6 +105,11 @@
                     assign_done:
                         if (md->host_ptr) { free(md->host_ptr); md->host_ptr = NULL; }
                         heap_set(ctx, loc + 1, dst_r);
+                        // Bump buffer epoch — invalidates cached kernel results
+                        // that read from this buffer.
+                        { extern u32 buf_epoch[];
+                          if (md->buf_id < MAX_BUF_EPOCHS)
+                              buf_epoch[md->buf_id]++; }
                     }
                     ctx->itrs++;
                     RETURN_REDUCED(dst_r);
@@ -113,16 +118,56 @@
 
             // UOP_KERNEL: scheduled kernel — dispatch from KernelEntry.
             // Fired by second thvm_reduce. Reads kernel spec from global table.
+            // Cache check uses per-buffer epochs: stale if any input buffer
+            // was written by ASSIGN since last dispatch.
             if (uop == UOP_KERNEL) {
                 extern Term kid_results[];
                 extern u32 sched_kernel_count;
+                extern u32 buf_epoch[];
+                extern u32 kid_input_bufs[][KERNEL_MAX_INPUTS];
+                extern u32 kid_input_epochs[][KERNEL_MAX_INPUTS];
+                extern u32 kid_n_inputs[];
                 Term kid_term = heap_read(ctx, loc + 1); // arg1 = kernel index
                 u32 kid = (u32)term_val(kid_term);
-                if (kid < sched_kernel_count && term_tag(kid_results[kid]) != TAG_ERA)
-                    RETURN_REDUCED(kid_results[kid]);
+                if (getenv("THVM_SCHED_DIAG"))
+                    fprintf(stderr, "KERNEL kid=%u cached=%d n_inputs=%u\n",
+                            kid, term_tag(kid_results[kid]) != TAG_ERA, kid_n_inputs[kid]);
+                // Cache check: valid only if all input buffer epochs match
+                if (kid < sched_kernel_count && term_tag(kid_results[kid]) != TAG_ERA) {
+                    int cache_valid = 1;
+                    for (u32 i = 0; i < kid_n_inputs[kid]; i++) {
+                        u32 bid = kid_input_bufs[kid][i];
+                        if (bid < MAX_BUF_EPOCHS && buf_epoch[bid] != kid_input_epochs[kid][i]) {
+                            cache_valid = 0;
+                            break;
+                        }
+                    }
+                    if (cache_valid)
+                        RETURN_REDUCED(kid_results[kid]);
+                    // Stale — invalidate and re-dispatch
+                    kid_results[kid] = term_era();
+                }
                 {
                     Term result = thvm_sched_dispatch_kernel(ctx, kid);
-                    if (kid < sched_kernel_count) kid_results[kid] = result;
+                    if (kid < sched_kernel_count) {
+                        kid_results[kid] = result;
+                        // Record input buffer epochs for future cache checks
+                        extern KernelEntry sched_kernels[];
+                        KernelEntry *ke = &sched_kernels[kid];
+                        u32 ni = 0;
+                        for (u32 i = 0; i < ke->n_leaves && ni < KERNEL_MAX_INPUTS; i++) {
+                            u32 tid = ke->leaf_ids[i];
+                            if (tid && tid < ctx->tensor_count) {
+                                u32 bid = ctx->tensors[tid].buf_id;
+                                if (bid) {
+                                    kid_input_bufs[kid][ni] = bid;
+                                    kid_input_epochs[kid][ni] = (bid < MAX_BUF_EPOCHS) ? buf_epoch[bid] : 0;
+                                    ni++;
+                                }
+                            }
+                        }
+                        kid_n_inputs[kid] = ni;
+                    }
                     RETURN_REDUCED(result);
                 }
             }

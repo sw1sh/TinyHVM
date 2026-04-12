@@ -608,6 +608,10 @@ typedef struct {
     u8 is_reduce2[MAX_DIM]; // reduce axes for phase 2 (may differ from phase 1)
 } ReduceSpec;
 
+// Buffer epoch tracking for ASSIGN invalidation of kernel result cache.
+#define MAX_BUF_EPOCHS 16384
+#define KERNEL_MAX_INPUTS 32
+
 // KernelEntry: scheduler's output — one fused kernel ready for dispatch.
 // Produced by fuse_build_kernel (pure walk), consumed by UOP_KERNEL handler.
 #define SCHED_MAX_KERNELS 512

@@ -33,6 +33,14 @@ u32 sched_kernel_count = 0;
 // kid_results: TAG_TEN result for each dispatched kid (ERA = not yet dispatched).
 // Shared with UOP_KERNEL handler in tensor_ops.c.
 Term kid_results[SCHED_MAX_KERNELS];
+
+// Buffer epoch invalidation: ASSIGN bumps epoch, kernel cache checks epoch match.
+u32 buf_epoch[MAX_BUF_EPOCHS];  // per-buffer generation counter
+// Per-kernel: input buffer IDs and their epochs at dispatch time.
+u32 kid_input_bufs[SCHED_MAX_KERNELS][KERNEL_MAX_INPUTS];
+u32 kid_input_epochs[SCHED_MAX_KERNELS][KERNEL_MAX_INPUTS];
+u32 kid_n_inputs[SCHED_MAX_KERNELS];
+
 static u64 phase1_root_slot = 0;
 
 typedef struct {
@@ -1246,6 +1254,9 @@ u32 sched_all(TinyHVM *ctx, Term root) {
     _sched_n_absorbed = 0;
     sched_kernel_count = 0;
     for (u32 i = 0; i < SCHED_MAX_KERNELS; i++) kid_results[i] = term_era();
+    memset(kid_n_inputs, 0, sizeof(kid_n_inputs));
+    // Note: buf_epoch is NOT reset — it persists across scheduling passes
+    // so ASSIGN writes from previous iterations are visible.
 
     sched_collect_boundaries(ctx, root);
     u32 selected = sched_select_boundaries();

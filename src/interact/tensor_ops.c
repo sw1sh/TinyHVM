@@ -119,11 +119,12 @@
             // UOP_KERNEL: scheduled kernel — dispatch from KernelEntry.
             // Fired by second thvm_reduce. Reads kernel spec from global table.
             // UOP_KERNEL: scheduled kernel — dispatch from KernelEntry.
-            // Only fires in phase 3 (when dispatch is enabled).
-            // In phase 2, KERNEL is WNF — waiting for UOP_SCHED to enable dispatch.
+            // Gated by dispatch flag: WNF during phase 2 (while UOP_FUSE builds graph),
+            // fires in phase 3 (after UOP_SCHED enables dispatch).
+            // SEQ chains enforce ordering between ASSIGN and KERNEL.
             if (uop == UOP_KERNEL) {
                 extern int _assign_dispatch_enabled;
-                if (!_assign_dispatch_enabled) return t;  // WNF until phase 3
+                if (!_assign_dispatch_enabled) return t;
                 extern Term kid_results[];
                 extern u32 sched_kernel_count;
                 extern u32 buf_epoch[];

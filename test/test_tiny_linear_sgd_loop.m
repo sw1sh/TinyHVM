@@ -80,14 +80,14 @@ static Term tiny_linear_sgd_loop(TinyHVM *ctx,
     Term lr_b = thvm_expand(ctx, lr, SHAPE(4));
     Term next_w = thvm_op(ctx, UOP_SUB, w_sgd, thvm_op(ctx, UOP_MUL, lr_w, gw_var));
     Term next_b = thvm_op(ctx, UOP_SUB, b_sgd, thvm_op(ctx, UOP_MUL, lr_b, gb_var));
-    Term next_w_leaf = thvm_detach(ctx, next_w);
-    Term next_b_leaf = thvm_detach(ctx, next_b);
-
+    // No DETACH: pass lazy TAG_TOP update expressions directly.
+    // Phase 1 unrolls all iterations structurally as lazy TAG_TOP chains.
+    // Phase 2 fuses and deduplicates kernels across iterations.
     Term rec = thvm_app(ctx,
                thvm_app(ctx,
                thvm_app(ctx, thvm_ref(ctx, train_id), next_counter),
-                        next_w_leaf),
-                        next_b_leaf);
+                        next_w),
+                        next_b);
 
     heap_set(ctx, l_gb + 1, rec);
     Term lam_gb = term_new(TAG_LAM, 0, l_gb);
@@ -164,12 +164,6 @@ int main(int argc, char **argv) {
             Term child = heap_read(ctx, rloc + i);
             printf("bundle_child[%u]_tag=%u ext=%u val=%llu\n",
                    i, (u32)term_tag(child), (u32)term_ext(child), (unsigned long long)term_val(child));
-            if (term_tag(child) == TAG_TOP && term_ext(child) == UOP_DETACH) {
-                u64 dloc = term_val(child);
-                Term src = heap_read(ctx, dloc + 0);
-                printf("bundle_child[%u]_detach_src_tag=%u ext=%u val=%llu\n",
-                       i, (u32)term_tag(src), (u32)term_ext(src), (unsigned long long)term_val(src));
-            }
         }
     }
 

@@ -154,6 +154,13 @@ Term thvm_tensor_u32(TinyHVM *ctx, const u32 *data, Shape s) {
 static const View *term_view(TinyHVM *ctx, Term t) {
     if (term_tag(t) == TAG_TEN) return tensor_view_get(&ctx->tensors[(u32)term_val(t)]);
     if (term_tag(t) == TAG_TOP) return st_get(term_val(t));
+    if (term_tag(t) == TAG_VAR) {
+        u64 loc = term_val(t);
+        Term sub = heap_read(ctx, loc);
+        if (!term_is_sub(sub)) return term_view(ctx, sub);
+        return st_get(loc);
+    }
+    if (term_tag(t) == TAG_ANN) return term_view(ctx, heap_read(ctx, term_val(t)));
     // Look through DUP nodes: DP0/DP1 share a value at heap[dl+0]
     if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1)
         return term_view(ctx, heap_read(ctx, term_val(t)));
@@ -338,13 +345,182 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
     return t; // table full
 }
 
-// Fast path: skip linear_use + shape tracking. For internal backward ops
-// Fast path: skip linear_use + shape tracking.
+static void thvm_track_top_shape(TinyHVM *ctx, u64 loc, u32 uop, Term a, Term b) {
+    const View *va = term_view(ctx, a);
+    const View *vb_dbg = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
+    {
+        View out = {0};
+        int stored = 0;
+
+        // View ops: output shape deterministic from metadata
+        if (term_tag(b) == TAG_TEN) {
+            u32 bf[MAX_DIM * 2];
+            u32 bn = tensor_meta_read_u32(ctx, (u32)term_val(b), bf, MAX_DIM * 2);
+            if (bn && uop == UOP_RESHAPE) {
+                Shape ns = {.rank = bn};
+                for (u32 i = 0; i < bn; i++) ns.dims[i] = bf[i];
+                u32 nn = 1;
+                for (u32 i = 0; i < ns.rank; i++) nn *= ns.dims[i];
+                const ShapeTracker *input_st = st_get_tracker(term_val(a));
+                if (input_st && va && nn == va->numel) {
+                    ShapeTracker composed = st_reshape(*input_st, ns);
+                    st_set_tracker(loc, &composed);
+                } else if (va && nn == va->numel) {
+                    ShapeTracker composed = st_reshape(st_from_view(*va), ns);
+                    st_set_tracker(loc, &composed);
+                } else {
+                    out = view_create(ns);
+                    st_set(loc, &out);
+                }
+                stored = 1;
+            } else if (bn && uop == UOP_EXPAND) {
+                const ShapeTracker *input_st = st_get_tracker(term_val(a));
+                if (input_st && va) {
+                    ShapeTracker composed = st_expand(*input_st, bf, bn);
+                    st_set_tracker(loc, &composed);
+                } else if (va) {
+                    ShapeTracker composed = st_expand(st_from_view(*va), bf, bn);
+                    st_set_tracker(loc, &composed);
+                } else {
+                    Shape ns = {.rank = bn};
+                    for (u32 i = 0; i < bn; i++) ns.dims[i] = bf[i];
+                    out = view_create(ns);
+                    st_set(loc, &out);
+                }
+                stored = 1;
+            } else if (bn && uop == UOP_SHRINK) {
+                u32 ndim = bn / 2;
+                u32 starts[MAX_DIM], ends[MAX_DIM];
+                for (u32 i = 0; i < ndim; i++) { starts[i] = bf[i * 2]; ends[i] = bf[i * 2 + 1]; }
+                const ShapeTracker *input_st = st_get_tracker(term_val(a));
+                if (input_st && va) {
+                    ShapeTracker composed = st_shrink(*input_st, starts, ends, ndim);
+                    st_set_tracker(loc, &composed);
+                } else {
+                    Shape ns = {.rank = ndim};
+                    for (u32 i = 0; i < ndim; i++) ns.dims[i] = ends[i] - starts[i];
+                    out = view_create(ns);
+                    st_set(loc, &out);
+                }
+                stored = 1;
+            } else if (bn && uop == UOP_PAD) {
+                u32 ndim = bn / 2;
+                u32 pb[MAX_DIM], pa[MAX_DIM];
+                for (u32 i = 0; i < ndim; i++) { pb[i] = bf[i * 2]; pa[i] = bf[i * 2 + 1]; }
+                const ShapeTracker *input_st = st_get_tracker(term_val(a));
+                if (input_st && va) {
+                    ShapeTracker composed = st_pad(*input_st, pb, pa);
+                    st_set_tracker(loc, &composed);
+                } else if (va) {
+                    ShapeTracker composed = st_pad(st_from_view(*va), pb, pa);
+                    st_set_tracker(loc, &composed);
+                } else {
+                    Shape ns = {.rank = ndim};
+                    for (u32 i = 0; i < ndim; i++) ns.dims[i] = pb[i] + pa[i];
+                    out = view_create(ns);
+                    st_set(loc, &out);
+                }
+                stored = 1;
+            } else if (bn && uop == UOP_PERMUTE && va) {
+                u32 axes[MAX_DIM];
+                for (u32 i = 0; i < bn; i++) axes[i] = bf[i];
+                const ShapeTracker *input_st = st_get_tracker(term_val(a));
+                if (input_st) {
+                    ShapeTracker composed = st_permute(*input_st, axes, bn);
+                    st_set_tracker(loc, &composed);
+                } else {
+                    ShapeTracker composed = st_permute(st_from_view(*va), axes, bn);
+                    st_set_tracker(loc, &composed);
+                }
+                stored = 1;
+            } else if ((uop == UOP_SUM || uop == UOP_RMAX)) {
+                if (!va) goto skip_sum;
+                out = *va;
+                for (u32 i = 0; i < bn; i++) {
+                    u32 ax = bf[i];
+                    if (ax < out.shape.rank) out.shape.dims[ax] = 1;
+                }
+                out = view_create(out.shape);
+                st_set(loc, &out);
+                stored = 1;
+                skip_sum:;
+            }
+        }
+
+        if (!stored && va && (uop == UOP_SUM || uop == UOP_RMAX) && term_tag(b) == TAG_ERA) {
+            out = *va;
+            for (int d = (int)va->shape.rank - 1; d >= 0; d--)
+                if (va->shape.dims[d] > 1) { out.shape.dims[d] = 1; break; }
+            out = view_create(out.shape);
+            st_set(loc, &out);
+            stored = 1;
+        }
+
+        if (!stored && uop == UOP_MM && va) {
+            const View *vb = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
+            if (vb) {
+                Shape os = {.rank = 2, .dims = {va->shape.dims[0], vb->shape.dims[1]}};
+                out = view_create(os);
+                st_set(loc, &out);
+                stored = 1;
+            }
+        }
+
+        if (!stored && uop == UOP_CAST && va) {
+            out = *va;
+            st_set(loc, &out);
+            stored = 1;
+        }
+
+        if (!stored && uop == UOP_DETACH && va) {
+            out = *va;
+            st_set(loc, &out);
+            stored = 1;
+        }
+
+        if (!stored && is_elementwise(uop)) {
+            const View *vb = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
+            if (va && vb) {
+                View av_bc, bv_bc;
+                u32 bc_shape[MAX_DIM], bc_ndim;
+                if (view_broadcast(va, vb, &av_bc, &bv_bc, bc_shape, &bc_ndim))
+                    out = view_create(shape_of(bc_shape, bc_ndim));
+                else
+                    out = *va;
+            } else if (va) {
+                out = *va;
+            } else {
+                const View *vb = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
+                if (vb) out = *vb;
+                else goto skip_st;
+            }
+            st_set(loc, &out);
+            skip_st:;
+        }
+    }
+    if (getenv("THVM_SCHED_DIAG") && loc >= 300) {
+        const View *ov = st_get(loc);
+        fprintf(stderr, "  OP_TRACK: loc=%llu uop=%s out=[",
+                (unsigned long long)loc, uop < UOP_COUNT ? uop_names[uop] : "?");
+        if (ov) for (u32 _d = 0; _d < ov->shape.rank; _d++)
+            fprintf(stderr, "%u%s", ov->shape.dims[_d], _d + 1 < ov->shape.rank ? "," : "");
+        fprintf(stderr, "] a=[");
+        if (va) for (u32 _d = 0; _d < va->shape.rank; _d++)
+            fprintf(stderr, "%u%s", va->shape.dims[_d], _d + 1 < va->shape.rank ? "," : "");
+        fprintf(stderr, "] b=[");
+        if (vb_dbg) for (u32 _d = 0; _d < vb_dbg->shape.rank; _d++)
+            fprintf(stderr, "%u%s", vb_dbg->shape.dims[_d], _d + 1 < vb_dbg->shape.rank ? "," : "");
+        fprintf(stderr, "]\n");
+    }
+}
+
+// Fast path: skip linear_use/shadow bookkeeping, but still track lazy shapes.
 Term thvm_op_raw(TinyHVM *ctx, u32 uop, Term a, Term b) {
     thvm_maybe_normalize_binary_broadcast(ctx, uop, &a, &b);
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc, a);
     heap_set(ctx, loc + 1, b);
+    thvm_track_top_shape(ctx, loc, uop, a, b);
     return term_new(TAG_TOP, uop, loc);
 }
 
@@ -382,154 +558,7 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
     heap_set(ctx, loc + 2, heap_read(ctx, loc)); // shadow: picks up DP0 patch
     heap_set(ctx, loc + 3, b);
 
-    // Shape tracking: eagerly compute and store output view.
-    // View ops with metadata (RESHAPE, EXPAND, SHRINK, PAD, PERMUTE) store
-    // shape even without input view. Elementwise/reduce need input view.
-    const View *va = term_view(ctx, a);
-    {
-        View out = {0};
-        int stored = 0;
-
-        // View ops: output shape deterministic from metadata
-        if (term_tag(b) == TAG_TEN) {
-            u32 bf[MAX_DIM * 2];
-            u32 bn = tensor_meta_read_u32(ctx, (u32)term_val(b), bf, MAX_DIM * 2);
-            if (bn && uop == UOP_RESHAPE) {
-                Shape ns = {.rank = bn}; u32 nn = 1;
-                for (u32 i = 0; i < bn; i++) { ns.dims[i] = bf[i]; nn *= ns.dims[i]; }
-                // Use ShapeTracker composition: merges if possible, pushes new view if not
-                const ShapeTracker *input_st = st_get_tracker(term_val(a));
-                if (input_st && va && nn == va->numel) {
-                    ShapeTracker composed = st_reshape(*input_st, ns);
-                    st_set_tracker(loc, &composed);
-                } else if (va && nn == va->numel) {
-                    ShapeTracker composed = st_reshape(st_from_view(*va), ns);
-                    st_set_tracker(loc, &composed);
-                } else {
-                    out = view_create(ns);
-                    st_set(loc, &out);
-                }
-                stored = 1;
-            } else if (bn && uop == UOP_EXPAND) {
-                // Compose expand onto input's ShapeTracker
-                const ShapeTracker *input_st = st_get_tracker(term_val(a));
-                if (input_st && va) {
-                    ShapeTracker composed = st_expand(*input_st, bf, bn);
-                    st_set_tracker(loc, &composed);
-                } else if (va) {
-                    ShapeTracker composed = st_expand(st_from_view(*va), bf, bn);
-                    st_set_tracker(loc, &composed);
-                } else {
-                    Shape ns = {.rank = bn};
-                    for (u32 i = 0; i < bn; i++) ns.dims[i] = bf[i];
-                    out = view_create(ns);
-                    st_set(loc, &out);
-                }
-                stored = 1;
-            } else if (bn && uop == UOP_SHRINK) {
-                // Compose shrink onto input's ShapeTracker
-                u32 ndim = bn / 2;
-                u32 starts[MAX_DIM], ends[MAX_DIM];
-                for (u32 i = 0; i < ndim; i++) { starts[i] = bf[i*2]; ends[i] = bf[i*2+1]; }
-                const ShapeTracker *input_st = st_get_tracker(term_val(a));
-                if (input_st && va) {
-                    ShapeTracker composed = st_shrink(*input_st, starts, ends, ndim);
-                    st_set_tracker(loc, &composed);
-                } else {
-                    Shape ns = {.rank = ndim}; u32 nn = 1;
-                    for (u32 i = 0; i < ndim; i++) { ns.dims[i] = ends[i] - starts[i]; nn *= ns.dims[i]; }
-                    out = view_create(ns);
-                    st_set(loc, &out);
-                }
-                stored = 1;
-            } else if (bn && uop == UOP_PAD) {
-                // Compose pad onto input's ShapeTracker
-                u32 ndim = bn / 2;
-                u32 pb[MAX_DIM], pa[MAX_DIM];
-                for (u32 i = 0; i < ndim; i++) { pb[i] = bf[i*2]; pa[i] = bf[i*2+1]; }
-                const ShapeTracker *input_st = st_get_tracker(term_val(a));
-                if (input_st && va) {
-                    ShapeTracker composed = st_pad(*input_st, pb, pa);
-                    st_set_tracker(loc, &composed);
-                } else if (va) {
-                    ShapeTracker composed = st_pad(st_from_view(*va), pb, pa);
-                    st_set_tracker(loc, &composed);
-                } else {
-                    Shape ns = {.rank = ndim};
-                    for (u32 i = 0; i < ndim; i++) ns.dims[i] = (va ? va->shape.dims[i] : 0) + pb[i] + pa[i];
-                    out = view_create(ns);
-                    st_set(loc, &out);
-                }
-                stored = 1;
-            } else if (bn && uop == UOP_PERMUTE && va) {
-                // Compose permute onto input's ShapeTracker
-                u32 axes[MAX_DIM];
-                for (u32 i = 0; i < bn; i++) axes[i] = bf[i];
-                const ShapeTracker *input_st = st_get_tracker(term_val(a));
-                if (input_st) {
-                    ShapeTracker composed = st_permute(*input_st, axes, bn);
-                    st_set_tracker(loc, &composed);
-                } else {
-                    ShapeTracker composed = st_permute(st_from_view(*va), axes, bn);
-                    st_set_tracker(loc, &composed);
-                }
-                stored = 1;
-            } else if ((uop == UOP_SUM || uop == UOP_RMAX)) {
-                if (bn) {
-                if (!va) goto skip_sum;
-                // va available:
-                out = *va;
-                for (u32 i = 0; i < bn; i++) {
-                    u32 ax = bf[i];
-                    if (ax < out.shape.rank) out.shape.dims[ax] = 1;
-                }
-                out = view_create(out.shape);
-                st_set(loc, &out); stored = 1;
-                skip_sum:;
-            }} // close bf check + view op metadata block
-        }
-
-        // SUM/RMAX with no explicit axes (b=ERA): reduce last non-1 dim
-        if (!stored && va && (uop == UOP_SUM || uop == UOP_RMAX) && term_tag(b) == TAG_ERA) {
-            out = *va;
-            for (int d = (int)va->shape.rank - 1; d >= 0; d--)
-                if (va->shape.dims[d] > 1) { out.shape.dims[d] = 1; break; }
-            out = view_create(out.shape);
-            st_set(loc, &out); stored = 1;
-        }
-
-        // MM: (M, K) @ (K, N) → (M, N)
-        if (!stored && uop == UOP_MM && va) {
-            const View *vb = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
-            if (vb) {
-                Shape os = {.rank = 2, .dims = {va->shape.dims[0], vb->shape.dims[1]}};
-                out = view_create(os);
-                st_set(loc, &out); stored = 1;
-            }
-        }
-
-        // CAST preserves the logical view; only dtype changes.
-        if (!stored && uop == UOP_CAST && va) {
-            out = *va;
-            st_set(loc, &out);
-            stored = 1;
-        }
-
-        // Elementwise: broadcast if both views available, propagate if one
-        if (!stored && is_elementwise(uop)) {
-            const View *vb = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
-            if (va && vb) {
-                View av_bc, bv_bc; u32 bc_shape[MAX_DIM], bc_ndim;
-                if (view_broadcast(va, vb, &av_bc, &bv_bc, bc_shape, &bc_ndim))
-                    out = view_create(shape_of(bc_shape, bc_ndim));
-                else out = *va;
-            } else if (va) out = *va;
-            else if (vb) out = *vb;
-            else goto skip_st;
-            st_set(loc, &out);
-            skip_st:;
-        }
-    }
+    thvm_track_top_shape(ctx, loc, uop, heap_read(ctx, loc), b);
 
     return term_top(uop, loc);
 }
@@ -538,15 +567,18 @@ Term thvm_cast(TinyHVM *ctx, Term t, u32 dtype) {
     return thvm_op(ctx, UOP_CAST, t, thvm_scalar_u32(ctx, dtype));
 }
 
+Term thvm_detach(TinyHVM *ctx, Term t) {
+    return thvm_op(ctx, UOP_DETACH, t, term_era());
+}
+
 // Matmul: [M,K] @ [K,N] → [M,N]. Decomposed to EXPAND+MUL+SUM primitives.
 // Codegen can recognize this pattern and emit MPS matmul as optimization.
 Term thvm_mm(TinyHVM *ctx, Term a, Term b) {
     // Get shapes from TAG_TEN or shape table
-    Shape sa, sb;
-    if (term_tag(a) == TAG_TEN) sa = ctx->tensors[(u32)term_val(a)].view.shape;
-    else { const View *v = st_get(term_val(a)); sa = v ? v->shape : SHAPE(1); }
-    if (term_tag(b) == TAG_TEN) sb = ctx->tensors[(u32)term_val(b)].view.shape;
-    else { const View *v = st_get(term_val(b)); sb = v ? v->shape : SHAPE(1); }
+    const View *va = term_view(ctx, a);
+    const View *vb = term_view(ctx, b);
+    Shape sa = va ? va->shape : SHAPE(1);
+    Shape sb = vb ? vb->shape : SHAPE(1);
     u32 M = sa.dims[0], K = sa.dims[1], N = sb.dims[1];
     // a: [M,K] → [M,K,1] → expand [M,K,N]
     Term a3 = thvm_reshape(ctx, a, SHAPE(M, K, 1));
@@ -657,7 +689,7 @@ expand_lazy:;
     for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (i32)new_shape.dims[i];
     Term shape_t = thvm_tensor_i32(ctx, dims, SHAPE(new_shape.rank));
     Term r = thvm_op(ctx, UOP_EXPAND, t, shape_t);
-    const View *iv = (term_tag(t)==TAG_TEN) ? &ctx->tensors[(u32)term_val(t)].view : st_get(term_val(t));
+    const View *iv = term_view(ctx, t);
     if (iv) { View ov = *iv; ov.shape = new_shape; ov.numel = 1;
         for (u32 i=0;i<new_shape.rank;i++) {
             if (i<iv->shape.rank && iv->shape.dims[i]==1 && new_shape.dims[i]>1) ov.strides[i]=0;
@@ -694,7 +726,7 @@ permute_lazy:;
     for (u32 i = 0; i < rank; i++) axes_i[i] = (i32)axes[i];
     Term axes_t = thvm_tensor_i32(ctx, axes_i, SHAPE(rank));
     Term r = thvm_op(ctx, UOP_PERMUTE, t, axes_t);
-    const View *iv = (term_tag(t)==TAG_TEN) ? &ctx->tensors[(u32)term_val(t)].view : st_get(term_val(t));
+    const View *iv = term_view(ctx, t);
     if (iv) { View ov = view_permute(*iv, axes); st_set(term_val(r), &ov); }
     return r; }
 }
@@ -734,7 +766,7 @@ pad_lazy:;
     for (u32 i = 0; i < ndim * 2; i++) pairs_i[i] = (i32)pairs[i];
     Term pairs_t = thvm_tensor_i32(ctx, pairs_i, SHAPE(ndim * 2));
     Term r = thvm_op(ctx, UOP_PAD, t, pairs_t);
-    const View *iv = (term_tag(t)==TAG_TEN) ? &ctx->tensors[(u32)term_val(t)].view : st_get(term_val(t));
+    const View *iv = term_view(ctx, t);
     if (iv) { View ov = view_pad(*iv, pb, pa); st_set(term_val(r), &ov); }
     return r; }
 }
@@ -785,7 +817,7 @@ shrink_lazy:;
     for (u32 i = 0; i < ndim * 2; i++) pairs_i[i] = (i32)pairs[i];
     Term pairs_t = thvm_tensor_i32(ctx, pairs_i, SHAPE(ndim * 2));
     Term r = thvm_op(ctx, UOP_SHRINK, t, pairs_t);
-    const View *iv = (term_tag(t)==TAG_TEN) ? &ctx->tensors[(u32)term_val(t)].view : st_get(term_val(t));
+    const View *iv = term_view(ctx, t);
     if (iv) { View ov = view_shrink(*iv, ss, se); st_set(term_val(r), &ov); }
     return r; }
 }

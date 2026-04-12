@@ -142,6 +142,7 @@ static u32 phase1_top_arity(u32 ext) {
     if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
     if (ext == UOP_GRAD) return 2;
     if (ext == UOP_LOG_PRINT) return 1;
+    if (ext == UOP_DETACH) return 1;
     if (!is_binary(ext) && is_elementwise(ext)) return 1;
     return 2;
 }
@@ -180,7 +181,8 @@ static int phase1_top_has_add_zero_arg(TinyHVM *ctx, Term t, u64 *slot_out, Term
 
 static int phase1_top_direct_uop(u32 uop) {
     return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_IFZ ||
-           uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_WHERE ||
+           uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_DETACH ||
+           uop == UOP_WHERE ||
            uop == UOP_FUSING;
 }
 
@@ -390,6 +392,11 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
             if (out_whnf) *out_whnf = t;
             return 0;
         }
+        if (out_before) *out_before = t;
+        return 1;
+    }
+
+    if (tag == TAG_REF) {
         if (out_before) *out_before = t;
         return 1;
     }
@@ -710,6 +717,13 @@ static Term sched_unwrap_views(TinyHVM *ctx, Term t) {
             t = heap_read(ctx, term_val(t));
             continue;
         }
+        if (term_tag(t) == TAG_VAR) {
+            Term sub = heap_read(ctx, term_val(t));
+            if (!term_is_sub(sub)) {
+                t = sub;
+                continue;
+            }
+        }
         if (term_tag(t) != TAG_TOP || !is_view_op(term_ext(t))) break;
         t = heap_read(ctx, term_val(t));
     }
@@ -727,12 +741,24 @@ static int sched_is_kernelizable_term(Term t) {
 static const View *sched_term_view(TinyHVM *ctx, Term t) {
     if (term_tag(t) == TAG_TOP) return st_get(term_val(t));
     if (term_tag(t) == TAG_TEN) return tensor_view_get(&ctx->tensors[(u32)term_val(t)]);
+    if (term_tag(t) == TAG_VAR) {
+        u64 loc = term_val(t);
+        Term sub = heap_read(ctx, loc);
+        if (!term_is_sub(sub)) return sched_term_view(ctx, sub);
+        return st_get(loc);
+    }
     return NULL;
 }
 
 static const ShapeTracker *sched_term_tracker(TinyHVM *ctx, Term t) {
     if (term_tag(t) == TAG_TOP) return st_get_tracker(term_val(t));
     if (term_tag(t) == TAG_TEN) return tensor_st_get(&ctx->tensors[(u32)term_val(t)]);
+    if (term_tag(t) == TAG_VAR) {
+        u64 loc = term_val(t);
+        Term sub = heap_read(ctx, loc);
+        if (!term_is_sub(sub)) return sched_term_tracker(ctx, sub);
+        return st_get_tracker(loc);
+    }
     return NULL;
 }
 
@@ -868,33 +894,52 @@ static void sched_collect_boundaries(TinyHVM *ctx, Term root) {
     u8 *seen_slot = (u8 *)calloc((size_t)ctx->heap_pos, 1);
     u8 *seen_dup  = (u8 *)calloc((size_t)ctx->heap_pos, 1);
     u64 work_cap = ctx->heap_pos ? (ctx->heap_pos * 8) : 0;
-    Term *work = work_cap ? (Term *)malloc(sizeof(Term) * (size_t)work_cap) : NULL;
+    typedef struct {
+        Term term;
+        SchedParentClass inherited_class;
+    } SchedWork;
+    SchedWork *work = work_cap ? (SchedWork *)malloc(sizeof(SchedWork) * (size_t)work_cap) : NULL;
     u64 wp = 0;
-    #define SCHED_PUSH(_tt) do { if (work && wp < work_cap) work[wp++] = (_tt); } while (0)
-    SCHED_PUSH(root);
+    #define SCHED_PUSH(_tt, _pc) do { \
+        if (work && wp < work_cap) { \
+            work[wp].term = (_tt); \
+            work[wp].inherited_class = (_pc); \
+            wp++; \
+        } \
+    } while (0)
+    SCHED_PUSH(root, SCHED_PARENT_EXTERNAL);
 
     while (work && wp > 0) {
-        Term tt = work[--wp];
+        SchedWork item = work[--wp];
+        Term tt = item.term;
         u8 tg = term_tag(tt);
         u64 tv = term_val(tt);
 
         if (tg == TAG_DP0 || tg == TAG_DP1) {
             if (tv == 0 || tv >= ctx->heap_pos || (seen_dup && seen_dup[tv])) continue;
             if (seen_dup) seen_dup[tv] = 1;
-            SCHED_PUSH(heap_read(ctx, tv));
+            SCHED_PUSH(heap_read(ctx, tv), item.inherited_class);
+            continue;
+        }
+        if (tg == TAG_VAR) {
+            if (tv == 0 || tv >= ctx->heap_pos) continue;
+            Term sub = heap_read(ctx, tv);
+            if (!term_is_sub(sub)) SCHED_PUSH(sub, item.inherited_class);
             continue;
         }
         if (tg == TAG_ERA) {
             if (tv == 0 || tv >= ctx->heap_pos) continue;
             if (!seen_slot || !seen_slot[tv]) {
                 if (seen_slot) seen_slot[tv] = 1;
-                SCHED_PUSH(heap_read(ctx, tv));
+                SCHED_PUSH(heap_read(ctx, tv), SCHED_PARENT_NONE);
             }
             continue;
         }
 
         u32 ar = phase1_term_arity(tt);
         SchedParentClass pclass = sched_parent_class(tt);
+        if (pclass == SCHED_PARENT_NONE && tg == TAG_TOP && is_view_op(term_ext(tt)))
+            pclass = item.inherited_class;
         for (u32 i = 0; i < ar; i++) {
             u64 p = tv + i;
             if (p >= ctx->heap_pos) continue;
@@ -902,7 +947,7 @@ static void sched_collect_boundaries(TinyHVM *ctx, Term root) {
             sched_boundary_note_consumer(ctx, child, pclass);
             if (!seen_slot || !seen_slot[p]) {
                 if (seen_slot) seen_slot[p] = 1;
-                SCHED_PUSH(child);
+                SCHED_PUSH(child, pclass);
             }
         }
     }
@@ -1246,7 +1291,11 @@ static u32 sched_all(TinyHVM *ctx, Term root) {
 
 
 Term thvm_eval(TinyHVM *ctx, Term t) {
-    if (getenv("THVM_STEP_GRAPH")) {
+    int outermost = (ctx->eval_depth++ == 0);
+    int run_step_graph = outermost && getenv("THVM_STEP_GRAPH") && !ctx->step_graph_consumed;
+    int run_coarse_graph = outermost && getenv("THVM_GRAPH") && !ctx->coarse_graph_consumed;
+    if (run_step_graph) {
+        ctx->step_graph_consumed = 1;
         phase1_root_slot = 0;
         t = thvm_phase1_seed_root_grad(ctx, t);
         thvm_step_graph_eval_begin(ctx, t);
@@ -1256,10 +1305,12 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             heap_set(ctx, phase1_root_slot, t);
         thvm_step_graph_finalize(ctx);
         phase1_root_slot = 0;
+        ctx->eval_depth--;
         return t;
     }
 
-    if (getenv("THVM_GRAPH")) {
+    if (run_coarse_graph) {
+        ctx->coarse_graph_consumed = 1;
         char cmd[512];
         snprintf(cmd, sizeof(cmd), "mkdir -p %s", thvm_graph_dir());
         system(cmd);
@@ -1271,8 +1322,10 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
             heap_set(ctx, phase1_root_slot, term_era());
     }
-    t = thvm_reduce(ctx, t);
-    if (getenv("THVM_GRAPH")) {
+    _assign_dispatch_enabled = 0;
+    t = run_coarse_graph ? thvm_phase1_structural_nf(ctx, t)
+                         : thvm_reduce(ctx, t);
+    if (run_coarse_graph) {
         t = thvm_phase1_seed_root_grad(ctx, t);
         char path[512];
         thvm_graph_dump_path(path, sizeof(path), "thvm_1_post_reduce.dot");
@@ -1288,7 +1341,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         if (!(term_tag(rt) == TAG_ERA && term_val(rt) == 0))
             t = rt;
     }
-    if (getenv("THVM_GRAPH")) {
+    if (run_coarse_graph) {
         t = thvm_phase1_seed_root_grad(ctx, t);
         char path[512];
         thvm_graph_dump_path(path, sizeof(path), "thvm_2_post_sched.dot");
@@ -1298,8 +1351,10 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             heap_set(ctx, phase1_root_slot, term_era());
     }
 
+    _assign_dispatch_enabled = 1;
     t = thvm_reduce(ctx, t);
-    if (getenv("THVM_GRAPH")) {
+    _assign_dispatch_enabled = 0;
+    if (run_coarse_graph) {
         t = thvm_phase1_seed_root_grad(ctx, t);
         char path[512];
         thvm_graph_dump_path(path, sizeof(path), "thvm_3_post_dispatch.dot");
@@ -1310,6 +1365,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         phase1_root_slot = 0;
     }
     sched_planner_release_detached_slots();
+    ctx->eval_depth--;
     return t;
 }
 

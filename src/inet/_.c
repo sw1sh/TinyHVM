@@ -143,6 +143,14 @@ Term thvm_ann(TinyHVM *ctx, Term term, Term type) {
     return term_new(TAG_ANN, 0, loc);
 }
 
+void thvm_hint_shape(TinyHVM *ctx, Term term, Shape shape) {
+    (void)ctx;
+    u8 tag = term_tag(term);
+    if (tag != TAG_VAR && tag != TAG_TOP) return;
+    View v = view_create(shape);
+    st_set(term_val(term), &v);
+}
+
 // DSU: dynamic superposition — label is an expression reduced at interaction time
 Term thvm_dsu(TinyHVM *ctx, Term label_expr, Term a, Term b) {
     u64 loc = heap_alloc(ctx, 3);

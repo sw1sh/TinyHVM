@@ -159,6 +159,174 @@
                 RETURN_REDUCED(term_era());
             }
 
+            if (uop == UOP_DETACH) {
+                Term memo = heap_read(ctx, loc + 1);
+                if (term_tag(memo) == TAG_TEN) {
+                    RETURN_REDUCED(memo);
+                }
+                Term src = heap_read(ctx, loc); // WNF from trampoline when possible
+                Term src_expr = src;
+                if (getenv("THVM_LOOP_DIAG")) {
+                    fprintf(stderr, "DETACH_ENTER loc=%llu src_tag=%u src_ext=%u src_val=%llu\n",
+                            (unsigned long long)loc,
+                            (u32)term_tag(src),
+                            (u32)term_ext(src),
+                            (unsigned long long)term_val(src));
+                    if (term_tag(src) == TAG_TOP) {
+                        u64 src_loc = term_val(src);
+                        Term a0 = heap_read(ctx, src_loc + 0);
+                        Term a1 = heap_read(ctx, src_loc + 1);
+                        fprintf(stderr,
+                                "DETACH_SRC0  loc=%llu a0_tag=%u a0_ext=%u a0_val=%llu a1_tag=%u a1_ext=%u a1_val=%llu\n",
+                                (unsigned long long)loc,
+                                (u32)term_tag(a0), (u32)term_ext(a0), (unsigned long long)term_val(a0),
+                                (u32)term_tag(a1), (u32)term_ext(a1), (unsigned long long)term_val(a1));
+                        if (term_tag(a1) == TAG_TOP) {
+                            u64 a1_loc = term_val(a1);
+                            Term b0 = heap_read(ctx, a1_loc + 0);
+                            Term b1 = heap_read(ctx, a1_loc + 1);
+                            fprintf(stderr,
+                                    "DETACH_SRC1  loc=%llu b0_tag=%u b0_ext=%u b0_val=%llu b1_tag=%u b1_ext=%u b1_val=%llu\n",
+                                    (unsigned long long)loc,
+                                    (u32)term_tag(b0), (u32)term_ext(b0), (unsigned long long)term_val(b0),
+                                    (u32)term_tag(b1), (u32)term_ext(b1), (unsigned long long)term_val(b1));
+                            if (term_tag(b0) == TAG_VAR || term_tag(b0) == TAG_DP0 || term_tag(b0) == TAG_DP1) {
+                                Term subb0 = heap_read(ctx, term_val(b0));
+                                fprintf(stderr,
+                                        "DETACH_SRC1A loc=%llu subb0_tag=%u subb0_ext=%u subb0_val=%llu\n",
+                                        (unsigned long long)loc,
+                                        (u32)term_tag(subb0), (u32)term_ext(subb0), (unsigned long long)term_val(subb0));
+                            }
+                            if (term_tag(b1) == TAG_VAR || term_tag(b1) == TAG_DP0 || term_tag(b1) == TAG_DP1) {
+                                Term subb1 = heap_read(ctx, term_val(b1));
+                                fprintf(stderr,
+                                        "DETACH_SRC1B loc=%llu subb1_tag=%u subb1_ext=%u subb1_val=%llu\n",
+                                        (unsigned long long)loc,
+                                        (u32)term_tag(subb1), (u32)term_ext(subb1), (unsigned long long)term_val(subb1));
+                                if (term_tag(subb1) == TAG_TOP) {
+                                    u64 subb1_loc = term_val(subb1);
+                                    Term c0 = heap_read(ctx, subb1_loc + 0);
+                                    Term c1 = heap_read(ctx, subb1_loc + 1);
+                                    fprintf(stderr,
+                                            "DETACH_SRC1C loc=%llu c0_tag=%u c0_ext=%u c0_val=%llu c1_tag=%u c1_ext=%u c1_val=%llu\n",
+                                            (unsigned long long)loc,
+                                            (u32)term_tag(c0), (u32)term_ext(c0), (unsigned long long)term_val(c0),
+                                            (u32)term_tag(c1), (u32)term_ext(c1), (unsigned long long)term_val(c1));
+                                }
+                            }
+                        }
+                        if (term_tag(a0) == TAG_VAR || term_tag(a0) == TAG_DP0 || term_tag(a0) == TAG_DP1) {
+                            Term sub0 = heap_read(ctx, term_val(a0));
+                            fprintf(stderr,
+                                    "DETACH_SRC0A loc=%llu sub0_tag=%u sub0_ext=%u sub0_val=%llu\n",
+                                    (unsigned long long)loc,
+                                    (u32)term_tag(sub0), (u32)term_ext(sub0), (unsigned long long)term_val(sub0));
+                        }
+                        if (term_tag(a1) == TAG_VAR || term_tag(a1) == TAG_DP0 || term_tag(a1) == TAG_DP1) {
+                            Term sub1 = heap_read(ctx, term_val(a1));
+                            fprintf(stderr,
+                                    "DETACH_SRC1A loc=%llu sub1_tag=%u sub1_ext=%u sub1_val=%llu\n",
+                                    (unsigned long long)loc,
+                                    (u32)term_tag(sub1), (u32)term_ext(sub1), (unsigned long long)term_val(sub1));
+                        }
+                    }
+                }
+                src = thvm_eval(ctx, src);
+                if (getenv("THVM_LOOP_DIAG")) {
+                    fprintf(stderr, "DETACH_EVAL  loc=%llu src_tag=%u src_ext=%u src_val=%llu\n",
+                            (unsigned long long)loc,
+                            (u32)term_tag(src),
+                            (u32)term_ext(src),
+                            (unsigned long long)term_val(src));
+                    if (term_tag(src) == TAG_TOP) {
+                        u64 src_loc = term_val(src);
+                        Term a0 = heap_read(ctx, src_loc + 0);
+                        Term a1 = heap_read(ctx, src_loc + 1);
+                        fprintf(stderr,
+                                "DETACH_EVAL0 loc=%llu a0_tag=%u a0_ext=%u a0_val=%llu a1_tag=%u a1_ext=%u a1_val=%llu\n",
+                                (unsigned long long)loc,
+                                (u32)term_tag(a0), (u32)term_ext(a0), (unsigned long long)term_val(a0),
+                                (u32)term_tag(a1), (u32)term_ext(a1), (unsigned long long)term_val(a1));
+                        if (term_tag(a1) == TAG_TOP) {
+                            u64 a1_loc = term_val(a1);
+                            Term b0 = heap_read(ctx, a1_loc + 0);
+                            Term b1 = heap_read(ctx, a1_loc + 1);
+                            fprintf(stderr,
+                                    "DETACH_EVAL1 loc=%llu b0_tag=%u b0_ext=%u b0_val=%llu b1_tag=%u b1_ext=%u b1_val=%llu\n",
+                                    (unsigned long long)loc,
+                                    (u32)term_tag(b0), (u32)term_ext(b0), (unsigned long long)term_val(b0),
+                                    (u32)term_tag(b1), (u32)term_ext(b1), (unsigned long long)term_val(b1));
+                            if (term_tag(b0) == TAG_VAR || term_tag(b0) == TAG_DP0 || term_tag(b0) == TAG_DP1) {
+                                Term subb0 = heap_read(ctx, term_val(b0));
+                                fprintf(stderr,
+                                        "DETACH_EVAL1A loc=%llu subb0_tag=%u subb0_ext=%u subb0_val=%llu\n",
+                                        (unsigned long long)loc,
+                                        (u32)term_tag(subb0), (u32)term_ext(subb0), (unsigned long long)term_val(subb0));
+                            }
+                            if (term_tag(b1) == TAG_VAR || term_tag(b1) == TAG_DP0 || term_tag(b1) == TAG_DP1) {
+                                Term subb1 = heap_read(ctx, term_val(b1));
+                                fprintf(stderr,
+                                        "DETACH_EVAL1B loc=%llu subb1_tag=%u subb1_ext=%u subb1_val=%llu\n",
+                                        (unsigned long long)loc,
+                                        (u32)term_tag(subb1), (u32)term_ext(subb1), (unsigned long long)term_val(subb1));
+                                if (term_tag(subb1) == TAG_TOP) {
+                                    u64 subb1_loc = term_val(subb1);
+                                    Term c0 = heap_read(ctx, subb1_loc + 0);
+                                    Term c1 = heap_read(ctx, subb1_loc + 1);
+                                    fprintf(stderr,
+                                            "DETACH_EVAL1C loc=%llu c0_tag=%u c0_ext=%u c0_val=%llu c1_tag=%u c1_ext=%u c1_val=%llu\n",
+                                            (unsigned long long)loc,
+                                            (u32)term_tag(c0), (u32)term_ext(c0), (unsigned long long)term_val(c0),
+                                            (u32)term_tag(c1), (u32)term_ext(c1), (unsigned long long)term_val(c1));
+                                }
+                            }
+                        }
+                        if (term_tag(a0) == TAG_VAR || term_tag(a0) == TAG_DP0 || term_tag(a0) == TAG_DP1) {
+                            Term sub0 = heap_read(ctx, term_val(a0));
+                            fprintf(stderr,
+                                    "DETACH_EVALA loc=%llu sub0_tag=%u sub0_ext=%u sub0_val=%llu\n",
+                                    (unsigned long long)loc,
+                                    (u32)term_tag(sub0), (u32)term_ext(sub0), (unsigned long long)term_val(sub0));
+                        }
+                        if (term_tag(a1) == TAG_VAR || term_tag(a1) == TAG_DP0 || term_tag(a1) == TAG_DP1) {
+                            Term sub1 = heap_read(ctx, term_val(a1));
+                            fprintf(stderr,
+                                    "DETACH_EVALB loc=%llu sub1_tag=%u sub1_ext=%u sub1_val=%llu\n",
+                                    (unsigned long long)loc,
+                                    (u32)term_tag(sub1), (u32)term_ext(sub1), (unsigned long long)term_val(sub1));
+                        }
+                    }
+                }
+                if (term_tag(src) == TAG_ERA) {
+                    ctx->itrs++;
+                    RETURN_REDUCED(term_era());
+                }
+                u32 src_dtype = DTYPE_F32;
+                Shape src_shape = SHAPE(1);
+                void *host = thvm_to_host_raw(ctx, src, &src_dtype, &src_shape);
+                if (!host) return t;
+
+                Term src_real = thvm_force_tensor_term(ctx, src);
+                TensorMeta *ms = (term_tag(src_real) == TAG_TEN)
+                               ? &ctx->tensors[(u32)term_val(src_real)]
+                               : NULL;
+                u32 new_id = tensor_create(ctx, src_shape, src_dtype);
+                TensorMeta *md = &ctx->tensors[new_id];
+                u64 nbytes = (u64)md->view.numel * dtype_size(md->dtype);
+                md->backend->buf_write(md->buf_id, host, nbytes);
+                md->requires_grad = ms ? ms->requires_grad : 0;
+                md->creator_op = 0;
+                md->creator_loc = 0;
+                md->src_ids[0] = 0;
+                md->src_ids[1] = 0;
+                md->defer_consumers = 0;
+                heap_set(ctx, loc + 1, term_ten(new_id, md->dtype));
+
+                thvm_spawn_detached_era(ctx, src_expr);
+                ctx->itrs++;
+                RETURN_REDUCED(term_ten(new_id, md->dtype));
+            }
+
             if (uop == UOP_WHERE) {
                 // UOP_WHERE(cond_ten, then_ten, else_ten) — elementwise ternary select
                 // Per tinyspec §ElementwiseOps: result[i] = A[i] if P[i]!=0 else B[i]
@@ -203,15 +371,28 @@
                 u32 ctr_dtype = ctx->tensors[(u32)term_val(ctr)].dtype;
                 void *val = thvm_to_host_raw(ctx, ctr, &ctr_dtype, NULL);
                 f32 ctr_val = val ? dtype_load_as_f32(val, ctr_dtype, 0) : 0.0f;
+                Term zero_case = heap_read(ctx, loc + 1);
+                Term succ_lam = heap_read(ctx, loc + 2);
+                if (getenv("THVM_LOOP_DIAG")) {
+                    fprintf(stderr,
+                            "IFZ loc=%llu ctr=%.3f zero_tag=%u succ_tag=%u succ_val=%llu\n",
+                            (unsigned long long)loc,
+                            ctr_val,
+                            (u32)term_tag(zero_case),
+                            (u32)term_tag(succ_lam),
+                            (unsigned long long)term_val(succ_lam));
+                }
                 ctx->itrs++;
+                thvm_spawn_detached_era(ctx, ctr);
                 if (ctr_val <= 0.0f) {
                     // Base case: return zero_case (slot 1)
-                    return heap_read(ctx, loc + 1);
+                    thvm_spawn_detached_era(ctx, succ_lam);
+                    return zero_case;
                 } else {
                     // Recursive case: decrement, apply succ_lam
                     f32 nv = ctr_val - 1.0f;
                     Term dec = thvm_scalar_typed(ctx, nv, ctr_dtype);
-                    Term succ_lam = heap_read(ctx, loc + 2);
+                    thvm_spawn_detached_era(ctx, zero_case);
                     return thvm_app(ctx, succ_lam, dec);
                 }
             }

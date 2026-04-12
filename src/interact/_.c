@@ -44,12 +44,9 @@ static Term thvm_interact(TinyHVM *ctx, Term t) {
     // via `next = r; goto enter;` (no need to force-reduce here).
     // Return directly — trampoline handles TAG_TOP via goto enter
     #define RETURN_REDUCED(result) do { return (result); } while(0)
-    // In step-budget mode (used by phase-1 step dumps), keep each interact()
-    // call to exactly one local rewrite.
-    #define INET_RECURSE() do { \
-        if (ctx->step_budget > 0) return t; \
-        goto inet_step; \
-    } while (0)
+    // One interact() call performs exactly one local rewrite.
+    // Continued reduction is the reducer trampoline's job.
+    #define INET_RECURSE() do { return t; } while (0)
     // No GRAD_STEP — all GRAD sub-terms are placed on heap iteratively
 
     u32 tag;

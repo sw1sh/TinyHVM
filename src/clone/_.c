@@ -9,11 +9,13 @@
 // cloned recursively.  Terminals (NUM, TEN, ERA, REF) are returned
 // as-is.  LAM/VAR pairs are rebound via a small relocation table.
 
-#define CLONE_MAX_RELOC 128
+#define CLONE_MAX_RELOC 512
 #define CLONE_MAX_LABELS 64
+#define CLONE_MAX_TERMMAP 512
 
 typedef struct { u64 old_loc; u64 new_loc; } Reloc;
 typedef struct { u32 old_label; u32 new_label; } LabelMap;
+typedef struct { Term old_term; Term new_term; } TermMap;
 
 static u32 clone_fresh_label(TinyHVM *ctx, u32 old_label, LabelMap *lmap, u32 *n_labels) {
     for (u32 i = 0; i < *n_labels; i++)
@@ -26,9 +28,25 @@ static u32 clone_fresh_label(TinyHVM *ctx, u32 old_label, LabelMap *lmap, u32 *n
     return fresh;
 }
 
+static void clone_term_map_add(TermMap *tmap, u32 *n_tmap, Term old_term, Term new_term) {
+    assert(*n_tmap < CLONE_MAX_TERMMAP);
+    tmap[*n_tmap] = (TermMap){ old_term, new_term };
+    (*n_tmap)++;
+}
+
+static Term clone_term_map_get(TermMap *tmap, u32 n_tmap, Term old_term) {
+    for (u32 i = 0; i < n_tmap; i++) {
+        if (tmap[i].old_term == old_term) return tmap[i].new_term;
+    }
+    return old_term;
+}
+
 static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
-                          LabelMap *lmap, u32 *n_labels) {
+                          LabelMap *lmap, u32 *n_labels,
+                          TermMap *tmap, u32 *n_tmap) {
     u32 tag = term_tag(t);
+    Term mapped = clone_term_map_get(tmap, *n_tmap, t);
+    if (mapped != t) return mapped;
 
     switch (tag) {
         // ── Terminals: no heap state ──────────────────────────────
@@ -61,11 +79,15 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
             // Fresh var slot (unbound / substitution marker)
             Term var = term_new(TAG_VAR, 0, new_loc);
             heap_set(ctx, new_loc, term_set_sub(var));
+            const ShapeTracker *vst = st_get_tracker(old_loc);
+            if (vst) st_set_tracker(new_loc, vst);
             // Clone body
             heap_set(ctx, new_loc + 1,
                      term_clone_r(ctx, heap_read(ctx, old_loc + 1),
-                                  relocs, n_relocs, lmap, n_labels));
-            return term_new(TAG_LAM, term_ext(t), new_loc);
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term out = term_new(TAG_LAM, term_ext(t), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
         }
 
         // ── BRI: bridge (same layout as LAM — 2 slots with var reloc)
@@ -77,10 +99,14 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
             (*n_relocs)++;
             Term var = term_new(TAG_VAR, 0, new_loc);
             heap_set(ctx, new_loc, term_set_sub(var));
+            const ShapeTracker *vst = st_get_tracker(old_loc);
+            if (vst) st_set_tracker(new_loc, vst);
             heap_set(ctx, new_loc + 1,
                      term_clone_r(ctx, heap_read(ctx, old_loc + 1),
-                                  relocs, n_relocs, lmap, n_labels));
-            return term_new(TAG_BRI, term_ext(t), new_loc);
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term out = term_new(TAG_BRI, term_ext(t), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
         }
 
         // ── APP: 2 slots (fun, arg) ──────────────────────────────
@@ -89,11 +115,13 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
             u64 new_loc = heap_alloc(ctx, 2);
             heap_set(ctx, new_loc,
                      term_clone_r(ctx, heap_read(ctx, old_loc),
-                                  relocs, n_relocs, lmap, n_labels));
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
             heap_set(ctx, new_loc + 1,
                      term_clone_r(ctx, heap_read(ctx, old_loc + 1),
-                                  relocs, n_relocs, lmap, n_labels));
-            return term_new(TAG_APP, term_ext(t), new_loc);
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term out = term_new(TAG_APP, term_ext(t), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
         }
 
         // ── SUP: 2 slots (freshen label) ────────────────────────
@@ -102,11 +130,13 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
             u64 new_loc = heap_alloc(ctx, 2);
             heap_set(ctx, new_loc,
                      term_clone_r(ctx, heap_read(ctx, old_loc),
-                                  relocs, n_relocs, lmap, n_labels));
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
             heap_set(ctx, new_loc + 1,
                      term_clone_r(ctx, heap_read(ctx, old_loc + 1),
-                                  relocs, n_relocs, lmap, n_labels));
-            return term_new(TAG_SUP, clone_fresh_label(ctx, term_ext(t), lmap, n_labels), new_loc);
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term out = term_new(TAG_SUP, clone_fresh_label(ctx, term_ext(t), lmap, n_labels), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
         }
 
         // ── DP0/DP1: 1 slot (freshen label) ─────────────────────
@@ -117,21 +147,26 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
         case TAG_DP1: {
             u64 old_loc = term_val(t);
             u64 use_loc = 0;
-            int shared = 0;
+            int mapped = 0;
             for (u32 i = 0; i < *n_relocs; i++) {
                 if (relocs[i].old_loc == old_loc) {
                     use_loc = relocs[i].new_loc;
-                    shared = 1;
+                    mapped = 1;
                     break;
                 }
             }
-            if (!shared) {
+            if (!mapped) {
                 use_loc = heap_alloc(ctx, 1);
+                assert(*n_relocs < CLONE_MAX_RELOC);
+                relocs[*n_relocs] = (Reloc){ old_loc, use_loc };
+                (*n_relocs)++;
                 heap_set(ctx, use_loc,
                          term_clone_r(ctx, heap_read(ctx, old_loc),
-                                      relocs, n_relocs, lmap, n_labels));
+                                      relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
             }
-            return term_new(tag, clone_fresh_label(ctx, term_ext(t), lmap, n_labels), use_loc);
+            Term out = term_new(tag, clone_fresh_label(ctx, term_ext(t), lmap, n_labels), use_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
         }
 
         // ── ANN: 2 slots (term, type) ─────────────────────────────
@@ -140,11 +175,13 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
             u64 new_loc = heap_alloc(ctx, 2);
             heap_set(ctx, new_loc,
                      term_clone_r(ctx, heap_read(ctx, old_loc),
-                                  relocs, n_relocs, lmap, n_labels));
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
             heap_set(ctx, new_loc + 1,
                      term_clone_r(ctx, heap_read(ctx, old_loc + 1),
-                                  relocs, n_relocs, lmap, n_labels));
-            return term_new(TAG_ANN, term_ext(t), new_loc);
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term out = term_new(TAG_ANN, term_ext(t), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
         }
 
         // ── DSU/DDU: 3 slots ─────────────────────────────────────
@@ -155,8 +192,10 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
             for (u32 i = 0; i < 3; i++)
                 heap_set(ctx, new_loc + i,
                          term_clone_r(ctx, heap_read(ctx, old_loc + i),
-                                      relocs, n_relocs, lmap, n_labels));
-            return term_new(tag, term_ext(t), new_loc);
+                                      relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term out = term_new(tag, term_ext(t), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
         }
 
         // ── INC: 1 slot ──────────────────────────────────────────
@@ -165,8 +204,10 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
             u64 new_loc = heap_alloc(ctx, 1);
             heap_set(ctx, new_loc,
                      term_clone_r(ctx, heap_read(ctx, old_loc),
-                                  relocs, n_relocs, lmap, n_labels));
-            return term_new(TAG_INC, term_ext(t), new_loc);
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term out = term_new(TAG_INC, term_ext(t), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
         }
 
         // ── OP2: 2 slots (x, y) ─────────────────────────────────
@@ -175,11 +216,13 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
             u64 new_loc = heap_alloc(ctx, 2);
             heap_set(ctx, new_loc,
                      term_clone_r(ctx, heap_read(ctx, old_loc),
-                                  relocs, n_relocs, lmap, n_labels));
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
             heap_set(ctx, new_loc + 1,
                      term_clone_r(ctx, heap_read(ctx, old_loc + 1),
-                                  relocs, n_relocs, lmap, n_labels));
-            return term_new(TAG_OP2, term_ext(t), new_loc);
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term out = term_new(TAG_OP2, term_ext(t), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
         }
 
         // ── TOP: tensor op, 2 or 3 slots ────────────────────────
@@ -191,8 +234,104 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
             for (u32 i = 0; i < arity; i++)
                 heap_set(ctx, new_loc + i,
                          term_clone_r(ctx, heap_read(ctx, old_loc + i),
-                                      relocs, n_relocs, lmap, n_labels));
-            return term_new(TAG_TOP, uop, new_loc);
+                                      relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            const View *vv = st_get(old_loc);
+            if (vv) st_set(new_loc, vv);
+            if (uop == UOP_GRAD) {
+                Term gx = term_clone_r(ctx, thvm_grad_target_get(ctx, old_loc),
+                                       relocs, n_relocs, lmap, n_labels, tmap, n_tmap);
+                thvm_grad_target_set(ctx, new_loc, gx);
+                thvm_grad_mode_set(ctx, new_loc, thvm_grad_mode_get(ctx, old_loc));
+                u32 nt = thvm_grad_targets_count_at(ctx, old_loc);
+                if (nt > 0) {
+                    Term params[THVM_GRAD_TARGETS_MAX];
+                    Term slots[THVM_GRAD_TARGETS_MAX];
+                    assert(nt <= THVM_GRAD_TARGETS_MAX);
+                    for (u32 i = 0; i < nt; i++) {
+                        params[i] = term_clone_r(ctx, thvm_grad_targets_get_term_at(ctx, old_loc, i),
+                                                 relocs, n_relocs, lmap, n_labels, tmap, n_tmap);
+                        slots[i] = term_clone_r(ctx, thvm_grad_targets_get_slot_at(ctx, old_loc, i),
+                                                relocs, n_relocs, lmap, n_labels, tmap, n_tmap);
+                    }
+                    thvm_grad_targets_set_for_loc(ctx, new_loc, params, slots, nt);
+                }
+                Term gb = thvm_grad_keep_bundle_get(ctx, old_loc);
+                Term gb_old = gb;
+                gb = term_clone_r(ctx, gb, relocs, n_relocs, lmap, n_labels, tmap, n_tmap);
+                if (!(term_tag(gb) == TAG_ERA && term_val(gb) == 0))
+                    thvm_grad_keep_bundle_set(ctx, new_loc, gb);
+                if (getenv("THVM_LOOP_DIAG")) {
+                    fprintf(stderr,
+                            "CLONE_GRAD old_loc=%llu new_loc=%llu old_bundle_tag=%u old_bundle_val=%llu new_bundle_tag=%u new_bundle_val=%llu\n",
+                            (unsigned long long)old_loc,
+                            (unsigned long long)new_loc,
+                            (u32)term_tag(gb_old),
+                            (unsigned long long)term_val(gb_old),
+                            (u32)term_tag(gb),
+                            (unsigned long long)term_val(gb));
+                }
+            }
+            Term out = term_new(TAG_TOP, uop, new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
+        }
+
+        // ── MAT: 2 slots (ok, fallback) ─────────────────────────
+        case TAG_MAT: {
+            u64 old_loc = term_val(t);
+            u64 new_loc = heap_alloc(ctx, 2);
+            heap_set(ctx, new_loc,
+                     term_clone_r(ctx, heap_read(ctx, old_loc),
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            heap_set(ctx, new_loc + 1,
+                     term_clone_r(ctx, heap_read(ctx, old_loc + 1),
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term out = term_new(TAG_MAT, term_ext(t), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
+        }
+
+        // ── CTR: ext children ───────────────────────────────────
+        case TAG_CTR: {
+            u32 arity = term_ext(t);
+            u64 old_loc = term_val(t);
+            if (arity == 0 || old_loc == 0) return t;
+            u64 new_loc = heap_alloc(ctx, arity);
+            for (u32 i = 0; i < arity; i++) {
+                heap_set(ctx, new_loc + i,
+                         term_clone_r(ctx, heap_read(ctx, old_loc + i),
+                                      relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            }
+            Term out = term_new(TAG_CTR, term_ext(t), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
+        }
+
+        // ── USP: 2 slots (freshen label) ────────────────────────
+        case TAG_USP: {
+            u64 old_loc = term_val(t);
+            u64 new_loc = heap_alloc(ctx, 2);
+            heap_set(ctx, new_loc,
+                     term_clone_r(ctx, heap_read(ctx, old_loc),
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            heap_set(ctx, new_loc + 1,
+                     term_clone_r(ctx, heap_read(ctx, old_loc + 1),
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term out = term_new(TAG_USP, clone_fresh_label(ctx, term_ext(t), lmap, n_labels), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
+        }
+
+        // ── UDP: 1 slot (freshen label) ─────────────────────────
+        case TAG_UDP: {
+            u64 old_loc = term_val(t);
+            u64 new_loc = heap_alloc(ctx, 1);
+            heap_set(ctx, new_loc,
+                     term_clone_r(ctx, heap_read(ctx, old_loc),
+                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term out = term_new(TAG_UDP, clone_fresh_label(ctx, term_ext(t), lmap, n_labels), new_loc);
+            clone_term_map_add(tmap, n_tmap, t, out);
+            return out;
         }
 
         // ── Unknown: return as-is ────────────────────────────────
@@ -207,5 +346,7 @@ static Term term_clone(TinyHVM *ctx, Term t) {
     u32 n_relocs = 0;
     LabelMap lmap[CLONE_MAX_LABELS];
     u32 n_labels = 0;
-    return term_clone_r(ctx, t, relocs, &n_relocs, lmap, &n_labels);
+    TermMap tmap[CLONE_MAX_TERMMAP];
+    u32 n_tmap = 0;
+    return term_clone_r(ctx, t, relocs, &n_relocs, lmap, &n_labels, tmap, &n_tmap);
 }

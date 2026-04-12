@@ -75,6 +75,7 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t);
 i32 *thvm_to_host_i32(TinyHVM *ctx, Term t);
 u32 *thvm_to_host_u32(TinyHVM *ctx, Term t);
 void *thvm_to_host_raw(TinyHVM *ctx, Term t, u32 *out_dtype, Shape *out_shape);
+static Term thvm_force_tensor_term(TinyHVM *ctx, Term t);
 
 // Forward declarations for cross-module dependencies
 static u32 reduce_id(TinyHVM *ctx, Term t);

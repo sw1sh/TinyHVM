@@ -144,7 +144,8 @@ typedef u64 Term;
 
 #define UOP_GRAD      28   // IC gradient: DUP-op interaction in the reducer
 #define UOP_TODEVICE  29   // lazy device transfer: TODEVICE(tensor, device_idx_scalar)
-#define UOP_COUNT     30
+#define UOP_DETACH    30   // realize current value and return a provenance-free tensor leaf
+#define UOP_COUNT     31
 
 // (LAYER_OP_POOL_GATHER and LAYER_OP_BATCHNORM removed — both are now
 // composed from standard UOps with standard backward rules.)
@@ -154,7 +155,7 @@ static const char *uop_names[] = {
     "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
     "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","FUSING","ASSIGN","WHERE",
-    "IFZ","LOG_PRINT","GRAD","TODEVICE"
+    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH"
 };
 
 // ============================================================
@@ -822,6 +823,9 @@ typedef struct {
     u8          no_dup;     // 1 to skip linear_use DUP (used inside GRAD handler)
     u8          defer_all;   // (legacy, unused)
     u8          dispatch_mode; // (legacy, unused)
+    u8          step_graph_consumed;   // outermost THVM_STEP_GRAPH session already used
+    u8          coarse_graph_consumed; // outermost THVM_GRAPH session already used
+    u32         eval_depth;            // nested thvm_eval reentrancy depth
 
     // Named definitions for TAG_REF (global def table)
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term
@@ -1001,6 +1005,7 @@ Term     thvm_scalar_i32(TinyHVM *ctx, i32 val);
 Term     thvm_scalar_u32(TinyHVM *ctx, u32 val);
 f32      thvm_scalar_val(TinyHVM *ctx, Term t);
 Term     thvm_cast(TinyHVM *ctx, Term t, u32 dtype);
+Term     thvm_detach(TinyHVM *ctx, Term t);
 
 // Movement ops (lazy — modify View, share buffer)
 Term     thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape);
@@ -1033,6 +1038,7 @@ u32      thvm_fresh_label(TinyHVM *ctx);                     // allocate next la
 // ICC: Bridge + Annotation
 Term     thvm_bri(TinyHVM *ctx, Term *var_out, Term body);   // θx.body (dual of lambda)
 Term     thvm_ann(TinyHVM *ctx, Term term, Term type);       // {term : type}
+void     thvm_hint_shape(TinyHVM *ctx, Term term, Shape shape); // host-side shape hint for lazy vars/terms
 
 // Dynamic labels + priority
 Term     thvm_dsu(TinyHVM *ctx, Term label_expr, Term a, Term b);  // dynamic SUP
@@ -1124,19 +1130,22 @@ u32      thvm_grad_bundle_count(TinyHVM *ctx, Term bundle);
 Term     thvm_grad_bundle_get(TinyHVM *ctx, Term bundle, u32 index);
 
 // Internal GRAD target registry used by phase-1 GRAD interactions and debug labels.
+#define THVM_GRAD_TARGETS_MAX 512
 void     thvm_grad_targets_clear(TinyHVM *ctx);
 void     thvm_grad_target_set(TinyHVM *ctx, u64 grad_loc, Term x);
 Term     thvm_grad_target_get(TinyHVM *ctx, u64 grad_loc);
-void     thvm_grad_targets_set(TinyHVM *ctx, Term *params, Term *grad_slots, u32 n_params);
-void     thvm_grad_targets_set_keep(TinyHVM *ctx, Term *params, u32 n_params, Term bundle);
-int      thvm_grad_targets_find_slot(TinyHVM *ctx, u32 tid, Term *out_slot);
-int      thvm_grad_targets_find_index(TinyHVM *ctx, u32 tid, u32 *out_index, Term *out_slot);
-int      thvm_grad_targets_find_term(TinyHVM *ctx, Term t, u32 *out_index, Term *out_slot);
-u32      thvm_grad_targets_count(TinyHVM *ctx);
-u32      thvm_grad_targets_get_tid(TinyHVM *ctx, u32 index);
+void     thvm_grad_mode_set(TinyHVM *ctx, u64 grad_loc, u32 mode);
 u32      thvm_grad_mode_get(TinyHVM *ctx, u64 grad_loc);
-int      thvm_grad_targets_has_keep_bundle(TinyHVM *ctx);
-Term     thvm_grad_targets_get_keep_bundle(TinyHVM *ctx);
+void     thvm_grad_targets_set_for_loc(TinyHVM *ctx, u64 grad_loc,
+                                       Term *params, Term *grad_slots, u32 n_params);
+void     thvm_grad_targets_share(TinyHVM *ctx, u64 dst_loc, u64 src_loc);
+int      thvm_grad_targets_find_slot_at(TinyHVM *ctx, u64 grad_loc, u32 tid, Term *out_slot);
+int      thvm_grad_targets_find_index_at(TinyHVM *ctx, u64 grad_loc, u32 tid, u32 *out_index, Term *out_slot);
+int      thvm_grad_targets_find_term_at(TinyHVM *ctx, u64 grad_loc, Term t, u32 *out_index, Term *out_slot);
+u32      thvm_grad_targets_count_at(TinyHVM *ctx, u64 grad_loc);
+u32      thvm_grad_targets_get_tid_at(TinyHVM *ctx, u64 grad_loc, u32 index);
+Term     thvm_grad_targets_get_term_at(TinyHVM *ctx, u64 grad_loc, u32 index);
+Term     thvm_grad_targets_get_slot_at(TinyHVM *ctx, u64 grad_loc, u32 index);
 void     thvm_grad_keep_bundle_set(TinyHVM *ctx, u64 grad_loc, Term bundle);
 Term     thvm_grad_keep_bundle_get(TinyHVM *ctx, u64 grad_loc);
 void     thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad);
@@ -1199,5 +1208,15 @@ Tensor tensor_bundle_get(Tensor bundle, u32 index);
 void   linear_init_uniform(Linear *layer, TinyHVM *ctx, u32 in_features,
                            u32 out_features, int has_bias);
 Tensor linear_forward(Linear *layer, Tensor x);
+
+// Additional NN wrappers (implemented in nn/_.c via nn/tensor_nn_api.c).
+// These follow tinygrad-style layer semantics while keeping explicit shape args.
+Tensor tensor_conv2d(Tensor x, Tensor w, const Tensor *bias_opt, u32 groups,
+                     const u32 *stride_, const u32 *padding_);
+Tensor tensor_maxpool2d(Tensor x, const u32 *kernel, const u32 *stride_);
+Tensor tensor_batchnorm(Tensor x, Tensor gamma, Tensor beta, Tensor rmean, Tensor rvar,
+                        u32 B, u32 C, u32 H, u32 W, int training);
+Tensor tensor_softmax(Tensor logits, u32 B, u32 C);
+Tensor tensor_cross_entropy(Tensor logits, const u8 *labels, u32 B, u32 C);
 
 #endif // TINYHVM_H

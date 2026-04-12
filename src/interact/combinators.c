@@ -27,6 +27,23 @@
             if (term_tag(fun) == TAG_BRI) {
                 u64 bri_loc = term_val(fun);
                 Term arg = heap_read(ctx, loc + 1);
+                if (term_tag(arg) == TAG_TOP && term_ext(arg) == UOP_DETACH) {
+                    Term src0 = heap_read(ctx, term_val(arg));
+                    Term forced = thvm_force_tensor_term(ctx, arg);
+                    if (getenv("THVM_LOOP_DIAG")) {
+                        fprintf(stderr,
+                                "APP_BRI_DETACH loc=%llu arg_loc=%llu src_tag=%u src_ext=%u src_val=%llu forced_tag=%u forced_ext=%u forced_val=%llu\n",
+                                (unsigned long long)bri_loc,
+                                (unsigned long long)term_val(arg),
+                                (u32)term_tag(src0),
+                                (u32)term_ext(src0),
+                                (unsigned long long)term_val(src0),
+                                (u32)term_tag(forced),
+                                (u32)term_ext(forced),
+                                (unsigned long long)term_val(forced));
+                    }
+                    if (term_tag(forced) == TAG_TEN) arg = forced;
+                }
                 heap_set(ctx, bri_loc, arg);
                 ctx->itrs++;
                 t = heap_read(ctx, bri_loc + 1);
@@ -37,6 +54,23 @@
             if (term_tag(fun) == TAG_LAM) {
                 u64 lam_loc = term_val(fun);
                 Term arg = heap_read(ctx, loc + 1);
+                if (term_tag(arg) == TAG_TOP && term_ext(arg) == UOP_DETACH) {
+                    Term src0 = heap_read(ctx, term_val(arg));
+                    Term forced = thvm_force_tensor_term(ctx, arg);
+                    if (getenv("THVM_LOOP_DIAG")) {
+                        fprintf(stderr,
+                                "APP_LAM_DETACH loc=%llu arg_loc=%llu src_tag=%u src_ext=%u src_val=%llu forced_tag=%u forced_ext=%u forced_val=%llu\n",
+                                (unsigned long long)lam_loc,
+                                (unsigned long long)term_val(arg),
+                                (u32)term_tag(src0),
+                                (u32)term_ext(src0),
+                                (unsigned long long)term_val(src0),
+                                (u32)term_tag(forced),
+                                (u32)term_ext(forced),
+                                (unsigned long long)term_val(forced));
+                    }
+                    if (term_tag(forced) == TAG_TEN) arg = forced;
+                }
                 heap_set(ctx, lam_loc, arg);      // link: write arg at var slot
                 ctx->itrs++;
                 t = heap_read(ctx, lam_loc + 1);  // body
@@ -56,10 +90,10 @@
                 t = heap_read(ctx, loc + 1);
                 INET_RECURSE();
             }
-            // APP-ERA: erasure propagation
+            // APP-ERA: HVM4 semantics — erase the whole application
             if (term_tag(fun) == TAG_ERA) {
                 ctx->itrs++;
-                t = heap_read(ctx, loc + 1);
+                t = term_era();
                 INET_RECURSE();
             }
 
@@ -93,6 +127,25 @@
                     t = thvm_usp(ctx, lab,
                         thvm_app(ctx, term_new(TAG_UDP, lab, dup), a),
                         thvm_app(ctx, term_new(TAG_UDP, lab, dup), b));
+                    INET_RECURSE();
+                }
+
+                // APP-MAT-CTR: constructor match on TAG_CTR ext. If the
+                // constructor code matches, apply the handler to each child.
+                if (term_tag(arg) == TAG_CTR) {
+                    u64 mat_loc = term_val(fun);
+                    u32 match_tag = term_ext(fun);
+                    u32 ctr_tag = term_ext(arg);
+                    ctx->itrs++;
+                    if (match_tag == ctr_tag) {
+                        Term r = heap_read(ctx, mat_loc + 0);
+                        u64 ctr_loc = term_val(arg);
+                        for (u32 i = 0; i < ctr_tag; i++)
+                            r = thvm_app(ctx, r, heap_read(ctx, ctr_loc + i));
+                        t = r;
+                    } else {
+                        t = thvm_app(ctx, heap_read(ctx, mat_loc + 1), arg);
+                    }
                     INET_RECURSE();
                 }
 
@@ -153,6 +206,7 @@
                         if ((_ext) == UOP_FUSING) _ar = 0; \
                         else if ((_ext) == UOP_WHERE || (_ext) == UOP_IFZ) _ar = 3; \
                         else if ((_ext) == UOP_GRAD) _ar = 2; \
+                        else if ((_ext) == UOP_LOG_PRINT || (_ext) == UOP_DETACH) _ar = 1; \
                         else if (!is_binary((_ext)) && is_elementwise((_ext))) _ar = 1; \
                         else _ar = 2; \
                         break; \
@@ -381,6 +435,24 @@ era_continue:
 	            if (term_tag(val) == TAG_TOP) {
 	                u32 uop = term_ext(val);
 	                if (uop == UOP_FUSING) DUP_STATE_RETURN(val, val, val);
+                    if (uop == UOP_DETACH) {
+                        Term forced = thvm_eval(ctx, val);
+                        if (getenv("THVM_LOOP_DIAG")) {
+                            fprintf(stderr,
+                                    "DUP_DETACH val_loc=%llu forced_tag=%u forced_ext=%u forced_val=%llu\n",
+                                    (unsigned long long)term_val(val),
+                                    (u32)term_tag(forced),
+                                    (u32)term_ext(forced),
+                                    (unsigned long long)term_val(forced));
+                        }
+                        if (term_tag(forced) == TAG_TEN ||
+                            term_tag(forced) == TAG_ERA ||
+                            term_tag(forced) == TAG_NUM ||
+                            term_tag(forced) == TAG_ANY ||
+                            term_tag(forced) == TAG_CTR) {
+                            DUP_STATE_RETURN(forced, forced, forced);
+                        }
+                    }
 	                u64 val_loc = term_val(val);
 	                u32 arity = (uop == UOP_WHERE || uop == UOP_IFZ) ? 3 : 2;
 	                if (!is_binary(uop) && is_elementwise(uop)) arity = 1;
@@ -411,9 +483,8 @@ era_continue:
 	                    st_set(r1, vv);
 	                }
 	                if (uop == UOP_GRAD) {
-	                    Term gx = thvm_grad_target_get(ctx, val_loc);
-	                    thvm_grad_target_set(ctx, r0, gx);
-	                    thvm_grad_target_set(ctx, r1, gx);
+	                    thvm_grad_targets_share(ctx, r0, val_loc);
+	                    thvm_grad_targets_share(ctx, r1, val_loc);
 	                }
 
 	                DUP_STATE_RETURN(val, n0, n1);
@@ -525,6 +596,15 @@ era_continue:
             u64 loc = term_val(t);
             Term sub = heap_read(ctx, loc);
             if (term_is_sub(sub)) return t;
+            if (term_tag(sub) == TAG_TOP && term_ext(sub) == UOP_DETACH) {
+                Term forced = thvm_force_tensor_term(ctx, sub);
+                if (term_tag(forced) == TAG_TEN) {
+                    heap_set(ctx, loc, forced);
+                    ctx->itrs++;
+                    return forced;
+                }
+                return forced;
+            }
             return sub; // trampoline re-enters
         }
 

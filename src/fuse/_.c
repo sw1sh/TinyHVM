@@ -118,16 +118,15 @@ static int fuse_append_leaf_num(f32 val, u32 dtype,
     return (int)(WALK_LEAF_BASE + idx);
 }
 
+static Term fuse_deref_links(TinyHVM *ctx, Term t);
+
 static int fuse_make_boundary_leaf(TinyHVM *ctx, Term t,
                                    const View *view,
                                    const ShapeTracker *st,
                                    u32 *leaf_ids, const View **leaf_views, u32 *n_leaves) {
     Term cur = t;
     for (int i = 0; i < 16; i++) {
-        if (term_tag(cur) == TAG_DP0 || term_tag(cur) == TAG_DP1) {
-            cur = heap_read(ctx, term_val(cur));
-            continue;
-        }
+        cur = fuse_deref_links(ctx, cur);
         if (term_tag(cur) == TAG_TOP && is_view_op(term_ext(cur))) {
             cur = heap_read(ctx, term_val(cur));
             continue;
@@ -149,6 +148,18 @@ static int fuse_make_boundary_leaf(TinyHVM *ctx, Term t,
             fuse_dep_add(fuse_boundary_kids[bidx]);
             return fuse_append_leaf_tensor(ctx, fuse_boundary_output_tids[bidx], view, st,
                                            leaf_ids, leaf_views, n_leaves);
+        }
+    }
+    if (getenv("THVM_SCHED_DIAG2")) {
+        fprintf(stderr, "  boundary_leaf_fail: start_tag=%u start_ext=%u start_val=%llu cur_tag=%u cur_ext=%u cur_val=%llu\n",
+                (u32)term_tag(t), (u32)term_ext(t), (unsigned long long)term_val(t),
+                (u32)term_tag(cur), (u32)term_ext(cur), (unsigned long long)term_val(cur));
+        if (term_tag(cur) == TAG_VAR) {
+            Term sub = heap_read(ctx, term_val(cur));
+            fprintf(stderr, "  boundary_leaf_var: loc=%llu sub_tag=%u sub_ext=%u sub_val=%llu sub_is_sub=%d\n",
+                    (unsigned long long)term_val(cur),
+                    (u32)term_tag(sub), (u32)term_ext(sub), (unsigned long long)term_val(sub),
+                    term_is_sub(sub));
         }
     }
     return -1;
@@ -185,6 +196,24 @@ static Term _fuse_absorbed_reduce;
 #define FUSE_MAX_DUP_LOCS 64
 static u64 _fuse_dup_locs[FUSE_MAX_DUP_LOCS];
 static u32 _fuse_n_dup_locs = 0;
+
+static Term fuse_deref_links(TinyHVM *ctx, Term t) {
+    for (int i = 0; i < 16; i++) {
+        if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1) {
+            t = heap_read(ctx, term_val(t));
+            continue;
+        }
+        if (term_tag(t) == TAG_VAR) {
+            Term sub = heap_read(ctx, term_val(t));
+            if (!term_is_sub(sub)) {
+                t = sub;
+                continue;
+            }
+        }
+        break;
+    }
+    return t;
+}
 
 // Compute a broadcast leaf's target shape in a reshaped iteration space.
 // For each OP dim, consume RESHAPE dims until product matches, then:
@@ -352,6 +381,15 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                     term_tag(shared)==TAG_TOP ? uop_names[term_ext(shared)] : "");
         return r;
     }
+    // TAG_VAR: if substituted, walk through the bound value.
+    if (term_tag(t) == TAG_VAR) {
+        Term sub = heap_read(ctx, term_val(t));
+        if (!term_is_sub(sub))
+            return fuse_walk_inner(ctx, sub, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+        if (getenv("THVM_SCHED_DIAG"))
+            fprintf(stderr, "  walk_var_unbound: loc=%llu\n", (unsigned long long)term_val(t));
+        return -1;
+    }
     // TAG_NUM: scalar constant leaf. Keep it explicit in the kernel IR.
     if (term_tag(t) == TAG_NUM) {
         for (u32 i = 0; i < *n_leaves; i++)
@@ -409,10 +447,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         Term view_input = heap_read(ctx, loc);
         Term boundary_inner = view_input;
         for (int bd = 0; bd < 16; bd++) {
-            if (term_tag(boundary_inner) == TAG_DP0 || term_tag(boundary_inner) == TAG_DP1) {
-                boundary_inner = heap_read(ctx, term_val(boundary_inner));
-                continue;
-            }
+            boundary_inner = fuse_deref_links(ctx, boundary_inner);
             if (term_tag(boundary_inner) != TAG_TOP || !is_view_op(term_ext(boundary_inner))) break;
             boundary_inner = heap_read(ctx, term_val(boundary_inner));
         }
@@ -425,16 +460,18 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             }
         }
         // Try to walk through: TAG_TEN, ew TAG_TOP, view TAG_TOP, or FUSING (scheduled kernel)
-        int can_walk = (term_tag(view_input) == TAG_TEN || term_tag(view_input) == TAG_NUM);
-        if (!can_walk && term_tag(view_input) == TAG_TOP) {
-            u32 vi_uop = term_ext(view_input);
+        Term vi0 = fuse_deref_links(ctx, view_input);
+        int can_walk = (term_tag(vi0) == TAG_TEN || term_tag(vi0) == TAG_NUM);
+        if (!can_walk && term_tag(vi0) == TAG_TOP) {
+            u32 vi_uop = term_ext(vi0);
             can_walk = is_elementwise(vi_uop) || is_view_op(vi_uop) || vi_uop == UOP_FUSING;
         }
         // DP0/DP1: deref to check what they point to.
         // can_walk when deref → TAG_TEN, FUSING, or ew/view TAG_TOP.
         // All view ops now handle the OP-inner case (EXPAND/SHRINK/PAD compose onto leaves).
-        if (!can_walk && (term_tag(view_input) == TAG_DP0 || term_tag(view_input) == TAG_DP1)) {
-            Term dp_inner = heap_read(ctx, term_val(view_input));
+        if (!can_walk && (term_tag(view_input) == TAG_DP0 || term_tag(view_input) == TAG_DP1 ||
+                          term_tag(view_input) == TAG_VAR)) {
+            Term dp_inner = fuse_deref_links(ctx, view_input);
             if (term_tag(dp_inner) == TAG_TEN) can_walk = 1;
             else if (term_tag(dp_inner) == TAG_TOP) {
                 u32 di_uop = term_ext(dp_inner);
@@ -444,13 +481,9 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         // Rank-changing RESHAPE: boundary when inner op produces different rank.
         // Walking through would create mixed-rank leaves → broadcast failure.
         if (can_walk && uop == UOP_RESHAPE) {
-            Term vi_check = view_input;
-            if (term_tag(vi_check) == TAG_DP0 || term_tag(vi_check) == TAG_DP1)
-                vi_check = heap_read(ctx, term_val(vi_check));
+            Term vi_check = fuse_deref_links(ctx, view_input);
             if (term_tag(vi_check) == TAG_TOP) {
-                Term rarg = heap_read(ctx, loc + 1);
-                if (term_tag(rarg) == TAG_DP0 || term_tag(rarg) == TAG_DP1)
-                    rarg = heap_read(ctx, term_val(rarg));
+                Term rarg = fuse_deref_links(ctx, heap_read(ctx, loc + 1));
                 if (term_tag(rarg) == TAG_TEN) {
                     u32 target_rank = ctx->tensors[(u32)term_val(rarg)].view.numel;
                     const View *inner_v = st_get(term_val(vi_check));
@@ -462,8 +495,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         if (!can_walk) {
             // Check if the inner (possibly through view chain) is an absorbable reduce
             if (_fuse_can_absorb_reduce) {
-                Term vi = view_input;
-                if (term_tag(vi)==TAG_DP0||term_tag(vi)==TAG_DP1) vi = heap_read(ctx, term_val(vi));
+                Term vi = fuse_deref_links(ctx, view_input);
                 // Unwrap through view ops to find SUM/RMAX
                 Term reduce_found = term_era();
                 Term vi_walk = vi;
@@ -474,8 +506,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                         reduce_found = vi_walk; break;
                     }
                     if (!is_view_op(vi_uop)) break;
-                    Term nx = heap_read(ctx, term_val(vi_walk));
-                    if (term_tag(nx)==TAG_DP0||term_tag(nx)==TAG_DP1) nx = heap_read(ctx, term_val(nx));
+                    Term nx = fuse_deref_links(ctx, heap_read(ctx, term_val(vi_walk)));
                     vi_walk = nx;
                 }
                 if (getenv("THVM_SCHED_DIAG2"))
@@ -485,15 +516,20 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 if (term_tag(reduce_found) == TAG_TOP && !_sched_is_absorbed(reduce_found)) {
                     _fuse_absorbed_reduce = reduce_found;
                     _fuse_can_absorb_reduce = 0;
-                    Term ri = heap_read(ctx, term_val(reduce_found));
-                    if (term_tag(ri)==TAG_DP0||term_tag(ri)==TAG_DP1) ri = heap_read(ctx, term_val(ri));
+                    Term ri = fuse_deref_links(ctx, heap_read(ctx, term_val(reduce_found)));
                     return fuse_walk_inner(ctx, ri, ops, n_ops, leaf_ids, leaf_views, n_leaves);
                 }
             }
             // Boundary leaf: realized child kernel or concrete leaf.
             const View *sv = st_get(loc);
             if (!sv) return -1;
-            if (getenv("THVM_SCHED_DIAG2")) fprintf(stderr, "  lazy_leaf: outer=%s vi_uop=%s@%llu\n", uop_names[uop], term_tag(view_input)==TAG_TOP?uop_names[term_ext(view_input)]:"?", term_val(view_input));
+            if (getenv("THVM_SCHED_DIAG2"))
+                fprintf(stderr, "  lazy_leaf: outer=%s vi_tag=%u vi_ext=%u vi_uop=%s@%llu\n",
+                        uop_names[uop],
+                        (u32)term_tag(view_input),
+                        (u32)term_ext(view_input),
+                        term_tag(view_input)==TAG_TOP?uop_names[term_ext(view_input)]:"?",
+                        (unsigned long long)term_val(view_input));
             return fuse_make_boundary_leaf(ctx, t, sv, NULL, leaf_ids, leaf_views, n_leaves);
         }
         u32 leaves_before = *n_leaves;
@@ -512,8 +548,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             // PERMUTE: store perm for reduce axis transform.
             if (uop == UOP_PERMUTE) {
                 Term parg = heap_read(ctx, loc + 1);
-                if (term_tag(parg) == TAG_DP0 || term_tag(parg) == TAG_DP1)
-                    parg = heap_read(ctx, term_val(parg));
+                parg = fuse_deref_links(ctx, parg);
                 if (term_tag(parg) == TAG_TEN) {
                     TensorMeta *pp2 = &ctx->tensors[(u32)term_val(parg)];
                     _fuse_perm_rank = pp2->view.numel;
@@ -531,8 +566,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 // Compose RESHAPE onto each leaf's ShapeTracker.
                 // On failure, fall back to boundary (undo walk, create lazy leaf).
                 Term rarg2 = heap_read(ctx, loc + 1);
-                if (term_tag(rarg2) == TAG_DP0 || term_tag(rarg2) == TAG_DP1)
-                    rarg2 = heap_read(ctx, term_val(rarg2));
+                rarg2 = fuse_deref_links(ctx, rarg2);
                 int compose_ok = 0;
                 if (term_tag(rarg2) == TAG_TEN) {
                     TensorMeta *rmp2 = &ctx->tensors[(u32)term_val(rarg2)];
@@ -542,9 +576,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                         tensor_meta_read_u32(ctx, (u32)term_val(rarg2), rf2, MAX_DIM);
                         Shape rs_shape = {.rank = rrank2};
                         for (u32 j = 0; j < rrank2; j++) rs_shape.dims[j] = rf2[j];
-                        Term vi_rs = view_input;
-                        if (term_tag(vi_rs) == TAG_DP0 || term_tag(vi_rs) == TAG_DP1)
-                            vi_rs = heap_read(ctx, term_val(vi_rs));
+                        Term vi_rs = fuse_deref_links(ctx, view_input);
                         const View *op_v = (term_tag(vi_rs) == TAG_TOP)
                             ? st_get(term_val(vi_rs)) : NULL;
                         u32 rs_numel = 1;
@@ -586,8 +618,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             // On failure, fall back to boundary (undo walk, create lazy leaf).
             if (uop == UOP_EXPAND || uop == UOP_SHRINK || uop == UOP_PAD) {
                 Term parg = heap_read(ctx, loc + 1);
-                if (term_tag(parg) == TAG_DP0 || term_tag(parg) == TAG_DP1)
-                    parg = heap_read(ctx, term_val(parg));
+                parg = fuse_deref_links(ctx, parg);
                 if (term_tag(parg) != TAG_TEN) goto view_op_boundary;
                 TensorMeta *mp2 = &ctx->tensors[(u32)term_val(parg)];
                 u32 rank2 = mp2->view.numel;
@@ -651,9 +682,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         }
         // Fallback: manual composition (when ST not in shape table)
         Term arg2 = heap_read(ctx, loc + 1);
-        // Look through DUP references for shared shape params
-        if (term_tag(arg2) == TAG_DP0 || term_tag(arg2) == TAG_DP1)
-            arg2 = heap_read(ctx, term_val(arg2));
+        arg2 = fuse_deref_links(ctx, arg2);
         if (term_tag(arg2) != TAG_TEN) {
             // No shape params (e.g. pool stride view with ERA arg1).
             // Fall back to non-ew leaf using st_get for the view.
@@ -699,9 +728,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             if (new_numel != base->numel) {
                 // Broadcast leaf through rank-changing reshape: try fuse_leaf_reshape_target
                 // to compute the leaf's target shape in the new coordinate space.
-                Term vi_rs = view_input;
-                if (term_tag(vi_rs) == TAG_DP0 || term_tag(vi_rs) == TAG_DP1)
-                    vi_rs = heap_read(ctx, term_val(vi_rs));
+                Term vi_rs = fuse_deref_links(ctx, view_input);
                 const View *op_v = (term_tag(vi_rs) == TAG_TOP)
                     ? st_get(term_val(vi_rs)) : NULL;
                 if (!op_v && term_tag(vi_rs) == TAG_TEN)
@@ -837,8 +864,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         if (!is_absorbable && is_view_op(uop)) {
             Term _cur = t;
             for (int _vd = 0; _vd < 10; _vd++) {
-                Term _ri = heap_read(ctx, term_val(_cur));
-                if (term_tag(_ri)==TAG_DP0||term_tag(_ri)==TAG_DP1) _ri = heap_read(ctx, term_val(_ri));
+                Term _ri = fuse_deref_links(ctx, heap_read(ctx, term_val(_cur)));
                 if (term_tag(_ri)==TAG_TOP && (term_ext(_ri)==UOP_SUM||term_ext(_ri)==UOP_RMAX)) {
                     is_absorbable = 1;
                     rt = _ri;
@@ -851,8 +877,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         if (is_absorbable && !_sched_is_absorbed(rt)) {
             _fuse_absorbed_reduce = rt;
             _fuse_can_absorb_reduce = 0;
-            Term ri = heap_read(ctx, term_val(rt));
-            if (term_tag(ri)==TAG_DP0||term_tag(ri)==TAG_DP1) ri = heap_read(ctx, term_val(ri));
+            Term ri = fuse_deref_links(ctx, heap_read(ctx, term_val(rt)));
             return fuse_walk_inner(ctx, ri, ops, n_ops, leaf_ids, leaf_views, n_leaves);
         }
     }
@@ -938,9 +963,7 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     // The chain becomes result-side kernel metadata, not a standalone phase-2 net.
     Term cur = t;
     while (term_tag(cur) == TAG_TOP && is_view_op(term_ext(cur))) {
-        Term inner = heap_read(ctx, term_val(cur));
-        if (term_tag(inner) == TAG_DP0 || term_tag(inner) == TAG_DP1)
-            inner = heap_read(ctx, term_val(inner));
+        Term inner = fuse_deref_links(ctx, heap_read(ctx, term_val(cur)));
         if (term_tag(inner) != TAG_TOP) return 0;
         cur = inner;
     }
@@ -950,9 +973,7 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     if (cur_uop == UOP_SUM || cur_uop == UOP_RMAX) {
         has_reduce = cur_uop;
         sum_term = cur;
-        Term ri = heap_read(ctx, term_val(cur));
-        if (term_tag(ri) == TAG_DP0 || term_tag(ri) == TAG_DP1)
-            ri = heap_read(ctx, term_val(ri));
+        Term ri = fuse_deref_links(ctx, heap_read(ctx, term_val(cur)));
         ew_root = ri; // walk from reduce input
     } else if (is_elementwise(cur_uop)) {
         ew_root = cur; // walk from ew root
@@ -1104,9 +1125,7 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     if (has_reduce) {
         rs.reduce_type = has_reduce;
         u64 sum_loc = term_val(sum_term);
-        Term sum_axes = heap_read(ctx, sum_loc + 1);
-        if (term_tag(sum_axes) == TAG_DP0 || term_tag(sum_axes) == TAG_DP1)
-            sum_axes = heap_read(ctx, term_val(sum_axes));
+        Term sum_axes = fuse_deref_links(ctx, heap_read(ctx, sum_loc + 1));
         int found_axes = 0;
         if (term_tag(sum_axes) == TAG_TEN) {
             u32 ax_id = (u32)term_val(sum_axes);

@@ -27,16 +27,27 @@ static Term thvm_force_view_chain(TinyHVM *ctx, Term t) {
     return t;
 }
 
-void *thvm_to_host_raw(TinyHVM *ctx, Term t, u32 *out_dtype, Shape *out_shape) {
+static Term thvm_force_tensor_term(TinyHVM *ctx, Term t) {
+    if (term_tag(t) == TAG_TOP && term_ext(t) == UOP_DETACH) {
+        u64 loc = term_val(t);
+        if (loc != 0 && loc + 1 < ctx->heap_pos) {
+            Term memo = heap_read(ctx, loc + 1);
+            if (term_tag(memo) == TAG_TEN) return memo;
+        }
+    }
     t = thvm_reduce(ctx, t);
     if (term_tag(t) != TAG_TEN) {
-        // After scheduler: TAG_TOPs may need dispatch_mode to resolve
         ctx->dispatch_mode = 1;
         t = thvm_reduce(ctx, t);
         ctx->dispatch_mode = 0;
     }
     if (thvm_is_view_top(t))
         t = thvm_force_view_chain(ctx, t);
+    return t;
+}
+
+void *thvm_to_host_raw(TinyHVM *ctx, Term t, u32 *out_dtype, Shape *out_shape) {
+    t = thvm_force_tensor_term(ctx, t);
     if (term_tag(t) != TAG_TEN) return NULL;
     u32 id = (u32)term_val(t);
     ENSURE(ctx, id);
@@ -180,22 +191,24 @@ static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target)
                 reduce_axes[n_reduce++] = n_leading + d;
         }
     } else {
-        // src.rank < target.rank: src was broadcast from a scalar/reduced form
-        // This happens when gy is a keepdims-reduced shape like [1,1] but
-        // the target has more dims. Just reshape src to target if numel matches or is 1.
-        // Generally this shouldn't happen in correct backward — but handle gracefully.
+        // src.rank < target.rank: the incoming grad is missing leading
+        // broadcast dimensions. Left-pad with ones, then explicitly expand
+        // to the requested target shape.
         fprintf(stderr, "sum_to_shape RANK MISMATCH: src.rank=%u < target.rank=%u\n", src_shape.rank, target.rank);
-        // Abort to get stack trace
-        // assert(0 && "sum_to_shape rank mismatch");
         printf("sum_to_shape: src.rank=%u < target.rank=%u src=[", src_shape.rank, target.rank);
         for (u32 d=0;d<src_shape.rank;d++) printf("%u,",src_shape.dims[d]);
         printf("] target=[");
         for (u32 d=0;d<target.rank;d++) printf("%u,",target.dims[d]);
         printf("]\n");
-        // Reshape grad to target shape (broadcast; assumes numel(src) == 1 or numel matches)
-        if (target.rank > 0) {
-            grad = thvm_reshape(ctx, grad, target);
-        }
+
+        Shape padded = {.rank = target.rank};
+        u32 pad = target.rank - src_shape.rank;
+        for (u32 d = 0; d < pad; d++) padded.dims[d] = 1;
+        for (u32 d = 0; d < src_shape.rank; d++) padded.dims[pad + d] = src_shape.dims[d];
+
+        grad = thvm_reshape(ctx, grad, padded);
+        if (target.rank > 0 && !shape_eq(padded, target))
+            grad = thvm_expand(ctx, grad, target);
         return grad;
     }
 

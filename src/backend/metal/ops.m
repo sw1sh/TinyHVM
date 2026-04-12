@@ -32,8 +32,9 @@ static int has_broadcast(const View *v) {
     return 0;
 }
 
-static void metal_op_unary(u32 uop, u32 dst, const View *dv,
-                            u32 src, const View *sv) {
+static void metal_op_unary(u32 uop, u32 dst, const View *dv, u32 dst_dtype,
+                            u32 src, const View *sv, u32 src_dtype) {
+    (void)dst_dtype; (void)src_dtype;
     u64 t0 = thvm_prof_tick();
 
     // Unified codegen path
@@ -106,8 +107,9 @@ static void metal_op_unary(u32 uop, u32 dst, const View *dv,
     thvm_prof_record(uop, t0);
 }
 
-static void metal_op_binary(u32 uop, u32 dst, const View *dv,
-                             u32 a, const View *av, u32 b, const View *bv) {
+static void metal_op_binary(u32 uop, u32 dst, const View *dv, u32 dst_dtype,
+                             u32 a, const View *av, u32 a_dtype, u32 b, const View *bv, u32 b_dtype) {
+    (void)dst_dtype; (void)a_dtype; (void)b_dtype;
     u64 t0 = thvm_prof_tick();
 
     // Unified codegen: JIT-generates optimal kernel for any stride pattern
@@ -264,8 +266,9 @@ static void metal_op_binary(u32 uop, u32 dst, const View *dv,
     } // end legacy fallback
 }
 
-static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
-                         u32 M, u32 K, u32 N) {
+static void metal_op_mm(u32 dst, u32 dst_dtype, u32 a, const View *av, u32 a_dtype, u32 b, const View *bv, u32 b_dtype,
+                        u32 M, u32 K, u32 N) {
+    (void)dst_dtype; (void)a_dtype; (void)b_dtype;
     u64 t0 = thvm_prof_tick();
 
     // Detect simple transposes: shape=[R,C] strides=[1,R] (swapped from contiguous)
@@ -338,7 +341,8 @@ static void metal_op_mm(u32 dst, u32 a, const View *av, u32 b, const View *bv,
 }
 
 static void metal_op_reduce(u32 uop, u32 dst, u32 dst_numel,
-                             u32 src, u32 src_numel, u32 reduce_dim) {
+                             u32 dst_dtype, u32 src, u32 src_numel, u32 src_dtype, u32 reduce_dim) {
+    (void)dst_dtype; (void)src_dtype;
     u64 t0 = thvm_prof_tick();
     (void)src_numel;
 

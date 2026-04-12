@@ -20,6 +20,7 @@ static u64 cg_hash_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
         h ^= ops[i].uop; h *= 0x100000001b3ULL;
         h ^= ops[i].arg_a; h *= 0x100000001b3ULL;
         h ^= ops[i].arg_b; h *= 0x100000001b3ULL;
+        h ^= ops[i].aux; h *= 0x100000001b3ULL;
     }
     for (u32 i = 0; i < n_leaves; i++) {
         const View *v = leaf_views[i];
@@ -54,6 +55,16 @@ static const char *cg_op_str(u32 uop) {
         case UOP_ADD: return "+"; case UOP_SUB: return "-";
         case UOP_MUL: return "*"; case UOP_DIV: return "/";
         default: return "+";
+    }
+}
+
+static NSString *cg_cast_expr(NSString *expr, u32 dtype) {
+    switch (dtype) {
+        case DTYPE_F16: return [NSString stringWithFormat:@"float(half(%@))", expr];
+        case DTYPE_I32: return [NSString stringWithFormat:@"float(int(%@))", expr];
+        case DTYPE_U32: return [NSString stringWithFormat:@"float(uint(%@))", expr];
+        case DTYPE_F32:
+        default: return expr;
     }
 }
 
@@ -147,6 +158,10 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
     int use_f4 = !has_reduce && (inner % 4 == 0) && n_out > 0;
     if (use_f4 && out_dims[n_out - 1] < rank) {
         if (full_shape->dims[out_dims[n_out - 1]] % 4 != 0) use_f4 = 0;
+    }
+    if (use_f4) {
+        for (u32 i = 0; i < n_ops; i++)
+            if (ops[i].uop == UOP_CAST) { use_f4 = 0; break; }
     }
     if (use_f4) {
         for (u32 i = 0; i < n_leaves; i++) {
@@ -474,6 +489,8 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
             case UOP_EXP:  [s appendFormat:@"%@%@ t%u=exp(t%u);\n", indent, ft, tid, a]; break;
             case UOP_LOG:  [s appendFormat:@"%@%@ t%u=log(t%u);\n", indent, ft, tid, a]; break;
             case UOP_SQRT: [s appendFormat:@"%@%@ t%u=sqrt(t%u);\n", indent, ft, tid, a]; break;
+            case UOP_CAST: [s appendFormat:@"%@float t%u=%@;\n", indent, tid,
+                            cg_cast_expr([NSString stringWithFormat:@"t%u", a], ops[i].aux)]; break;
             default:       [s appendFormat:@"%@%@ t%u=t%u;\n", indent, ft, tid, a]; break;
         }
     }
@@ -557,6 +574,7 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                     case UOP_RELU: [s appendFormat:@"  float p%u=max(%@,0.f);\n", pidx, a_name]; break;
                     case UOP_EXP:  [s appendFormat:@"  float p%u=exp(%@);\n", pidx, a_name]; break;
                     case UOP_LOG:  [s appendFormat:@"  float p%u=log(%@);\n", pidx, a_name]; break;
+                    case UOP_CAST: [s appendFormat:@"  float p%u=%@;\n", pidx, cg_cast_expr(a_name, ops[pi].aux)]; break;
                     default:       [s appendFormat:@"  float p%u=%@;\n", pidx, a_name]; break;
                 }
             }
@@ -666,6 +684,7 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                         case UOP_EXP:  [s appendFormat:@"    float r2v%u=exp(%@);\n", pidx, a_name]; break;
                         case UOP_LOG:  [s appendFormat:@"    float r2v%u=log(%@);\n", pidx, a_name]; break;
                         case UOP_SQRT: [s appendFormat:@"    float r2v%u=sqrt(%@);\n", pidx, a_name]; break;
+                        case UOP_CAST: [s appendFormat:@"    float r2v%u=%@;\n", pidx, cg_cast_expr(a_name, ops[pi].aux)]; break;
                         default:       [s appendFormat:@"    float r2v%u=%@;\n", pidx, a_name]; break;
                     }
                 }
@@ -736,6 +755,7 @@ static NSString *codegen_kernel_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
                     case UOP_EXP:  [s appendFormat:@"    float r2v%u=exp(%@);\n", pidx, a_name]; break;
                     case UOP_LOG:  [s appendFormat:@"    float r2v%u=log(%@);\n", pidx, a_name]; break;
                     case UOP_SQRT: [s appendFormat:@"    float r2v%u=sqrt(%@);\n", pidx, a_name]; break;
+                    case UOP_CAST: [s appendFormat:@"    float r2v%u=%@;\n", pidx, cg_cast_expr(a_name, ops[pi].aux)]; break;
                     default:       [s appendFormat:@"    float r2v%u=%@;\n", pidx, a_name]; break;
                 }
             }
@@ -848,7 +868,10 @@ void metal_dispatch_kernel_rs(u32 out_buf,
                                FusedOp *ops, u32 n_ops,
                                const Shape *full_shape,
                                const ReduceSpec *reduce,
-                               u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs) {
+                               u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs,
+                               const u32 *leaf_dtypes, u32 out_dtype) {
+    (void)leaf_dtypes;
+    (void)out_dtype;
     // Delegate to the full version, using provided STs (or NULL)
     const ShapeTracker *sts[FUSE_MAX_LEAVES];
     if (leaf_sts) memcpy(sts, leaf_sts, n_leaves * sizeof(sts[0]));
@@ -991,6 +1014,7 @@ static u64 cg_hash(const FusedOp *ops, u32 n_ops, u32 n_leaves,
         h ^= ops[i].uop; h *= 0x100000001b3ULL;
         h ^= ops[i].arg_a; h *= 0x100000001b3ULL;
         h ^= ops[i].arg_b; h *= 0x100000001b3ULL;
+        h ^= ops[i].aux; h *= 0x100000001b3ULL;
     }
     for (u32 i = 0; i < n_leaves; i++) {
         const View *v = leaf_views[i];
@@ -1097,9 +1121,11 @@ void metal_dispatch_kernel(u32 out_buf,
             }
         }
         metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, NULL, n_leaves,
-                                  ops, n_ops, &full, &rs, NULL, NULL, 0);
+                                  ops, n_ops, &full, &rs, NULL, NULL, 0,
+                                  NULL, DTYPE_F32);
     } else {
         metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, NULL, n_leaves,
-                                  ops, n_ops, &full, NULL, NULL, NULL, 0);
+                                  ops, n_ops, &full, NULL, NULL, NULL, 0,
+                                  NULL, DTYPE_F32);
     }
 }

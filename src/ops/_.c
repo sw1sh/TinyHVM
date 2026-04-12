@@ -2,7 +2,32 @@ void thvm_realize(TinyHVM *ctx, Term t) {
     thvm_reduce(ctx, t);
 }
 
-f32 *thvm_to_host(TinyHVM *ctx, Term t) {
+static int thvm_is_view_top(Term t) {
+    return term_tag(t) == TAG_TOP &&
+           term_ext(t) >= UOP_RESHAPE &&
+           term_ext(t) <= UOP_PAD;
+}
+
+static Term thvm_force_view_chain(TinyHVM *ctx, Term t) {
+    for (u32 depth = 0; depth < 32; depth++) {
+        if (!thvm_is_view_top(t)) return t;
+        u64 loc = term_val(t);
+        Term a = thvm_reduce(ctx, heap_read(ctx, loc + 0));
+        if (thvm_is_view_top(a)) a = thvm_force_view_chain(ctx, a);
+        heap_set(ctx, loc + 0, a);
+
+        Term b = thvm_reduce(ctx, heap_read(ctx, loc + 1));
+        if (thvm_is_view_top(b)) b = thvm_force_view_chain(ctx, b);
+        heap_set(ctx, loc + 1, b);
+
+        Term r = thvm_interact(ctx, t);
+        if (r == t) return t;
+        t = thvm_reduce(ctx, r);
+    }
+    return t;
+}
+
+void *thvm_to_host_raw(TinyHVM *ctx, Term t, u32 *out_dtype, Shape *out_shape) {
     t = thvm_reduce(ctx, t);
     if (term_tag(t) != TAG_TEN) {
         // After scheduler: TAG_TOPs may need dispatch_mode to resolve
@@ -10,17 +35,22 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t) {
         t = thvm_reduce(ctx, t);
         ctx->dispatch_mode = 0;
     }
+    if (thvm_is_view_top(t))
+        t = thvm_force_view_chain(ctx, t);
     if (term_tag(t) != TAG_TEN) return NULL;
     u32 id = (u32)term_val(t);
     ENSURE(ctx, id);
     TensorMeta *m = &ctx->tensors[id];
+    u32 elem_bytes = dtype_size(m->dtype);
+    if (out_dtype) *out_dtype = m->dtype;
+    if (out_shape) *out_shape = m->view.shape;
 
     if (m->view.contiguous) {
         // Contiguous: direct read
-        if (!m->host_ptr) m->host_ptr = malloc((size_t)m->view.numel * dtype_size(m->dtype));
+        if (!m->host_ptr) m->host_ptr = malloc((size_t)m->view.numel * elem_bytes);
         if (m->backend) m->backend->buf_read(m->buf_id, m->host_ptr,
-                                                  (u64)m->view.numel * dtype_size(m->dtype));
-        return (f32 *)m->host_ptr;
+                                                  (u64)m->view.numel * elem_bytes);
+        return m->host_ptr;
     }
 
     // Non-contiguous (e.g. expand with stride=0): need strided copy
@@ -35,12 +65,12 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t) {
     src_numel += 1;
     if (src_numel == 0) src_numel = 1;
 
-    f32 *src_buf = malloc((size_t)src_numel * sizeof(f32));
+    u8 *src_buf = malloc((size_t)src_numel * elem_bytes);
     if (m->backend) m->backend->buf_read(m->buf_id, src_buf,
-                                              (u64)src_numel * sizeof(f32));
+                                              (u64)src_numel * elem_bytes);
 
-    if (!m->host_ptr) m->host_ptr = malloc((size_t)m->view.numel * sizeof(f32));
-    f32 *dst = (f32 *)m->host_ptr;
+    if (!m->host_ptr) m->host_ptr = malloc((size_t)m->view.numel * elem_bytes);
+    u8 *dst = (u8 *)m->host_ptr;
 
     // Strided copy (with mask support)
     for (u32 flat = 0; flat < m->view.numel; flat++) {
@@ -54,10 +84,33 @@ f32 *thvm_to_host(TinyHVM *ctx, Term t) {
                 masked_out = 1;
             src_idx_s += (i32)coord * (m->view.strides[d] > 0 ? m->view.strides[d] : 0);
         }
-        dst[flat] = masked_out ? 0.0f : src_buf[(u32)src_idx_s];
+        if (masked_out) memset(dst + (size_t)flat * elem_bytes, 0, elem_bytes);
+        else memcpy(dst + (size_t)flat * elem_bytes,
+                    src_buf + (size_t)(u32)src_idx_s * elem_bytes, elem_bytes);
     }
     free(src_buf);
     return dst;
+}
+
+f32 *thvm_to_host(TinyHVM *ctx, Term t) {
+    u32 dtype = DTYPE_F32;
+    void *raw = thvm_to_host_raw(ctx, t, &dtype, NULL);
+    if (!raw || dtype != DTYPE_F32) return NULL;
+    return (f32 *)raw;
+}
+
+i32 *thvm_to_host_i32(TinyHVM *ctx, Term t) {
+    u32 dtype = DTYPE_I32;
+    void *raw = thvm_to_host_raw(ctx, t, &dtype, NULL);
+    if (!raw || dtype != DTYPE_I32) return NULL;
+    return (i32 *)raw;
+}
+
+u32 *thvm_to_host_u32(TinyHVM *ctx, Term t) {
+    u32 dtype = DTYPE_U32;
+    void *raw = thvm_to_host_raw(ctx, t, &dtype, NULL);
+    if (!raw || dtype != DTYPE_U32) return NULL;
+    return (u32 *)raw;
 }
 
 // Lazy device transfer — creates a UOP_TODEVICE node, realized at reduce time
@@ -71,15 +124,20 @@ Term thvm_to_device(TinyHVM *ctx, Term t, u32 device_idx) {
 // ============================================================
 
 // Create a tensor filled with a constant
-static u32 tensor_fill(TinyHVM *ctx, Shape s, f32 val) {
-    u32 id = tensor_create(ctx, s, DTYPE_F32);
+static u32 tensor_fill_typed(TinyHVM *ctx, Shape s, f32 val, u32 dtype) {
+    u32 id = tensor_create(ctx, s, dtype);
     TensorMeta *m = &ctx->tensors[id];
     u32 n = m->view.numel;
-    f32 *tmp = malloc(n * sizeof(f32));
-    for (u32 i = 0; i < n; i++) tmp[i] = val;
-    if (m->backend) m->backend->buf_write(m->buf_id, tmp, (u64)n * dtype_size(DTYPE_F32));
+    u64 nbytes = (u64)n * dtype_size(dtype);
+    void *tmp = malloc((size_t)nbytes);
+    for (u32 i = 0; i < n; i++) dtype_store_from_f32(tmp, dtype, i, val);
+    if (m->backend) m->backend->buf_write(m->buf_id, tmp, nbytes);
     free(tmp);
     return id;
+}
+
+static u32 tensor_fill(TinyHVM *ctx, Shape s, f32 val) {
+    return tensor_fill_typed(ctx, s, val, DTYPE_F32);
 }
 
 // Transpose 2D: just swap axes via permute (zero-copy, stride swap)
@@ -164,12 +222,17 @@ void thvm_set_requires_grad(TinyHVM *ctx, Term t) {
 
 Term thvm_argmax(TinyHVM *ctx, Term x, u32 rows, u32 cols) {
     x = thvm_reduce(ctx, x);
-    f32 *data = thvm_to_host(ctx, x);
+    u32 dtype = DTYPE_F32;
+    void *data = thvm_to_host_raw(ctx, x, &dtype, NULL);
+    if (!data) return term_era();
     u32 *preds = malloc(rows * sizeof(u32));
     for (u32 i = 0; i < rows; i++) {
-        u32 best = 0; f32 mv = data[i * cols];
+        u32 best = 0; f32 mv = dtype_load_as_f32(data, dtype, i * cols);
         for (u32 j = 1; j < cols; j++)
-            if (data[i * cols + j] > mv) { mv = data[i * cols + j]; best = j; }
+            if (dtype_load_as_f32(data, dtype, i * cols + j) > mv) {
+                mv = dtype_load_as_f32(data, dtype, i * cols + j);
+                best = j;
+            }
         preds[i] = best;
     }
     u32 id = ctx->tensor_count++;
@@ -183,12 +246,17 @@ Term thvm_argmax(TinyHVM *ctx, Term x, u32 rows, u32 cols) {
 
 f32 thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels, u32 n_samples, u32 n_classes) {
     logits = thvm_reduce(ctx, logits);
-    f32 *data = thvm_to_host(ctx, logits);
+    u32 dtype = DTYPE_F32;
+    void *data = thvm_to_host_raw(ctx, logits, &dtype, NULL);
+    if (!data) return 0.0f;
     u32 correct = 0;
     for (u32 i = 0; i < n_samples; i++) {
-        u32 best = 0; f32 mv = data[i * n_classes];
+        u32 best = 0; f32 mv = dtype_load_as_f32(data, dtype, i * n_classes);
         for (u32 j = 1; j < n_classes; j++)
-            if (data[i * n_classes + j] > mv) { mv = data[i * n_classes + j]; best = j; }
+            if (dtype_load_as_f32(data, dtype, i * n_classes + j) > mv) {
+                mv = dtype_load_as_f32(data, dtype, i * n_classes + j);
+                best = j;
+            }
         if (best == labels[i]) correct++;
     }
     return 100.0f * (f32)correct / (f32)n_samples;
@@ -209,4 +277,3 @@ void thvm_profile_reset(TinyHVM *ctx) {
 
 void thvm_trace_enable(TinyHVM *ctx, int enabled) { ctx->trace_enabled = (u8)enabled; }
 void thvm_trace_clear(TinyHVM *ctx) { ctx->trace_count = 0; }
-

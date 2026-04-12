@@ -204,21 +204,21 @@
                         case UOP_RESHAPE: UG_DROP(bt, thvm_reshape(ctx,gy,a_shape));
                         case UOP_PERMUTE: {
                             if (term_tag(bt)==TAG_TEN) { u32 pid=(u32)term_val(bt); TensorMeta *mp=&ctx->tensors[pid];
-                                u32 nd=mp->view.numel; f32 pf[MAX_DIM]; META_READ(mp->backend,mp->buf_id,pf,nd*4);
-                                u32 inv[MAX_DIM]; for(u32 j=0;j<nd;j++) inv[(u32)pf[j]]=j;
+                                u32 nd=mp->view.numel; u32 pf[MAX_DIM]; tensor_meta_read_u32(ctx, pid, pf, MAX_DIM);
+                                u32 inv[MAX_DIM]; for(u32 j=0;j<nd;j++) inv[pf[j]]=j;
                                 UG_DROP(bt, thvm_permute(ctx,gy,inv,nd));
 	                            } else GRAD_RETURN(GRAD_ERASE(gy)); }
                         case UOP_EXPAND: UG_DROP(bt, sum_to_shape(ctx,gy,y_shape,a_shape));
                         case UOP_SHRINK: {
                             if (term_tag(bt)==TAG_TEN) { u32 sid=(u32)term_val(bt); TensorMeta *ms=&ctx->tensors[sid];
-                                u32 nd=ms->view.numel/2; f32 sf[MAX_DIM*2]; META_READ(ms->backend,ms->buf_id,sf,nd*2*4);
-                                u32 pp[MAX_DIM*2]; for(u32 j=0;j<nd;j++){pp[j*2]=(u32)sf[j*2];pp[j*2+1]=a_shape.dims[j]-(u32)sf[j*2+1];}
+                                u32 nd=ms->view.numel/2; u32 sf[MAX_DIM*2]; tensor_meta_read_u32(ctx, sid, sf, MAX_DIM*2);
+                                u32 pp[MAX_DIM*2]; for(u32 j=0;j<nd;j++){pp[j*2]=sf[j*2];pp[j*2+1]=a_shape.dims[j]-sf[j*2+1];}
                                 UG_DROP(bt, thvm_pad(ctx,gy,pp,nd));
 	                            } else GRAD_RETURN(GRAD_ERASE(gy)); }
                         case UOP_PAD: {
                             if (term_tag(bt)==TAG_TEN) { u32 pid2=(u32)term_val(bt); TensorMeta *mp2=&ctx->tensors[pid2];
-                                u32 nd=mp2->view.numel/2; f32 pf2[MAX_DIM*2]; META_READ(mp2->backend,mp2->buf_id,pf2,nd*2*4);
-                                u32 sp[MAX_DIM*2]; for(u32 j=0;j<nd;j++){sp[j*2]=(u32)pf2[j*2];sp[j*2+1]=(u32)pf2[j*2]+a_shape.dims[j];}
+                                u32 nd=mp2->view.numel/2; u32 pf2[MAX_DIM*2]; tensor_meta_read_u32(ctx, pid2, pf2, MAX_DIM*2);
+                                u32 sp[MAX_DIM*2]; for(u32 j=0;j<nd;j++){sp[j*2]=pf2[j*2];sp[j*2+1]=pf2[j*2]+a_shape.dims[j];}
                                 UG_DROP(bt, thvm_shrink(ctx,gy,sp,nd));
 	                            } else GRAD_RETURN(GRAD_ERASE(gy)); }
 	                        default: GRAD_RETURN(GRAD_ERASE(gy));
@@ -340,8 +340,8 @@
                                 if (bid) {
                                     TensorMeta *mp = &ctx->tensors[bid];
                                     u32 nd = mp->view.numel;
-                                    f32 pf[MAX_DIM]; META_READ(mp->backend, mp->buf_id, pf, nd*4);
-                                    u32 inv[MAX_DIM]; for(u32 j=0;j<nd;j++) inv[(u32)pf[j]]=j;
+                                    u32 pf[MAX_DIM]; tensor_meta_read_u32(ctx, bid, pf, MAX_DIM);
+                                    u32 inv[MAX_DIM]; for(u32 j=0;j<nd;j++) inv[pf[j]]=j;
                                     WALK(thvm_permute(ctx, gy, inv, nd));
                                 }
 	                                GRAD_RETURN(GRAD_ERASE(gy));
@@ -351,9 +351,9 @@
                                 if (bid) {
                                     TensorMeta *ms = &ctx->tensors[bid];
                                     u32 nd = ms->view.numel/2;
-                                    f32 sf[MAX_DIM*2]; META_READ(ms->backend, ms->buf_id, sf, nd*2*4);
+                                    u32 sf[MAX_DIM*2]; tensor_meta_read_u32(ctx, bid, sf, MAX_DIM*2);
                                     u32 pp[MAX_DIM*2];
-                                    for(u32 j=0;j<nd;j++){pp[j*2]=(u32)sf[j*2];pp[j*2+1]=ctx->tensors[aid].view.shape.dims[j]-(u32)sf[j*2+1];}
+                                    for(u32 j=0;j<nd;j++){pp[j*2]=sf[j*2];pp[j*2+1]=ctx->tensors[aid].view.shape.dims[j]-sf[j*2+1];}
                                     WALK(thvm_pad(ctx, gy, pp, nd));
                                 }
 	                                GRAD_RETURN(GRAD_ERASE(gy));
@@ -362,9 +362,9 @@
                                 if (bid) {
                                     TensorMeta *mp = &ctx->tensors[bid];
                                     u32 nd = mp->view.numel/2;
-                                    f32 pf[MAX_DIM*2]; META_READ(mp->backend, mp->buf_id, pf, nd*2*4);
+                                    u32 pf[MAX_DIM*2]; tensor_meta_read_u32(ctx, bid, pf, MAX_DIM*2);
                                     u32 sp[MAX_DIM*2];
-                                    for(u32 j=0;j<nd;j++){sp[j*2]=(u32)pf[j*2];sp[j*2+1]=(u32)pf[j*2]+ctx->tensors[aid].view.shape.dims[j];}
+                                    for(u32 j=0;j<nd;j++){sp[j*2]=pf[j*2];sp[j*2+1]=pf[j*2]+ctx->tensors[aid].view.shape.dims[j];}
                                     WALK(thvm_shrink(ctx, gy, sp, nd));
                                 }
 	                                GRAD_RETURN(GRAD_ERASE(gy));

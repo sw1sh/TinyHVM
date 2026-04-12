@@ -80,6 +80,7 @@ def main() -> int:
     pre = os.path.join(graph_dir, "thvm_0_pre_reduce.dot")
     post_reduce = os.path.join(graph_dir, "thvm_1_post_reduce.dot")
     post_sched = os.path.join(graph_dir, "thvm_2_post_sched.dot")
+    post_dispatch = os.path.join(graph_dir, "thvm_3_post_dispatch.dot")
 
     missing = [p for p in (pre, post_reduce, post_sched) if not os.path.exists(p)]
     if missing:
@@ -89,6 +90,7 @@ def main() -> int:
 
     g_reduce = parse_dot(post_reduce)
     g_sched = parse_dot(post_sched)
+    g_dispatch = parse_dot(post_dispatch) if os.path.exists(post_dispatch) else DotGraph(path=post_dispatch)
 
     errs: List[str] = []
 
@@ -132,6 +134,12 @@ def main() -> int:
                 f"{os.path.basename(post_sched)}: direct kernel-to-kernel edge {src}->{dst} is forbidden"
             )
 
+    for nid, label in g_dispatch.nodes.items():
+        if "planned" in label:
+            errs.append(
+                f"{os.path.basename(post_dispatch)}: planned tensor leaked into post_dispatch at {nid}"
+            )
+
     if args.expect_kernels is not None and kernel_count != args.expect_kernels:
         errs.append(
             f"{os.path.basename(post_sched)}: found {kernel_count} kernels, "
@@ -162,7 +170,8 @@ def main() -> int:
 
     print(
         f"PASS: {post_sched} kernels={kernel_count} log={log_count} ctr={ctr_count} "
-        f"nodes={len(g_sched.nodes)} < post_reduce={len(g_reduce.nodes)}"
+        f"nodes={len(g_sched.nodes)} < post_reduce={len(g_reduce.nodes)} "
+        f"dispatch_nodes={len(g_dispatch.nodes)}"
     )
     return 0
 

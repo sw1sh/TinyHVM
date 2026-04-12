@@ -57,7 +57,8 @@ static inline int reduce_top_has_add_zero_arg(TinyHVM *ctx, Term t) {
 
 static inline int reduce_top_direct_uop(u32 uop) {
     return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_IFZ ||
-           uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_WHERE ||
+           uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_CAST ||
+           uop == UOP_WHERE ||
            uop == UOP_FUSING;
 }
 
@@ -353,8 +354,8 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             goto enter;
         }
         if (_uop != UOP_ASSIGN && _uop != UOP_GRAD && _uop != UOP_IFZ &&
-            _uop != UOP_LOG_PRINT && _uop != UOP_TODEVICE && _uop != UOP_WHERE &&
-            _uop != UOP_FUSING) {
+            _uop != UOP_LOG_PRINT && _uop != UOP_TODEVICE && _uop != UOP_CAST &&
+            _uop != UOP_WHERE && _uop != UOP_FUSING) {
             whnf = next; goto apply;
         }
         // Non-compute: reduce args then fire interact

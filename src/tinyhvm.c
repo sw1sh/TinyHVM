@@ -63,10 +63,18 @@ extern Backend metal_backend;
 #endif
 
 // ── Forward declarations (needed by interact handlers) ───────────────────────
+Term thvm_tensor_typed(TinyHVM *ctx, const void *data, Shape s, u32 dtype);
+Term thvm_tensor_i32(TinyHVM *ctx, const i32 *data, Shape s);
+Term thvm_tensor_u32(TinyHVM *ctx, const u32 *data, Shape s);
+static u32  tensor_meta_read_u32(TinyHVM *ctx, u32 tid, u32 *out, u32 max_n);
 static u32  tensor_fill(TinyHVM *ctx, Shape s, f32 val);
 static u32  tensor_transpose_2d(TinyHVM *ctx, u32 src_id);
 static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target);
 static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid);
+f32 *thvm_to_host(TinyHVM *ctx, Term t);
+i32 *thvm_to_host_i32(TinyHVM *ctx, Term t);
+u32 *thvm_to_host_u32(TinyHVM *ctx, Term t);
+void *thvm_to_host_raw(TinyHVM *ctx, Term t, u32 *out_dtype, Shape *out_shape);
 
 // Forward declarations for cross-module dependencies
 static u32 reduce_id(TinyHVM *ctx, Term t);

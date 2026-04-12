@@ -44,7 +44,7 @@
                                         _tid = _nvid;
                                     }
                                 }
-                                heap_set(ctx, loc + 1, term_ten(_tid, DTYPE_F32));
+                                heap_set(ctx, loc + 1, term_ten(_tid, ctx->tensors[_tid].dtype));
                                 src_t = heap_read(ctx, loc + 1);
                             }
                         }
@@ -77,16 +77,29 @@
                             md = &ctx->tensors[dst_id];
                             if (ms->buf_id == 0) { fprintf(stderr, "ASSIGN_NULL_BUF: dst=%u src=%u\n", dst_id, src_id); goto assign_done; }
                             if (md->backend->buf_copy && ms->view.contiguous &&
-                                ms->view.numel == md->view.numel) {
+                                ms->view.numel == md->view.numel &&
+                                ms->dtype == md->dtype) {
                                 md->backend->buf_copy(md->buf_id, ms->buf_id,
-                                    (u64)md->view.numel * sizeof(f32));
-                            } else if (md->backend->contiguify) {
+                                    (u64)md->view.numel * dtype_size(md->dtype));
+                            } else if (md->backend->contiguify && ms->dtype == md->dtype) {
                                 md->backend->contiguify(md->buf_id, md->view.numel,
                                                          ms->buf_id, &ms->view);
                             } else {
-                                u64 nbytes = (u64)md->view.numel * sizeof(f32);
-                                f32 *src_host = (f32 *)thvm_to_host(ctx, src_t);
-                                md->backend->buf_write(md->buf_id, src_host, nbytes);
+                                u32 src_dtype = ms->dtype;
+                                void *src_host = thvm_to_host_raw(ctx, src_t, &src_dtype, NULL);
+                                u64 n = md->view.numel;
+                                u64 nbytes = n * dtype_size(md->dtype);
+                                if (!src_host) goto assign_done;
+                                if (src_dtype == md->dtype) {
+                                    md->backend->buf_write(md->buf_id, src_host, nbytes);
+                                } else {
+                                    void *dst_host = malloc((size_t)nbytes);
+                                    for (u32 i = 0; i < n; i++)
+                                        dtype_store_from_f32(dst_host, md->dtype, i,
+                                                             dtype_load_as_f32(src_host, src_dtype, i));
+                                    md->backend->buf_write(md->buf_id, dst_host, nbytes);
+                                    free(dst_host);
+                                }
                             }
                         }
                     assign_done:
@@ -123,17 +136,16 @@
                     u32 src_id = (u32)term_val(src_t);
                     ENSURE(ctx, src_id);
                     TensorMeta *ms = &ctx->tensors[src_id];
-                    u32 dev_id = (u32)term_val(dev_t); ENSURE(ctx, dev_id);
-                    f32 dev_f; ctx->tensors[dev_id].backend->buf_read(
-                        ctx->tensors[dev_id].buf_id, &dev_f, sizeof(f32));
-                    u32 dev_idx = (u32)dev_f;
+                    u32 dev_dtype = DTYPE_U32;
+                    void *dev_raw = thvm_to_host_raw(ctx, dev_t, &dev_dtype, NULL);
+                    u32 dev_idx = dev_raw ? dtype_load_as_u32(dev_raw, dev_dtype, 0) : 0;
                     Backend *dst_be = ctx->backends[dev_idx];
                     if (!dst_be || ms->backend == dst_be) {
                         ctx->itrs++;
                         RETURN_REDUCED(src_t); // no-op: same device or invalid
                     }
                     // Read to host, allocate on target device
-                    f32 *host = (f32 *)thvm_to_host(ctx, src_t);
+                    void *host = thvm_to_host_raw(ctx, src_t, NULL, NULL);
                     u32 new_id = tensor_create(ctx, ms->view.shape, ms->dtype);
                     TensorMeta *mn = &ctx->tensors[new_id];
                     mn->backend->buf_free(mn->buf_id);
@@ -163,16 +175,21 @@
                 TensorMeta *mb_w = &ctx->tensors[b_wid];
                 u32 n = ma_w->view.numel;
                 assert(mc->view.numel == n && mb_w->view.numel == n);
-                // Materialize all three
-                f32 *cp = malloc(n * sizeof(f32)), *ap = malloc(n * sizeof(f32)),
-                    *bp = malloc(n * sizeof(f32)), *rp = malloc(n * sizeof(f32));
-                mc->backend->buf_read(mc->buf_id, cp, n*sizeof(f32));
-                ma_w->backend->buf_read(ma_w->buf_id, ap, n*sizeof(f32));
-                mb_w->backend->buf_read(mb_w->buf_id, bp, n*sizeof(f32));
-                for (u32 i = 0; i < n; i++) rp[i] = (cp[i] != 0.0f) ? ap[i] : bp[i];
-                free(cp); free(ap); free(bp);
+                u32 cond_dtype = mc->dtype, then_dtype = ma_w->dtype, else_dtype = mb_w->dtype;
+                void *cp = thvm_to_host_raw(ctx, cond_t, &cond_dtype, NULL);
+                void *ap = thvm_to_host_raw(ctx, then_t, &then_dtype, NULL);
+                void *bp = thvm_to_host_raw(ctx, else_t, &else_dtype, NULL);
+                if (!cp || !ap || !bp) RETURN_REDUCED(term_era());
                 u32 dst_wid = tensor_create(ctx, ma_w->view.shape, ma_w->dtype);
-                ctx->tensors[dst_wid].backend->buf_write(ctx->tensors[dst_wid].buf_id, rp, n*sizeof(f32));
+                u64 nbytes = (u64)n * dtype_size(ma_w->dtype);
+                void *rp = malloc((size_t)nbytes);
+                for (u32 i = 0; i < n; i++) {
+                    f32 pick = dtype_load_as_f32(cp, cond_dtype, i) != 0.0f
+                             ? dtype_load_as_f32(ap, then_dtype, i)
+                             : dtype_load_as_f32(bp, else_dtype, i);
+                    dtype_store_from_f32(rp, ma_w->dtype, i, pick);
+                }
+                ctx->tensors[dst_wid].backend->buf_write(ctx->tensors[dst_wid].buf_id, rp, nbytes);
                 free(rp);
                 ctx->itrs++;
                 RETURN_REDUCED(term_ten(dst_wid, ma_w->dtype));
@@ -183,15 +200,17 @@
             if (uop == UOP_IFZ) {
                 Term ctr = heap_read(ctx, loc); // WNF from trampoline
                 if (term_tag(ctr) != TAG_TEN) RETURN_REDUCED(term_era());
-                f32 *val = thvm_to_host(ctx, ctr);
+                u32 ctr_dtype = ctx->tensors[(u32)term_val(ctr)].dtype;
+                void *val = thvm_to_host_raw(ctx, ctr, &ctr_dtype, NULL);
+                f32 ctr_val = val ? dtype_load_as_f32(val, ctr_dtype, 0) : 0.0f;
                 ctx->itrs++;
-                if (val[0] <= 0.0f) {
+                if (ctr_val <= 0.0f) {
                     // Base case: return zero_case (slot 1)
                     return heap_read(ctx, loc + 1);
                 } else {
                     // Recursive case: decrement, apply succ_lam
-                    f32 nv = val[0] - 1.0f;
-                    Term dec = thvm_tensor(ctx, &nv, SHAPE(1));
+                    f32 nv = ctr_val - 1.0f;
+                    Term dec = thvm_scalar_typed(ctx, nv, ctr_dtype);
                     Term succ_lam = heap_read(ctx, loc + 2);
                     return thvm_app(ctx, succ_lam, dec);
                 }
@@ -203,10 +222,18 @@
                 ctx->itrs++;
                 if (term_tag(t) == TAG_TEN) {
                     u32 tid = (u32)term_val(t);
-                    f32 *val = thvm_to_host(ctx, t);
+                    u32 dtype = ctx->tensors[tid].dtype;
+                    void *val = thvm_to_host_raw(ctx, t, &dtype, NULL);
                     u32 n = ctx->tensors[tid].view.numel;
-                    if (n == 1) printf("  loss: %.6f\n", val[0]);
-                    else        printf("  tensor[%u]: %.6f ...\n", n, val[0]);
+                    if (n == 1) {
+                        if (dtype == DTYPE_I32)      printf("  loss: %d\n", ((i32 *)val)[0]);
+                        else if (dtype == DTYPE_U32) printf("  loss: %u\n", ((u32 *)val)[0]);
+                        else                         printf("  loss: %.6f\n", dtype_load_as_f32(val, dtype, 0));
+                    } else {
+                        if (dtype == DTYPE_I32)      printf("  tensor[%u]: %d ...\n", n, ((i32 *)val)[0]);
+                        else if (dtype == DTYPE_U32) printf("  tensor[%u]: %u ...\n", n, ((u32 *)val)[0]);
+                        else                         printf("  tensor[%u]: %.6f ...\n", n, dtype_load_as_f32(val, dtype, 0));
+                    }
                     tensor_release(ctx, tid);
                 } else if (term_tag(t) == TAG_NUM) {
                     printf("  loss: %.6f\n", term_as_f32(t));
@@ -227,6 +254,7 @@
 
             // Movement ops: modify View, share buffer
             int is_movement = (uop >= UOP_RESHAPE && uop <= UOP_PAD);
+            int is_cast = (uop == UOP_CAST);
 
             // Args resolved by thvm_reduce's enter/apply loop before firing.
             // Direct reads here — no thvm_reduce recursion.
@@ -235,21 +263,20 @@
 
             int is_binary = (uop >= UOP_ADD && uop <= UOP_SUB) || uop == UOP_MM;
             int is_reduce = (uop == UOP_SUM || uop == UOP_RMAX);
+            int has_aux = is_binary || is_movement || is_reduce || is_cast;
             Term b = term_era();
-            if (is_binary || is_movement) {
+            if (has_aux) {
                 b = heap_read(ctx, loc + 1);
                 heap_set(ctx, loc + 1, b);
             }
-            Term b_arg = (is_binary || is_movement || is_reduce) ? heap_read(ctx, loc + 1) : term_era();
+            Term b_arg = has_aux ? heap_read(ctx, loc + 1) : term_era();
 
             // Strict ERA commutation for lazy UOP nodes:
             // if any aux port is ERA, the UOP disappears and ERA propagates to
             // all remaining aux payloads as explicit future interactions.
-            if (term_tag(a) == TAG_ERA ||
-                ((is_binary || is_movement || is_reduce) && term_tag(b_arg) == TAG_ERA)) {
+            if (term_tag(a) == TAG_ERA || (has_aux && term_tag(b_arg) == TAG_ERA)) {
                 int a_has_era = term_tag(a) == TAG_ERA;
-                int b_has_era = (is_binary || is_movement || is_reduce) &&
-                                term_tag(b_arg) == TAG_ERA;
+                int b_has_era = has_aux && term_tag(b_arg) == TAG_ERA;
                 int a_is_active_era = a_has_era && term_val(a) != 0;
                 int b_is_active_era = b_has_era && term_val(b_arg) != 0;
                 Term era_term = a_has_era ? a : b_arg;
@@ -273,10 +300,10 @@
                     ctx->itrs++;
                     RETURN_REDUCED(other);
                 }
-                if ((is_binary || is_movement || is_reduce) && !(a_has_era && b_has_era))
+                if (has_aux && !(a_has_era && b_has_era))
                     thvm_spawn_detached_era(ctx, other);
                 heap_set(ctx, loc + 0, term_era());
-                if (is_binary || is_movement || is_reduce)
+                if (has_aux)
                     heap_set(ctx, loc + 1, term_era());
                 ctx->itrs++;
                 if (a_has_era && b_has_era) {
@@ -312,7 +339,7 @@
                 Term a0 = heap_read(ctx, sup_loc + 0);
                 Term a1 = heap_read(ctx, sup_loc + 1);
                 Term b0 = b, b1 = b;
-                if (is_binary || is_movement) {
+                if (has_aux) {
                     // DUP the other arg with the SUP's label
                     u64 dup_loc = heap_alloc(ctx, 1);
                     heap_set(ctx, dup_loc, b);
@@ -324,7 +351,7 @@
                     thvm_op_raw(ctx, uop, a0, b0),
                     thvm_op_raw(ctx, uop, a1, b1)));
             }
-            if (term_tag(b) == TAG_SUP && (is_binary || is_movement)) {
+            if (term_tag(b) == TAG_SUP && has_aux) {
                 u32 lab = term_ext(b);
                 u64 sup_loc = term_val(b);
                 Term b0 = heap_read(ctx, sup_loc + 0);
@@ -361,12 +388,47 @@
 
             if (term_tag(a) != TAG_TEN) return t;
             if (is_binary && term_tag(b) != TAG_TEN) return t;
+            if (uop == UOP_CAST && term_tag(b) != TAG_TEN) return t;
 
             // Compute ops: return t (stay TAG_TOP). Scheduler rewrites to UOP_FUSING.
             // Movement ops fire immediately when args are TAG_TEN.
 
             u32 a_id = (u32)term_val(a);
             TensorMeta *ma = &ctx->tensors[a_id];
+
+            if (uop == UOP_CAST) {
+                if (!ctx->dispatch_mode) return t;
+                u32 arg_dtype = DTYPE_U32;
+                void *dtype_raw = thvm_to_host_raw(ctx, b, &arg_dtype, NULL);
+                if (!dtype_raw) RETURN_REDUCED(term_era());
+                u32 dst_dtype = dtype_load_as_u32(dtype_raw, arg_dtype, 0);
+                if (dst_dtype >= DTYPE_COUNT) RETURN_REDUCED(term_era());
+                if (dst_dtype == ma->dtype) {
+                    ctx->itrs++;
+                    RETURN_REDUCED(a);
+                }
+                void *src_raw = thvm_to_host_raw(ctx, a, NULL, NULL);
+                if (!src_raw) RETURN_REDUCED(term_era());
+                u32 n = ma->view.numel;
+                u32 dst_id = tensor_create(ctx, ma->view.shape, dst_dtype);
+                TensorMeta *md = &ctx->tensors[dst_id];
+                size_t bytes = (size_t)n * dtype_size(dst_dtype);
+                void *dst_raw = malloc(bytes);
+                for (u32 i = 0; i < n; i++)
+                    dtype_store_from_f32(dst_raw, dst_dtype, i, dtype_load_as_f32(src_raw, ma->dtype, i));
+                if (md->backend) md->backend->buf_write(md->buf_id, dst_raw, bytes);
+                if (n <= MAX_DIM * 2) {
+                    md->host_ptr = malloc(bytes);
+                    memcpy(md->host_ptr, dst_raw, bytes);
+                }
+                free(dst_raw);
+                md->requires_grad = ma->requires_grad;
+                md->creator_op = UOP_CAST;
+                md->src_ids[0] = a_id;
+                md->src_ids[1] = (u32)term_val(b);
+                ctx->itrs++;
+                RETURN_REDUCED(term_ten(dst_id, dst_dtype));
+            }
 
             if (!is_movement) goto skip_movement;
             {
@@ -381,8 +443,9 @@
                     if (term_tag(sa) == TAG_TEN) {
                         u32 ax_id = (u32)term_val(sa);
                         TensorMeta *axt = &ctx->tensors[ax_id];
-                        f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel * 4);
-                        for (u32 i = 0; i < axt->view.numel; i++) out_shape[(u32)af[i]] = 1;
+                        u32 af[MAX_DIM];
+                        u32 an = tensor_meta_read_u32(ctx, ax_id, af, MAX_DIM);
+                        for (u32 i = 0; i < an; i++) out_shape[af[i]] = 1;
                         if (!b_id) b_id = ax_id;
                     } else { for (int d=(int)out_ndim-1;d>=0;d--) if(out_shape[d]>1){out_shape[d]=1;break;} }
                 } else if (is_binary) {
@@ -398,12 +461,14 @@
                     TensorMeta *bm = &ctx->tensors[bv_id];
                     if (uop==UOP_PERMUTE) {
                         out_ndim = ma->view.shape.rank;
-                        f32 pf[MAX_DIM]; META_READ(bm->backend, bm->buf_id, pf, out_ndim*4);
-                        for (u32 i=0;i<out_ndim;i++) out_shape[i]=ma->view.shape.dims[(u32)pf[i]];
+                        u32 pf[MAX_DIM];
+                        tensor_meta_read_u32(ctx, bv_id, pf, MAX_DIM);
+                        for (u32 i=0;i<out_ndim;i++) out_shape[i]=ma->view.shape.dims[pf[i]];
                     } else {
                         out_ndim = bm->view.numel;
-                        f32 df[MAX_DIM]; META_READ(bm->backend, bm->buf_id, df, out_ndim*4);
-                        for (u32 i=0;i<out_ndim;i++) out_shape[i]=(u32)df[i];
+                        u32 df[MAX_DIM];
+                        tensor_meta_read_u32(ctx, bv_id, df, MAX_DIM);
+                        for (u32 i=0;i<out_ndim;i++) out_shape[i]=df[i];
                     }
                 } else {
                     out_ndim = ma->view.shape.rank;
@@ -437,10 +502,9 @@
                         assert(b_id);
                         TensorMeta *mb = &ctx->tensors[b_id];
                         Shape ns = {.rank = mb->view.numel};
-                        f32 *dims = malloc(ns.rank * sizeof(f32));
-                        META_READ(mb->backend, mb->buf_id, dims, ns.rank * sizeof(f32));
-                        for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
-                        free(dims);
+                        u32 dims[MAX_DIM];
+                        tensor_meta_read_u32(ctx, b_id, dims, MAX_DIM);
+                        for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = dims[i];
                         // Pool stride view: numel mismatch (overlapping windows).
                         // Return self unchanged — fuser handles via st_get.
                         { u32 nn = 1; for (u32 i = 0; i < ns.rank; i++) nn *= ns.dims[i];
@@ -477,15 +541,16 @@
                                                          ma->buf_id, &ma->view);
                             } else {
                                 // CPU path: strided gather
-                                f32 *src = malloc(numel * sizeof(f32));
+                                u32 elem_bytes = dtype_size(ma->dtype);
+                                u8 *src = malloc((size_t)numel * elem_bytes);
                                 u32 buf_bytes = (ma->view.offset > 0) ? (u32)ma->view.offset : 0;
                                 for (u32 d = 0; d < ma->view.shape.rank; d++)
                                     if (ma->view.strides[d] > 0)
                                         buf_bytes += (ma->view.shape.dims[d]-1) * (u32)ma->view.strides[d];
                                 buf_bytes += 1;
                                 if (buf_bytes == 0) buf_bytes = 1;
-                                f32 *raw = malloc(buf_bytes * sizeof(f32));
-                                ma->backend->buf_read(ma->buf_id, raw, buf_bytes * sizeof(f32));
+                                u8 *raw = malloc((size_t)buf_bytes * elem_bytes);
+                                ma->backend->buf_read(ma->buf_id, raw, (u64)buf_bytes * elem_bytes);
                                 for (u32 flat = 0; flat < numel; flat++) {
                                     u32 rem = flat; i32 idx = ma->view.offset;
                                     int msk = 0;
@@ -495,10 +560,16 @@
                                         if (ma->view.has_mask && (coord < ma->view.mask_begin[d] || coord >= ma->view.mask_end[d])) msk = 1;
                                         idx += (i32)coord * (ma->view.strides[d] > 0 ? ma->view.strides[d] : 0);
                                     }
-                                    src[flat] = (msk || idx < 0 || (u32)idx >= buf_bytes) ? 0.f : raw[(u32)idx];
+                                    u8 *dstp = src + (size_t)flat * elem_bytes;
+                                    if (msk || idx < 0 || (u32)idx >= buf_bytes) {
+                                        memset(dstp, 0, elem_bytes);
+                                    } else {
+                                        memcpy(dstp, raw + (size_t)(u32)idx * elem_bytes, elem_bytes);
+                                    }
                                 }
                                 free(raw);
-                                ctx->tensors[mat_id].backend->buf_write(ctx->tensors[mat_id].buf_id, src, numel * sizeof(f32));
+                                ctx->tensors[mat_id].backend->buf_write(ctx->tensors[mat_id].buf_id, src,
+                                                                        (u64)numel * elem_bytes);
                                 free(src);
                             }
 
@@ -521,10 +592,9 @@
                         assert(b_id);
                         TensorMeta *mb = &ctx->tensors[b_id];
                         Shape ns = {.rank = mb->view.numel};
-                        f32 *dims = malloc(ns.rank * sizeof(f32));
-                        META_READ(mb->backend, mb->buf_id, dims, ns.rank * sizeof(f32));
-                        for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = (u32)dims[i];
-                        free(dims);
+                        u32 dims[MAX_DIM];
+                        tensor_meta_read_u32(ctx, b_id, dims, MAX_DIM);
+                        for (u32 i = 0; i < ns.rank; i++) ns.dims[i] = dims[i];
                         // Guard: GRAD backward may create rank-mismatched expands
                         if (ns.rank != ma->view.shape.rank) return t;
                         new_view = view_expand(ma->view, ns);
@@ -534,11 +604,8 @@
                         assert(b_id);
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 rank = mb->view.numel;
-                        f32 *axes_f = malloc(rank * sizeof(f32));
-                        META_READ(mb->backend, mb->buf_id, axes_f, rank * sizeof(f32));
                         u32 axes[MAX_DIM];
-                        for (u32 i = 0; i < rank; i++) axes[i] = (u32)axes_f[i];
-                        free(axes_f);
+                        tensor_meta_read_u32(ctx, b_id, axes, MAX_DIM);
                         new_view = view_permute(ma->view, axes);
                         break;
                     }
@@ -547,19 +614,13 @@
                         assert(b_id);
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 n_pairs = mb->view.numel;
-                        f32 *pairs;
-                        if (mb->host_ptr && n_pairs <= MAX_DIM * 2) {
-                            pairs = (f32*)mb->host_ptr; // CPU-cached, no GPU flush
-                        } else {
-                            pairs = malloc(n_pairs * sizeof(f32));
-                            mb->backend->buf_read(mb->buf_id, pairs, n_pairs * sizeof(f32));
-                        }
+                        u32 pairs[MAX_DIM * 2];
+                        tensor_meta_read_u32(ctx, b_id, pairs, MAX_DIM * 2);
                         u32 starts[MAX_DIM], ends[MAX_DIM];
                         for (u32 i = 0; i < n_pairs / 2; i++) {
-                            starts[i] = (u32)pairs[i * 2];
-                            ends[i]   = (u32)pairs[i * 2 + 1];
+                            starts[i] = pairs[i * 2];
+                            ends[i]   = pairs[i * 2 + 1];
                         }
-                        if (pairs != (f32*)mb->host_ptr) free(pairs);
                         new_view = view_shrink(ma->view, starts, ends);
                         break;
                     }
@@ -569,14 +630,13 @@
                         assert(b_id);
                         TensorMeta *mb = &ctx->tensors[b_id];
                         u32 n_pairs = mb->view.numel;
-                        f32 *pairs = malloc(n_pairs * sizeof(f32));
-                        META_READ(mb->backend, mb->buf_id, pairs, n_pairs * sizeof(f32));
+                        u32 pairs[MAX_DIM * 2];
+                        tensor_meta_read_u32(ctx, b_id, pairs, MAX_DIM * 2);
                         u32 pad_before[MAX_DIM], pad_after[MAX_DIM];
                         for (u32 i = 0; i < n_pairs / 2; i++) {
-                            pad_before[i] = (u32)pairs[i * 2];
-                            pad_after[i]  = (u32)pairs[i * 2 + 1];
+                            pad_before[i] = pairs[i * 2];
+                            pad_after[i]  = pairs[i * 2 + 1];
                         }
-                        free(pairs);
                         new_view = view_pad(ma->view, pad_before, pad_after);
                         break;
                     }

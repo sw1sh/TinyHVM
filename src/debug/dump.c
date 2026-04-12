@@ -11,6 +11,7 @@ static Term heap_dot_hl_term = 0;
 static int heap_dot_hl_hit = 0;
 static char heap_dot_prev_name[96] = {0};
 static char heap_dot_next_name[96] = {0};
+static int heap_dot_include_sched_kernels = 0;
 static void thvm_heap_dot_set_highlight(u64 slot, Term term) {
     heap_dot_hl_on = (slot != 0);
     heap_dot_hl_slot = slot;
@@ -21,6 +22,9 @@ static int thvm_heap_dot_highlight_was_drawn(void) { return heap_dot_hl_hit; }
 static void thvm_heap_dot_set_step_meta(const char *prev_name, const char *next_name) {
     snprintf(heap_dot_prev_name, sizeof(heap_dot_prev_name), "%s", prev_name ? prev_name : "");
     snprintf(heap_dot_next_name, sizeof(heap_dot_next_name), "%s", next_name ? next_name : "");
+}
+static void thvm_heap_dot_set_sched_kernels(int enabled) {
+    heap_dot_include_sched_kernels = enabled ? 1 : 0;
 }
 
 static int dot_shape_is_valid(Shape s) {
@@ -43,6 +47,27 @@ static u32 dot_tensor_planned_slot(TinyHVM *ctx, u32 tid) {
             return ke->output_slot;
     }
     return 0;
+}
+
+static const char *dot_backend_short(TinyHVM *ctx, Backend *backend) {
+    if (!backend && ctx) backend = ctx_default_backend(ctx);
+    if (!backend) return "?";
+    if (ctx && ctx->backends[THVM_DEV_CPU] == backend) return "cpu";
+    if (ctx && ctx->backends[THVM_DEV_METAL] == backend) return "mtl";
+    return "dev";
+}
+
+static const char *dot_kernel_backend(TinyHVM *ctx, const KernelEntry *ke) {
+    if (!ke) return "?";
+    if (ke->output_tid && ke->output_tid < ctx->tensor_count) {
+        Backend *bk = ctx->tensors[ke->output_tid].backend;
+        if (bk) return dot_backend_short(ctx, bk);
+    }
+    if (ke->raw_output_tid && ke->raw_output_tid < ctx->tensor_count) {
+        Backend *bk = ctx->tensors[ke->raw_output_tid].backend;
+        if (bk) return dot_backend_short(ctx, bk);
+    }
+    return dot_backend_short(ctx, ctx_default_backend(ctx));
 }
 
 static int dot_shape_broadcast(Shape a, Shape b, Shape *out) {
@@ -157,16 +182,11 @@ static int dot_meta_shape_from_tensor(TinyHVM *ctx, Term tmeta, Shape *out) {
     TensorMeta *m = &ctx->tensors[tid];
     u32 n = m->view.numel;
     if (n == 0 || n > MAX_DIM) return 0;
-    f32 tmp[MAX_DIM];
-    const f32 *pf = (const f32 *)m->host_ptr;
-    if (!pf && m->backend) {
-        META_READ(m->backend, m->buf_id, tmp, n * sizeof(f32));
-        pf = tmp;
-    }
-    if (!pf) return 0;
+    u32 dims[MAX_DIM];
+    if (!tensor_meta_read_u32(ctx, tid, dims, MAX_DIM)) return 0;
     Shape s = {.rank = n};
     for (u32 i = 0; i < n; i++) {
-        s.dims[i] = (u32)pf[i];
+        s.dims[i] = dims[i];
         if (s.dims[i] == 0) return 0;
     }
     *out = s;
@@ -194,15 +214,10 @@ static int dot_infer_top_shape(TinyHVM *ctx, u32 uop, u64 loc, Shape *out) {
                 TensorMeta *m = &ctx->tensors[tid];
                 u32 n = m->view.numel;
                 if (n <= MAX_DIM) {
-                    f32 tmp[MAX_DIM];
-                    const f32 *pf = (const f32 *)m->host_ptr;
-                    if (!pf && m->backend) {
-                        META_READ(m->backend, m->buf_id, tmp, n * sizeof(f32));
-                        pf = tmp;
-                    }
-                    if (pf) {
+                    u32 axes[MAX_DIM];
+                    if (tensor_meta_read_u32(ctx, tid, axes, MAX_DIM)) {
                         for (u32 i = 0; i < n; i++) {
-                            int ax = (int)pf[i];
+                            int ax = (int)axes[i];
                             if (ax >= 0 && ax < (int)out->rank) out->dims[ax] = 1;
                         }
                     }
@@ -375,7 +390,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             char _sh[64]=""; int _p=0; \
             for (u32 _d=0;_d<_m->view.shape.rank;_d++) \
                 _p+=snprintf(_sh+_p,sizeof(_sh)-_p,"%s%u",_d?",":"",_m->view.shape.dims[_d]); \
-            const char *_dt=_m->dtype==0?"f32":_m->dtype==1?"i32":"?"; \
+            const char *_dt=dtype_name(_m->dtype); \
             const char *_bk=_m->backend?((_m->backend==ctx->backends[0])?"cpu":"mtl"):"?"; \
             u32 _pslot = dot_tensor_planned_slot(ctx, (tid)); \
             int _planned = (_m->creator_op == UOP_FUSING && _m->buf_id == 0 && _pslot != 0); \
@@ -446,7 +461,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 PUSH_TERM(ht);
             if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN)
                 PUSH_TERM(ht);
-            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_FUSING)
+            if (heap_dot_include_sched_kernels &&
+                term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_FUSING)
                 PUSH_TERM(ht);
         }
 
@@ -628,6 +644,14 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         } \
     } while(0)
 
+    if (term_tag(root) == TAG_TEN) {
+        EMIT_TEN((u32)term_val(root));
+    } else if (term_tag(root) == TAG_NUM) {
+        f32 _fv; u32 _bv = (u32)term_val(root); memcpy(&_fv, &_bv, 4);
+        fprintf(f, "  num_root [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n",
+                (double)_fv);
+    }
+
     // Flat walk: every heap position
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term t = ctx->heap[h];
@@ -702,7 +726,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     snprintf(ops_s, sizeof(ops_s), "%s",
                              (ou < UOP_COUNT) ? uop_names[ou] : "FUSING");
                 }
-                snprintf(label,sizeof(label),"K%u: %s\\n[%s]",kid,ops_s,sh);
+                snprintf(label,sizeof(label),"K%u: %s\\n[%s]\\n%s",
+                         kid, ops_s, sh, dot_kernel_backend(ctx, ke));
                 color = "#ccffcc";
             } else if (ext == UOP_GRAD) {
                 // GRAD bead: y (input below), gy (output above).
@@ -1093,7 +1118,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     snprintf(ops_s, sizeof(ops_s), "%s", \
                              (ou2 < UOP_COUNT) ? uop_names[ou2] : "FUSING"); \
                 } \
-                snprintf(label, sizeof(label), "K%u: %s\\n[%s]", kid2, ops_s, sh); \
+                snprintf(label, sizeof(label), "K%u: %s\\n[%s]\\n%s", \
+                         kid2, ops_s, sh, dot_kernel_backend(ctx, ke2)); \
                 color = "#ccffcc"; \
             } else if ((_ext) == UOP_GRAD) { \
                 Term gx = thvm_grad_target_get(ctx, (_loc)); \
@@ -1179,7 +1205,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     } while(0)
 
     // FUSING leaf edges (for post-schedule graphs)
-    {
+    if (heap_dot_include_sched_kernels) {
         extern KernelEntry sched_kernels[];
         extern u32 sched_kernel_count;
         u8 output_used[SCHED_MAX_KERNELS];

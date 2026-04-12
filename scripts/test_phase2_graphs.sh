@@ -27,6 +27,31 @@ run_case() {
   fi
 }
 
+run_metal_case() {
+  local log="$1"
+  shift
+  if "$@" >"$log" 2>&1; then
+    return 0
+  fi
+  if grep -Eq "SKIP: metal unavailable|FATAL: Metal newBuffer\\(" "$log"; then
+    return 0
+  fi
+  cat "$log"
+  return 1
+}
+
+assert_or_skip_metal() {
+  local log="$1"
+  shift
+  if grep -Eq "SKIP: metal unavailable|FATAL: Metal newBuffer\\(" "$log"; then
+    echo "SKIP: metal numeric smoke unavailable in this environment"
+    return 0
+  fi
+  for pattern in "$@"; do
+    grep -F "$pattern" "$log" >/dev/null
+  done
+}
+
 SP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/thvm_phase2_sp.XXXXXX")"
 LB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/thvm_phase2_lb.XXXXXX")"
 SPK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/thvm_phase2_spk.XXXXXX")"
@@ -40,7 +65,11 @@ SP_OUT="$(mktemp "${TMPDIR:-/tmp}/thvm_phase2_sp.out.XXXXXX")"
 LB_OUT="$(mktemp "${TMPDIR:-/tmp}/thvm_phase2_lb.out.XXXXXX")"
 SPK_OUT="$(mktemp "${TMPDIR:-/tmp}/thvm_phase2_spk.out.XXXXXX")"
 LBK_OUT="$(mktemp "${TMPDIR:-/tmp}/thvm_phase2_lbk.out.XXXXXX")"
-trap 'rm -rf "$SP_DIR" "$LB_DIR" "$SPK_DIR" "$LBK_DIR" "$BUILD_LOG" "$PARITY_SP_LOG" "$PARITY_LB_LOG" "$PARITY_SPK_LOG" "$PARITY_LBK_LOG" "$SP_OUT" "$LB_OUT" "$SPK_OUT" "$LBK_OUT"' EXIT
+SPK_CPU_OUT="$(mktemp "${TMPDIR:-/tmp}/thvm_phase2_spk_cpu.out.XXXXXX")"
+SPK_MTL_OUT="$(mktemp "${TMPDIR:-/tmp}/thvm_phase2_spk_mtl.out.XXXXXX")"
+LBK_CPU_OUT="$(mktemp "${TMPDIR:-/tmp}/thvm_phase2_lbk_cpu.out.XXXXXX")"
+LBK_MTL_OUT="$(mktemp "${TMPDIR:-/tmp}/thvm_phase2_lbk_mtl.out.XXXXXX")"
+trap 'rm -rf "$SP_DIR" "$LB_DIR" "$SPK_DIR" "$LBK_DIR" "$BUILD_LOG" "$PARITY_SP_LOG" "$PARITY_LB_LOG" "$PARITY_SPK_LOG" "$PARITY_LBK_LOG" "$SP_OUT" "$LB_OUT" "$SPK_OUT" "$LBK_OUT" "$SPK_CPU_OUT" "$SPK_MTL_OUT" "$LBK_CPU_OUT" "$LBK_MTL_OUT"' EXIT
 
 build_bin bin/test_tiny_single_param      test/test_tiny_single_param.m      "$BUILD_LOG"
 build_bin bin/test_tiny_linear_bias       test/test_tiny_linear_bias.m       "$BUILD_LOG"
@@ -51,6 +80,10 @@ run_case "$SP_OUT"  env THVM_GRAPH=1 THVM_GRAPH_DIR="$SP_DIR"  ./bin/test_tiny_s
 run_case "$LB_OUT"  env THVM_GRAPH=1 THVM_GRAPH_DIR="$LB_DIR"  ./bin/test_tiny_linear_bias
 run_case "$SPK_OUT" env THVM_GRAPH=1 THVM_GRAPH_DIR="$SPK_DIR" ./bin/test_tiny_single_param_keep
 run_case "$LBK_OUT" env THVM_GRAPH=1 THVM_GRAPH_DIR="$LBK_DIR" ./bin/test_tiny_linear_bias_keep
+run_case "$SPK_CPU_OUT" ./bin/test_tiny_single_param_keep cpu
+run_metal_case "$SPK_MTL_OUT" ./bin/test_tiny_single_param_keep metal
+run_case "$LBK_CPU_OUT" ./bin/test_tiny_linear_bias_keep cpu
+run_metal_case "$LBK_MTL_OUT" ./bin/test_tiny_linear_bias_keep metal
 
 if ! ./scripts/test_phase1_reduce_parity.sh bin/test_tiny_single_param_keep test/test_tiny_single_param_keep.m >"$PARITY_SPK_LOG" 2>&1; then
   cat "$PARITY_SPK_LOG"
@@ -67,9 +100,16 @@ python3 scripts/check_phase2_graphs.py "$SPK_DIR" --expect-log 0 --expect-kernel
 python3 scripts/check_phase2_graphs.py "$LBK_DIR" --allow-ctr --expect-ctr 1 --expect-log 0 --expect-kernels 5
 
 grep -F "grad_w = [5.00, 7.00, 9.00]" "$SPK_OUT" >/dev/null
-grep -F "grad_w = [5.00, 0.00, 5.00, 0.00, 7.00, 0.00, 7.00, 0.00, 9.00, 0.00, 9.00, 0.00]" "$LBK_OUT" >/dev/null
-grep -F "grad_b = [2.00, 0.00, 2.00, 0.00]" "$LBK_OUT" >/dev/null
+grep -F "grad_w = [5.00, 0.00, 0.00, 0.00, 7.00, 0.00, 0.00, 0.00, 9.00, 0.00, 0.00, 0.00]" "$LBK_OUT" >/dev/null
+grep -F "grad_b = [2.00, 0.00, 0.00, 0.00]" "$LBK_OUT" >/dev/null
+grep -F "grad_w = [5.00, 7.00, 9.00]" "$SPK_CPU_OUT" >/dev/null
+grep -F "grad_w = [5.00, 0.00, 0.00, 0.00, 7.00, 0.00, 0.00, 0.00, 9.00, 0.00, 0.00, 0.00]" "$LBK_CPU_OUT" >/dev/null
+grep -F "grad_b = [2.00, 0.00, 0.00, 0.00]" "$LBK_CPU_OUT" >/dev/null
+assert_or_skip_metal "$SPK_MTL_OUT" "grad_w = [5.00, 7.00, 9.00]"
+assert_or_skip_metal "$LBK_MTL_OUT" \
+  "grad_w = [5.00, 0.00, 0.00, 0.00, 7.00, 0.00, 0.00, 0.00, 9.00, 0.00, 0.00, 0.00]" \
+  "grad_b = [2.00, 0.00, 0.00, 0.00]"
 
 grep -F "PASS:" "$PARITY_SPK_LOG"
 grep -F "PASS:" "$PARITY_LBK_LOG"
-echo "PASS: phase-2 plain and keep graph checks"
+echo "PASS: phase-2 plain and keep graph checks + cpu/metal numeric smokes"

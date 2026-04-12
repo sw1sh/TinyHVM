@@ -33,12 +33,12 @@ static ShapeTracker st_permute(ShapeTracker st, const u32 *axes, u32 rank) {
 }
 
 // Compose expand onto last view (always merges — sets stride=0 for broadcast dims).
-static ShapeTracker st_expand(ShapeTracker st, const f32 *dims, u32 rank) {
+static ShapeTracker st_expand(ShapeTracker st, const u32 *dims, u32 rank) {
     if (st.n_views == 0) return st;
     View *v = &st.views[st.n_views - 1];
     View nv = *v; nv.shape.rank = rank; nv.numel = 1;
     for (u32 i = 0; i < rank; i++) {
-        u32 nd = (u32)dims[i];
+        u32 nd = dims[i];
         if (i < v->shape.rank && v->shape.dims[i] == 1 && nd > 1) nv.strides[i] = 0;
         nv.shape.dims[i] = nd; nv.numel *= nd;
     }

@@ -36,6 +36,43 @@ static void grad_targets_reset(GradTargetSet *s) {
         s->slots[i] = term_era();
 }
 
+static u32 thvm_grad_seed_dtype_hint(TinyHVM *ctx, Term t) {
+    for (u32 depth = 0; depth < 32; depth++) {
+        while (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1)
+            t = heap_read(ctx, term_val(t));
+
+        if (term_tag(t) == TAG_TEN) {
+            u32 tid = (u32)term_val(t);
+            return (tid < ctx->tensor_count) ? ctx->tensors[tid].dtype : DTYPE_F32;
+        }
+        if (term_tag(t) == TAG_NUM) return DTYPE_F32;
+        if (term_tag(t) != TAG_TOP) break;
+
+        u64 loc = term_val(t);
+        if (loc >= ctx->heap_pos) break;
+
+        switch (term_ext(t)) {
+            case UOP_WHERE:
+            case UOP_IFZ:
+                t = heap_read(ctx, loc + 1);
+                continue;
+            default:
+                t = heap_read(ctx, loc + 0);
+                continue;
+        }
+    }
+    return DTYPE_F32;
+}
+
+static Term thvm_grad_seed_like(TinyHVM *ctx, Term loss) {
+    u32 dtype = thvm_grad_seed_dtype_hint(ctx, loss);
+    // Backward seeds should be scalar tensors, not TAG_NUM literals. Keep the
+    // seed at the loss float dtype when we know it; integer losses still fall
+    // back to f32 until compute kernels become genuinely typed.
+    if (dtype != DTYPE_F32 && dtype != DTYPE_F16) dtype = DTYPE_F32;
+    return thvm_scalar_typed(ctx, 1.0f, dtype);
+}
+
 static GradTargetSet *grad_targets_get(TinyHVM *ctx, int create) {
     for (u32 i = 0; i < GRAD_TARGET_CTX_MAX; i++) {
         if (grad_target_sets[i].ctx == ctx) return &grad_target_sets[i];
@@ -197,7 +234,7 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
     // Single-target mode: no global target table.
     thvm_grad_targets_clear(ctx);
     term_use_clear();
-    Term seed = term_num_f32(1.0f);
+    Term seed = thvm_grad_seed_like(ctx, y);
     u64 loc = heap_alloc(ctx, 2);
     y = linear_use(ctx, y, loc);
     heap_set(ctx, loc, y);
@@ -212,7 +249,7 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
 Term thvm_grad_multi(TinyHVM *ctx, Term loss, Term *params, Term *grad_slots, u32 n_params) {
     thvm_grad_targets_set(ctx, params, grad_slots, n_params);
     term_use_clear();
-    Term seed = term_num_f32(1.0f);
+    Term seed = thvm_grad_seed_like(ctx, loss);
     u64 loc = heap_alloc(ctx, 2);
     loss = linear_use(ctx, loss, loc);
     heap_set(ctx, loc, loss);
@@ -227,7 +264,7 @@ Term thvm_grad_keep(TinyHVM *ctx, Term y, Term x) {
 
 Term thvm_grad_multi_keep(TinyHVM *ctx, Term loss, Term *params, u32 n_params) {
     term_use_clear();
-    Term seed = term_num_f32(1.0f);
+    Term seed = thvm_grad_seed_like(ctx, loss);
     u64 grad_loc = heap_alloc(ctx, 2);
     loss = linear_use(ctx, loss, grad_loc);
     heap_set(ctx, grad_loc + 0, loss);

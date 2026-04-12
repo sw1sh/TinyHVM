@@ -1,6 +1,7 @@
 // Forward declarations (defined in debug/dump.c, included after this file)
 static void thvm_heap_dot(TinyHVM *ctx, const char *path);
 static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
+static void thvm_heap_dot_set_sched_kernels(int enabled);
 static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root);
 static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term root);
 static void thvm_step_graph_finalize(TinyHVM *ctx);
@@ -716,7 +717,7 @@ static Term sched_unwrap_views(TinyHVM *ctx, Term t) {
 }
 
 static int sched_is_kernelizable_uop(u32 uop) {
-    return is_elementwise(uop) || uop == UOP_SUM || uop == UOP_RMAX;
+    return is_elementwise(uop) || uop == UOP_CAST || uop == UOP_SUM || uop == UOP_RMAX;
 }
 
 static int sched_is_kernelizable_term(Term t) {
@@ -733,6 +734,38 @@ static const ShapeTracker *sched_term_tracker(TinyHVM *ctx, Term t) {
     if (term_tag(t) == TAG_TOP) return st_get_tracker(term_val(t));
     if (term_tag(t) == TAG_TEN) return tensor_st_get(&ctx->tensors[(u32)term_val(t)]);
     return NULL;
+}
+
+static u32 sched_term_dtype(TinyHVM *ctx, Term t) {
+    switch (term_tag(t)) {
+        case TAG_TEN:
+            return ctx->tensors[(u32)term_val(t)].dtype;
+        case TAG_NUM:
+            return term_ext(t) == NUM_U32 ? DTYPE_U32 : DTYPE_F32;
+        case TAG_TOP: {
+            u32 uop = term_ext(t);
+            u64 loc = term_val(t);
+            if (uop == UOP_CAST) {
+                Term b = heap_read(ctx, loc + 1);
+                if (term_tag(b) == TAG_TEN) {
+                    u32 bid = (u32)term_val(b);
+                    if (bid < ctx->tensor_count) {
+                        u32 raw[MAX_DIM];
+                        if (tensor_meta_read_u32(ctx, bid, raw, MAX_DIM) == 1 && raw[0] < DTYPE_COUNT)
+                            return raw[0];
+                    }
+                }
+            }
+            if (is_view_op(uop) || sched_is_kernelizable_uop(uop) || uop == UOP_CAST) {
+                Term a = heap_read(ctx, loc + 0);
+                u32 dt = sched_term_dtype(ctx, a);
+                if (dt < DTYPE_COUNT) return dt;
+            }
+            return DTYPE_F32;
+        }
+        default:
+            return DTYPE_F32;
+    }
 }
 
 typedef enum {
@@ -907,7 +940,7 @@ static void sched_prepare_boundary_output(TinyHVM *ctx, SchedBoundary *b) {
     if (!raw_v) raw_v = sched_term_view(ctx, b->root_term);
     if (!raw_v) return;
 
-    u32 raw_tid = tensor_create_unbacked(ctx, raw_v->shape, DTYPE_F32);
+    u32 raw_tid = tensor_create_unbacked(ctx, raw_v->shape, sched_term_dtype(ctx, b->compute_term));
     TensorMeta *raw_m = &ctx->tensors[raw_tid];
     raw_m->creator_op = UOP_FUSING;
     raw_m->fusing_loc = term_val(b->compute_term);
@@ -1101,7 +1134,7 @@ static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
         }
         if (ke->leaf_kinds[i] == KERNEL_LEAF_NUM) {
             f32 val = ke->leaf_nums[i];
-            Term scalar = thvm_tensor(ctx, &val, (Shape){.dims={1}, .rank=1});
+            Term scalar = thvm_scalar_typed(ctx, val, ke->leaf_dtypes[i]);
             u32 lid = (u32)term_val(scalar);
             bufs[i] = ctx->tensors[lid].buf_id;
             views[i] = &ke->leaf_views[i];
@@ -1122,7 +1155,7 @@ static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
         has_multiview ? st_ptrs : NULL, ke->n_leaves,
         ke->ops, ke->n_ops, &ke->full_shape,
         ke->has_reduce ? &ke->reduce : NULL,
-        NULL, NULL, 0);
+        NULL, NULL, 0, ke->leaf_dtypes, md->dtype);
     ctx->itrs++;
     md->creator_op = UOP_FUSING;
     md->fusing_loc = sched_kernel_locs[kid];
@@ -1134,7 +1167,7 @@ static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
         out_m->fusing_loc = sched_kernel_locs[kid];
     }
 
-    Term result = term_ten(ke->output_tid ? ke->output_tid : raw_tid, DTYPE_F32);
+    Term result = term_ten(ke->output_tid ? ke->output_tid : raw_tid, ctx->tensors[ke->output_tid ? ke->output_tid : raw_tid].dtype);
     kid_results[kid] = result;
 
     for (u32 di = 0; di < ke->n_deps; di++) {
@@ -1233,6 +1266,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         t = thvm_phase1_seed_root_grad(ctx, t);
         char path[512];
         thvm_graph_dump_path(path, sizeof(path), "thvm_0_pre_reduce.dot");
+        thvm_heap_dot_set_sched_kernels(0);
         thvm_heap_dot_root(ctx, path, t);
         if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
             heap_set(ctx, phase1_root_slot, term_era());
@@ -1242,6 +1276,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         t = thvm_phase1_seed_root_grad(ctx, t);
         char path[512];
         thvm_graph_dump_path(path, sizeof(path), "thvm_1_post_reduce.dot");
+        thvm_heap_dot_set_sched_kernels(0);
         thvm_heap_dot_root(ctx, path, t);
         if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
             heap_set(ctx, phase1_root_slot, term_era());
@@ -1257,6 +1292,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         t = thvm_phase1_seed_root_grad(ctx, t);
         char path[512];
         thvm_graph_dump_path(path, sizeof(path), "thvm_2_post_sched.dot");
+        thvm_heap_dot_set_sched_kernels(1);
         thvm_heap_dot_root(ctx, path, t);
         if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
             heap_set(ctx, phase1_root_slot, term_era());
@@ -1267,6 +1303,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         t = thvm_phase1_seed_root_grad(ctx, t);
         char path[512];
         thvm_graph_dump_path(path, sizeof(path), "thvm_3_post_dispatch.dot");
+        thvm_heap_dot_set_sched_kernels(0);
         thvm_heap_dot_root(ctx, path, t);
         if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
             heap_set(ctx, phase1_root_slot, term_era());

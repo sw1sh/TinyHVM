@@ -2,7 +2,7 @@
 // Same interface as Metal's dispatch_kernel_rs: evaluates FusedOp DAG
 // over leaf views with optional reduction.
 
-static inline f32 eval_uop(u32 uop, f32 a, f32 b) {
+static inline f32 eval_uop(u32 uop, u32 aux, f32 a, f32 b) {
     switch (uop) {
         case UOP_ADD:  return a + b;
         case UOP_MUL:  return a * b;
@@ -15,6 +15,7 @@ static inline f32 eval_uop(u32 uop, f32 a, f32 b) {
         case UOP_EXP:  return __builtin_expf(a);
         case UOP_LOG:  return __builtin_logf(a);
         case UOP_SQRT: return __builtin_sqrtf(a);
+        case UOP_CAST: return dtype_cast_from_f32(a, aux);
         default:       return a;
     }
 }
@@ -22,7 +23,7 @@ static inline f32 eval_uop(u32 uop, f32 a, f32 b) {
 // Read a single element via multi-view ShapeTracker.
 // Handles rank-changing reshapes: computes flat index through outer shape,
 // then decomposes through inner shape to apply inner strides.
-static inline f32 leaf_read_st(const f32 *buf, const ShapeTracker *st,
+static inline f32 leaf_read_st(const void *buf, u32 dtype, const ShapeTracker *st,
                                 const u32 *coords, u32 rank,
                                 const Shape *full_shape) {
     if (!st || st->n_views <= 1) return 0.f;
@@ -80,12 +81,12 @@ static inline f32 leaf_read_st(const f32 *buf, const ShapeTracker *st,
         if (idx < 0) return 0.f;
         si = (u32)idx;
     }
-    return buf[si];
+    return dtype_load_as_f32(buf, dtype, si);
 }
 
 // Read a single element from a leaf buffer using its view.
 // coords[] are in the full_shape coordinate space.
-static inline f32 leaf_read(const f32 *buf, const View *v,
+static inline f32 leaf_read(const void *buf, u32 dtype, const View *v,
                             const u32 *coords, u32 rank) {
     // Mask check: if coordinate is outside valid range, return 0
     if (v->has_mask) {
@@ -112,14 +113,15 @@ static inline f32 leaf_read(const f32 *buf, const View *v,
         idx += (i32)c * v->strides[d];
     }
     if (idx < 0) return 0.f;
-    return buf[(u32)idx];
+    return dtype_load_as_f32(buf, dtype, (u32)idx);
 }
 
 void cpu_dispatch_kernel_rs(
     u32 out_buf, u32 *leaf_bufs, const View **leaf_views,
     const ShapeTracker *const *leaf_sts, u32 n_leaves,
     FusedOp *ops, u32 n_ops, const Shape *full_shape, const ReduceSpec *reduce,
-    u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs)
+    u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs,
+    const u32 *leaf_dtypes, u32 out_dtype)
 {
     (void)side_bufs; (void)side_op_indices; (void)n_side_outputs;
     u32 rank = full_shape->rank;
@@ -136,16 +138,16 @@ void cpu_dispatch_kernel_rs(
     }
 
     // Read all leaf buffers into CPU pointers
-    f32 *leaf_ptrs[FUSE_MAX_LEAVES];
+    const void *leaf_ptrs[FUSE_MAX_LEAVES];
     for (u32 i = 0; i < n_leaves; i++)
         leaf_ptrs[i] = cpu_pool.bufs[leaf_bufs[i]];
 
     // Allocate output
-    f32 *out = cpu_pool.bufs[out_buf];
+    void *out = cpu_pool.bufs[out_buf];
     // Initialize output (reduce needs accumulator init)
     if (has_reduce) {
         f32 init = (reduce->reduce_type == UOP_RMAX) ? -1e30f : 0.f;
-        for (u32 i = 0; i < out_numel; i++) out[i] = init;
+        for (u32 i = 0; i < out_numel; i++) dtype_store_from_f32(out, out_dtype, i, init);
     }
 
     // Compute strides for full_shape (row-major) for coord decomposition
@@ -174,10 +176,11 @@ void cpu_dispatch_kernel_rs(
 
         // Read leaf values (use multi-view ST when available)
         for (u32 i = 0; i < n_leaves; i++) {
+            u32 leaf_dtype = leaf_dtypes ? leaf_dtypes[i] : DTYPE_F32;
             if (leaf_sts && leaf_sts[i] && leaf_sts[i]->n_views >= 2)
-                vals[i] = leaf_read_st(leaf_ptrs[i], leaf_sts[i], coords, rank, full_shape);
+                vals[i] = leaf_read_st(leaf_ptrs[i], leaf_dtype, leaf_sts[i], coords, rank, full_shape);
             else
-                vals[i] = leaf_read(leaf_ptrs[i], leaf_views[i], coords, rank);
+                vals[i] = leaf_read(leaf_ptrs[i], leaf_dtype, leaf_views[i], coords, rank);
         }
 
         // Evaluate FusedOp DAG (pre-reduce ops only if post_reduce_start set)
@@ -190,7 +193,7 @@ void cpu_dispatch_kernel_rs(
             }
             f32 a = vals[aa];
             f32 b = vals[bb];
-            vals[n_leaves + i] = eval_uop(ops[i].uop, a, b);
+            vals[n_leaves + i] = eval_uop(ops[i].uop, ops[i].aux, a, b);
         }
 
         f32 result = (eval_n_ops > 0) ? vals[n_leaves + eval_n_ops - 1] : vals[0];
@@ -204,11 +207,13 @@ void cpu_dispatch_kernel_rs(
                     oi += coords[d] * out_strides[d];
             }
             if (reduce->reduce_type == UOP_SUM)
-                out[oi] += result;
+                dtype_store_from_f32(out, out_dtype, oi, dtype_load_as_f32(out, out_dtype, oi) + result);
             else if (reduce->reduce_type == UOP_RMAX)
-                out[oi] = result > out[oi] ? result : out[oi];
+                dtype_store_from_f32(out, out_dtype, oi,
+                                     result > dtype_load_as_f32(out, out_dtype, oi) ? result
+                                                                                     : dtype_load_as_f32(out, out_dtype, oi));
         } else {
-            out[flat] = result;
+            dtype_store_from_f32(out, out_dtype, flat, result);
         }
     }
 
@@ -238,7 +243,7 @@ void cpu_dispatch_kernel_rs(
             }
 
             // Read the reduce result for this output position
-            f32 reduce_result = out[oi];
+            f32 reduce_result = dtype_load_as_f32(out, out_dtype, oi);
 
             // Read post-reduce leaf values
             // Post-reduce leaves are at the END of the leaf array
@@ -250,10 +255,11 @@ void cpu_dispatch_kernel_rs(
                     vals[i] = 0; // not used by post-reduce ops (they use reduce result)
                 } else {
                     // Post-reduce leaf: read from buffer
+                    u32 leaf_dtype = leaf_dtypes ? leaf_dtypes[i] : DTYPE_F32;
                     if (leaf_sts && leaf_sts[i] && leaf_sts[i]->n_views >= 2)
-                        vals[i] = leaf_read_st(leaf_ptrs[i], leaf_sts[i], coords, rank, &(Shape){.rank=rank, .dims={0}});
+                        vals[i] = leaf_read_st(leaf_ptrs[i], leaf_dtype, leaf_sts[i], coords, rank, &(Shape){.rank=rank, .dims={0}});
                     else
-                        vals[i] = leaf_read(leaf_ptrs[i], leaf_views[i], coords, rank);
+                        vals[i] = leaf_read(leaf_ptrs[i], leaf_dtype, leaf_views[i], coords, rank);
                 }
             }
 
@@ -266,11 +272,11 @@ void cpu_dispatch_kernel_rs(
             for (u32 i = post_start; i < n_ops; i++) {
                 f32 a = vals[ops[i].arg_a];
                 f32 b = vals[ops[i].arg_b];
-                vals[n_leaves + i] = eval_uop(ops[i].uop, a, b);
+                vals[n_leaves + i] = eval_uop(ops[i].uop, ops[i].aux, a, b);
             }
 
             f32 post_result = vals[n_leaves + n_ops - 1];
-            out[oi] = post_result;
+            dtype_store_from_f32(out, out_dtype, oi, post_result);
         }
     }
 }

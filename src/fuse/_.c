@@ -12,7 +12,7 @@ static int is_view_op(u32 uop) {
 static int is_elementwise(u32 uop) {
     return uop==UOP_ADD||uop==UOP_SUB||uop==UOP_MUL||uop==UOP_DIV||
            uop==UOP_MAX||uop==UOP_CMP||uop==UOP_NEG||uop==UOP_RELU||
-           uop==UOP_EXP||uop==UOP_LOG||uop==UOP_SQRT;
+           uop==UOP_EXP||uop==UOP_LOG||uop==UOP_SQRT||uop==UOP_CAST;
 }
 static int is_binary(u32 uop) {
     return uop==UOP_ADD||uop==UOP_SUB||uop==UOP_MUL||uop==UOP_DIV||
@@ -27,6 +27,7 @@ static View fuse_composed_views[FUSE_MAX_LEAVES];
 static ShapeTracker fuse_leaf_sts[FUSE_MAX_LEAVES];
 static u8 fuse_leaf_kinds[FUSE_MAX_LEAVES];
 static f32 fuse_leaf_nums[FUSE_MAX_LEAVES];
+static u32 fuse_leaf_dtypes[FUSE_MAX_LEAVES];
 
 // Current scheduler-selected realization boundaries.
 static const u64 *fuse_boundary_locs = NULL;
@@ -74,6 +75,16 @@ static void fuse_dep_add(u32 kid) {
         fuse_dep_kids[fuse_n_dep_kids++] = kid;
 }
 
+static u32 fuse_cast_aux_from_term(TinyHVM *ctx, u64 loc) {
+    Term dt = heap_read(ctx, loc + 1);
+    if (term_tag(dt) != TAG_TEN) return DTYPE_F32;
+    u32 tid = (u32)term_val(dt);
+    u32 raw[MAX_DIM];
+    if (tensor_meta_read_u32(ctx, tid, raw, MAX_DIM) == 1 && raw[0] < DTYPE_COUNT)
+        return raw[0];
+    return DTYPE_F32;
+}
+
 static int fuse_append_leaf_tensor(TinyHVM *ctx, u32 tid,
                                    const View *view,
                                    const ShapeTracker *st,
@@ -83,13 +94,14 @@ static int fuse_append_leaf_tensor(TinyHVM *ctx, u32 tid,
     leaf_ids[idx] = tid;
     fuse_leaf_kinds[idx] = KERNEL_LEAF_TENSOR;
     fuse_leaf_nums[idx] = 0.0f;
+    fuse_leaf_dtypes[idx] = ctx->tensors[tid].dtype;
     fuse_composed_views[idx] = *view;
     leaf_views[idx] = &fuse_composed_views[idx];
     fuse_leaf_sts[idx] = st ? *st : st_from_view(*view);
     return (int)(WALK_LEAF_BASE + idx);
 }
 
-static int fuse_append_leaf_num(f32 val,
+static int fuse_append_leaf_num(f32 val, u32 dtype,
                                 const View *view,
                                 const ShapeTracker *st,
                                 u32 *leaf_ids, const View **leaf_views, u32 *n_leaves) {
@@ -99,6 +111,7 @@ static int fuse_append_leaf_num(f32 val,
     leaf_ids[idx] = 0;
     fuse_leaf_kinds[idx] = KERNEL_LEAF_NUM;
     fuse_leaf_nums[idx] = val;
+    fuse_leaf_dtypes[idx] = dtype;
     fuse_composed_views[idx] = scalar;
     leaf_views[idx] = &fuse_composed_views[idx];
     fuse_leaf_sts[idx] = st ? *st : st_from_view(scalar);
@@ -124,9 +137,12 @@ static int fuse_make_boundary_leaf(TinyHVM *ctx, Term t,
     if (term_tag(cur) == TAG_TEN)
         return fuse_append_leaf_tensor(ctx, (u32)term_val(cur), view, st,
                                        leaf_ids, leaf_views, n_leaves);
-    if (term_tag(cur) == TAG_NUM)
-        return fuse_append_leaf_num(term_as_f32(cur), view, st,
+    if (term_tag(cur) == TAG_NUM) {
+        f32 num_val = term_ext(cur) == NUM_U32 ? (f32)term_as_u32(cur) : term_as_f32(cur);
+        u32 num_dtype = term_ext(cur) == NUM_U32 ? DTYPE_U32 : DTYPE_F32;
+        return fuse_append_leaf_num(num_val, num_dtype, view, st,
                                     leaf_ids, leaf_views, n_leaves);
+    }
     if (term_tag(cur) == TAG_TOP) {
         int bidx = fuse_boundary_index_for_loc(term_val(cur));
         if (bidx >= 0) {
@@ -241,7 +257,12 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 if (b_res < 0) return -1;
             }
             u32 oi = (*n_ops)++;
-            ops[oi] = (FusedOp){.uop = m->creator_op, .arg_a = (u32)a_res, .arg_b = (u32)b_res};
+            ops[oi] = (FusedOp){
+                .uop = m->creator_op,
+                .arg_a = (u32)a_res,
+                .arg_b = (u32)b_res,
+                .aux = m->creator_op == UOP_CAST ? m->dtype : 0,
+            };
             return (int)(WALK_LEAF_BASE * 2 + oi);
         }
         // Deferred view tensor (buf_id=0): walk through and compose view
@@ -256,7 +277,9 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 if (m->creator_op == UOP_PERMUTE && m->src_ids[1] && !_fuse_has_perm) {
                     TensorMeta *ppm = &ctx->tensors[m->src_ids[1]];
                     _fuse_perm_rank = ppm->view.numel;
-                    META_READ(ppm->backend, ppm->buf_id, _fuse_perm, _fuse_perm_rank * sizeof(f32));
+                    u32 perm[MAX_DIM];
+                    tensor_meta_read_u32(ctx, m->src_ids[1], perm, MAX_DIM);
+                    for (u32 j = 0; j < _fuse_perm_rank; j++) _fuse_perm[j] = (f32)perm[j];
                     _fuse_has_perm = 1;
                 }
                 return inner;
@@ -268,12 +291,12 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             if (m->creator_op == UOP_PERMUTE && m->src_ids[1]) {
                 TensorMeta *mp = &ctx->tensors[m->src_ids[1]];
                 u32 rank = mp->view.numel;
-                f32 pf[MAX_DIM];
-                META_READ(mp->backend, mp->buf_id, pf, rank * sizeof(f32));
+                u32 pf[MAX_DIM];
+                tensor_meta_read_u32(ctx, m->src_ids[1], pf, MAX_DIM);
                 View nv = {0}; nv.offset = base->offset; nv.shape.rank = rank; nv.numel = base->numel;
                 for (u32 j = 0; j < rank; j++) {
-                    nv.shape.dims[j] = base->shape.dims[(u32)pf[j]];
-                    nv.strides[j] = base->strides[(u32)pf[j]];
+                    nv.shape.dims[j] = base->shape.dims[pf[j]];
+                    nv.strides[j] = base->strides[pf[j]];
                 }
                 nv.contiguous = 0;
                 fuse_composed_views[leaf_idx] = nv;
@@ -281,10 +304,10 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             } else if (m->creator_op == UOP_RESHAPE && m->src_ids[1]) {
                 TensorMeta *mp = &ctx->tensors[m->src_ids[1]];
                 u32 rank = mp->view.numel;
-                f32 rf[MAX_DIM];
-                META_READ(mp->backend, mp->buf_id, rf, rank * sizeof(f32));
+                u32 rf[MAX_DIM];
+                tensor_meta_read_u32(ctx, m->src_ids[1], rf, MAX_DIM);
                 Shape ns = {.rank = rank};
-                for (u32 j = 0; j < rank; j++) ns.dims[j] = (u32)rf[j];
+                for (u32 j = 0; j < rank; j++) ns.dims[j] = rf[j];
                 View nv = view_reshape(*base, ns);
                 if (nv.numel == 0) return -1; // can't merge — fail this walk
                 fuse_composed_views[leaf_idx] = nv;
@@ -307,6 +330,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         leaf_ids[idx] = tid;
         fuse_leaf_kinds[idx] = KERNEL_LEAF_TENSOR;
         fuse_leaf_nums[idx] = 0.0f;
+        fuse_leaf_dtypes[idx] = ctx->tensors[tid].dtype;
         leaf_views[idx] = tensor_view_get(&ctx->tensors[tid]);
         { const ShapeTracker *tst = tensor_st_get(&ctx->tensors[tid]);
           fuse_leaf_sts[idx] = tst ? *tst : st_from_view(ctx->tensors[tid].view); }
@@ -332,13 +356,15 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
     if (term_tag(t) == TAG_NUM) {
         for (u32 i = 0; i < *n_leaves; i++)
             if (fuse_leaf_kinds[i] == KERNEL_LEAF_NUM &&
-                fuse_leaf_nums[i] == term_as_f32(t))
+                fuse_leaf_dtypes[i] == (term_ext(t) == NUM_U32 ? DTYPE_U32 : DTYPE_F32) &&
+                fuse_leaf_nums[i] == (term_ext(t) == NUM_U32 ? (f32)term_as_u32(t) : term_as_f32(t)))
                 return (int)(WALK_LEAF_BASE + i);
         if (*n_leaves >= FUSE_MAX_LEAVES) return -1;
         u32 idx = (*n_leaves)++;
         leaf_ids[idx] = 0;
         fuse_leaf_kinds[idx] = KERNEL_LEAF_NUM;
-        fuse_leaf_nums[idx] = term_as_f32(t);
+        fuse_leaf_nums[idx] = term_ext(t) == NUM_U32 ? (f32)term_as_u32(t) : term_as_f32(t);
+        fuse_leaf_dtypes[idx] = term_ext(t) == NUM_U32 ? DTYPE_U32 : DTYPE_F32;
         fuse_composed_views[idx] = view_create((Shape){.dims={1}, .rank=1});
         leaf_views[idx] = &fuse_composed_views[idx];
         fuse_leaf_sts[idx] = st_from_view(fuse_composed_views[idx]);
@@ -365,6 +391,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             leaf_ids[idx] = out_tid;
             fuse_leaf_kinds[idx] = KERNEL_LEAF_TENSOR;
             fuse_leaf_nums[idx] = 0.0f;
+            fuse_leaf_dtypes[idx] = ctx->tensors[out_tid].dtype;
             leaf_views[idx] = tensor_view_get(&ctx->tensors[out_tid]);
             { const ShapeTracker *tst = tensor_st_get(&ctx->tensors[out_tid]);
               fuse_leaf_sts[idx] = tst ? *tst : st_from_view(ctx->tensors[out_tid].view); }
@@ -490,7 +517,9 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 if (term_tag(parg) == TAG_TEN) {
                     TensorMeta *pp2 = &ctx->tensors[(u32)term_val(parg)];
                     _fuse_perm_rank = pp2->view.numel;
-                    META_READ(pp2->backend, pp2->buf_id, _fuse_perm, _fuse_perm_rank * sizeof(f32));
+                    u32 perm[MAX_DIM];
+                    tensor_meta_read_u32(ctx, (u32)term_val(parg), perm, MAX_DIM);
+                    for (u32 j = 0; j < _fuse_perm_rank; j++) _fuse_perm[j] = (f32)perm[j];
                     _fuse_has_perm = 1;
                     return inner;
                 }
@@ -509,12 +538,10 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                     TensorMeta *rmp2 = &ctx->tensors[(u32)term_val(rarg2)];
                     u32 rrank2 = rmp2->view.numel;
                     if (rrank2 <= MAX_DIM) {
-                        f32 rf2[MAX_DIM];
-                        const f32 *rc2 = (const f32 *)rmp2->host_ptr;
-                        if (rc2) memcpy(rf2, rc2, rrank2 * sizeof(f32));
-                        else META_READ(rmp2->backend, rmp2->buf_id, rf2, rrank2 * sizeof(f32));
+                        u32 rf2[MAX_DIM];
+                        tensor_meta_read_u32(ctx, (u32)term_val(rarg2), rf2, MAX_DIM);
                         Shape rs_shape = {.rank = rrank2};
-                        for (u32 j = 0; j < rrank2; j++) rs_shape.dims[j] = (u32)rf2[j];
+                        for (u32 j = 0; j < rrank2; j++) rs_shape.dims[j] = rf2[j];
                         Term vi_rs = view_input;
                         if (term_tag(vi_rs) == TAG_DP0 || term_tag(vi_rs) == TAG_DP1)
                             vi_rs = heap_read(ctx, term_val(vi_rs));
@@ -565,10 +592,8 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 TensorMeta *mp2 = &ctx->tensors[(u32)term_val(parg)];
                 u32 rank2 = mp2->view.numel;
                 if (rank2 > MAX_DIM) goto view_op_boundary;
-                f32 pf2[MAX_DIM];
-                const f32 *cached2 = (const f32 *)mp2->host_ptr;
-                if (cached2) memcpy(pf2, cached2, rank2 * sizeof(f32));
-                else META_READ(mp2->backend, mp2->buf_id, pf2, rank2 * sizeof(f32));
+                u32 pf2[MAX_DIM];
+                tensor_meta_read_u32(ctx, (u32)term_val(parg), pf2, MAX_DIM);
                 int compose_ok2 = 1;
                 for (u32 li = leaves_before; li < *n_leaves; li++) {
                     const View *base2 = leaf_views[li];
@@ -619,7 +644,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 return fuse_append_leaf_tensor(ctx, leaf_ids[leaf_idx],
                                                &pre_st->views[pre_st->n_views - 1],
                                                pre_st, leaf_ids, leaf_views, n_leaves);
-            return fuse_append_leaf_num(fuse_leaf_nums[leaf_idx],
+            return fuse_append_leaf_num(fuse_leaf_nums[leaf_idx], fuse_leaf_dtypes[leaf_idx],
                                         &pre_st->views[pre_st->n_views - 1],
                                         pre_st, leaf_ids, leaf_views, n_leaves);
           }
@@ -640,29 +665,27 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             if (fuse_leaf_kinds[leaf_idx] == KERNEL_LEAF_TENSOR)
                 return fuse_append_leaf_tensor(ctx, leaf_ids[leaf_idx], sv, NULL,
                                                leaf_ids, leaf_views, n_leaves);
-            return fuse_append_leaf_num(fuse_leaf_nums[leaf_idx], sv, NULL,
+            return fuse_append_leaf_num(fuse_leaf_nums[leaf_idx], fuse_leaf_dtypes[leaf_idx], sv, NULL,
                                         leaf_ids, leaf_views, n_leaves);
         }
         TensorMeta *mp = &ctx->tensors[(u32)term_val(arg2)];
         u32 rank = mp->view.numel;
         if (rank > MAX_DIM) return -1;
-        f32 pf[MAX_DIM];
-        const f32 *cached = (const f32 *)mp->host_ptr;
-        if (cached) memcpy(pf, cached, rank * sizeof(f32));
-        else META_READ(mp->backend, mp->buf_id, pf, rank * sizeof(f32));
+        u32 pf[MAX_DIM];
+        tensor_meta_read_u32(ctx, (u32)term_val(arg2), pf, MAX_DIM);
 
         View nv = {0};
         if (uop == UOP_PERMUTE) {
             nv.offset = base->offset; nv.shape.rank = rank; nv.numel = base->numel;
             for (u32 j = 0; j < rank; j++) {
-                nv.shape.dims[j] = base->shape.dims[(u32)pf[j]];
-                nv.strides[j] = base->strides[(u32)pf[j]];
+                nv.shape.dims[j] = base->shape.dims[pf[j]];
+                nv.strides[j] = base->strides[pf[j]];
             }
             nv.contiguous = 0;
         } else if (uop == UOP_EXPAND) {
             nv = *base; nv.shape.rank = rank; nv.numel = 1;
             for (u32 j = 0; j < rank; j++) {
-                u32 nd = (u32)pf[j];
+                u32 nd = pf[j];
                 if (j < base->shape.rank && base->shape.dims[j] == 1 && nd > 1)
                     nv.strides[j] = 0;
                 nv.shape.dims[j] = nd; nv.numel *= nd;
@@ -670,7 +693,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             nv.contiguous = 0;
         } else if (uop == UOP_RESHAPE) {
             Shape ns = {.rank = rank};
-            for (u32 j = 0; j < rank; j++) ns.dims[j] = (u32)pf[j];
+            for (u32 j = 0; j < rank; j++) ns.dims[j] = pf[j];
             u32 new_numel = 1;
             for (u32 j = 0; j < rank; j++) new_numel *= ns.dims[j];
             if (new_numel != base->numel) {
@@ -704,7 +727,7 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
                 if (fuse_leaf_kinds[leaf_idx] == KERNEL_LEAF_TENSOR)
                     return fuse_append_leaf_tensor(ctx, leaf_ids[leaf_idx], sv, NULL,
                                                    leaf_ids, leaf_views, n_leaves);
-                return fuse_append_leaf_num(fuse_leaf_nums[leaf_idx], sv, NULL,
+                return fuse_append_leaf_num(fuse_leaf_nums[leaf_idx], fuse_leaf_dtypes[leaf_idx], sv, NULL,
                                             leaf_ids, leaf_views, n_leaves);
             }
             reshape_leaf_done:
@@ -719,8 +742,8 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             u32 ndim = rank / 2;
             u32 starts[MAX_DIM], ends[MAX_DIM];
             for (u32 j = 0; j < ndim && j < MAX_DIM; j++) {
-                starts[j] = (u32)pf[j * 2];
-                ends[j]   = (u32)pf[j * 2 + 1];
+                starts[j] = pf[j * 2];
+                ends[j]   = pf[j * 2 + 1];
             }
             if (ndim != base->shape.rank) return -1; // rank mismatch
             nv = view_shrink(*base, starts, ends);
@@ -729,8 +752,8 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             u32 ndim = rank / 2;
             u32 pad_before[MAX_DIM], pad_after[MAX_DIM];
             for (u32 j = 0; j < ndim && j < MAX_DIM; j++) {
-                pad_before[j] = (u32)pf[j * 2];
-                pad_after[j]  = (u32)pf[j * 2 + 1];
+                pad_before[j] = pf[j * 2];
+                pad_after[j]  = pf[j * 2 + 1];
             }
             nv = view_pad(*base, pad_before, pad_after);
         } else {
@@ -744,19 +767,19 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
             if (uop == UOP_PERMUTE) {
                 nv.has_mask = 1;
                 for (u32 j = 0; j < rank; j++) {
-                    nv.mask_begin[j] = base->mask_begin[(u32)pf[j]];
-                    nv.mask_end[j] = base->mask_end[(u32)pf[j]];
+                    nv.mask_begin[j] = base->mask_begin[pf[j]];
+                    nv.mask_end[j] = base->mask_end[pf[j]];
                 }
             } else if (uop == UOP_EXPAND) {
                 nv.has_mask = 1;
                 for (u32 j = 0; j < rank; j++) {
                     if (j < base->shape.rank) {
                         nv.mask_begin[j] = base->mask_begin[j];
-                        nv.mask_end[j] = (base->shape.dims[j] == 1 && (u32)pf[j] > 1) ?
-                            (u32)pf[j] : base->mask_end[j]; // expanded dims: full range
+                        nv.mask_end[j] = (base->shape.dims[j] == 1 && pf[j] > 1) ?
+                            pf[j] : base->mask_end[j]; // expanded dims: full range
                     } else {
                         nv.mask_begin[j] = 0;
-                        nv.mask_end[j] = (u32)pf[j];
+                        nv.mask_end[j] = pf[j];
                     }
                 }
             }
@@ -771,27 +794,28 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         leaf_ids[new_idx] = leaf_ids[leaf_idx];
         fuse_leaf_kinds[new_idx] = fuse_leaf_kinds[leaf_idx];
         fuse_leaf_nums[new_idx] = fuse_leaf_nums[leaf_idx];
+        fuse_leaf_dtypes[new_idx] = fuse_leaf_dtypes[leaf_idx];
         // Compose ST: apply the view op to the leaf's ShapeTracker
         { ShapeTracker st_composed = fuse_leaf_sts[leaf_idx];
           if (uop == UOP_RESHAPE) {
             Shape ns2 = {.rank = rank};
-            for (u32 j = 0; j < rank; j++) ns2.dims[j] = (u32)pf[j];
+            for (u32 j = 0; j < rank; j++) ns2.dims[j] = pf[j];
             st_composed = st_reshape(st_composed, ns2);
           } else if (uop == UOP_PERMUTE) {
             u32 axes[MAX_DIM];
-            for (u32 j = 0; j < rank; j++) axes[j] = (u32)pf[j];
+            for (u32 j = 0; j < rank; j++) axes[j] = pf[j];
             st_composed = st_permute(st_composed, axes, rank);
           } else if (uop == UOP_EXPAND) {
             st_composed = st_expand(st_composed, pf, rank);
           } else if (uop == UOP_SHRINK) {
             u32 ndim = rank / 2;
             u32 s3[MAX_DIM], e3[MAX_DIM];
-            for (u32 j = 0; j < ndim; j++) { s3[j]=(u32)pf[j*2]; e3[j]=(u32)pf[j*2+1]; }
+            for (u32 j = 0; j < ndim; j++) { s3[j]=pf[j*2]; e3[j]=pf[j*2+1]; }
             st_composed = st_shrink(st_composed, s3, e3, ndim);
           } else if (uop == UOP_PAD) {
             u32 ndim = rank / 2;
             u32 pb3[MAX_DIM], pa3[MAX_DIM];
-            for (u32 j = 0; j < ndim; j++) { pb3[j]=(u32)pf[j*2]; pa3[j]=(u32)pf[j*2+1]; }
+            for (u32 j = 0; j < ndim; j++) { pb3[j]=pf[j*2]; pa3[j]=pf[j*2+1]; }
             st_composed = st_pad(st_composed, pb3, pa3);
           }
           fuse_leaf_sts[new_idx] = st_composed;
@@ -862,7 +886,12 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         }
     }
     u32 op_idx = (*n_ops)++;
-    ops[op_idx] = (FusedOp){ .uop = uop, .arg_a = (u32)arg_a, .arg_b = (u32)arg_b };
+    ops[op_idx] = (FusedOp){
+        .uop = uop,
+        .arg_a = (u32)arg_a,
+        .arg_b = (u32)arg_b,
+        .aux = uop == UOP_CAST ? fuse_cast_aux_from_term(ctx, loc) : 0,
+    };
     return (int)(WALK_LEAF_BASE * 2 + op_idx);
 }
 
@@ -1049,6 +1078,7 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
                 leaf_views_p[new_n_leaves] = leaf_views_p[i];
                 fuse_leaf_kinds[new_n_leaves] = fuse_leaf_kinds[i];
                 fuse_leaf_nums[new_n_leaves] = fuse_leaf_nums[i];
+                fuse_leaf_dtypes[new_n_leaves] = fuse_leaf_dtypes[i];
                 fuse_leaf_sts[new_n_leaves] = fuse_leaf_sts[i];
                 new_n_leaves++;
             } else {
@@ -1082,8 +1112,8 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
             u32 ax_id = (u32)term_val(sum_axes);
             TensorMeta *axt = &ctx->tensors[ax_id];
             u32 n_axes = axt->view.numel;
-            f32 axes_f[MAX_DIM];
-            META_READ(axt->backend, axt->buf_id, axes_f, n_axes * sizeof(f32));
+            u32 axes_f[MAX_DIM];
+            tensor_meta_read_u32(ctx, ax_id, axes_f, MAX_DIM);
             for (u32 i = 0; i < n_axes; i++) {
                 int ax = (int)axes_f[i];
                 // Don't transform axes through perm — SUM axes are in the ew chain's
@@ -1116,6 +1146,7 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
         ke->leaf_ids[i] = leaf_ids[i];
         ke->leaf_kinds[i] = fuse_leaf_kinds[i];
         ke->leaf_nums[i] = fuse_leaf_nums[i];
+        ke->leaf_dtypes[i] = fuse_leaf_dtypes[i];
         ke->leaf_views[i] = *leaf_views_p[i];
         ke->leaf_sts[i] = fuse_leaf_sts[i];
     }

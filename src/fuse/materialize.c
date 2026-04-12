@@ -28,6 +28,10 @@ static u8 walk_no_reshape_through = 0;
 // (used by scheduler during planning — pure read-only walk).
 static u8 walk_no_materialize = 0;
 
+static inline u32 materialize_fused_aux(u32 uop, u32 out_dtype) {
+    return uop == UOP_CAST ? out_dtype : 0;
+}
+
 // Walk provenance chain. op_tids[i] = tensor ID for op i.
 static int materialize_walk(TinyHVM *ctx, u32 tid,
                              FusedOp *ops, u32 *n_ops, u32 *op_tids,
@@ -115,7 +119,12 @@ static int materialize_walk(TinyHVM *ctx, u32 tid,
         return -1;
     }
     u32 op_idx = (*n_ops)++;
-    ops[op_idx] = (FusedOp){ .uop = uop, .arg_a = (u32)arg_a, .arg_b = is_binary(uop) ? (u32)arg_b : 0 };
+    ops[op_idx] = (FusedOp){
+        .uop = uop,
+        .arg_a = (u32)arg_a,
+        .arg_b = is_binary(uop) ? (u32)arg_b : 0,
+        .aux = materialize_fused_aux(uop, m->dtype),
+    };
     op_tids[op_idx] = tid;
 
     // NOTE: side output buffer allocation moved to tensor_materialize
@@ -181,10 +190,12 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
         if (ma->buf_id && mb->buf_id) {
             // Use ASSIGN elision target if available
             if (m->assign_target) m->buf_id = m->assign_target;
-            else m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+            else m->buf_id = m->backend->buf_alloc((u64)m->view.numel * dtype_size(m->dtype));
             u32 M = ma->view.shape.dims[0], K = ma->view.shape.dims[1], N = mb->view.shape.dims[1];
-            m->backend->op_mm(m->buf_id, ma->buf_id, &ma->view,
-                              mb->buf_id, &mb->view, M, K, N);
+            m->backend->op_mm(m->buf_id, m->dtype,
+                              ma->buf_id, &ma->view, ma->dtype,
+                              mb->buf_id, &mb->view, mb->dtype,
+                              M, K, N);
             return;
         }
     }
@@ -241,12 +252,22 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                         if (ctx->tensors[other].buf_id != 0 && n_leaves < FUSE_MAX_LEAVES) {
                             leaf_ids[n_leaves] = other;
                             leaf_views[n_leaves] = &ctx->tensors[other].view;
-                            ops[n_ops] = (FusedOp){ .uop = pm->creator_op, .arg_a = 0, .arg_b = n_leaves };
+                            ops[n_ops] = (FusedOp){
+                                .uop = pm->creator_op,
+                                .arg_a = 0,
+                                .arg_b = n_leaves,
+                                .aux = materialize_fused_aux(pm->creator_op, pm->dtype),
+                            };
                             op_tids[n_ops] = post_chain[pi];
                             n_leaves++; n_post_leaves++; n_ops++;
                         }
                     } else {
-                        ops[n_ops] = (FusedOp){ .uop = pm->creator_op, .arg_a = 0, .arg_b = 0 };
+                        ops[n_ops] = (FusedOp){
+                            .uop = pm->creator_op,
+                            .arg_a = 0,
+                            .arg_b = 0,
+                            .aux = materialize_fused_aux(pm->creator_op, pm->dtype),
+                        };
                         op_tids[n_ops] = post_chain[pi];
                         n_ops++;
                     }
@@ -276,16 +297,17 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                     if (axes_id) {
                         ENSURE(ctx, axes_id);
                         TensorMeta *axt = &ctx->tensors[axes_id];
-                        f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
-                        for (u32 i=0;i<axt->view.numel;i++) { u32 ax=(u32)af[i]; if(ax<fs.rank) rs.is_reduce[ax]=1; }
+                        u32 af[MAX_DIM]; tensor_meta_read_u32(ctx, axes_id, af, MAX_DIM);
+                        for (u32 i=0;i<axt->view.numel;i++) { u32 ax=af[i]; if(ax<fs.rank) rs.is_reduce[ax]=1; }
                     } else {
                         for (int d=(int)fs.rank-1;d>=0;d--) if(fs.dims[d]>1){rs.is_reduce[d]=1;break;}
                     }
-                    m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+                    m->buf_id = m->backend->buf_alloc((u64)m->view.numel * dtype_size(m->dtype));
                     u32 bufs[FUSE_MAX_LEAVES];
                     for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
                     m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, NULL, n_leaves,
-                        ops, n_ops, &fs, &rs, n_sides?side_bufs:NULL, n_sides?side_ops:NULL, n_sides);
+                        ops, n_ops, &fs, &rs, n_sides?side_bufs:NULL, n_sides?side_ops:NULL, n_sides,
+                        NULL, m->dtype);
                     return;
                 }
             }
@@ -390,7 +412,8 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                                     ops[n_ops] = (FusedOp){
                                         .uop = pm->creator_op,
                                         .arg_a = acc_ref, // previous result (acc or last post op)
-                                        .arg_b = n_leaves
+                                        .arg_b = n_leaves,
+                                        .aux = materialize_fused_aux(pm->creator_op, pm->dtype),
                                     };
                                     n_leaves++;
                                     op_tids[n_ops] = ptid;
@@ -400,7 +423,12 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                                 // Unary post-op
                                 u32 prev = (n_ops > pre_reduce_ops) ?
                                     n_leaves + n_ops - 1 : pre_reduce_leaves + pre_reduce_ops - 1;
-                                ops[n_ops] = (FusedOp){ .uop = pm->creator_op, .arg_a = prev, .arg_b = 0 };
+                                ops[n_ops] = (FusedOp){
+                                    .uop = pm->creator_op,
+                                    .arg_a = prev,
+                                    .arg_b = 0,
+                                    .aux = materialize_fused_aux(pm->creator_op, pm->dtype),
+                                };
                                 op_tids[n_ops] = ptid;
                                 n_ops++;
                             }
@@ -428,8 +456,8 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                             if (axes_id) {
                                 ENSURE(ctx, axes_id);
                                 TensorMeta *axt = &ctx->tensors[axes_id];
-                                f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
-                                for (u32 i=0;i<axt->view.numel;i++) { u32 ax=(u32)af[i]; if(ax<fs.rank) rs.is_reduce[ax]=1; }
+                                u32 af[MAX_DIM]; tensor_meta_read_u32(ctx, axes_id, af, MAX_DIM);
+                                for (u32 i=0;i<axt->view.numel;i++) { u32 ax=af[i]; if(ax<fs.rank) rs.is_reduce[ax]=1; }
                             } else {
                                 for (int d=(int)fs.rank-1;d>=0;d--) if(fs.dims[d]>1){rs.is_reduce[d]=1;break;}
                             }
@@ -443,12 +471,13 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                                 }
                             }
 
-                            m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+                            m->buf_id = m->backend->buf_alloc((u64)m->view.numel * dtype_size(m->dtype));
                             u32 bufs[FUSE_MAX_LEAVES];
                             for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
                             m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, NULL, n_leaves,
                                 ops, n_ops, &fs, &rs,
-                                n_sides2 ? side_bufs2 : NULL, n_sides2 ? side_ops2 : NULL, n_sides2);
+                                n_sides2 ? side_bufs2 : NULL, n_sides2 ? side_ops2 : NULL, n_sides2,
+                                NULL, m->dtype);
                             return;
                         }
                     }
@@ -460,20 +489,21 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
             // Fusion failed (input pre-materialized). Dispatch standalone reduce.
             ENSURE(ctx, m->src_ids[0]);
             TensorMeta *ms = &ctx->tensors[m->src_ids[0]];
-            m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+            m->buf_id = m->backend->buf_alloc((u64)m->view.numel * dtype_size(m->dtype));
             if (m->backend->dispatch_kernel_rs) {
                 ReduceSpec rs = {0}; rs.reduce_type = reduce_type;
                 Shape fs = ms->view.shape;
                 if (reduce_axes_id) {
                     ENSURE(ctx, reduce_axes_id);
                     TensorMeta *axt = &ctx->tensors[reduce_axes_id];
-                    f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
-                    for (u32 i=0;i<axt->view.numel;i++) { u32 ax=(u32)af[i]; if(ax<fs.rank) rs.is_reduce[ax]=1; }
+                    u32 af[MAX_DIM]; tensor_meta_read_u32(ctx, reduce_axes_id, af, MAX_DIM);
+                    for (u32 i=0;i<axt->view.numel;i++) { u32 ax=af[i]; if(ax<fs.rank) rs.is_reduce[ax]=1; }
                 } else {
                     for (int d=(int)fs.rank-1;d>=0;d--) if(fs.dims[d]>1){rs.is_reduce[d]=1;break;}
                 }
                 u32 bufs[]={ms->buf_id}; const View *views[]={&ms->view};
-                m->backend->dispatch_kernel_rs(m->buf_id, bufs, views, NULL, 1, NULL, 0, &fs, &rs, NULL, NULL, 0);
+                m->backend->dispatch_kernel_rs(m->buf_id, bufs, views, NULL, 1, NULL, 0, &fs, &rs, NULL, NULL, 0,
+                                               NULL, m->dtype);
             }
             return;
         }
@@ -508,7 +538,7 @@ static void tensor_materialize_chain(TinyHVM *ctx, u32 tid) {
                 if (result >= 0 && n_ops > 0) goto dispatch_chain;
             }
         }
-        m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+        m->buf_id = m->backend->buf_alloc((u64)m->view.numel * dtype_size(m->dtype));
         return;
     }
 
@@ -523,7 +553,7 @@ dispatch_chain:
     if (m->assign_target) {
         m->buf_id = m->assign_target;
     } else {
-        m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+        m->buf_id = m->backend->buf_alloc((u64)m->view.numel * dtype_size(m->dtype));
     }
 
     // Allocate side output buffers for shared/grad-needed intermediates.
@@ -535,7 +565,7 @@ dispatch_chain:
         TensorMeta *sm = &ctx->tensors[op_tids[i]];
         u32 min_dc = (reduce_type && op_tids[i] == walk_tid) ? 1 : 0;
         if (sm->defer_consumers > min_dc && sm->buf_id == 0 && op_tids[i] != tid)
-            sm->buf_id = sm->backend->buf_alloc(sm->view.numel * sizeof(f32));
+            sm->buf_id = sm->backend->buf_alloc((u64)sm->view.numel * dtype_size(sm->dtype));
     }
 
     // Propagate side-output buf_ids to views that reference them
@@ -577,9 +607,9 @@ dispatch_chain:
             if (reduce_axes_id) {
                 TensorMeta *axt = &ctx->tensors[reduce_axes_id];
                 u32 n_ax = axt->view.numel;
-                f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, n_ax * 4);
+                u32 af[MAX_DIM]; tensor_meta_read_u32(ctx, reduce_axes_id, af, MAX_DIM);
                 for (u32 i = 0; i < n_ax; i++) {
-                    u32 ax = (u32)af[i];
+                    u32 ax = af[i];
                     if (ax < full_shape.rank) rs.is_reduce[ax] = 1;
                 }
             } else {
@@ -589,11 +619,13 @@ dispatch_chain:
             m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, NULL, n_leaves,
                                             ops, n_ops, &full_shape, &rs,
                                             n_sides ? side_bufs : NULL,
-                                            n_sides ? side_ops : NULL, n_sides);
+                                            n_sides ? side_ops : NULL, n_sides,
+                                            NULL, m->dtype);
         } else {
             m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, NULL, n_leaves,
                                             ops, n_ops, &m->view.shape, NULL,
-                                            side_bufs, side_ops, n_sides);
+                                            side_bufs, side_ops, n_sides,
+                                            NULL, m->dtype);
         }
         // No post-dispatch decref here — view-op increfs are permanent.
         // Buffer steal uses buf_last_use timeline instead of refcount.
@@ -624,7 +656,7 @@ dispatch_chain:
         } else if (om->buf_id != 0) {
             dst_buf = om->buf_id;
         } else {
-            dst_buf = m->backend->buf_alloc(om->view.numel * sizeof(f32));
+            dst_buf = m->backend->buf_alloc((u64)om->view.numel * dtype_size(om->dtype));
             om->buf_id = dst_buf;
         }
         View dst_view = om->view;
@@ -633,16 +665,23 @@ dispatch_chain:
         if (is_binary(ops[i].uop)) {
             u32 b_buf = temp_bufs[ops[i].arg_b];
             const View *b_view = temp_views[ops[i].arg_b];
-            m->backend->op_binary(ops[i].uop, dst_buf, &dst_view,
-                                  a_buf, a_view, b_buf, b_view);
+            u32 a_tid = (ops[i].arg_a < n_leaves) ? leaf_ids[ops[i].arg_a] : op_tids[ops[i].arg_a - n_leaves];
+            u32 b_tid = (ops[i].arg_b < n_leaves) ? leaf_ids[ops[i].arg_b] : op_tids[ops[i].arg_b - n_leaves];
+            u32 a_dtype = (a_tid && a_tid < ctx->tensor_count) ? ctx->tensors[a_tid].dtype : DTYPE_F32;
+            u32 b_dtype = (b_tid && b_tid < ctx->tensor_count) ? ctx->tensors[b_tid].dtype : DTYPE_F32;
+            m->backend->op_binary(ops[i].uop, dst_buf, &dst_view, om->dtype,
+                                  a_buf, a_view, a_dtype,
+                                  b_buf, b_view, b_dtype);
         } else {
             // For unary ops, input view might not match output shape.
             // Use output shape with input strides for correct indexing.
             View uv = *a_view;
             uv.shape = dst_view.shape;
             uv.numel = dst_view.numel;
-            m->backend->op_unary(ops[i].uop, dst_buf, &dst_view,
-                                 a_buf, &uv);
+            u32 a_tid = (ops[i].arg_a < n_leaves) ? leaf_ids[ops[i].arg_a] : op_tids[ops[i].arg_a - n_leaves];
+            u32 a_dtype = (a_tid && a_tid < ctx->tensor_count) ? ctx->tensors[a_tid].dtype : DTYPE_F32;
+            m->backend->op_unary(ops[i].uop, dst_buf, &dst_view, om->dtype,
+                                 a_buf, &uv, a_dtype);
         }
         temp_bufs[n_leaves + i] = dst_buf;
         temp_views[n_leaves + i] = &ctx->tensors[op_tid].view;
@@ -658,8 +697,8 @@ dispatch_chain:
             u32 reduce_dim = 1;
             for (int d = (int)ms->view.shape.rank - 1; d >= 0; d--)
                 if (ms->view.shape.dims[d] > 1) { reduce_dim = ms->view.shape.dims[d]; break; }
-            m->backend->op_reduce(reduce_type, m->buf_id, m->view.numel,
-                                   ms->buf_id, ms->view.numel, reduce_dim);
+            m->backend->op_reduce(reduce_type, m->buf_id, m->view.numel, m->dtype,
+                                   ms->buf_id, ms->view.numel, ms->dtype, reduce_dim);
         }
     }
 }
@@ -705,7 +744,8 @@ static int tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf,
         im->backend->dispatch_kernel_rs(out_buf, bufs, leaf_views, NULL, n_leaves,
                                          ops, n_ops, &full_shape, rs,
                                          n_sides ? side_bufs : NULL,
-                                         n_sides ? side_ops : NULL, n_sides);
+                                         n_sides ? side_ops : NULL, n_sides,
+                                         NULL, im->dtype);
         return 1;
     }
     return 0;
@@ -890,13 +930,13 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
     {
         u32 r1a = r1m->src_ids[1], r2a = r2m->src_ids[1];
         if (r1a && r2a) {
-            const f32 *r1f = tensor_host_f32(ctx, r1a);
-            const f32 *r2f = tensor_host_f32(ctx, r2a);
-            if (!r1f || !r2f) return 0; // can't read axes without ENSURE
-            u32 n1 = ctx->tensors[r1a].view.numel, n2 = ctx->tensors[r2a].view.numel;
+            u32 r1f[MAX_DIM], r2f[MAX_DIM];
+            u32 n1 = tensor_meta_read_u32(ctx, r1a, r1f, MAX_DIM);
+            u32 n2 = tensor_meta_read_u32(ctx, r2a, r2f, MAX_DIM);
+            if (!n1 || !n2) return 0;
             if (n1 != n2) return 0;
             for (u32 i = 0; i < n1; i++)
-                if ((u32)r1f[i] != (u32)r2f[i]) return 0;
+                if (r1f[i] != r2f[i]) return 0;
         } else if (r1a != r2a) return 0; // one has axes, other doesn't
     }
 
@@ -921,9 +961,9 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
     if (r1_axes) {
         ENSURE(ctx, r1_axes);
         TensorMeta *axt = &ctx->tensors[r1_axes];
-        f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
+        u32 af[MAX_DIM]; tensor_meta_read_u32(ctx, r1_axes, af, MAX_DIM);
         for (u32 i = 0; i < axt->view.numel; i++) {
-            u32 ax = (u32)af[i]; if (ax < fs.rank) rs.is_reduce[ax] = 1;
+            u32 ax = af[i]; if (ax < fs.rank) rs.is_reduce[ax] = 1;
         }
     } else {
         for (int d = (int)fs.rank-1; d >= 0; d--)
@@ -994,7 +1034,12 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
                 }
             }
         }
-        ops[n_ops] = (FusedOp){ .uop = bm->creator_op, .arg_a = a_ref, .arg_b = b_ref };
+        ops[n_ops] = (FusedOp){
+            .uop = bm->creator_op,
+            .arg_a = a_ref,
+            .arg_b = b_ref,
+            .aux = materialize_fused_aux(bm->creator_op, bm->dtype),
+        };
         op_tids[n_ops] = between_chain[bi];
         n_ops++;
     }
@@ -1003,9 +1048,9 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
     if (r2_axes) {
         ENSURE(ctx, r2_axes);
         TensorMeta *axt = &ctx->tensors[r2_axes];
-        f32 af[MAX_DIM]; META_READ(axt->backend, axt->buf_id, af, axt->view.numel*4);
+        u32 af[MAX_DIM]; tensor_meta_read_u32(ctx, r2_axes, af, MAX_DIM);
         for (u32 i = 0; i < axt->view.numel; i++) {
-            u32 ax = (u32)af[i]; if (ax < fs.rank) rs.is_reduce2[ax] = 1;
+            u32 ax = af[i]; if (ax < fs.rank) rs.is_reduce2[ax] = 1;
         }
     } else {
         memcpy(rs.is_reduce2, rs.is_reduce, sizeof(rs.is_reduce)); // same axes
@@ -1016,11 +1061,12 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
         return 0; // different axes — can't fuse into one loop
 
     // Allocate output and dispatch
-    m->buf_id = m->backend->buf_alloc(m->view.numel * sizeof(f32));
+    m->buf_id = m->backend->buf_alloc((u64)m->view.numel * dtype_size(m->dtype));
     u32 bufs[FUSE_MAX_LEAVES];
     for (u32 i = 0; i < n_leaves; i++) bufs[i] = ctx->tensors[leaf_ids[i]].buf_id;
     m->backend->dispatch_kernel_rs(m->buf_id, bufs, leaf_views, NULL, n_leaves,
-        ops, n_ops, &fs, &rs, NULL, NULL, 0);
+        ops, n_ops, &fs, &rs, NULL, NULL, 0,
+        NULL, m->dtype);
 
     // Mark intermediate deferred tensors as "materialized" by allocating
     // minimal buffers. They won't actually be read (the fused kernel wrote
@@ -1028,14 +1074,14 @@ static int try_multi_reduce(TinyHVM *ctx, u32 tid) {
     for (u32 i = 0; i < bn; i++) {
         TensorMeta *bm = &ctx->tensors[between_chain[i]];
         if (bm->buf_id == 0 && bm->backend)
-            bm->buf_id = bm->backend->buf_alloc(4); // minimal alloc
+            bm->buf_id = bm->backend->buf_alloc(dtype_size(bm->dtype)); // minimal typed alloc
     }
     if (reduce1_tid != tid && ctx->tensors[reduce1_tid].buf_id == 0)
         ctx->tensors[reduce1_tid].buf_id = ctx->tensors[reduce1_tid].backend->buf_alloc(
-            ctx->tensors[reduce1_tid].view.numel * sizeof(f32));
+            (u64)ctx->tensors[reduce1_tid].view.numel * dtype_size(ctx->tensors[reduce1_tid].dtype));
     if (reduce2_tid != tid && ctx->tensors[reduce2_tid].buf_id == 0)
         ctx->tensors[reduce2_tid].buf_id = ctx->tensors[reduce2_tid].backend->buf_alloc(
-            ctx->tensors[reduce2_tid].view.numel * sizeof(f32));
+            (u64)ctx->tensors[reduce2_tid].view.numel * dtype_size(ctx->tensors[reduce2_tid].dtype));
 
     return 1;
 }

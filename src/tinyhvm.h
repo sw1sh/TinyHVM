@@ -360,6 +360,106 @@ static inline u32 dtype_size(u32 dtype) {
     return (dtype < DTYPE_COUNT) ? sizes[dtype] : 4;
 }
 
+static inline const char *dtype_name(u32 dtype) {
+    static const char *names[] = {"f32", "f16", "i32", "u32"};
+    return (dtype < DTYPE_COUNT) ? names[dtype] : "?";
+}
+
+static inline u16 f32_to_f16_bits(f32 f) {
+    u32 x; memcpy(&x, &f, sizeof(x));
+    u32 sign = (x >> 16) & 0x8000u;
+    i32 exp = (i32)((x >> 23) & 0xFFu) - 127 + 15;
+    u32 mant = x & 0x7FFFFFu;
+
+    if (exp <= 0) {
+        if (exp < -10) return (u16)sign;
+        mant = (mant | 0x800000u) >> (1 - exp);
+        if (mant & 0x1000u) mant += 0x2000u;
+        return (u16)(sign | (mant >> 13));
+    }
+    if (exp >= 31) {
+        return (u16)(sign | 0x7C00u | (mant ? 0x0200u : 0));
+    }
+    if (mant & 0x1000u) {
+        mant += 0x2000u;
+        if (mant & 0x800000u) {
+            mant = 0;
+            exp += 1;
+            if (exp >= 31) return (u16)(sign | 0x7C00u);
+        }
+    }
+    return (u16)(sign | ((u32)exp << 10) | (mant >> 13));
+}
+
+static inline f32 f16_bits_to_f32(u16 h) {
+    u32 sign = ((u32)h & 0x8000u) << 16;
+    u32 exp = ((u32)h >> 10) & 0x1Fu;
+    u32 mant = (u32)h & 0x03FFu;
+    u32 bits;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                exp -= 1;
+            }
+            mant &= 0x03FFu;
+            bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+
+    f32 out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static inline f32 dtype_load_as_f32(const void *base, u32 dtype, u32 index) {
+    switch (dtype) {
+        case DTYPE_F32: return ((const f32 *)base)[index];
+        case DTYPE_F16: return f16_bits_to_f32(((const u16 *)base)[index]);
+        case DTYPE_I32: return (f32)((const i32 *)base)[index];
+        case DTYPE_U32: return (f32)((const u32 *)base)[index];
+        default: return 0.0f;
+    }
+}
+
+static inline u32 dtype_load_as_u32(const void *base, u32 dtype, u32 index) {
+    switch (dtype) {
+        case DTYPE_F32: return (u32)((const f32 *)base)[index];
+        case DTYPE_F16: return (u32)f16_bits_to_f32(((const u16 *)base)[index]);
+        case DTYPE_I32: return (u32)((const i32 *)base)[index];
+        case DTYPE_U32: return ((const u32 *)base)[index];
+        default: return 0;
+    }
+}
+
+static inline void dtype_store_from_f32(void *base, u32 dtype, u32 index, f32 value) {
+    switch (dtype) {
+        case DTYPE_F32: ((f32 *)base)[index] = value; break;
+        case DTYPE_F16: ((u16 *)base)[index] = f32_to_f16_bits(value); break;
+        case DTYPE_I32: ((i32 *)base)[index] = (i32)value; break;
+        case DTYPE_U32: ((u32 *)base)[index] = (u32)value; break;
+        default: break;
+    }
+}
+
+static inline f32 dtype_cast_from_f32(f32 value, u32 dtype) {
+    switch (dtype) {
+        case DTYPE_F32: return value;
+        case DTYPE_F16: return f16_bits_to_f32(f32_to_f16_bits(value));
+        case DTYPE_I32: return (f32)(i32)value;
+        case DTYPE_U32: return (f32)(u32)value;
+        default: return value;
+    }
+}
+
 #define MAX_DIM 8
 #define MAX_TENSORS 16384
 
@@ -483,7 +583,7 @@ static inline const View *st_get(u64 heap_loc) {
 #define FUSE_MAX_OPS    64
 #define FUSE_MAX_LEAVES 64
 
-typedef struct { u32 uop; u32 arg_a; u32 arg_b; } FusedOp;
+typedef struct { u32 uop; u32 arg_a; u32 arg_b; u32 aux; } FusedOp;
 typedef struct {
     u8 is_reduce[MAX_DIM];
     u32 reduce_type;
@@ -518,6 +618,7 @@ typedef struct {
     u32        leaf_ids[FUSE_MAX_LEAVES];
     u8         leaf_kinds[FUSE_MAX_LEAVES];
     f32        leaf_nums[FUSE_MAX_LEAVES];
+    u32        leaf_dtypes[FUSE_MAX_LEAVES];
     View       leaf_views[FUSE_MAX_LEAVES]; u32 n_leaves;
     ShapeTracker leaf_sts[FUSE_MAX_LEAVES]; // multi-view STs for cross-rank indexing
     Shape      full_shape;       // ew iteration domain
@@ -635,13 +736,18 @@ struct Backend {
 
     // UOp dispatch — the only compute primitives a backend must implement
     void  (*op_unary)(u32 uop, u32 dst, const View *dv,
-                      u32 src, const View *sv);
+                      u32 dst_dtype,
+                      u32 src, const View *sv, u32 src_dtype);
     void  (*op_binary)(u32 uop, u32 dst, const View *dv,
-                       u32 a, const View *av, u32 b, const View *bv);
-    void  (*op_mm)(u32 dst, u32 a, const View *av, u32 b, const View *bv,
+                       u32 dst_dtype,
+                       u32 a, const View *av, u32 a_dtype,
+                       u32 b, const View *bv, u32 b_dtype);
+    void  (*op_mm)(u32 dst, u32 dst_dtype,
+                   u32 a, const View *av, u32 a_dtype, u32 b, const View *bv, u32 b_dtype,
                    u32 M, u32 K, u32 N);
     void  (*op_reduce)(u32 uop, u32 dst, u32 dst_numel,
-                       u32 src, u32 src_numel, u32 reduce_dim);
+                       u32 dst_dtype,
+                       u32 src, u32 src_numel, u32 src_dtype, u32 reduce_dim);
 
     // Advanced dispatch (optional — NULL means unsupported, fall back to CPU)
     void  (*dispatch_kernel_rs)(u32 out_buf,
@@ -649,7 +755,8 @@ struct Backend {
                                 const ShapeTracker *const *leaf_sts, u32 n_leaves,
                                 FusedOp *ops, u32 n_ops,
                                 const Shape *full_shape, const ReduceSpec *reduce,
-                                u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs);
+                                u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs,
+                                const u32 *leaf_dtypes, u32 out_dtype);
     void  (*contiguify)(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view);
     void  (*buf_copy)(u32 dst_buf, u32 src_buf, u64 nbytes);
     void  (*buf_read_nosync)(u32 id, void *out, u64 bytes);
@@ -877,9 +984,22 @@ Term     thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps);
 
 // Tensor API
 Term     thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s);
+Term     thvm_tensor_typed(TinyHVM *ctx, const void *data, Shape s, u32 dtype);
+Term     thvm_tensor_i32(TinyHVM *ctx, const i32 *data, Shape s);
+Term     thvm_tensor_u32(TinyHVM *ctx, const u32 *data, Shape s);
 Term     thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b);
 void     thvm_realize(TinyHVM *ctx, Term t);
 f32     *thvm_to_host(TinyHVM *ctx, Term t);
+i32     *thvm_to_host_i32(TinyHVM *ctx, Term t);
+u32     *thvm_to_host_u32(TinyHVM *ctx, Term t);
+void    *thvm_to_host_raw(TinyHVM *ctx, Term t, u32 *out_dtype, Shape *out_shape);
+
+Term     thvm_scalar(TinyHVM *ctx, f32 val);
+Term     thvm_scalar_typed(TinyHVM *ctx, f32 val, u32 dtype);
+Term     thvm_scalar_i32(TinyHVM *ctx, i32 val);
+Term     thvm_scalar_u32(TinyHVM *ctx, u32 val);
+f32      thvm_scalar_val(TinyHVM *ctx, Term t);
+Term     thvm_cast(TinyHVM *ctx, Term t, u32 dtype);
 
 // Movement ops (lazy — modify View, share buffer)
 Term     thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape);

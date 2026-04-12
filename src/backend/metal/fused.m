@@ -7,7 +7,8 @@ void metal_dispatch_kernel_rs(u32 out_buf,
                                FusedOp *ops, u32 n_ops,
                                const Shape *full_shape,
                                const ReduceSpec *reduce,
-                               u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs);
+                               u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs,
+                               const u32 *leaf_dtypes, u32 out_dtype);
 
 typedef struct {
     uint32_t n_reduce;
@@ -92,6 +93,7 @@ static u64 fuse_hash_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves) {
         h ^= ops[i].uop; h *= 0x100000001b3ULL;
         h ^= ops[i].arg_a; h *= 0x100000001b3ULL;
         h ^= ops[i].arg_b; h *= 0x100000001b3ULL;
+        h ^= ops[i].aux; h *= 0x100000001b3ULL;
     }
     return h;
 }
@@ -157,6 +159,14 @@ static NSString *codegen_fused_v2(const FusedOp *ops, u32 n_ops, u32 n_leaves, i
                 case UOP_EXP:  [src appendFormat:@"%@float t%u = exp(t%u);\n", indent, tid, a]; break; \
                 case UOP_LOG:  [src appendFormat:@"%@float t%u = log(t%u);\n", indent, tid, a]; break; \
                 case UOP_SQRT: [src appendFormat:@"%@float t%u = sqrt(t%u);\n", indent, tid, a]; break; \
+                case UOP_CAST: \
+                    switch (ops[i].aux) { \
+                        case DTYPE_F16: [src appendFormat:@"%@float t%u = float(half(t%u));\n", indent, tid, a]; break; \
+                        case DTYPE_I32: [src appendFormat:@"%@float t%u = float(int(t%u));\n", indent, tid, a]; break; \
+                        case DTYPE_U32: [src appendFormat:@"%@float t%u = float(uint(t%u));\n", indent, tid, a]; break; \
+                        default:        [src appendFormat:@"%@float t%u = t%u;\n", indent, tid, a]; break; \
+                    } \
+                    break; \
                 default:       [src appendFormat:@"%@float t%u = t%u;\n", indent, tid, a]; break; \
             } \
         }
@@ -225,7 +235,8 @@ void metal_dispatch_fused_rs(u32 out_buf,
                                const Shape *full_shape,
                                const ReduceSpec *reduce) {
     metal_dispatch_kernel_rs(out_buf, leaf_bufs, leaf_views, NULL, n_leaves,
-                              ops, n_ops, full_shape, reduce, NULL, NULL, 0);
+                              ops, n_ops, full_shape, reduce, NULL, NULL, 0,
+                              NULL, DTYPE_F32);
 }
 
 // ============================================================

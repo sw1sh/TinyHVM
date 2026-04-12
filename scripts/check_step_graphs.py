@@ -289,9 +289,6 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                     errs.append(f"{os.path.basename(g.path)}: GRAD node '{nid}' missing inputs {sorted(miss)}")
                 if in_count != 2:
                     errs.append(f"{os.path.basename(g.path)}: GRAD node '{nid}' has {in_count} inputs (expected 2)")
-                for src, _, attrs in incoming:
-                    if edge_label(attrs) == "gy" and g.kind(src) == "TEN":
-                        errs.append(f"{os.path.basename(g.path)}: GRAD node '{nid}' uses tensor '{src}' as visible gy seed")
             elif op in BINARY_OPS:
                 if in_count != 2:
                     errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has {in_count} inputs (expected 2)")

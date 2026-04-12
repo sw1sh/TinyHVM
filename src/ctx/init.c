@@ -17,10 +17,15 @@ TinyHVM *thvm_init(const char *default_device) {
     // Register Metal backend if available and requested
     #ifdef __APPLE__
     if (default_device && (strcmp(default_device, "metal") == 0 || strcmp(default_device, "gpu") == 0)) {
-        ctx->backends[THVM_DEV_METAL] = &metal_backend;
-        ctx->n_backends = 2;
-        ctx->default_device = THVM_DEV_METAL;
-        if (metal_backend.init) metal_backend.init();
+        int metal_ok = 1;
+        if (metal_backend.init) metal_ok = (metal_backend.init() == 0);
+        if (metal_ok) {
+            ctx->backends[THVM_DEV_METAL] = &metal_backend;
+            ctx->n_backends = 2;
+            ctx->default_device = THVM_DEV_METAL;
+        } else {
+            fprintf(stderr, "TinyHVM: requested metal backend unavailable; using cpu\n");
+        }
     }
     #else
     (void)default_device;
@@ -118,18 +123,31 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
 }
 
 Term thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s) {
-    u32 id = tensor_create(ctx, s, DTYPE_F32);
+    return thvm_tensor_typed(ctx, data, s, DTYPE_F32);
+}
+
+Term thvm_tensor_typed(TinyHVM *ctx, const void *data, Shape s, u32 dtype) {
+    u32 id = tensor_create(ctx, s, dtype);
     TensorMeta *m = &ctx->tensors[id];
     if (m->backend && data) {
-        m->backend->buf_write(m->buf_id, data, (u64)m->view.numel * dtype_size(m->dtype));
+        m->backend->buf_write(m->buf_id, data, (u64)m->view.numel * dtype_size(dtype));
     }
-    // Cache host data for small metadata tensors (shapes, axes, permutations).
-    // This allows shape tracking in thvm_op to read data without GPU buffer access.
-    if (data && m->view.numel <= MAX_DIM) {
-        m->host_ptr = malloc(m->view.numel * sizeof(f32));
-        memcpy(m->host_ptr, data, m->view.numel * sizeof(f32));
+    // Cache small host payloads (including shape/axes/pairs metadata) so shape
+    // tracking and debug code can read them without GPU round-trips.
+    if (data && m->view.numel <= MAX_DIM * 2) {
+        size_t bytes = (size_t)m->view.numel * dtype_size(dtype);
+        m->host_ptr = malloc(bytes);
+        memcpy(m->host_ptr, data, bytes);
     }
-    return term_ten(id, DTYPE_F32);
+    return term_ten(id, dtype);
+}
+
+Term thvm_tensor_i32(TinyHVM *ctx, const i32 *data, Shape s) {
+    return thvm_tensor_typed(ctx, data, s, DTYPE_I32);
+}
+
+Term thvm_tensor_u32(TinyHVM *ctx, const u32 *data, Shape s) {
+    return thvm_tensor_typed(ctx, data, s, DTYPE_U32);
 }
 
 // Get the output view of any term (TAG_TEN or TAG_TOP with shape tracking)
@@ -142,10 +160,51 @@ static const View *term_view(TinyHVM *ctx, Term t) {
     return NULL;
 }
 
-// Read cached metadata from a TAG_TEN's host_ptr (no GPU access).
-// Returns NULL if not cached.
-static const f32 *tensor_host_f32(TinyHVM *ctx, u32 tid) {
-    return (const f32 *)ctx->tensors[tid].host_ptr;
+// Read small metadata tensors (shape/axes/pairs) as u32 values.
+// Accepts legacy f32 metadata and new i32/u32 metadata.
+static u32 tensor_meta_read_u32(TinyHVM *ctx, u32 tid, u32 *out, u32 max_n) {
+    if (tid >= ctx->tensor_count) return 0;
+    TensorMeta *m = &ctx->tensors[tid];
+    u32 n = m->view.numel;
+    if (n == 0 || n > max_n) return 0;
+
+    switch (m->dtype) {
+        case DTYPE_I32: {
+            i32 tmp[MAX_DIM * 2];
+            const i32 *src = (const i32 *)m->host_ptr;
+            if (!src) {
+                if (!m->backend) return 0;
+                META_READ(m->backend, m->buf_id, tmp, n * sizeof(i32));
+                src = tmp;
+            }
+            for (u32 i = 0; i < n; i++) out[i] = (u32)src[i];
+            return n;
+        }
+        case DTYPE_U32: {
+            u32 tmp[MAX_DIM * 2];
+            const u32 *src = (const u32 *)m->host_ptr;
+            if (!src) {
+                if (!m->backend) return 0;
+                META_READ(m->backend, m->buf_id, tmp, n * sizeof(u32));
+                src = tmp;
+            }
+            memcpy(out, src, n * sizeof(u32));
+            return n;
+        }
+        case DTYPE_F32: {
+            f32 tmp[MAX_DIM * 2];
+            const f32 *src = (const f32 *)m->host_ptr;
+            if (!src) {
+                if (!m->backend) return 0;
+                META_READ(m->backend, m->buf_id, tmp, n * sizeof(f32));
+                src = tmp;
+            }
+            for (u32 i = 0; i < n; i++) out[i] = (u32)src[i];
+            return n;
+        }
+        default:
+            return 0;
+    }
 }
 
 // Check if a term is a lazy elementwise op (not a chain — just 1 op with TAG_TEN args)
@@ -333,11 +392,11 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
 
         // View ops: output shape deterministic from metadata
         if (term_tag(b) == TAG_TEN) {
-            const f32 *bf = tensor_host_f32(ctx, (u32)term_val(b));
-            u32 bn = bf ? ctx->tensors[(u32)term_val(b)].view.numel : 0;
-            if (bf && uop == UOP_RESHAPE) {
+            u32 bf[MAX_DIM * 2];
+            u32 bn = tensor_meta_read_u32(ctx, (u32)term_val(b), bf, MAX_DIM * 2);
+            if (bn && uop == UOP_RESHAPE) {
                 Shape ns = {.rank = bn}; u32 nn = 1;
-                for (u32 i = 0; i < bn; i++) { ns.dims[i] = (u32)bf[i]; nn *= ns.dims[i]; }
+                for (u32 i = 0; i < bn; i++) { ns.dims[i] = bf[i]; nn *= ns.dims[i]; }
                 // Use ShapeTracker composition: merges if possible, pushes new view if not
                 const ShapeTracker *input_st = st_get_tracker(term_val(a));
                 if (input_st && va && nn == va->numel) {
@@ -351,7 +410,7 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
                     st_set(loc, &out);
                 }
                 stored = 1;
-            } else if (bf && uop == UOP_EXPAND) {
+            } else if (bn && uop == UOP_EXPAND) {
                 // Compose expand onto input's ShapeTracker
                 const ShapeTracker *input_st = st_get_tracker(term_val(a));
                 if (input_st && va) {
@@ -362,16 +421,16 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
                     st_set_tracker(loc, &composed);
                 } else {
                     Shape ns = {.rank = bn};
-                    for (u32 i = 0; i < bn; i++) ns.dims[i] = (u32)bf[i];
+                    for (u32 i = 0; i < bn; i++) ns.dims[i] = bf[i];
                     out = view_create(ns);
                     st_set(loc, &out);
                 }
                 stored = 1;
-            } else if (bf && uop == UOP_SHRINK) {
+            } else if (bn && uop == UOP_SHRINK) {
                 // Compose shrink onto input's ShapeTracker
                 u32 ndim = bn / 2;
                 u32 starts[MAX_DIM], ends[MAX_DIM];
-                for (u32 i = 0; i < ndim; i++) { starts[i] = (u32)bf[i*2]; ends[i] = (u32)bf[i*2+1]; }
+                for (u32 i = 0; i < ndim; i++) { starts[i] = bf[i*2]; ends[i] = bf[i*2+1]; }
                 const ShapeTracker *input_st = st_get_tracker(term_val(a));
                 if (input_st && va) {
                     ShapeTracker composed = st_shrink(*input_st, starts, ends, ndim);
@@ -383,11 +442,11 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
                     st_set(loc, &out);
                 }
                 stored = 1;
-            } else if (bf && uop == UOP_PAD) {
+            } else if (bn && uop == UOP_PAD) {
                 // Compose pad onto input's ShapeTracker
                 u32 ndim = bn / 2;
                 u32 pb[MAX_DIM], pa[MAX_DIM];
-                for (u32 i = 0; i < ndim; i++) { pb[i] = (u32)bf[i*2]; pa[i] = (u32)bf[i*2+1]; }
+                for (u32 i = 0; i < ndim; i++) { pb[i] = bf[i*2]; pa[i] = bf[i*2+1]; }
                 const ShapeTracker *input_st = st_get_tracker(term_val(a));
                 if (input_st && va) {
                     ShapeTracker composed = st_pad(*input_st, pb, pa);
@@ -402,10 +461,10 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
                     st_set(loc, &out);
                 }
                 stored = 1;
-            } else if (bf && uop == UOP_PERMUTE && va) {
+            } else if (bn && uop == UOP_PERMUTE && va) {
                 // Compose permute onto input's ShapeTracker
                 u32 axes[MAX_DIM];
-                for (u32 i = 0; i < bn; i++) axes[i] = (u32)bf[i];
+                for (u32 i = 0; i < bn; i++) axes[i] = bf[i];
                 const ShapeTracker *input_st = st_get_tracker(term_val(a));
                 if (input_st) {
                     ShapeTracker composed = st_permute(*input_st, axes, bn);
@@ -416,12 +475,12 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
                 }
                 stored = 1;
             } else if ((uop == UOP_SUM || uop == UOP_RMAX)) {
-                if (bf) {
+                if (bn) {
                 if (!va) goto skip_sum;
                 // va available:
                 out = *va;
                 for (u32 i = 0; i < bn; i++) {
-                    u32 ax = (u32)bf[i];
+                    u32 ax = bf[i];
                     if (ax < out.shape.rank) out.shape.dims[ax] = 1;
                 }
                 out = view_create(out.shape);
@@ -449,6 +508,13 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
             }
         }
 
+        // CAST preserves the logical view; only dtype changes.
+        if (!stored && uop == UOP_CAST && va) {
+            out = *va;
+            st_set(loc, &out);
+            stored = 1;
+        }
+
         // Elementwise: broadcast if both views available, propagate if one
         if (!stored && is_elementwise(uop)) {
             const View *vb = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
@@ -466,6 +532,10 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
     }
 
     return term_top(uop, loc);
+}
+
+Term thvm_cast(TinyHVM *ctx, Term t, u32 dtype) {
+    return thvm_op(ctx, UOP_CAST, t, thvm_scalar_u32(ctx, dtype));
 }
 
 // Matmul: [M,K] @ [K,N] → [M,N]. Decomposed to EXPAND+MUL+SUM primitives.
@@ -495,16 +565,16 @@ Term thvm_mm(TinyHVM *ctx, Term a, Term b) {
 // Matches tinygrad's .sum(axis=[...]) — the axes tensor is stored as the
 // second heap slot, just like reshape stores shape.
 Term thvm_sum_axes(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes) {
-    f32 axes_f[MAX_DIM];
-    for (u32 i = 0; i < n_axes; i++) axes_f[i] = (f32)axes[i];
-    Term axes_t = thvm_tensor(ctx, axes_f, SHAPE(n_axes));
+    i32 axes_i[MAX_DIM];
+    for (u32 i = 0; i < n_axes; i++) axes_i[i] = (i32)axes[i];
+    Term axes_t = thvm_tensor_i32(ctx, axes_i, SHAPE(n_axes));
     return thvm_op(ctx, UOP_SUM, x, axes_t);
 }
 
 Term thvm_rmax_axes(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes) {
-    f32 axes_f[MAX_DIM];
-    for (u32 i = 0; i < n_axes; i++) axes_f[i] = (f32)axes[i];
-    Term axes_t = thvm_tensor(ctx, axes_f, SHAPE(n_axes));
+    i32 axes_i[MAX_DIM];
+    for (u32 i = 0; i < n_axes; i++) axes_i[i] = (i32)axes[i];
+    Term axes_t = thvm_tensor_i32(ctx, axes_i, SHAPE(n_axes));
     return thvm_op(ctx, UOP_RMAX, x, axes_t);
 }
 
@@ -538,9 +608,9 @@ Term thvm_reshape(TinyHVM *ctx, Term t, Shape new_shape) {
         return term_ten(id, m->dtype);
     }
 lazy:;
-    { f32 dims[MAX_DIM];
-    for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (f32)new_shape.dims[i];
-    Term shape_t = thvm_tensor(ctx, dims, SHAPE(new_shape.rank));
+    { i32 dims[MAX_DIM];
+    for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (i32)new_shape.dims[i];
+    Term shape_t = thvm_tensor_i32(ctx, dims, SHAPE(new_shape.rank));
     // thvm_op composes ShapeTracker via st_reshape — always succeeds.
     return thvm_op(ctx, UOP_RESHAPE, t, shape_t); }
 }
@@ -583,9 +653,9 @@ Term thvm_expand(TinyHVM *ctx, Term t, Shape new_shape) {
         return term_ten(id, m->dtype);
     }
 expand_lazy:;
-    { f32 dims[MAX_DIM];
-    for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (f32)new_shape.dims[i];
-    Term shape_t = thvm_tensor(ctx, dims, SHAPE(new_shape.rank));
+    { i32 dims[MAX_DIM];
+    for (u32 i = 0; i < new_shape.rank; i++) dims[i] = (i32)new_shape.dims[i];
+    Term shape_t = thvm_tensor_i32(ctx, dims, SHAPE(new_shape.rank));
     Term r = thvm_op(ctx, UOP_EXPAND, t, shape_t);
     const View *iv = (term_tag(t)==TAG_TEN) ? &ctx->tensors[(u32)term_val(t)].view : st_get(term_val(t));
     if (iv) { View ov = *iv; ov.shape = new_shape; ov.numel = 1;
@@ -612,17 +682,17 @@ Term thvm_permute(TinyHVM *ctx, Term t, const u32 *axes, u32 rank) {
         ctx->tensors[id].creator_op = UOP_PERMUTE;
         ctx->tensors[id].src_ids[0] = src_id;
         // Store axes in src_ids[1] as tensor for backward (need this for inverse permute)
-        f32 axes_f[MAX_DIM];
-        for (u32 i = 0; i < rank; i++) axes_f[i] = (f32)axes[i];
-        Term axes_t = thvm_tensor(ctx, axes_f, SHAPE(rank));
+        i32 axes_i[MAX_DIM];
+        for (u32 i = 0; i < rank; i++) axes_i[i] = (i32)axes[i];
+        Term axes_t = thvm_tensor_i32(ctx, axes_i, SHAPE(rank));
         ctx->tensors[id].src_ids[1] = (u32)term_val(axes_t);
         if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
     }
 permute_lazy:;
-    { f32 axes_f[MAX_DIM];
-    for (u32 i = 0; i < rank; i++) axes_f[i] = (f32)axes[i];
-    Term axes_t = thvm_tensor(ctx, axes_f, SHAPE(rank));
+    { i32 axes_i[MAX_DIM];
+    for (u32 i = 0; i < rank; i++) axes_i[i] = (i32)axes[i];
+    Term axes_t = thvm_tensor_i32(ctx, axes_i, SHAPE(rank));
     Term r = thvm_op(ctx, UOP_PERMUTE, t, axes_t);
     const View *iv = (term_tag(t)==TAG_TEN) ? &ctx->tensors[(u32)term_val(t)].view : st_get(term_val(t));
     if (iv) { View ov = view_permute(*iv, axes); st_set(term_val(r), &ov); }
@@ -650,9 +720,9 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         ctx->tensors[id].view = view_pad(m->view, pad_before, pad_after);
         ctx->tensors[id].creator_op = UOP_PAD;
         ctx->tensors[id].src_ids[0] = src_id;
-        f32 pairs_f[MAX_DIM * 2];
-        for (u32 i2 = 0; i2 < ndim * 2; i2++) pairs_f[i2] = (f32)pairs[i2];
-        Term pt = thvm_tensor(ctx, pairs_f, SHAPE(ndim * 2));
+        i32 pairs_i[MAX_DIM * 2];
+        for (u32 i2 = 0; i2 < ndim * 2; i2++) pairs_i[i2] = (i32)pairs[i2];
+        Term pt = thvm_tensor_i32(ctx, pairs_i, SHAPE(ndim * 2));
         ctx->tensors[id].src_ids[1] = (u32)term_val(pt);
         if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
@@ -660,9 +730,9 @@ Term thvm_pad(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
 pad_lazy:;
     { u32 pb[MAX_DIM], pa[MAX_DIM];
     for (u32 i=0;i<ndim;i++){pb[i]=pairs[i*2];pa[i]=pairs[i*2+1];}
-    f32 pairs_f[MAX_DIM * 2];
-    for (u32 i = 0; i < ndim * 2; i++) pairs_f[i] = (f32)pairs[i];
-    Term pairs_t = thvm_tensor(ctx, pairs_f, SHAPE(ndim * 2));
+    i32 pairs_i[MAX_DIM * 2];
+    for (u32 i = 0; i < ndim * 2; i++) pairs_i[i] = (i32)pairs[i];
+    Term pairs_t = thvm_tensor_i32(ctx, pairs_i, SHAPE(ndim * 2));
     Term r = thvm_op(ctx, UOP_PAD, t, pairs_t);
     const View *iv = (term_tag(t)==TAG_TEN) ? &ctx->tensors[(u32)term_val(t)].view : st_get(term_val(t));
     if (iv) { View ov = view_pad(*iv, pb, pa); st_set(term_val(r), &ov); }
@@ -701,9 +771,9 @@ Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
         ctx->tensors[id].creator_op = UOP_SHRINK;
         ctx->tensors[id].src_ids[0] = src_id;
         // Store pairs as tensor for backward
-        f32 shrink_f[MAX_DIM * 2];
-        for (u32 i2 = 0; i2 < ndim * 2; i2++) shrink_f[i2] = (f32)pairs[i2];
-        Term st = thvm_tensor(ctx, shrink_f, SHAPE(ndim * 2));
+        i32 shrink_i[MAX_DIM * 2];
+        for (u32 i2 = 0; i2 < ndim * 2; i2++) shrink_i[i2] = (i32)pairs[i2];
+        Term st = thvm_tensor_i32(ctx, shrink_i, SHAPE(ndim * 2));
         ctx->tensors[id].src_ids[1] = (u32)term_val(st);
         if (m->requires_grad) ctx->tensors[id].requires_grad = 1;
         return term_ten(id, m->dtype);
@@ -711,9 +781,9 @@ Term thvm_shrink(TinyHVM *ctx, Term t, const u32 *pairs, u32 ndim) {
 shrink_lazy:;
     { u32 ss[MAX_DIM], se[MAX_DIM];
     for (u32 i=0;i<ndim;i++){ss[i]=pairs[i*2];se[i]=pairs[i*2+1];}
-    f32 pairs_f[MAX_DIM * 2];
-    for (u32 i = 0; i < ndim * 2; i++) pairs_f[i] = (f32)pairs[i];
-    Term pairs_t = thvm_tensor(ctx, pairs_f, SHAPE(ndim * 2));
+    i32 pairs_i[MAX_DIM * 2];
+    for (u32 i = 0; i < ndim * 2; i++) pairs_i[i] = (i32)pairs[i];
+    Term pairs_t = thvm_tensor_i32(ctx, pairs_i, SHAPE(ndim * 2));
     Term r = thvm_op(ctx, UOP_SHRINK, t, pairs_t);
     const View *iv = (term_tag(t)==TAG_TEN) ? &ctx->tensors[(u32)term_val(t)].view : st_get(term_val(t));
     if (iv) { View ov = view_shrink(*iv, ss, se); st_set(term_val(r), &ov); }

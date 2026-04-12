@@ -61,12 +61,9 @@ static inline int reduce_top_has_add_zero_arg(TinyHVM *ctx, Term t) {
 }
 
 static inline int reduce_top_direct_uop(u32 uop) {
-    return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_IFZ ||
-           uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_CAST ||
-           uop == UOP_DETACH ||
-           uop == UOP_WHERE ||
-           uop == UOP_KERNEL ||
-           uop == UOP_FUSE || uop == UOP_SCHED;
+    // ALL compute ops are direct — reducer reduces their args then fires.
+    // With FUSE propagation, compute ops dispatch when args reach TAG_TEN.
+    return 1;
 }
 
 static inline u32 reduce_net_term_arity(Term t) {

@@ -138,128 +138,73 @@
                 }
             }
 
-            // UOP_FUSE: LOCAL lowering — fuses one compute root into KERNEL.
-            // Distributes through SEQ/CTR/ASSIGN by wrapping children in FUSE.
-            // Fusion is an IC interaction — no global sched_all walk.
+            // UOP_FUSE: propagating IC agent — like GRAD but for fusion.
+            // Propagates through compute ops, wrapping children in FUSE.
+            // When all children are TAG_TEN, creates UOP_KERNEL and dispatches.
+            // Distributes through SEQ/CTR/ASSIGN transparently.
             if (uop == UOP_FUSE) {
                 Term payload = heap_read(ctx, loc);
                 u8 ptag = term_tag(payload);
 
+                // TAG_TEN/ERA/NUM: leaf — pass through (nothing to fuse)
+                if (ptag == TAG_TEN || ptag == TAG_ERA || ptag == TAG_NUM)
+                    RETURN_REDUCED(payload);
+
+                // TAG_TOP: dispatch by UOP
                 if (ptag == TAG_TOP) {
                     u32 puop = term_ext(payload);
 
-                    // Already fused or meta-op — pass through
+                    // Already fused or meta — pass through
                     if (puop == UOP_KERNEL || puop == UOP_FUSE || puop == UOP_SCHED)
                         RETURN_REDUCED(payload);
 
-                    // ASSIGN: eagerly fuse the src expression
+                    // ASSIGN: wrap src in FUSE, pass through
                     if (puop == UOP_ASSIGN) {
                         u64 aloc = term_val(payload);
                         Term src = heap_read(ctx, aloc + 1);
-                        // Recursively fuse by wrapping src in FUSE and reducing
-                        if (term_tag(src) == TAG_TOP && term_ext(src) != UOP_KERNEL &&
-                            term_ext(src) != UOP_FUSE) {
-                            u64 floc = heap_alloc(ctx, 1);
-                            heap_set(ctx, floc, src);
-                            Term fused = thvm_reduce(ctx, term_new(TAG_TOP, UOP_FUSE, floc));
-                            heap_set(ctx, aloc + 1, fused);
+                        if (term_tag(src) != TAG_TEN && term_tag(src) != TAG_ERA &&
+                            !(term_tag(src) == TAG_TOP && term_ext(src) == UOP_KERNEL)) {
+                            u64 fl = heap_alloc(ctx, 1);
+                            heap_set(ctx, fl, src);
+                            heap_set(ctx, aloc + 1, term_new(TAG_TOP, UOP_FUSE, fl));
                         }
                         RETURN_REDUCED(payload);
                     }
 
-                    // Compute op (MUL, ADD, SUM, etc.): fuse into KERNEL
-                    {
-                        extern KernelEntry sched_kernels[];
-                        extern u32 sched_kernel_count;
-                        extern Term kid_results[];
-                        extern u32 kid_n_inputs[];
-                        extern u32 fuse_n_assign_deps;
-                        extern Term fuse_assign_deps[];
-                        extern int fuse_no_lazy_resolve;
+                    // Compute op (MUL, ADD, SUM, etc.): wrap children in FUSE
+                    // and convert this op into a single-op KERNEL.
+                    // Multi-op fusion is a future optimization.
+                    if (is_elementwise(puop) || puop == UOP_SUM || puop == UOP_RMAX) {
+                        u64 ploc = term_val(payload);
+                        u32 arity = is_binary(puop) ? 2 : 1;
 
-                        KernelEntry ke;
-                        memset(&ke, 0, sizeof(ke));
-                        fuse_n_assign_deps = 0;
-
-                        // Set up minimal fuse state for local build
-                        fuse_set_schedule_boundaries(NULL, NULL, NULL, 0, term_val(payload));
-                        fuse_no_lazy_resolve = 1;
-
-                        // Build kernel from this single compute root
-                        if (!fuse_build_kernel(ctx, payload, &ke)) {
-                            if (getenv("THVM_SCHED_DIAG"))
-                                fprintf(stderr, "  local_fuse_fail: fc=%d\n", ke.fail_code);
-                            fuse_clear_schedule_boundaries();
-                            fuse_no_lazy_resolve = 0;
-                            RETURN_REDUCED(payload); // can't fuse — pass through
-                        }
-
-                        // Allocate kid and store kernel spec
-                        u32 kid = sched_kernel_count++;
-                        ke.original_term = payload;
-                        sched_kernels[kid] = ke;
-                        kid_results[kid] = term_era();
-                        kid_n_inputs[kid] = 0;
-
-                        // Create output tensor (unbacked)
-                        u32 out_tid = tensor_create_unbacked(ctx,
-                            ke.out_shape, DTYPE_F32);
-                        ctx->tensors[out_tid].creator_op = UOP_KERNEL;
-                        ke.output_tid = out_tid;
-                        ke.raw_output_tid = out_tid;
-                        sched_kernels[kid] = ke;
-
-                        // Install UOP_KERNEL node
-                        u64 kloc = heap_alloc(ctx, 2);
-                        heap_set(ctx, kloc, term_era());
-                        heap_set(ctx, kloc + 1, term_num_u32(kid));
-                        Term ft = term_new(TAG_TOP, UOP_KERNEL, kloc);
-
-                        // Copy shape metadata
-                        View fv = view_create(ke.out_shape);
-                        st_set(kloc, &fv);
-
-                        // Save ASSIGN deps before recursive fuse clobbers them
-                        u32 saved_n = fuse_n_assign_deps;
-                        Term saved_deps[16];
-                        for (u32 i = 0; i < saved_n && i < 16; i++)
-                            saved_deps[i] = fuse_assign_deps[i];
-
-                        // Recursively fuse ASSIGN deps' sources
-                        for (u32 i = 0; i < saved_n; i++) {
-                            Term adep = saved_deps[i];
-                            if (term_tag(adep) == TAG_TOP && term_ext(adep) == UOP_ASSIGN) {
-                                u64 aloc2 = term_val(adep);
-                                Term asrc = heap_read(ctx, aloc2 + 1);
-                                if (term_tag(asrc) == TAG_TOP && term_ext(asrc) != UOP_KERNEL &&
-                                    term_ext(asrc) != UOP_FUSE) {
-                                    u64 fl2 = heap_alloc(ctx, 1);
-                                    heap_set(ctx, fl2, asrc);
-                                    Term fused2 = thvm_reduce(ctx, term_new(TAG_TOP, UOP_FUSE, fl2));
-                                    heap_set(ctx, aloc2 + 1, fused2);
-                                }
+                        // Wrap each child in FUSE
+                        for (u32 i = 0; i < arity; i++) {
+                            Term child = heap_read(ctx, ploc + i);
+                            if (term_tag(child) != TAG_TEN && term_tag(child) != TAG_NUM &&
+                                term_tag(child) != TAG_ERA &&
+                                !(term_tag(child) == TAG_TOP && term_ext(child) == UOP_KERNEL)) {
+                                u64 fl = heap_alloc(ctx, 1);
+                                heap_set(ctx, fl, child);
+                                heap_set(ctx, ploc + i, term_new(TAG_TOP, UOP_FUSE, fl));
                             }
                         }
-
-                        // Wrap with SEQ for ASSIGN deps
-                        for (u32 i = 0; i < saved_n; i++)
-                            ft = thvm_seq(ctx, saved_deps[i], ft);
-
-                        fuse_clear_schedule_boundaries();
-                        fuse_no_lazy_resolve = 0;
-                        if (getenv("THVM_SCHED_DIAG"))
-                            fprintf(stderr, "  local_fuse_ok: kid=%u ft_tag=%u ft_ext=%u\n",
-                                    kid, term_tag(ft), term_ext(ft));
-                        RETURN_REDUCED(ft);
+                        // Return the compute op — its children are now FUSE-wrapped.
+                        // The reducer will reduce the FUSE children to TAG_TEN,
+                        // then the compute op will have TAG_TEN inputs and can dispatch.
+                        RETURN_REDUCED(payload);
                     }
+
+                    // Other TAG_TOP (LOG_PRINT, IFZ, etc.): pass through
+                    RETURN_REDUCED(payload);
                 }
 
-                // SEQ: distribute → SEQ(FUSE(a), FUSE(b))
+                // TAG_SEQ: distribute → SEQ(FUSE(a), FUSE(b))
                 if (ptag == TAG_SEQ) {
                     u64 sloc = term_val(payload);
                     for (u32 i = 0; i < 2; i++) {
                         Term c = heap_read(ctx, sloc + i);
-                        if (term_tag(c) == TAG_TOP && term_ext(c) != UOP_KERNEL) {
+                        if (term_tag(c) != TAG_TEN && term_tag(c) != TAG_ERA) {
                             u64 fl = heap_alloc(ctx, 1);
                             heap_set(ctx, fl, c);
                             heap_set(ctx, sloc + i, term_new(TAG_TOP, UOP_FUSE, fl));
@@ -268,13 +213,13 @@
                     RETURN_REDUCED(payload);
                 }
 
-                // CTR: distribute → CTR(FUSE(c0), FUSE(c1), ...)
+                // TAG_CTR: distribute → CTR(FUSE(c0), FUSE(c1), ...)
                 if (ptag == TAG_CTR) {
                     u64 cloc = term_val(payload);
                     u32 arity = term_ext(payload);
                     for (u32 i = 0; i < arity; i++) {
                         Term c = heap_read(ctx, cloc + i);
-                        if (term_tag(c) == TAG_TOP && term_ext(c) != UOP_KERNEL) {
+                        if (term_tag(c) != TAG_TEN && term_tag(c) != TAG_ERA) {
                             u64 fl = heap_alloc(ctx, 1);
                             heap_set(ctx, fl, c);
                             heap_set(ctx, cloc + i, term_new(TAG_TOP, UOP_FUSE, fl));
@@ -283,7 +228,13 @@
                     RETURN_REDUCED(payload);
                 }
 
-                // Atoms (TEN, ERA, NUM, etc.): pass through
+                // DP0/DP1: propagate through DUP projections
+                if (ptag == TAG_DP0 || ptag == TAG_DP1) {
+                    // Let the reducer resolve the DP first, then re-fuse
+                    RETURN_REDUCED(payload);
+                }
+
+                // Anything else: pass through
                 RETURN_REDUCED(payload);
             }
 
@@ -1017,5 +968,38 @@
 
             if (!ctx_default_backend(ctx)) return t;
 
-            // Compute ops stay as TAG_TOP. Scheduler rewrites to UOP_KERNEL.
-            return t;
+            // Compute ops: dispatch directly when args are TAG_TEN.
+            // Single-op dispatch via fuse_build_kernel + backend.
+            // FUSE propagation ensures inputs are TAG_TEN before we get here.
+            {
+                extern KernelEntry sched_kernels[];
+                extern u32 sched_kernel_count;
+                extern Term kid_results[];
+                extern u32 kid_n_inputs[];
+
+                KernelEntry ke;
+                memset(&ke, 0, sizeof(ke));
+                fuse_set_schedule_boundaries(NULL, NULL, NULL, 0, term_val(t));
+                if (!fuse_build_kernel(ctx, t, &ke)) {
+                    fuse_clear_schedule_boundaries();
+                    return t; // can't fuse — stay WNF
+                }
+                fuse_clear_schedule_boundaries();
+
+                u32 kid = sched_kernel_count++;
+                ke.original_term = t;
+                sched_kernels[kid] = ke;
+                kid_results[kid] = term_era();
+                kid_n_inputs[kid] = 0;
+
+                u32 out_tid = tensor_create_unbacked(ctx, ke.out_shape, ma->dtype);
+                ctx->tensors[out_tid].creator_op = UOP_KERNEL;
+                ke.output_tid = out_tid;
+                ke.raw_output_tid = out_tid;
+                sched_kernels[kid] = ke;
+
+                Term result = thvm_sched_dispatch_kernel(ctx, kid);
+                kid_results[kid] = result;
+                ctx->itrs++;
+                RETURN_REDUCED(result);
+            }

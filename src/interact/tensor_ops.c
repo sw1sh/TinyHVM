@@ -118,9 +118,12 @@
 
             // UOP_KERNEL: scheduled kernel — dispatch from KernelEntry.
             // Fired by second thvm_reduce. Reads kernel spec from global table.
-            // Cache check uses per-buffer epochs: stale if any input buffer
-            // was written by ASSIGN since last dispatch.
+            // UOP_KERNEL: scheduled kernel — dispatch from KernelEntry.
+            // Only fires in phase 3 (when dispatch is enabled).
+            // In phase 2, KERNEL is WNF — waiting for UOP_SCHED to enable dispatch.
             if (uop == UOP_KERNEL) {
+                extern int _assign_dispatch_enabled;
+                if (!_assign_dispatch_enabled) return t;  // WNF until phase 3
                 extern Term kid_results[];
                 extern u32 sched_kernel_count;
                 extern u32 buf_epoch[];
@@ -130,8 +133,15 @@
                 Term kid_term = heap_read(ctx, loc + 1); // arg1 = kernel index
                 u32 kid = (u32)term_val(kid_term);
                 if (getenv("THVM_SCHED_DIAG"))
-                    fprintf(stderr, "KERNEL kid=%u cached=%d n_inputs=%u\n",
+                    fprintf(stderr, "KERNEL kid=%u cached=%d n_inputs=%u epoch_check=",
                             kid, term_tag(kid_results[kid]) != TAG_ERA, kid_n_inputs[kid]);
+                if (getenv("THVM_SCHED_DIAG") && term_tag(kid_results[kid]) != TAG_ERA) {
+                    for (u32 _di = 0; _di < kid_n_inputs[kid]; _di++)
+                        fprintf(stderr, "b%u:%u/%u ", kid_input_bufs[kid][_di],
+                                kid_input_epochs[kid][_di],
+                                kid_input_bufs[kid][_di] < MAX_BUF_EPOCHS ? buf_epoch[kid_input_bufs[kid][_di]] : 0);
+                }
+                if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "\n");
                 // Cache check: valid only if all input buffer epochs match
                 if (kid < sched_kernel_count && term_tag(kid_results[kid]) != TAG_ERA) {
                     int cache_valid = 1;

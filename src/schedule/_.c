@@ -1143,15 +1143,23 @@ static Term sched_install_kernel(TinyHVM *ctx, SchedBoundary *b, KernelEntry *ke
         st_set(floc, &fallback);
     }
 
-    // Wrap kernel in SEQ chains for ASSIGN dependencies.
-    // SEQ(ASSIGN, KERNEL) forces ASSIGN to fire before KERNEL dispatches.
+    // Wrap kernel in SEQ chains for dependencies.
+    // SEQ(dep, KERNEL) forces dep to fire before KERNEL dispatches.
+
+    // 1. Kernel deps (other kernels this one depends on)
+    for (u32 di = 0; di < ke->n_deps; di++) {
+        u32 dep_kid = ke->dep_kids[di];
+        if (dep_kid < SCHED_MAX_KERNELS && sched_kernel_locs[dep_kid]) {
+            Term dep_kernel = term_new(TAG_TOP, UOP_KERNEL, sched_kernel_locs[dep_kid]);
+            ft = thvm_seq(ctx, dep_kernel, ft);
+        }
+    }
+
+    // 2. ASSIGN deps (buffer writes this kernel reads after)
     extern Term fuse_assign_deps[];
     extern u32  fuse_n_assign_deps;
     for (u32 i = 0; i < fuse_n_assign_deps; i++) {
         ft = thvm_seq(ctx, fuse_assign_deps[i], ft);
-        // Copy shape metadata to SEQ's heap loc so downstream can find it
-        const View *sv = st_get(floc);
-        if (sv) st_set(term_val(ft), sv);
     }
 
     thvm_sched_rewrite_remember(ctx, b->root_term, ft);
@@ -1161,13 +1169,9 @@ static Term sched_install_kernel(TinyHVM *ctx, SchedBoundary *b, KernelEntry *ke
 
 static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
     if (kid >= sched_kernel_count) return term_era();
-    if (term_tag(kid_results[kid]) != TAG_ERA) return kid_results[kid];
-
+    // Cache check with epoch invalidation is in UOP_KERNEL handler.
+    // No recursive dep dispatch here — deps are wired as SEQ in the graph.
     KernelEntry *ke = &sched_kernels[kid];
-    for (u32 di = 0; di < ke->n_deps; di++) {
-        Term dep = thvm_sched_dispatch_kernel(ctx, ke->dep_kids[di]);
-        if (term_tag(dep) == TAG_ERA) return dep;
-    }
 
     u32 raw_tid = ke->raw_output_tid ? ke->raw_output_tid : ke->output_tid;
     if (raw_tid == 0) return term_era();

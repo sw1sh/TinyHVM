@@ -169,6 +169,12 @@ static int fuse_make_boundary_leaf(TinyHVM *ctx, Term t,
 #define FUSE_MAX_ABSORBED 256
 static Term fuse_absorbed[FUSE_MAX_ABSORBED];
 static u32  fuse_n_absorbed = 0;
+
+// Per-fuse state: ASSIGN terms encountered as leaf dependencies.
+// After kernel installation, these are wrapped in SEQ(ASSIGN, KERNEL) for ordering.
+#define FUSE_MAX_ASSIGN_DEPS 16
+static Term fuse_assign_deps[FUSE_MAX_ASSIGN_DEPS];
+static u32  fuse_n_assign_deps = 0;
 static void fuse_mark_absorbed(Term t) {
     if (fuse_n_absorbed < FUSE_MAX_ABSORBED) fuse_absorbed[fuse_n_absorbed++] = t;
 }
@@ -905,7 +911,10 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         if (term_tag(dst) == TAG_TEN) {
             u32 tid = (u32)term_val(dst);
             if (tid < ctx->tensor_count) {
-                // Use dst tensor directly as the leaf — ASSIGN resolves to this tensor.
+                // Record ASSIGN as a dependency for SEQ injection
+                if (fuse_n_assign_deps < FUSE_MAX_ASSIGN_DEPS)
+                    fuse_assign_deps[fuse_n_assign_deps++] = t;
+                // Use dst tensor as the leaf — ASSIGN resolves to this tensor.
                 return fuse_append_leaf_tensor(ctx, tid,
                     tensor_view_get(&ctx->tensors[tid]),
                     tensor_st_get(&ctx->tensors[tid]),
@@ -1014,8 +1023,9 @@ static int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
         return 0; // MM, ASSIGN, etc. — not handled by fuser
     }
 
-    // Walk the tree (reset absorbed + dup tracking)
+    // Walk the tree (reset absorbed + dup + assign-dep tracking)
     fuse_n_absorbed = 0;
+    fuse_n_assign_deps = 0;
     _fuse_n_dup_locs = 0;
     _fuse_can_absorb_reduce = (!has_reduce && is_elementwise(cur_uop)) ? 1 : 0;
     _fuse_absorbed_reduce = term_era();

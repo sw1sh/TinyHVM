@@ -1135,6 +1135,17 @@ static Term sched_install_kernel(TinyHVM *ctx, SchedBoundary *b, KernelEntry *ke
         st_set(floc, &fallback);
     }
 
+    // Wrap kernel in SEQ chains for ASSIGN dependencies.
+    // SEQ(ASSIGN, KERNEL) forces ASSIGN to fire before KERNEL dispatches.
+    extern Term fuse_assign_deps[];
+    extern u32  fuse_n_assign_deps;
+    for (u32 i = 0; i < fuse_n_assign_deps; i++) {
+        ft = thvm_seq(ctx, fuse_assign_deps[i], ft);
+        // Copy shape metadata to SEQ's heap loc so downstream can find it
+        const View *sv = st_get(floc);
+        if (sv) st_set(term_val(ft), sv);
+    }
+
     thvm_sched_rewrite_remember(ctx, b->root_term, ft);
     sched_replace_term_everywhere(ctx, b->root_term, ft);
     return ft;

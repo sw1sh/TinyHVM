@@ -33,7 +33,7 @@ digraph G {
   dup8 -> n14 [label="a (dp0)"];
   n10 -> n14 [label="b"];
   ref20 [label="REF\n#0", shape=oval, fillcolor="#eeeeee", fontsize=8];
-  ref20 -> def0 [style=dashed, color="#999999", label="def"];
+  ref20 -> deflam0_0 [style=dashed, color="#999999", label="def"];
   n20 [label="APP", shape=invtriangle, fillcolor="#f3f3f3"];
   ref20 -> n20 [label="fun"];
   var21 [label="VAR\n@5", shape=oval, fillcolor="#eeeeee", fontsize=8];
@@ -79,12 +79,16 @@ digraph G {
   ref56 -> n56 [label="fun"];
   var57 [label="VAR\n@43", shape=oval, fillcolor="#eeeeee", fontsize=8];
   var57 -> n56 [label="arg"];
-  ref56 -> def0 [style=dashed, color="#999999", label="def"];
+  ref56 -> deflam0_0 [style=dashed, color="#999999", label="def"];
   era59 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
   t4 [label="t4\n[1]\nu32 cpu",shape=box,fillcolor="#e0e0e0"];
   t4 -> era59 [label="p"];
   era61 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
   n43 -> era61 [label="p"];
-  def0 [label="def #0", shape=box, fillcolor="#f2e8ff", style="filled,dashed", fontsize=8];
-  def0 -> n26 [style=dashed, color="#999999"];
+  deflam0_0 [label="LAM\n@1", shape=box, fillcolor="#f2e8ff", style="filled,dashed", fontsize=8];
+  ref_def0 [label="def #0", shape=none, fontsize=7];
+  ref_def0 -> deflam0_0 [style=dashed, color="#999999"];
+  deflam0_1 [label="LAM\n@3", shape=box, fillcolor="#f2e8ff", style="filled,dashed", fontsize=8];
+  deflam0_0 -> deflam0_1 [style=dashed, color="#999999", label="body"];
+  deflam0_1 -> n26 [style=dashed, color="#999999", label="body"];
 }

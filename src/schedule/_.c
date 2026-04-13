@@ -676,7 +676,8 @@ static Term thvm_phase1_seed_root_grad(TinyHVM *ctx, Term t) {
 static Term thvm_phase1_structural_nf(TinyHVM *ctx, Term t) {
     size_t reach_cap = (size_t)ctx->heap_pos;
     u8 *reach = (u8 *)calloc(reach_cap ? reach_cap : 1, 1);
-    for (u32 guard = 0; guard < 100000; guard++) {
+    u32 max_guard = getenv("THVM_STEP_GRAPH") ? 500 : 100000;
+    for (u32 guard = 0; guard < max_guard; guard++) {
         int fired = 0;
         if ((size_t)ctx->heap_pos > reach_cap) {
             size_t new_cap = (size_t)ctx->heap_pos;
@@ -1368,8 +1369,10 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             heap_set(ctx, phase1_root_slot, t);
         thvm_step_graph_finalize(ctx);
         phase1_root_slot = 0;
-        ctx->eval_depth--;
-        return t;
+        // Fall through to phase 2 (FUSE + dispatch) so the result is correct.
+        // Step graph only visualizes phase 1, but the computation completes.
+        // Skip the redundant phase 1 reduce below (already done in structural_nf).
+        goto phase2;
     }
 
     if (run_coarse_graph) {
@@ -1401,6 +1404,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             heap_set(ctx, phase1_root_slot, term_era());
     }
 
+    phase2:
     // Phase 2: wrap in UOP_FUSE and reduce — fuses compute + dispatches + fires ASSIGN
     // Local FUSE creates KERNELs that fire immediately. SEQ handles ordering.
     // No separate UOP_SCHED phase — everything happens in one reduce pass.

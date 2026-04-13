@@ -728,7 +728,7 @@ static const char *thvm_step_graph_interaction_name(TinyHVM *ctx, Term before,
 
 static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term root) {
     if (!getenv("THVM_STEP_GRAPH") || !step_graph_active) return;
-    if (step_graph_n >= 1000) return;
+    if (step_graph_n >= 100) return;
     const char *step_graph_dir = thvm_step_graph_dir();
     step_graph_root_term = root;
     u64 sig = thvm_step_graph_sig(ctx);

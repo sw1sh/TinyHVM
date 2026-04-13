@@ -1351,6 +1351,9 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     // Phase 1: pure IC reduction — combinators fire, compute ops are WNF
     t = run_coarse_graph ? thvm_phase1_structural_nf(ctx, t)
                          : thvm_reduce(ctx, t);
+    if (getenv("THVM_SCHED_DIAG"))
+        fprintf(stderr, "PHASE1_RESULT: tag=%u ext=%u val=%llu\n",
+                term_tag(t), term_ext(t), (unsigned long long)term_val(t));
     if (run_coarse_graph) {
         t = thvm_phase1_seed_root_grad(ctx, t);
         char path[512];
@@ -1364,11 +1367,15 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     // Phase 2: wrap in UOP_FUSE and reduce — fuses compute + dispatches + fires ASSIGN
     // Local FUSE creates KERNELs that fire immediately. SEQ handles ordering.
     // No separate UOP_SCHED phase — everything happens in one reduce pass.
+    // Use nested reduce (depth>0 via eval_depth) to suppress quiesce —
+    // quiesce would modify FUSE payloads on the heap.
     {
         u64 fuse_loc = heap_alloc(ctx, 1);
         heap_set(ctx, fuse_loc, t);
         Term fuse_term = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
+        ctx->step_budget = 1000000;  // suppress quiesce (budget>0 → no quiesce)
         t = thvm_reduce(ctx, fuse_term);
+        ctx->step_budget = 0;
     }
     if (run_coarse_graph) {
         t = thvm_phase1_seed_root_grad(ctx, t);

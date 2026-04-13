@@ -502,20 +502,26 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 whnf = term_new(TAG_TOP, term_ext(frame), loc);
                 continue;
             }
-            // Re-enter FUSE/FUSE2/KERNEL results to keep reducing through fusion
+            // Re-enter direct UOP results to keep reducing through fusion chain
             if (w1t == TAG_TOP && (term_ext(whnf) == UOP_FUSE ||
-                term_ext(whnf) == UOP_FUSE2 || term_ext(whnf) == UOP_KERNEL)) {
+                term_ext(whnf) == UOP_FUSE2 || term_ext(whnf) == UOP_KERNEL ||
+                term_ext(whnf) == UOP_ASSIGN)) {
                 heap_set(ctx, loc + 1, whnf);
                 PUSH(frame);
                 next = whnf;
                 goto enter;
             }
             if (w1t != TAG_TEN && w1t != TAG_ERA && w1t != TAG_NUM &&
-                w1t != TAG_LAM && w1t != TAG_SUP) { whnf = frame; continue; }
+                w1t != TAG_LAM && w1t != TAG_SUP) {
+                // Reconstruct original TAG_TOP from TOP1 sentinel
+                heap_set(ctx, loc + 1, whnf);
+                whnf = term_new(TAG_TOP, term_ext(frame), loc);
+                continue;
+            }
             heap_set(ctx, loc + 1, whnf);  // store arg1 result
             // 3-arg ops (WHERE, IFZ): reduce arg2 before firing
             u32 _uop1 = term_ext(frame);
-            if (_uop1 == UOP_WHERE || _uop1 == UOP_IFZ) {
+            if (_uop1 == UOP_WHERE || _uop1 == UOP_IFZ || _uop1 == UOP_FUSE2) {
                 Term a2 = heap_read(ctx, loc + 2);
                 u8 a2t = term_tag(a2);
                 if (a2t != TAG_TEN && a2t != TAG_ERA && a2t != TAG_NUM &&
@@ -667,8 +673,10 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     #undef PUSH
     #undef BUDGET_HIT
     #undef TRACE_STEP
-    if (depth == 0 && ctx->step_budget == 0)
-        whnf = reduce_net_quiesce(ctx, whnf);
+    // Quiesce disabled: with FUSE propagation, all reduction goes through
+    // the normal trampoline. Quiesce's global heap scan corrupts FUSE payloads.
+    // if (depth == 0 && ctx->step_budget == 0)
+    //     whnf = reduce_net_quiesce(ctx, whnf);
     return whnf;
 }
 

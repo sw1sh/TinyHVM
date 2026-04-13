@@ -53,6 +53,9 @@ int main() {
         Term r = thvm_reduce(ctx, fuse);
         printf("FUSE(SEQ(ASSIGN,TEN)): tag=%u ext=%u val=%llu raw=0x%016llx\n",
                term_tag(r), term_ext(r), (unsigned long long)term_val(r), (unsigned long long)r);
+        u32 dt = DTYPE_F32; Shape sh = SHAPE(1);
+        f32 *v = thvm_to_host_raw(ctx, x, &dt, &sh);
+        if (v) printf("  x = [%.1f, %.1f, %.1f] (expect [2,4,6])\n", v[0], v[1], v[2]);
     }
 
     thvm_free(ctx);

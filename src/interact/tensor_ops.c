@@ -143,27 +143,14 @@
             // Unary: FUSE(op, child) — heap [NUM(op), child] (tag of slot0 == NUM)
             if (uop == UOP_FUSE) {
                 Term slot0 = heap_read(ctx, loc);
-
-                // --- Unary FUSE(op, child): child resolved? ---
-                if (term_tag(slot0) == TAG_NUM) {
-                    u32 fop = term_as_u32(slot0);
-                    Term child = heap_read(ctx, loc + 1);
-                    // Child still FUSE → WNF (waiting)
-                    if (term_tag(child) == TAG_TOP &&
-                        (term_ext(child) == UOP_FUSE || term_ext(child) == UOP_FUSE2))
-                        return t;
-                    // Child is TEN or KERNEL → create/merge kernel
-                    // For now: single-op kernel from op + TEN child
-                    if (term_tag(child) == TAG_TEN) {
-                        // Build single-op kernel: op(child_tensor)
-                        // TODO: proper KernelEntry creation
-                        // For now pass through as the compute op (will be handled later)
-                        return t; // placeholder
-                    }
-                    return t; // WNF
+                if (getenv("THVM_SCHED_DIAG")) {
+                    fprintf(stderr, "FUSE_ENTRY: slot0_tag=%u slot0_ext=%u loc=%llu\n",
+                            term_tag(slot0), term_ext(slot0), (unsigned long long)loc);
+                    fflush(stderr);
                 }
 
                 // --- Entry FUSE(payload): propagate ---
+                // (No unary FUSE(op,child) form — use FUSE2 for all ops)
                 Term payload = slot0;
                 u8 ptag = term_tag(payload);
 
@@ -210,16 +197,17 @@
                           RETURN_REDUCED(_r); }
                     }
 
-                    // Unary compute/movement/reduce: absorb → FUSE(op, FUSE(child))
+                    // Unary compute/movement/reduce: absorb → FUSE2(op, FUSE(child), ERA)
                     if (is_elementwise(puop) || puop == UOP_SUM || puop == UOP_RMAX ||
                         (puop >= UOP_RESHAPE && puop <= UOP_PAD)) {
                         u64 ploc = term_val(payload);
                         Term child = heap_read(ctx, ploc);
                         u64 fc = heap_alloc(ctx, 1); heap_set(ctx, fc, child);
-                        u64 floc = heap_alloc(ctx, 2);
-                        heap_set(ctx, floc, term_num_u32(puop));
-                        heap_set(ctx, floc + 1, term_new(TAG_TOP, UOP_FUSE, fc));
-                        RETURN_REDUCED(term_new(TAG_TOP, UOP_FUSE, floc));
+                        u64 f2loc = heap_alloc(ctx, 3);
+                        heap_set(ctx, f2loc, term_num_u32(puop));
+                        heap_set(ctx, f2loc + 1, term_new(TAG_TOP, UOP_FUSE, fc));
+                        heap_set(ctx, f2loc + 2, term_era());
+                        RETURN_REDUCED(term_new(TAG_TOP, UOP_FUSE2, f2loc));
                     }
 
                     // Other TAG_TOP: pass through
@@ -292,13 +280,15 @@
                     RETURN_REDUCED(thvm_seq(ctx, left, right));
                 }
 
-                // Binary compute op: both children resolved
-                int l_ten = term_tag(left) == TAG_TEN;
-                int r_ten = term_tag(right) == TAG_TEN;
-                int l_kernel = term_tag(left) == TAG_TOP && term_ext(left) == UOP_KERNEL;
-                int r_kernel = term_tag(right) == TAG_TOP && term_ext(right) == UOP_KERNEL;
+                // Compute op: children resolved (TEN, KERNEL, ERA, or NUM)
+                int l_ok = term_tag(left) == TAG_TEN || term_tag(left) == TAG_ERA ||
+                    term_tag(left) == TAG_NUM ||
+                    (term_tag(left) == TAG_TOP && term_ext(left) == UOP_KERNEL);
+                int r_ok = term_tag(right) == TAG_TEN || term_tag(right) == TAG_ERA ||
+                    term_tag(right) == TAG_NUM ||
+                    (term_tag(right) == TAG_TOP && term_ext(right) == UOP_KERNEL);
 
-                if ((l_ten || l_kernel) && (r_ten || r_kernel)) {
+                if (l_ok && r_ok) {
                     // Both resolved. Build kernel with this op on top.
                     // For now: reconstruct the compute op and build via fuse_build_kernel
                     u64 oploc = heap_alloc(ctx, 2);
@@ -306,7 +296,7 @@
                     heap_set(ctx, oploc + 1, right);
                     Term compute = term_new(TAG_TOP, fop, oploc);
                     // Copy shape metadata from children
-                    if (l_ten) {
+                    if (term_tag(left) == TAG_TEN) {
                         u32 tid = (u32)term_val(left);
                         if (tid < ctx->tensor_count) {
                             const View *v = tensor_view_get(&ctx->tensors[tid]);
@@ -329,7 +319,7 @@
                         kid_results[kid] = term_era();
                         kid_n_inputs[kid] = 0;
                         u32 out_tid = tensor_create_unbacked(ctx, ke.out_shape,
-                            l_ten ? ctx->tensors[(u32)term_val(left)].dtype : DTYPE_F32);
+                            (term_tag(left)==TAG_TEN) ? ctx->tensors[(u32)term_val(left)].dtype : DTYPE_F32);
                         ctx->tensors[out_tid].creator_op = UOP_KERNEL;
                         ke.output_tid = out_tid;
                         ke.raw_output_tid = out_tid;

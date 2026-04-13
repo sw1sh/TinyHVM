@@ -913,6 +913,9 @@ era_continue:
         case TAG_SEQ: {
             u64 loc = term_val(t);
             Term a = heap_read(ctx, loc); // WNF from trampoline
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "SEQ_INTERACT: a_tag=%u a_ext=%u loc=%llu\n",
+                        term_tag(a), term_ext(a), (unsigned long long)loc);
 
             // SEQ-SUP: distribute through superposition
             if (term_tag(a) == TAG_SUP) {

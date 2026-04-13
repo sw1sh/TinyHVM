@@ -12,24 +12,12 @@ The user has repeatedly asked for these specific things and been frustrated
 that they keep getting partially addressed or papered over. **Read each one
 carefully and fix the root cause, not the symptom.**
 
-### 1. Definition body should show the LAM structure
+### 1. Definition body LAM structure — FIXED
 
-Current: `REF → def#0 LAM → (body IFZ)` where `def#0` is a synthetic proxy
-node because the outermost LAM isn't a heap cell.
-
-Problem: The definition is `LAM(counter, LAM(w, IFZ(...)))`. The graph should
-show the actual LAM→LAM→IFZ chain as real nodes, not skip through LAMs.
-
-Root cause: `ctx->defs[0]` stores a TAG_LAM term but the LAM term itself is
-NOT stored as `ctx->heap[something] = TAG_LAM`. The heap has the LAM's DATA
-(var slot at heap[1], body at heap[2]) but not the LAM TERM. The main render
-loop at `src/debug/dump.c:1290` scans `ctx->heap[h]` and only renders what
-it finds there. It finds VAR SUB at heap[1], not TAG_LAM.
-
-Fix approach: During the def-body seeding (dump.c line 620-625), explicitly
-write the LAM terms from `ctx->defs[]` into the traversal so they appear as
-real nodes. Or: add a special LAM rendering pass that emits LAM nodes from
-`ctx->defs[]` with proper var/body edges, integrated into the main graph.
+REF now points directly to the outermost rendered LAM node (n3) via dashed
+"def" edge. The LAM→IFZ→SEQ→ASSIGN chain is visible from there. No proxy
+nodes needed — the LAM nodes are already rendered by the main loop from the
+def-body seeding.
 
 ### 2. VAR substitution should be visible
 

@@ -1258,29 +1258,32 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         if (tag == TAG_REF) {
             if (!SLOT_LIVE(h)) continue;
             EMIT_REF_NODE(h, ext);
-            // Draw dashed edge REF → def#N → body.
-            // The outermost LAM from ctx->defs isn't rendered as a heap node
-            // (heap has VAR SUB at that location). Emit a "def #N" proxy node.
-            if (ext < ctx->def_count && term_tag(ctx->defs[ext]) == TAG_LAM) {
-                // Emit def node once
-                if (!NODE_SEEN(0xD00000 + ext)) {
-                    NODE_MARK(0xD00000 + ext);
-                    fprintf(f, "  def%u [label=\"def #%u\\nLAM\", shape=box, "
-                               "fillcolor=\"#f2e8ff\", style=\"filled,dashed\", fontsize=8];\n", ext, ext);
-                    // Connect def node to innermost non-LAM body
-                    Term _d = ctx->defs[ext];
-                    for (int _dd = 0; _dd < 8 && term_tag(_d) == TAG_LAM; _dd++) {
-                        u64 _ll = term_val(_d);
-                        if (_ll + 1 >= ctx->heap_pos) break;
-                        _d = heap_read(ctx, _ll + 1);
-                    }
-                    u64 _dv = term_val(_d);
-                    if ((term_tag(_d) == TAG_TOP || term_tag(_d) == TAG_SEQ) && _dv > 0 && _dv < ctx->heap_pos)
-                        fprintf(f, "  def%u -> n%llu [style=dashed, color=\"#999999\", label=\"body\"];\n",
-                                ext, (unsigned long long)_dv);
+            // Draw dashed edge REF → outermost rendered LAM of the definition.
+            // Walk the LAM chain to find the first LAM that the main loop rendered.
+            if (ext < ctx->def_count) {
+                Term _d = ctx->defs[ext];
+                for (int _dd = 0; _dd < 8 && term_tag(_d) == TAG_LAM; _dd++) {
+                    u64 _ll = term_val(_d);
+                    if (_ll >= ctx->heap_pos) break;
+                    // The main loop renders LAMs as n{val}. Check if n{_ll} exists
+                    // by checking if there's a heap cell with TAG_LAM at this location.
+                    // LAMs are rendered when heap[h] has tag matching dot_visible_heap_loc_tag
+                    // and the generic combinator path picks them up. The LAM body is at
+                    // heap[_ll+1]. If that body is also a LAM, it gets rendered as n{body_val}.
+                    // We want the FIRST rendered one, which is the innermost LAM whose
+                    // body is NOT a LAM (because the main loop traverses from the body up).
+                    if (_ll + 1 < ctx->heap_pos) {
+                        Term _body = heap_read(ctx, _ll + 1);
+                        if (term_tag(_body) != TAG_LAM) {
+                            // This LAM's body is the innermost non-LAM — but the LAM
+                            // itself is rendered as n{_ll} by the main loop.
+                            fprintf(f, "  ref%llu -> n%llu [style=dashed, color=\"#999999\", label=\"def\"];\n",
+                                    (unsigned long long)h, (unsigned long long)_ll);
+                            break;
+                        }
+                        _d = _body;
+                    } else break;
                 }
-                fprintf(f, "  ref%llu -> def%u [style=dashed, color=\"#999999\", label=\"def\"];\n",
-                        (unsigned long long)h, ext);
             }
             nn++;
             continue;

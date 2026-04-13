@@ -23,6 +23,7 @@ static inline int uop_allocates_fresh(u32 uop) {
         case UOP_DETACH:
         case UOP_FUSE:
         case UOP_SCHED:
+        case UOP_FUSE2:
             return 0;  // returns sub-terms / passthrough, not a fresh tensor
         default:
             return 1;  // compute ops: ADD, SUB, MUL, MM, SUM, etc.
@@ -31,7 +32,8 @@ static inline int uop_allocates_fresh(u32 uop) {
 
 static inline u32 reduce_top_arity(u32 uop) {
     if (uop == UOP_KERNEL) return 0;
-    if (uop == UOP_FUSE || uop == UOP_SCHED) return 1; // single payload
+    if (uop == UOP_FUSE || uop == UOP_SCHED) return 1;
+    if (uop == UOP_FUSE2) return 3; // op_num, left, right
     if (uop == UOP_WHERE || uop == UOP_IFZ) return 3;
     if (uop == UOP_GRAD) return 2;
     if (uop == UOP_LOG_PRINT) return 1;
@@ -61,9 +63,12 @@ static inline int reduce_top_has_add_zero_arg(TinyHVM *ctx, Term t) {
 }
 
 static inline int reduce_top_direct_uop(u32 uop) {
-    // ALL compute ops are direct — reducer reduces their args then fires.
-    // With FUSE propagation, compute ops dispatch when args reach TAG_TEN.
-    return 1;
+    return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_IFZ ||
+           uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_CAST ||
+           uop == UOP_DETACH ||
+           uop == UOP_WHERE ||
+           uop == UOP_KERNEL ||
+           uop == UOP_FUSE || uop == UOP_SCHED || uop == UOP_FUSE2;
 }
 
 static inline u32 reduce_net_term_arity(Term t) {
@@ -426,8 +431,8 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 term_tag(whnf) == TAG_SUP ||
                 (term_tag(whnf) == TAG_TOP && frame_uop == UOP_GRAD) ||
                 (term_tag(whnf) == TAG_VAR && frame_uop == UOP_DETACH) ||
-                // UOP_FUSE/UOP_SCHED accept any WNF payload (pass-through signals)
-                (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED);
+                // UOP_FUSE/UOP_SCHED/UOP_FUSE2 accept any WNF payload
+                (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED || frame_uop == UOP_FUSE2);
             if (!arg0_ready) {
                 heap_set(ctx, loc+0, whnf); whnf = frame; continue;
             }
@@ -445,8 +450,9 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 goto enter;
             }
 
-            // UOP_FUSE/UOP_SCHED/UOP_KERNEL: fire once entered (arity 0-1).
-            if (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED || frame_uop == UOP_KERNEL) {
+            // UOP_FUSE/UOP_SCHED/UOP_KERNEL: fire once arg0 ready (arity 0-1).
+            if (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED ||
+                frame_uop == UOP_KERNEL) {
                 if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }

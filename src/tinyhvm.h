@@ -150,11 +150,12 @@ typedef u64 Term;
 #define UOP_TODEVICE  29   // lazy device transfer: TODEVICE(tensor, device_idx_scalar)
 #define UOP_DETACH    30   // realize current value and return a provenance-free tensor leaf
 
-// Scheduling signals (interact to drive phase transitions):
-#define UOP_FUSE      31   // lowering request: boundary walk → create UOP_KERNEL nodes
-#define UOP_SCHED     32   // planning signal: memory layout walk, assign buffer slots
+// Fusion signals (propagating IC agents):
+#define UOP_FUSE      31   // unary fusion: FUSE(payload) or FUSE(op, child)
+#define UOP_SCHED     32   // (deprecated — pass-through)
+#define UOP_FUSE2     33   // binary fusion: FUSE2(op, left, right)
 
-#define UOP_COUNT     33
+#define UOP_COUNT     34
 
 // (LAYER_OP_POOL_GATHER and LAYER_OP_BATCHNORM removed — both are now
 // composed from standard UOps with standard backward rules.)
@@ -164,7 +165,7 @@ static const char *uop_names[] = {
     "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
     "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","KERNEL","ASSIGN","WHERE",
-    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","SCHED"
+    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","SCHED","FUSE2"
 };
 
 // ============================================================

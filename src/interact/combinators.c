@@ -538,6 +538,23 @@ era_continue:
                 DUP_STATE_RETURN(val, n0, n1);
             }
 
+            // DUP ⊳ FUSE2: 3-slot compound duplication
+            if (term_tag(val) == TAG_TOP && term_ext(val) == UOP_FUSE2) {
+                u64 val_loc = term_val(val);
+                u64 r0 = heap_alloc(ctx, 3);
+                u64 r1 = heap_alloc(ctx, 3);
+                for (u32 i = 0; i < 3; i++) {
+                    Term child = heap_read(ctx, val_loc + i);
+                    u64 cdup = heap_alloc(ctx, 1);
+                    heap_set(ctx, cdup, child);
+                    heap_set(ctx, r0 + i, term_new(TAG_DP0, dup_label, cdup));
+                    heap_set(ctx, r1 + i, term_new(TAG_DP1, dup_label, cdup));
+                }
+                Term n0 = term_new(TAG_TOP, UOP_FUSE2, r0);
+                Term n1 = term_new(TAG_TOP, UOP_FUSE2, r1);
+                DUP_STATE_RETURN(val, n0, n1);
+            }
+
             // Not yet reducible — return DUP as-is
             #undef DUP_STATE_RETURN
             return t;

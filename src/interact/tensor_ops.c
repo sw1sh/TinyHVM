@@ -166,14 +166,18 @@
                         puop == UOP_SCHED || puop == UOP_FUSE2)
                         RETURN_REDUCED(payload);
 
-                    // ASSIGN: wrap src in FUSE
+                    // ASSIGN: fuse src via sub-reduce, then return ASSIGN
                     if (puop == UOP_ASSIGN) {
                         u64 aloc = term_val(payload);
                         Term src = heap_read(ctx, aloc + 1);
                         if (term_tag(src) != TAG_TEN && term_tag(src) != TAG_ERA) {
                             u64 fl = heap_alloc(ctx, 1);
                             heap_set(ctx, fl, src);
-                            heap_set(ctx, aloc + 1, term_new(TAG_TOP, UOP_FUSE, fl));
+                            Term fused = thvm_reduce(ctx, term_new(TAG_TOP, UOP_FUSE, fl));
+                            if (getenv("THVM_SCHED_DIAG"))
+                                fprintf(stderr, "FUSE_ASSIGN_SRC: src_tag=%u→fused_tag=%u fused_ext=%u\n",
+                                        term_tag(src), term_tag(fused), term_ext(fused));
+                            heap_set(ctx, aloc + 1, fused);
                         }
                         RETURN_REDUCED(payload);
                     }
@@ -260,25 +264,22 @@
                 u32 fop = term_as_u32(heap_read(ctx, loc));
                 Term left  = heap_read(ctx, loc + 1);
                 Term right = heap_read(ctx, loc + 2);
+                if (getenv("THVM_SCHED_DIAG"))
+                    fprintf(stderr, "FUSE2: fop=%u l_tag=%u l_ext=%u r_tag=%u r_ext=%u\n",
+                            fop, term_tag(left), term_ext(left), term_tag(right), term_ext(right));
 
-                // Both still FUSE → WNF
+                // SEQ compose: degrade to SEQ immediately.
+                // SEQ children are typically ASSIGN + continuation — not fuseable.
+                if (fop == UOP_COUNT) { // SEQ marker
+                    RETURN_REDUCED(thvm_seq(ctx, left, right));
+                }
+
+                // Compute op: wait for children to resolve
                 int l_fuse = term_tag(left) == TAG_TOP &&
                     (term_ext(left) == UOP_FUSE || term_ext(left) == UOP_FUSE2);
                 int r_fuse = term_tag(right) == TAG_TOP &&
                     (term_ext(right) == UOP_FUSE || term_ext(right) == UOP_FUSE2);
                 if (l_fuse || r_fuse) return t;
-
-                // SEQ compose: degrade to SEQ if can't merge
-                if (fop == UOP_COUNT) { // SEQ marker
-                    int l_kernel = term_tag(left) == TAG_TOP && term_ext(left) == UOP_KERNEL;
-                    int r_kernel = term_tag(right) == TAG_TOP && term_ext(right) == UOP_KERNEL;
-                    if (l_kernel && r_kernel) {
-                        // TODO: merge two kernels into composite
-                        // For now: degrade to SEQ
-                    }
-                    // Degrade: SEQ(left, right)
-                    RETURN_REDUCED(thvm_seq(ctx, left, right));
-                }
 
                 // Compute op: children resolved (TEN, KERNEL, ERA, or NUM)
                 int l_ok = term_tag(left) == TAG_TEN || term_tag(left) == TAG_ERA ||

@@ -503,15 +503,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 continue;
             }
             // No re-entry — let the parent handler deal with unreduced children.
-            // Re-enter reducible terms (DP, APP, SEQ, etc.) as arg1
-            if (w1t == TAG_DP0 || w1t == TAG_DP1 || w1t == TAG_APP ||
-                w1t == TAG_SEQ || w1t == TAG_REF ||
-                (w1t == TAG_TOP && reduce_top_direct_uop(term_ext(whnf)))) {
-                heap_set(ctx, loc + 1, whnf);
-                PUSH(frame);
-                next = whnf;
-                goto enter;
-            }
+            // No re-entry — reconstructed TAG_TOP handles unreduced arg1.
             if (w1t != TAG_TEN && w1t != TAG_ERA && w1t != TAG_NUM &&
                 w1t != TAG_LAM && w1t != TAG_SUP) {
                 // Reconstruct original TAG_TOP from TOP1 sentinel

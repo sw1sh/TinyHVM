@@ -166,17 +166,20 @@
                         puop == UOP_SCHED || puop == UOP_FUSE2)
                         RETURN_REDUCED(payload);
 
-                    // ASSIGN: fuse src via sub-reduce, then return ASSIGN
+                    // ASSIGN: fuse src via sub-reduce until TAG_TEN
                     if (puop == UOP_ASSIGN) {
                         u64 aloc = term_val(payload);
                         Term src = heap_read(ctx, aloc + 1);
                         if (term_tag(src) != TAG_TEN && term_tag(src) != TAG_ERA) {
+                            // Wrap in FUSE and reduce repeatedly until TEN
                             u64 fl = heap_alloc(ctx, 1);
                             heap_set(ctx, fl, src);
-                            Term fused = thvm_reduce(ctx, term_new(TAG_TOP, UOP_FUSE, fl));
-                            if (getenv("THVM_SCHED_DIAG"))
-                                fprintf(stderr, "FUSE_ASSIGN_SRC: src_tag=%u→fused_tag=%u fused_ext=%u\n",
-                                        term_tag(src), term_tag(fused), term_ext(fused));
+                            Term fused = term_new(TAG_TOP, UOP_FUSE, fl);
+                            for (int _retry = 0; _retry < 100; _retry++) {
+                                fused = thvm_reduce(ctx, fused);
+                                if (term_tag(fused) == TAG_TEN || term_tag(fused) == TAG_ERA)
+                                    break;
+                            }
                             heap_set(ctx, aloc + 1, fused);
                         }
                         RETURN_REDUCED(payload);
@@ -250,9 +253,21 @@
                     RETURN_REDUCED(payload);
                 }
 
-                // DP: pass through
-                if (ptag == TAG_DP0 || ptag == TAG_DP1)
-                    RETURN_REDUCED(payload);
+                // DP: resolve fully through DUP chain
+                if (ptag == TAG_DP0 || ptag == TAG_DP1) {
+                    fprintf(stderr, "FUSE_DP_ENTER\n");
+                    Term resolved = payload;
+                    for (int _dp = 0; _dp < 32; _dp++) {
+                        resolved = thvm_reduce(ctx, resolved);
+                        if (term_tag(resolved) != TAG_DP0 && term_tag(resolved) != TAG_DP1)
+                            break;
+                    }
+                    fprintf(stderr, "FUSE_DP: → tag=%u ext=%u val=%llu\n",
+                            term_tag(resolved), term_ext(resolved),
+                            (unsigned long long)term_val(resolved));
+                    fflush(stderr);
+                    RETURN_REDUCED(resolved);
+                }
 
                 // Default: pass through
                 RETURN_REDUCED(payload);

@@ -13,7 +13,7 @@ digraph G {
   n36 -> n31 [label="fun",color="#cc0000",penwidth=2.0];
   t1 [label="t1\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t1 -> n31 [label="arg"];
-  n38 [label="IFZ\n[?]", shape=box, fillcolor="#f0f0f0"];
+  n38 [label="IFZ", shape=box, fillcolor="#f0f0f0"];
   var38 [label="VAR\n@34", shape=oval, fillcolor="#eeeeee", fontsize=8];
   var38 -> n38 [label=""];
   dup41 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];

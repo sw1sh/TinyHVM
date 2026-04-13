@@ -904,7 +904,14 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 snprintf(label, sizeof(label), "GRAD\\nd/d(%s)", tgt);
                 color = "#e8d0ff"; nshape = "box";
             } else {
-                snprintf(label, sizeof(label), "%s\\n[%s]", opn, sh);
+                // Pure combinators (IFZ, DETACH, etc.) don't carry tensor shapes
+                int is_combinator = (ext == UOP_IFZ || ext == UOP_DETACH ||
+                                     ext == UOP_LOG_PRINT || ext == UOP_FUSE ||
+                                     ext == UOP_SCHED || ext == UOP_FUSE2);
+                if (is_combinator || !has_shape)
+                    snprintf(label, sizeof(label), "%s", opn);
+                else
+                    snprintf(label, sizeof(label), "%s\\n[%s]", opn, sh);
                 if (ext == UOP_ASSIGN) color = "#ffd700";
                 else if (is_elementwise(ext)) color = "#cce5ff";
                 else if (ext == UOP_SUM || ext == UOP_RMAX) color = "#ffcccc";

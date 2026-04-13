@@ -21,7 +21,7 @@ digraph G {
   var36 [label="VAR\n@36 sub", shape=oval, fillcolor="#eeeeee", fontsize=8];
   var36 -> n36 [label="var"];
   n38 -> n36 [label="body"];
-  n38 [label="IFZ\n[?]", shape=box, fillcolor="#f0f0f0"];
+  n38 [label="IFZ", shape=box, fillcolor="#f0f0f0"];
   var38 [label="VAR\n@34", shape=oval, fillcolor="#eeeeee", fontsize=8];
   var38 -> n38 [label=""];
   dup41 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];

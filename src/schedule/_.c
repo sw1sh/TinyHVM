@@ -499,6 +499,20 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
             return 0;
         }
 
+        // IFZ: fires when counter (arg0) is ready
+        if (uop == UOP_IFZ) {
+            Term a0 = heap_read(ctx, loc + 0);
+            Term wa0 = a0;
+            if (thvm_phase1_predict_next_redex(ctx, a0, out_before, &wa0))
+                return 1;
+            if (phase1_top_arg0_ready(wa0)) {
+                if (out_before) *out_before = t;
+                return 1;
+            }
+            if (out_whnf) *out_whnf = t;
+            return 0;
+        }
+
         if (phase1_top_has_era_arg(ctx, t, NULL, NULL) ||
             phase1_top_has_add_zero_arg(ctx, t, NULL, NULL)) {
             if (out_before) *out_before = t;
@@ -521,6 +535,21 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
         if (phase1_dp_can_fire_on(wv)) {
             if (out_before) *out_before = t;
             return 1;
+        }
+        if (out_whnf) *out_whnf = t;
+        return 0;
+    }
+
+    // TAG_VAR: substituted VARs are reducible (resolve to the substituted value)
+    if (tag == TAG_VAR) {
+        u64 loc = term_val(t);
+        if (loc < ctx->heap_pos) {
+            Term sub = heap_read(ctx, loc);
+            if (!term_is_sub(sub)) {
+                // Substituted — follow through to resolved value
+                if (out_before) *out_before = t;
+                return 1;
+            }
         }
         if (out_whnf) *out_whnf = t;
         return 0;

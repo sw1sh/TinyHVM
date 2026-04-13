@@ -1,12 +1,13 @@
 digraph G {
   // PREV_INTERACTION: interact_VAR
+  // NEXT_INTERACTION: interact_IFZ
   rankdir=BT;
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  n38 [label="IFZ\n[1]", shape=box, fillcolor="#f0f0f0"];
+  n38 [label="IFZ", shape=box, fillcolor="#f0f0f0"];
   t4 [label="t4\n[1]\nu32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t4 -> n38 [label=""];
+  t4 -> n38 [label="",color="#cc0000",penwidth=2.0];
   dup41 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];
   dup42 -> dup41 [label="dp1"];
   dup42 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];

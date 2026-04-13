@@ -1,5 +1,6 @@
 // graph.c — BFS heap walker for inet graph visualization
 // Returns node/edge arrays suitable for WL Graph construction.
+static int heap_dot_root_only = 0; // skip global ERA/ASSIGN seeding in step graphs
 static void thvm_heap_dot(TinyHVM *ctx, const char *path);
 static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 static void thvm_heap_dot_set_highlight(u64 slot, Term term);
@@ -577,14 +578,18 @@ static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root) {
         thvm_heap_dot_set_highlight(0, 0);
     }
     thvm_heap_dot_set_step_meta("state_init", next_name[0] ? next_name : "");
+    heap_dot_root_only = 1;
     thvm_heap_dot_root(ctx, p0, root);
+    heap_dot_root_only = 0;
     step_graph_last_sig = thvm_step_graph_sig(ctx);
     {
         char p0s[256];
         snprintf(p0s, sizeof(p0s), "%s/.tmp_step_struct.dot", step_graph_dir);
         thvm_heap_dot_set_highlight(0, 0);
         thvm_heap_dot_set_step_meta("", "");
+        heap_dot_root_only = 1;
         thvm_heap_dot_root(ctx, p0s, root);
+        heap_dot_root_only = 0;
         step_graph_last_dot_sig = thvm_file_sig(p0s);
         remove(p0s);
         if (thvm_step_graph_find_next_interaction(ctx, &hs, &ht, &next_before)) {
@@ -694,7 +699,9 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term ro
     snprintf(tmp_struct, sizeof(tmp_struct), "%s/.tmp_step_struct.dot", step_graph_dir);
     thvm_heap_dot_set_highlight(0, 0);
     thvm_heap_dot_set_step_meta("", "");
+    heap_dot_root_only = 1;
     thvm_heap_dot_root(ctx, tmp_struct, root);
+    heap_dot_root_only = 0;
     u64 dot_sig = thvm_file_sig(tmp_struct);
     if (dot_sig == step_graph_last_dot_sig) {
         step_graph_last_sig = sig;
@@ -715,7 +722,9 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term ro
         // No further visible interaction from this state: emit explicit final state.
         thvm_heap_dot_set_highlight(0, 0);
         thvm_heap_dot_set_step_meta(prev_name, "");
+        heap_dot_root_only = 1;
         thvm_heap_dot_root(ctx, tmp, root);
+        heap_dot_root_only = 0;
         char p_final[256];
         snprintf(p_final, sizeof(p_final), "%s/step_%03u_state_final.dot", step_graph_dir, step_graph_n);
         rename(tmp, p_final);
@@ -731,7 +740,9 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term ro
     thvm_step_graph_interaction_name(ctx, next_before, next_name, sizeof(next_name));
     thvm_heap_dot_set_highlight(hs, ht);
     thvm_heap_dot_set_step_meta(prev_name, next_name);
+    heap_dot_root_only = 1;
     thvm_heap_dot_root(ctx, tmp, root);
+    heap_dot_root_only = 0;
     if (!thvm_heap_dot_highlight_was_drawn() || !thvm_file_has_substr(tmp, "#cc0000")) {
         // If candidate selection found a detached/non-rendered interaction,
         // keep this as a plain state transition instead of dropping the step.
@@ -767,7 +778,9 @@ static void thvm_step_graph_finalize(TinyHVM *ctx) {
     snprintf(tmp_struct, sizeof(tmp_struct), "%s/.tmp_step_struct.dot", step_graph_dir);
     thvm_heap_dot_set_highlight(0, 0);
     thvm_heap_dot_set_step_meta("", "");
+    heap_dot_root_only = 1;
     thvm_heap_dot_root(ctx, tmp_struct, step_graph_root_term);
+    heap_dot_root_only = 0;
     u64 dot_sig = thvm_file_sig(tmp_struct);
     remove(tmp_struct);
     if (dot_sig != step_graph_last_dot_sig) {
@@ -779,7 +792,9 @@ static void thvm_step_graph_finalize(TinyHVM *ctx) {
         else
             thvm_heap_dot_set_highlight(0, 0);
         thvm_heap_dot_set_step_meta(step_graph_last_prev_name, "");
+        heap_dot_root_only = 1;
         thvm_heap_dot_root(ctx, tmp, step_graph_root_term);
+        heap_dot_root_only = 0;
         char p[256];
         snprintf(p, sizeof(p), "%s/step_%03u_state_final.dot", step_graph_dir, step_graph_n);
         rename(tmp, p);

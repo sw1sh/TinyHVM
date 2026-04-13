@@ -12,6 +12,7 @@ static int heap_dot_hl_hit = 0;
 static char heap_dot_prev_name[96] = {0};
 static char heap_dot_next_name[96] = {0};
 static int heap_dot_include_sched_kernels = 0;
+// heap_dot_root_only declared in graph.c (included before dump.c)
 static void thvm_heap_dot_set_highlight(u64 slot, Term term) {
     heap_dot_hl_on = (slot != 0);
     heap_dot_hl_slot = slot;
@@ -571,20 +572,23 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         // Also seed explicit active ERA agents. GRAD interactions can drop
         // discarded metadata onto detached ERA components that still belong to
         // the literal heap state and must be visible/firable step-by-step.
-        for (u64 h = 1; h < ctx->heap_pos; h++) {
-            Term ht = ctx->heap[h];
-            if (term_tag(ht) == TAG_ERA && term_val(ht) != 0) {
-                slot_live[h] = 1;
-                PUSH_TERM(ht);
-            }
-            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
-                slot_live[h] = 1;
-                PUSH_TERM(ht);
-            }
-            if (heap_dot_include_sched_kernels &&
-                term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_KERNEL) {
-                slot_live[h] = 1;
-                PUSH_TERM(ht);
+        // Skip when heap_dot_root_only is set (step graphs: show only root-reachable).
+        if (!heap_dot_root_only) {
+            for (u64 h = 1; h < ctx->heap_pos; h++) {
+                Term ht = ctx->heap[h];
+                if (term_tag(ht) == TAG_ERA && term_val(ht) != 0) {
+                    slot_live[h] = 1;
+                    PUSH_TERM(ht);
+                }
+                if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
+                    slot_live[h] = 1;
+                    PUSH_TERM(ht);
+                }
+                if (heap_dot_include_sched_kernels &&
+                    term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_KERNEL) {
+                    slot_live[h] = 1;
+                    PUSH_TERM(ht);
+                }
             }
         }
 
@@ -1221,6 +1225,9 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
 
         if (tag == TAG_VAR) {
             if (!SLOT_LIVE(h)) continue;
+            // Skip unsubstituted VAR (SUB) nodes that float disconnected —
+            // they are lambda slots not yet applied, visible only internally.
+            if (term_is_sub(t) && !LOC_LIVE(h)) continue;
             EMIT_VAR_NODE(h, val, term_is_sub(t));
             nn++;
             continue;

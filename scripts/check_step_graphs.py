@@ -246,12 +246,19 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
         if g.suffix.startswith("state_no_highlight"):
             errs.append(f"{os.path.basename(g.path)}: hidden next interaction (state_no_highlight artifact)")
 
-        # 0) every step should mark the next reducible edge in red
+        # 0) every step should mark the next reducible edge or node in red
         # (including step 0 init — it should highlight the first interaction)
         is_final = g.suffix.startswith("state_final")
         if not is_final:
-            if not any("#cc0000" in attrs for _, _, attrs in g.edges):
-                errs.append(f"{os.path.basename(g.path)}: missing highlighted next-interaction edge")
+            has_edge_hl = any("#cc0000" in attrs for _, _, attrs in g.edges)
+            # Also check node highlights (red border on nodes)
+            has_node_hl = any("#cc0000" in g.nodes.get(nid, "") for nid in g.nodes)
+            # Check raw DOT content for node-level color attribute
+            if not has_edge_hl and not has_node_hl:
+                with open(g.path, "r") as _f:
+                    has_node_hl = "cc0000" in _f.read()
+            if not has_edge_hl and not has_node_hl:
+                errs.append(f"{os.path.basename(g.path)}: missing highlighted next-interaction edge or node")
 
         # 1) no undeclared node refs — filter these edges out for subsequent checks
         clean_edges = []

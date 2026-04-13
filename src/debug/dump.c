@@ -12,7 +12,7 @@ static int heap_dot_hl_hit = 0;
 static char heap_dot_prev_name[96] = {0};
 static char heap_dot_next_name[96] = {0};
 static int heap_dot_include_sched_kernels = 0;
-// heap_dot_root_only declared in graph.c (included before dump.c)
+// heap_dot_node_hl and heap_dot_root_only declared in graph.c (included before dump.c)
 static void thvm_heap_dot_set_highlight(u64 slot, Term term) {
     heap_dot_hl_on = (slot != 0);
     heap_dot_hl_slot = slot;
@@ -554,26 +554,16 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     #define EMIT_VAR_NODE(slot, loc, is_sub) do { \
         if (!NODE_SEEN(VAR_NODE_KEY(slot))) { \
             NODE_MARK(VAR_NODE_KEY(slot)); \
-            if (!(is_sub) && (loc) < ctx->heap_pos) { \
-                /* Substituted VAR: show resolved value tag */ \
-                Term _rv = heap_read(ctx, (loc)); \
-                u8 _rt = term_tag(_rv); \
-                if (_rt == TAG_TEN) { \
-                    u32 _tid = (u32)term_val(_rv); \
-                    fprintf(f, "  var%llu [label=\"→t%u\", shape=oval, fillcolor=\"#d4edda\", fontsize=8];\n", \
-                            (unsigned long long)(slot), _tid); \
-                } else { \
-                    fprintf(f, "  var%llu [label=\"VAR\\n@%llu→%s\", shape=oval, fillcolor=\"#d4edda\", fontsize=8];\n", \
-                            (unsigned long long)(slot), (unsigned long long)(loc), dot_heap_tag_name(_rt)); \
-                } \
-            } else { \
-                fprintf(f, "  var%llu [label=\"VAR\\n@%llu%s\", shape=oval, fillcolor=\"#eeeeee\", fontsize=8];\n", \
-                        (unsigned long long)(slot), (unsigned long long)(loc), (is_sub) ? " sub" : ""); \
-            } \
+            fprintf(f, "  var%llu [label=\"VAR\\n@%llu%s\", shape=oval, fillcolor=\"#eeeeee\", fontsize=8%s];\n", \
+                    (unsigned long long)(slot), (unsigned long long)(loc), (is_sub) ? " sub" : "", \
+                    NODE_HL_ATTRS(loc)); \
         } \
     } while(0)
     #define SLOT_LIVE(pos) (((pos) < ctx->heap_pos) ? slot_live[(pos)] : 0)
     #define LOC_LIVE(pos)  (((pos) < ctx->heap_pos) ? loc_live[(pos)] : 0)
+    // Node highlight: red border when edge highlight failed
+    #define NODE_HL_ATTRS(loc) ((heap_dot_node_hl > 0 && (u64)(loc) == heap_dot_node_hl) ? \
+        ",color=\"#cc0000\",penwidth=2.0" : "")
     // Resolve VAR chains: if t is a substituted VAR, follow through to the value.
     // Returns the resolved term and updates *slot to the final heap position.
     #define RESOLVE_VAR(t, slot) do { \
@@ -949,7 +939,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 else if (is_view_op(ext)) color = "#fff3cd";
                 else if (ext == UOP_MM) color = "#ffccff";
             }
-            fprintf(f, "  n%llu [label=\"%s\", shape=%s, fillcolor=\"%s\"];\n", val, label, nshape, color);
+            fprintf(f, "  n%llu [label=\"%s\", shape=%s, fillcolor=\"%s\"%s];\n", val, label, nshape, color, NODE_HL_ATTRS(val));
 
             // Child edges: GRAD has 2 heap ports (y + gy). target pattern is metadata.
             u32 arity = 2;
@@ -962,10 +952,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             for (u32 ai = 0; ai < arity; ai++) {
                 Term child = heap_read(ctx, val + ai);
                 u64 cpos = val + ai;
-                // Follow through substituted VARs to show resolved values
-                RESOLVE_VAR(child, cpos);
                 u8 ctag = term_tag(child); u64 cval = term_val(child);
-                int edge_hl = heap_dot_hl_on && (cpos == heap_dot_hl_slot || (val + ai) == heap_dot_hl_slot);
+                int edge_hl = heap_dot_hl_on && cpos == heap_dot_hl_slot;
                 if (edge_hl) heap_dot_hl_hit = 1;
                 const char *elbl = "";
                 if (ext == UOP_ASSIGN) elbl = ai==0 ? "tgt" : "src";
@@ -1073,15 +1061,14 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (!LOC_LIVE(val)) continue;
             if (NODE_SEEN(val)) continue;
             NODE_MARK(val);
-            fprintf(f, "  n%llu [label=\"APP\", shape=invtriangle, fillcolor=\"#f3f3f3\"];\n",
-                    (unsigned long long)val);
+            fprintf(f, "  n%llu [label=\"APP\", shape=invtriangle, fillcolor=\"#f3f3f3\"%s];\n",
+                    (unsigned long long)val, NODE_HL_ATTRS(val));
             for (u32 ai = 0; ai < 2; ai++) {
                 Term child = heap_read(ctx, val + ai);
-                u64 cpos = val + ai;
-                RESOLVE_VAR(child, cpos);
                 u8 ctag = term_tag(child);
                 u64 cval = term_val(child);
-                int edge_hl = heap_dot_hl_on && (cpos == heap_dot_hl_slot || (val + ai) == heap_dot_hl_slot);
+                u64 cpos = val + ai;
+                int edge_hl = heap_dot_hl_on && cpos == heap_dot_hl_slot;
                 if (edge_hl) heap_dot_hl_hit = 1;
                 const char *elbl = ai == 0 ? "fun" : "arg";
 
@@ -1271,22 +1258,22 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         if (tag == TAG_REF) {
             if (!SLOT_LIVE(h)) continue;
             EMIT_REF_NODE(h, ext);
-            // Draw dashed edge to definition body (find the outermost
-            // rendered node by following through LAM bodies)
+            // Draw dashed edge to definition body.
+            // LAM nodes from defs aren't rendered directly — follow through
+            // LAMs to find the innermost body node that IS rendered.
             if (ext < ctx->def_count) {
                 Term _def = ctx->defs[ext];
-                // Follow through LAMs to find a rendered child
                 for (int _dd = 0; _dd < 8 && term_tag(_def) == TAG_LAM; _dd++) {
                     u64 _bl = term_val(_def);
                     if (_bl + 1 >= ctx->heap_pos) break;
-                    Term _body = heap_read(ctx, _bl + 1);
-                    if (term_tag(_body) == TAG_LAM) { _def = _body; continue; }
-                    // Found a non-LAM body — this should be rendered as n{_bl+1} or similar
-                    u64 _tgt = term_val(_body);
-                    if (dot_visible_heap_loc_tag(term_tag(_body)) && _tgt > 0 && _tgt < ctx->heap_pos)
+                    _def = heap_read(ctx, _bl + 1); // body of LAM
+                }
+                // _def is now the first non-LAM body (e.g., IFZ, SEQ, TOP)
+                if (term_tag(_def) == TAG_TOP || term_tag(_def) == TAG_SEQ) {
+                    u64 _tgt = term_val(_def);
+                    if (_tgt > 0 && _tgt < ctx->heap_pos)
                         fprintf(f, "  ref%llu -> n%llu [style=dashed, color=\"#999999\", label=\"def\"];\n",
                                 (unsigned long long)h, (unsigned long long)_tgt);
-                    break;
                 }
             }
             nn++;
@@ -1295,12 +1282,22 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
 
         if (tag == TAG_VAR) {
             if (!SLOT_LIVE(h)) continue;
-            // Skip unsubstituted (SUB) and substituted standalone VARs —
-            // SUBs are lambda slots not yet applied; substituted VARs
-            // are resolved via RESOLVE_VAR in parent edges.
+            // Skip disconnected SUB markers (lambda slots not yet applied)
             if (term_is_sub(t) && !LOC_LIVE(h)) continue;
-            if (!term_is_sub(t) && !LOC_LIVE(h)) continue;
             EMIT_VAR_NODE(h, val, term_is_sub(t));
+            // Substituted VAR: draw dashed edge to resolved value
+            if (!term_is_sub(t) && val < ctx->heap_pos) {
+                Term _rv = heap_read(ctx, val);
+                u8 _rt = term_tag(_rv);
+                if (_rt == TAG_TEN) {
+                    EMIT_TEN((u32)term_val(_rv));
+                    fprintf(f, "  var%llu -> t%u [style=dashed, color=\"#999999\", label=\"=\"];\n",
+                            (unsigned long long)h, (u32)term_val(_rv));
+                } else if (dot_visible_heap_loc_tag(_rt)) {
+                    fprintf(f, "  var%llu -> n%llu [style=dashed, color=\"#999999\", label=\"=\"];\n",
+                            (unsigned long long)h, (unsigned long long)term_val(_rv));
+                }
+            }
             nn++;
             continue;
         }

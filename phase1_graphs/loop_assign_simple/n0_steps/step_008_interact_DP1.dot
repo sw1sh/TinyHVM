@@ -12,12 +12,12 @@ digraph G {
   var3 -> n3 [label="var"];
   n26 -> n3 [label="body"];
   n26 [label="IFZ", shape=box, fillcolor="#f0f0f0"];
-  var26 [label="VAR\n@1→VAR", shape=oval, fillcolor="#d4edda", fontsize=8];
+  var26 [label="VAR\n@1", shape=oval, fillcolor="#eeeeee", fontsize=8];
   var26 -> n26 [label=""];
   dup9 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];
   dup7 -> dup9 [label="dp1"];
   dup7 [label="DUP", shape=invtriangle, fillcolor="#d4b8e8", fontsize=9, width=0.7, height=0.5];
-  var7 [label="VAR\n@3→VAR", shape=oval, fillcolor="#d4edda", fontsize=8];
+  var7 [label="VAR\n@3", shape=oval, fillcolor="#eeeeee", fontsize=8];
   var7 -> dup7;
   dup9 -> n26 [label=" (dp1)"];
   n5 -> n26 [label=""];
@@ -37,9 +37,9 @@ digraph G {
   n10 -> n14 [label="b"];
   ref20 [label="REF\n#0", shape=oval, fillcolor="#eeeeee", fontsize=8];
   ref20 -> n26 [style=dashed, color="#999999", label="def"];
+  var21 [label="VAR\n@5", shape=oval, fillcolor="#eeeeee", fontsize=8];
   n20 [label="APP", shape=invtriangle, fillcolor="#f3f3f3"];
   ref20 -> n20 [label="fun"];
-  var21 [label="VAR\n@5→VAR", shape=oval, fillcolor="#d4edda", fontsize=8];
   var21 -> n20 [label="arg"];
   n18 [label="ASSIGN\n[3]", shape=box, fillcolor="#ffd700"];
   dup8 -> n18 [label="tgt (dp1)"];
@@ -74,7 +74,7 @@ digraph G {
   n56 [label="APP", shape=invtriangle, fillcolor="#f3f3f3"];
   ref56 [label="REF\n#0", shape=oval, fillcolor="#eeeeee", fontsize=8];
   ref56 -> n56 [label="fun"];
-  var57 [label="VAR\n@43→VAR", shape=oval, fillcolor="#d4edda", fontsize=8];
+  var57 [label="VAR\n@43", shape=oval, fillcolor="#eeeeee", fontsize=8];
   var57 -> n56 [label="arg"];
   ref56 -> n26 [style=dashed, color="#999999", label="def"];
   era59 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];

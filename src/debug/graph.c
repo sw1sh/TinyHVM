@@ -1,6 +1,7 @@
 // graph.c — BFS heap walker for inet graph visualization
 // Returns node/edge arrays suitable for WL Graph construction.
 static int heap_dot_root_only = 0; // skip global ERA/ASSIGN seeding in step graphs
+static u64 heap_dot_node_hl = 0;  // node highlight (red border when edge hl fails)
 static void thvm_heap_dot(TinyHVM *ctx, const char *path);
 static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 static void thvm_heap_dot_set_highlight(u64 slot, Term term);
@@ -514,12 +515,21 @@ static int thvm_step_graph_highlight_from_before(TinyHVM *ctx, u64 source_slot, 
         *out_term = before;
         return 1;
     }
-    if (tag == TAG_REF || tag == TAG_VAR) {
-        // REF/VAR interact when entered — find the heap slot where this
-        // term sits. Walk APP chain from root, or use phase1_root_slot
-        // if the root itself is the term.
+    if (tag == TAG_VAR) {
+        // VAR resolves to its substituted value at heap[var_loc].
+        // Highlight the VAR node itself (keyed by var_loc in NODE_HL_ATTRS).
+        u64 var_loc = term_val(before);
+        if (var_loc > 0 && var_loc < ctx->heap_pos) {
+            *out_slot = var_loc;
+            *out_term = before;
+            return 1;
+        }
+        if (out_slot) *out_slot = 0;
+        return 0;
+    }
+    if (tag == TAG_REF) {
+        // REF unfolds when entered by APP — find the slot.
         {
-            // Check if the root IS this term (stored at phase1_root_slot)
             if (source_slot != 0 && source_slot < ctx->heap_pos &&
                 heap_read(ctx, source_slot) == before) {
                 *out_slot = source_slot;
@@ -778,19 +788,12 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term ro
     thvm_heap_dot_root(ctx, tmp, root);
     heap_dot_root_only = 0;
     if (!thvm_heap_dot_highlight_was_drawn() || !thvm_file_has_substr(tmp, "#cc0000")) {
-        // If candidate selection found a detached/non-rendered interaction,
-        // keep this as a plain state transition instead of dropping the step.
-        char p_state[256];
-        snprintf(p_state, sizeof(p_state), "%s/step_%03u_state_no_highlight.dot",
-                 step_graph_dir, step_graph_n);
-        rename(tmp, p_state);
-        step_graph_n++;
-        step_graph_last_sig = sig;
-        step_graph_last_dot_sig = dot_sig;
-        step_graph_before_grad_y = 0;
-        step_graph_before_era_payload = 0;
-        step_graph_before_top_had_add_zero = 0;
-        return;
+        // Edge highlight failed — re-render with node highlight instead.
+        heap_dot_node_hl = hs;
+        heap_dot_root_only = 1;
+        thvm_heap_dot_root(ctx, tmp, root);
+        heap_dot_root_only = 0;
+        heap_dot_node_hl = 0;
     }
     char p[256];
     snprintf(p, sizeof(p), "%s/step_%03u_%s.dot", step_graph_dir, step_graph_n, prev_name);

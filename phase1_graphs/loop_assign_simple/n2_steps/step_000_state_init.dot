@@ -5,7 +5,6 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  var1 [label="VAR\n@1 sub", shape=oval, fillcolor="#eeeeee", fontsize=8];
   n3 [label="LAM", shape=box, fillcolor="#f2e8ff"];
   var3 [label="VAR\n@3 sub", shape=oval, fillcolor="#eeeeee", fontsize=8];
   var3 -> n3 [label="var"];
@@ -20,7 +19,6 @@ digraph G {
   var7 -> dup7;
   dup9 -> n26 [label=" (dp1)"];
   n5 -> n26 [label=""];
-  var5 [label="VAR\n@5 sub", shape=oval, fillcolor="#eeeeee", fontsize=8];
   n24 [label="SEQ", shape=box, fillcolor="#f0f0f0"];
   n18 -> n24 [label="first"];
   n22 -> n24 [label="then"];
@@ -35,10 +33,10 @@ digraph G {
   dup8 -> n14 [label="a (dp0)"];
   n10 -> n14 [label="b"];
   ref20 [label="REF\n#0", shape=oval, fillcolor="#eeeeee", fontsize=8];
-  ref20 -> n26 [style=dashed, color="#999999", label="def"];
-  var21 [label="VAR\n@5", shape=oval, fillcolor="#eeeeee", fontsize=8];
+  ref20 -> def0 [style=dashed, color="#999999", label="def"];
   n20 [label="APP", shape=invtriangle, fillcolor="#f3f3f3"];
   ref20 -> n20 [label="fun"];
+  var21 [label="VAR\n@5", shape=oval, fillcolor="#eeeeee", fontsize=8];
   var21 -> n20 [label="arg"];
   n18 [label="ASSIGN\n[3]", shape=box, fillcolor="#ffd700"];
   dup8 -> n18 [label="tgt (dp1)"];
@@ -47,10 +45,11 @@ digraph G {
   n20 -> n22 [label="fun"];
   dup9 -> n22 [label="arg (dp0)"];
   n5 [label="LAM", shape=box, fillcolor="#f2e8ff"];
+  var5 [label="VAR\n@5 sub", shape=oval, fillcolor="#eeeeee", fontsize=8];
   var5 -> n5 [label="var"];
   n24 -> n5 [label="body"];
   ref29 [label="REF\n#0", shape=oval, fillcolor="#eeeeee", fontsize=8];
-  ref29 -> n26 [style=dashed, color="#999999", label="def"];
+  ref29 -> def0 [style=dashed, color="#999999", label="def"];
   n29 [label="APP", shape=invtriangle, fillcolor="#f3f3f3"];
   ref29 -> n29 [label="fun",color="#cc0000",penwidth=2.0];
   t4 [label="t4\n[1]\nu32 cpu",shape=box,fillcolor="#e0e0e0"];
@@ -59,4 +58,6 @@ digraph G {
   n29 -> n31 [label="fun"];
   t1 [label="t1\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t1 -> n31 [label="arg"];
+  def0 [label="def #0", shape=box, fillcolor="#f2e8ff", style="filled,dashed", fontsize=8];
+  def0 -> n26 [style=dashed, color="#999999"];
 }

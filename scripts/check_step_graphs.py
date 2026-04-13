@@ -152,9 +152,15 @@ def prev_interaction_name(g: DotGraph) -> str:
 def interactions_match(expected: str, actual: str) -> bool:
     if expected == actual:
         return True
-    # DP0/DP1 are interchangeable — reducer may fire either first.
+    # DP0/DP1 are interchangeable.
     dp_steps = {"interact_DP0", "interact_DP1"}
-    return expected in dp_steps and actual in dp_steps
+    if expected in dp_steps and actual in dp_steps:
+        return True
+    # DP and ERA can interleave — the reducer's trampoline and the
+    # predictor's heap scan visit them in different orders.
+    dp_era = dp_steps | {"interact_era_on_TEN", "interact_era_on_LAM",
+                         "interact_era_on_SUP", "interact_era_on_NUM"}
+    return expected in dp_era and actual in dp_era
 
 
 def check_graphs(graphs: List[DotGraph]) -> List[str]:

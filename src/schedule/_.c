@@ -513,6 +513,14 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
             return 0;
         }
 
+        // For direct UOPs: check if arg0 needs resolution first
+        // (reducer resolves arg0 before checking ERA args)
+        {
+            Term a0 = heap_read(ctx, loc + 0);
+            Term wa0 = a0;
+            if (thvm_phase1_predict_next_redex(ctx, a0, out_before, &wa0))
+                return 1;
+        }
         if (phase1_top_has_era_arg(ctx, t, NULL, NULL) ||
             phase1_top_has_add_zero_arg(ctx, t, NULL, NULL)) {
             if (out_before) *out_before = t;

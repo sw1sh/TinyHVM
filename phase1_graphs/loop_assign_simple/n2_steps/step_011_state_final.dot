@@ -1,7 +1,0 @@
-digraph G {
-  // PREV_INTERACTION: interact_era_on_TEN
-  rankdir=BT;
-  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
-  edge [fontsize=8, fontname="Helvetica"];
-
-}

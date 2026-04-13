@@ -118,6 +118,7 @@ static int dot_visible_heap_loc_tag(u8 tag) {
         case TAG_DSU:
         case TAG_DDU:
         case TAG_UDP:
+        case TAG_SEQ:
         case TAG_CTR:
         case TAG_INC:
             return 1;
@@ -142,6 +143,7 @@ static const char *dot_heap_tag_name(u8 tag) {
         case TAG_DSU: return "DSU";
         case TAG_DDU: return "DDU";
         case TAG_UDP: return "UDP";
+        case TAG_SEQ: return "SEQ";
         case TAG_CTR: return "CTR";
         case TAG_REF: return "REF";
         case TAG_VAR: return "VAR";
@@ -188,6 +190,7 @@ static const char *dot_heap_port_name(u8 tag, u32 idx) {
         case TAG_DDU: return idx == 0 ? "label" : (idx == 1 ? "a" : "b");
         case TAG_UDP:
         case TAG_INC: return "in";
+        case TAG_SEQ: return idx == 0 ? "first" : "then";
         default: return idx == 0 ? "a" : "b";
     }
 }
@@ -364,6 +367,7 @@ static u32 dot_term_arity(Term t) {
         case TAG_EQL:
         case TAG_AND:
         case TAG_OR:
+        case TAG_SEQ:
         case TAG_MAT:
         case TAG_ANN:
             return 2;
@@ -518,8 +522,13 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         if (!NODE_SEEN(RAW_NODE_KEY(hid))) { \
             NODE_MARK(RAW_NODE_KEY(hid)); \
             Term _rt = (tterm); \
-            fprintf(f, "  h%llu [label=\"h%llu\\ntag=%u\", shape=box, fillcolor=\"#dddddd\", fontsize=8];\n", \
-                    (unsigned long long)(hid), (unsigned long long)(hid), (u32)term_tag(_rt)); \
+            const char *_tn = dot_heap_tag_name(term_tag(_rt)); \
+            if (_tn[0] == '?') \
+                fprintf(f, "  h%llu [label=\"h%llu\\ntag=%u\", shape=box, fillcolor=\"#dddddd\", fontsize=8];\n", \
+                        (unsigned long long)(hid), (unsigned long long)(hid), (u32)term_tag(_rt)); \
+            else \
+                fprintf(f, "  h%llu [label=\"h%llu\\n%s\", shape=box, fillcolor=\"#dddddd\", fontsize=8];\n", \
+                        (unsigned long long)(hid), (unsigned long long)(hid), _tn); \
         } \
     } while(0)
     #define EMIT_CTR_NODE(cloc) do { \
@@ -572,14 +581,16 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         // Also seed explicit active ERA agents. GRAD interactions can drop
         // discarded metadata onto detached ERA components that still belong to
         // the literal heap state and must be visible/firable step-by-step.
-        // Skip when heap_dot_root_only is set (step graphs: show only root-reachable).
-        if (!heap_dot_root_only) {
-            for (u64 h = 1; h < ctx->heap_pos; h++) {
-                Term ht = ctx->heap[h];
-                if (term_tag(ht) == TAG_ERA && term_val(ht) != 0) {
-                    slot_live[h] = 1;
-                    PUSH_TERM(ht);
-                }
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            Term ht = ctx->heap[h];
+            // ERA agents are always seeded — they're active computation.
+            if (term_tag(ht) == TAG_ERA && term_val(ht) != 0) {
+                slot_live[h] = 1;
+                PUSH_TERM(ht);
+            }
+            // ASSIGN/KERNEL: skip in root_only mode to avoid pulling in
+            // unreachable definition body nodes.
+            if (!heap_dot_root_only) {
                 if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
                     slot_live[h] = 1;
                     PUSH_TERM(ht);

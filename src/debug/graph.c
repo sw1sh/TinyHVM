@@ -514,6 +514,33 @@ static int thvm_step_graph_highlight_from_before(TinyHVM *ctx, u64 source_slot, 
         *out_term = before;
         return 1;
     }
+    if (tag == TAG_REF || tag == TAG_VAR) {
+        // REF/VAR interact when entered by APP — walk from root to find
+        // the actual slot where this term sits. The source_slot is a mirror
+        // cell that doesn't correspond to a rendered DOT edge.
+        // Simple approach: walk the APP chain from root.
+        {
+            Term _walk = step_graph_root_term;
+            for (int _depth = 0; _depth < 32; _depth++) {
+                if (term_tag(_walk) != TAG_APP) break;
+                u64 _aloc = term_val(_walk);
+                if (_aloc == 0 || _aloc + 1 >= ctx->heap_pos) break;
+                Term _fun = heap_read(ctx, _aloc);
+                if (_fun == before) {
+                    *out_slot = _aloc; // fun slot of this APP
+                    *out_term = before;
+                    return 1;
+                }
+                _walk = _fun; // descend into fun position
+            }
+        }
+        // Fallback: use source_slot
+        if (source_slot != 0 && source_slot < ctx->heap_pos) {
+            *out_slot = source_slot;
+            *out_term = before;
+            return 1;
+        }
+    }
     if (tag == TAG_TOP) {
         u64 loc = term_val(before);
         if (loc >= ctx->heap_pos) return 0;

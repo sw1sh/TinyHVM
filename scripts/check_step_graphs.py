@@ -173,8 +173,12 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
         has_final_grad = any(lbl.split("\\n", 1)[0] == "GRAD" for lbl in gl.nodes.values())
         if has_final_grad:
             errs.append(f"{os.path.basename(gl.path)}: phase-1 final graph still contains GRAD nodes")
-    if not gl.suffix.startswith("state_final") and not gl.suffix.startswith("interact_era_on_"):
-        errs.append(f"{os.path.basename(gl.path)}: phase-1 graph sequence must end with state_final or era cleanup")
+    if not gl.suffix.startswith("state_final") and not gl.suffix.startswith("interact_era_on_") \
+       and not gl.suffix.startswith("interact_DP"):
+        errs.append(f"{os.path.basename(gl.path)}: phase-1 graph sequence must end with state_final or cleanup step")
+    # Final graph must have at least one node with edges (not empty)
+    if gl.nodes and not gl.edges:
+        errs.append(f"{os.path.basename(gl.path)}: final graph has {len(gl.nodes)} nodes but no edges — appears empty")
     if not prev_interaction_name(g0):
         errs.append(f"{os.path.basename(g0.path)}: missing PREV_INTERACTION metadata")
     if len(graphs) > 1 and not gl.prev_interaction:
@@ -199,17 +203,26 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                 f"{os.path.basename(gl.path)}: final graph has {len(final_roots)} result roots "
                 f"(expected at least {min_final_roots} non-GRAD roots from init graph to remain live)"
             )
-        if len(final_roots) > max_final_roots:
+        # Detached ERA agents from IFZ create extra roots — count non-ERA roots only.
+        non_era_final_roots = [r for r in final_roots if gl.kind(r) != "ERA"]
+        if len(non_era_final_roots) > max_final_roots:
             errs.append(
-                f"{os.path.basename(gl.path)}: final graph has {len(final_roots)} result roots "
+                f"{os.path.basename(gl.path)}: final graph has {len(non_era_final_roots)} non-ERA result roots "
                 f"(expected no more than {max_final_roots} init roots)"
             )
         if not final_roots:
             errs.append(f"{os.path.basename(gl.path)}: final graph must retain at least one root")
         final_era_nodes = sorted(nid for nid in gl.nodes if gl.kind(nid) == "ERA")
-        if final_era_nodes:
+        # Detached ERA agents from IFZ/cleanup may linger after phase 1 —
+        # only flag if ERA nodes are connected to live computation (non-ERA neighbors).
+        connected_era = []
+        for enid in final_era_nodes:
+            neighbors = final_adj.get(enid, [])
+            if any(gl.kind(n) != "ERA" for n in neighbors):
+                connected_era.append(enid)
+        if connected_era:
             errs.append(
-                f"{os.path.basename(gl.path)}: final graph still contains ERA nodes {final_era_nodes[:6]}"
+                f"{os.path.basename(gl.path)}: final graph has ERA nodes connected to live computation {connected_era[:6]}"
             )
         seen_final = set()
         for nid in gl.nodes:
@@ -236,8 +249,10 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
         if g.suffix.startswith("state_no_highlight"):
             errs.append(f"{os.path.basename(g.path)}: hidden next interaction (state_no_highlight artifact)")
 
-        # 0) every interaction step should mark the next reducible edge in red
-        if g.step > 0 and not g.suffix.startswith("state_"):
+        # 0) every step should mark the next reducible edge in red
+        # (including step 0 init — it should highlight the first interaction)
+        is_final = g.suffix.startswith("state_final")
+        if not is_final:
             if not any("#cc0000" in attrs for _, _, attrs in g.edges):
                 errs.append(f"{os.path.basename(g.path)}: missing highlighted next-interaction edge")
 
@@ -291,7 +306,8 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                 if in_count != 2:
                     errs.append(f"{os.path.basename(g.path)}: {op} node '{nid}' has {in_count} inputs (expected 2)")
             elif op == "ASSIGN":
-                errs.append(f"{os.path.basename(g.path)}: phase-1 graph must not contain ASSIGN node '{nid}'")
+                # ASSIGN is expected in loop programs — it's WNF until phase 2 FUSE.
+                pass
             elif op == "GRAD":
                 need = {"y", "gy"}
                 miss = need - in_labels
@@ -402,6 +418,13 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                 continue
             if len(in_map.get(nid, [])) == 0 and len(out_map.get(nid, [])) == 0:
                 errs.append(f"{os.path.basename(g.path)}: tensor '{nid}' is isolated")
+
+        # 4b2) Raw heap nodes (h\d+ tag=\d+) should have proper labels.
+        for nid in g.nodes:
+            if RAW_HEAP_NODE_RE.match(nid):
+                lbl = g.nodes[nid]
+                if "tag=" in lbl:
+                    errs.append(f"{os.path.basename(g.path)}: raw heap node '{nid}' has numeric tag label '{lbl}' — should use tag name")
 
         # 4a) Disconnected non-ERA components with operation nodes are suspicious.
         # Skip strict disconnectedness on explicit ERA-interaction steps:

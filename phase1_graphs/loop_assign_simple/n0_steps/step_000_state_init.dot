@@ -7,7 +7,7 @@ digraph G {
 
   ref29 [label="REF\n#0", shape=oval, fillcolor="#eeeeee", fontsize=8];
   n29 [label="APP", shape=invtriangle, fillcolor="#f3f3f3"];
-  ref29 -> n29 [label="fun"];
+  ref29 -> n29 [label="fun",color="#cc0000",penwidth=2.0];
   t4 [label="t4\n[1]\nu32 cpu",shape=box,fillcolor="#e0e0e0"];
   t4 -> n29 [label="arg"];
   n31 [label="APP", shape=invtriangle, fillcolor="#f3f3f3"];

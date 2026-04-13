@@ -166,21 +166,15 @@
                         puop == UOP_SCHED || puop == UOP_FUSE2)
                         RETURN_REDUCED(payload);
 
-                    // ASSIGN: fuse src via sub-reduce until TAG_TEN
+                    // ASSIGN: wrap src in FUSE, return ASSIGN.
+                    // Pure interaction — no sub-reduce. Reducer handles the rest.
                     if (puop == UOP_ASSIGN) {
                         u64 aloc = term_val(payload);
                         Term src = heap_read(ctx, aloc + 1);
                         if (term_tag(src) != TAG_TEN && term_tag(src) != TAG_ERA) {
-                            // Wrap in FUSE and reduce repeatedly until TEN
                             u64 fl = heap_alloc(ctx, 1);
                             heap_set(ctx, fl, src);
-                            Term fused = term_new(TAG_TOP, UOP_FUSE, fl);
-                            for (int _retry = 0; _retry < 100; _retry++) {
-                                fused = thvm_reduce(ctx, fused);
-                                if (term_tag(fused) == TAG_TEN || term_tag(fused) == TAG_ERA)
-                                    break;
-                            }
-                            heap_set(ctx, aloc + 1, fused);
+                            heap_set(ctx, aloc + 1, term_new(TAG_TOP, UOP_FUSE, fl));
                         }
                         RETURN_REDUCED(payload);
                     }
@@ -232,11 +226,7 @@
                     heap_set(ctx, f2loc, term_num_u32(UOP_COUNT));
                     heap_set(ctx, f2loc + 1, term_new(TAG_TOP, UOP_FUSE, fa));
                     heap_set(ctx, f2loc + 2, term_new(TAG_TOP, UOP_FUSE, fb));
-                    Term _r = term_new(TAG_TOP, UOP_FUSE2, f2loc);
-                    fprintf(stderr, "FUSE_SEQ: tag=%u ext=%u val=%llu raw=0x%llx\n",
-                            term_tag(_r), term_ext(_r), (unsigned long long)term_val(_r),
-                            (unsigned long long)_r);
-                    RETURN_REDUCED(_r);
+                    RETURN_REDUCED(term_new(TAG_TOP, UOP_FUSE2, f2loc));
                 }
 
                 // CTR: distribute
@@ -253,20 +243,10 @@
                     RETURN_REDUCED(payload);
                 }
 
-                // DP: resolve fully through DUP chain
+                // DP: should have been resolved by reducer before reaching FUSE.
+                // If still DP, return not-ready — reducer will keep reducing.
                 if (ptag == TAG_DP0 || ptag == TAG_DP1) {
-                    fprintf(stderr, "FUSE_DP_ENTER\n");
-                    Term resolved = payload;
-                    for (int _dp = 0; _dp < 32; _dp++) {
-                        resolved = thvm_reduce(ctx, resolved);
-                        if (term_tag(resolved) != TAG_DP0 && term_tag(resolved) != TAG_DP1)
-                            break;
-                    }
-                    fprintf(stderr, "FUSE_DP: → tag=%u ext=%u val=%llu\n",
-                            term_tag(resolved), term_ext(resolved),
-                            (unsigned long long)term_val(resolved));
-                    fflush(stderr);
-                    RETURN_REDUCED(resolved);
+                    return t;
                 }
 
                 // Default: pass through
@@ -280,8 +260,8 @@
                 Term left  = heap_read(ctx, loc + 1);
                 Term right = heap_read(ctx, loc + 2);
                 if (getenv("THVM_SCHED_DIAG"))
-                    fprintf(stderr, "FUSE2: fop=%u l_tag=%u l_ext=%u r_tag=%u r_ext=%u\n",
-                            fop, term_tag(left), term_ext(left), term_tag(right), term_ext(right));
+                    fprintf(stderr, "FUSE2: fop=%u loc=%llu l_tag=%u l_ext=%u r_tag=%u r_ext=%u\n",
+                            fop, (unsigned long long)loc, term_tag(left), term_ext(left), term_tag(right), term_ext(right));
 
                 // SEQ compose: degrade to SEQ immediately.
                 // SEQ children are typically ASSIGN + continuation — not fuseable.
@@ -296,20 +276,26 @@
                     (term_ext(right) == UOP_FUSE || term_ext(right) == UOP_FUSE2);
                 if (l_fuse || r_fuse) return t;
 
-                // Compute op: children resolved (TEN, KERNEL, ERA, or NUM)
-                int l_ok = term_tag(left) == TAG_TEN || term_tag(left) == TAG_ERA ||
-                    term_tag(left) == TAG_NUM ||
-                    (term_tag(left) == TAG_TOP && term_ext(left) == UOP_KERNEL);
-                int r_ok = term_tag(right) == TAG_TEN || term_tag(right) == TAG_ERA ||
-                    term_tag(right) == TAG_NUM ||
-                    (term_tag(right) == TAG_TOP && term_ext(right) == UOP_KERNEL);
+                // Compute op: children resolved (TEN, KERNEL, ERA, NUM, or raw compute op)
+                // Raw compute ops (non-direct TAG_TOP like EXPAND, RESHAPE) are accepted
+                // so the kernel builder can fuse the whole tree at once.
+                #define _FUSE2_CHILD_OK(x) \
+                    (term_tag(x) == TAG_TEN || term_tag(x) == TAG_ERA || \
+                     term_tag(x) == TAG_NUM || \
+                     (term_tag(x) == TAG_TOP && term_ext(x) != UOP_FUSE && \
+                      term_ext(x) != UOP_FUSE2 && term_ext(x) != UOP_SCHED))
+                int l_ok = _FUSE2_CHILD_OK(left);
+                int r_ok = _FUSE2_CHILD_OK(right);
+                #undef _FUSE2_CHILD_OK
 
                 if (l_ok && r_ok) {
                     // Both resolved. Build kernel with this op on top.
-                    // For now: reconstruct the compute op and build via fuse_build_kernel
-                    u64 oploc = heap_alloc(ctx, 2);
+                    // Unary ops have ERA in right slot — use 1-slot to avoid
+                    // reduce_top_has_era_arg firing prematurely on the raw compute.
+                    int _unary = (term_tag(right) == TAG_ERA);
+                    u64 oploc = heap_alloc(ctx, _unary ? 1 : 2);
                     heap_set(ctx, oploc, left);
-                    heap_set(ctx, oploc + 1, right);
+                    if (!_unary) heap_set(ctx, oploc + 1, right);
                     Term compute = term_new(TAG_TOP, fop, oploc);
                     // Copy shape metadata from children
                     if (term_tag(left) == TAG_TEN) {

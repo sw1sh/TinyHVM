@@ -117,7 +117,8 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
             return out;
         }
 
-        // ── APP: 2 slots (fun, arg) ──────────────────────────────
+        // ── APP / SEQ: 2 slots ──────────────────────────────────
+        case TAG_SEQ:
         case TAG_APP: {
             u64 old_loc = term_val(t);
             u64 new_loc = heap_alloc(ctx, 2);
@@ -127,7 +128,7 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
             heap_set(ctx, new_loc + 1,
                      term_clone_r(ctx, heap_read(ctx, old_loc + 1),
                                   relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
-            Term out = term_new(TAG_APP, term_ext(t), new_loc);
+            Term out = term_new(tag, term_ext(t), new_loc);
             clone_term_map_add(tmap, n_tmap, t, out);
             return out;
         }

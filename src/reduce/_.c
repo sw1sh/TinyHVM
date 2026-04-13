@@ -44,8 +44,11 @@ static inline u32 reduce_top_arity(u32 uop) {
 
 static inline int reduce_top_has_era_arg(TinyHVM *ctx, Term t) {
     if (term_tag(t) != TAG_TOP) return 0;
+    u32 uop = term_ext(t);
+    // FUSE2 uses ERA intentionally for unary ops — not an erasure case.
+    if (uop == UOP_FUSE2 || uop == UOP_FUSE || uop == UOP_SCHED) return 0;
     u64 loc = term_val(t);
-    u32 arity = reduce_top_arity(term_ext(t));
+    u32 arity = reduce_top_arity(uop);
     for (u32 i = 0; i < arity; i++) {
         Term child = heap_read(ctx, loc + i);
         if (term_tag(child) == TAG_ERA) return 1;
@@ -431,8 +434,10 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 term_tag(whnf) == TAG_SUP ||
                 (term_tag(whnf) == TAG_TOP && frame_uop == UOP_GRAD) ||
                 (term_tag(whnf) == TAG_VAR && frame_uop == UOP_DETACH) ||
-                // UOP_FUSE/UOP_SCHED/UOP_FUSE2 accept any WNF payload
-                (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED || frame_uop == UOP_FUSE2);
+                // UOP_FUSE/UOP_SCHED/UOP_FUSE2 accept most WNF payloads,
+                // but NOT DP0/DP1 — those must be resolved by reducer first.
+                ((frame_uop == UOP_FUSE || frame_uop == UOP_SCHED || frame_uop == UOP_FUSE2) &&
+                 term_tag(whnf) != TAG_DP0 && term_tag(whnf) != TAG_DP1);
             if (!arg0_ready) {
                 heap_set(ctx, loc+0, whnf); whnf = frame; continue;
             }
@@ -504,21 +509,32 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             }
             // No re-entry — let the parent handler deal with unreduced children.
             // No re-entry — reconstructed TAG_TOP handles unreduced arg1.
-            if (w1t != TAG_TEN && w1t != TAG_ERA && w1t != TAG_NUM &&
-                w1t != TAG_LAM && w1t != TAG_SUP) {
+            u32 _uop1 = term_ext(frame);
+            int _arg1_ok = (w1t == TAG_TEN || w1t == TAG_ERA || w1t == TAG_NUM ||
+                            w1t == TAG_LAM || w1t == TAG_SUP);
+            // FUSE2: also accept TAG_TOP (ASSIGN, KERNEL, etc.) and TAG_SEQ
+            // as valid children. BUT NOT UOP_FUSE/UOP_FUSE2 — those must be
+            // reduced first (they resolve to TEN/KERNEL/ASSIGN).
+            if (_uop1 == UOP_FUSE2)
+                _arg1_ok = _arg1_ok || w1t == TAG_SEQ || w1t == TAG_CTR ||
+                           (w1t == TAG_TOP && term_ext(whnf) != UOP_FUSE && term_ext(whnf) != UOP_FUSE2);
+            if (!_arg1_ok) {
                 // Reconstruct original TAG_TOP from TOP1 sentinel
                 heap_set(ctx, loc + 1, whnf);
-                whnf = term_new(TAG_TOP, term_ext(frame), loc);
+                whnf = term_new(TAG_TOP, _uop1, loc);
                 continue;
             }
             heap_set(ctx, loc + 1, whnf);  // store arg1 result
-            // 3-arg ops (WHERE, IFZ): reduce arg2 before firing
-            u32 _uop1 = term_ext(frame);
+            // 3-arg ops (WHERE, IFZ, FUSE2): reduce arg2 before firing
             if (_uop1 == UOP_WHERE || _uop1 == UOP_IFZ || _uop1 == UOP_FUSE2) {
                 Term a2 = heap_read(ctx, loc + 2);
                 u8 a2t = term_tag(a2);
-                if (a2t != TAG_TEN && a2t != TAG_ERA && a2t != TAG_NUM &&
-                    a2t != TAG_CTR && a2t != TAG_ANY && a2t != TAG_LAM && a2t != TAG_SUP) {
+                int _arg2_ok = (a2t == TAG_TEN || a2t == TAG_ERA || a2t == TAG_NUM ||
+                                a2t == TAG_CTR || a2t == TAG_ANY || a2t == TAG_LAM || a2t == TAG_SUP);
+                if (_uop1 == UOP_FUSE2)
+                    _arg2_ok = _arg2_ok || a2t == TAG_SEQ ||
+                               (a2t == TAG_TOP && term_ext(a2) != UOP_FUSE && term_ext(a2) != UOP_FUSE2);
+                if (!_arg2_ok) {
                     PUSH(term_new(TAG_TOP2, (u8)_uop1, loc));
                     next = a2;
                     goto enter;
@@ -542,8 +558,14 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 whnf = term_new(TAG_TOP, term_ext(frame), loc);
                 continue;
             }
-            if (w2t != TAG_TEN && w2t != TAG_ERA && w2t != TAG_NUM &&
-                w2t != TAG_LAM && w2t != TAG_SUP && w2t != TAG_CTR && w2t != TAG_ANY) { whnf = frame; continue; }
+            { int _arg2_ok2 = (w2t == TAG_TEN || w2t == TAG_ERA || w2t == TAG_NUM ||
+                              w2t == TAG_LAM || w2t == TAG_SUP || w2t == TAG_CTR || w2t == TAG_ANY);
+              u32 _uop2 = term_ext(frame);
+              if (_uop2 == UOP_FUSE2)
+                  _arg2_ok2 = _arg2_ok2 || w2t == TAG_SEQ ||
+                              (w2t == TAG_TOP && term_ext(whnf) != UOP_FUSE && term_ext(whnf) != UOP_FUSE2);
+              if (!_arg2_ok2) { heap_set(ctx, loc+2, whnf); whnf = term_new(TAG_TOP, _uop2, loc); continue; }
+            }
             heap_set(ctx, loc + 2, whnf);  // store arg2 result
             // All needed args ready — fire interact
             Term top_frame = term_new(TAG_TOP, term_ext(frame), loc);

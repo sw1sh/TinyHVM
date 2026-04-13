@@ -1,0 +1,15 @@
+digraph G {
+  // PREV_INTERACTION: interact_era_on_LAM
+  // NEXT_INTERACTION: interact_era_on_VAR
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1 [label="t1\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  era61 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  var60 [label="VAR\n@43 sub", shape=oval, fillcolor="#eeeeee", fontsize=8];
+  var60 -> era61 [label="p",color="#cc0000",penwidth=2.0];
+  era63 [label="ERA",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  h62 [label="h62\ntag=25", shape=box, fillcolor="#dddddd", fontsize=8];
+  h62 -> era63 [label="p"];
+}

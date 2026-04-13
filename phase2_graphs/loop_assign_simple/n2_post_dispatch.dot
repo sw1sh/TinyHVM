@@ -4,7 +4,6 @@ digraph G {
   edge [fontsize=8, fontname="Helvetica"];
 
   t1 [label="t1\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
-  var3 [label="VAR\n@3 sub", shape=oval, fillcolor="#eeeeee", fontsize=8];
   n10 [label="EXPAND\n[3]", shape=box, fillcolor="#fff3cd"];
   t2 [label="t2\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t2 -> n10 [label="in"];

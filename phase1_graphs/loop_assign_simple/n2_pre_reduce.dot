@@ -3,7 +3,6 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  var3 [label="VAR\n@3 sub", shape=oval, fillcolor="#eeeeee", fontsize=8];
   n10 [label="EXPAND\n[3]", shape=box, fillcolor="#fff3cd"];
   t2 [label="t2\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t2 -> n10 [label="in"];

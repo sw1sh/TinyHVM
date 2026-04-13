@@ -152,12 +152,9 @@ def prev_interaction_name(g: DotGraph) -> str:
 def interactions_match(expected: str, actual: str) -> bool:
     if expected == actual:
         return True
-    # Reducer can fire auxiliary interactions (DP, VAR, ERA) in any order
-    # when resolving a principal interaction. Allow these mismatches.
-    aux_steps = {"interact_DP0", "interact_DP1", "interact_VAR",
-                 "interact_era_on_TEN", "interact_era_on_LAM",
-                 "interact_era_on_SUP", "interact_era_on_NUM"}
-    return expected in aux_steps or actual in aux_steps
+    # DP0/DP1 are interchangeable — reducer may fire either first.
+    dp_steps = {"interact_DP0", "interact_DP1"}
+    return expected in dp_steps and actual in dp_steps
 
 
 def check_graphs(graphs: List[DotGraph]) -> List[str]:
@@ -407,11 +404,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                 errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' has {port_counts['dp0']} dp0 consumers (expected <=1)")
             if port_counts["dp1"] > 1:
                 errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' has {port_counts['dp1']} dp1 consumers (expected <=1)")
-            # DUP ports may be outside the visible graph (e.g., cloned DUPs
-            # from REF unfold where one port's consumer is in a lazy branch).
-            # Only flag if BOTH ports are missing (DUP should have at least one).
-            if not has_dp0 and not has_dp1:
-                errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' has no dp0 or dp1 output")
+            # (DUP port completeness checked in rule 4f below)
         # 4b) Isolated tensors indicate heap-dump artifacts or broken links.
         for nid in g.nodes:
             if g.kind(nid) != "TEN":
@@ -489,6 +482,42 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                 f"{os.path.basename(a.path)}: highlighted next interaction '{a.next_interaction}' "
                 f"does not match following step '{b_prev}'"
             )
+
+    # 4d) state_final must actually be final — no more interact steps should follow
+    for i, g in enumerate(graphs):
+        if g.suffix.startswith("state_final") and i < len(graphs) - 1:
+            rest = graphs[i+1:]
+            interact_follows = [r for r in rest if not r.suffix.startswith("state_")]
+            if interact_follows:
+                errs.append(
+                    f"{os.path.basename(g.path)}: labeled 'state_final' but {len(interact_follows)} "
+                    f"interact steps follow (next: {os.path.basename(interact_follows[0].path)})"
+                )
+
+    # 4e) IFZ nodes must not have [?] shape label
+    for g in graphs:
+        for nid in g.nodes:
+            lbl = g.nodes[nid]
+            head = lbl.split("\\n", 1)[0]
+            if head == "IFZ" and "\\n[?]" in lbl:
+                errs.append(f"{os.path.basename(g.path)}: IFZ node '{nid}' has unknown shape [?]")
+
+    # 4f) DUP nodes should have both dp0 and dp1 outputs
+    for g in graphs:
+        out_map_dup: Dict[str, List[Tuple[str, str, str]]] = {}
+        for e in g.edges:
+            out_map_dup.setdefault(e[0], []).append(e)
+        for nid in g.nodes:
+            if g.kind(nid) != "DUP":
+                continue
+            outs = out_map_dup.get(nid, [])
+            ports = {edge_dp_port(attrs) for _, _, attrs in outs}
+            has_dp0 = "dp0" in ports
+            has_dp1 = "dp1" in ports
+            if not has_dp0:
+                errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' is missing dp0 output")
+            if not has_dp1:
+                errs.append(f"{os.path.basename(g.path)}: DUP '{nid}' is missing dp1 output")
 
     # 5) no identical consecutive steps
     for a, b in zip(graphs, graphs[1:]):

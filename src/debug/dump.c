@@ -554,12 +554,38 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     #define EMIT_VAR_NODE(slot, loc, is_sub) do { \
         if (!NODE_SEEN(VAR_NODE_KEY(slot))) { \
             NODE_MARK(VAR_NODE_KEY(slot)); \
-            fprintf(f, "  var%llu [label=\"VAR\\n@%llu%s\", shape=oval, fillcolor=\"#eeeeee\", fontsize=8];\n", \
-                    (unsigned long long)(slot), (unsigned long long)(loc), (is_sub) ? " sub" : ""); \
+            if (!(is_sub) && (loc) < ctx->heap_pos) { \
+                /* Substituted VAR: show resolved value tag */ \
+                Term _rv = heap_read(ctx, (loc)); \
+                u8 _rt = term_tag(_rv); \
+                if (_rt == TAG_TEN) { \
+                    u32 _tid = (u32)term_val(_rv); \
+                    fprintf(f, "  var%llu [label=\"→t%u\", shape=oval, fillcolor=\"#d4edda\", fontsize=8];\n", \
+                            (unsigned long long)(slot), _tid); \
+                } else { \
+                    fprintf(f, "  var%llu [label=\"VAR\\n@%llu→%s\", shape=oval, fillcolor=\"#d4edda\", fontsize=8];\n", \
+                            (unsigned long long)(slot), (unsigned long long)(loc), dot_heap_tag_name(_rt)); \
+                } \
+            } else { \
+                fprintf(f, "  var%llu [label=\"VAR\\n@%llu%s\", shape=oval, fillcolor=\"#eeeeee\", fontsize=8];\n", \
+                        (unsigned long long)(slot), (unsigned long long)(loc), (is_sub) ? " sub" : ""); \
+            } \
         } \
     } while(0)
     #define SLOT_LIVE(pos) (((pos) < ctx->heap_pos) ? slot_live[(pos)] : 0)
     #define LOC_LIVE(pos)  (((pos) < ctx->heap_pos) ? loc_live[(pos)] : 0)
+    // Resolve VAR chains: if t is a substituted VAR, follow through to the value.
+    // Returns the resolved term and updates *slot to the final heap position.
+    #define RESOLVE_VAR(t, slot) do { \
+        for (int _vr = 0; _vr < 16 && term_tag(t) == TAG_VAR; _vr++) { \
+            u64 _vl = term_val(t); \
+            if (_vl >= ctx->heap_pos) break; \
+            Term _vs = heap_read(ctx, _vl); \
+            if (term_is_sub(_vs)) break; \
+            (slot) = _vl; \
+            (t) = _vs; \
+        } \
+    } while(0)
 
     // Precompute live TOP locations by traversing from active agents/root only.
     // This hides stale detached TOP cells left in dead heap regions.
@@ -588,8 +614,6 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 slot_live[h] = 1;
                 PUSH_TERM(ht);
             }
-            // ASSIGN/KERNEL: skip in root_only mode to avoid pulling in
-            // unreachable definition body nodes.
             if (!heap_dot_root_only) {
                 if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_ASSIGN) {
                     slot_live[h] = 1;
@@ -601,6 +625,13 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     PUSH_TERM(ht);
                 }
             }
+        }
+
+        // Seed definition bodies — these are fixed terms on the heap
+        // that should always be visible (shown as separate subgraphs).
+        for (u32 _di = 0; _di < ctx->def_count; _di++) {
+            Term _dt = ctx->defs[_di];
+            if (term_tag(_dt) != TAG_ERA) PUSH_TERM(_dt);
         }
 
         while (work && wp > 0) {
@@ -930,9 +961,11 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             else if (!is_binary(ext) && is_elementwise(ext)) arity = 1;
             for (u32 ai = 0; ai < arity; ai++) {
                 Term child = heap_read(ctx, val + ai);
-                u8 ctag = term_tag(child); u64 cval = term_val(child);
                 u64 cpos = val + ai;
-                int edge_hl = heap_dot_hl_on && cpos == heap_dot_hl_slot;
+                // Follow through substituted VARs to show resolved values
+                RESOLVE_VAR(child, cpos);
+                u8 ctag = term_tag(child); u64 cval = term_val(child);
+                int edge_hl = heap_dot_hl_on && (cpos == heap_dot_hl_slot || (val + ai) == heap_dot_hl_slot);
                 if (edge_hl) heap_dot_hl_hit = 1;
                 const char *elbl = "";
                 if (ext == UOP_ASSIGN) elbl = ai==0 ? "tgt" : "src";
@@ -1044,10 +1077,11 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     (unsigned long long)val);
             for (u32 ai = 0; ai < 2; ai++) {
                 Term child = heap_read(ctx, val + ai);
+                u64 cpos = val + ai;
+                RESOLVE_VAR(child, cpos);
                 u8 ctag = term_tag(child);
                 u64 cval = term_val(child);
-                u64 cpos = val + ai;
-                int edge_hl = heap_dot_hl_on && cpos == heap_dot_hl_slot;
+                int edge_hl = heap_dot_hl_on && (cpos == heap_dot_hl_slot || (val + ai) == heap_dot_hl_slot);
                 if (edge_hl) heap_dot_hl_hit = 1;
                 const char *elbl = ai == 0 ? "fun" : "arg";
 
@@ -1237,15 +1271,35 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         if (tag == TAG_REF) {
             if (!SLOT_LIVE(h)) continue;
             EMIT_REF_NODE(h, ext);
+            // Draw dashed edge to definition body (find the outermost
+            // rendered node by following through LAM bodies)
+            if (ext < ctx->def_count) {
+                Term _def = ctx->defs[ext];
+                // Follow through LAMs to find a rendered child
+                for (int _dd = 0; _dd < 8 && term_tag(_def) == TAG_LAM; _dd++) {
+                    u64 _bl = term_val(_def);
+                    if (_bl + 1 >= ctx->heap_pos) break;
+                    Term _body = heap_read(ctx, _bl + 1);
+                    if (term_tag(_body) == TAG_LAM) { _def = _body; continue; }
+                    // Found a non-LAM body — this should be rendered as n{_bl+1} or similar
+                    u64 _tgt = term_val(_body);
+                    if (dot_visible_heap_loc_tag(term_tag(_body)) && _tgt > 0 && _tgt < ctx->heap_pos)
+                        fprintf(f, "  ref%llu -> n%llu [style=dashed, color=\"#999999\", label=\"def\"];\n",
+                                (unsigned long long)h, (unsigned long long)_tgt);
+                    break;
+                }
+            }
             nn++;
             continue;
         }
 
         if (tag == TAG_VAR) {
             if (!SLOT_LIVE(h)) continue;
-            // Skip unsubstituted VAR (SUB) nodes that float disconnected —
-            // they are lambda slots not yet applied, visible only internally.
+            // Skip unsubstituted (SUB) and substituted standalone VARs —
+            // SUBs are lambda slots not yet applied; substituted VARs
+            // are resolved via RESOLVE_VAR in parent edges.
             if (term_is_sub(t) && !LOC_LIVE(h)) continue;
+            if (!term_is_sub(t) && !LOC_LIVE(h)) continue;
             EMIT_VAR_NODE(h, val, term_is_sub(t));
             nn++;
             continue;

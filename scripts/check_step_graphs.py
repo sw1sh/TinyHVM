@@ -185,8 +185,8 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
     final_adj: Dict[str, List[str]] = {nid: [] for nid in gl.nodes}
     for e in gl.edges:
         final_out_map.setdefault(e[0], []).append(e)
-        final_adj[e[0]].append(e[1])
-        final_adj[e[1]].append(e[0])
+        if e[0] in final_adj: final_adj[e[0]].append(e[1])
+        if e[1] in final_adj: final_adj[e[1]].append(e[0])
     init_out_map: Dict[str, List[Tuple[str, str, str]]] = {}
     for e in g0.edges:
         init_out_map.setdefault(e[0], []).append(e)
@@ -321,7 +321,9 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
 
             # IC principal-port invariant: non-dup combinators are single-output.
             # In child->parent orientation this means at most one outgoing edge.
-            out_count = len(out_map.get(nid, []))
+            # Exclude dashed metadata edges (e.g., REF→def body links).
+            real_outs = [e for e in out_map.get(nid, []) if "dashed" not in (e[2] or "")]
+            out_count = len(real_outs)
             if out_count > 1:
                 errs.append(
                     f"{os.path.basename(g.path)}: {op} node '{nid}' has {out_count} outputs (expected <=1); missing commute/split"
@@ -460,7 +462,15 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                     has_erase = any(g.kind(n) == "ERA" for n in comp)
                     has_op = any(g.kind(n) == "NODE" for n in comp)
                     has_assign = any(node_head(g, n) == "ASSIGN" for n in comp)
-                    if has_op and not has_erase and not has_assign:
+                    # VAR-only and REF-only components are definition body plumbing
+                    all_var_ref = all(
+                        node_head(g, n).startswith("VAR") or
+                        node_head(g, n).startswith("REF") or
+                        node_head(g, n).startswith("→t") or
+                        g.kind(n) == "TEN"
+                        for n in comp
+                    )
+                    if has_op and not has_erase and not has_assign and not all_var_ref:
                         errs.append(
                             f"{os.path.basename(g.path)}: disconnected non-ERA component with ops: {sorted(comp)[:4]}"
                         )

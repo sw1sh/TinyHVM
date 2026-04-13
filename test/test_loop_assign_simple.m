@@ -96,14 +96,20 @@ int main(int argc, char **argv) {
            (unsigned long long)term_val(result),
            (unsigned long long)result);
 
+    // Result must be TAG_TEN — the reduced value, not a stuck SEQ/ERA
+    assert(term_tag(result) == TAG_TEN && "result must reduce to TEN");
+
     // Read w's buffer directly
     u32 dtype = DTYPE_F32;
     Shape sh = SHAPE(1);
     f32 *wf = thvm_to_host_raw(ctx, w, &dtype, &sh);
-    if (wf)
-        printf("final_w = [%.1f, %.1f, %.1f]  (expect [%.1f, %.1f, %.1f])\n",
-               wf[0], wf[1], wf[2],
-               wd[0] * (1 << n_steps), wd[1] * (1 << n_steps), wd[2] * (1 << n_steps));
+    assert(wf && "w buffer must be readable");
+    f32 scale = (f32)(1 << n_steps);
+    printf("final_w = [%.1f, %.1f, %.1f]  (expect [%.1f, %.1f, %.1f])\n",
+           wf[0], wf[1], wf[2],
+           wd[0] * scale, wd[1] * scale, wd[2] * scale);
+    assert(wf[0] == wd[0] * scale && wf[1] == wd[1] * scale && wf[2] == wd[2] * scale
+           && "w values must match expected");
 
     // Also read from result term
     u32 dtype2 = DTYPE_F32;

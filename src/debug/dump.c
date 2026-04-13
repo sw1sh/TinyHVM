@@ -1258,10 +1258,30 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         if (tag == TAG_REF) {
             if (!SLOT_LIVE(h)) continue;
             EMIT_REF_NODE(h, ext);
-            // Draw dashed edge to definition's outermost LAM (emitted at end of graph)
-            if (ext < ctx->def_count && term_tag(ctx->defs[ext]) == TAG_LAM)
-                fprintf(f, "  ref%llu -> deflam%u_0 [style=dashed, color=\"#999999\", label=\"def\"];\n",
+            // Draw dashed edge REF → def#N → body.
+            // The outermost LAM from ctx->defs isn't rendered as a heap node
+            // (heap has VAR SUB at that location). Emit a "def #N" proxy node.
+            if (ext < ctx->def_count && term_tag(ctx->defs[ext]) == TAG_LAM) {
+                // Emit def node once
+                if (!NODE_SEEN(0xD00000 + ext)) {
+                    NODE_MARK(0xD00000 + ext);
+                    fprintf(f, "  def%u [label=\"def #%u\\nLAM\", shape=box, "
+                               "fillcolor=\"#f2e8ff\", style=\"filled,dashed\", fontsize=8];\n", ext, ext);
+                    // Connect def node to innermost non-LAM body
+                    Term _d = ctx->defs[ext];
+                    for (int _dd = 0; _dd < 8 && term_tag(_d) == TAG_LAM; _dd++) {
+                        u64 _ll = term_val(_d);
+                        if (_ll + 1 >= ctx->heap_pos) break;
+                        _d = heap_read(ctx, _ll + 1);
+                    }
+                    u64 _dv = term_val(_d);
+                    if ((term_tag(_d) == TAG_TOP || term_tag(_d) == TAG_SEQ) && _dv > 0 && _dv < ctx->heap_pos)
+                        fprintf(f, "  def%u -> n%llu [style=dashed, color=\"#999999\", label=\"body\"];\n",
+                                ext, (unsigned long long)_dv);
+                }
+                fprintf(f, "  ref%llu -> def%u [style=dashed, color=\"#999999\", label=\"def\"];\n",
                         (unsigned long long)h, ext);
+            }
             nn++;
             continue;
         }
@@ -1577,52 +1597,6 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
 
     #undef EMIT_FUSING_LEAF_CHILD
     #undef EMIT_TOP_NODE_LABEL
-
-    // Emit definition body LAM chains as explicit nodes.
-    // ctx->defs[] terms are TAG_LAM but not stored as heap cells,
-    // so the main renderer doesn't see them. Emit them here with
-    // dashed borders and connect REF nodes to them.
-    for (u32 _di = 0; _di < ctx->def_count; _di++) {
-        Term _dt = ctx->defs[_di];
-        if (term_tag(_dt) != TAG_LAM) continue;
-        // Emit LAM chain: def#N → LAM → LAM → body
-        // Emit LAM chain: def#N → LAM → LAM → body
-        // Each LAM gets its own node showing the var binding.
-        char _prev_id[32];
-        snprintf(_prev_id, sizeof(_prev_id), "def%u", _di);
-        Term _cur = _dt;
-        for (int _dd = 0; _dd < 8 && term_tag(_cur) == TAG_LAM; _dd++) {
-            u64 _ll = term_val(_cur);
-            if (_ll + 1 >= ctx->heap_pos) break;
-            // Emit this LAM node
-            char _lam_id[32];
-            snprintf(_lam_id, sizeof(_lam_id), "deflam%u_%d", _di, _dd);
-            fprintf(f, "  %s [label=\"LAM\\n@%llu\", shape=box, fillcolor=\"#f2e8ff\", "
-                       "style=\"filled,dashed\", fontsize=8];\n",
-                    _lam_id, (unsigned long long)_ll);
-            // Edge from prev to this LAM
-            if (_dd == 0)
-                fprintf(f, "  ref_def%u [label=\"def #%u\", shape=none, fontsize=7];\n"
-                           "  ref_def%u -> %s [style=dashed, color=\"#999999\"];\n",
-                        _di, _di, _di, _lam_id);
-            else
-                fprintf(f, "  %s -> %s [style=dashed, color=\"#999999\", label=\"body\"];\n",
-                        _prev_id, _lam_id);
-            snprintf(_prev_id, sizeof(_prev_id), "%s", _lam_id);
-            // Check body
-            Term _body = heap_read(ctx, _ll + 1);
-            u8 _bt = term_tag(_body);
-            if (_bt != TAG_LAM) {
-                // Non-LAM body — connect to the rendered node
-                u64 _bval = term_val(_body);
-                if ((_bt == TAG_TOP || _bt == TAG_SEQ) && _bval > 0 && _bval < ctx->heap_pos)
-                    fprintf(f, "  %s -> n%llu [style=dashed, color=\"#999999\", label=\"body\"];\n",
-                            _prev_id, (unsigned long long)_bval);
-                break;
-            }
-            _cur = _body;
-        }
-    }
 
     fprintf(f, "}\n");
     fclose(f);

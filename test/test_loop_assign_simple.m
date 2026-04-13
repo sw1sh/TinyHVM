@@ -91,9 +91,10 @@ int main(int argc, char **argv) {
     Term program = simple_loop(ctx, w, n_steps);
     Term result = thvm_eval(ctx, program);
 
-    printf("result tag=%u ext=%u val=%llu\n",
+    printf("result tag=%u ext=%u val=%llu raw=0x%016llx\n",
            (u32)term_tag(result), (u32)term_ext(result),
-           (unsigned long long)term_val(result));
+           (unsigned long long)term_val(result),
+           (unsigned long long)result);
 
     // Read w's buffer directly
     u32 dtype = DTYPE_F32;

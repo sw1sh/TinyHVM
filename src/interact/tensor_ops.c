@@ -202,7 +202,12 @@
                         heap_set(ctx, f2loc, term_num_u32(puop));
                         heap_set(ctx, f2loc + 1, term_new(TAG_TOP, UOP_FUSE, fa));
                         heap_set(ctx, f2loc + 2, term_new(TAG_TOP, UOP_FUSE, fb));
-                        RETURN_REDUCED(term_new(TAG_TOP, UOP_FUSE2, f2loc));
+                        { Term _r = term_new(TAG_TOP, UOP_FUSE2, f2loc);
+                          if (getenv("THVM_SCHED_DIAG"))
+                              fprintf(stderr, "FUSE→FUSE2: op=%s tag=%u ext=%u val=%llu\n",
+                                      uop_names[puop], term_tag(_r), term_ext(_r),
+                                      (unsigned long long)term_val(_r));
+                          RETURN_REDUCED(_r); }
                     }
 
                     // Unary compute/movement/reduce: absorb → FUSE(op, FUSE(child))
@@ -229,10 +234,14 @@
                     u64 fa = heap_alloc(ctx, 1); heap_set(ctx, fa, a);
                     u64 fb = heap_alloc(ctx, 1); heap_set(ctx, fb, b);
                     u64 f2loc = heap_alloc(ctx, 3);
-                    heap_set(ctx, f2loc, term_num_u32(UOP_COUNT)); // SEQ marker (not a real UOP)
+                    heap_set(ctx, f2loc, term_num_u32(UOP_COUNT));
                     heap_set(ctx, f2loc + 1, term_new(TAG_TOP, UOP_FUSE, fa));
                     heap_set(ctx, f2loc + 2, term_new(TAG_TOP, UOP_FUSE, fb));
-                    RETURN_REDUCED(term_new(TAG_TOP, UOP_FUSE2, f2loc));
+                    Term _r = term_new(TAG_TOP, UOP_FUSE2, f2loc);
+                    fprintf(stderr, "FUSE_SEQ: tag=%u ext=%u val=%llu raw=0x%llx\n",
+                            term_tag(_r), term_ext(_r), (unsigned long long)term_val(_r),
+                            (unsigned long long)_r);
+                    RETURN_REDUCED(_r);
                 }
 
                 // CTR: distribute

@@ -130,50 +130,43 @@ Public declarations live in [`src/tinyhvm.h`](src/tinyhvm.h). `thvm_eval` is in 
 
 The repo keeps **Graphviz** exports from debugging runs (`THVM_STEP_GRAPH` / `THVM_GRAPH`, see `src/debug/graph.c` and `thvm_eval` in `src/schedule/_.c`). Two useful views:
 
-1. **Phase 1 — inet steps** — PNGs under `phase1_graphs/<fixture>/` while the reducer walks a training-shaped graph (examples below: `tiny_linear_bias_keep`).
-2. **Phase 2 — pipeline snapshots** — `thvm_0` … `thvm_3` under `phase2_graphs/…` for **pre-reduce → post-reduce → post-schedule → post-dispatch** (Metal fixture `tiny_linear_bias_keep_metal`).
+1. **Step graphs** — PNGs under `graphs/<fixture>/` while the reducer walks a training-shaped graph (examples below: `tiny_linear_bias_keep`).
+2. **Pipeline snapshots** — `thvm_0` … `thvm_3` under `graphs/…` for **pre-reduce → post-reduce → post-schedule → post-dispatch** (Metal fixture `tiny_linear_bias_keep_metal`).
 
-### How phase-1 filenames relate to highlights
+### How step filenames relate to highlights
 
-Each `step_NNN_interact_<rule>.png` is written **after** that rule has **already fired** on the heap. The basename records the rule that just ran (derived from the **pre-redex** pattern in `thvm_step_graph_after_interaction`). The **red** subgraph drawn in that same file is the **next** candidate redex the tracer will schedule (not the rule in the filename). So the **highlight that belongs to** `interact_grad_on_TEN` appears on the **previous** image, `step_031_…`, where the label in the filename is still the *prior* rule (`interact_grad_on_RESHAPE` here); the next-step title/metadata points at `grad_on_TEN`.
+Each step image is written after a reduction step, and the basename now matches the red-highlighted
+interaction that is actually visible in that image:
+`step_NNN_NAME1_hX_NAME2_hY.png`, for example `step_000_REF_h35_LAM_h39.png` or
+`step_009_ERA_h55_TEN_h38.png`. `NAME1/hX` is the highlighted node/rule focus and `NAME2/hY` is
+the highlighted peer on that same red edge.
 
-### Before / after two rules (`tiny_linear_bias_keep`)
+The DOT metadata stores that same visible interaction in `PREV_INTERACTION`. Once the following
+step is emitted, the tracer rewrites `NEXT_INTERACTION` to the following step's basename so adjacent
+steps can still be checked for consistency.
 
-**`interact_grad_on_TEN`** — heap before the rule fires (highlight marks this redex on the prior step):
+Final heap snapshots still end as `step_NNN_state_final.png`.
 
-![Before interact_grad_on_TEN — step 031](phase1_graphs/tiny_linear_bias_keep/step_031_interact_grad_on_RESHAPE.png)
+For loop fixtures the repository now emits two parallel step sets:
 
-**`interact_grad_on_TEN`** — heap immediately after (filename step 032; highlight is now the following `ADD` redex):
-
-![After interact_grad_on_TEN — step 032](phase1_graphs/tiny_linear_bias_keep/step_032_interact_grad_on_TEN.png)
-
-**`interact_ADD`** — before firing (same heap snapshot as the previous panel: step 032; red highlight is the `ADD` redex):
-
-![Before interact_ADD — step 032](phase1_graphs/tiny_linear_bias_keep/step_032_interact_grad_on_TEN.png)
-
-**`interact_ADD`** — after:
-
-![After interact_ADD — step 033](phase1_graphs/tiny_linear_bias_keep/step_033_interact_ADD.png)
-
-Final heap snapshot when no further inet step is emitted:
-
-![Final state — step 127](phase1_graphs/tiny_linear_bias_keep/step_127_state_final.png)
+1. `n*_steps/` traces structural unfolding without firing FUSE.
+2. `n*_steps_fuse_vals/` traces `FUSE(program)` propagation with tensor values so KERNEL updates stay visible.
 
 ### Reduce → schedule → dispatch (phase 2, Metal)
 
 Lazy graph before reduction:
 
-![Pre-reduce — phase2 tiny_linear_bias_keep_metal](phase2_graphs/tiny_linear_bias_keep_metal/thvm_0_pre_reduce.png)
+![Pre-reduce — phase2 tiny_linear_bias_keep_metal](graphs/tiny_linear_bias_keep_metal/thvm_0_pre_reduce.png)
 
 After scheduling (work grouped for backends):
 
-![Post-schedule — phase2 tiny_linear_bias_keep_metal](phase2_graphs/tiny_linear_bias_keep_metal/thvm_2_post_sched.png)
+![Post-schedule — phase2 tiny_linear_bias_keep_metal](graphs/tiny_linear_bias_keep_metal/thvm_2_post_sched.png)
 
 After dispatch (concrete tensor / kernel wiring):
 
-![Post-dispatch — phase2 tiny_linear_bias_keep_metal](phase2_graphs/tiny_linear_bias_keep_metal/thvm_3_post_dispatch.png)
+![Post-dispatch — phase2 tiny_linear_bias_keep_metal](graphs/tiny_linear_bias_keep_metal/thvm_3_post_dispatch.png)
 
-More graphs live under [`phase1_graphs/`](phase1_graphs/) and [`phase2_graphs/`](phase2_graphs/) (other fixtures: `tiny_single_param_keep`, non-`_metal` CPU runs, etc.).
+More graphs live under [`graphs/`](graphs/) (other fixtures: `tiny_single_param_keep`, non-`_metal` CPU runs, etc.).
 
 ---
 

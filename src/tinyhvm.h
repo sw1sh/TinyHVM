@@ -851,6 +851,7 @@ typedef struct {
     u32 label_old;   // original DUP/SUP label from static/book terms
     u32 label_new;   // fresh runtime label
     u8  kind;        // 1=binder mapping, 2=label mapping
+    u8  bind_tag;    // originating static/book tag for binder mapping
 } AloState;
 
 #define THVM_STEP_ALO_SUBST_MAX 8
@@ -881,6 +882,7 @@ typedef struct {
     u8          dispatch_mode; // (legacy, unused)
     u8          step_graph_consumed;   // outermost THVM_STEP_GRAPH session already used
     u8          coarse_graph_consumed; // outermost THVM_GRAPH session already used
+    u8          step_graph_local_fuse; // traced step-graph pass lets FUSE fire locally before descending
     u32         eval_depth;            // nested thvm_eval reentrancy depth
 
     // Named definitions for TAG_REF (global def table)

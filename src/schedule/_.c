@@ -180,7 +180,7 @@ static void sched_release_output_kid(TinyHVM *ctx, u32 kid) {
 
 static const char *thvm_graph_dir(void) {
     const char *dir = getenv("THVM_GRAPH_DIR");
-    return (dir && dir[0]) ? dir : "/tmp";
+    return (dir && dir[0]) ? dir : "graphs";
 }
 
 static void thvm_graph_dump_path(char *buf, size_t nbuf, const char *name) {
@@ -456,6 +456,66 @@ static int phase1_top_arg0_ready(Term t) {
     return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM || tag == TAG_SUP;
 }
 
+static int phase1_fuse_payload_top_ready(u32 uop) {
+    return uop == UOP_ASSIGN ||
+           uop == UOP_KERNEL ||
+           uop == UOP_FUSE ||
+           uop == UOP_SCHED ||
+           uop == UOP_FUSE2 ||
+           is_binary(uop) ||
+           is_elementwise(uop) ||
+           uop == UOP_SUM ||
+           uop == UOP_RMAX ||
+           (uop >= UOP_RESHAPE && uop <= UOP_PAD);
+}
+
+static int phase1_fuse_payload_ready(Term t) {
+    switch (term_tag(t)) {
+        case TAG_TEN:
+        case TAG_ERA:
+        case TAG_NUM:
+        case TAG_SEQ:
+        case TAG_CTR:
+            return 1;
+        case TAG_TOP:
+            return phase1_fuse_payload_top_ready(term_ext(t));
+        default:
+            return 0;
+    }
+}
+
+static int phase1_top_frame_arg0_ready(Term t, u32 uop) {
+    u8 tag = term_tag(t);
+    return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM || tag == TAG_SUP ||
+           (tag == TAG_TOP && uop == UOP_GRAD) ||
+           (tag == TAG_VAR && uop == UOP_DETACH) ||
+           ((uop == UOP_FUSE || uop == UOP_SCHED) &&
+            phase1_fuse_payload_ready(t)) ||
+           (uop == UOP_FUSE2 && tag != TAG_DP0 && tag != TAG_DP1);
+}
+
+static int phase1_top_frame_arg1_ready(Term t, u32 uop) {
+    u8 tag = term_tag(t);
+    int ok = tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
+             tag == TAG_LAM || tag == TAG_SUP;
+    if (uop == UOP_FUSE2) {
+        ok = ok || tag == TAG_SEQ || tag == TAG_CTR ||
+             (tag == TAG_TOP && term_ext(t) != UOP_FUSE && term_ext(t) != UOP_FUSE2);
+    }
+    return ok;
+}
+
+static int phase1_top_frame_arg2_ready(Term t, u32 uop) {
+    u8 tag = term_tag(t);
+    int ok = tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
+             tag == TAG_CTR || tag == TAG_ANY || tag == TAG_LAM || tag == TAG_SUP;
+    if (uop == UOP_FUSE2) {
+        ok = ok || tag == TAG_SEQ ||
+             (tag == TAG_TOP && term_ext(t) != UOP_FUSE && term_ext(t) != UOP_FUSE2);
+    }
+    return ok;
+}
+
 static int phase1_log_print_arg_ready(Term t) {
     return phase1_top_arg0_ready(t);
 }
@@ -621,6 +681,73 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
             return 0;
         }
 
+        if (uop == UOP_KERNEL) {
+            if (out_before) *out_before = t;
+            return 1;
+        }
+
+        if (ctx->step_graph_local_fuse && (uop == UOP_FUSE || uop == UOP_SCHED)) {
+            Term a0 = heap_read(ctx, loc + 0);
+            if (phase1_fuse_payload_ready(a0)) {
+                if (out_before) *out_before = t;
+                return 1;
+            }
+            Term wa0 = a0;
+            if (thvm_phase1_predict_next_redex(ctx, a0, out_before, &wa0))
+                return 1;
+            if (phase1_fuse_payload_ready(wa0)) {
+                if (out_before) *out_before = t;
+                return 1;
+            }
+            if (out_whnf) *out_whnf = t;
+            return 0;
+        }
+
+        if (phase1_top_direct_uop(uop)) {
+            Term a0 = heap_read(ctx, loc + 0);
+            Term wa0 = a0;
+            if (phase1_top_arity(uop) > 0 &&
+                thvm_phase1_predict_next_redex(ctx, a0, out_before, &wa0))
+                return 1;
+            if (phase1_top_has_era_arg(ctx, t, NULL, NULL) ||
+                phase1_top_has_add_zero_arg(ctx, t, NULL, NULL)) {
+                if (out_before) *out_before = t;
+                return 1;
+            }
+            if (!phase1_top_frame_arg0_ready(wa0, uop)) {
+                if (out_whnf) *out_whnf = t;
+                return 0;
+            }
+            if (phase1_top_arity(uop) == 1) {
+                if (out_before) *out_before = t;
+                return 1;
+            }
+
+            Term a1 = heap_read(ctx, loc + 1);
+            Term wa1 = a1;
+            if (thvm_phase1_predict_next_redex(ctx, a1, out_before, &wa1))
+                return 1;
+            if (!phase1_top_frame_arg1_ready(wa1, uop)) {
+                if (out_whnf) *out_whnf = t;
+                return 0;
+            }
+            if (phase1_top_arity(uop) == 2) {
+                if (out_before) *out_before = t;
+                return 1;
+            }
+
+            Term a2 = heap_read(ctx, loc + 2);
+            Term wa2 = a2;
+            if (thvm_phase1_predict_next_redex(ctx, a2, out_before, &wa2))
+                return 1;
+            if (!phase1_top_frame_arg2_ready(wa2, uop)) {
+                if (out_whnf) *out_whnf = t;
+                return 0;
+            }
+            if (out_before) *out_before = t;
+            return 1;
+        }
+
         // For direct UOPs: check if arg0 needs resolution first
         // (reducer resolves arg0 before checking ERA args)
         {
@@ -770,7 +897,9 @@ static int thvm_phase1_fire_one(TinyHVM *ctx, Term in, Term *out_term, Term *out
     Term before = predicted_before;
     if (traced) {
         Term traced_before = term_new((u8)tr.before_tag, tr.before_ext, tr.before_loc);
-        if (traced_before == predicted_before) before = traced_before;
+        if (traced_before == predicted_before ||
+            (predicted_before == in && traced_before != in))
+            before = traced_before;
     }
 
     ctx->trace_buf = saved_buf;
@@ -925,6 +1054,42 @@ static Term thvm_phase1_structural_nf(TinyHVM *ctx, Term t) {
     }
     free(reach);
     return t;
+}
+
+static int thvm_step_graph_trace_fuse(void) {
+    const char *env = getenv("THVM_STEP_GRAPH_FUSE");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static Term thvm_eval_reduce_fused(TinyHVM *ctx, Term t) {
+    u64 fuse_loc = heap_alloc(ctx, 1);
+    heap_set(ctx, fuse_loc, t);
+    Term fuse_term = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
+    ctx->step_budget = 1000000;  // suppress quiesce (budget>0 → no quiesce)
+    t = thvm_reduce(ctx, fuse_term);
+    ctx->step_budget = 0;
+    return t;
+}
+
+static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced, int local_fuse) {
+    phase1_root_slot = 0;
+    if (local_fuse) {
+        u64 fuse_loc = heap_alloc(ctx, 1);
+        heap_set(ctx, fuse_loc, traced);
+        traced = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
+    }
+    traced = thvm_phase1_seed_root_grad(ctx, traced);
+    ctx->step_graph_local_fuse = local_fuse ? 1 : 0;
+    thvm_step_graph_eval_begin(ctx, traced);
+    traced = thvm_phase1_structural_nf(ctx, traced);
+    traced = thvm_reduce(ctx, traced);
+    ctx->step_graph_local_fuse = 0;
+    traced = reduce_net_quiesce(ctx, traced);
+    thvm_step_graph_set_root(traced);
+    thvm_step_graph_finalize(ctx);
+    phase1_root_slot = 0;
+    sched_planner_release_detached_slots();
+    return traced;
 }
 
 static void sched_dump_heap(TinyHVM *ctx) {
@@ -1549,6 +1714,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         u32 snap_count = 0;
         StepGraphTensorSnap *snaps = thvm_step_graph_snapshot_tensors(ctx, &snap_count);
         Term traced = term_clone(ctx, t);
+        int trace_fuse = thvm_step_graph_trace_fuse();
         // #region agent log
         do {
             static u32 step_trace_start_dbg_count = 0;
@@ -1566,73 +1732,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
                                  "step_graph_trace_start", _dbg);
         } while (0);
         // #endregion
-        phase1_root_slot = 0;
-        traced = thvm_phase1_seed_root_grad(ctx, traced);
-        thvm_step_graph_eval_begin(ctx, traced);
-        traced = thvm_phase1_structural_nf(ctx, traced);
-        traced = thvm_reduce(ctx, traced);
-        // Clean detached ERA/DP remnants before FUSE wrapping; this keeps the
-        // visible net semantically quiescent for step-graph output.
-        traced = reduce_net_quiesce(ctx, traced);
-        // Continue through FUSE/dispatch with normal evaluator semantics, then
-        // append that transition into the same step sequence.
-        {
-            u64 fuse_loc = heap_alloc(ctx, 1);
-            heap_set(ctx, fuse_loc, traced);
-            Term fuse_term = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
-            u64 saved_budget = ctx->step_budget;
-            ctx->step_budget = 1000000;  // suppress quiesce while reducing FUSE
-            Term t_after = thvm_reduce(ctx, fuse_term);
-            ctx->step_budget = saved_budget;
-            // #region agent log
-            do {
-                static u32 step_trace_fuse_dbg_count = 0;
-                if (step_trace_fuse_dbg_count >= 8) break;
-                step_trace_fuse_dbg_count++;
-                char _dbg[320];
-                snprintf(_dbg, sizeof(_dbg),
-                         "{\"pre_fuse_tag\":%u,\"pre_fuse_ext\":%u,\"pre_fuse_val\":%llu,"
-                         "\"fuse_loc\":%llu,\"post_fuse_tag\":%u,\"post_fuse_ext\":%u,"
-                         "\"post_fuse_val\":%llu,\"phase1_root_slot\":%llu}",
-                         (u32)term_tag(traced), (u32)term_ext(traced), (unsigned long long)term_val(traced),
-                         (unsigned long long)fuse_loc,
-                         (u32)term_tag(t_after), (u32)term_ext(t_after), (unsigned long long)term_val(t_after),
-                         (unsigned long long)phase1_root_slot);
-                thvm_agent_debug_log("pre-fix", "H3", "src/schedule/_.c:1542",
-                                     "step_graph_fuse_transition", _dbg);
-            } while (0);
-            // #endregion
-            // #region agent log
-            do {
-                static u32 step_trace_fuse_probe_dbg_count = 0;
-                if (step_trace_fuse_probe_dbg_count >= 8) break;
-                if (term_tag(t_after) == TAG_TEN || term_tag(t_after) == TAG_ERA) break;
-                step_trace_fuse_probe_dbg_count++;
-                Term probe_root = term_clone(ctx, t_after);
-                u64 probe_loc = heap_alloc(ctx, 1);
-                heap_set(ctx, probe_loc, probe_root);
-                Term probe_term = term_new(TAG_TOP, UOP_FUSE, probe_loc);
-                u64 probe_saved_budget = ctx->step_budget;
-                ctx->step_budget = 1000000;
-                Term probe_after = thvm_reduce(ctx, probe_term);
-                ctx->step_budget = probe_saved_budget;
-                char _dbg[256];
-                snprintf(_dbg, sizeof(_dbg),
-                         "{\"post_fuse_tag\":%u,\"post_fuse_ext\":%u,\"post_fuse_val\":%llu,"
-                         "\"probe_after_tag\":%u,\"probe_after_ext\":%u,\"probe_after_val\":%llu}",
-                         (u32)term_tag(t_after), (u32)term_ext(t_after), (unsigned long long)term_val(t_after),
-                         (u32)term_tag(probe_after), (u32)term_ext(probe_after), (unsigned long long)term_val(probe_after));
-                thvm_agent_debug_log("pre-fix", "H9", "src/schedule/_.c:1559",
-                                     "step_graph_second_fuse_probe", _dbg);
-            } while (0);
-            // #endregion
-            thvm_step_graph_after_interaction(ctx, fuse_loc, fuse_term, t_after);
-            traced = t_after;
-        }
-        thvm_step_graph_set_root(traced);
-        thvm_step_graph_finalize(ctx);
-        phase1_root_slot = 0;
-        sched_planner_release_detached_slots();
+        traced = thvm_trace_step_graph_session(ctx, traced, trace_fuse);
         thvm_step_graph_restore_tensors(ctx, snaps, snap_count);
         // Keep step-graph tracing path semantically aligned with normal eval:
         // after emitting graphs, run the standard pipeline (without tracing)
@@ -1655,6 +1755,13 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         // #endregion
         ctx->eval_depth--;
         return settled;
+    }
+
+    if (!run_coarse_graph) {
+        t = thvm_eval_reduce_fused(ctx, t);
+        sched_planner_release_detached_slots();
+        ctx->eval_depth--;
+        return t;
     }
 
     if (run_coarse_graph) {
@@ -1686,7 +1793,6 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             heap_set(ctx, phase1_root_slot, term_era());
     }
 
-    phase2:
     // Phase 2: wrap in UOP_FUSE and reduce — fuses compute + dispatches + fires ASSIGN
     // Local FUSE creates KERNELs that fire immediately. SEQ handles ordering.
     // No separate UOP_SCHED phase — everything happens in one reduce pass.

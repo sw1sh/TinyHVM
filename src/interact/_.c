@@ -57,7 +57,7 @@ static void thvm_spawn_detached_era(TinyHVM *ctx, Term item) {
     }
 }
 
-static u32 thvm_alo_state_push(TinyHVM *ctx, u32 parent, u8 kind, u64 bind_book, u64 bind_dyn, u32 label_old, u32 label_new) {
+static u32 thvm_alo_state_push(TinyHVM *ctx, u32 parent, u8 kind, u8 bind_tag, u64 bind_book, u64 bind_dyn, u32 label_old, u32 label_new) {
     if (!ctx->alo_states) return 0;
     if (ctx->alo_state_count >= ctx->alo_state_cap) {
         u32 new_cap = ctx->alo_state_cap ? (ctx->alo_state_cap << 1) : (1u << 16);
@@ -72,7 +72,8 @@ static u32 thvm_alo_state_push(TinyHVM *ctx, u32 parent, u8 kind, u64 bind_book,
         .bind_dyn = bind_dyn,
         .label_old = label_old,
         .label_new = label_new,
-        .kind = kind
+        .kind = kind,
+        .bind_tag = bind_tag
     };
     return id;
 }
@@ -94,7 +95,7 @@ static u32 thvm_alo_get_or_add_label(TinyHVM *ctx, u32 state_id, u32 old_label, 
         if (s->kind == 2 && s->label_old == old_label) return s->label_new;
     }
     u32 fresh = thvm_fresh_label(ctx);
-    u32 next_state = thvm_alo_state_push(ctx, state_id, 2, 0, 0, old_label, fresh);
+    u32 next_state = thvm_alo_state_push(ctx, state_id, 2, 0, 0, 0, old_label, fresh);
     if (io_state_id) *io_state_id = next_state;
     return fresh;
 }
@@ -182,7 +183,7 @@ static Term thvm_alo_realize(TinyHVM *ctx, Term book_term, u32 state_id) {
             dyn_loc = heap_alloc(ctx, 1);
             Term child = (old_loc > 0 && old_loc < ctx->book_heap_pos) ? ctx->book_heap[old_loc] : term_era();
             heap_set(ctx, dyn_loc, thvm_alo_suspend_child(ctx, child, walk_state));
-            walk_state = thvm_alo_state_push(ctx, walk_state, 1, old_loc, dyn_loc, 0, 0);
+            walk_state = thvm_alo_state_push(ctx, walk_state, 1, term_tag(book_term), old_loc, dyn_loc, 0, 0);
         }
         return term_new(tag, new_lab, dyn_loc);
     }
@@ -206,7 +207,7 @@ static Term thvm_alo_realize(TinyHVM *ctx, Term book_term, u32 state_id) {
         u64 new_loc = heap_alloc(ctx, 2);
         Term var = term_new(TAG_VAR, 0, new_loc);
         heap_set(ctx, new_loc + 0, term_set_sub(var));
-        u32 body_state = thvm_alo_state_push(ctx, state_id, 1, old_loc, new_loc, 0, 0);
+        u32 body_state = thvm_alo_state_push(ctx, state_id, 1, tag, old_loc, new_loc, 0, 0);
         Term body = (old_loc > 0 && old_loc + 1 < ctx->book_heap_pos) ? ctx->book_heap[old_loc + 1] : term_era();
         heap_set(ctx, new_loc + 1, thvm_alo_suspend_child(ctx, body, body_state));
         return term_new(tag, term_ext(book_term), new_loc);

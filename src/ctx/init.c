@@ -128,6 +128,7 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
         memset(ctx->alo_states, 0, (size_t)ctx->alo_state_cap * sizeof(AloState));
         ctx->alo_state_count = 1;
     }
+    ctx->step_graph_local_fuse = 0;
     // Clear shape tracker — stale entries from old heap locs cause wrong
     // view compositions after heap reuse.
     memset(st_keys, 0, sizeof(st_keys));

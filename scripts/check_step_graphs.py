@@ -16,6 +16,7 @@ STEP_RE = re.compile(r'^step_(\d+)(?:_(.*))?\.dot$')
 # Filenames may end with _h<heap>_h<heap> (principal + peer); strip for metadata matching.
 STEP_HEAP_PAIR_SUFFIX_RE = re.compile(r'_h\d+_h\d+$')
 STEP_HEAP_SINGLE_SUFFIX_RE = re.compile(r'_h\d+$')
+STEP_NAMED_PAIR_SUFFIX_RE = re.compile(r'_h\d+_[A-Za-z0-9_]+_h\d+$')
 VAR_RED_NODE_RE = re.compile(r'^\s*var\d+\s*\[[^\]]*#cc0000', re.M)
 TENSOR_LABEL_RE = re.compile(r'^t\d+$')
 RAW_HEAP_NODE_RE = re.compile(r'^h\d+$')
@@ -137,6 +138,13 @@ def edge_label(attrs: str) -> str:
         lbl = lbl.split("/", 1)[1]
     return lbl.strip()
 
+
+def edge_label_raw(attrs: str) -> str:
+    m = LABEL_RE.search(attrs or "")
+    if not m:
+        return ""
+    return m.group(1).strip()
+
 def edge_dp_port(attrs: str) -> str:
     m = LABEL_RE.search(attrs or "")
     if not m:
@@ -151,6 +159,15 @@ def edge_dp_port(attrs: str) -> str:
 
 def is_annotation_edge(attrs: str) -> bool:
     return edge_label(attrs) in ANNOTATION_EDGE_LABELS
+
+
+def is_alo_env_edge(attrs: str) -> bool:
+    raw = edge_label_raw(attrs)
+    if raw == "env":
+        return True
+    if "style=dotted" not in (attrs or ""):
+        return False
+    return "@" in raw or (raw.startswith("h") and raw[1:].isdigit())
 
 
 def node_head(g: DotGraph, node_id: str) -> str:
@@ -177,9 +194,16 @@ def has_erase_path_from_tensor(g: DotGraph, tensor_node: str,
 def canonical_step_base(name: str) -> str:
     if not name:
         return name
-    s = STEP_HEAP_PAIR_SUFFIX_RE.sub("", name)
+    s = STEP_NAMED_PAIR_SUFFIX_RE.sub("", name)
+    s = STEP_HEAP_PAIR_SUFFIX_RE.sub("", s)
     s = STEP_HEAP_SINGLE_SUFFIX_RE.sub("", s)
     return s
+
+
+def step_mentions(name: str, token: str) -> bool:
+    if not name:
+        return False
+    return re.search(rf'(^|_){re.escape(token)}(_h|$)', name) is not None
 
 
 def prev_interaction_name(g: DotGraph) -> str:
@@ -195,20 +219,19 @@ def prev_interaction_name(g: DotGraph) -> str:
 def interactions_match(expected: str, actual: str) -> bool:
     if expected == actual:
         return True
-    if expected in {"interact_VAR", "interact_IFZ"} and actual in {"interact_VAR", "interact_IFZ"}:
+    if expected in {"VAR", "IFZ"} and actual in {"VAR", "IFZ"}:
         return True
     # DP0/DP1 are interchangeable.
-    dp_steps = {"interact_DP0", "interact_DP1"}
+    dp_steps = {"DP0", "DP1"}
     if expected in dp_steps and actual in dp_steps:
         return True
     # DP and ERA can interleave — the reducer's trampoline and the
     # predictor's heap scan visit them in different orders.
-    dp_era = dp_steps | {"interact_era_on_TEN", "interact_era_on_LAM",
-                         "interact_era_on_SUP", "interact_era_on_NUM"}
-    if expected in {"interact_era_on_VAR", "interact_era_on_TEN"}:
-        return actual in (dp_era | {"interact_FUSE", "interact_VAR"})
-    if actual in {"interact_era_on_VAR", "interact_era_on_TEN"}:
-        return expected in (dp_era | {"interact_FUSE", "interact_VAR"})
+    dp_era = dp_steps | {"ERA"}
+    if expected == "ERA":
+        return actual in (dp_era | {"FUSE", "VAR"})
+    if actual == "ERA":
+        return expected in (dp_era | {"FUSE", "VAR"})
     return expected in dp_era and actual in dp_era
 
 
@@ -313,20 +336,20 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
             if not has_edge_hl and not has_node_hl:
                 has_node_hl = "cc0000" in raw_dot
             if not has_edge_hl and not has_node_hl:
-                if g.next_interaction in {"interact_VAR", "interact_IFZ"}:
+                if canonical_step_base(g.next_interaction or "") in {"VAR", "IFZ"}:
                     continue
-                if (canonical_step_base(g.suffix) == "interact_VAR" and
-                        canonical_step_base(g.next_interaction or "") == "interact_era_on_UNK"):
+                if (canonical_step_base(g.suffix) == "VAR" and
+                        canonical_step_base(g.next_interaction or "") == "ERA"):
                     continue
-                if canonical_step_base(g.suffix) == "interact_IFZ":
+                if canonical_step_base(g.suffix) == "IFZ":
                     continue
-                if (gi + 1 < len(graphs) and "interact_FUSE" in graphs[gi + 1].suffix and
-                        canonical_step_base(g.suffix) == "interact_era_on_TEN"):
+                if (gi + 1 < len(graphs) and canonical_step_base(graphs[gi + 1].suffix) == "FUSE" and
+                        canonical_step_base(g.suffix) == "ERA"):
                     continue
-                if canonical_step_base(g.suffix) == "interact_FUSE":
+                if canonical_step_base(g.suffix) == "FUSE":
                     continue
                 # Large APP spine: highlight slot can disagree with drawn principal port.
-                if canonical_step_base(g.suffix) == "interact_APP" and "_h33_" in g.suffix and "_h63" in g.suffix:
+                if canonical_step_base(g.suffix) == "APP" and "_h33_" in g.suffix and "_h63" in g.suffix:
                     continue
                 errs.append(f"{os.path.basename(g.path)}: missing highlighted next-interaction edge or node")
 
@@ -436,7 +459,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
             # Exclude dashed metadata edges (e.g., REF→def body links).
             real_outs = [
                 e for e in out_map.get(nid, [])
-                if "dashed" not in (e[2] or "") and edge_label(e[2]) != "env"
+                if "dashed" not in (e[2] or "") and not is_alo_env_edge(e[2])
             ]
             out_count = len(real_outs)
             # VAR is a shared binder node in step-graph view: one VAR may fan out
@@ -502,7 +525,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                 continue
             outs = [
                 e for e in out_map.get(nid, [])
-                if not is_annotation_edge(e[2]) and edge_label(e[2]) != "env"
+                if not is_annotation_edge(e[2]) and not is_alo_env_edge(e[2])
             ]
             if not outs:
                 continue
@@ -530,7 +553,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                     # Dotted env edges are ALO-capture metadata, not direct net consumers.
                     if src == nid and dst == nid:
                         port_self_counts[p] += 1
-                    elif edge_label(attrs) == "env":
+                    elif is_alo_env_edge(attrs):
                         pass
                     else:
                         port_counts[p] += 1
@@ -581,7 +604,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
         # 4a) Disconnected non-ERA components with operation nodes are suspicious.
         # Skip strict disconnectedness on explicit ERA-interaction steps:
         # these snapshots may temporarily isolate pending-erasure subnets.
-        if not g.suffix.startswith("interact_era_on_"):
+        if canonical_step_base(g.suffix) not in {"ERA", "ASSIGN"}:
             adj: Dict[str, List[str]] = {}
             for nid in g.nodes:
                 if RAW_HEAP_NODE_RE.match(nid):
@@ -659,7 +682,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
             # state_final steps legitimately have no next interaction
             if not a.suffix.startswith("state_final") and not a.suffix.startswith("state_no_highlight"):
                 # Phase-1 stepping may end at state_final (short runs) or hand off to FUSE.
-                if ("interact_FUSE" not in b.suffix and "interact_FUSE" not in a.suffix and
+                if (canonical_step_base(b.suffix) != "FUSE" and canonical_step_base(a.suffix) != "FUSE" and
                         not b.suffix.startswith("state_final")):
                     errs.append(f"{os.path.basename(a.path)}: missing NEXT_INTERACTION metadata")
             continue
@@ -723,15 +746,10 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
     # or by APP/IFZ beta-reduction consuming the lambda body.
     for a, b in zip(graphs, graphs[1:]):
         # ERA/APP/IFZ/state steps can remove tensors as part of reduction.
-        if a.suffix.startswith("interact_APP") or \
-           a.suffix.startswith("interact_IFZ") or \
-           a.suffix.startswith("interact_ALO") or \
-           b.suffix.startswith("interact_era_on_") or \
-           b.suffix.startswith("interact_APP") or \
-           b.suffix.startswith("interact_IFZ") or \
-           b.suffix.startswith("interact_REF") or \
-           b.suffix.startswith("interact_VAR") or \
-           b.suffix.startswith("interact_FUSE") or \
+        if canonical_step_base(a.suffix) in {"APP", "IFZ", "ALO"} or \
+           canonical_step_base(b.suffix) in {"ERA", "ALO", "ASSIGN", "APP", "IFZ", "REF", "VAR", "FUSE"} or \
+           any(step_mentions(a.suffix, tok) for tok in {"ALO", "EXPAND"}) or \
+           any(step_mentions(b.suffix, tok) for tok in {"ERA", "ALO", "ASSIGN", "APP", "IFZ", "REF", "VAR", "FUSE", "EXPAND"}) or \
            b.suffix.startswith("state_final") or \
            b.suffix.startswith("state_no_highlight"):
             continue

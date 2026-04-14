@@ -1,5 +1,6 @@
 // Forward declarations for fusion (defined in fuse/_.c)
 static int is_elementwise(u32 uop);
+static int is_binary(u32 uop);
 
 // Reduce a term to TAG_TEN and return its tensor ID (or ~0u on failure)
 static u32 reduce_id(TinyHVM *ctx, Term t) {
@@ -81,6 +82,34 @@ static inline int reduce_top_has_add_zero_arg(TinyHVM *ctx, Term t) {
     Term b = heap_read(ctx, loc + 1);
     return (term_tag(a) == TAG_NUM && term_as_f32(a) == 0.0f) ||
            (term_tag(b) == TAG_NUM && term_as_f32(b) == 0.0f);
+}
+
+static inline int reduce_fuse_payload_top_ready(u32 uop) {
+    return uop == UOP_ASSIGN ||
+           uop == UOP_KERNEL ||
+           uop == UOP_FUSE ||
+           uop == UOP_SCHED ||
+           uop == UOP_FUSE2 ||
+           is_binary(uop) ||
+           is_elementwise(uop) ||
+           uop == UOP_SUM ||
+           uop == UOP_RMAX ||
+           (uop >= UOP_RESHAPE && uop <= UOP_PAD);
+}
+
+static inline int reduce_fuse_payload_ready(Term t) {
+    switch (term_tag(t)) {
+        case TAG_TEN:
+        case TAG_ERA:
+        case TAG_NUM:
+        case TAG_SEQ:
+        case TAG_CTR:
+            return 1;
+        case TAG_TOP:
+            return reduce_fuse_payload_top_ready(term_ext(t));
+        default:
+            return 0;
+    }
 }
 
 static inline int reduce_top_direct_uop(u32 uop) {
@@ -375,6 +404,19 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             next = a0;
             goto enter;
         }
+        if (ctx->step_graph_local_fuse && (_uop == UOP_FUSE || _uop == UOP_SCHED)) {
+            u64 loc = term_val(next);
+            Term a0 = heap_read(ctx, loc + 0);
+            if (reduce_fuse_payload_ready(a0)) {
+                if (BUDGET_HIT()) { whnf = next; goto apply; }
+                Term r = thvm_interact(ctx, next);
+                if (r != next) {
+                    TRACE_STEP(next, r);
+                    next = r;
+                    goto enter;
+                }
+            }
+        }
         if (_uop == UOP_DETACH) {
             if (BUDGET_HIT()) { whnf = next; goto apply; }
             Term r = thvm_interact(ctx, next);
@@ -467,9 +509,11 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 term_tag(whnf) == TAG_SUP ||
                 (term_tag(whnf) == TAG_TOP && frame_uop == UOP_GRAD) ||
                 (term_tag(whnf) == TAG_VAR && frame_uop == UOP_DETACH) ||
-                // UOP_FUSE/UOP_SCHED/UOP_FUSE2 accept most WNF payloads,
-                // but NOT DP0/DP1 — those must be resolved by reducer first.
-                ((frame_uop == UOP_FUSE || frame_uop == UOP_SCHED || frame_uop == UOP_FUSE2) &&
+                ((frame_uop == UOP_FUSE || frame_uop == UOP_SCHED) &&
+                 reduce_fuse_payload_ready(whnf)) ||
+                // UOP_FUSE2 accepts most WNF payloads, but NOT DP0/DP1 —
+                // those must be resolved by reducer first.
+                (frame_uop == UOP_FUSE2 &&
                  term_tag(whnf) != TAG_DP0 && term_tag(whnf) != TAG_DP1);
             if (!arg0_ready) {
                 heap_set(ctx, loc+0, whnf); whnf = frame; continue;

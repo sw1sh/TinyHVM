@@ -120,6 +120,8 @@
                         // Record input buffer epochs for future cache checks
                         extern KernelEntry sched_kernels[];
                         KernelEntry *ke = &sched_kernels[kid];
+                        u32 kernel_uop = (term_tag(ke->original_term) == TAG_TOP)
+                            ? term_ext(ke->original_term) : 0;
                         u32 ni = 0;
                         for (u32 i = 0; i < ke->n_leaves && ni < KERNEL_MAX_INPUTS; i++) {
                             u32 tid = ke->leaf_ids[i];
@@ -133,6 +135,14 @@
                             }
                         }
                         kid_n_inputs[kid] = ni;
+                        if (term_tag(result) == TAG_TEN) {
+                            u32 rid = (u32)term_val(result);
+                            if (rid < ctx->tensor_count) {
+                                ctx->tensors[rid].creator_op = UOP_KERNEL;
+                                ctx->tensors[rid].fusing_loc = loc;
+                                ctx->tensors[rid].fusing_uop = kernel_uop;
+                            }
+                        }
                     }
                     RETURN_REDUCED(result);
                 }
@@ -198,9 +208,8 @@
                           RETURN_REDUCED(_r); }
                     }
 
-                    // Unary compute/movement/reduce: absorb → FUSE2(op, FUSE(child), ERA)
-                    if (is_elementwise(puop) || puop == UOP_SUM || puop == UOP_RMAX ||
-                        (puop >= UOP_RESHAPE && puop <= UOP_PAD)) {
+                    // True unary ops: absorb → FUSE2(op, FUSE(child), ERA)
+                    if (is_elementwise(puop)) {
                         u64 ploc = term_val(payload);
                         Term child = heap_read(ctx, ploc);
                         u64 fc = heap_alloc(ctx, 1); heap_set(ctx, fc, child);
@@ -208,6 +217,21 @@
                         heap_set(ctx, f2loc, term_num_u32(puop));
                         heap_set(ctx, f2loc + 1, term_new(TAG_TOP, UOP_FUSE, fc));
                         heap_set(ctx, f2loc + 2, term_era());
+                        RETURN_REDUCED(term_new(TAG_TOP, UOP_FUSE2, f2loc));
+                    }
+
+                    // View/reduction ops keep their metadata operand visible so
+                    // the traced graph still carries shape/axes semantics.
+                    if (puop == UOP_SUM || puop == UOP_RMAX ||
+                        (puop >= UOP_RESHAPE && puop <= UOP_PAD)) {
+                        u64 ploc = term_val(payload);
+                        Term child = heap_read(ctx, ploc);
+                        Term meta  = heap_read(ctx, ploc + 1);
+                        u64 fc = heap_alloc(ctx, 1); heap_set(ctx, fc, child);
+                        u64 f2loc = heap_alloc(ctx, 3);
+                        heap_set(ctx, f2loc, term_num_u32(puop));
+                        heap_set(ctx, f2loc + 1, term_new(TAG_TOP, UOP_FUSE, fc));
+                        heap_set(ctx, f2loc + 2, meta);
                         RETURN_REDUCED(term_new(TAG_TOP, UOP_FUSE2, f2loc));
                     }
 
@@ -323,12 +347,14 @@
                         u32 out_tid = tensor_create_unbacked(ctx, ke.out_shape,
                             (term_tag(left)==TAG_TEN) ? ctx->tensors[(u32)term_val(left)].dtype : DTYPE_F32);
                         ctx->tensors[out_tid].creator_op = UOP_KERNEL;
+                        ctx->tensors[out_tid].fusing_uop = fop;
                         ke.output_tid = out_tid;
                         ke.raw_output_tid = out_tid;
                         sched_kernels[kid] = ke;
                         u64 kloc = heap_alloc(ctx, 2);
                         heap_set(ctx, kloc, term_era());
                         heap_set(ctx, kloc + 1, term_num_u32(kid));
+                        ctx->tensors[out_tid].fusing_loc = kloc;
                         View fv = view_create(ke.out_shape);
                         st_set(kloc, &fv);
                         RETURN_REDUCED(term_new(TAG_TOP, UOP_KERNEL, kloc));

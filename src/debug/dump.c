@@ -342,9 +342,16 @@ static const char *dot_fuse_payload_label_r(TinyHVM *ctx, Term payload, char *bu
     }
     if (term_tag(payload) == TAG_TOP) {
         u32 uop = term_ext(payload);
+        if (uop == UOP_KERNEL) {
+            u32 kop = thvm_kernel_root_uop(ctx, payload);
+            if (kop < UOP_COUNT) {
+                snprintf(buf, nbuf, "%s", uop_names[kop]);
+                return buf;
+            }
+        }
         if (uop < UOP_COUNT &&
             uop != UOP_FUSE && uop != UOP_SCHED &&
-            uop != UOP_FUSE2 && uop != UOP_KERNEL) {
+            uop != UOP_FUSE2) {
             snprintf(buf, nbuf, "%s", uop_names[uop]);
             return buf;
         }
@@ -362,14 +369,7 @@ static u32 dot_book_struct_arity(Term t) {
     u32 ext = term_ext(t);
     switch (tag) {
         case TAG_TOP:
-            if (ext == UOP_KERNEL) return 0;
-            if (ext == UOP_FUSE || ext == UOP_SCHED) return 1;
-            if (ext == UOP_FUSE2) return 3;
-            if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
-            if (ext == UOP_GRAD) return 2;
-            if (ext == UOP_LOG_PRINT || ext == UOP_DETACH) return 1;
-            if (!is_binary(ext) && is_elementwise(ext)) return 1;
-            return 2;
+            return thvm_uop_visible_arity(ext);
         case TAG_APP:
         case TAG_LAM:
         case TAG_BRI:
@@ -551,12 +551,39 @@ static int dot_meta_shape_from_tensor(TinyHVM *ctx, Term tmeta, Shape *out) {
 }
 
 static int dot_infer_top_shape(TinyHVM *ctx, u32 uop, u64 loc, Shape *out) {
-    if (uop == UOP_KERNEL) return 0;
-
     Term a = term_era();
     Term b = term_era();
     if (uop == UOP_FUSE || uop == UOP_SCHED) {
         a = heap_read(ctx, loc + 0);
+    } else if (uop == UOP_KERNEL) {
+        a = heap_read(ctx, loc + 0);
+        b = heap_read(ctx, loc + 1);
+        u32 kop = thvm_kernel_root_uop(ctx, term_new(TAG_TOP, UOP_KERNEL, loc));
+        Shape sa = SHAPE(1), sb = SHAPE(1);
+        int has_a = dot_term_shape(ctx, a, &sa);
+        int has_b = dot_term_shape(ctx, b, &sb);
+        if (kop == UOP_RESHAPE || kop == UOP_EXPAND) {
+            if (dot_meta_shape_from_tensor(ctx, b, out)) return 1;
+            if (has_a) { *out = sa; return 1; }
+            return 0;
+        }
+        if (kop == UOP_SUM || kop == UOP_RMAX) {
+            if (has_a) { *out = sa; return 1; }
+            return 0;
+        }
+        if (kop == UOP_COUNT) {
+            if (has_b) { *out = sb; return 1; }
+            if (has_a) { *out = sa; return 1; }
+            return 0;
+        }
+        if (is_binary(kop) || kop == UOP_CMP) {
+            if (has_a && has_b && dot_shape_broadcast(sa, sb, out)) return 1;
+            if (has_a) { *out = sa; return 1; }
+            if (has_b) { *out = sb; return 1; }
+            return 0;
+        }
+        if (has_a) { *out = sa; return 1; }
+        return 0;
     } else if (uop == UOP_FUSE2) {
         a = heap_read(ctx, loc + 1);
         b = heap_read(ctx, loc + 2);
@@ -649,15 +676,7 @@ static u32 dot_term_arity(Term t) {
     u32 ext = term_ext(t);
     switch (tag) {
         case TAG_TOP:
-            if (ext == UOP_KERNEL) return 0;
-            if (ext == UOP_FUSE || ext == UOP_SCHED) return 1;
-            if (ext == UOP_FUSE2) return 3;
-            if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
-            if (ext == UOP_GRAD) return 2;
-            if (ext == UOP_LOG_PRINT) return 1;
-            if (ext == UOP_DETACH) return 1;
-            if (!is_binary(ext) && is_elementwise(ext)) return 1;
-            return 2;
+            return thvm_uop_storage_arity(ext);
         case TAG_APP:
         case TAG_LAM:
         case TAG_BRI:
@@ -1469,25 +1488,27 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 }
             }
             if (ext == UOP_KERNEL) {
-                Term kid_t = heap_read(ctx, val + 1);
-                u32 kid = (term_tag(kid_t) == TAG_NUM) ? (u32)term_val(kid_t) : 0;
-                extern KernelEntry sched_kernels[];
-                KernelEntry *ke = &sched_kernels[kid];
-                char ops_s[64] = ""; int p = 0;
-                if (ke->has_reduce) { p += snprintf(ops_s+p,sizeof(ops_s)-p,"%s",ke->has_reduce==UOP_SUM?"SUM":"RMAX");
-                    if (ke->n_ops) p += snprintf(ops_s+p,sizeof(ops_s)-p,"+"); }
-                u8 seen_op[UOP_COUNT]={0};
-                for (u32 oi=0; oi<ke->n_ops && p<50; oi++) { u32 u=ke->ops[oi].uop;
-                    if (u<UOP_COUNT && !seen_op[u]) { seen_op[u]=1;
-                        if (p>0 && ops_s[p-1]!='+') p+=snprintf(ops_s+p,sizeof(ops_s)-p,"+");
-                        p+=snprintf(ops_s+p,sizeof(ops_s)-p,"%s",uop_names[u]); }}
-                if (ops_s[0] == '\0' && term_tag(ke->original_term) == TAG_TOP) {
-                    u32 ou = term_ext(ke->original_term);
-                    snprintf(ops_s, sizeof(ops_s), "%s",
-                             (ou < UOP_COUNT) ? uop_names[ou] : "FUSING");
+                u32 kop = thvm_kernel_root_uop(ctx, t);
+                char op_label[32] = "NULL";
+                if (kop < UOP_COUNT) snprintf(op_label, sizeof(op_label), "%s", uop_names[kop]);
+                else if (kop == UOP_COUNT) snprintf(op_label, sizeof(op_label), "SEQ");
+                u32 kid = 0;
+                if (thvm_kernel_lookup_kid(val, &kid)) {
+                    extern KernelEntry sched_kernels[];
+                    KernelEntry *ke = &sched_kernels[kid];
+                    if (has_shape)
+                        snprintf(label,sizeof(label),"KERNEL\\n%s\\n#%u %s\\n[%s]\\n@%llu",
+                                 op_label, kid, dot_kernel_backend(ctx, ke), sh, (unsigned long long)val);
+                    else
+                        snprintf(label,sizeof(label),"KERNEL\\n%s\\n#%u %s\\n@%llu",
+                                 op_label, kid, dot_kernel_backend(ctx, ke), (unsigned long long)val);
+                } else if (has_shape) {
+                    snprintf(label,sizeof(label),"KERNEL\\n%s\\n[%s]\\n@%llu",
+                             op_label, sh, (unsigned long long)val);
+                } else {
+                    snprintf(label,sizeof(label),"KERNEL\\n%s\\n@%llu",
+                             op_label, (unsigned long long)val);
                 }
-                snprintf(label,sizeof(label),"KERNEL\\n#%u %s\\n[%s]\\n%s\\n@%llu",
-                         kid, ops_s, sh, dot_kernel_backend(ctx, ke), (unsigned long long)val);
                 color = "#ccffcc";
             } else if (ext == UOP_GRAD) {
                 // GRAD bead: y (input below), gy (output above).
@@ -1550,7 +1571,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             u32 arity = 2;
             if (ext == UOP_GRAD) arity = 2;
             else if (ext == UOP_WHERE || ext == UOP_IFZ) arity = 3;
-            else if (ext == UOP_KERNEL) arity = 0;
+            else if (ext == UOP_KERNEL) arity = 2;
             else if (ext == UOP_FUSE || ext == UOP_SCHED) arity = 1;
             else if (ext == UOP_FUSE2) arity = 3;
             else if (ext == UOP_LOG_PRINT) arity = 1;
@@ -1566,6 +1587,17 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 const char *elbl = "";
                 if (ext == UOP_ASSIGN) elbl = ai==0 ? "tgt" : "src";
                 else if (ext == UOP_IFZ) elbl = ai==0 ? "cond" : (ai==1 ? "then" : "else");
+                else if (ext == UOP_KERNEL) {
+                    u32 kop = thvm_kernel_root_uop(ctx, t);
+                    if (ai == 1 && term_tag(child) == TAG_ERA &&
+                        !is_binary(kop) && is_elementwise(kop))
+                        continue;
+                    if (kop == UOP_COUNT) elbl = ai==0 ? "eff" : "next";
+                    else if (kop >= UOP_RESHAPE && kop <= UOP_PAD) elbl = ai==0 ? "in" : "shape";
+                    else if (kop == UOP_SUM || kop == UOP_RMAX) elbl = ai==0 ? "in" : "axes";
+                    else if (is_binary(kop)) elbl = ai==0 ? "a" : "b";
+                    else elbl = ai==0 ? "in" : "";
+                }
                 else if (ext == UOP_FUSE2) elbl = ai==1 ? "a" : "b";
                 else if (ext >= UOP_RESHAPE && ext <= UOP_PAD) elbl = ai==0 ? "in" : "shape";
                 else if (ext == UOP_SUM || ext == UOP_RMAX) elbl = ai==0 ? "in" : "axes";
@@ -2255,32 +2287,18 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 } \
             } \
             if ((_ext) == UOP_KERNEL) { \
-                Term kid_t2 = heap_read(ctx, (_loc) + 1); \
-                u32 kid2 = (term_tag(kid_t2) == TAG_NUM) ? (u32)term_val(kid_t2) : 0; \
-                KernelEntry *ke2 = &sched_kernels[kid2]; \
-                char ops_s[64] = ""; int p = 0; \
-                if (ke2->has_reduce) { \
-                    p += snprintf(ops_s + p, sizeof(ops_s) - p, "%s", \
-                                  ke2->has_reduce == UOP_SUM ? "SUM" : "RMAX"); \
-                    if (ke2->n_ops) p += snprintf(ops_s + p, sizeof(ops_s) - p, "+"); \
+                u32 kop2 = thvm_kernel_root_uop(ctx, term_new(TAG_TOP, UOP_KERNEL, (_loc))); \
+                char op_label2[32] = "NULL"; \
+                if (kop2 < UOP_COUNT) snprintf(op_label2, sizeof(op_label2), "%s", uop_names[kop2]); \
+                else if (kop2 == UOP_COUNT) snprintf(op_label2, sizeof(op_label2), "SEQ"); \
+                u32 kid2 = 0; \
+                if (thvm_kernel_lookup_kid((_loc), &kid2)) { \
+                    KernelEntry *ke2 = &sched_kernels[kid2]; \
+                    snprintf(label, sizeof(label), "KERNEL\\n%s\\n#%u %s\\n[%s]", \
+                             op_label2, kid2, dot_kernel_backend(ctx, ke2), sh); \
+                } else { \
+                    snprintf(label, sizeof(label), "KERNEL\\n%s\\n[%s]", op_label2, sh); \
                 } \
-                u8 seen_op[UOP_COUNT] = {0}; \
-                for (u32 oi = 0; oi < ke2->n_ops && p < 50; oi++) { \
-                    u32 u = ke2->ops[oi].uop; \
-                    if (u < UOP_COUNT && !seen_op[u]) { \
-                        seen_op[u] = 1; \
-                        if (p > 0 && ops_s[p - 1] != '+') \
-                            p += snprintf(ops_s + p, sizeof(ops_s) - p, "+"); \
-                        p += snprintf(ops_s + p, sizeof(ops_s) - p, "%s", uop_names[u]); \
-                    } \
-                } \
-                if (ops_s[0] == '\0' && term_tag(ke2->original_term) == TAG_TOP) { \
-                    u32 ou2 = term_ext(ke2->original_term); \
-                    snprintf(ops_s, sizeof(ops_s), "%s", \
-                             (ou2 < UOP_COUNT) ? uop_names[ou2] : "FUSING"); \
-                } \
-                snprintf(label, sizeof(label), "KERNEL\\n#%u %s\\n[%s]\\n%s", \
-                         kid2, ops_s, sh, dot_kernel_backend(ctx, ke2)); \
                 color = "#ccffcc"; \
             } else if ((_ext) == UOP_GRAD) { \
                 Term gx = thvm_grad_target_get(ctx, (_loc)); \
@@ -2393,10 +2411,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 if (fusing_leaf_done[loc]) continue;
                 fusing_leaf_done[loc] = 1;
             }
-            Term kid_t = heap_read(ctx, loc + 1);
-            if (term_tag(kid_t) != TAG_NUM) continue;
-            u32 kid = (u32)term_val(kid_t);
-            if (kid >= sched_kernel_count) continue;
+            u32 kid = 0;
+            if (!thvm_kernel_lookup_kid(loc, &kid) || kid >= sched_kernel_count) continue;
             KernelEntry *ke = &sched_kernels[kid];
             if (output_used[kid] && ke->output_tid) {
                 char out_lbl[48];
@@ -2433,13 +2449,11 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         for (u32 tid = 0; tid < ctx->tensor_count && tid < 256; tid++) {
             if (!ten_emitted[tid]) continue;
             TensorMeta *m = &ctx->tensors[tid];
-            if (m->creator_op != UOP_KERNEL || m->fusing_loc == 0 || m->fusing_loc + 1 >= ctx->heap_pos)
+            if (m->creator_op != UOP_KERNEL || m->fusing_loc == 0 || m->fusing_loc + 2 >= ctx->heap_pos)
                 continue;
             u64 loc = m->fusing_loc;
-            Term kid_t = heap_read(ctx, loc + 1);
-            if (term_tag(kid_t) != TAG_NUM) continue;
-            u32 kid = (u32)term_val(kid_t);
-            if (kid >= sched_kernel_count) continue;
+            u32 kid = 0;
+            if (!thvm_kernel_lookup_kid(loc, &kid) || kid >= sched_kernel_count) continue;
             KernelEntry *ke = &sched_kernels[kid];
             EMIT_TOP_NODE_LABEL(loc, UOP_KERNEL);
             if (!kernel_leaf_drawn[kid]) {

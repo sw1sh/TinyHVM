@@ -1,19 +1,25 @@
-# Fusion: FUSE as Propagating IC Agent
+# Fusion: FUSE to Structural KERNEL
 
-FUSE propagates through the compute graph like GRAD propagates through the
-backward graph — via pure IC interactions, no imperative walk.
+`FUSE` propagates through the compute graph like `GRAD` propagates through the
+backward graph: by local IC interactions, not by an imperative fusion pass.
 
-## FUSE Forms
+The important split is now:
 
+- `FUSE` marks fuseable structure and keeps propagating.
+- `KERNEL` is the explicit fused kernel boundary on the heap.
+- dispatch/cache is a later runtime concern keyed from that `KERNEL`, not the IR
+  itself.
+
+## Core Forms
+
+```text
+FUSE(payload)
+KERNEL(left, right_or_meta, root_uop)
 ```
-FUSE(payload)           Entry point: propagate into compute structure
-FUSE(op, child)         Absorbed one unary op, waiting for child to resolve
-FUSE2(op, left, right)  Absorbed one binary op, waiting for children to resolve
-```
 
-FUSE **absorbs** compute ops. The op becomes part of FUSE's metadata, not a
-separate TAG_TOP node. When children resolve to TEN or KERNEL, FUSE creates
-or merges a KERNEL.
+`FUSE2` is no longer part of the intended IR contract. It only remains as a
+deprecated compatibility shim for older heaps/tests and is immediately lowered
+to `KERNEL`.
 
 ## Entry FUSE Interactions
 
@@ -22,74 +28,61 @@ or merges a KERNEL.
 | `FUSE(TEN)` | `TEN` | Leaf, nothing to fuse |
 | `FUSE(NUM)` | `NUM` | Leaf |
 | `FUSE(ERA)` | `ERA` | Leaf |
-| `FUSE(MUL(a,b))` | `FUSE2(MUL, FUSE(a), FUSE(b))` | Absorb binary compute |
-| `FUSE(NEG(a))` | `FUSE(NEG, FUSE(a))` | Absorb unary compute |
-| `FUSE(SUM(a,axes))` | `FUSE(SUM, FUSE(a))` | Absorb reduce |
-| `FUSE(RESHAPE(a,sh))` | `FUSE(RESHAPE, FUSE(a))` | Absorb movement |
-| `FUSE(SEQ(a,b))` | `FUSE2(SEQ, FUSE(a), FUSE(b))` | Compose via SEQ |
-| `FUSE(CTR(a,b,...))` | `CTR(FUSE(a), FUSE(b), ...)` | Distribute |
-| `FUSE(ASSIGN(d,s))` | `ASSIGN(d, FUSE(s))` | Fuse the source |
-| `FUSE(KERNEL)` | `KERNEL` | Already fused |
-| `FUSE(DP0/DP1)` | `DP0/DP1` | Let reducer resolve DUP |
+| `FUSE(binary(a,b))` | `KERNEL(FUSE(a), FUSE(b), binary)` | Structural fused node |
+| `FUSE(unary(a))` | `KERNEL(FUSE(a), ERA, unary)` | Unary sentinel uses inert `ERA` |
+| `FUSE(view_or_reduce(a, meta))` | `KERNEL(FUSE(a), meta, op)` | Keep metadata visible |
+| `FUSE(SEQ(a,b))` | `KERNEL(FUSE(a), FUSE(b), SEQ)` | Ordering stays explicit |
+| `FUSE(CTR(...))` | `CTR(FUSE(...), ...)` | Distribute |
+| `FUSE(ASSIGN(dst, src))` | `ASSIGN(dst, FUSE(src))` | Fuse only the source |
+| `FUSE(KERNEL(...))` | `KERNEL(...)` | Already structural |
 
-## Unary FUSE(op, child) Interactions
+## KERNEL Semantics
 
-| Pattern | Result |
-|---------|--------|
-| `FUSE(op, FUSE_child)` | WNF (waiting) |
-| `FUSE(op, TEN)` | `KERNEL` — single-op kernel: op(TEN) |
-| `FUSE(op, KERNEL)` | `KERNEL` — absorb op on top of existing kernel |
+`KERNEL` is lazy structural IR, not an already-dispatched result.
 
-## Binary FUSE2(op, left, right) Interactions
+- Heap layout: `TAG_TOP(UOP_KERNEL, loc)`, heap `[left, right_or_meta, NUM(root_uop)]`
+- The node stays visible in the net until a strict context reaches it.
+- `SEQ`-shaped kernels degrade back to `SEQ(left, right)` once both children are
+  ready.
+- Non-`SEQ` kernels dispatch only when reduction actually demands a `TEN`
+  result, such as under `ASSIGN`, `LOG_PRINT`, or as the final eval result.
 
-| Pattern | Result |
-|---------|--------|
-| `FUSE2(op, FUSE, FUSE)` | WNF (waiting) |
-| `FUSE2(op, TEN, TEN)` | `KERNEL` — single-op kernel: op(TEN, TEN) |
-| `FUSE2(op, KERNEL, TEN)` | `KERNEL` — absorb op on top |
-| `FUSE2(op, TEN, KERNEL)` | `KERNEL` — absorb op on top |
-| `FUSE2(op, KERNEL, KERNEL)` | `KERNEL` — merge: op composes two kernels |
-| `FUSE2(SEQ, non-KERNEL, b)` | `SEQ(a, b)` — degrade to ordering |
+This means step graphs can show:
 
-## KERNEL is Lazy
+1. `FUSE` propagation
+2. `KERNEL` materialization as a real heap node
+3. `KERNEL -> TEN` dispatch
+4. `ASSIGN` / cleanup
 
-FUSE/FUSE2 produces KERNEL — a lazy kernel spec, NOT a dispatched result.
-KERNEL stays WNF on the heap. It only dispatches when **demanded**:
+## Runtime Lowering
 
-```
-FUSE(ADD(MUL(a,b), c)):
-  → FUSE2(ADD, FUSE2(MUL, FUSE(a), FUSE(b)), FUSE(c))
-  → FUSE2(ADD, KERNEL(MUL,a,b), TEN(c))    // inner MUL → KERNEL, NOT dispatched
-  → KERNEL(ADD(MUL(a,b),c))                  // merged into one fused kernel
-  → dispatches only when ASSIGN or root demands TAG_TEN
-```
+When a demanded `KERNEL` is ready:
 
-This prevents premature dispatch: a parent FUSE2 can absorb a child KERNEL
-into a larger fused kernel before anything dispatches.
+1. The structural `KERNEL` subtree is converted back into a raw compute term.
+2. `fuse_build_kernel()` lowers that compute term into a `KernelEntry`.
+3. The resulting runtime entry is cached behind the structural kernel location.
+4. Buffer-epoch checks decide whether a cached `TEN` result is still valid.
+
+So the runtime still uses `KernelEntry`, `kid_results[]`, and epoch tracking, but
+those are implementation details behind the structural heap node.
 
 ## Training Loop
 
-```
+```text
 train(counter)(w) = IFZ(counter, w, λm. SEQ(ASSIGN(w, w*2), train(m)(w)))
 ```
 
-1. Phase 1: IFZ fires once → `SEQ(ASSIGN(w, MUL(w,2)), train(m)(w))`. SEQ blocks.
-2. FUSE propagates: `MUL(w,2)` → `FUSE2(MUL, TEN, TEN)` → KERNEL.
-3. ASSIGN demands TEN → KERNEL dispatches → ASSIGN writes buffer.
-4. SEQ continues → recursive reference to same body (Y-combinator, no clone).
-5. DUP on KERNEL → fresh dispatch instance. Epoch check → re-dispatch.
-6. One kernel spec, reused across iterations.
-
-## Encoding
-
-- Entry FUSE: `TAG_TOP(UOP_FUSE, loc)`, heap `[payload]`
-- Unary FUSE: `TAG_TOP(UOP_FUSE, loc)`, heap `[NUM(op), child]`
-  - Distinguished by `term_tag(heap[loc]) == TAG_NUM`
-- Binary FUSE2: `TAG_TOP(UOP_FUSE2, loc)`, heap `[NUM(op), left, right]`
+1. Phase 1 exposes `SEQ(ASSIGN(w, MUL(w,2)), train(m)(w))`.
+2. `FUSE` rewrites `MUL(w,2)` into a visible `KERNEL`.
+3. `ASSIGN` forces that `KERNEL` to dispatch to `TEN`.
+4. `ASSIGN` writes the updated buffer and bumps the buffer epoch.
+5. Later loop iterations revisit the same structural kernel and re-dispatch when
+   epoch checks detect stale cached results.
 
 ## Files
 
-- `src/interact/tensor_ops.c` — FUSE/FUSE2/KERNEL interaction handlers
-- `src/reduce/_.c` — arity, direct_uop, apply-phase dispatch
-- `src/interact/combinators.c` — DUP ⊳ FUSE2 commutation
-- `src/tinyhvm.h` — UOP_FUSE2 definition
+- `src/interact/tensor_ops.c` — `FUSE`, compatibility `FUSE2`, and `KERNEL` dispatch
+- `src/interact/_.c` — shared kernel helpers and arity metadata
+- `src/reduce/_.c` — reducer readiness for structural kernels
+- `src/interact/combinators.c` — `DUP`/`ERA` behavior for 3-slot kernels
+- `src/debug/dump.c` and `src/debug/graph.c` — visible kernel tracing

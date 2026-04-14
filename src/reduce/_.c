@@ -22,6 +22,7 @@ static inline int uop_allocates_fresh(u32 uop) {
         case UOP_IFZ:
         case UOP_LOG_PRINT:
         case UOP_DETACH:
+        case UOP_KERNEL:
         case UOP_FUSE:
         case UOP_SCHED:
         case UOP_FUSE2:
@@ -32,15 +33,7 @@ static inline int uop_allocates_fresh(u32 uop) {
 }
 
 static inline u32 reduce_top_arity(u32 uop) {
-    if (uop == UOP_KERNEL) return 0;
-    if (uop == UOP_FUSE || uop == UOP_SCHED) return 1;
-    if (uop == UOP_FUSE2) return 3; // op_num, left, right
-    if (uop == UOP_WHERE || uop == UOP_IFZ) return 3;
-    if (uop == UOP_GRAD) return 2;
-    if (uop == UOP_LOG_PRINT) return 1;
-    if (uop == UOP_DETACH) return 1;
-    if (!is_binary(uop) && is_elementwise(uop)) return 1;
-    return 2;
+    return thvm_uop_storage_arity(uop);
 }
 
 static inline int reduce_term_is_active_era_like(TinyHVM *ctx, Term t, Term *era_out) {
@@ -513,7 +506,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                  reduce_fuse_payload_ready(whnf)) ||
                 // UOP_FUSE2 accepts most WNF payloads, but NOT DP0/DP1 —
                 // those must be resolved by reducer first.
-                (frame_uop == UOP_FUSE2 &&
+                ((frame_uop == UOP_FUSE2 || frame_uop == UOP_KERNEL) &&
                  term_tag(whnf) != TAG_DP0 && term_tag(whnf) != TAG_DP1);
             if (!arg0_ready) {
                 heap_set(ctx, loc+0, whnf); whnf = frame; continue;
@@ -532,9 +525,8 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 goto enter;
             }
 
-            // UOP_FUSE/UOP_SCHED/UOP_KERNEL: fire once arg0 ready (arity 0-1).
-            if (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED ||
-                frame_uop == UOP_KERNEL) {
+            // UOP_FUSE/UOP_SCHED fire once arg0 is ready.
+            if (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED) {
                 if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
@@ -592,9 +584,10 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             // FUSE2: also accept TAG_TOP (ASSIGN, KERNEL, etc.) and TAG_SEQ
             // as valid children. BUT NOT UOP_FUSE/UOP_FUSE2 — those must be
             // reduced first (they resolve to TEN/KERNEL/ASSIGN).
-            if (_uop1 == UOP_FUSE2)
+            if (_uop1 == UOP_FUSE2 || _uop1 == UOP_KERNEL)
                 _arg1_ok = _arg1_ok || w1t == TAG_SEQ || w1t == TAG_CTR ||
-                           (w1t == TAG_TOP && term_ext(whnf) != UOP_FUSE && term_ext(whnf) != UOP_FUSE2);
+                           (w1t == TAG_TOP && term_ext(whnf) != UOP_FUSE &&
+                            term_ext(whnf) != UOP_FUSE2 && term_ext(whnf) != UOP_SCHED);
             if (!_arg1_ok) {
                 // Reconstruct original TAG_TOP from TOP1 sentinel
                 heap_set(ctx, loc + 1, whnf);
@@ -602,11 +595,14 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 continue;
             }
             heap_set(ctx, loc + 1, whnf);  // store arg1 result
-            // 3-arg ops (WHERE, IFZ, FUSE2): reduce arg2 before firing
-            if (_uop1 == UOP_WHERE || _uop1 == UOP_IFZ || _uop1 == UOP_FUSE2) {
+            // 3-arg ops (WHERE, IFZ, FUSE2, KERNEL): reduce arg2 before firing
+            if (_uop1 == UOP_WHERE || _uop1 == UOP_IFZ ||
+                _uop1 == UOP_FUSE2 || _uop1 == UOP_KERNEL) {
                 Term a2 = heap_read(ctx, loc + 2);
                 u8 a2t = term_tag(a2);
-                int _arg2_ok = (a2t == TAG_TEN || a2t == TAG_ERA || a2t == TAG_NUM ||
+                int _arg2_ok = (_uop1 == UOP_KERNEL)
+                             ? (a2t == TAG_NUM)
+                             : (a2t == TAG_TEN || a2t == TAG_ERA || a2t == TAG_NUM ||
                                 a2t == TAG_CTR || a2t == TAG_ANY || a2t == TAG_LAM || a2t == TAG_SUP);
                 if (_uop1 == UOP_FUSE2)
                     _arg2_ok = _arg2_ok || a2t == TAG_SEQ ||
@@ -638,6 +634,8 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             { int _arg2_ok2 = (w2t == TAG_TEN || w2t == TAG_ERA || w2t == TAG_NUM ||
                               w2t == TAG_LAM || w2t == TAG_SUP || w2t == TAG_CTR || w2t == TAG_ANY);
               u32 _uop2 = term_ext(frame);
+              if (_uop2 == UOP_KERNEL)
+                  _arg2_ok2 = (w2t == TAG_NUM);
               if (_uop2 == UOP_FUSE2)
                   _arg2_ok2 = _arg2_ok2 || w2t == TAG_SEQ ||
                               (w2t == TAG_TOP && term_ext(whnf) != UOP_FUSE && term_ext(whnf) != UOP_FUSE2);

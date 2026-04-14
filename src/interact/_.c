@@ -57,6 +57,174 @@ static void thvm_spawn_detached_era(TinyHVM *ctx, Term item) {
     }
 }
 
+static u32 thvm_uop_storage_arity(u32 ext) {
+    if (ext == UOP_KERNEL) return 3;
+    if (ext == UOP_FUSE || ext == UOP_SCHED) return 1;
+    if (ext == UOP_FUSE2) return 3;
+    if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
+    if (ext == UOP_GRAD) return 2;
+    if (ext == UOP_LOG_PRINT || ext == UOP_DETACH) return 1;
+    if (!is_binary(ext) && is_elementwise(ext)) return 1;
+    return 2;
+}
+
+static u32 thvm_uop_visible_arity(u32 ext) {
+    if (ext == UOP_KERNEL || ext == UOP_FUSE2) return 2;
+    return thvm_uop_storage_arity(ext);
+}
+
+static u32 thvm_term_dtype_hint(TinyHVM *ctx, Term t) {
+    switch (term_tag(t)) {
+        case TAG_TEN:
+            return ctx->tensors[(u32)term_val(t)].dtype;
+        case TAG_NUM:
+            return term_ext(t) == NUM_U32 ? DTYPE_U32 : DTYPE_F32;
+        case TAG_TOP: {
+            u32 uop = term_ext(t);
+            u64 loc = term_val(t);
+            if (uop == UOP_KERNEL) {
+                if (loc > 0 && loc + 2 < ctx->heap_pos)
+                    return thvm_term_dtype_hint(ctx, heap_read(ctx, loc + 0));
+                return DTYPE_F32;
+            }
+            if (uop == UOP_CAST && loc > 0 && loc + 1 < ctx->heap_pos) {
+                Term meta = heap_read(ctx, loc + 1);
+                if (term_tag(meta) == TAG_TEN) {
+                    u32 tid = (u32)term_val(meta);
+                    if (tid < ctx->tensor_count) {
+                        u32 raw[MAX_DIM];
+                        if (tensor_meta_read_u32(ctx, tid, raw, MAX_DIM) == 1 && raw[0] < DTYPE_COUNT)
+                            return raw[0];
+                    }
+                }
+            }
+            if ((is_view_op(uop) || is_elementwise(uop) || uop == UOP_CAST ||
+                 uop == UOP_SUM || uop == UOP_RMAX) &&
+                loc > 0 && loc < ctx->heap_pos)
+                return thvm_term_dtype_hint(ctx, heap_read(ctx, loc + 0));
+            return DTYPE_F32;
+        }
+        default:
+            return DTYPE_F32;
+    }
+}
+
+static u32 thvm_kernel_root_uop(TinyHVM *ctx, Term kernel) {
+    if (term_tag(kernel) != TAG_TOP || term_ext(kernel) != UOP_KERNEL) return UOP_COUNT;
+    u64 loc = term_val(kernel);
+    if (loc == 0 || loc + 2 >= ctx->heap_pos) return UOP_COUNT;
+    Term op = heap_read(ctx, loc + 2);
+    return term_tag(op) == TAG_NUM ? term_as_u32(op) : UOP_COUNT;
+}
+
+static int thvm_kernel_child_ready(Term t) {
+    u8 tag = term_tag(t);
+    if (tag == TAG_DP0 || tag == TAG_DP1) return 0;
+    if (tag == TAG_TOP) {
+        u32 ext = term_ext(t);
+        return ext != UOP_FUSE && ext != UOP_SCHED;
+    }
+    return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
+           tag == TAG_SEQ || tag == TAG_CTR || tag == TAG_LAM ||
+           tag == TAG_SUP || tag == TAG_ANY;
+}
+
+static int thvm_kernel_to_compute(TinyHVM *ctx, Term t, Term *out_compute, u32 depth) {
+    if (!out_compute || depth > 64) return 0;
+    if (term_tag(t) == TAG_TOP && term_ext(t) == UOP_KERNEL) {
+        u64 loc = term_val(t);
+        if (loc == 0 || loc + 2 >= ctx->heap_pos) return 0;
+        Term left = heap_read(ctx, loc + 0);
+        Term right = heap_read(ctx, loc + 1);
+        u32 kop = thvm_kernel_root_uop(ctx, t);
+        if (kop >= UOP_COUNT || kop == UOP_COUNT) return 0;
+        Term raw_left = left;
+        Term raw_right = right;
+        if (term_tag(left) == TAG_TOP && term_ext(left) == UOP_KERNEL) {
+            if (!thvm_kernel_to_compute(ctx, left, &raw_left, depth + 1)) return 0;
+        } else if (!thvm_kernel_child_ready(left)) {
+            return 0;
+        }
+        if (term_tag(right) == TAG_TOP && term_ext(right) == UOP_KERNEL) {
+            if (!thvm_kernel_to_compute(ctx, right, &raw_right, depth + 1)) return 0;
+        } else if (!thvm_kernel_child_ready(right)) {
+            return 0;
+        }
+        int unary = (!is_binary(kop) && is_elementwise(kop) && term_tag(right) == TAG_ERA);
+        u64 oploc = heap_alloc(ctx, unary ? 1 : 2);
+        heap_set(ctx, oploc + 0, raw_left);
+        if (!unary) heap_set(ctx, oploc + 1, raw_right);
+        *out_compute = term_new(TAG_TOP, kop, oploc);
+        {
+            const View *sv = st_get(loc);
+            if (sv) st_set(oploc, sv);
+        }
+        return 1;
+    }
+    if (!thvm_kernel_child_ready(t)) return 0;
+    *out_compute = t;
+    return 1;
+}
+
+static int thvm_kernel_lookup_kid(u64 loc, u32 *out_kid) {
+    extern u32 sched_kernel_count;
+    extern u64 sched_kernel_locs[];
+    for (u32 kid = 0; kid < sched_kernel_count; kid++) {
+        if (sched_kernel_locs[kid] == loc) {
+            if (out_kid) *out_kid = kid;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int thvm_kernel_register(TinyHVM *ctx, Term kernel, u32 *out_kid) {
+    extern KernelEntry sched_kernels[];
+    extern u32 sched_kernel_count;
+    extern Term kid_results[];
+    extern u32 kid_n_inputs[];
+    extern u64 sched_kernel_locs[];
+    u64 loc = term_val(kernel);
+    u32 existing = 0;
+    if (thvm_kernel_lookup_kid(loc, &existing)) {
+        if (out_kid) *out_kid = existing;
+        return 1;
+    }
+    Term compute = 0;
+    if (!thvm_kernel_to_compute(ctx, kernel, &compute, 0)) return 0;
+    if (sched_kernel_count >= SCHED_MAX_KERNELS) return 0;
+
+    KernelEntry ke;
+    memset(&ke, 0, sizeof(ke));
+    fuse_set_schedule_boundaries(NULL, NULL, NULL, 0, term_val(compute));
+    if (!fuse_build_kernel(ctx, compute, &ke)) {
+        fuse_clear_schedule_boundaries();
+        return 0;
+    }
+    fuse_clear_schedule_boundaries();
+
+    u32 kid = sched_kernel_count++;
+    ke.original_term = compute;
+    {
+        u32 out_tid = tensor_create_unbacked(ctx, ke.out_shape, thvm_term_dtype_hint(ctx, kernel));
+        ctx->tensors[out_tid].creator_op = UOP_KERNEL;
+        ctx->tensors[out_tid].fusing_loc = loc;
+        ctx->tensors[out_tid].fusing_uop = thvm_kernel_root_uop(ctx, kernel);
+        ke.raw_output_tid = out_tid;
+        ke.output_tid = out_tid;
+    }
+    sched_kernels[kid] = ke;
+    kid_results[kid] = term_era();
+    kid_n_inputs[kid] = 0;
+    sched_kernel_locs[kid] = loc;
+    {
+        View fv = view_create(ke.out_shape);
+        st_set(loc, &fv);
+    }
+    if (out_kid) *out_kid = kid;
+    return 1;
+}
+
 static u32 thvm_alo_state_push(TinyHVM *ctx, u32 parent, u8 kind, u8 bind_tag, u64 bind_book, u64 bind_dyn, u32 label_old, u32 label_new) {
     if (!ctx->alo_states) return 0;
     if (ctx->alo_state_count >= ctx->alo_state_cap) {
@@ -121,14 +289,7 @@ static Term thvm_alo_suspend_child(TinyHVM *ctx, Term child, u32 state_id) {
 }
 
 static u32 thvm_alo_top_arity(u32 ext) {
-    if (ext == UOP_KERNEL) return 0;
-    if (ext == UOP_FUSE || ext == UOP_SCHED) return 1;
-    if (ext == UOP_FUSE2) return 3;
-    if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
-    if (ext == UOP_GRAD) return 2;
-    if (ext == UOP_LOG_PRINT || ext == UOP_DETACH) return 1;
-    if (!is_binary(ext) && is_elementwise(ext)) return 1;
-    return 2;
+    return thvm_uop_storage_arity(ext);
 }
 
 static u32 thvm_alo_book_arity(Term t) {

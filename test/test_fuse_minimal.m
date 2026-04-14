@@ -21,7 +21,7 @@ int main() {
         printf("FUSE(TEN): tag=%u ext=%u (expect TEN=10)\n", term_tag(r), term_ext(r));
     }
 
-    // Test 2: FUSE on MUL (should absorb into FUSE2)
+    // Test 2: FUSE on MUL (should pass through structural KERNEL to TEN)
     {
         u64 fl = heap_alloc(ctx, 1);
         heap_set(ctx, fl, mul);

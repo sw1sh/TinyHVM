@@ -105,15 +105,7 @@ static u64 thvm_book_heap_alloc(TinyHVM *ctx, u32 n) {
 }
 
 static inline u32 thvm_book_top_arity(u32 ext) {
-    if (ext == UOP_KERNEL) return 0;
-    if (ext == UOP_FUSE || ext == UOP_SCHED) return 1;
-    if (ext == UOP_FUSE2) return 3;
-    if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
-    if (ext == UOP_GRAD) return 2;
-    if (ext == UOP_LOG_PRINT) return 1;
-    if (ext == UOP_DETACH) return 1;
-    if (!is_binary(ext) && is_elementwise(ext)) return 1;
-    return 2;
+    return thvm_uop_storage_arity(ext);
 }
 
 static inline u32 thvm_book_term_arity(Term t) {

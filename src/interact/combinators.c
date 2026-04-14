@@ -203,14 +203,7 @@
                 u32 _ar = 0; \
                 switch ((_tg)) { \
                     case TAG_TOP: \
-                        if ((_ext) == UOP_KERNEL) _ar = 0; \
-                        else if ((_ext) == UOP_FUSE || (_ext) == UOP_SCHED) _ar = 1; \
-                        else if ((_ext) == UOP_FUSE2) _ar = 3; \
-                        else if ((_ext) == UOP_WHERE || (_ext) == UOP_IFZ) _ar = 3; \
-                        else if ((_ext) == UOP_GRAD) _ar = 2; \
-                        else if ((_ext) == UOP_LOG_PRINT || (_ext) == UOP_DETACH) _ar = 1; \
-                        else if (!is_binary((_ext)) && is_elementwise((_ext))) _ar = 1; \
-                        else _ar = 2; \
+                        _ar = thvm_uop_storage_arity((_ext)); \
                         break; \
                     case TAG_APP: \
                     case TAG_LAM: \
@@ -467,15 +460,6 @@ era_continue:
 	            // DUP ⊳ TOP: commute by duplicating the node and splitting children.
 	            if (term_tag(val) == TAG_TOP) {
 	                u32 uop = term_ext(val);
-	                if (uop == UOP_KERNEL) {
-	                    // Create independent dispatch instance: same kid, fresh heap slot.
-	                    // One copy consumed this iteration, the other survives for next.
-	                    u64 old_loc = term_val(val);
-	                    u64 new_loc = heap_alloc(ctx, 1);
-	                    heap_set(ctx, new_loc, heap_read(ctx, old_loc)); // copy kid
-	                    Term copy = term_new(TAG_TOP, UOP_KERNEL, new_loc);
-	                    DUP_STATE_RETURN(val, val, copy);
-	                }
                     if (uop == UOP_DETACH) {
                         Term forced = thvm_eval(ctx, val);
                         if (getenv("THVM_LOOP_DIAG")) {
@@ -495,8 +479,7 @@ era_continue:
                         }
                     }
 	                u64 val_loc = term_val(val);
-	                u32 arity = (uop == UOP_WHERE || uop == UOP_IFZ) ? 3 : 2;
-	                if (!is_binary(uop) && is_elementwise(uop)) arity = 1;
+	                u32 arity = thvm_uop_storage_arity(uop);
 
 	                u64 r0 = heap_alloc(ctx, arity);
 	                u64 r1 = heap_alloc(ctx, arity);
@@ -568,23 +551,6 @@ era_continue:
                 }
                 Term n0 = term_new(term_tag(val), term_ext(val), r0);
                 Term n1 = term_new(term_tag(val), term_ext(val), r1);
-                DUP_STATE_RETURN(val, n0, n1);
-            }
-
-            // DUP ⊳ FUSE2: 3-slot compound duplication
-            if (term_tag(val) == TAG_TOP && term_ext(val) == UOP_FUSE2) {
-                u64 val_loc = term_val(val);
-                u64 r0 = heap_alloc(ctx, 3);
-                u64 r1 = heap_alloc(ctx, 3);
-                for (u32 i = 0; i < 3; i++) {
-                    Term child = heap_read(ctx, val_loc + i);
-                    u64 cdup = heap_alloc(ctx, 1);
-                    heap_set(ctx, cdup, child);
-                    heap_set(ctx, r0 + i, term_new(TAG_DP0, dup_label, cdup));
-                    heap_set(ctx, r1 + i, term_new(TAG_DP1, dup_label, cdup));
-                }
-                Term n0 = term_new(TAG_TOP, UOP_FUSE2, r0);
-                Term n1 = term_new(TAG_TOP, UOP_FUSE2, r1);
                 DUP_STATE_RETURN(val, n0, n1);
             }
 

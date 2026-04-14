@@ -139,9 +139,9 @@ typedef u64 Term;
 #define UOP_SHRINK    21  // = slice
 #define UOP_PAD       22
 
-// Fusion: wraps any fused subgraph. Realized tensor carries the original subnet
-// heap root in src_ids, so GRAD can walk back through the unfused lazy graph.
-#define UOP_KERNEL    23  // fused kernel (SUM(MUL) etc); see docs/eval.md
+// Fusion: FUSE is the propagating marker, KERNEL is the structural fused IR.
+// Realized tensors keep the originating kernel location in `fusing_loc`.
+#define UOP_KERNEL    23  // structural fused kernel boundary; heap [left, right/meta, NUM(root_uop)]
 #define UOP_FUSING    UOP_KERNEL  // back-compat alias (deprecated)
 #define UOP_ASSIGN    24  // in-place weight update: blit src buf into dst buf
 #define UOP_WHERE     25  // elementwise select: WHERE(cond_ten, then_ten, else_ten)
@@ -154,9 +154,9 @@ typedef u64 Term;
 #define UOP_DETACH    30   // realize current value and return a provenance-free tensor leaf
 
 // Fusion signals (propagating IC agents):
-#define UOP_FUSE      31   // unary fusion: FUSE(payload) or FUSE(op, child)
+#define UOP_FUSE      31   // propagating fuse marker: FUSE(payload)
 #define UOP_SCHED     32   // (deprecated — pass-through)
-#define UOP_FUSE2     33   // binary fusion: FUSE2(op, left, right)
+#define UOP_FUSE2     33   // deprecated compatibility shim; runtime no longer produces it
 
 #define UOP_COUNT     34
 
@@ -636,8 +636,8 @@ typedef struct {
 #define MAX_BUF_EPOCHS 16384
 #define KERNEL_MAX_INPUTS 32
 
-// KernelEntry: scheduler's output — one fused kernel ready for dispatch.
-// Produced by fuse_build_kernel (pure walk), consumed by UOP_KERNEL handler.
+// KernelEntry: runtime-lowered kernel payload built from a structural UOP_KERNEL.
+// Produced lazily from the on-heap kernel DAG, then consumed by dispatch/cache.
 #define SCHED_MAX_KERNELS 512
 typedef enum {
     KERNEL_LEAF_NONE   = 0,
@@ -708,9 +708,9 @@ typedef struct {
     u32         assign_target; // ASSIGN elision: write fused output here instead of new buf
 
     // Fusion metadata (only when creator_op == UOP_KERNEL)
-    u64         fusing_loc; // heap loc of the original subnet root TAG_TOP
-    u32         fusing_uop; // UOP of the subnet root (e.g. UOP_SUM)
-    u32         planned_slot; // phase-2 planned storage slot (0 = none / not scheduled)
+    u64         fusing_loc; // heap loc of the structural UOP_KERNEL that produced this tensor
+    u32         fusing_uop; // root fused op carried by that kernel (e.g. UOP_SUM)
+    u32         planned_slot; // optional runtime storage slot (0 = none / not scheduled)
 
     // Conv backward metadata: enables specialized MPS matmul backward
     // instead of generic 8-dim unfuse+contiguify. Set by thvm_conv2d.

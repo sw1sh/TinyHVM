@@ -20,9 +20,9 @@ static void thvm_step_graph_set_before_top_add_zero(int had_add_zero);
 //   1. thvm_reduce(t)             — pure IC to WNF
 //   2. thvm_reduce(UOP_FUSE(t))   — local fusion + dispatch + ASSIGN
 //
-// UOP_FUSE distributes through SEQ/CTR/ASSIGN, fuses compute ops into
-// UOP_KERNEL. KERNEL fires immediately. ASSIGN fires when both args TAG_TEN.
-// SEQ handles dependency ordering. No separate scheduling phase needed.
+// UOP_FUSE distributes through SEQ/CTR/ASSIGN and rewrites fuseable structure
+// into explicit heap-visible UOP_KERNEL nodes. KERNEL remains lazy until a
+// consuming reduction path reaches it.
 
 int fuse_no_lazy_resolve = 0;
 int _assign_dispatch_enabled = 0;
@@ -188,15 +188,7 @@ static void thvm_graph_dump_path(char *buf, size_t nbuf, const char *name) {
 }
 
 static u32 phase1_top_arity(u32 ext) {
-    if (ext == UOP_KERNEL) return 0;
-    if (ext == UOP_FUSE || ext == UOP_SCHED) return 1;
-    if (ext == UOP_FUSE2) return 3;
-    if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
-    if (ext == UOP_GRAD) return 2;
-    if (ext == UOP_LOG_PRINT) return 1;
-    if (ext == UOP_DETACH) return 1;
-    if (!is_binary(ext) && is_elementwise(ext)) return 1;
-    return 2;
+    return thvm_uop_storage_arity(ext);
 }
 
 static u32 phase1_term_arity(Term t);
@@ -491,24 +483,28 @@ static int phase1_top_frame_arg0_ready(Term t, u32 uop) {
            (tag == TAG_VAR && uop == UOP_DETACH) ||
            ((uop == UOP_FUSE || uop == UOP_SCHED) &&
             phase1_fuse_payload_ready(t)) ||
-           (uop == UOP_FUSE2 && tag != TAG_DP0 && tag != TAG_DP1);
+           ((uop == UOP_FUSE2 || uop == UOP_KERNEL) &&
+            tag != TAG_DP0 && tag != TAG_DP1);
 }
 
 static int phase1_top_frame_arg1_ready(Term t, u32 uop) {
     u8 tag = term_tag(t);
     int ok = tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
              tag == TAG_LAM || tag == TAG_SUP;
-    if (uop == UOP_FUSE2) {
+    if (uop == UOP_FUSE2 || uop == UOP_KERNEL) {
         ok = ok || tag == TAG_SEQ || tag == TAG_CTR ||
-             (tag == TAG_TOP && term_ext(t) != UOP_FUSE && term_ext(t) != UOP_FUSE2);
+             (tag == TAG_TOP && term_ext(t) != UOP_FUSE &&
+              term_ext(t) != UOP_FUSE2 && term_ext(t) != UOP_SCHED);
     }
     return ok;
 }
 
 static int phase1_top_frame_arg2_ready(Term t, u32 uop) {
     u8 tag = term_tag(t);
-    int ok = tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
-             tag == TAG_CTR || tag == TAG_ANY || tag == TAG_LAM || tag == TAG_SUP;
+    int ok = (uop == UOP_KERNEL)
+           ? (tag == TAG_NUM)
+           : (tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
+              tag == TAG_CTR || tag == TAG_ANY || tag == TAG_LAM || tag == TAG_SUP);
     if (uop == UOP_FUSE2) {
         ok = ok || tag == TAG_SEQ ||
              (tag == TAG_TOP && term_ext(t) != UOP_FUSE && term_ext(t) != UOP_FUSE2);
@@ -679,11 +675,6 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
             }
             if (out_whnf) *out_whnf = t;
             return 0;
-        }
-
-        if (uop == UOP_KERNEL) {
-            if (out_before) *out_before = t;
-            return 1;
         }
 
         if (ctx->step_graph_local_fuse && (uop == UOP_FUSE || uop == UOP_SCHED)) {
@@ -1216,7 +1207,7 @@ static u32 sched_boundary_count = 0;
 static u64 sched_boundary_locs[SCHED_MAX_KERNELS];
 static u32 sched_boundary_output_tids[SCHED_MAX_KERNELS];
 static u32 sched_boundary_kids[SCHED_MAX_KERNELS];
-static u64 sched_kernel_locs[SCHED_MAX_KERNELS];
+u64 sched_kernel_locs[SCHED_MAX_KERNELS];
 
 static SchedBoundary *sched_boundary_find(Term compute_term, int create) {
     if (!sched_is_kernelizable_term(compute_term)) return NULL;
@@ -1568,13 +1559,37 @@ static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
     TensorMeta *md = &ctx->tensors[raw_tid];
 
     if (md->buf_id == 0) {
-        if (sched_slot_bind_output(ctx, ke->output_slot, raw_tid, ke->output_tid) == 0)
-            return term_era();
+        if (ke->output_slot) {
+            if (sched_slot_bind_output(ctx, ke->output_slot, raw_tid, ke->output_tid) == 0)
+                return term_era();
+        } else {
+            Backend *be = md->backend ? md->backend : ctx_default_backend(ctx);
+            if (!be) return term_era();
+            u64 bytes = (u64)md->view.numel * dtype_size(md->dtype);
+            md->backend = be;
+            md->buf_id = be->buf_alloc(bytes);
+            if (md->buf_id == 0) return term_era();
+            if (ke->output_tid && ke->output_tid != raw_tid) {
+                TensorMeta *out_m = &ctx->tensors[ke->output_tid];
+                out_m->backend = be;
+                out_m->buf_id = md->buf_id;
+                if (out_m->backend && out_m->backend->buf_incref)
+                    out_m->backend->buf_incref(out_m->buf_id);
+            }
+        }
     } else if (ke->output_tid && ke->output_tid != raw_tid &&
                ke->output_tid < ctx->tensor_count &&
                ctx->tensors[ke->output_tid].buf_id == 0) {
-        if (sched_slot_bind_output(ctx, ke->output_slot, raw_tid, ke->output_tid) == 0)
-            return term_era();
+        if (ke->output_slot) {
+            if (sched_slot_bind_output(ctx, ke->output_slot, raw_tid, ke->output_tid) == 0)
+                return term_era();
+        } else {
+            TensorMeta *out_m = &ctx->tensors[ke->output_tid];
+            out_m->backend = md->backend;
+            out_m->buf_id = md->buf_id;
+            if (out_m->backend && out_m->backend->buf_incref)
+                out_m->backend->buf_incref(out_m->buf_id);
+        }
     }
 
     u32 bufs[FUSE_MAX_LEAVES];

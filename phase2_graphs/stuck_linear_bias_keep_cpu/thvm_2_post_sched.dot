@@ -1,8 +1,0 @@
-digraph G {
-  rankdir=BT;
-  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
-  edge [fontsize=8, fontname="Helvetica"];
-
-  n483 [label="K1: ADD+CMP+MUL\n[2,3,4]\ncpu", shape=box, fillcolor="#ccffcc"];
-  n485 [label="K2: SUM+MUL\n[2,4]\ncpu", shape=box, fillcolor="#ccffcc"];
-}

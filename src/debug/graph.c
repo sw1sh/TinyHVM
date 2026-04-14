@@ -345,6 +345,64 @@ static void thvm_step_graph_prune_isolated_tensor_nodes(const char *path) {
     free(buf);
 }
 
+static void thvm_step_graph_keep_only_root_tensor_result(const char *path, u32 root_tid) {
+    if (!path || !path[0]) return;
+    FILE *in = fopen(path, "rb");
+    if (!in) return;
+    fseek(in, 0, SEEK_END);
+    long n = ftell(in);
+    if (n <= 0) { fclose(in); return; }
+    rewind(in);
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) { fclose(in); return; }
+    size_t nr = fread(buf, 1, (size_t)n, in);
+    fclose(in);
+    buf[nr] = '\0';
+
+    char tmp[320];
+    snprintf(tmp, sizeof(tmp), "%s.final.tmp", path);
+    FILE *out = fopen(tmp, "wb");
+    if (!out) { free(buf); return; }
+
+    char *cursor = buf;
+    while (*cursor) {
+        char *eol = strchr(cursor, '\n');
+        size_t len = eol ? (size_t)(eol - cursor) : strlen(cursor);
+        char line[2048];
+        size_t copy_len = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
+        memcpy(line, cursor, copy_len);
+        line[copy_len] = '\0';
+
+        int keep = 1;
+        u32 tid = 0, src_tid = 0, dst_tid = 0;
+        if (sscanf(line, "  t%u -> rootout_t%u ", &src_tid, &dst_tid) == 2) {
+            keep = (src_tid == root_tid && dst_tid == root_tid);
+        } else if (strncmp(line, "  node [", 8) == 0 ||
+                   strncmp(line, "  edge [", 8) == 0 ||
+                   strncmp(line, "  graph [", 9) == 0) {
+            keep = 1;
+        } else if (strstr(line, "->")) {
+            keep = 0;
+        } else if (sscanf(line, "  t%u [", &tid) == 1) {
+            keep = (tid == root_tid);
+        } else if (sscanf(line, "  rootout_t%u [", &tid) == 1) {
+            keep = (tid == root_tid);
+        } else if (strchr(line, '[') && strncmp(line, "digraph ", 8) != 0) {
+            keep = 0;
+        }
+
+        if (keep) {
+            fputs(line, out);
+            fputc('\n', out);
+        }
+        if (!eol) break;
+        cursor = eol + 1;
+    }
+    fclose(out);
+    rename(tmp, path);
+    free(buf);
+}
+
 static u32 thvm_step_top_arity(u32 ext) {
     return thvm_uop_visible_arity(ext);
 }
@@ -1120,6 +1178,36 @@ static int thvm_step_graph_find_next_interaction(TinyHVM *ctx, u64 *out_slot, Te
     return thvm_step_graph_highlight_from_current_before(ctx, graph_source_slot, before, out_slot, out_term);
 }
 
+static int thvm_step_graph_prefer_kernel_child_fuse(TinyHVM *ctx, u64 source_slot, Term before,
+                                                    u64 *out_hs, Term *out_ht,
+                                                    u64 *out_source_slot, Term *out_before) {
+    if (term_tag(before) != TAG_TOP) return 0;
+    u32 uop = term_ext(before);
+    if (uop != UOP_FUSE) return 0;
+    if (source_slot == 0 || source_slot >= ctx->heap_pos) return 0;
+    Term after = heap_read(ctx, source_slot);
+    if (term_tag(after) != TAG_TOP || term_ext(after) != UOP_KERNEL) return 0;
+    u64 kloc = term_val(after);
+    if (kloc == 0 || kloc + 1 >= ctx->heap_pos) return 0;
+    for (u32 ai = 0; ai < 2; ai++) {
+        u64 child_slot = kloc + ai;
+        Term child = heap_read(ctx, child_slot);
+        if (term_tag(child) != TAG_TOP) continue;
+        u32 cuop = term_ext(child);
+        if (cuop != UOP_FUSE) continue;
+        u64 hs = 0;
+        Term ht = 0;
+        if (!thvm_step_graph_highlight_from_before(ctx, child_slot, child, &hs, &ht))
+            continue;
+        if (out_hs) *out_hs = hs;
+        if (out_ht) *out_ht = ht;
+        if (out_source_slot) *out_source_slot = child_slot;
+        if (out_before) *out_before = child;
+        return 1;
+    }
+    return 0;
+}
+
 static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root) {
     if (!getenv("THVM_STEP_GRAPH") || step_graph_active) return;
     const char *step_graph_dir = thvm_step_graph_dir();
@@ -1309,6 +1397,12 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
     int have_prev_hl = thvm_step_graph_highlight_from_before(ctx, source_slot, before, &hs, &ht);
     int have_next = thvm_step_graph_find_next_interaction(ctx, &next_hs, &next_ht, &next_source_slot, &next_before);
     if (!have_prev_hl) {
+        if (thvm_step_graph_prefer_kernel_child_fuse(ctx, source_slot, before,
+                                                     &hs, &ht, &shown_source_slot, &shown_before)) {
+            have_prev_hl = 1;
+        }
+    }
+    if (!have_prev_hl) {
         if (have_next) {
             hs = next_hs;
             ht = next_ht;
@@ -1420,7 +1514,9 @@ static void thvm_step_graph_finalize(TinyHVM *ctx) {
         char p[384];
         snprintf(p, sizeof(p), "%s/step_%03u_state_final.dot", step_graph_dir, step_graph_n);
         rename(tmp, p);
-        if (term_tag(step_graph_root_term) != TAG_TEN)
+        if (term_tag(step_graph_root_term) == TAG_TEN)
+            thvm_step_graph_keep_only_root_tensor_result(p, (u32)term_val(step_graph_root_term));
+        else
             thvm_step_graph_prune_isolated_tensor_nodes(p);
         thvm_step_graph_rewrite_meta(step_graph_last_file, step_graph_last_prev_name, "");
         snprintf(step_graph_last_file, sizeof(step_graph_last_file), "%s", p);

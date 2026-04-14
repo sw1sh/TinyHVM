@@ -350,7 +350,7 @@ static const char *dot_fuse_payload_label_r(TinyHVM *ctx, Term payload, char *bu
             }
         }
         if (uop < UOP_COUNT &&
-            uop != UOP_FUSE && uop != UOP_SCHED &&
+            uop != UOP_FUSE &&
             uop != UOP_FUSE2) {
             snprintf(buf, nbuf, "%s", uop_names[uop]);
             return buf;
@@ -553,7 +553,7 @@ static int dot_meta_shape_from_tensor(TinyHVM *ctx, Term tmeta, Shape *out) {
 static int dot_infer_top_shape(TinyHVM *ctx, u32 uop, u64 loc, Shape *out) {
     Term a = term_era();
     Term b = term_era();
-    if (uop == UOP_FUSE || uop == UOP_SCHED) {
+    if (uop == UOP_FUSE) {
         a = heap_read(ctx, loc + 0);
     } else if (uop == UOP_KERNEL) {
         a = heap_read(ctx, loc + 0);
@@ -1492,24 +1492,33 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 char op_label[32] = "NULL";
                 if (kop < UOP_COUNT) snprintf(op_label, sizeof(op_label), "%s", uop_names[kop]);
                 else if (kop == UOP_COUNT) snprintf(op_label, sizeof(op_label), "SEQ");
-                u32 kid = 0;
-                if (thvm_kernel_lookup_kid(val, &kid)) {
-                    extern KernelEntry sched_kernels[];
-                    KernelEntry *ke = &sched_kernels[kid];
+                if (kop == UOP_COUNT) {
                     if (has_shape)
-                        snprintf(label,sizeof(label),"KERNEL\\n%s\\n#%u %s\\n[%s]\\n@%llu",
-                                 op_label, kid, dot_kernel_backend(ctx, ke), sh, (unsigned long long)val);
+                        snprintf(label,sizeof(label),"SEQ\\n[%s]\\n@%llu",
+                                 sh, (unsigned long long)val);
                     else
-                        snprintf(label,sizeof(label),"KERNEL\\n%s\\n#%u %s\\n@%llu",
-                                 op_label, kid, dot_kernel_backend(ctx, ke), (unsigned long long)val);
-                } else if (has_shape) {
-                    snprintf(label,sizeof(label),"KERNEL\\n%s\\n[%s]\\n@%llu",
-                             op_label, sh, (unsigned long long)val);
+                        snprintf(label,sizeof(label),"SEQ\\n@%llu",
+                                 (unsigned long long)val);
                 } else {
-                    snprintf(label,sizeof(label),"KERNEL\\n%s\\n@%llu",
-                             op_label, (unsigned long long)val);
+                    u32 kid = 0;
+                    if (thvm_kernel_lookup_kid(val, &kid)) {
+                        extern KernelEntry sched_kernels[];
+                        KernelEntry *ke = &sched_kernels[kid];
+                        if (has_shape)
+                            snprintf(label,sizeof(label),"KERNEL\\n%s\\n#%u %s\\n[%s]\\n@%llu",
+                                     op_label, kid, dot_kernel_backend(ctx, ke), sh, (unsigned long long)val);
+                        else
+                            snprintf(label,sizeof(label),"KERNEL\\n%s\\n#%u %s\\n@%llu",
+                                     op_label, kid, dot_kernel_backend(ctx, ke), (unsigned long long)val);
+                    } else if (has_shape) {
+                        snprintf(label,sizeof(label),"KERNEL\\n%s\\n[%s]\\n@%llu",
+                                 op_label, sh, (unsigned long long)val);
+                    } else {
+                        snprintf(label,sizeof(label),"KERNEL\\n%s\\n@%llu",
+                                 op_label, (unsigned long long)val);
+                    }
+                    color = "#ccffcc";
                 }
-                color = "#ccffcc";
             } else if (ext == UOP_GRAD) {
                 // GRAD bead: y (input below), gy (output above).
                 Term gx = thvm_grad_target_get(ctx, val);
@@ -1532,12 +1541,9 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 snprintf(label, sizeof(label), "GRAD\\nd/d(%s)\\n@%llu", tgt, (unsigned long long)val);
                 color = "#e8d0ff"; nshape = "box";
             } else {
-                if (ext == UOP_FUSE || ext == UOP_SCHED) {
-                    char payload_name[32];
-                    Term payload = heap_read(ctx, val + 0);
-                    dot_fuse_payload_label(ctx, payload, payload_name, sizeof(payload_name));
-                    snprintf(label, sizeof(label), "%s\\n%s\\n@%llu",
-                             opn, payload_name, (unsigned long long)val);
+                if (ext == UOP_FUSE) {
+                    snprintf(label, sizeof(label), "%s\\n@%llu",
+                             opn, (unsigned long long)val);
                 } else if (ext == UOP_FUSE2) {
                     char op_label[32] = "?";
                     Term op_term = heap_read(ctx, val + 0);
@@ -1553,7 +1559,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 // Pure combinators (IFZ, DETACH, etc.) don't carry tensor shapes
                     int is_combinator = (ext == UOP_IFZ || ext == UOP_DETACH ||
                                          ext == UOP_LOG_PRINT || ext == UOP_FUSE ||
-                                         ext == UOP_SCHED || ext == UOP_FUSE2);
+                                         ext == UOP_FUSE2);
                     if (is_combinator || !has_shape)
                         snprintf(label, sizeof(label), "%s\\n@%llu", opn, (unsigned long long)val);
                     else
@@ -1572,7 +1578,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (ext == UOP_GRAD) arity = 2;
             else if (ext == UOP_WHERE || ext == UOP_IFZ) arity = 3;
             else if (ext == UOP_KERNEL) arity = 2;
-            else if (ext == UOP_FUSE || ext == UOP_SCHED) arity = 1;
+            else if (ext == UOP_FUSE) arity = 1;
             else if (ext == UOP_FUSE2) arity = 3;
             else if (ext == UOP_LOG_PRINT) arity = 1;
             else if (ext == UOP_DETACH) arity = 1;
@@ -1599,6 +1605,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     else elbl = ai==0 ? "in" : "";
                 }
                 else if (ext == UOP_FUSE2) elbl = ai==1 ? "a" : "b";
+                else if (ext == UOP_FUSE) elbl = "in";
                 else if (ext >= UOP_RESHAPE && ext <= UOP_PAD) elbl = ai==0 ? "in" : "shape";
                 else if (ext == UOP_SUM || ext == UOP_RMAX) elbl = ai==0 ? "in" : "axes";
                 else if (ext == UOP_GRAD) elbl = ai==0 ? "y" : "gy";
@@ -2291,15 +2298,19 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 char op_label2[32] = "NULL"; \
                 if (kop2 < UOP_COUNT) snprintf(op_label2, sizeof(op_label2), "%s", uop_names[kop2]); \
                 else if (kop2 == UOP_COUNT) snprintf(op_label2, sizeof(op_label2), "SEQ"); \
-                u32 kid2 = 0; \
-                if (thvm_kernel_lookup_kid((_loc), &kid2)) { \
-                    KernelEntry *ke2 = &sched_kernels[kid2]; \
-                    snprintf(label, sizeof(label), "KERNEL\\n%s\\n#%u %s\\n[%s]", \
-                             op_label2, kid2, dot_kernel_backend(ctx, ke2), sh); \
+                if (kop2 == UOP_COUNT) { \
+                    snprintf(label, sizeof(label), "SEQ\\n[%s]", sh); \
                 } else { \
-                    snprintf(label, sizeof(label), "KERNEL\\n%s\\n[%s]", op_label2, sh); \
+                    u32 kid2 = 0; \
+                    if (thvm_kernel_lookup_kid((_loc), &kid2)) { \
+                        KernelEntry *ke2 = &sched_kernels[kid2]; \
+                        snprintf(label, sizeof(label), "KERNEL\\n%s\\n#%u %s\\n[%s]", \
+                                 op_label2, kid2, dot_kernel_backend(ctx, ke2), sh); \
+                    } else { \
+                        snprintf(label, sizeof(label), "KERNEL\\n%s\\n[%s]", op_label2, sh); \
+                    } \
+                    color = "#ccffcc"; \
                 } \
-                color = "#ccffcc"; \
             } else if ((_ext) == UOP_GRAD) { \
                 Term gx = thvm_grad_target_get(ctx, (_loc)); \
                 char tgt[32] = "?"; \
@@ -2441,7 +2452,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
 
     // Show producer kernels for visible tensors even after the kernel term has
     // already dispatched and vanished from the reachable heap.
-    if (!heap_dot_include_sched_kernels) {
+    if (!heap_dot_include_sched_kernels && !heap_dot_root_only) {
         extern KernelEntry sched_kernels[];
         extern u32 sched_kernel_count;
         u8 kernel_leaf_drawn[SCHED_MAX_KERNELS];

@@ -155,10 +155,9 @@ typedef u64 Term;
 
 // Fusion signals (propagating IC agents):
 #define UOP_FUSE      31   // propagating fuse marker: FUSE(payload)
-#define UOP_SCHED     32   // (deprecated — pass-through)
-#define UOP_FUSE2     33   // deprecated compatibility shim; runtime no longer produces it
+#define UOP_FUSE2     32   // deprecated compatibility shim; runtime no longer produces it
 
-#define UOP_COUNT     34
+#define UOP_COUNT     33
 
 // (LAYER_OP_POOL_GATHER and LAYER_OP_BATCHNORM removed — both are now
 // composed from standard UOps with standard backward rules.)
@@ -168,7 +167,7 @@ static const char *uop_names[] = {
     "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
     "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","KERNEL","ASSIGN","WHERE",
-    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","SCHED","FUSE2"
+    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","FUSE2"
 };
 
 // ============================================================
@@ -632,6 +631,51 @@ typedef struct {
     u8 is_reduce2[MAX_DIM]; // reduce axes for phase 2 (may differ from phase 1)
 } ReduceSpec;
 
+#define KOP_MAX 512
+typedef enum {
+    KOP_NOOP = 0,
+    KOP_GID,      // grid position: imm.u = axis (0=x, 1=y, 2=z)
+    KOP_CONST_F,  // float constant: imm.f = value
+    KOP_CONST_U,  // uint constant: imm.u = value
+    KOP_RANGE,    // reduce loop: imm.u = trip count
+    KOP_ENDRANGE, // close reduce loop: arg[0] = range op id
+    KOP_LOAD,     // load: imm.u = buf_idx, arg[0] = index
+    KOP_STORE,    // store: imm.u = buf_idx, arg[0] = index, arg[1] = value
+    KOP_ALU,      // arithmetic: imm.u = UOP_*, arg[0..1] = inputs, arg[2] = aux
+    KOP_ACC_INIT, // accumulator init: imm.f = initial value
+    KOP_ACC,      // accumulate: imm.u = reduce type, arg[0] = acc, arg[1] = value
+    KOP_IDX,      // index arithmetic: result = arg[0]*imm.u + arg[1]
+    KOP_MOD,      // integer mod: result = arg[0] % imm.u
+    KOP_DIV,      // integer div: result = arg[0] / imm.u
+    KOP_MASK,     // conditional: result = arg[0] ? arg[1] : 0.0f
+} KOpType;
+
+typedef struct {
+    KOpType type;
+    u32     arg[3];
+    union {
+        f32 f;
+        u32 u;
+    } imm;
+} KOp;
+
+typedef struct {
+    KOp   ops[KOP_MAX];
+    u32   n_ops;
+    u32   n_bufs;
+    u32   n_leaves;
+    View  leaf_views[FUSE_MAX_LEAVES];
+    u32   leaf_dtypes[FUSE_MAX_LEAVES];
+    u32   coord_uop[MAX_DIM];
+    u32   rank;
+    Shape full_shape;
+    u32   grid[3];
+    u32   tg[3];
+    u32   local_size;
+    u32   reduce_numel;
+    u32   out_dtype;
+} UOpKernel;
+
 // Buffer epoch tracking for ASSIGN invalidation of kernel result cache.
 #define MAX_BUF_EPOCHS 16384
 #define KERNEL_MAX_INPUTS 32
@@ -674,8 +718,151 @@ typedef struct {
     u32        output_slot;
     u32        raw_output_tid;
     u32        output_tid;
+    u64        normalized_sig;   // compile/tune cache identity from lowered ops+views
     int        fail_code;        // diagnostic: last failure reason from fuse_build_kernel
 } KernelEntry;
+
+static inline u64 thvm_kernel_sig_mix(u64 h, u64 v) {
+    return (h ^ v) * 0x100000001b3ULL;
+}
+
+static inline u64 thvm_kernel_sig_hash_shape(u64 h, const Shape *shape) {
+    if (!shape) return thvm_kernel_sig_mix(h, 0);
+    h = thvm_kernel_sig_mix(h, shape->rank);
+    for (u32 d = 0; d < shape->rank && d < MAX_DIM; d++)
+        h = thvm_kernel_sig_mix(h, shape->dims[d]);
+    return h;
+}
+
+static inline u64 thvm_kernel_sig_hash_view(u64 h, const View *view) {
+    if (!view) return thvm_kernel_sig_mix(h, 0);
+    h = thvm_kernel_sig_mix(h, view->shape.rank);
+    h = thvm_kernel_sig_mix(h, view->numel);
+    h = thvm_kernel_sig_mix(h, (u64)(u32)view->offset);
+    h = thvm_kernel_sig_mix(h, view->has_mask);
+    for (u32 d = 0; d < view->shape.rank && d < MAX_DIM; d++) {
+        h = thvm_kernel_sig_mix(h, view->shape.dims[d]);
+        h = thvm_kernel_sig_mix(h, (u64)(u32)view->strides[d]);
+        if (view->has_mask) {
+            h = thvm_kernel_sig_mix(h, view->mask_begin[d]);
+            h = thvm_kernel_sig_mix(h, view->mask_end[d]);
+        }
+        h = thvm_kernel_sig_mix(h, view->mod_size[d]);
+    }
+    h = thvm_kernel_sig_mix(h, view->n_compound_masks);
+    for (u32 i = 0; i < view->n_compound_masks && i < 2; i++) {
+        h = thvm_kernel_sig_mix(h, view->compound_masks[i].dim_a);
+        h = thvm_kernel_sig_mix(h, view->compound_masks[i].dim_b);
+        h = thvm_kernel_sig_mix(h, (u64)(u32)view->compound_masks[i].stride_a);
+        h = thvm_kernel_sig_mix(h, view->compound_masks[i].begin);
+        h = thvm_kernel_sig_mix(h, view->compound_masks[i].end);
+    }
+    return h;
+}
+
+static inline u64 thvm_kernel_sig_hash_tracker(u64 h, const ShapeTracker *st,
+                                               const View *fallback_view) {
+    if (!st || st->n_views == 0)
+        return thvm_kernel_sig_hash_view(h, fallback_view);
+    h = thvm_kernel_sig_mix(h, st->n_views);
+    for (u32 i = 0; i < st->n_views && i < ST_MAX_VIEWS; i++)
+        h = thvm_kernel_sig_hash_view(h, &st->views[i]);
+    return h;
+}
+
+static inline u64 thvm_kernel_sig_hash_reduce(u64 h, const ReduceSpec *reduce) {
+    if (!reduce) return thvm_kernel_sig_mix(h, 0);
+    h = thvm_kernel_sig_mix(h, reduce->reduce_type);
+    h = thvm_kernel_sig_mix(h, reduce->post_reduce_start);
+    h = thvm_kernel_sig_mix(h, reduce->n_post_leaves);
+    h = thvm_kernel_sig_mix(h, reduce->reduce2_type);
+    h = thvm_kernel_sig_mix(h, reduce->reduce2_start);
+    for (u32 d = 0; d < MAX_DIM; d++) {
+        h = thvm_kernel_sig_mix(h, reduce->is_reduce[d]);
+        h = thvm_kernel_sig_mix(h, reduce->is_reduce2[d]);
+    }
+    return h;
+}
+
+static inline u64 thvm_kernel_signature_from_ptrs(const FusedOp *ops, u32 n_ops,
+                                                  const View *const *leaf_views,
+                                                  const ShapeTracker *const *leaf_sts,
+                                                  u32 n_leaves,
+                                                  const Shape *full_shape,
+                                                  const ReduceSpec *reduce,
+                                                  const u32 *side_op_indices,
+                                                  u32 n_side_outputs) {
+    u64 h = 0x5448564d4b45524eULL; // "THVMKERN"
+    h = thvm_kernel_sig_mix(h, n_ops);
+    h = thvm_kernel_sig_mix(h, n_leaves);
+    for (u32 i = 0; i < n_ops; i++) {
+        h = thvm_kernel_sig_mix(h, ops[i].uop);
+        h = thvm_kernel_sig_mix(h, ops[i].arg_a);
+        h = thvm_kernel_sig_mix(h, ops[i].arg_b);
+        h = thvm_kernel_sig_mix(h, ops[i].aux);
+    }
+    h = thvm_kernel_sig_hash_shape(h, full_shape);
+    h = thvm_kernel_sig_hash_reduce(h, reduce);
+    for (u32 i = 0; i < n_leaves; i++) {
+        const View *view = leaf_views ? leaf_views[i] : NULL;
+        const ShapeTracker *st = leaf_sts ? leaf_sts[i] : NULL;
+        h = thvm_kernel_sig_hash_tracker(h, st, view);
+    }
+    h = thvm_kernel_sig_mix(h, n_side_outputs);
+    for (u32 i = 0; i < n_side_outputs; i++)
+        h = thvm_kernel_sig_mix(h, side_op_indices ? side_op_indices[i] : 0);
+    return h;
+}
+
+static inline u64 thvm_kernel_entry_signature(const KernelEntry *ke) {
+    const View *leaf_views[FUSE_MAX_LEAVES] = {0};
+    const ShapeTracker *leaf_sts[FUSE_MAX_LEAVES] = {0};
+    if (!ke) return 0;
+    for (u32 i = 0; i < ke->n_leaves && i < FUSE_MAX_LEAVES; i++) {
+        leaf_views[i] = &ke->leaf_views[i];
+        leaf_sts[i] = &ke->leaf_sts[i];
+    }
+    return thvm_kernel_signature_from_ptrs(
+        ke->ops, ke->n_ops,
+        leaf_views, leaf_sts, ke->n_leaves,
+        &ke->full_shape,
+        ke->has_reduce ? &ke->reduce : NULL,
+        NULL, 0);
+}
+
+static inline u64 thvm_uop_kernel_signature(const UOpKernel *uk) {
+    if (!uk) return 0;
+    u64 h = 0x554f504b45524e4cULL; // "UOPKERNL"
+    h = thvm_kernel_sig_mix(h, uk->n_ops);
+    h = thvm_kernel_sig_mix(h, uk->n_leaves);
+    h = thvm_kernel_sig_mix(h, uk->rank);
+    h = thvm_kernel_sig_hash_shape(h, &uk->full_shape);
+    h = thvm_kernel_sig_mix(h, uk->grid[0]);
+    h = thvm_kernel_sig_mix(h, uk->grid[1]);
+    h = thvm_kernel_sig_mix(h, uk->grid[2]);
+    h = thvm_kernel_sig_mix(h, uk->local_size);
+    h = thvm_kernel_sig_mix(h, uk->reduce_numel);
+    h = thvm_kernel_sig_mix(h, uk->out_dtype);
+    for (u32 i = 0; i < uk->n_leaves && i < FUSE_MAX_LEAVES; i++) {
+        h = thvm_kernel_sig_mix(h, uk->leaf_dtypes[i]);
+        h = thvm_kernel_sig_hash_view(h, &uk->leaf_views[i]);
+    }
+    for (u32 i = 0; i < uk->n_ops && i < KOP_MAX; i++) {
+        const KOp *op = &uk->ops[i];
+        h = thvm_kernel_sig_mix(h, op->type);
+        h = thvm_kernel_sig_mix(h, op->arg[0]);
+        h = thvm_kernel_sig_mix(h, op->arg[1]);
+        h = thvm_kernel_sig_mix(h, op->arg[2]);
+        if (op->type == KOP_CONST_F || op->type == KOP_ACC_INIT) {
+            u32 bits = 0;
+            memcpy(&bits, &op->imm.f, sizeof(bits));
+            h = thvm_kernel_sig_mix(h, bits);
+        } else {
+            h = thvm_kernel_sig_mix(h, op->imm.u);
+        }
+    }
+    return h;
+}
 
 typedef struct Backend Backend;
 
@@ -795,6 +982,9 @@ struct Backend {
                                 const Shape *full_shape, const ReduceSpec *reduce,
                                 u32 *side_bufs, const u32 *side_op_indices, u32 n_side_outputs,
                                 const u32 *leaf_dtypes, u32 out_dtype);
+    void  (*dispatch_uop_kernel)(u32 out_buf,
+                                 const u32 *leaf_bufs, u32 n_leaves,
+                                 const UOpKernel *kernel, u64 cache_key);
     void  (*contiguify)(u32 dst_buf, u32 numel, u32 src_buf, const View *src_view);
     void  (*buf_copy)(u32 dst_buf, u32 src_buf, u64 nbytes);
     void  (*buf_read_nosync)(u32 id, void *out, u64 bytes);
@@ -862,11 +1052,21 @@ typedef struct {
 } StepGraphAloSubst;
 
 typedef struct {
+    Term *heap;
+    u64   heap_pos;
+    u64   heap_cap;
+    Term  root;
+    u32   rewrite_count;
+    u64   normalized_sig;
+} LowerCtx;
+
+typedef struct {
     Term       *heap;
     u64         heap_pos;
     Term       *book_heap;
     u64         book_heap_pos;
     u64         book_heap_cap;
+    LowerCtx    lower_ctx;
     TensorMeta *tensors;
     u32         tensor_count;
 

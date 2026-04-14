@@ -94,6 +94,9 @@ static int  tensor_materialize_reduce(TinyHVM *ctx, u32 input_tid, u32 out_buf, 
 static int  materialize_walk(TinyHVM *ctx, u32 tid,
                               FusedOp *ops, u32 *n_ops, u32 *op_tids,
                               u32 *leaf_ids, const View **leaf_views, u32 *n_leaves);
+static int  thvm_lower_kernel_uop(TinyHVM *ctx, const KernelEntry *ke,
+                                  UOpKernel *out, u64 *out_lower_sig);
+static void thvm_lower_dump_uop_kernel(const UOpKernel *uk);
 Term thvm_op2(TinyHVM *ctx, u32 opr, Term x, Term y);
 Term thvm_op_raw(TinyHVM *ctx, u32 uop, Term a, Term b);
 Term thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b);
@@ -155,6 +158,9 @@ static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel)
 // ── fuse/ — elementwise fusion (fuse_walk_inner, fuse_or_reduce) ─────────────
 #include "fuse/_.c"
 #include "fuse/materialize.c"
+
+// ── lower/ — private lowering IC arena for backend UOp kernels ───────────────
+#include "lower/_.c"
 
 // ── grad/ — thvm_grad, thvm_grad_multi (pure IC term constructors) ────────────
 #include "grad/_.c"

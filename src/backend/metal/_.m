@@ -41,6 +41,7 @@ Backend metal_backend = {
     .op_mm     = metal_op_mm,
     .op_reduce = metal_op_reduce,
     .dispatch_kernel_rs = metal_dispatch_kernel_rs,
+    .dispatch_uop_kernel = metal_dispatch_uop_kernel,
     .contiguify         = metal_contiguify,
     .mem_checkpoint     = metal_mem_checkpoint,
     .buf_mark_use       = metal_buf_mark_use,

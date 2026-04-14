@@ -5,62 +5,19 @@ static int _last_local_size = 0; // GROUP_REDUCE threadgroup size (0 = no group 
 // Replaces FusedOp[] + ReduceSpec with a single linear SSA IR
 // that naturally supports multi-reduce, multi-output, and complex indexing.
 
-#define KOP_MAX 512
-
-typedef enum {
-    KOP_NOOP = 0,
-    KOP_GID,     // grid position: imm.u = axis (0=x, 1=y, 2=z)
-    KOP_CONST_F, // float constant: imm.f = value
-    KOP_CONST_U, // uint constant: imm.u = value
-    KOP_RANGE,   // reduce loop: imm.u = trip count. arg[0] = body end marker
-    KOP_ENDRANGE,// close reduce loop
-    KOP_LOAD,    // load: imm.u = buf_idx, arg[0] = index
-    KOP_STORE,   // store: imm.u = buf_idx, arg[0] = index, arg[1] = value
-    KOP_ALU,     // arithmetic: imm.u = UOP_ADD etc, arg[0..1] = inputs
-    KOP_ACC_INIT,// accumulator init: imm.f = initial value (0 for sum, -inf for max)
-    KOP_ACC,     // accumulate: imm.u = reduce type (UOP_SUM/UOP_RMAX), arg[0] = acc, arg[1] = value
-    KOP_IDX,     // index arithmetic: result = arg[0]*imm.u + arg[1]  (multiply-add)
-    KOP_MOD,     // modulo: result = arg[0] % imm.u
-    KOP_DIV,     // integer div: result = arg[0] / imm.u
-    KOP_MASK,    // conditional: result = arg[0] ? arg[1] : 0.0f  (mask for PAD views)
-} KOpType;
-
-typedef struct {
-    KOpType type;
-    u32     arg[3];  // references to other UOps (SSA)
-    union {
-        f32 f;
-        u32 u;
-    } imm;
-} UOp;
-
-typedef struct {
-    UOp ops[KOP_MAX];
-    u32 n_ops;
-    u32 n_bufs;
-    u32 n_leaves;
-    const View *leaf_views[32];
-    u32 coord_uop[MAX_DIM]; // UOp id for coordinate of each dim (for mask rendering)
-    u32 rank;
-    u32 grid[3];
-    u32 tg[3];
-    u32 local_size;      // threads per threadgroup for GROUP_REDUCE (0 = no group reduce)
-    u32 reduce_numel;    // total reduce elements (for stride loop)
-} UOpKernel;
-
 // ── Build UOp kernel from FusedOp[] + ReduceSpec (compatibility layer) ──
 
 static u32 uop_emit(UOpKernel *k, KOpType type, u32 a0, u32 a1, u32 a2, u32 imm_u) {
     assert(k->n_ops < KOP_MAX);
     u32 id = k->n_ops++;
-    k->ops[id] = (UOp){ .type = type, .arg = {a0, a1, a2}, .imm.u = imm_u };
+    k->ops[id] = (KOp){ .type = type, .arg = {a0, a1, a2}, .imm.u = imm_u };
     return id;
 }
 
 static u32 uop_emit_f(UOpKernel *k, KOpType type, u32 a0, u32 a1, u32 a2, f32 imm_f) {
     assert(k->n_ops < KOP_MAX);
     u32 id = k->n_ops++;
-    k->ops[id] = (UOp){ .type = type, .arg = {a0, a1, a2} };
+    k->ops[id] = (KOp){ .type = type, .arg = {a0, a1, a2} };
     k->ops[id].imm.f = imm_f;
     return id;
 }
@@ -202,7 +159,7 @@ static int uop_from_fused(UOpKernel *k, const FusedOp *ops, u32 n_ops,
     k->tg[2] = 1;
     k->n_bufs = 1 + n_leaves;
     k->n_leaves = n_leaves;
-    for (u32 i = 0; i < n_leaves && i < 32; i++) k->leaf_views[i] = leaf_views[i];
+    for (u32 i = 0; i < n_leaves && i < FUSE_MAX_LEAVES; i++) k->leaf_views[i] = *leaf_views[i];
 
     // GID for output position
     u32 gid = uop_emit(k, KOP_GID, 0, 0, 0, 0);
@@ -377,7 +334,7 @@ static NSString *uop_render_msl(const UOpKernel *k) {
     int depth = 1;
 
     for (u32 i = 0; i < k->n_ops; i++) {
-        const UOp *op = &k->ops[i];
+        const KOp *op = &k->ops[i];
         NSString *indent = (depth <= 1) ? @"  " : (depth == 2) ? @"    " : @"      ";
         switch (op->type) {
             case KOP_GID:
@@ -402,8 +359,8 @@ static NSString *uop_render_msl(const UOpKernel *k) {
                         op->arg[0], op->imm.u, op->arg[1]]; break;
             case KOP_LOAD: {
                 u32 leaf_idx = op->imm.u - 1; // buf 0=out, 1+=leaves
-                if (leaf_idx < k->n_leaves && k->leaf_views[leaf_idx]->has_mask) {
-                    const View *lv = k->leaf_views[leaf_idx];
+                if (leaf_idx < k->n_leaves && k->leaf_views[leaf_idx].has_mask) {
+                    const View *lv = &k->leaf_views[leaf_idx];
                     [s appendFormat:@"%@float v%u=(", indent, i];
                     int first = 1;
                     for (u32 d = 0; d < lv->shape.rank && d < k->rank; d++) {
@@ -467,9 +424,20 @@ static NSString *uop_render_msl(const UOpKernel *k) {
                     case UOP_SQRT: [s appendFormat:@"%@float v%u=sqrt(v%u);\n", indent, i, a]; break;
                     case UOP_MAX:  [s appendFormat:@"%@float v%u=max(v%u,v%u);\n", indent, i, a, b]; break;
                     case UOP_CMP:  [s appendFormat:@"%@float v%u=v%u>v%u?1.f:0.f;\n", indent, i, a, b]; break;
+                    case UOP_CAST:
+                        switch (op->arg[2]) {
+                            case DTYPE_F16: [s appendFormat:@"%@float v%u=float(half(v%u));\n", indent, i, a]; break;
+                            case DTYPE_I32: [s appendFormat:@"%@float v%u=float(int(v%u));\n", indent, i, a]; break;
+                            case DTYPE_U32: [s appendFormat:@"%@float v%u=float(uint(v%u));\n", indent, i, a]; break;
+                            default:        [s appendFormat:@"%@float v%u=v%u;\n", indent, i, a]; break;
+                        }
+                        break;
                     default:       [s appendFormat:@"%@float v%u=v%u;\n", indent, i, a]; break;
                 }
             } break;
+            case KOP_MASK:
+                [s appendFormat:@"%@float v%u=(v%u!=0)?v%u:0.f;\n", indent, i, op->arg[0], op->arg[1]];
+                break;
             case KOP_ACC_INIT:
                 [s appendFormat:@"%@float v%u=%.1ff;\n", indent, i, op->imm.f]; break;
             case KOP_RANGE:

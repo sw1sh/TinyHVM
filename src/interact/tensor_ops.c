@@ -85,14 +85,13 @@
                 extern u32 kid_input_bufs[][KERNEL_MAX_INPUTS];
                 extern u32 kid_input_epochs[][KERNEL_MAX_INPUTS];
                 extern u32 kid_n_inputs[];
+                extern KernelEntry sched_kernels[];
                 Term left = heap_read(ctx, loc + 0);
                 Term right = heap_read(ctx, loc + 1);
                 u32 kernel_uop = thvm_kernel_root_uop(ctx, t);
                 if (kernel_uop == UOP_COUNT) {
-                    if ((term_tag(left) == TAG_TOP &&
-                         (term_ext(left) == UOP_FUSE || term_ext(left) == UOP_SCHED)) ||
-                        (term_tag(right) == TAG_TOP &&
-                         (term_ext(right) == UOP_FUSE || term_ext(right) == UOP_SCHED)))
+                    if ((term_tag(left) == TAG_TOP && term_ext(left) == UOP_FUSE) ||
+                        (term_tag(right) == TAG_TOP && term_ext(right) == UOP_FUSE))
                         return t;
                     RETURN_REDUCED(thvm_seq(ctx, left, right));
                 }
@@ -103,9 +102,11 @@
                         RETURN_REDUCED(compute);
                     return t;
                 }
+                u64 sig = (kid < sched_kernel_count) ? sched_kernels[kid].normalized_sig : 0;
                 if (getenv("THVM_SCHED_DIAG"))
-                    fprintf(stderr, "KERNEL kid=%u cached=%d n_inputs=%u epoch_check=",
-                            kid, term_tag(kid_results[kid]) != TAG_ERA, kid_n_inputs[kid]);
+                    fprintf(stderr, "KERNEL kid=%u sig=0x%016llx cached=%d n_inputs=%u epoch_check=",
+                            kid, (unsigned long long)sig,
+                            term_tag(kid_results[kid]) != TAG_ERA, kid_n_inputs[kid]);
                 if (getenv("THVM_SCHED_DIAG") && term_tag(kid_results[kid]) != TAG_ERA) {
                     for (u32 _di = 0; _di < kid_n_inputs[kid]; _di++)
                         fprintf(stderr, "b%u:%u/%u ", kid_input_bufs[kid][_di],
@@ -123,19 +124,29 @@
                             break;
                         }
                     }
-                    if (cache_valid)
+                    if (cache_valid) {
+                        if (getenv("THVM_SCHED_DIAG"))
+                            fprintf(stderr, "KERNEL_CACHE_HIT kid=%u sig=0x%016llx\n",
+                                    kid, (unsigned long long)sig);
                         RETURN_REDUCED(kid_results[kid]);
+                    }
                     // Stale — invalidate and re-dispatch
+                    if (getenv("THVM_SCHED_DIAG"))
+                        fprintf(stderr, "KERNEL_CACHE_STALE kid=%u sig=0x%016llx\n",
+                                kid, (unsigned long long)sig);
                     kid_results[kid] = term_era();
                 }
                 {
                     Term result = thvm_sched_dispatch_kernel(ctx, kid);
                     if (result == t || (term_tag(result) == TAG_ERA && term_val(result) == 0))
                         return t;
+                    if (getenv("THVM_SCHED_DIAG"))
+                        fprintf(stderr, "KERNEL_DISPATCH kid=%u sig=0x%016llx result_tag=%u result_val=%llu\n",
+                                kid, (unsigned long long)sig,
+                                (u32)term_tag(result), (unsigned long long)term_val(result));
                     if (kid < sched_kernel_count) {
                         kid_results[kid] = result;
                         // Record input buffer epochs for future cache checks
-                        extern KernelEntry sched_kernels[];
                         KernelEntry *ke = &sched_kernels[kid];
                         u32 ni = 0;
                         for (u32 i = 0; i < ke->n_leaves && ni < KERNEL_MAX_INPUTS; i++) {
@@ -187,8 +198,7 @@
                     u32 puop = term_ext(payload);
 
                     // Already fused/meta — pass through
-                    if (puop == UOP_KERNEL || puop == UOP_FUSE ||
-                        puop == UOP_SCHED || puop == UOP_FUSE2)
+                    if (puop == UOP_KERNEL || puop == UOP_FUSE || puop == UOP_FUSE2)
                         RETURN_REDUCED(payload);
 
                     // ASSIGN: wrap src in FUSE, return ASSIGN.
@@ -204,16 +214,16 @@
                         RETURN_REDUCED(payload);
                     }
 
-                    // Binary compute: absorb → KERNEL(FUSE(a), FUSE(b), op)
+                    // Binary compute: keep one structural root kernel boundary.
+                    // Child compute subtrees stay raw and are flattened by
+                    // thvm_kernel_to_compute()/fuse_build_kernel at dispatch time.
                     if (is_binary(puop)) {
                         u64 ploc = term_val(payload);
                         Term a = heap_read(ctx, ploc);
                         Term b = heap_read(ctx, ploc + 1);
-                        u64 fa = heap_alloc(ctx, 1); heap_set(ctx, fa, a);
-                        u64 fb = heap_alloc(ctx, 1); heap_set(ctx, fb, b);
                         u64 kloc = heap_alloc(ctx, 3);
-                        heap_set(ctx, kloc + 0, term_new(TAG_TOP, UOP_FUSE, fa));
-                        heap_set(ctx, kloc + 1, term_new(TAG_TOP, UOP_FUSE, fb));
+                        heap_set(ctx, kloc + 0, a);
+                        heap_set(ctx, kloc + 1, b);
                         heap_set(ctx, kloc + 2, term_num_u32(puop));
                         { Term _r = term_new(TAG_TOP, UOP_KERNEL, kloc);
                           if (getenv("THVM_SCHED_DIAG"))
@@ -302,13 +312,6 @@
                 heap_set(ctx, kloc + 1, right);
                 heap_set(ctx, kloc + 2, term_num_u32(fop));
                 RETURN_REDUCED(term_new(TAG_TOP, UOP_KERNEL, kloc));
-            }
-
-            // UOP_SCHED: pass-through. With local FUSE + clean ASSIGN + SEQ,
-            // scheduling signals are unnecessary — KERNEL fires immediately,
-            // ASSIGN fires when args are TAG_TEN, SEQ handles ordering.
-            if (uop == UOP_SCHED) {
-                RETURN_REDUCED(heap_read(ctx, loc));
             }
 
             if (uop == UOP_TODEVICE) {

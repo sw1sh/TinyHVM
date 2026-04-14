@@ -11,43 +11,15 @@ static u32 cg_cache_count = 0;
 
 // ── Hash: op chain + leaf patterns + full shape + reduce spec ──────
 static u64 cg_hash_rs(const FusedOp *ops, u32 n_ops, u32 n_leaves,
-                       const View **leaf_views, const Shape *full_shape,
-                       const ReduceSpec *reduce) {
-    u64 h = 0x1337c0de00000000ULL;
-    h ^= n_ops; h *= 0x100000001b3ULL;
-    h ^= n_leaves; h *= 0x100000001b3ULL;
-    for (u32 i = 0; i < n_ops; i++) {
-        h ^= ops[i].uop; h *= 0x100000001b3ULL;
-        h ^= ops[i].arg_a; h *= 0x100000001b3ULL;
-        h ^= ops[i].arg_b; h *= 0x100000001b3ULL;
-        h ^= ops[i].aux; h *= 0x100000001b3ULL;
-    }
-    for (u32 i = 0; i < n_leaves; i++) {
-        const View *v = leaf_views[i];
-        h ^= v->numel; h *= 0x100000001b3ULL;
-        h ^= (u64)v->offset; h *= 0x100000001b3ULL;
-        h ^= v->has_mask; h *= 0x100000001b3ULL;
-        for (u32 d = 0; d < v->shape.rank; d++) {
-            h ^= v->shape.dims[d]; h *= 0x100000001b3ULL;
-            h ^= (u64)(u32)v->strides[d]; h *= 0x100000001b3ULL;
-        }
-    }
-    for (u32 d = 0; d < full_shape->rank; d++) {
-        h ^= full_shape->dims[d]; h *= 0x100000001b3ULL;
-    }
-    if (reduce && reduce->reduce_type) {
-        h ^= (u64)reduce->reduce_type << 32; h *= 0x100000001b3ULL;
-        for (u32 d = 0; d < full_shape->rank; d++) {
-            h ^= (u64)reduce->is_reduce[d] << d; h *= 0x100000001b3ULL;
-        }
-        if (reduce->reduce2_type) {
-            h ^= (u64)reduce->reduce2_type << 48; h *= 0x100000001b3ULL;
-            h ^= (u64)reduce->reduce2_start << 16; h *= 0x100000001b3ULL;
-            for (u32 d = 0; d < full_shape->rank; d++)
-                h ^= (u64)reduce->is_reduce2[d] << (d+8); h *= 0x100000001b3ULL;
-        }
-    }
-    return h;
+                       const View **leaf_views,
+                       const ShapeTracker *const *leaf_sts,
+                       const Shape *full_shape,
+                       const ReduceSpec *reduce,
+                       const u32 *side_op_indices,
+                       u32 n_side_outputs) {
+    return thvm_kernel_signature_from_ptrs(
+        ops, n_ops, leaf_views, leaf_sts, n_leaves,
+        full_shape, reduce, side_op_indices, n_side_outputs);
 }
 
 static const char *cg_op_str(u32 uop) {
@@ -798,9 +770,8 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
         const ShapeTracker *const *leaf_sts,
         const Shape *full_shape, const ReduceSpec *reduce,
         const u32 *side_op_indices, u32 n_side_outputs) {
-    u64 key = cg_hash_rs(ops, n_ops, n_leaves, leaf_views, full_shape, reduce);
-    for (u32 i = 0; i < n_side_outputs; i++) { key ^= side_op_indices[i]; key *= 0x100000001b3ULL; }
-    key ^= n_side_outputs; key *= 0x100000001b3ULL;
+    u64 key = cg_hash_rs(ops, n_ops, n_leaves, leaf_views, leaf_sts,
+                         full_shape, reduce, side_op_indices, n_side_outputs);
     for (u32 i = 0; i < cg_cache_count && i < CODEGEN_CACHE_SIZE; i++)
         if (cg_cache[i].key == key) {
             _last_compiled_uop = cg_cache[i].is_uop;
@@ -855,6 +826,40 @@ static id<MTLComputePipelineState> cg_get_pipe_rs(
     return pipe;
 }
 
+static id<MTLComputePipelineState> cg_get_pipe_uop(const UOpKernel *uk, u64 cache_key) {
+    u64 key = cache_key ^ 0x55504f5049504555ULL; // separate namespace from RS cache
+    for (u32 i = 0; i < cg_cache_count && i < CODEGEN_CACHE_SIZE; i++) {
+        if (cg_cache[i].key == key) {
+            _last_compiled_uop = 1;
+            _last_local_size = cg_cache[i].group_reduce ? (int)cg_cache[i].local_size : 0;
+            return cg_cache[i].pipe;
+        }
+    }
+
+    NSString *src = uop_render_msl(uk);
+    _last_compiled_uop = 1;
+    _last_local_size = (int)uk->local_size;
+    if (getenv("THVM_DUMP_CODEGEN"))
+        fprintf(stderr, "--- codegen-uop (ops=%u key=0x%016llx cmd=%u) ---\n%s\n---\n",
+                uk->n_ops, (unsigned long long)cache_key, jit.n_cmds, [src UTF8String]);
+    NSError *err;
+    id<MTLLibrary> lib = [mtl_dev newLibraryWithSource:src options:nil error:&err];
+    if (!lib) { NSLog(@"uop codegen error: %@\n%@", err, src); return nil; }
+    id<MTLComputePipelineState> pipe =
+        [mtl_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"K"]
+                                              error:&err];
+    if (!pipe) return nil;
+
+    u32 slot = cg_cache_count < CODEGEN_CACHE_SIZE ?
+        cg_cache_count++ : (cg_cache_count++ % CODEGEN_CACHE_SIZE);
+    cg_cache[slot].key = key;
+    cg_cache[slot].pipe = pipe;
+    cg_cache[slot].is_uop = 1;
+    cg_cache[slot].group_reduce = (uk->local_size > 0);
+    cg_cache[slot].local_size = uk->local_size;
+    return pipe;
+}
+
 // ── Dispatch (new interface with ReduceSpec) ───────────────────────
 static void metal_dispatch_kernel_rs_st(u32 out_buf,
     u32 *leaf_bufs, const View **leaf_views,
@@ -879,6 +884,52 @@ void metal_dispatch_kernel_rs(u32 out_buf,
     metal_dispatch_kernel_rs_st(out_buf, leaf_bufs, leaf_views, sts, n_leaves,
                                  ops, n_ops, full_shape, reduce,
                                  side_bufs, side_op_indices, n_side_outputs);
+}
+
+void metal_dispatch_uop_kernel(u32 out_buf, const u32 *leaf_bufs, u32 n_leaves,
+                               const UOpKernel *uk, u64 cache_key) {
+    if (!uk) return;
+    id<MTLComputePipelineState> pipe = cg_get_pipe_uop(uk, cache_key);
+    if (!pipe) return;
+
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:pipe];
+    [enc setBuffer:metal_pool.bufs[out_buf] offset:BUF_OFFSET(out_buf) atIndex:0];
+    for (u32 i = 0; i < n_leaves; i++)
+        [enc setBuffer:metal_pool.bufs[leaf_bufs[i]] offset:BUF_OFFSET(leaf_bufs[i]) atIndex:i + 1];
+    if (uk->local_size > 0) {
+        [enc dispatchThreadgroups:MTLSizeMake(uk->grid[0], uk->grid[1], uk->grid[2])
+           threadsPerThreadgroup:MTLSizeMake(uk->local_size, 1, 1)];
+    } else {
+        u32 tw = MIN(uk->grid[0], 256u);
+        [enc dispatchThreads:MTLSizeMake(uk->grid[0], uk->grid[1], uk->grid[2])
+           threadsPerThreadgroup:MTLSizeMake(tw ? tw : 1, 1, 1)];
+    }
+    batch_dirty = 1;
+    buf_cpu_only[out_buf] = 0;
+    total_dispatches++;
+    dispatch_counter++;
+    for (u32 li = 0; li < n_leaves; li++)
+        buf_last_use[leaf_bufs[li]] = dispatch_counter;
+    dc[uk->local_size > 0 ? DC_REDUCE : DC_FUSED]++;
+
+    if (jit.state == JIT_CAPTURE) {
+        u32 ids[1 + FUSE_MAX_LEAVES];
+        ids[0] = out_buf;
+        for (u32 i = 0; i < n_leaves && i < FUSE_MAX_LEAVES; i++)
+            ids[i + 1] = leaf_bufs[i];
+        if (uk->local_size > 0) {
+            jit_record_dispatch_ids(pipe, ids, 1 + n_leaves, NULL, NULL, 0,
+                                    uk->grid[0], uk->grid[1], uk->grid[2],
+                                    uk->local_size, 1, 1);
+            jit.cmds[jit.n_cmds - 1].grid[1] = 0;
+        } else {
+            u32 tw = MIN(uk->grid[0], 256u);
+            jit_record_dispatch_ids(pipe, ids, 1 + n_leaves, NULL, NULL, 0,
+                                    uk->grid[0], uk->grid[1], uk->grid[2],
+                                    tw ? tw : 1, 1, 1);
+        }
+    }
 }
 
 void metal_dispatch_kernel_rs_st(u32 out_buf,

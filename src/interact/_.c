@@ -59,7 +59,7 @@ static void thvm_spawn_detached_era(TinyHVM *ctx, Term item) {
 
 static u32 thvm_uop_storage_arity(u32 ext) {
     if (ext == UOP_KERNEL) return 3;
-    if (ext == UOP_FUSE || ext == UOP_SCHED) return 1;
+    if (ext == UOP_FUSE) return 1;
     if (ext == UOP_FUSE2) return 3;
     if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
     if (ext == UOP_GRAD) return 2;
@@ -122,7 +122,7 @@ static int thvm_kernel_child_ready(Term t) {
     if (tag == TAG_DP0 || tag == TAG_DP1) return 0;
     if (tag == TAG_TOP) {
         u32 ext = term_ext(t);
-        return ext != UOP_FUSE && ext != UOP_SCHED;
+        return ext != UOP_FUSE;
     }
     return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
            tag == TAG_SEQ || tag == TAG_CTR || tag == TAG_LAM ||

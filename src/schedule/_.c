@@ -282,13 +282,35 @@ static int phase1_top_has_add_zero_arg(TinyHVM *ctx, Term t, u64 *slot_out, Term
 static int phase1_top_direct_uop(u32 uop) {
     return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_IFZ ||
            uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_DETACH ||
-           uop == UOP_WHERE || uop == UOP_FUSE || uop == UOP_SCHED || uop == UOP_FUSE2 ||
+           uop == UOP_WHERE || uop == UOP_FUSE || uop == UOP_FUSE2 ||
            uop == UOP_KERNEL;
+}
+
+static int phase1_fuse_payload_is_terminal_passthru(Term t) {
+    switch (term_tag(t)) {
+        case TAG_TEN:
+        case TAG_ERA:
+        case TAG_NUM:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int phase1_top_is_hidden_trace_passthru(TinyHVM *ctx, Term t) {
+    if (term_tag(t) != TAG_TOP) return 0;
+    u32 uop = term_ext(t);
+    if (uop != UOP_FUSE) return 0;
+    u64 loc = term_val(t);
+    if (loc == 0 || loc >= ctx->heap_pos) return 0;
+    return phase1_fuse_payload_is_terminal_passthru(heap_read(ctx, loc));
 }
 
 static int phase1_term_maybe_active(TinyHVM *ctx, Term t) {
     u8 tag = term_tag(t);
     if (tag == TAG_TOP) {
+        if (phase1_top_is_hidden_trace_passthru(ctx, t))
+            return 0;
         return phase1_top_direct_uop(term_ext(t)) ||
                phase1_top_has_era_arg(ctx, t, NULL, NULL) ||
                phase1_top_has_add_zero_arg(ctx, t, NULL, NULL);
@@ -452,7 +474,6 @@ static int phase1_fuse_payload_top_ready(u32 uop) {
     return uop == UOP_ASSIGN ||
            uop == UOP_KERNEL ||
            uop == UOP_FUSE ||
-           uop == UOP_SCHED ||
            uop == UOP_FUSE2 ||
            is_binary(uop) ||
            is_elementwise(uop) ||
@@ -462,10 +483,9 @@ static int phase1_fuse_payload_top_ready(u32 uop) {
 }
 
 static int phase1_fuse_payload_ready(Term t) {
+    if (phase1_fuse_payload_is_terminal_passthru(t))
+        return 0;
     switch (term_tag(t)) {
-        case TAG_TEN:
-        case TAG_ERA:
-        case TAG_NUM:
         case TAG_SEQ:
         case TAG_CTR:
             return 1;
@@ -476,12 +496,16 @@ static int phase1_fuse_payload_ready(Term t) {
     }
 }
 
+static int phase1_trace_root_is_terminal(TinyHVM *ctx, Term t) {
+    return phase1_term_is_whnf_atom(t) || phase1_top_is_hidden_trace_passthru(ctx, t);
+}
+
 static int phase1_top_frame_arg0_ready(Term t, u32 uop) {
     u8 tag = term_tag(t);
     return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM || tag == TAG_SUP ||
            (tag == TAG_TOP && uop == UOP_GRAD) ||
            (tag == TAG_VAR && uop == UOP_DETACH) ||
-           ((uop == UOP_FUSE || uop == UOP_SCHED) &&
+           (uop == UOP_FUSE &&
             phase1_fuse_payload_ready(t)) ||
            ((uop == UOP_FUSE2 || uop == UOP_KERNEL) &&
             tag != TAG_DP0 && tag != TAG_DP1);
@@ -494,7 +518,7 @@ static int phase1_top_frame_arg1_ready(Term t, u32 uop) {
     if (uop == UOP_FUSE2 || uop == UOP_KERNEL) {
         ok = ok || tag == TAG_SEQ || tag == TAG_CTR ||
              (tag == TAG_TOP && term_ext(t) != UOP_FUSE &&
-              term_ext(t) != UOP_FUSE2 && term_ext(t) != UOP_SCHED);
+              term_ext(t) != UOP_FUSE2);
     }
     return ok;
 }
@@ -677,7 +701,7 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
             return 0;
         }
 
-        if (ctx->step_graph_local_fuse && (uop == UOP_FUSE || uop == UOP_SCHED)) {
+        if (ctx->step_graph_local_fuse && uop == UOP_FUSE) {
             Term a0 = heap_read(ctx, loc + 0);
             if (phase1_fuse_payload_ready(a0)) {
                 if (out_before) *out_before = t;
@@ -978,6 +1002,11 @@ static Term thvm_phase1_structural_nf(TinyHVM *ctx, Term t) {
             thvm_step_graph_after_interaction(ctx, graph_src, before, t);
             continue;
         }
+
+        // Stop numbered step tracing once the visible root has reached its
+        // useful terminal value. Remaining cleanup can run silently afterward.
+        if (phase1_trace_root_is_terminal(ctx, t))
+            break;
 
         // Otherwise fire one interaction from phase-1 heap agents.
         // No priority classes here: with correct local rules, order should
@@ -1622,12 +1651,38 @@ static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
         if (ke->leaf_sts[i].n_views >= 2) has_multiview = 1;
     }
 
-    md->backend->dispatch_kernel_rs(
-        md->buf_id, bufs, views,
-        has_multiview ? st_ptrs : NULL, ke->n_leaves,
-        ke->ops, ke->n_ops, &ke->full_shape,
-        ke->has_reduce ? &ke->reduce : NULL,
-        NULL, NULL, 0, ke->leaf_dtypes, md->dtype);
+    UOpKernel uk;
+    u64 lower_sig = 0;
+    int lowered = getenv("THVM_NO_LOWER") ? 0 : thvm_lower_kernel_uop(ctx, ke, &uk, &lower_sig);
+    if (getenv("THVM_LOWER_DIAG")) {
+        if (lowered) {
+            fprintf(stderr,
+                    "LOWER_KERNEL_BUILT kid=%u cache_sig=0x%016llx lower_sig=0x%016llx lower_heap=%llu ops=%u rewrites=%u\n",
+                    kid,
+                    (unsigned long long)ke->normalized_sig,
+                    (unsigned long long)lower_sig,
+                    (unsigned long long)ctx->lower_ctx.heap_pos,
+                    uk.n_ops,
+                    ctx->lower_ctx.rewrite_count);
+            if (getenv("THVM_LOWER_TRACE"))
+                thvm_lower_dump_uop_kernel(&uk);
+        } else {
+            fprintf(stderr,
+                    "LOWER_KERNEL_FALLBACK kid=%u cache_sig=0x%016llx reason=builder\n",
+                    kid, (unsigned long long)ke->normalized_sig);
+        }
+    }
+
+    if (lowered && md->backend->dispatch_uop_kernel) {
+        md->backend->dispatch_uop_kernel(md->buf_id, bufs, ke->n_leaves, &uk, ke->normalized_sig);
+    } else {
+        md->backend->dispatch_kernel_rs(
+            md->buf_id, bufs, views,
+            has_multiview ? st_ptrs : NULL, ke->n_leaves,
+            ke->ops, ke->n_ops, &ke->full_shape,
+            ke->has_reduce ? &ke->reduce : NULL,
+            NULL, NULL, 0, ke->leaf_dtypes, md->dtype);
+    }
     ctx->itrs++;
     md->creator_op = UOP_KERNEL;
     md->fusing_loc = sched_kernel_locs[kid];
@@ -1810,7 +1865,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
 
     // Phase 2: wrap in UOP_FUSE and reduce — fuses compute + dispatches + fires ASSIGN
     // Local FUSE creates KERNELs that fire immediately. SEQ handles ordering.
-    // No separate UOP_SCHED phase — everything happens in one reduce pass.
+    // No separate scheduling marker remains — everything happens in one reduce pass.
     // Use nested reduce (depth>0 via eval_depth) to suppress quiesce —
     // quiesce would modify FUSE payloads on the heap.
     {

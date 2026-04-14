@@ -24,7 +24,6 @@ static inline int uop_allocates_fresh(u32 uop) {
         case UOP_DETACH:
         case UOP_KERNEL:
         case UOP_FUSE:
-        case UOP_SCHED:
         case UOP_FUSE2:
             return 0;  // returns sub-terms / passthrough, not a fresh tensor
         default:
@@ -58,7 +57,7 @@ static inline int reduce_top_has_era_arg(TinyHVM *ctx, Term t) {
     if (term_tag(t) != TAG_TOP) return 0;
     u32 uop = term_ext(t);
     // FUSE2 uses ERA intentionally for unary ops — not an erasure case.
-    if (uop == UOP_FUSE2 || uop == UOP_FUSE || uop == UOP_SCHED) return 0;
+    if (uop == UOP_FUSE2 || uop == UOP_FUSE) return 0;
     u64 loc = term_val(t);
     u32 arity = reduce_top_arity(uop);
     for (u32 i = 0; i < arity; i++) {
@@ -81,7 +80,6 @@ static inline int reduce_fuse_payload_top_ready(u32 uop) {
     return uop == UOP_ASSIGN ||
            uop == UOP_KERNEL ||
            uop == UOP_FUSE ||
-           uop == UOP_SCHED ||
            uop == UOP_FUSE2 ||
            is_binary(uop) ||
            is_elementwise(uop) ||
@@ -111,7 +109,7 @@ static inline int reduce_top_direct_uop(u32 uop) {
            uop == UOP_DETACH ||
            uop == UOP_WHERE ||
            uop == UOP_KERNEL ||
-           uop == UOP_FUSE || uop == UOP_SCHED || uop == UOP_FUSE2;
+           uop == UOP_FUSE || uop == UOP_FUSE2;
 }
 
 static inline u32 reduce_net_term_arity(Term t) {
@@ -397,7 +395,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             next = a0;
             goto enter;
         }
-        if (ctx->step_graph_local_fuse && (_uop == UOP_FUSE || _uop == UOP_SCHED)) {
+        if (ctx->step_graph_local_fuse && _uop == UOP_FUSE) {
             u64 loc = term_val(next);
             Term a0 = heap_read(ctx, loc + 0);
             if (reduce_fuse_payload_ready(a0)) {
@@ -502,7 +500,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 term_tag(whnf) == TAG_SUP ||
                 (term_tag(whnf) == TAG_TOP && frame_uop == UOP_GRAD) ||
                 (term_tag(whnf) == TAG_VAR && frame_uop == UOP_DETACH) ||
-                ((frame_uop == UOP_FUSE || frame_uop == UOP_SCHED) &&
+                (frame_uop == UOP_FUSE &&
                  reduce_fuse_payload_ready(whnf)) ||
                 // UOP_FUSE2 accepts most WNF payloads, but NOT DP0/DP1 —
                 // those must be resolved by reducer first.
@@ -525,8 +523,8 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 goto enter;
             }
 
-            // UOP_FUSE/UOP_SCHED fire once arg0 is ready.
-            if (frame_uop == UOP_FUSE || frame_uop == UOP_SCHED) {
+            // UOP_FUSE fires once arg0 is ready.
+            if (frame_uop == UOP_FUSE) {
                 if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }
@@ -587,7 +585,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             if (_uop1 == UOP_FUSE2 || _uop1 == UOP_KERNEL)
                 _arg1_ok = _arg1_ok || w1t == TAG_SEQ || w1t == TAG_CTR ||
                            (w1t == TAG_TOP && term_ext(whnf) != UOP_FUSE &&
-                            term_ext(whnf) != UOP_FUSE2 && term_ext(whnf) != UOP_SCHED);
+                            term_ext(whnf) != UOP_FUSE2);
             if (!_arg1_ok) {
                 // Reconstruct original TAG_TOP from TOP1 sentinel
                 heap_set(ctx, loc + 1, whnf);

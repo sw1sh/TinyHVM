@@ -23,7 +23,8 @@ thvm_eval(ctx, t):
 ```
 
 There is no separate scheduling phase in the live eval path anymore.
-`UOP_SCHED` remains only as a deprecated pass-through.
+There is also no separate `UOP_SCHED` marker anymore: `FUSE` is the only
+propagating fusion agent.
 
 ## Phase 1: Structural Reduction
 

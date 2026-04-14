@@ -1220,6 +1220,7 @@ int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     ke->has_reduce = has_reduce;
     kernel_capture_result_view(ctx, t, out_view.shape, ke);
     ke->sum_term = sum_term;
+    ke->normalized_sig = thvm_kernel_entry_signature(ke);
     if (getenv("THVM_KERN_DIAG") && has_reduce) {
         fprintf(stderr, "FK ops=%u lv=%u perm=%d full=[", n_ops, n_leaves, _fuse_has_perm);
         for(u32 d=0;d<ew_view.shape.rank;d++) fprintf(stderr,"%u,",ew_view.shape.dims[d]);

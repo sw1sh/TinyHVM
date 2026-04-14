@@ -3,8 +3,9 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path);
 static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 static void thvm_heap_dot_set_sched_kernels(int enabled);
 static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root);
-static void thvm_step_graph_after_interaction(TinyHVM *ctx, Term before, Term root);
+static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Term before, Term root);
 static void thvm_step_graph_finalize(TinyHVM *ctx);
+static void thvm_step_graph_set_root(Term root);
 static void thvm_step_graph_set_before_grad_y(Term y);
 static void thvm_step_graph_set_before_era_payload(Term payload);
 static void thvm_step_graph_set_before_top_era(int had_era);
@@ -42,6 +43,47 @@ u32 kid_input_epochs[SCHED_MAX_KERNELS][KERNEL_MAX_INPUTS];
 u32 kid_n_inputs[SCHED_MAX_KERNELS];
 
 static u64 phase1_root_slot = 0;
+
+typedef struct {
+    u32 tid;
+    u64 bytes;
+    void *data;
+} StepGraphTensorSnap;
+
+static StepGraphTensorSnap *thvm_step_graph_snapshot_tensors(TinyHVM *ctx, u32 *out_count) {
+    if (out_count) *out_count = 0;
+    if (!ctx || !ctx->tensors || ctx->tensor_count == 0) return NULL;
+    StepGraphTensorSnap *snaps = (StepGraphTensorSnap *)calloc(ctx->tensor_count, sizeof(StepGraphTensorSnap));
+    if (!snaps) return NULL;
+    u32 n = 0;
+    for (u32 tid = 0; tid < ctx->tensor_count; tid++) {
+        TensorMeta *tm = &ctx->tensors[tid];
+        if (!tm->backend || !tm->backend->buf_read || !tm->backend->buf_write) continue;
+        if (tm->buf_id == 0 || tm->refcount == 0) continue;
+        const View *v = tensor_view_get(tm);
+        u64 bytes = (u64)(v ? v->numel : 0u) * (u64)dtype_size(tm->dtype);
+        if (bytes == 0) continue;
+        void *buf = malloc((size_t)bytes);
+        if (!buf) continue;
+        tm->backend->buf_read(tm->buf_id, buf, bytes);
+        snaps[n++] = (StepGraphTensorSnap){ .tid = tid, .bytes = bytes, .data = buf };
+    }
+    if (out_count) *out_count = n;
+    return snaps;
+}
+
+static void thvm_step_graph_restore_tensors(TinyHVM *ctx, StepGraphTensorSnap *snaps, u32 count) {
+    if (!ctx || !snaps) return;
+    for (u32 i = 0; i < count; i++) {
+        StepGraphTensorSnap *s = &snaps[i];
+        if (!s->data || s->tid >= ctx->tensor_count) continue;
+        TensorMeta *tm = &ctx->tensors[s->tid];
+        if (tm->backend && tm->backend->buf_write && tm->buf_id != 0 && tm->refcount != 0)
+            tm->backend->buf_write(tm->buf_id, s->data, s->bytes);
+        free(s->data);
+    }
+    free(snaps);
+}
 
 typedef struct {
     Backend *backend;
@@ -147,6 +189,8 @@ static void thvm_graph_dump_path(char *buf, size_t nbuf, const char *name) {
 
 static u32 phase1_top_arity(u32 ext) {
     if (ext == UOP_KERNEL) return 0;
+    if (ext == UOP_FUSE || ext == UOP_SCHED) return 1;
+    if (ext == UOP_FUSE2) return 3;
     if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
     if (ext == UOP_GRAD) return 2;
     if (ext == UOP_LOG_PRINT) return 1;
@@ -158,15 +202,71 @@ static u32 phase1_top_arity(u32 ext) {
 static u32 phase1_term_arity(Term t);
 static int phase1_has_parent_ref(TinyHVM *ctx, Term target);
 
+static u64 phase1_find_child_slot_in_term(TinyHVM *ctx, Term parent, Term target, u32 depth) {
+    if (depth > 64) return 0;
+    u32 ar = phase1_term_arity(parent);
+    u64 loc = term_val(parent);
+    if (ar == 0 || loc == 0 || loc + ar > ctx->heap_pos) return 0;
+    for (u32 i = 0; i < ar; i++) {
+        if (heap_read(ctx, loc + i) == target) return loc + i;
+    }
+    for (u32 i = 0; i < ar; i++) {
+        Term child = heap_read(ctx, loc + i);
+        switch (term_tag(child)) {
+            case TAG_VAR:
+            case TAG_DP0:
+            case TAG_DP1:
+            case TAG_UDP:
+            case TAG_ERA:
+            case TAG_REF:
+            case TAG_ALO:
+            case TAG_TEN:
+            case TAG_NUM:
+            case TAG_ANY:
+                continue;
+            default:
+                break;
+        }
+        u64 hit = phase1_find_child_slot_in_term(ctx, child, target, depth + 1);
+        if (hit != 0) return hit;
+    }
+    return 0;
+}
+
+static u64 thvm_phase1_graph_source_slot(TinyHVM *ctx, u64 container_slot, Term container, Term before) {
+    if (container == before) return container_slot;
+    u64 hit = phase1_find_child_slot_in_term(ctx, container, before, 0);
+    return hit ? hit : container_slot;
+}
+
+static int phase1_term_is_active_era_like(TinyHVM *ctx, Term t, Term *era_out) {
+    if (term_tag(t) == TAG_ERA && term_val(t) != 0) {
+        if (era_out) *era_out = t;
+        return 1;
+    }
+    if (term_tag(t) == TAG_VAR) {
+        u64 loc = term_val(t);
+        if (loc < ctx->heap_pos) {
+            Term sub = heap_read(ctx, loc);
+            if (term_tag(sub) == TAG_ERA && term_val(sub) != 0) {
+                if (era_out) *era_out = sub;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int phase1_top_has_era_arg(TinyHVM *ctx, Term t, u64 *slot_out, Term *term_out) {
     if (term_tag(t) != TAG_TOP) return 0;
     u64 loc = term_val(t);
     u32 arity = phase1_top_arity(term_ext(t));
     for (u32 i = 0; i < arity; i++) {
         Term child = heap_read(ctx, loc + i);
-        if (term_tag(child) == TAG_ERA) {
+        Term era_child = 0;
+        if (phase1_term_is_active_era_like(ctx, child, &era_child)) {
             if (slot_out) *slot_out = loc + i;
-            if (term_out) *term_out = child;
+            if (term_out) *term_out = era_child;
             return 1;
         }
     }
@@ -190,7 +290,7 @@ static int phase1_top_has_add_zero_arg(TinyHVM *ctx, Term t, u64 *slot_out, Term
 static int phase1_top_direct_uop(u32 uop) {
     return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_IFZ ||
            uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_DETACH ||
-           uop == UOP_WHERE ||
+           uop == UOP_WHERE || uop == UOP_FUSE || uop == UOP_SCHED || uop == UOP_FUSE2 ||
            uop == UOP_KERNEL;
 }
 
@@ -233,6 +333,7 @@ static u32 phase1_term_arity(Term t) {
         case TAG_APP:
         case TAG_LAM:
         case TAG_BRI:
+        case TAG_SEQ:
         case TAG_SUP:
         case TAG_USP:
         case TAG_OP2:
@@ -242,6 +343,8 @@ static u32 phase1_term_arity(Term t) {
         case TAG_MAT:
         case TAG_ANN:
             return 2;
+        case TAG_ALO:
+            return 0;
         case TAG_DSU:
         case TAG_DDU:
             return 3;
@@ -293,7 +396,7 @@ static void phase1_mark_reachable_slots(TinyHVM *ctx, Term root, u8 *reach) {
             reach[h] = 1;
             P1_PUSH(ht);
         }
-    }
+        }
 
     while (work && wp > 0) {
         Term tt = work[--wp];
@@ -405,6 +508,11 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
     }
 
     if (tag == TAG_REF) {
+        if (out_before) *out_before = t;
+        return 1;
+    }
+
+    if (tag == TAG_ALO) {
         if (out_before) *out_before = t;
         return 1;
     }
@@ -553,6 +661,10 @@ static int thvm_phase1_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before
         u64 loc = term_val(t);
         if (loc < ctx->heap_pos) {
             Term sub = heap_read(ctx, loc);
+            if (term_tag(sub) == TAG_ERA && term_val(sub) != 0) {
+                if (out_whnf) *out_whnf = sub;
+                return 0;
+            }
             if (!term_is_sub(sub)) {
                 // Substituted — follow through to resolved value
                 if (out_before) *out_before = t;
@@ -581,14 +693,17 @@ static int thvm_phase1_find_next_actual(TinyHVM *ctx, Term root,
     phase1_mark_reachable_slots(ctx, root, reach);
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         if (h == phase1_root_slot) continue;
-        if (reach && !reach[h]) continue;
         Term ht = ctx->heap[h];
+        int reachable = !(reach && !reach[h]);
+        if (!reachable && !phase1_term_needs_global_cleanup(ctx, ht)) continue;
         if (!phase1_term_maybe_active(ctx, ht)) continue;
         if ((term_tag(ht) == TAG_DP0 || term_tag(ht) == TAG_DP1) &&
+            reachable &&
             !phase1_term_first_reachable_occurrence(ctx, h, ht, reach)) {
             continue;
         }
         if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD &&
+            reachable &&
             !phase1_term_first_reachable_occurrence(ctx, h, ht, reach)) {
             continue;
         }
@@ -622,7 +737,7 @@ static void thvm_phase1_capture_step_before_meta(TinyHVM *ctx, Term before) {
         thvm_step_graph_set_before_top_add_zero(0);
     if (term_tag(before) == TAG_ERA) {
         u64 el = term_val(before);
-        Term payload = (el > 0 && el < ctx->heap_pos) ? heap_read(ctx, el) : term_era();
+        Term payload = (el > 0 && el < ctx->heap_pos) ? thvm_era_payload(ctx, heap_read(ctx, el)) : term_era();
         thvm_step_graph_set_before_era_payload(payload);
     } else {
         thvm_step_graph_set_before_era_payload(term_era());
@@ -649,9 +764,13 @@ static int thvm_phase1_fire_one(TinyHVM *ctx, Term in, Term *out_term, Term *out
     Term r = thvm_reduce_steps(ctx, in, 1);
     int traced = (ctx->steps_taken > 0) && (ctx->trace_count > 0);
     int fired = traced || (ctx->itrs != itrs_before);
-    Term before = in;
+    // For step-graph labelling we want the pre-step redex the predictor chose.
+    // The reducer trace can observe a deeper administrative frame after local
+    // rewiring, which makes filenames/metadata drift from the visible graph step.
+    Term before = predicted_before;
     if (traced) {
-        before = term_new((u8)tr.before_tag, tr.before_ext, tr.before_loc);
+        Term traced_before = term_new((u8)tr.before_tag, tr.before_ext, tr.before_loc);
+        if (traced_before == predicted_before) before = traced_before;
     }
 
     ctx->trace_buf = saved_buf;
@@ -673,10 +792,46 @@ static Term thvm_phase1_seed_root_grad(TinyHVM *ctx, Term t) {
     return t;
 }
 
+static void thvm_step_graph_scrub_detached_eras(TinyHVM *ctx) {
+    u32 removed = 0;
+    u32 first_tag = 0;
+    u64 first_loc = 0;
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term ht = ctx->heap[h];
+        if (term_tag(ht) != TAG_ERA || term_val(ht) == 0) continue;
+        if (phase1_has_parent_ref(ctx, ht)) continue;
+        u64 loc = term_val(ht);
+        if (loc > 0 && loc < ctx->heap_pos) {
+            if (removed == 0) {
+                first_tag = term_tag(heap_read(ctx, loc));
+                first_loc = loc;
+            }
+            removed++;
+            heap_set(ctx, loc, term_era());
+        }
+        ctx->heap[h] = term_era();
+    }
+    // #region agent log
+    do {
+        static u32 scrub_dbg_count = 0;
+        if (removed == 0 || scrub_dbg_count >= 12) break;
+        scrub_dbg_count++;
+        char _dbg[192];
+        snprintf(_dbg, sizeof(_dbg),
+                 "{\"removed\":%u,\"first_tag\":%u,\"first_loc\":%llu}",
+                 removed, first_tag, (unsigned long long)first_loc);
+        thvm_agent_debug_log("pre-fix", "H10", "src/schedule/_.c:792",
+                             "step_graph_scrub_detached_eras", _dbg);
+    } while (0);
+    // #endregion
+}
+
 static Term thvm_phase1_structural_nf(TinyHVM *ctx, Term t) {
     size_t reach_cap = (size_t)ctx->heap_pos;
     u8 *reach = (u8 *)calloc(reach_cap ? reach_cap : 1, 1);
-    u32 max_guard = getenv("THVM_STEP_GRAPH") ? 500 : 100000;
+    // ALO-based unfolding introduces extra administrative reductions in traced
+    // runs; keep the same high guard to avoid premature structural-NF cutoff.
+    u32 max_guard = 100000;
     for (u32 guard = 0; guard < max_guard; guard++) {
         int fired = 0;
         if ((size_t)ctx->heap_pos > reach_cap) {
@@ -689,12 +844,18 @@ static Term thvm_phase1_structural_nf(TinyHVM *ctx, Term t) {
         }
         Term tr = t;
         Term before = t;
+        Term graph_before = t;
+        u64 graph_src = phase1_root_slot;
+        if (phase1_term_maybe_active(ctx, t) &&
+            thvm_phase1_predict_next_redex(ctx, t, &graph_before, NULL)) {
+            graph_src = thvm_phase1_graph_source_slot(ctx, phase1_root_slot, t, graph_before);
+        }
         if (phase1_term_maybe_active(ctx, t) &&
             thvm_phase1_fire_one(ctx, t, &tr, &before)) {
             t = tr;
             if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
                 heap_set(ctx, phase1_root_slot, t);
-            thvm_step_graph_after_interaction(ctx, before, t);
+            thvm_step_graph_after_interaction(ctx, graph_src, before, t);
             continue;
         }
 
@@ -721,6 +882,7 @@ static Term thvm_phase1_structural_nf(TinyHVM *ctx, Term t) {
             Term hr = ht;
             Term before_h = ht;
             if (thvm_phase1_fire_one(ctx, ht, &hr, &before_h)) {
+                u64 graph_src = thvm_phase1_graph_source_slot(ctx, h, ht, before_h);
                 if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD) {
                     for (u64 i = 1; i < ctx->heap_pos; i++) {
                         if (ctx->heap[i] == ht) ctx->heap[i] = hr;
@@ -730,9 +892,33 @@ static Term thvm_phase1_structural_nf(TinyHVM *ctx, Term t) {
                 }
                 if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
                     heap_set(ctx, phase1_root_slot, t);
-                thvm_step_graph_after_interaction(ctx, before_h, t);
+                thvm_step_graph_after_interaction(ctx, graph_src, before_h, t);
                 fired = 1;
                 break;
+            }
+        }
+        // If the regular sweep found no progress but the predictor still
+        // identifies a concrete next redex, try firing it directly. This keeps
+        // step-graph runs from stopping with a dangling NEXT_INTERACTION.
+        if (!fired) {
+            u64 src = 0;
+            Term predicted_before = t;
+            if (thvm_phase1_find_next_actual(ctx, t, &src, &predicted_before)) {
+                Term in = (src == phase1_root_slot) ? t : ((src < ctx->heap_pos) ? ctx->heap[src] : t);
+                Term out = in;
+                Term before_pred = in;
+                if (thvm_phase1_fire_one(ctx, in, &out, &before_pred)) {
+                    u64 graph_src = thvm_phase1_graph_source_slot(ctx, src, in, before_pred);
+                    if (src == phase1_root_slot) {
+                        t = out;
+                    } else if (src < ctx->heap_pos) {
+                        ctx->heap[src] = out;
+                    }
+                    if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
+                        heap_set(ctx, phase1_root_slot, t);
+                    thvm_step_graph_after_interaction(ctx, graph_src, before_pred, t);
+                    fired = 1;
+                }
             }
         }
         if (!fired) break;
@@ -1360,19 +1546,115 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     int run_coarse_graph = outermost && getenv("THVM_GRAPH") && !ctx->coarse_graph_consumed;
     if (run_step_graph) {
         ctx->step_graph_consumed = 1;
+        u32 snap_count = 0;
+        StepGraphTensorSnap *snaps = thvm_step_graph_snapshot_tensors(ctx, &snap_count);
+        Term traced = term_clone(ctx, t);
+        // #region agent log
+        do {
+            static u32 step_trace_start_dbg_count = 0;
+            if (step_trace_start_dbg_count >= 8) break;
+            step_trace_start_dbg_count++;
+            char _dbg[256];
+            snprintf(_dbg, sizeof(_dbg),
+                     "{\"root_tag\":%u,\"root_ext\":%u,\"root_val\":%llu,"
+                     "\"traced_tag\":%u,\"traced_ext\":%u,\"traced_val\":%llu,"
+                     "\"snap_count\":%u,\"heap_pos\":%llu}",
+                     (u32)term_tag(t), (u32)term_ext(t), (unsigned long long)term_val(t),
+                     (u32)term_tag(traced), (u32)term_ext(traced), (unsigned long long)term_val(traced),
+                     snap_count, (unsigned long long)ctx->heap_pos);
+            thvm_agent_debug_log("pre-fix", "H2", "src/schedule/_.c:1525",
+                                 "step_graph_trace_start", _dbg);
+        } while (0);
+        // #endregion
         phase1_root_slot = 0;
-        t = thvm_phase1_seed_root_grad(ctx, t);
-        thvm_step_graph_eval_begin(ctx, t);
-        t = thvm_phase1_structural_nf(ctx, t);
-        t = thvm_reduce(ctx, t);
-        if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
-            heap_set(ctx, phase1_root_slot, t);
+        traced = thvm_phase1_seed_root_grad(ctx, traced);
+        thvm_step_graph_eval_begin(ctx, traced);
+        traced = thvm_phase1_structural_nf(ctx, traced);
+        traced = thvm_reduce(ctx, traced);
+        // Clean detached ERA/DP remnants before FUSE wrapping; this keeps the
+        // visible net semantically quiescent for step-graph output.
+        traced = reduce_net_quiesce(ctx, traced);
+        // Continue through FUSE/dispatch with normal evaluator semantics, then
+        // append that transition into the same step sequence.
+        {
+            u64 fuse_loc = heap_alloc(ctx, 1);
+            heap_set(ctx, fuse_loc, traced);
+            Term fuse_term = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
+            u64 saved_budget = ctx->step_budget;
+            ctx->step_budget = 1000000;  // suppress quiesce while reducing FUSE
+            Term t_after = thvm_reduce(ctx, fuse_term);
+            ctx->step_budget = saved_budget;
+            // #region agent log
+            do {
+                static u32 step_trace_fuse_dbg_count = 0;
+                if (step_trace_fuse_dbg_count >= 8) break;
+                step_trace_fuse_dbg_count++;
+                char _dbg[320];
+                snprintf(_dbg, sizeof(_dbg),
+                         "{\"pre_fuse_tag\":%u,\"pre_fuse_ext\":%u,\"pre_fuse_val\":%llu,"
+                         "\"fuse_loc\":%llu,\"post_fuse_tag\":%u,\"post_fuse_ext\":%u,"
+                         "\"post_fuse_val\":%llu,\"phase1_root_slot\":%llu}",
+                         (u32)term_tag(traced), (u32)term_ext(traced), (unsigned long long)term_val(traced),
+                         (unsigned long long)fuse_loc,
+                         (u32)term_tag(t_after), (u32)term_ext(t_after), (unsigned long long)term_val(t_after),
+                         (unsigned long long)phase1_root_slot);
+                thvm_agent_debug_log("pre-fix", "H3", "src/schedule/_.c:1542",
+                                     "step_graph_fuse_transition", _dbg);
+            } while (0);
+            // #endregion
+            // #region agent log
+            do {
+                static u32 step_trace_fuse_probe_dbg_count = 0;
+                if (step_trace_fuse_probe_dbg_count >= 8) break;
+                if (term_tag(t_after) == TAG_TEN || term_tag(t_after) == TAG_ERA) break;
+                step_trace_fuse_probe_dbg_count++;
+                Term probe_root = term_clone(ctx, t_after);
+                u64 probe_loc = heap_alloc(ctx, 1);
+                heap_set(ctx, probe_loc, probe_root);
+                Term probe_term = term_new(TAG_TOP, UOP_FUSE, probe_loc);
+                u64 probe_saved_budget = ctx->step_budget;
+                ctx->step_budget = 1000000;
+                Term probe_after = thvm_reduce(ctx, probe_term);
+                ctx->step_budget = probe_saved_budget;
+                char _dbg[256];
+                snprintf(_dbg, sizeof(_dbg),
+                         "{\"post_fuse_tag\":%u,\"post_fuse_ext\":%u,\"post_fuse_val\":%llu,"
+                         "\"probe_after_tag\":%u,\"probe_after_ext\":%u,\"probe_after_val\":%llu}",
+                         (u32)term_tag(t_after), (u32)term_ext(t_after), (unsigned long long)term_val(t_after),
+                         (u32)term_tag(probe_after), (u32)term_ext(probe_after), (unsigned long long)term_val(probe_after));
+                thvm_agent_debug_log("pre-fix", "H9", "src/schedule/_.c:1559",
+                                     "step_graph_second_fuse_probe", _dbg);
+            } while (0);
+            // #endregion
+            thvm_step_graph_after_interaction(ctx, fuse_loc, fuse_term, t_after);
+            traced = t_after;
+        }
+        thvm_step_graph_set_root(traced);
         thvm_step_graph_finalize(ctx);
         phase1_root_slot = 0;
-        // Fall through to phase 2 (FUSE + dispatch) so the result is correct.
-        // Step graph only visualizes phase 1, but the computation completes.
-        // Skip the redundant phase 1 reduce below (already done in structural_nf).
-        goto phase2;
+        sched_planner_release_detached_slots();
+        thvm_step_graph_restore_tensors(ctx, snaps, snap_count);
+        // Keep step-graph tracing path semantically aligned with normal eval:
+        // after emitting graphs, run the standard pipeline (without tracing)
+        // to settle any residual administrative structure.
+        Term settled = thvm_eval(ctx, t);
+        // #region agent log
+        do {
+            static u32 step_trace_settled_dbg_count = 0;
+            if (step_trace_settled_dbg_count >= 8) break;
+            step_trace_settled_dbg_count++;
+            char _dbg[256];
+            snprintf(_dbg, sizeof(_dbg),
+                     "{\"returned_tag\":%u,\"returned_ext\":%u,\"returned_val\":%llu,"
+                     "\"traced_tag\":%u,\"traced_ext\":%u,\"traced_val\":%llu}",
+                     (u32)term_tag(settled), (u32)term_ext(settled), (unsigned long long)term_val(settled),
+                     (u32)term_tag(traced), (u32)term_ext(traced), (unsigned long long)term_val(traced));
+            thvm_agent_debug_log("pre-fix", "H2", "src/schedule/_.c:1557",
+                                 "step_graph_settled_result", _dbg);
+        } while (0);
+        // #endregion
+        ctx->eval_depth--;
+        return settled;
     }
 
     if (run_coarse_graph) {

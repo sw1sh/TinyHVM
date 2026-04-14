@@ -21,18 +21,15 @@ static Term simple_loop(TinyHVM *ctx, Term w0, u32 n_steps) {
     assert(train_id < 256);
 
     // train := λcounter. λw. IFZ(counter, w, λm. SEQ(ASSIGN(w, w*2), train(m)(w)))
-    u64 l_counter = heap_alloc(ctx, 2);
-    Term counter_var = term_new(TAG_VAR, 0, l_counter);
-    heap_set(ctx, l_counter + 0, term_set_sub(counter_var));
+    Term counter_var = 0;
+    Term w_var = 0;
+    Term next_counter = 0;
 
-    u64 l_w = heap_alloc(ctx, 2);
-    Term w_var = term_new(TAG_VAR, 0, l_w);
-    heap_set(ctx, l_w + 0, term_set_sub(w_var));
+    // Build binders explicitly via thvm_lam, then fill their bodies.
+    Term lam_counter = thvm_lam(ctx, &counter_var, term_new(TAG_ERA, 0, 0));
+    Term lam_w       = thvm_lam(ctx, &w_var,       term_new(TAG_ERA, 0, 0));
+    Term succ_lam    = thvm_lam(ctx, &next_counter,term_new(TAG_ERA, 0, 0));
     thvm_hint_shape(ctx, w_var, SHAPE(3));
-
-    u64 l_next = heap_alloc(ctx, 2);
-    Term next_counter = term_new(TAG_VAR, 0, l_next);
-    heap_set(ctx, l_next + 0, term_set_sub(next_counter));
 
     // DUP w for 4 uses: compute_src, assign_dst, recurse_param, base_case
     Term w1, w2, w3, w4;
@@ -59,15 +56,12 @@ static Term simple_loop(TinyHVM *ctx, Term w0, u32 n_steps) {
     // SEQ(ASSIGN(w, w*2), train(m)(w))
     // Forces ASSIGN to fire before the recursive call.
     Term seq_body = thvm_seq(ctx, assign, rec);
-
-    heap_set(ctx, l_next + 1, seq_body);
-    Term succ_lam = term_new(TAG_LAM, 0, l_next);
+    heap_set(ctx, term_val(succ_lam) + 1, seq_body);
 
     // IFZ(counter, w, succ_lam)
-    heap_set(ctx, l_w + 1, thvm_ifz(ctx, counter_var, w4, succ_lam));
-    Term lam_w = term_new(TAG_LAM, 0, l_w);
-    heap_set(ctx, l_counter + 1, lam_w);
-    ctx->defs[train_id] = term_new(TAG_LAM, 0, l_counter);
+    heap_set(ctx, term_val(lam_w) + 1, thvm_ifz(ctx, counter_var, w4, succ_lam));
+    heap_set(ctx, term_val(lam_counter) + 1, lam_w);
+    ctx->defs[train_id] = lam_counter;
 
     return thvm_app(ctx,
            thvm_app(ctx, thvm_ref(ctx, train_id), thvm_scalar_u32(ctx, n_steps)),

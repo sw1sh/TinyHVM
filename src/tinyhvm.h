@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <sys/stat.h>
 
 // ============================================================
 // Types
@@ -93,8 +95,9 @@ typedef u64 Term;
 
 // Sequencing (dependency ordering):
 #define TAG_SEQ  25  // SEQ(a, b): strict on a, discard result, return b. Heap: [a, b].
+#define TAG_ALO  26  // Lazy allocation wrapper for static/book terms. Heap: [book_term, state_id].
 
-#define TAG_COUNT 26
+#define TAG_COUNT 27
 
 // ============================================================
 // UOps — Minimal tensor operations (tinygrad-inspired)
@@ -173,6 +176,26 @@ static const char *uop_names[] = {
 // ============================================================
 
 #include <time.h>
+
+// #region agent log
+static inline void thvm_agent_debug_log(const char *run_id, const char *hypothesis_id,
+                                        const char *location, const char *message,
+                                        const char *data_json) {
+    mkdir("/Users/swish/src/TinyHVM/.cursor", 0777);
+    FILE *f = fopen("/Users/swish/src/TinyHVM/.cursor/debug-1fa7bd.log", "a");
+    if (!f) return;
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    u64 ts_ms = (u64)ts.tv_sec * 1000ull + (u64)ts.tv_nsec / 1000000ull;
+    fprintf(f,
+            "{\"sessionId\":\"1fa7bd\",\"runId\":\"%s\",\"hypothesisId\":\"%s\","
+            "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%llu}\n",
+            run_id ? run_id : "", hypothesis_id ? hypothesis_id : "",
+            location ? location : "", message ? message : "",
+            data_json ? data_json : "{}", (unsigned long long)ts_ms);
+    fclose(f);
+}
+// #endregion
 
 // Extended UOp range to cover POOL_GATHER
 #define PROF_UOP_MAX 128
@@ -822,8 +845,27 @@ typedef struct {
 } SchedRewriteEntry;
 
 typedef struct {
+    u32 parent;      // 0 = empty root
+    u64 bind_book;   // mapping key for VAR binders in static/book terms
+    u64 bind_dyn;    // runtime heap slot for mapped binder
+    u32 label_old;   // original DUP/SUP label from static/book terms
+    u32 label_new;   // fresh runtime label
+    u8  kind;        // 1=binder mapping, 2=label mapping
+} AloState;
+
+#define THVM_STEP_ALO_SUBST_MAX 8
+typedef struct {
+    u64 old_alo_loc;
+    Term out;
+    Term book_term;
+} StepGraphAloSubst;
+
+typedef struct {
     Term       *heap;
     u64         heap_pos;
+    Term       *book_heap;
+    u64         book_heap_pos;
+    u64         book_heap_cap;
     TensorMeta *tensors;
     u32         tensor_count;
 
@@ -843,6 +885,7 @@ typedef struct {
 
     // Named definitions for TAG_REF (global def table)
     Term        defs[256];   // defs[name] = heap loc or TAG_TOP term
+    Term        def_books[256]; // immutable static/book templates for defs[name]
     u32         def_count;
 
     // Interaction tracing (Phase 4)
@@ -867,6 +910,11 @@ typedef struct {
     HCSlot     *hc_table;
     DupPortEntry *dup_ports;
     SchedRewriteEntry *sched_rewrites;
+    AloState   *alo_states;
+    u32         alo_state_count;
+    u32         alo_state_cap;
+    StepGraphAloSubst step_alo_substs[THVM_STEP_ALO_SUBST_MAX];
+    u32         step_alo_subst_count;
 
 } TinyHVM;
 
@@ -933,6 +981,29 @@ static inline void thvm_dup_ports_clear_entry(TinyHVM *ctx, u64 dup_loc) {
     if (!e) return;
     e->port_slot[0] = 0;
     e->port_slot[1] = 0;
+}
+
+static inline void thvm_step_alo_substs_clear(TinyHVM *ctx) {
+    if (!ctx) return;
+    ctx->step_alo_subst_count = 0;
+    memset(ctx->step_alo_substs, 0, sizeof(ctx->step_alo_substs));
+}
+
+static inline void thvm_step_alo_subst_record(TinyHVM *ctx, u64 old_alo_loc, Term out, Term book_term) {
+    if (!ctx || old_alo_loc == 0) return;
+    for (u32 i = 0; i < ctx->step_alo_subst_count; i++) {
+        if (ctx->step_alo_substs[i].old_alo_loc == old_alo_loc) {
+            ctx->step_alo_substs[i].out = out;
+            ctx->step_alo_substs[i].book_term = book_term;
+            return;
+        }
+    }
+    if (ctx->step_alo_subst_count >= THVM_STEP_ALO_SUBST_MAX) return;
+    ctx->step_alo_substs[ctx->step_alo_subst_count++] = (StepGraphAloSubst){
+        .old_alo_loc = old_alo_loc,
+        .out = out,
+        .book_term = book_term,
+    };
 }
 
 static inline SchedRewriteEntry *thvm_sched_rewrites_find(TinyHVM *ctx, u64 top_loc, int create) {
@@ -1045,6 +1116,7 @@ Term     thvm_app_hc(TinyHVM *ctx, Term fun, Term arg);    // hash-consed APP
 void     thvm_hc_clear(TinyHVM *ctx);                      // clear HC table
 u32      thvm_define(TinyHVM *ctx, Term body);               // register def, return name id
 Term     thvm_ref(TinyHVM *ctx, u32 name);                   // TAG_REF(name)
+Term     thvm_book_from_dynamic(TinyHVM *ctx, Term body);    // internal: freeze dynamic term into static/book heap
 Term     thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b);   // TAG_SUP with label
 void     thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1); // DUP with label
 u32      thvm_fresh_label(TinyHVM *ctx);                     // allocate next label

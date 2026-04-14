@@ -12,19 +12,26 @@ clang -O0 -g \
   -framework Metal -framework MetalPerformanceShaders -framework Foundation -framework Accelerate \
   -o "$BIN" "$TEST" 2>&1 | grep -v warning || true
 
-# Run for multiple step counts
+# Clean stale loop graph dumps so each run is unambiguous.
+rm -rf thvm_steps
+rm -rf phase1_graphs/loop_assign_simple/n*_steps
+rm -f phase1_graphs/loop_assign_simple/n*_pre_reduce.dot \
+      phase1_graphs/loop_assign_simple/n*_post_reduce.dot \
+      phase1_graphs/loop_assign_simple/n*_pre_reduce.png \
+      phase1_graphs/loop_assign_simple/n*_post_reduce.png
+rm -f phase2_graphs/loop_assign_simple/n*_post_dispatch.dot \
+      phase2_graphs/loop_assign_simple/n*_post_dispatch.png
+
+# Full-eval step graph checks (includes FUSE/dispatch interactions in sequence).
 FAIL=0
-for n in 0 1 2; do
+for n in 0 1 2 3; do
   echo "=== n=$n ==="
-  rm -rf thvm_steps
-  THVM_TRAIN_STEPS=$n THVM_STEP_GRAPH=1 THVM_STEP_GRAPH_NO_PNG=1 \
+  STEP_DIR="phase1_graphs/loop_assign_simple/n${n}_steps"
+  rm -rf "$STEP_DIR"
+  THVM_TRAIN_STEPS=$n THVM_STEP_GRAPH=1 THVM_STEP_GRAPH_DIR="$STEP_DIR" \
     timeout 30 "$BIN" 2>&1 | tail -3
-  if ! python3 scripts/check_step_graphs.py thvm_steps; then
-    if [ "$n" -eq 0 ]; then
-      echo "  (n=0 base case has known ERA cleanup issues — continuing)"
-    else
-      FAIL=1
-    fi
+  if ! python3 scripts/check_step_graphs.py "$STEP_DIR"; then
+    FAIL=1
   fi
 done
 

@@ -42,6 +42,24 @@ static inline u32 reduce_top_arity(u32 uop) {
     return 2;
 }
 
+static inline int reduce_term_is_active_era_like(TinyHVM *ctx, Term t, Term *era_out) {
+    if (term_tag(t) == TAG_ERA && term_val(t) != 0) {
+        if (era_out) *era_out = t;
+        return 1;
+    }
+    if (term_tag(t) == TAG_VAR) {
+        u64 loc = term_val(t);
+        if (loc < ctx->heap_pos) {
+            Term sub = heap_read(ctx, loc);
+            if (term_tag(sub) == TAG_ERA && term_val(sub) != 0) {
+                if (era_out) *era_out = sub;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static inline int reduce_top_has_era_arg(TinyHVM *ctx, Term t) {
     if (term_tag(t) != TAG_TOP) return 0;
     u32 uop = term_ext(t);
@@ -51,7 +69,7 @@ static inline int reduce_top_has_era_arg(TinyHVM *ctx, Term t) {
     u32 arity = reduce_top_arity(uop);
     for (u32 i = 0; i < arity; i++) {
         Term child = heap_read(ctx, loc + i);
-        if (term_tag(child) == TAG_ERA) return 1;
+        if (reduce_term_is_active_era_like(ctx, child, NULL)) return 1;
     }
     return 0;
 }
@@ -83,6 +101,7 @@ static inline u32 reduce_net_term_arity(Term t) {
         case TAG_APP:
         case TAG_LAM:
         case TAG_BRI:
+        case TAG_SEQ:
         case TAG_SUP:
         case TAG_USP:
         case TAG_OP2:
@@ -406,6 +425,20 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
         PUSH(next);
         next = heap_read(ctx, loc + 0);
         goto enter;
+    }
+
+    if (tag == TAG_VAR) {
+        u64 loc = term_val(next);
+        if (loc < ctx->heap_pos) {
+            Term sub = heap_read(ctx, loc);
+            if (term_tag(sub) == TAG_ERA && term_val(sub) != 0) {
+                // Treat binder-erased VARs as administrative substitution so
+                // the parent redex sees ERA immediately instead of producing a
+                // separate VAR-only step.
+                whnf = sub;
+                goto apply;
+            }
+        }
     }
 
     {

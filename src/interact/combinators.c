@@ -73,7 +73,7 @@
                 }
                 heap_set(ctx, lam_loc, arg);      // link: write arg at var slot
                 ctx->itrs++;
-                t = heap_read(ctx, lam_loc + 1);  // body
+                t = heap_read(ctx, lam_loc + 1);  // body (may be ALO; let it interact explicitly next)
                 INET_RECURSE();
             }
             // APP-TEN: discard tensor, return arg (sequencing)
@@ -204,6 +204,8 @@
                 switch ((_tg)) { \
                     case TAG_TOP: \
                         if ((_ext) == UOP_KERNEL) _ar = 0; \
+                        else if ((_ext) == UOP_FUSE || (_ext) == UOP_SCHED) _ar = 1; \
+                        else if ((_ext) == UOP_FUSE2) _ar = 3; \
                         else if ((_ext) == UOP_WHERE || (_ext) == UOP_IFZ) _ar = 3; \
                         else if ((_ext) == UOP_GRAD) _ar = 2; \
                         else if ((_ext) == UOP_LOG_PRINT || (_ext) == UOP_DETACH) _ar = 1; \
@@ -213,6 +215,7 @@
                     case TAG_APP: \
                     case TAG_LAM: \
                     case TAG_BRI: \
+                    case TAG_SEQ: \
                     case TAG_SUP: \
                     case TAG_USP: \
                     case TAG_OP2: \
@@ -221,6 +224,7 @@
                     case TAG_OR: \
                     case TAG_MAT: \
                     case TAG_ANN: \
+                    case TAG_ALO: \
                         _ar = 2; \
                         break; \
                     case TAG_DSU: \
@@ -261,6 +265,25 @@
                     heap_set(ctx, dl, term_era());
                 }
                 goto era_done;
+            } else if (vtag == TAG_VAR) {
+                // ERA ⊳ VAR erases the binder-input cell (VAR slot), not an
+                // arbitrary consumer edge. If VAR is already substituted, keep
+                // erasing through the resolved value.
+                if (vval >= ctx->heap_pos) goto era_done;
+                Term sub = heap_read(ctx, vval);
+                if (term_is_sub(sub)) {
+                    // Binder still unsubstituted: materialize active ERA only in the
+                    // binder cell (local rule). Consumer VAR@loc sites stay as VAR
+                    // until they reduce and read the slot (see TAG_VAR path).
+                    u64 el2 = heap_alloc(ctx, 1);
+                    heap_set(ctx, el2, term_era());
+                    heap_set(ctx, vval, term_era_at(el2));
+                    goto era_done;
+                }
+                next = thvm_era_payload(ctx, sub);
+                if (!(term_tag(next) == TAG_ERA && term_val(next) == 0))
+                    goto era_continue;
+                goto era_done;
             } else if (vtag == TAG_TEN) {
                 tensor_release(ctx, (u32)vval);
                 goto era_done;
@@ -269,6 +292,7 @@
                 if (vval < ctx->heap_pos) {
                     for (u32 i = 0; i < ar; i++) {
                         Term child = thvm_era_payload(ctx, heap_read(ctx, vval + i));
+                        heap_set(ctx, vval + i, term_era());
                         if (term_tag(child) == TAG_ERA && term_val(child) == 0) continue;
                         if (!have_next) {
                             next = child;
@@ -284,6 +308,7 @@
                 if (ar > 0 && vval < ctx->heap_pos) {
                     for (u32 i = 0; i < ar; i++) {
                         Term child = thvm_era_payload(ctx, heap_read(ctx, vval + i));
+                        heap_set(ctx, vval + i, term_era());
                         if (term_tag(child) == TAG_ERA && term_val(child) == 0) continue;
                         if (!have_next) {
                             next = child;
@@ -307,13 +332,21 @@ era_continue:
             return term_new(TAG_ERA, term_ext(t) ^ 1u, era_loc);
         }
 
-        // TAG_REF: unfold definition — clone body for fresh variable bindings.
-        // TODO: optimize for loops — clone only lambda scaffolding, share compute.
+        // TAG_REF: convert named definition reference into lazy allocation frontier.
         case TAG_REF: {
             u32 name = (u32)term_ext(t);
             assert(name < ctx->def_count);
+            if (ctx->def_books[name] == 0)
+                ctx->def_books[name] = thvm_book_from_dynamic(ctx, ctx->defs[name]);
             ctx->itrs++;
-            t = term_clone(ctx, ctx->defs[name]);
+            t = thvm_alo_realize(ctx, ctx->def_books[name], 0);
+            INET_RECURSE();
+        }
+
+        // TAG_ALO: force exactly one static/book layer into dynamic net.
+        case TAG_ALO: {
+            ctx->itrs++;
+            t = thvm_alo_force(ctx, t);
             INET_RECURSE();
         }
 
@@ -622,6 +655,13 @@ era_continue:
             u64 loc = term_val(t);
             Term sub = heap_read(ctx, loc);
             if (term_is_sub(sub)) return t;
+            if (term_tag(sub) == TAG_ERA && term_val(sub) != 0) {
+                // Each consumer gets its own local active ERA, but collapse
+                // through any ERA indirection first so VAR substitution does
+                // not manufacture ERA->ERA shells.
+                ctx->itrs++;
+                return thvm_make_active_era(ctx, sub);
+            }
             if (term_tag(sub) == TAG_TOP && term_ext(sub) == UOP_DETACH) {
                 Term forced = thvm_force_tensor_term(ctx, sub);
                 if (term_tag(forced) == TAG_TEN) {

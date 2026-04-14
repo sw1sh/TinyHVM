@@ -2,8 +2,14 @@ TinyHVM *thvm_init(const char *default_device) {
     TinyHVM *ctx = calloc(1, sizeof(TinyHVM));
     ctx->tensors = calloc(MAX_TENSORS, sizeof(TensorMeta));
     ctx->heap = calloc(HEAP_CAP, sizeof(Term));
+    ctx->book_heap_cap = (1u << 20);
+    ctx->book_heap = calloc((size_t)ctx->book_heap_cap, sizeof(Term));
+    ctx->book_heap_pos = 1;
     ctx->dup_ports = calloc(DUP_PORT_CAP, sizeof(DupPortEntry));
     ctx->sched_rewrites = calloc(SCHED_REWRITE_CAP, sizeof(SchedRewriteEntry));
+    ctx->alo_state_cap = (1u << 16);
+    ctx->alo_states = calloc(ctx->alo_state_cap, sizeof(AloState));
+    ctx->alo_state_count = 1; // 0 = empty root state
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();  // sentinel: prevent TAG_APP(0) self-loop
     ctx->tensor_count = 1;      // reserve tensor 0 as sentinel (0 = "no tensor")
@@ -70,8 +76,10 @@ void thvm_free(TinyHVM *ctx) {
     free(ctx->trace_buf);
     free(ctx->tensors);
     free(ctx->heap);
+    free(ctx->book_heap);
     free(ctx->dup_ports);
     free(ctx->sched_rewrites);
+    free(ctx->alo_states);
     free(ctx);
     // Clear stale DUP tracking — TAG_TEN terms encode low tensor IDs
     // (0,1,2...) that collide across ctx instances.
@@ -116,6 +124,10 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
     ctx->heap[0] = term_era();
     if (ctx->dup_ports) memset(ctx->dup_ports, 0, DUP_PORT_CAP * sizeof(DupPortEntry));
     if (ctx->sched_rewrites) memset(ctx->sched_rewrites, 0, SCHED_REWRITE_CAP * sizeof(SchedRewriteEntry));
+    if (ctx->alo_states) {
+        memset(ctx->alo_states, 0, (size_t)ctx->alo_state_cap * sizeof(AloState));
+        ctx->alo_state_count = 1;
+    }
     // Clear shape tracker — stale entries from old heap locs cause wrong
     // view compositions after heap reuse.
     memset(st_keys, 0, sizeof(st_keys));

@@ -588,12 +588,26 @@
             // counter==0 → zero_case; counter>0 → APP(succ_lam, TEN(counter-1))
             if (uop == UOP_IFZ) {
                 Term ctr = heap_read(ctx, loc); // WNF from trampoline
+                Term ctr_era = ctr;
+                if (thvm_term_is_active_era_like(ctx, ctr, &ctr_era))
+                    ctr = ctr_era;
+                Term zero_case = heap_read(ctx, loc + 1);
+                Term succ_lam = heap_read(ctx, loc + 2);
+                if (term_tag(ctr) == TAG_ERA) {
+                    heap_set(ctx, loc + 0, term_era());
+                    heap_set(ctx, loc + 1, term_era());
+                    heap_set(ctx, loc + 2, term_era());
+                    if (term_val(ctr) != 0) {
+                        thvm_spawn_detached_era(ctx, zero_case);
+                        thvm_spawn_detached_era(ctx, succ_lam);
+                    }
+                    ctx->itrs++;
+                    RETURN_REDUCED(term_val(ctr) != 0 ? ctr : term_era());
+                }
                 if (term_tag(ctr) != TAG_TEN) RETURN_REDUCED(term_era());
                 u32 ctr_dtype = ctx->tensors[(u32)term_val(ctr)].dtype;
                 void *val = thvm_to_host_raw(ctx, ctr, &ctr_dtype, NULL);
                 f32 ctr_val = val ? dtype_load_as_f32(val, ctr_dtype, 0) : 0.0f;
-                Term zero_case = heap_read(ctx, loc + 1);
-                Term succ_lam = heap_read(ctx, loc + 2);
                 if (getenv("THVM_LOOP_DIAG")) {
                     fprintf(stderr,
                             "IFZ loc=%llu ctr=%.3f zero_tag=%u succ_tag=%u succ_val=%llu\n",
@@ -672,17 +686,24 @@
                 heap_set(ctx, loc + 1, b);
             }
             Term b_arg = has_aux ? heap_read(ctx, loc + 1) : term_era();
+            Term a_era = a;
+            Term b_era = b_arg;
+            int a_era_like = thvm_term_is_active_era_like(ctx, a, &a_era);
+            int b_era_like = has_aux && thvm_term_is_active_era_like(ctx, b_arg, &b_era);
 
             // Strict ERA commutation for lazy UOP nodes:
             // if any aux port is ERA, the UOP disappears and ERA propagates to
             // all remaining aux payloads as explicit future interactions.
-            if (term_tag(a) == TAG_ERA || (has_aux && term_tag(b_arg) == TAG_ERA)) {
-                int a_has_era = term_tag(a) == TAG_ERA;
-                int b_has_era = has_aux && term_tag(b_arg) == TAG_ERA;
-                int a_is_active_era = a_has_era && term_val(a) != 0;
-                int b_is_active_era = b_has_era && term_val(b_arg) != 0;
-                Term era_term = a_has_era ? a : b_arg;
-                Term other = a_has_era ? b_arg : a;
+            if (term_tag(a) == TAG_ERA || (has_aux && term_tag(b_arg) == TAG_ERA) ||
+                a_era_like || b_era_like) {
+                int a_has_era = term_tag(a) == TAG_ERA || a_era_like;
+                int b_has_era = has_aux && (term_tag(b_arg) == TAG_ERA || b_era_like);
+                Term a_term = a_era_like ? a_era : a;
+                Term b_term = b_era_like ? b_era : b_arg;
+                int a_is_active_era = a_has_era && term_tag(a_term) == TAG_ERA && term_val(a_term) != 0;
+                int b_is_active_era = b_has_era && term_tag(b_term) == TAG_ERA && term_val(b_term) != 0;
+                Term era_term = a_has_era ? a_term : b_term;
+                Term other = a_has_era ? b_term : a_term;
                 // ADD treats an erased branch as additive zero: drop the ADD,
                 // preserve the other branch, and let the ERA continue erasing
                 // its own payload as a detached interaction.
@@ -691,10 +712,10 @@
                     heap_set(ctx, loc + 1, term_era());
                     if (a_has_era && b_has_era) {
                         if (a_is_active_era && b_is_active_era)
-                            thvm_spawn_detached_era(ctx, b_arg);
+                            thvm_spawn_detached_era(ctx, b_term);
                         ctx->itrs++;
-                        if (a_is_active_era) RETURN_REDUCED(a);
-                        if (b_is_active_era) RETURN_REDUCED(b_arg);
+                        if (a_is_active_era) RETURN_REDUCED(a_term);
+                        if (b_is_active_era) RETURN_REDUCED(b_term);
                         RETURN_REDUCED(term_era());
                     }
                     if (a_is_active_era || b_is_active_era)
@@ -710,9 +731,9 @@
                 ctx->itrs++;
                 if (a_has_era && b_has_era) {
                     if (a_is_active_era && b_is_active_era)
-                        thvm_spawn_detached_era(ctx, b_arg);
-                    if (a_is_active_era) RETURN_REDUCED(a);
-                    if (b_is_active_era) RETURN_REDUCED(b_arg);
+                        thvm_spawn_detached_era(ctx, b_term);
+                    if (a_is_active_era) RETURN_REDUCED(a_term);
+                    if (b_is_active_era) RETURN_REDUCED(b_term);
                     RETURN_REDUCED(term_era());
                 }
                 RETURN_REDUCED(era_term);

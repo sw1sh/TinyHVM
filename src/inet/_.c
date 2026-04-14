@@ -83,10 +83,147 @@ u32 thvm_fresh_label(TinyHVM *ctx) {
     return ctx->next_sup_label++;
 }
 
+typedef struct { u64 old_loc; u64 new_loc; } BookReloc;
+static u64 thvm_book_heap_alloc(TinyHVM *ctx, u32 n) {
+    if (n == 0) return 0;
+    if (!ctx->book_heap) {
+        ctx->book_heap_cap = (1u << 20);
+        ctx->book_heap = (Term *)calloc((size_t)ctx->book_heap_cap, sizeof(Term));
+        ctx->book_heap_pos = 1;
+    }
+    if (ctx->book_heap_pos + n >= ctx->book_heap_cap) {
+        u64 need = ctx->book_heap_pos + n + 1;
+        u64 cap = ctx->book_heap_cap ? ctx->book_heap_cap : (1u << 20);
+        while (cap < need) cap <<= 1;
+        ctx->book_heap = (Term *)realloc(ctx->book_heap, (size_t)cap * sizeof(Term));
+        memset(ctx->book_heap + ctx->book_heap_cap, 0, (size_t)(cap - ctx->book_heap_cap) * sizeof(Term));
+        ctx->book_heap_cap = cap;
+    }
+    u64 loc = ctx->book_heap_pos;
+    ctx->book_heap_pos += n;
+    return loc;
+}
+
+static inline u32 thvm_book_top_arity(u32 ext) {
+    if (ext == UOP_KERNEL) return 0;
+    if (ext == UOP_FUSE || ext == UOP_SCHED) return 1;
+    if (ext == UOP_FUSE2) return 3;
+    if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
+    if (ext == UOP_GRAD) return 2;
+    if (ext == UOP_LOG_PRINT) return 1;
+    if (ext == UOP_DETACH) return 1;
+    if (!is_binary(ext) && is_elementwise(ext)) return 1;
+    return 2;
+}
+
+static inline u32 thvm_book_term_arity(Term t) {
+    switch (term_tag(t)) {
+        case TAG_APP:
+        case TAG_LAM:
+        case TAG_BRI:
+        case TAG_SEQ:
+        case TAG_SUP:
+        case TAG_USP:
+        case TAG_OP2:
+        case TAG_EQL:
+        case TAG_AND:
+        case TAG_OR:
+        case TAG_MAT:
+        case TAG_ANN:
+            return 2;
+        case TAG_DSU:
+        case TAG_DDU:
+            return 3;
+        case TAG_INC:
+        case TAG_UDP:
+            return 1;
+        case TAG_CTR:
+            return term_ext(t);
+        case TAG_TOP:
+            return thvm_book_top_arity(term_ext(t));
+        default:
+            return 0;
+    }
+}
+
+static Term thvm_book_from_dynamic_r(TinyHVM *ctx, Term t,
+                                     BookReloc *relocs, u32 *n_relocs) {
+    u8 tag = term_tag(t);
+    switch (tag) {
+        case TAG_NUM:
+        case TAG_ERA:
+        case TAG_TEN:
+        case TAG_REF:
+        case TAG_ANY:
+            return t;
+        case TAG_VAR: {
+            u64 old_loc = term_val(t);
+            for (u32 i = 0; i < *n_relocs; i++) {
+                if (relocs[i].old_loc == old_loc)
+                    return term_new(TAG_VAR, term_ext(t), relocs[i].new_loc);
+            }
+            if (old_loc < ctx->heap_pos) {
+                Term sub = heap_read(ctx, old_loc);
+                if (!term_is_sub(sub))
+                    return thvm_book_from_dynamic_r(ctx, sub, relocs, n_relocs);
+            }
+            return t;
+        }
+        case TAG_LAM:
+        case TAG_BRI: {
+            u64 old_loc = term_val(t);
+            u64 new_loc = thvm_book_heap_alloc(ctx, 2);
+            if (*n_relocs < 4096) relocs[(*n_relocs)++] = (BookReloc){old_loc, new_loc};
+            Term var = term_new(TAG_VAR, 0, new_loc);
+            ctx->book_heap[new_loc + 0] = term_set_sub(var);
+            ctx->book_heap[new_loc + 1] = thvm_book_from_dynamic_r(ctx, heap_read(ctx, old_loc + 1),
+                                                                    relocs, n_relocs);
+            Term out = term_new(tag, term_ext(t), new_loc);
+            return out;
+        }
+        case TAG_DP0:
+        case TAG_DP1: {
+            u64 old_loc = term_val(t);
+            u64 new_loc = 0;
+            for (u32 i = 0; i < *n_relocs; i++) {
+                if (relocs[i].old_loc == old_loc) { new_loc = relocs[i].new_loc; break; }
+            }
+            if (!new_loc) {
+                new_loc = thvm_book_heap_alloc(ctx, 1);
+                if (*n_relocs < 4096) relocs[(*n_relocs)++] = (BookReloc){old_loc, new_loc};
+                ctx->book_heap[new_loc] = thvm_book_from_dynamic_r(ctx, heap_read(ctx, old_loc),
+                                                                    relocs, n_relocs);
+            }
+            Term out = term_new(tag, term_ext(t), new_loc);
+            return out;
+        }
+        default: {
+            u32 ar = thvm_book_term_arity(t);
+            if (ar == 0) return t;
+            u64 old_loc = term_val(t);
+            u64 new_loc = thvm_book_heap_alloc(ctx, ar);
+            for (u32 i = 0; i < ar; i++) {
+                ctx->book_heap[new_loc + i] = thvm_book_from_dynamic_r(ctx, heap_read(ctx, old_loc + i),
+                                                                        relocs, n_relocs);
+            }
+            Term out = term_new(tag, term_ext(t), new_loc);
+            return out;
+        }
+    }
+}
+
+Term thvm_book_from_dynamic(TinyHVM *ctx, Term body) {
+    if (body == 0) return 0;
+    BookReloc relocs[4096];
+    u32 n_relocs = 0;
+    return thvm_book_from_dynamic_r(ctx, body, relocs, &n_relocs);
+}
+
 u32 thvm_define(TinyHVM *ctx, Term body) {
     assert(ctx->def_count < 256);
     u32 name = ctx->def_count++;
     ctx->defs[name] = body;
+    ctx->def_books[name] = thvm_book_from_dynamic(ctx, body);
     return name;
 }
 

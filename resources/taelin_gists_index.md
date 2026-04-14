@@ -25,6 +25,7 @@
 | `flattener.hs` | `1a7c87e9...` | 0 | Flattener (Haskell, IC-related) |
 | `icc_spec.md` | `c360b392...` | — | **ICC** — Interaction Calculus of Constructions (bridges, annotations, type encodings) |
 | `icc_type_checker.ts` | `dd291148...` | — | ITT-flavored CoC type checker (TS, uses Slf/Ann instead of Bri/Ann) |
+| `par_tree_sum_bend2_compiled.c` | `f2c4440c...` | — | **Bend2 sample codegen** — `par_tree_sum.bend` → parallel pthread C (split/join tasks, join points in heap) |
 
 ## HigherOrderCO Key Repos
 

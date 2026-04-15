@@ -166,10 +166,13 @@ static int thvm_public_kernel_absorb_child(TinyHVM *ctx, Term child, Term *out, 
 
 static Term thvm_make_public_kernel_from_uop(TinyHVM *ctx, u32 uop, Term left, Term right, Term shape_src) {
     if (!ctx || uop >= UOP_COUNT) return 0;
+    // Absorb child kernels inline (KERNEL/KERNEL fusion); for FUSE-wrapped or
+    // unsettled children, store them as-is — the inner FUSE will fire later
+    // and the outer kernel's payload slot will be rewritten in place.
     Term raw_left = left;
     Term raw_right = right;
-    if (!thvm_public_kernel_absorb_child(ctx, left, &raw_left, 0)) return 0;
-    if (!thvm_public_kernel_absorb_child(ctx, right, &raw_right, 0)) return 0;
+    (void)thvm_public_kernel_absorb_child(ctx, left, &raw_left, 0);
+    (void)thvm_public_kernel_absorb_child(ctx, right, &raw_right, 0);
     int unary = (!is_binary(uop) && is_elementwise(uop) && term_tag(right) == TAG_ERA);
     u64 ploc = heap_alloc(ctx, unary ? 1 : 2);
     heap_set(ctx, ploc + 0, raw_left);
@@ -191,7 +194,7 @@ static Term thvm_fuse_public_term(TinyHVM *ctx, Term t, u32 depth) {
 
     if (is_binary(uop)) {
         if (loc + 1 >= ctx->heap_pos) return t;
-        return thvm_make_growing_kernel_from_uop(
+        return thvm_make_public_kernel_from_uop(
             ctx, uop,
             thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0)),
             thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 1)),
@@ -200,7 +203,7 @@ static Term thvm_fuse_public_term(TinyHVM *ctx, Term t, u32 depth) {
     }
 
     if (is_elementwise(uop)) {
-        return thvm_make_growing_kernel_from_uop(
+        return thvm_make_public_kernel_from_uop(
             ctx, uop,
             thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0)),
             term_era(),
@@ -210,7 +213,7 @@ static Term thvm_fuse_public_term(TinyHVM *ctx, Term t, u32 depth) {
 
     if (uop == UOP_SUM || uop == UOP_RMAX || is_view_op(uop)) {
         if (loc + 1 >= ctx->heap_pos) return t;
-        return thvm_make_growing_kernel_from_uop(
+        return thvm_make_public_kernel_from_uop(
             ctx, uop,
             thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0)),
             heap_read(ctx, loc + 1),

@@ -95,6 +95,23 @@
                         return t;
                     RETURN_REDUCED(thvm_seq(ctx, left, right));
                 }
+                if (!thvm_kernel_is_monolithic(ctx, t)) {
+                    if (!thvm_kernel_local_child_ready(ctx, left) ||
+                        !thvm_kernel_local_child_ready(ctx, right))
+                        return t;
+                    Term settled = thvm_make_public_kernel_from_uop(ctx, kernel_uop, left, right, t);
+                    if (!settled) return t;
+                    if (getenv("THVM_SCHED_DIAG"))
+                        fprintf(stderr, "KERNEL_SETTLE: op=%s tag=%u ext=%u val=%llu\n",
+                                uop_names[kernel_uop], term_tag(settled), term_ext(settled),
+                                (unsigned long long)term_val(settled));
+                    RETURN_REDUCED(settled);
+                }
+                // KERNEL stays a DAG node in phase-1 — only phase-2 (which sets
+                // dispatch_enabled) is allowed to lower (register) and dispatch it.
+                // KERNEL/KERNEL fusion above (the !monolithic settle path) still
+                // runs unconditionally so the DAG can grow during phase-1.
+                if (!ctx->dispatch_enabled) return t;
                 u32 kid = 0;
                 if (!thvm_kernel_register(ctx, t, &kid)) {
                     Term compute = term_era();
@@ -197,6 +214,7 @@
                     if (!thvm_kernel_child_ready(d0) || !thvm_kernel_child_ready(d1))
                         return t;  // deps not ready
                 }
+                if (!ctx->dispatch_enabled) return t;
                 u32 kid = term_as_u32(kid_term);
                 if (kid >= sched_kernel_count) {
                     RETURN_REDUCED(term_era());
@@ -250,7 +268,7 @@
                 }
 
                 // --- Entry FUSE(payload): propagate ---
-                // (No unary FUSE(op,child) form — use FUSE2 for all ops)
+                // FUSE remains a single-slot propagating marker.
                 Term payload = slot0;
                 u8 ptag = term_tag(payload);
 
@@ -262,7 +280,7 @@
                     u32 puop = term_ext(payload);
 
                     // Already fused/meta — pass through
-                    if (puop == UOP_KERNEL || puop == UOP_FUSE || puop == UOP_FUSE2)
+                    if (puop == UOP_KERNEL || puop == UOP_FUSE)
                         RETURN_REDUCED(payload);
 
                     // ASSIGN: wrap src in FUSE, return ASSIGN.
@@ -278,50 +296,19 @@
                         RETURN_REDUCED(payload);
                     }
 
-                    // Binary compute: keep one structural root kernel boundary.
-                    // Child compute subtrees stay raw and are flattened by
-                    // thvm_kernel_to_compute()/fuse_build_kernel at dispatch time.
-                    if (is_binary(puop)) {
-                        u64 ploc = term_val(payload);
-                        Term a = heap_read(ctx, ploc);
-                        Term b = heap_read(ctx, ploc + 1);
-                        u64 kloc = heap_alloc(ctx, 3);
-                        heap_set(ctx, kloc + 0, a);
-                        heap_set(ctx, kloc + 1, b);
-                        heap_set(ctx, kloc + 2, term_num_u32(puop));
-                        { Term _r = term_new(TAG_TOP, UOP_KERNEL, kloc);
-                          if (getenv("THVM_SCHED_DIAG"))
-                              fprintf(stderr, "FUSE→KERNEL: op=%s tag=%u ext=%u val=%llu\n",
-                                      uop_names[puop], term_tag(_r), term_ext(_r),
-                                      (unsigned long long)term_val(_r));
-                          RETURN_REDUCED(_r); }
-                    }
-
-                    // True unary ops: absorb → KERNEL(FUSE(child), ERA, op)
-                    if (is_elementwise(puop)) {
-                        u64 ploc = term_val(payload);
-                        Term child = heap_read(ctx, ploc);
-                        u64 fc = heap_alloc(ctx, 1); heap_set(ctx, fc, child);
-                        u64 kloc = heap_alloc(ctx, 3);
-                        heap_set(ctx, kloc + 0, term_new(TAG_TOP, UOP_FUSE, fc));
-                        heap_set(ctx, kloc + 1, term_era());
-                        heap_set(ctx, kloc + 2, term_num_u32(puop));
-                        RETURN_REDUCED(term_new(TAG_TOP, UOP_KERNEL, kloc));
-                    }
-
-                    // View/reduction ops keep their metadata operand visible so
-                    // the traced graph still carries shape/axes semantics.
-                    if (puop == UOP_SUM || puop == UOP_RMAX ||
+                    // Compute-like payloads first become growing public KERNEL
+                    // carriers so local step traces expose region buildup.
+                    if (is_elementwise(puop) || puop == UOP_SUM || puop == UOP_RMAX ||
                         (puop >= UOP_RESHAPE && puop <= UOP_PAD)) {
-                        u64 ploc = term_val(payload);
-                        Term child = heap_read(ctx, ploc);
-                        Term meta  = heap_read(ctx, ploc + 1);
-                        u64 fc = heap_alloc(ctx, 1); heap_set(ctx, fc, child);
-                        u64 kloc = heap_alloc(ctx, 3);
-                        heap_set(ctx, kloc + 0, term_new(TAG_TOP, UOP_FUSE, fc));
-                        heap_set(ctx, kloc + 1, meta);
-                        heap_set(ctx, kloc + 2, term_num_u32(puop));
-                        RETURN_REDUCED(term_new(TAG_TOP, UOP_KERNEL, kloc));
+                        Term public_term = thvm_fuse_public_term(ctx, payload, 0);
+                        if (getenv("THVM_SCHED_DIAG") &&
+                            term_tag(public_term) == TAG_TOP &&
+                            term_ext(public_term) == UOP_KERNEL) {
+                            fprintf(stderr, "FUSE→KERNEL: op=%s tag=%u ext=%u val=%llu\n",
+                                    uop_names[puop], term_tag(public_term), term_ext(public_term),
+                                    (unsigned long long)term_val(public_term));
+                        }
+                        RETURN_REDUCED(public_term);
                     }
 
                     // Other TAG_TOP: pass through
@@ -364,18 +351,6 @@
 
                 // Default: pass through
                 RETURN_REDUCED(payload);
-            }
-
-            // ── UOP_FUSE2: deprecated compatibility shim ────────────────
-            if (uop == UOP_FUSE2) {
-                u32 fop = term_as_u32(heap_read(ctx, loc));
-                Term left  = heap_read(ctx, loc + 1);
-                Term right = heap_read(ctx, loc + 2);
-                u64 kloc = heap_alloc(ctx, 3);
-                heap_set(ctx, kloc + 0, left);
-                heap_set(ctx, kloc + 1, right);
-                heap_set(ctx, kloc + 2, term_num_u32(fop));
-                RETURN_REDUCED(term_new(TAG_TOP, UOP_KERNEL, kloc));
             }
 
             if (uop == UOP_TODEVICE) {
@@ -850,7 +825,7 @@
             TensorMeta *ma = &ctx->tensors[a_id];
 
             if (uop == UOP_CAST) {
-                if (!ctx->dispatch_mode) return t;
+                if (!ctx->dispatch_enabled) return t;
                 u32 arg_dtype = DTYPE_U32;
                 void *dtype_raw = thvm_to_host_raw(ctx, b, &arg_dtype, NULL);
                 if (!dtype_raw) RETURN_REDUCED(term_era());

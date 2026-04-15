@@ -155,7 +155,7 @@ typedef u64 Term;
 
 // Fusion signals (propagating IC agents):
 #define UOP_FUSE      31   // propagating fuse marker: FUSE(payload)
-#define UOP_FUSE2     32   // deprecated compatibility shim; runtime no longer produces it
+#define UOP_LEGACY32  32   // reserved legacy opcode slot; no live IR should produce it
 #define UOP_EXEC      33   // executable kernel trigger: EXEC(NUM(kid), deps, NUM(flags))
                            // installed by global compiler passes; fires JIT/dispatch on reduce
 
@@ -169,7 +169,7 @@ static const char *uop_names[] = {
     "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
     "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","KERNEL","ASSIGN","WHERE",
-    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","FUSE2","EXEC"
+    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","LEGACY32","EXEC"
 };
 
 // ============================================================
@@ -1085,7 +1085,10 @@ typedef struct TinyHVM_s {
     u8          no_grad_alloc; // keep movement/view ops lazy instead of allocating TEN aliases
     u8          no_dup;     // 1 to skip linear_use DUP (used inside GRAD handler)
     u8          defer_all;   // (legacy, unused)
-    u8          dispatch_mode; // (legacy, unused)
+    u8          dispatch_enabled; // 1 to allow KERNEL→TEN dispatch + register in interaction net
+                                   // (phase-2 sets this around the FUSE-driven reduce; phase-1
+                                   // and tracing leave it 0 so KERNELs stay as DAG nodes that
+                                   // can still fuse with each other but never lower/exec).
     u8          step_graph_consumed;   // outermost THVM_STEP_GRAPH session already used
     u8          coarse_graph_consumed; // outermost THVM_GRAPH session already used
     u8          step_graph_settled_replay; // post-trace eval used only to settle/lower real execution

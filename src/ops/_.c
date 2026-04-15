@@ -37,9 +37,9 @@ static Term thvm_force_tensor_term(TinyHVM *ctx, Term t) {
     }
     t = thvm_reduce(ctx, t);
     if (term_tag(t) != TAG_TEN) {
-        ctx->dispatch_mode = 1;
+        ctx->dispatch_enabled = 1;
         t = thvm_reduce(ctx, t);
-        ctx->dispatch_mode = 0;
+        ctx->dispatch_enabled = 0;
     }
     if (thvm_is_view_top(t))
         t = thvm_force_view_chain(ctx, t);

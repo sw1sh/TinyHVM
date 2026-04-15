@@ -970,7 +970,9 @@ static Term thvm_eval_reduce_fused(TinyHVM *ctx, Term t) {
     heap_set(ctx, fuse_loc, t);
     Term fuse_term = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
     ctx->step_budget = 1000000;  // suppress quiesce (budget>0 → no quiesce)
+    ctx->dispatch_enabled = 1;   // phase-2: allow KERNEL register + dispatch
     t = thvm_reduce(ctx, fuse_term);
+    ctx->dispatch_enabled = 0;
     ctx->step_budget = 0;
     return t;
 }
@@ -1038,12 +1040,6 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
             ctx->trace_enabled = saved_en;
 
             if (did_fire) {
-                // Phase-1 NF check: if the root just collapsed from a KERNEL
-                // (or other compute term) to a TEN, that was the kernel-dispatch
-                // interaction (phase-2). Don't apply it — leave traced as the
-                // pre-dispatch KERNEL DAG so finalize snapshots the NF.
-                if (term_tag(result) == TAG_TEN && term_tag(traced) != TAG_TEN)
-                    break;
                 traced = result;
                 if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
                     heap_set(ctx, phase1_root_slot, traced);
@@ -1987,7 +1983,9 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
             heap_set(ctx, fuse_loc, traced);
             Term fuse_term = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
             ctx->step_budget = 1000000;  // suppress quiesce (budget>0 → no quiesce)
+            ctx->dispatch_enabled = 1;
             traced = thvm_reduce(ctx, fuse_term);
+            ctx->dispatch_enabled = 0;
             ctx->step_budget = 0;
         }
         traced = thvm_phase1_seed_root_grad(ctx, traced);
@@ -2011,7 +2009,9 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         // Phase 3: second reduce for exec triggers.
         if (ctx->n_compiler_passes > 0) {
             ctx->step_budget = 1000000;
+            ctx->dispatch_enabled = 1;
             traced = thvm_reduce(ctx, traced);
+            ctx->dispatch_enabled = 0;
             ctx->step_budget = 0;
         }
         traced = thvm_phase1_seed_root_grad(ctx, traced);

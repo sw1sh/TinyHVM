@@ -468,3 +468,15 @@ static NSString *uop_render_msl(const UOpKernel *k) {
     [s appendString:@"}\n"];
     return s;
 }
+
+static char *thvm_metal_render_uop_kernel_source(const UOpKernel *k) {
+    if (!k) return NULL;
+    NSString *src = uop_render_msl(k);
+    const char *utf8 = [src UTF8String];
+    if (!utf8) return NULL;
+    size_t n = strlen(utf8);
+    char *out = (char *)malloc(n + 1);
+    if (!out) return NULL;
+    memcpy(out, utf8, n + 1);
+    return out;
+}

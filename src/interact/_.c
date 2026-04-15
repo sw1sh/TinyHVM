@@ -59,6 +59,7 @@ static void thvm_spawn_detached_era(TinyHVM *ctx, Term item) {
 
 static u32 thvm_uop_storage_arity(u32 ext) {
     if (ext == UOP_KERNEL) return 3;
+    if (ext == UOP_EXEC) return 3;   // [NUM(kid), deps, NUM(flags)]
     if (ext == UOP_FUSE) return 1;
     if (ext == UOP_FUSE2) return 3;
     if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
@@ -122,11 +123,35 @@ static int thvm_kernel_child_ready(Term t) {
     if (tag == TAG_DP0 || tag == TAG_DP1) return 0;
     if (tag == TAG_TOP) {
         u32 ext = term_ext(t);
-        return ext != UOP_FUSE;
+        if (ext == UOP_FUSE) return 0;
+        // Child UOP_KERNEL must be dispatched (have a cached result) before
+        // the parent can proceed — no recursive flattening.
+        if (ext == UOP_KERNEL) return 0;
+        return 1;
     }
     return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
            tag == TAG_SEQ || tag == TAG_CTR || tag == TAG_LAM ||
            tag == TAG_SUP || tag == TAG_ANY;
+}
+
+// Resolve a child UOP_KERNEL to its cached result (TAG_TEN).
+// Returns 0 if the child has not yet been dispatched (not ready).
+static int thvm_kernel_child_resolve(Term child, Term *out) {
+    extern Term kid_results[];
+    extern u32 sched_kernel_count;
+    extern u64 sched_kernel_locs[];
+    if (term_tag(child) == TAG_TOP && term_ext(child) == UOP_KERNEL) {
+        u64 cloc = term_val(child);
+        for (u32 kid = 0; kid < sched_kernel_count; kid++) {
+            if (sched_kernel_locs[kid] == cloc && term_tag(kid_results[kid]) != TAG_ERA) {
+                *out = kid_results[kid];
+                return 1;
+            }
+        }
+        return 0;  // child kernel not yet dispatched
+    }
+    *out = child;
+    return 1;
 }
 
 static int thvm_kernel_to_compute(TinyHVM *ctx, Term t, Term *out_compute, u32 depth) {
@@ -138,15 +163,17 @@ static int thvm_kernel_to_compute(TinyHVM *ctx, Term t, Term *out_compute, u32 d
         Term right = heap_read(ctx, loc + 1);
         u32 kop = thvm_kernel_root_uop(ctx, t);
         if (kop >= UOP_COUNT || kop == UOP_COUNT) return 0;
+        // Child UOP_KERNELs are opaque boundaries — use their cached
+        // result (TAG_TEN) instead of recursively flattening.
         Term raw_left = left;
         Term raw_right = right;
         if (term_tag(left) == TAG_TOP && term_ext(left) == UOP_KERNEL) {
-            if (!thvm_kernel_to_compute(ctx, left, &raw_left, depth + 1)) return 0;
+            if (!thvm_kernel_child_resolve(left, &raw_left)) return 0;
         } else if (!thvm_kernel_child_ready(left)) {
             return 0;
         }
         if (term_tag(right) == TAG_TOP && term_ext(right) == UOP_KERNEL) {
-            if (!thvm_kernel_to_compute(ctx, right, &raw_right, depth + 1)) return 0;
+            if (!thvm_kernel_child_resolve(right, &raw_right)) return 0;
         } else if (!thvm_kernel_child_ready(right)) {
             return 0;
         }

@@ -156,8 +156,10 @@ typedef u64 Term;
 // Fusion signals (propagating IC agents):
 #define UOP_FUSE      31   // propagating fuse marker: FUSE(payload)
 #define UOP_FUSE2     32   // deprecated compatibility shim; runtime no longer produces it
+#define UOP_EXEC      33   // executable kernel trigger: EXEC(NUM(kid), deps, NUM(flags))
+                           // installed by global compiler passes; fires JIT/dispatch on reduce
 
-#define UOP_COUNT     33
+#define UOP_COUNT     34
 
 // (LAYER_OP_POOL_GATHER and LAYER_OP_BATCHNORM removed — both are now
 // composed from standard UOps with standard backward rules.)
@@ -167,7 +169,7 @@ static const char *uop_names[] = {
     "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
     "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","KERNEL","ASSIGN","WHERE",
-    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","FUSE2"
+    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","FUSE2","EXEC"
 };
 
 // ============================================================
@@ -1060,7 +1062,11 @@ typedef struct {
     u64   normalized_sig;
 } LowerCtx;
 
-typedef struct {
+// Forward declaration for compiler pass function pointer (used in TinyHVM context).
+struct TinyHVM_s;
+typedef Term (*ThvmCompilerPass)(struct TinyHVM_s *ctx, Term root);
+
+typedef struct TinyHVM_s {
     Term       *heap;
     u64         heap_pos;
     Term       *book_heap;
@@ -1117,6 +1123,13 @@ typedef struct {
     u32         alo_state_cap;
     StepGraphAloSubst step_alo_substs[THVM_STEP_ALO_SUBST_MAX];
     u32         step_alo_subst_count;
+
+    // Global compiler passes (kernel DAG redesign layer 2).
+    // Each pass takes a root term (post-fusion coarse IC) and returns the
+    // rewritten term. Passes run in order before the second reduce phase.
+    ThvmCompilerPass compiler_passes[16];
+    const char      *pass_names[16];
+    u32              n_compiler_passes;
 
 } TinyHVM;
 

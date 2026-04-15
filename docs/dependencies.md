@@ -101,12 +101,12 @@ Change: ASSIGN should be an **opaque boundary** like UOP_KERNEL:
 3. **During dispatch**: ASSIGN fires after its dependencies complete.
    Downstream kernels fire after ASSIGN completes.
 
-## Relation to UOP_SCHED
+## Dependency Analysis
 
-UOP_SCHED should build the full dependency DAG:
+The planner should build the full dependency DAG:
 
 ```
-UOP_SCHED fires:
+After fusion:
   1. Walk the post-fusion graph
   2. For each UOP_KERNEL and ASSIGN:
      - Record buffer read set and write set
@@ -171,7 +171,7 @@ See: `resources/icc_bridges.md` for full ICC theory.
 
 ## Files
 
-- `src/schedule/_.c` — sched_all, UOP_FUSE/UOP_SCHED handlers
+- `src/schedule/_.c` — sched_all, UOP_FUSE handlers
 - `src/interact/tensor_ops.c` — ASSIGN interaction, UOP_KERNEL dispatch
 - `src/fuse/_.c` — fusion boundary walker (needs ASSIGN awareness)
 - `docs/memory.md` — buffer planning (needs dependency DAG integration)

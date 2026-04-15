@@ -75,13 +75,13 @@ static u32 tag_arity(u32 tag, u32 ext) {
 }
 
 // Heap graph output (caller frees node_data and edge_data)
-// node_data: [tag, ext, val_lo] per node (3 ints per node)
+// node_data: [tag, ext, val_lo, heap_loc_lo] per node (4 ints per node)
 // edge_data: [from_idx, to_idx] per edge (2 ints per edge)
 void thvm_heap_graph(TinyHVM *ctx, Term root,
                      i32 **out_nodes, u32 *out_n_nodes,
                      i32 **out_edges, u32 *out_n_edges) {
     u32 max_n = 4096, max_e = 8192;
-    i32 *nodes = (i32 *)malloc(max_n * 3 * sizeof(i32));
+    i32 *nodes = (i32 *)malloc(max_n * 4 * sizeof(i32));
     i32 *edges = (i32 *)malloc(max_e * 2 * sizeof(i32));
     u32 nn = 0, ne = 0;
 
@@ -108,10 +108,14 @@ void thvm_heap_graph(TinyHVM *ctx, Term root,
 
         // Add node
         u32 my_idx = nn;
-        if (nn >= max_n) { max_n *= 2; nodes = (i32 *)realloc(nodes, max_n * 3 * sizeof(i32)); }
-        nodes[nn * 3 + 0] = (i32)tag;
-        nodes[nn * 3 + 1] = (i32)ext;
-        nodes[nn * 3 + 2] = (i32)(val & 0xFFFFFFFF);
+        if (nn >= max_n) { max_n *= 2; nodes = (i32 *)realloc(nodes, max_n * 4 * sizeof(i32)); }
+        nodes[nn * 4 + 0] = (i32)tag;
+        nodes[nn * 4 + 1] = (i32)ext;
+        nodes[nn * 4 + 2] = (i32)(val & 0xFFFFFFFF);
+        // heap_loc: for nodes with children, val IS the heap location;
+        // for leaves (TEN, NUM, ERA, VAR, REF), use -1 (no meaningful heap loc)
+        u32 arity = tag_arity(tag, ext);
+        nodes[nn * 4 + 3] = (arity > 0) ? (i32)(val & 0xFFFFFFFF) : -1;
         nn++;
 
         // Add edge: data flows child -> parent
@@ -123,7 +127,6 @@ void thvm_heap_graph(TinyHVM *ctx, Term root,
         }
 
         // Enqueue children
-        u32 arity = tag_arity(tag, ext);
         for (u32 i = 0; i < arity; i++) {
             Term child = heap_read(ctx, val + i);
             if (child == 0) continue; // uninitialized
@@ -142,8 +145,8 @@ void thvm_heap_graph(TinyHVM *ctx, Term root,
                 // Already visited — still add edge to existing node
                 // Find existing node index
                 for (u32 j = 0; j < nn; j++) {
-                    u32 jtag = (u32)nodes[j * 3 + 0];
-                    u32 jval = (u32)nodes[j * 3 + 2];
+                    u32 jtag = (u32)nodes[j * 4 + 0];
+                    u32 jval = (u32)nodes[j * 4 + 2];
                     if (jtag == term_tag(child) && jval == (u32)(term_val(child) & 0xFFFFFFFF)) {
                         if (ne >= max_e) { max_e *= 2; edges = (i32 *)realloc(edges, max_e * 2 * sizeof(i32)); }
                         edges[ne * 2 + 0] = (i32)j;
@@ -181,10 +184,32 @@ static int step_graph_before_top_had_era = 0;
 static int step_graph_before_top_had_add_zero = 0;
 static char step_graph_last_prev_name[160] = {0};
 static char step_graph_last_file[384] = {0};
+static char step_graph_lower_anchor_name[160] = {0};
+static u32 step_graph_lower_anchor_index = 0;
 
 static const char *thvm_step_graph_dir(void) {
     const char *dir = getenv("THVM_STEP_GRAPH_DIR");
     return (dir && dir[0]) ? dir : "graphs";
+}
+
+static int thvm_step_graph_is_active(void) {
+    return step_graph_active ? 1 : 0;
+}
+
+static u32 thvm_step_graph_current_index(void) {
+    return step_graph_n;
+}
+
+static const char *thvm_step_graph_last_name(void) {
+    return step_graph_last_prev_name;
+}
+
+static const char *thvm_step_graph_lower_anchor_name(void) {
+    return step_graph_lower_anchor_name;
+}
+
+static u32 thvm_step_graph_lower_anchor_index(void) {
+    return step_graph_lower_anchor_index;
 }
 
 static u32 thvm_step_graph_max_steps(void) {
@@ -1212,6 +1237,8 @@ static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root) {
     if (!getenv("THVM_STEP_GRAPH") || step_graph_active) return;
     const char *step_graph_dir = thvm_step_graph_dir();
     step_graph_root_term = root;
+    step_graph_lower_anchor_name[0] = '\0';
+    step_graph_lower_anchor_index = 0;
     thvm_step_alo_substs_clear(ctx);
     step_graph_before_grad_y = 0;
     step_graph_before_era_payload = 0;
@@ -1494,6 +1521,19 @@ static void thvm_step_graph_finalize(TinyHVM *ctx) {
     if (!step_graph_active || !getenv("THVM_STEP_GRAPH")) return;
     const char *step_graph_dir = thvm_step_graph_dir();
     u64 sig = thvm_step_graph_sig(ctx);
+    if (term_tag(step_graph_root_term) == TAG_TOP && term_ext(step_graph_root_term) == UOP_KERNEL) {
+        u64 loc = term_val(step_graph_root_term);
+        u64 hl_slot = (loc > 0 && loc < ctx->heap_pos) ? loc : 0;
+        Term hl_term = hl_slot ? heap_read(ctx, hl_slot) : 0;
+        thvm_step_graph_display_name(ctx, phase1_root_slot, step_graph_root_term,
+                                     hl_slot, hl_term,
+                                     step_graph_lower_anchor_name, sizeof(step_graph_lower_anchor_name));
+        step_graph_lower_anchor_index = step_graph_n;
+    } else if (step_graph_last_prev_name[0]) {
+        snprintf(step_graph_lower_anchor_name, sizeof(step_graph_lower_anchor_name),
+                 "%s", step_graph_last_prev_name);
+        step_graph_lower_anchor_index = step_graph_n > 0 ? step_graph_n - 1 : 0;
+    }
     char tmp_struct[256];
     snprintf(tmp_struct, sizeof(tmp_struct), "%s/.tmp_step_struct.dot", step_graph_dir);
     thvm_heap_dot_set_highlight(0, 0);

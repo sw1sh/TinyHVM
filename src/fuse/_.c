@@ -376,21 +376,14 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
           fuse_leaf_sts[idx] = tst ? *tst : st_from_view(ctx->tensors[tid].view); }
         return (int)(WALK_LEAF_BASE + idx);
     }
-    // DP0/DP1: look through to the shared value in the DUP node.
-    // DUP means 2+ consumers → don't absorb reduces through DUP
-    // (they should be standalone kernels shared by both consumers).
+    // DUP is a hard fusion boundary — shared values must be materialized,
+    // not fused through. Each consumer gets its own kernel with the shared
+    // value as a leaf tensor.
     if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1) {
-        Term shared = heap_read(ctx, term_val(t));
-        int saved_absorb = _fuse_can_absorb_reduce;
-        _fuse_can_absorb_reduce = 0;
-        int r = fuse_walk_inner(ctx, shared, ops, n_ops, leaf_ids, leaf_views, n_leaves);
-        _fuse_can_absorb_reduce = saved_absorb;
-        if (r < 0 && getenv("THVM_SCHED_DIAG"))
-            fprintf(stderr, "  dp_walk_fail: dp%u@%llu → tag%u/%s\n",
-                    (term_tag(t)==TAG_DP1)?1:0, term_val(t),
-                    term_tag(shared),
-                    term_tag(shared)==TAG_TOP ? uop_names[term_ext(shared)] : "");
-        return r;
+        if (getenv("THVM_SCHED_DIAG"))
+            fprintf(stderr, "  dp_boundary: dp%u@%llu (hard boundary)\n",
+                    (term_tag(t)==TAG_DP1)?1:0, (unsigned long long)term_val(t));
+        return -1;
     }
     // TAG_VAR: if substituted, walk through the bound value.
     if (term_tag(t) == TAG_VAR) {
@@ -480,12 +473,13 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
         // DP0/DP1: deref to check what they point to.
         // can_walk when deref → TAG_TEN, FUSING, or ew/view TAG_TOP.
         // All view ops now handle the OP-inner case (EXPAND/SHRINK/PAD compose onto leaves).
-        if (!can_walk && (term_tag(view_input) == TAG_DP0 || term_tag(view_input) == TAG_DP1 ||
-                          term_tag(view_input) == TAG_VAR)) {
-            Term dp_inner = fuse_deref_links(ctx, view_input);
-            if (term_tag(dp_inner) == TAG_TEN) can_walk = 1;
-            else if (term_tag(dp_inner) == TAG_TOP) {
-                u32 di_uop = term_ext(dp_inner);
+        // DUP is a hard fusion boundary — do not peek through DP0/DP1 for view walk decisions.
+        // TAG_VAR: still deref substituted vars (not a DUP boundary).
+        if (!can_walk && term_tag(view_input) == TAG_VAR) {
+            Term var_inner = fuse_deref_links(ctx, view_input);
+            if (term_tag(var_inner) == TAG_TEN) can_walk = 1;
+            else if (term_tag(var_inner) == TAG_TOP) {
+                u32 di_uop = term_ext(var_inner);
                 can_walk = (di_uop == UOP_KERNEL || is_elementwise(di_uop) || is_view_op(di_uop));
             }
         }

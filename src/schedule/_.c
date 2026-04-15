@@ -1130,10 +1130,8 @@ static void sched_dump_heap(TinyHVM *ctx) {
 // Walk through view ops and DP refs to find the innermost compute/leaf term.
 static Term sched_unwrap_views(TinyHVM *ctx, Term t) {
     for (int d = 0; d < 20; d++) {
-        if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1) {
-            t = heap_read(ctx, term_val(t));
-            continue;
-        }
+        // DUP is a hard boundary — do not unwrap through DP0/DP1.
+        if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1) break;
         if (term_tag(t) == TAG_VAR) {
             Term sub = heap_read(ctx, term_val(t));
             if (!term_is_sub(sub)) {
@@ -1332,10 +1330,15 @@ static void sched_collect_boundaries(TinyHVM *ctx, Term root) {
         u8 tg = term_tag(tt);
         u64 tv = term_val(tt);
 
+        // DUP is a hard fusion boundary. Note the shared child as a forced
+        // boundary (it must materialize), then continue traversal so we still
+        // discover structure below it — but the boundary prevents fusing through.
         if (tg == TAG_DP0 || tg == TAG_DP1) {
             if (tv == 0 || tv >= ctx->heap_pos || (seen_dup && seen_dup[tv])) continue;
             if (seen_dup) seen_dup[tv] = 1;
-            SCHED_PUSH(heap_read(ctx, tv), item.inherited_class);
+            Term shared = heap_read(ctx, tv);
+            sched_boundary_note_consumer(ctx, shared, SCHED_PARENT_EXTERNAL);
+            SCHED_PUSH(shared, SCHED_PARENT_EXTERNAL);
             continue;
         }
         if (tg == TAG_VAR) {
@@ -1552,23 +1555,45 @@ static Term sched_install_kernel(TinyHVM *ctx, SchedBoundary *b, KernelEntry *ke
         st_set(floc, &fallback);
     }
 
-    // Wrap kernel in SEQ chains for dependencies.
-    // SEQ(dep, KERNEL) forces dep to fire before KERNEL dispatches.
+    // Encode dependencies as DAG edges in the kernel's heap slot.
+    // Deps are stored as a right-nested CTR chain: CTR(dep0, CTR(dep1, ERA)).
+    // The UOP_KERNEL/UOP_EXEC handler checks dep readiness before dispatch.
+    extern Term fuse_assign_deps[];
+    extern u32  fuse_n_assign_deps;
 
-    // 1. Kernel deps (other kernels this one depends on)
+    // Collect all deps into a single right-nested CTR chain
+    Term dep_chain = term_era();
     for (u32 di = 0; di < ke->n_deps; di++) {
         u32 dep_kid = ke->dep_kids[di];
         if (dep_kid < SCHED_MAX_KERNELS && sched_kernel_locs[dep_kid]) {
             Term dep_kernel = term_new(TAG_TOP, UOP_KERNEL, sched_kernel_locs[dep_kid]);
-            ft = thvm_seq(ctx, dep_kernel, ft);
+            u64 ctr_loc = heap_alloc(ctx, 2);
+            heap_set(ctx, ctr_loc + 0, dep_kernel);
+            heap_set(ctx, ctr_loc + 1, dep_chain);
+            dep_chain = term_new(TAG_CTR, 0, ctr_loc);
         }
     }
-
-    // 2. ASSIGN deps (buffer writes this kernel reads after)
-    extern Term fuse_assign_deps[];
-    extern u32  fuse_n_assign_deps;
     for (u32 i = 0; i < fuse_n_assign_deps; i++) {
-        ft = thvm_seq(ctx, fuse_assign_deps[i], ft);
+        u64 ctr_loc = heap_alloc(ctx, 2);
+        heap_set(ctx, ctr_loc + 0, fuse_assign_deps[i]);
+        heap_set(ctx, ctr_loc + 1, dep_chain);
+        dep_chain = term_new(TAG_CTR, 0, ctr_loc);
+    }
+
+    // Store dep chain in kernel's slot 0 (was ERA before)
+    heap_set(ctx, floc, dep_chain);
+
+    // Legacy SEQ wrapping kept for backward compatibility until
+    // UOP_KERNEL handler checks dep_chain directly.
+    // TODO: remove once UOP_KERNEL handles CTR deps natively.
+    if (term_tag(dep_chain) != TAG_ERA) {
+        // Walk the CTR chain and wrap as SEQ for now
+        Term walk = dep_chain;
+        while (term_tag(walk) == TAG_CTR) {
+            Term dep = heap_read(ctx, term_val(walk));
+            ft = thvm_seq(ctx, dep, ft);
+            walk = heap_read(ctx, term_val(walk) + 1);
+        }
     }
 
     thvm_sched_rewrite_remember(ctx, b->root_term, ft);
@@ -1576,10 +1601,19 @@ static Term sched_install_kernel(TinyHVM *ctx, SchedBoundary *b, KernelEntry *ke
     return ft;
 }
 
+// Build a UOP_EXEC trigger node with CTR-encoded deps.
+// Heap layout: [NUM(kid), dep_chain, NUM(flags)]
+static Term thvm_build_exec_trigger(TinyHVM *ctx, u32 kid, Term dep_chain, u32 flags) {
+    u64 eloc = heap_alloc(ctx, 3);
+    heap_set(ctx, eloc + 0, term_num_u32(kid));
+    heap_set(ctx, eloc + 1, dep_chain);
+    heap_set(ctx, eloc + 2, term_num_u32(flags));
+    return term_new(TAG_TOP, UOP_EXEC, eloc);
+}
+
 static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid) {
     if (kid >= sched_kernel_count) return term_era();
-    // Cache check with epoch invalidation is in UOP_KERNEL handler.
-    // No recursive dep dispatch here — deps are wired as SEQ in the graph.
+    // Cache check with epoch invalidation is in UOP_KERNEL/UOP_EXEC handler.
     KernelEntry *ke = &sched_kernels[kid];
 
     u32 raw_tid = ke->raw_output_tid ? ke->raw_output_tid : ke->output_tid;
@@ -1773,7 +1807,28 @@ u32 sched_all(TinyHVM *ctx, Term root) {
 // Kernel count matches tinygrad without merging (the fuser already
 // absorbs ew ops into reduce kernels during the walk).
 
+// ── Global compiler passes (kernel DAG redesign layer 2) ──────────
+// Run registered named passes on the post-fusion coarse IC.
+// Each pass takes the root term and returns a (possibly rewritten) root.
+static Term thvm_run_global_passes(TinyHVM *ctx, Term t) {
+    if (ctx->n_compiler_passes == 0) return t;
+    for (u32 i = 0; i < ctx->n_compiler_passes; i++) {
+        if (ctx->compiler_passes[i]) {
+            if (getenv("THVM_SCHED_DIAG"))
+                fprintf(stderr, "GLOBAL_PASS[%u]: %s\n", i,
+                        ctx->pass_names[i] ? ctx->pass_names[i] : "(unnamed)");
+            t = ctx->compiler_passes[i](ctx, t);
+        }
+    }
+    return t;
+}
 
+void thvm_register_pass(TinyHVM *ctx, ThvmCompilerPass pass, const char *name) {
+    if (ctx->n_compiler_passes >= 16) return;
+    u32 idx = ctx->n_compiler_passes++;
+    ctx->compiler_passes[idx] = pass;
+    ctx->pass_names[idx] = name;
+}
 
 Term thvm_eval(TinyHVM *ctx, Term t) {
     int outermost = (ctx->eval_depth++ == 0);
@@ -1828,7 +1883,16 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     }
 
     if (!run_coarse_graph) {
+        // Phase 1+2: reduce to WNF then fuse (creates UOP_KERNEL nodes + dispatches)
         t = thvm_eval_reduce_fused(ctx, t);
+        // Phase 2.5: run global compiler passes (may install UOP_EXEC triggers)
+        t = thvm_run_global_passes(ctx, t);
+        // Phase 3: second reduce — fires any UOP_EXEC triggers from passes
+        if (ctx->n_compiler_passes > 0) {
+            ctx->step_budget = 1000000;
+            t = thvm_reduce(ctx, t);
+            ctx->step_budget = 0;
+        }
         sched_planner_release_detached_slots();
         ctx->eval_depth--;
         return t;
@@ -1885,6 +1949,14 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
             heap_set(ctx, phase1_root_slot, term_era());
         phase1_root_slot = 0;
+    }
+    // Phase 2.5: run global compiler passes
+    t = thvm_run_global_passes(ctx, t);
+    // Phase 3: second reduce for exec triggers
+    if (ctx->n_compiler_passes > 0) {
+        ctx->step_budget = 1000000;
+        t = thvm_reduce(ctx, t);
+        ctx->step_budget = 0;
     }
     sched_planner_release_detached_slots();
     ctx->eval_depth--;

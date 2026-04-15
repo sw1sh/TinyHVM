@@ -55,7 +55,7 @@ Phase 2 (UOP_FUSE):
     → Multi-consumer deduplication: same subgraph structure → same kernel ID
     → Result: small set of unique kernels, reused across iterations
 
-Phase 3 (UOP_SCHED + dispatch):
+Phase 3 (dispatch):
     Fire kernels → TAG_TEN results
     → kid_results[] caches by kernel ID
     → Same kernel structure across iterations hits cache

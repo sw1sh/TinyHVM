@@ -6,7 +6,15 @@
 #include <stdio.h>
 
 int main(void) {
-    TinyHVM *ctx = thvm_init("cpu");
+    const char *backend = getenv("THVM_TEST_BACKEND");
+    if (!backend || !backend[0]) backend = "cpu";
+#ifdef __APPLE__
+    if (strcmp(backend, "metal") == 0 && !MTLCreateSystemDefaultDevice()) {
+        fprintf(stderr, "SKIP: metal unavailable\n");
+        return 0;
+    }
+#endif
+    TinyHVM *ctx = thvm_init(backend);
 
     f32 xd[] = {1.0f, 2.0f, 3.0f};
     f32 yd[] = {2.0f, 2.0f, 2.0f};

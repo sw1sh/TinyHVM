@@ -9,17 +9,17 @@
 $tagColor = <|
     0  -> RGBColor[0.63, 0.28, 0.64],   (* APP — purple *)
     1  -> RGBColor[0.63, 0.28, 0.64],   (* LAM — purple *)
-    2  -> GrayLevel[0.7],               (* VAR — gray *)
+    2  -> LightDarkSwitched[GrayLevel[0.7], GrayLevel[0.5]],   (* VAR *)
     3  -> RGBColor[0.85, 0.33, 0.10],   (* SUP — orange *)
     4  -> RGBColor[0.85, 0.33, 0.10],   (* DP0 — orange *)
     5  -> RGBColor[0.85, 0.33, 0.10],   (* DP1 — orange *)
-    6  -> GrayLevel[0.5],               (* ERA — dark gray *)
-    7  -> GrayLevel[0.6],               (* NUM — gray *)
+    6  -> LightDarkSwitched[GrayLevel[0.5], GrayLevel[0.6]],   (* ERA *)
+    7  -> LightDarkSwitched[GrayLevel[0.6], GrayLevel[0.5]],   (* NUM *)
     8  -> RGBColor[0.44, 0.74, 0.27],   (* REF — green *)
     9  -> RGBColor[0.93, 0.49, 0.19],   (* OP2 — orange *)
     10 -> RGBColor[0.2, 0.6, 0.9],      (* TEN — blue *)
     11 -> RGBColor[0.93, 0.49, 0.19],   (* TOP — orange *)
-    12 -> GrayLevel[0.6]                (* CTR — gray *)
+    12 -> LightDarkSwitched[GrayLevel[0.6], GrayLevel[0.5]]    (* CTR *)
 |>;
 
 (* Build label for a graph node *)
@@ -39,24 +39,26 @@ iNodeLabel[tag_, ext_, val_] := Switch[tag,
     _, Lookup[$tagName, tag, "?"]
 ];
 
-TINetGraph[t_TTensor, opts___?OptionQ] := TINetGraph[ToTTerm[t], opts];
-TINetGraph[t_TTerm, opts___?OptionQ] := Module[
+(* ── Shared graph data extraction ────────────────────────────────────── *)
+
+iNetGraphData[t_] := Module[
     {raw, nNodes, nEdges, nodesRaw, edgesRaw,
-     tags, exts, vals, i, j, tag, ext, val,
+     tags, exts, vals, hlocs, i, j, tag, ext, val,
      dupGroups, rep, nodeMap, keptNodes,
-     verts, edges, labels, colors, elabels,
+     edges, labels, colors, elabels, heapLocs,
      src, dst, mSrc, mDst, portLabel, edge, seen},
     loadLibrary[];
-    raw = Round[Normal[thvmHeapGraphFn[t[[1]]]]];
+    raw = Round[Normal[thvmHeapGraphFn[termId[t]]]];
     nNodes = raw[[1]];
     nEdges = raw[[2]];
-    nodesRaw = raw[[3 ;; 2 + nNodes * 3]];
-    edgesRaw = raw[[3 + nNodes * 3 ;; 2 + nNodes * 3 + nEdges * 2]];
+    nodesRaw = raw[[3 ;; 2 + nNodes * 4]];
+    edgesRaw = raw[[3 + nNodes * 4 ;; 2 + nNodes * 4 + nEdges * 2]];
 
-    (* Extract per-node data *)
-    tags = Table[nodesRaw[[3 i - 2]], {i, nNodes}];
-    exts = Table[nodesRaw[[3 i - 1]], {i, nNodes}];
-    vals = Table[nodesRaw[[3 i]], {i, nNodes}];
+    (* Extract per-node data: 4 fields per node *)
+    tags  = Table[nodesRaw[[4 i - 3]], {i, nNodes}];
+    exts  = Table[nodesRaw[[4 i - 2]], {i, nNodes}];
+    vals  = Table[nodesRaw[[4 i - 1]], {i, nNodes}];
+    hlocs = Table[nodesRaw[[4 i]],     {i, nNodes}];
 
     (* Group DP0/DP1 nodes by val (dup_loc) — merge into single DUP vertex *)
     dupGroups = <||>;
@@ -73,9 +75,10 @@ TINetGraph[t_TTerm, opts___?OptionQ] := Module[
         {group, Values[dupGroups]}];
     keptNodes = DeleteDuplicates[Values[nodeMap]];
 
-    (* Build labels and colors for kept nodes *)
-    labels = <||>; colors = <||>;
+    (* Build labels, colors, and heap-location map for kept nodes *)
+    labels = <||>; colors = <||>; heapLocs = <||>;
     Do[tag = tags[[idx + 1]]; ext = exts[[idx + 1]]; val = vals[[idx + 1]];
+        heapLocs[idx] = hlocs[[idx + 1]];
         If[tag == 4 || tag == 5,
             labels[idx] = "Dup"; colors[idx] = RGBColor[0.85, 0.33, 0.10],
             labels[idx] = iNodeLabel[tag, ext, val];
@@ -100,15 +103,76 @@ TINetGraph[t_TTerm, opts___?OptionQ] := Module[
                     AppendTo[edges, DirectedEdge[mSrc, mDst]]]]],
         {j, nEdges}];
 
-    Graph[keptNodes, edges,
-        VertexLabels -> Normal[labels],
-        VertexStyle -> Normal[colors],
+    <|"KeptNodes" -> keptNodes, "Edges" -> edges,
+      "Labels" -> labels, "Colors" -> colors, "EdgeLabels" -> elabels,
+      "HeapLocs" -> heapLocs, "Tags" -> tags, "NodeMap" -> nodeMap|>
+];
+
+(* ── TINetGraph — standard graph (unchanged behavior) ────────────────── *)
+
+TINetGraph[t_TTensor, opts___?OptionQ] := TINetGraph[ToTTerm[t], opts];
+TINetGraph[t_TTerm, opts___?OptionQ] := Module[{gd},
+    gd = iNetGraphData[t];
+    Graph[gd["KeptNodes"], gd["Edges"],
+        VertexLabels -> Normal[gd["Labels"]],
+        VertexStyle -> Normal[gd["Colors"]],
         VertexSize -> 0.6,
         VertexLabelStyle -> Directive[9, Bold],
         GraphLayout -> {"LayeredDigraphEmbedding", "Orientation" -> Left},
-        EdgeStyle -> GrayLevel[0.5],
-        EdgeLabels -> Normal[elabels],
-        EdgeLabelStyle -> Directive[8, Italic, GrayLevel[0.3]],
+        EdgeStyle -> LightDarkSwitched[GrayLevel[0.5], GrayLevel[0.6]],
+        EdgeLabels -> Normal[gd["EdgeLabels"]],
+        EdgeLabelStyle -> Directive[8, Italic, LightDarkSwitched[GrayLevel[0.3], GrayLevel[0.7]]],
+        ImageSize -> Medium,
+        opts
+    ]
+];
+
+(* ── TInteractionGraph — graph with highlighted active pair ──────────── *)
+
+TInteractionGraph[t_TTensor, opts___?OptionQ] := TInteractionGraph[ToTTerm[t], opts];
+TInteractionGraph[t_TTerm, opts___?OptionQ] := Module[
+    {gd, nextInfo, found, sourceSlot, hlNode = None,
+     vstyle, estyleRules},
+    loadLibrary[];
+    gd = iNetGraphData[t];
+
+    (* Find the next active pair *)
+    nextInfo = thvmNextInteractionFn[termId[t]];
+    found = nextInfo[[1]];
+    sourceSlot = nextInfo[[2]];
+
+    (* Find graph node whose heap location matches the source slot *)
+    If[found == 1,
+        Do[If[gd["HeapLocs"][idx] == sourceSlot, hlNode = idx; Break[]],
+            {idx, gd["KeptNodes"]}]
+    ];
+
+    (* Build vertex styles: highlight the active node with red border *)
+    vstyle = Normal[gd["Colors"]];
+    If[hlNode =!= None,
+        vstyle = Join[vstyle,
+            {hlNode -> Directive[
+                EdgeForm[{Thick, RGBColor[0.9, 0.2, 0.2]}],
+                Lookup[gd["Colors"], hlNode, GrayLevel[0.7]]]}]
+    ];
+
+    (* Build edge styles: highlight edges from the active node *)
+    estyleRules = {};
+    If[hlNode =!= None,
+        Do[If[MatchQ[e, DirectedEdge[hlNode, _, ___] | DirectedEdge[_, hlNode, ___]],
+            AppendTo[estyleRules, e -> Directive[Thick, RGBColor[0.9, 0.2, 0.2]]]],
+            {e, gd["Edges"]}]
+    ];
+
+    Graph[gd["KeptNodes"], gd["Edges"],
+        VertexLabels -> Normal[gd["Labels"]],
+        VertexStyle -> vstyle,
+        VertexSize -> 0.6,
+        VertexLabelStyle -> Directive[9, Bold],
+        GraphLayout -> {"LayeredDigraphEmbedding", "Orientation" -> Left},
+        EdgeStyle -> Join[{LightDarkSwitched[GrayLevel[0.5], GrayLevel[0.6]]}, estyleRules],
+        EdgeLabels -> Normal[gd["EdgeLabels"]],
+        EdgeLabelStyle -> Directive[8, Italic, LightDarkSwitched[GrayLevel[0.3], GrayLevel[0.7]]],
         ImageSize -> Medium,
         opts
     ]

@@ -109,7 +109,7 @@ mechanism local and IC-native:
 ## Recommended Next Moves
 
 1. Keep the public contract centered on structural `KERNEL`, not `kid`.
-2. Treat `sched_all()` and `UOP_SCHED` as legacy implementation support unless a
+2. Treat `sched_all()` as legacy implementation support unless a
    new explicit planner is reintroduced.
 3. If TinyHVM later grows a more explicit scheduler, make it operate over the
    visible `KERNEL` DAG instead of inventing a second hidden kernel IR.

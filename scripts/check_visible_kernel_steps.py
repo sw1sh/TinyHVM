@@ -30,6 +30,7 @@ def main() -> int:
 
     kernel_steps = []
     visible_kernel_steps = []
+    kernel_label_steps = []
     assign_steps = []
     fuse_nodes_by_file = {}
     edge_attrs_by_file = {}
@@ -66,21 +67,23 @@ def main() -> int:
         edge_attrs_by_file[name] = edge_attrs
         if "_KERNEL_" in name:
             kernel_steps.append(idx)
-            if "label=\"KERNEL" in text:
+        if "label=\"KERNEL" in text:
+            kernel_label_steps.append(idx)
+            if "_KERNEL_" in name:
                 visible_kernel_steps.append(idx)
         if "_ASSIGN_" in name:
             assign_steps.append(idx)
 
-    if not kernel_steps:
-        return fail(f"{step_dir} has no KERNEL step filenames")
-    if not visible_kernel_steps:
+    if not kernel_label_steps:
+        return fail(f"{step_dir} has no visible KERNEL node labels")
+    if kernel_steps and not visible_kernel_steps:
         return fail(f"{step_dir} has KERNEL step filenames but no visible KERNEL node labels")
     if has_fuse_null:
         return fail(f"{step_dir} still renders FUSE NULL payload labels: {has_fuse_null[:3]}")
     if has_nested_mul_kernel:
         return fail(f"{step_dir} still shows nested KERNEL MUL nodes: {has_nested_mul_kernel[:3]}")
 
-    first_kernel = min(visible_kernel_steps)
+    first_kernel = min(kernel_label_steps)
     if assign_steps and first_kernel >= min(assign_steps):
         return fail(
             f"first visible KERNEL step ({first_kernel}) does not precede first ASSIGN step ({min(assign_steps)})"

@@ -747,9 +747,9 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
     for a, b in zip(graphs, graphs[1:]):
         # ERA/APP/IFZ/state steps can remove tensors as part of reduction.
         if canonical_step_base(a.suffix) in {"APP", "IFZ", "ALO"} or \
-           canonical_step_base(b.suffix) in {"ERA", "ALO", "ASSIGN", "APP", "IFZ", "REF", "VAR", "FUSE"} or \
-           any(step_mentions(a.suffix, tok) for tok in {"ALO", "EXPAND"}) or \
-           any(step_mentions(b.suffix, tok) for tok in {"ERA", "ALO", "ASSIGN", "APP", "IFZ", "REF", "VAR", "FUSE", "EXPAND"}) or \
+           canonical_step_base(b.suffix) in {"ERA", "ALO", "ASSIGN", "APP", "IFZ", "REF", "VAR", "FUSE", "KERNEL"} or \
+           any(step_mentions(a.suffix, tok) for tok in {"ALO", "EXPAND", "KERNEL"}) or \
+           any(step_mentions(b.suffix, tok) for tok in {"ERA", "ALO", "ASSIGN", "APP", "IFZ", "REF", "VAR", "FUSE", "EXPAND", "KERNEL"}) or \
            b.suffix.startswith("state_final") or \
            b.suffix.startswith("state_no_highlight"):
             continue

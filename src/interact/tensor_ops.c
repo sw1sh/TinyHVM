@@ -174,6 +174,70 @@
                 }
             }
 
+            // ── UOP_EXEC: executable kernel trigger ──────────────────
+            // Heap layout: [NUM(kid), deps, NUM(flags)]
+            // Installed by global compiler passes. Fires JIT/dispatch on reduce.
+            if (uop == UOP_EXEC) {
+                extern Term kid_results[];
+                extern u32 sched_kernel_count;
+                extern u32 buf_epoch[];
+                extern u32 kid_input_bufs[][KERNEL_MAX_INPUTS];
+                extern u32 kid_input_epochs[][KERNEL_MAX_INPUTS];
+                extern u32 kid_n_inputs[];
+                extern KernelEntry sched_kernels[];
+                Term kid_term = heap_read(ctx, loc + 0);
+                Term deps     = heap_read(ctx, loc + 1);
+                // Check dependencies are resolved
+                if (term_tag(deps) == TAG_TOP &&
+                    (term_ext(deps) == UOP_KERNEL || term_ext(deps) == UOP_EXEC))
+                    return t;  // dep not yet fired
+                if (term_tag(deps) == TAG_CTR) {
+                    Term d0 = heap_read(ctx, term_val(deps) + 0);
+                    Term d1 = heap_read(ctx, term_val(deps) + 1);
+                    if (!thvm_kernel_child_ready(d0) || !thvm_kernel_child_ready(d1))
+                        return t;  // deps not ready
+                }
+                u32 kid = term_as_u32(kid_term);
+                if (kid >= sched_kernel_count) {
+                    RETURN_REDUCED(term_era());
+                }
+                // Cache check (same as UOP_KERNEL)
+                if (term_tag(kid_results[kid]) != TAG_ERA) {
+                    int cache_valid = 1;
+                    for (u32 i = 0; i < kid_n_inputs[kid]; i++) {
+                        u32 bid = kid_input_bufs[kid][i];
+                        if (bid < MAX_BUF_EPOCHS && buf_epoch[bid] != kid_input_epochs[kid][i]) {
+                            cache_valid = 0; break;
+                        }
+                    }
+                    if (cache_valid) RETURN_REDUCED(kid_results[kid]);
+                    kid_results[kid] = term_era();
+                }
+                {
+                    Term result = thvm_sched_dispatch_kernel(ctx, kid);
+                    if (result == t || (term_tag(result) == TAG_ERA && term_val(result) == 0))
+                        return t;
+                    if (kid < sched_kernel_count) {
+                        kid_results[kid] = result;
+                        KernelEntry *ke = &sched_kernels[kid];
+                        u32 ni = 0;
+                        for (u32 i = 0; i < ke->n_leaves && ni < KERNEL_MAX_INPUTS; i++) {
+                            u32 tid = ke->leaf_ids[i];
+                            if (tid && tid < ctx->tensor_count) {
+                                u32 bid = ctx->tensors[tid].buf_id;
+                                if (bid) {
+                                    kid_input_bufs[kid][ni] = bid;
+                                    kid_input_epochs[kid][ni] = (bid < MAX_BUF_EPOCHS) ? buf_epoch[bid] : 0;
+                                    ni++;
+                                }
+                            }
+                        }
+                        kid_n_inputs[kid] = ni;
+                    }
+                    RETURN_REDUCED(result);
+                }
+            }
+
             // ── UOP_FUSE: propagating fusion agent ──────────────────
             // Entry: FUSE(payload) — heap [payload]
             // Unary: FUSE(op, child) — heap [NUM(op), child] (tag of slot0 == NUM)

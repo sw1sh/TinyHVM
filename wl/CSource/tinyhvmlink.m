@@ -1398,7 +1398,8 @@ EXTERN_C DLLEXPORT int thvmHeapGraph(
     thvm_heap_graph(g_ctx, root, &nodes, &n_nodes, &edges, &n_edges);
 
     // Pack into single flat Real64 array: [n_nodes, n_edges, nodes..., edges...]
-    mint total = 2 + n_nodes * 3 + n_edges * 2;
+    // node_data: 4 ints per node [tag, ext, val_lo, heap_loc_lo]
+    mint total = 2 + n_nodes * 4 + n_edges * 2;
     mint dims[1] = { total };
     MNumericArray na = NULL;
     g_na_funcs->MNumericArray_new(MNumericArray_Type_Real64, 1, dims, &na);
@@ -1407,12 +1408,12 @@ EXTERN_C DLLEXPORT int thvmHeapGraph(
     // For TAG_TEN nodes, replace val (tid) with the WL term id
     // by reverse-scanning g_terms[]. This makes labels match TTensor[id].
     for (u32 i = 0; i < n_nodes; i++) {
-        if ((u32)nodes[i * 3] == TAG_TEN) {
-            u32 tid = (u32)nodes[i * 3 + 2];
+        if ((u32)nodes[i * 4] == TAG_TEN) {
+            u32 tid = (u32)nodes[i * 4 + 2];
             for (u32 j = 1; j < g_term_cap; j++) {
                 if (g_terms[j] != 0 && term_tag(g_terms[j]) == TAG_TEN &&
                     (u32)term_val(g_terms[j]) == tid) {
-                    nodes[i * 3 + 2] = (i32)j; // replace tid with WL id
+                    nodes[i * 4 + 2] = (i32)j; // replace tid with WL id
                     break;
                 }
             }
@@ -1421,8 +1422,8 @@ EXTERN_C DLLEXPORT int thvmHeapGraph(
 
     d[0] = (double)n_nodes;
     d[1] = (double)n_edges;
-    for (u32 i = 0; i < n_nodes * 3; i++) d[2 + i] = (double)nodes[i];
-    for (u32 i = 0; i < n_edges * 2; i++) d[2 + n_nodes * 3 + i] = (double)edges[i];
+    for (u32 i = 0; i < n_nodes * 4; i++) d[2 + i] = (double)nodes[i];
+    for (u32 i = 0; i < n_edges * 2; i++) d[2 + n_nodes * 4 + i] = (double)edges[i];
 
     free(nodes);
     free(edges);
@@ -1463,16 +1464,18 @@ EXTERN_C DLLEXPORT int thvmTraceData(
 
     u32 n = g_ctx->trace_count;
     MNumericArray na = NULL;
-    mint dims[1] = { (mint)(n * 5) };
+    mint dims[1] = { (mint)(n * 7) };
     g_na_funcs->MNumericArray_new(MNumericArray_Type_Real64, 1, dims, &na);
     double *data = (double *)g_na_funcs->MNumericArray_getData(na);
     for (u32 i = 0; i < n; i++) {
         struct InteractionTrace *tr = &g_ctx->trace_buf[i];
-        data[i * 5 + 0] = (double)tr->before_tag;
-        data[i * 5 + 1] = (double)tr->before_ext;
-        data[i * 5 + 2] = (double)tr->after_tag;
-        data[i * 5 + 3] = (double)tr->after_ext;
-        data[i * 5 + 4] = (double)tr->rule_id;
+        data[i * 7 + 0] = (double)tr->before_tag;
+        data[i * 7 + 1] = (double)tr->before_ext;
+        data[i * 7 + 2] = (double)tr->after_tag;
+        data[i * 7 + 3] = (double)tr->after_ext;
+        data[i * 7 + 4] = (double)tr->rule_id;
+        data[i * 7 + 5] = (double)(tr->before_loc & 0xFFFFFFFF);
+        data[i * 7 + 6] = (double)(tr->after_loc & 0xFFFFFFFF);
     }
     MArgument_setMNumericArray(res, na);
     return LIBRARY_NO_ERROR;
@@ -1494,5 +1497,83 @@ EXTERN_C DLLEXPORT int thvmReduceSteps(
     Term result = thvm_reduce_steps(g_ctx, t, (u32)max_steps);
     set_term(out_id, result);
     MArgument_setInteger(res, (mint)g_ctx->steps_taken);
+    return LIBRARY_NO_ERROR;
+}
+
+// ============================================================
+// Heap introspection
+// ============================================================
+
+// thvmHeapRead(loc) → {Integer, 1} of 3 elements: {tag, ext, val_lo}
+EXTERN_C DLLEXPORT int thvmHeapRead(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint loc = MArgument_getInteger(args[0]);
+    Term t;
+    if (loc < 0 || (u64)loc >= g_ctx->heap_pos) {
+        t = term_era();
+    } else {
+        t = heap_read(g_ctx, (u64)loc);
+    }
+
+    mint dims[1] = {3};
+    MTensor out;
+    libData->MTensor_new(MType_Integer, 1, dims, &out);
+    mint *od = libData->MTensor_getIntegerData(out);
+    od[0] = (mint)term_tag(t);
+    od[1] = (mint)term_ext(t);
+    od[2] = (mint)(term_val(t) & 0xFFFFFFFF);
+    MArgument_setMTensor(res, out);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmHeapSnapshot() → {Integer, 1} of 5 elements:
+//   {heap_pos, itrs, tensor_count, next_sup_label, def_count}
+EXTERN_C DLLEXPORT int thvmHeapSnapshot(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)argc; (void)args;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint dims[1] = {5};
+    MTensor out;
+    libData->MTensor_new(MType_Integer, 1, dims, &out);
+    mint *od = libData->MTensor_getIntegerData(out);
+    od[0] = (mint)g_ctx->heap_pos;
+    od[1] = (mint)g_ctx->itrs;
+    od[2] = (mint)g_ctx->tensor_count;
+    od[3] = (mint)g_ctx->next_sup_label;
+    od[4] = (mint)g_ctx->def_count;
+    MArgument_setMTensor(res, out);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmNextInteraction(termId) → {Integer, 1} of 4 elements:
+//   {found, source_slot_lo, before_tag, before_ext}
+EXTERN_C DLLEXPORT int thvmNextInteraction(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint term_id = MArgument_getInteger(args[0]);
+    Term root = get_term(term_id);
+
+    u64 source_slot = 0;
+    Term before = 0;
+    int found = thvm_phase1_find_next_actual(g_ctx, root, &source_slot, &before);
+
+    mint dims[1] = {4};
+    MTensor out;
+    libData->MTensor_new(MType_Integer, 1, dims, &out);
+    mint *od = libData->MTensor_getIntegerData(out);
+    od[0] = (mint)found;
+    od[1] = (mint)(source_slot & 0xFFFFFFFF);
+    od[2] = found ? (mint)term_tag(before) : 0;
+    od[3] = found ? (mint)term_ext(before) : 0;
+    MArgument_setMTensor(res, out);
     return LIBRARY_NO_ERROR;
 }

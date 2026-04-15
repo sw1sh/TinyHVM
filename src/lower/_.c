@@ -1,5 +1,16 @@
 // lower/_.c — private lowering IC arena for structural KERNEL dispatch
 
+// Forward declarations (defined in debug/graph.c, included after schedule/_.c)
+static int thvm_step_graph_is_active(void);
+static u32 thvm_step_graph_current_index(void);
+static const char *thvm_step_graph_dir(void);
+static const char *thvm_step_graph_last_name(void);
+static const char *thvm_step_graph_lower_anchor_name(void);
+static u32 thvm_step_graph_lower_anchor_index(void);
+#ifdef __OBJC__
+static char *thvm_metal_render_uop_kernel_source(const UOpKernel *k);
+#endif
+
 typedef enum {
     LOP_SINK = 1,
     LOP_GID,
@@ -976,5 +987,697 @@ static void thvm_lower_dump_uop_kernel(const UOpKernel *uk) {
                         i, op->type, op->arg[0], op->arg[1], op->arg[2], op->imm.u);
                 break;
         }
+    }
+}
+
+static int lower_env_enabled(const char *name) {
+    const char *env = getenv(name);
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static const char *lower_backend_short(TinyHVM *ctx, Backend *backend) {
+    if (!backend && ctx) backend = ctx_default_backend(ctx);
+    if (!backend) return "?";
+    if (ctx && ctx->backends[THVM_DEV_CPU] == backend) return "cpu";
+    if (ctx && ctx->backends[THVM_DEV_METAL] == backend) return "mtl";
+    return "dev";
+}
+
+static void lower_shape_str(const Shape *shape, char *buf, size_t nbuf) {
+    if (!buf || nbuf == 0) return;
+    if (!shape) {
+        snprintf(buf, nbuf, "[]");
+        return;
+    }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, nbuf - pos, "[");
+    if (shape->rank == 0) {
+        snprintf(buf + pos, nbuf - pos, "1]");
+        return;
+    }
+    for (u32 d = 0; d < shape->rank && pos + 8 < nbuf; d++)
+        pos += snprintf(buf + pos, nbuf - pos, "%s%u", d ? "," : "", shape->dims[d]);
+    snprintf(buf + pos, nbuf - pos, "]");
+}
+
+static void lower_axes_str(const ReduceSpec *reduce, u32 rank, char *buf, size_t nbuf) {
+    if (!buf || nbuf == 0) return;
+    size_t pos = 0;
+    pos += snprintf(buf + pos, nbuf - pos, "[");
+    int first = 1;
+    if (reduce) {
+        for (u32 d = 0; d < rank && pos + 8 < nbuf; d++) {
+            if (!reduce->is_reduce[d]) continue;
+            pos += snprintf(buf + pos, nbuf - pos, "%s%u", first ? "" : ",", d);
+            first = 0;
+        }
+    }
+    snprintf(buf + pos, nbuf - pos, "]");
+}
+
+static void lower_view_str(const View *view, char *buf, size_t nbuf) {
+    if (!buf || nbuf == 0) return;
+    if (!view) {
+        snprintf(buf, nbuf, "view=none");
+        return;
+    }
+    char shape[96];
+    size_t pos = 0;
+    lower_shape_str(&view->shape, shape, sizeof(shape));
+    pos += snprintf(buf + pos, nbuf - pos, "shape=%s strides=[", shape);
+    for (u32 d = 0; d < view->shape.rank && pos + 16 < nbuf; d++)
+        pos += snprintf(buf + pos, nbuf - pos, "%s%d", d ? "," : "", view->strides[d]);
+    pos += snprintf(buf + pos, nbuf - pos, "] off=%d", view->offset);
+    if (view->has_mask && pos + 64 < nbuf) {
+        pos += snprintf(buf + pos, nbuf - pos, " mask=[");
+        for (u32 d = 0; d < view->shape.rank && pos + 16 < nbuf; d++)
+            pos += snprintf(buf + pos, nbuf - pos, "%s%u:%u",
+                            d ? "," : "", view->mask_begin[d], view->mask_end[d]);
+        snprintf(buf + pos, nbuf - pos, "]");
+    }
+}
+
+static const char *lower_lop_port_name(u32 lop, u32 idx) {
+    switch (lop) {
+        case LOP_SINK: return "in";
+        case LOP_RANGE: return "trip";
+        case LOP_ENDRANGE: return idx == 0 ? "range" : "body";
+        case LOP_LOAD: return idx == 0 ? "idx" : "buf";
+        case LOP_STORE: return idx == 0 ? "idx" : "val";
+        case LOP_ALU: return idx == 0 ? "a" : idx == 1 ? "b" : idx == 2 ? "uop" : "aux";
+        case LOP_ACC_INIT: return "init";
+        case LOP_ACC: return idx == 0 ? "acc" : idx == 1 ? "val" : "reduce";
+        case LOP_INDEX: return idx == 0 ? "base" : idx == 1 ? "add" : "scale";
+        case LOP_MOD: return idx == 0 ? "a" : "mod";
+        case LOP_DIV: return idx == 0 ? "a" : "div";
+        case LOP_MASK: return idx == 0 ? "cond" : "val";
+        default: return idx == 0 ? "a" : "b";
+    }
+}
+
+static const char *lower_kop_name(KOpType type) {
+    switch (type) {
+        case KOP_GID: return "KOP_GID";
+        case KOP_CONST_F: return "KOP_CONST_F";
+        case KOP_CONST_U: return "KOP_CONST_U";
+        case KOP_RANGE: return "KOP_RANGE";
+        case KOP_ENDRANGE: return "KOP_ENDRANGE";
+        case KOP_LOAD: return "KOP_LOAD";
+        case KOP_STORE: return "KOP_STORE";
+        case KOP_ALU: return "KOP_ALU";
+        case KOP_ACC_INIT: return "KOP_ACC_INIT";
+        case KOP_ACC: return "KOP_ACC";
+        case KOP_IDX: return "KOP_IDX";
+        case KOP_MOD: return "KOP_MOD";
+        case KOP_DIV: return "KOP_DIV";
+        case KOP_MASK: return "KOP_MASK";
+        default: return "KOP_NOOP";
+    }
+}
+
+static const char *lower_kop_port_name(const KOp *op, u32 idx) {
+    if (!op) return "";
+    switch (op->type) {
+        case KOP_MOD:
+        case KOP_DIV:
+            return idx == 0 ? "a" : "";
+        case KOP_IDX:
+            return idx == 0 ? "base" : idx == 1 ? "add" : "";
+        case KOP_LOAD:
+            return idx == 0 ? "idx" : "";
+        case KOP_STORE:
+            return idx == 0 ? "idx" : idx == 1 ? "val" : "";
+        case KOP_ALU:
+            return idx == 0 ? "a" : idx == 1 ? "b" : "";
+        case KOP_ACC:
+            return idx == 0 ? "acc" : idx == 1 ? "val" : "";
+        case KOP_ENDRANGE:
+            return idx == 0 ? "range" : "";
+        case KOP_MASK:
+            return idx == 0 ? "cond" : idx == 1 ? "val" : "";
+        default:
+            return "";
+    }
+}
+
+static void lower_term_id(Term t, char *buf, size_t nbuf) {
+    if (!buf || nbuf == 0) return;
+    if (term_tag(t) == TAG_TOP && lower_term_arity(t) > 0) {
+        snprintf(buf, nbuf, "l%llu", (unsigned long long)term_val(t));
+        return;
+    }
+    snprintf(buf, nbuf, "li_%u_%llu",
+             (u32)term_ext(t), (unsigned long long)term_val(t));
+}
+
+static const char *lower_dot_fill(Term t) {
+    if (term_tag(t) != TAG_TOP) return "#f0f0f0";
+    switch (term_ext(t)) {
+        case LOP_SINK: return "#ffd9d9";
+        case LOP_RANGE:
+        case LOP_ENDRANGE: return "#ffe7cc";
+        case LOP_LOAD:
+        case LOP_STORE: return "#d9f2e6";
+        case LOP_ALU:
+        case LOP_ACC:
+        case LOP_ACC_INIT:
+        case LOP_MASK: return "#dbe8ff";
+        case LOP_INDEX:
+        case LOP_MOD:
+        case LOP_DIV: return "#efe2ff";
+        case LOP_GID:
+        case LOP_CONST_U:
+        case LOP_CONST_F: return "#fff2cc";
+        default: return "#f0f0f0";
+    }
+}
+
+static void lower_term_label(TinyHVM *ctx, Term t, char *buf, size_t nbuf) {
+    if (!buf || nbuf == 0) return;
+    if (term_tag(t) != TAG_TOP) {
+        snprintf(buf, nbuf, "TERM");
+        return;
+    }
+    u32 lop = term_ext(t);
+    u64 loc = term_val(t);
+    switch (lop) {
+        case LOP_GID:
+            snprintf(buf, nbuf, "LGID\\naxis=%llu", (unsigned long long)term_val(t));
+            return;
+        case LOP_CONST_U:
+            snprintf(buf, nbuf, "LCONST_U\\n%u", (u32)term_val(t));
+            return;
+        case LOP_CONST_F: {
+            u32 bits = (u32)term_val(t);
+            f32 f = 0.0f;
+            memcpy(&f, &bits, sizeof(bits));
+            snprintf(buf, nbuf, "LCONST_F\\n%.6g", (double)f);
+            return;
+        }
+        case LOP_RANGE: {
+            u32 trip = 0;
+            lower_is_const_u(lower_heap_read(ctx, loc + 0), &trip);
+            snprintf(buf, nbuf, "LRANGE\\ntrip=%u\\n@%llu",
+                     trip, (unsigned long long)loc);
+            return;
+        }
+        case LOP_ENDRANGE:
+            snprintf(buf, nbuf, "LENDRANGE\\n@%llu", (unsigned long long)loc);
+            return;
+        case LOP_LOAD: {
+            u32 buf_idx = 0;
+            lower_is_const_u(lower_heap_read(ctx, loc + 1), &buf_idx);
+            snprintf(buf, nbuf, "LLOAD\\nleaf=%u\\n@%llu",
+                     buf_idx > 0 ? buf_idx - 1 : 0, (unsigned long long)loc);
+            return;
+        }
+        case LOP_STORE:
+            snprintf(buf, nbuf, "LSTORE\\n@%llu", (unsigned long long)loc);
+            return;
+        case LOP_ALU: {
+            u32 uop = 0, aux = 0;
+            lower_is_const_u(lower_heap_read(ctx, loc + 2), &uop);
+            lower_is_const_u(lower_heap_read(ctx, loc + 3), &aux);
+            snprintf(buf, nbuf, "LALU\\n%s aux=%u\\n@%llu",
+                     uop < UOP_COUNT ? uop_names[uop] : "?", aux,
+                     (unsigned long long)loc);
+            return;
+        }
+        case LOP_ACC_INIT: {
+            f32 init = 0.0f;
+            lower_is_const_f(lower_heap_read(ctx, loc + 0), &init);
+            snprintf(buf, nbuf, "LACC_INIT\\n%.6g\\n@%llu",
+                     (double)init, (unsigned long long)loc);
+            return;
+        }
+        case LOP_ACC: {
+            u32 red = 0;
+            lower_is_const_u(lower_heap_read(ctx, loc + 2), &red);
+            snprintf(buf, nbuf, "LACC\\n%s\\n@%llu",
+                     red < UOP_COUNT ? uop_names[red] : "?",
+                     (unsigned long long)loc);
+            return;
+        }
+        case LOP_INDEX: {
+            u32 scale = 1;
+            lower_is_const_u(lower_heap_read(ctx, loc + 2), &scale);
+            snprintf(buf, nbuf, "LINDEX\\nscale=%u\\n@%llu",
+                     scale, (unsigned long long)loc);
+            return;
+        }
+        case LOP_MOD: {
+            u32 mod = 1;
+            lower_is_const_u(lower_heap_read(ctx, loc + 1), &mod);
+            snprintf(buf, nbuf, "LMOD\\n%u\\n@%llu",
+                     mod, (unsigned long long)loc);
+            return;
+        }
+        case LOP_DIV: {
+            u32 div = 1;
+            lower_is_const_u(lower_heap_read(ctx, loc + 1), &div);
+            snprintf(buf, nbuf, "LDIV\\n%u\\n@%llu",
+                     div, (unsigned long long)loc);
+            return;
+        }
+        case LOP_MASK:
+            snprintf(buf, nbuf, "LMASK\\n@%llu", (unsigned long long)loc);
+            return;
+        case LOP_SINK:
+            snprintf(buf, nbuf, "LSINK\\n@%llu", (unsigned long long)loc);
+            return;
+        default:
+            snprintf(buf, nbuf, "%s\\n@%llu",
+                     lower_op_name(lop), (unsigned long long)loc);
+            return;
+    }
+}
+
+static const char *lower_kop_fill(const KOp *op) {
+    if (!op) return "#f0f0f0";
+    switch (op->type) {
+        case KOP_RANGE:
+        case KOP_ENDRANGE: return "#ffe7cc";
+        case KOP_LOAD:
+        case KOP_STORE: return "#d9f2e6";
+        case KOP_ALU:
+        case KOP_ACC:
+        case KOP_ACC_INIT:
+        case KOP_MASK: return "#dbe8ff";
+        case KOP_IDX:
+        case KOP_MOD:
+        case KOP_DIV: return "#efe2ff";
+        case KOP_GID:
+        case KOP_CONST_U:
+        case KOP_CONST_F: return "#fff2cc";
+        default: return "#f0f0f0";
+    }
+}
+
+static void lower_kop_label(const UOpKernel *uk, u32 idx, char *buf, size_t nbuf) {
+    if (!buf || nbuf == 0 || !uk || idx >= uk->n_ops) return;
+    const KOp *op = &uk->ops[idx];
+    switch (op->type) {
+        case KOP_GID:
+            snprintf(buf, nbuf, "%u\\nKOP_GID\\naxis=%u", idx, op->imm.u);
+            return;
+        case KOP_CONST_U:
+            snprintf(buf, nbuf, "%u\\nKOP_CONST_U\\n%u", idx, op->imm.u);
+            return;
+        case KOP_CONST_F:
+            snprintf(buf, nbuf, "%u\\nKOP_CONST_F\\n%.6g", idx, (double)op->imm.f);
+            return;
+        case KOP_RANGE:
+            snprintf(buf, nbuf, "%u\\nKOP_RANGE\\ntrip=%u", idx, op->imm.u);
+            return;
+        case KOP_ENDRANGE:
+            snprintf(buf, nbuf, "%u\\nKOP_ENDRANGE\\nrange=#%u", idx, op->arg[0]);
+            return;
+        case KOP_LOAD:
+            snprintf(buf, nbuf, "%u\\nKOP_LOAD\\nbuf=%u idx=#%u",
+                     idx, op->imm.u, op->arg[0]);
+            return;
+        case KOP_STORE:
+            snprintf(buf, nbuf, "%u\\nKOP_STORE\\nout idx=#%u\\nval=#%u",
+                     idx, op->arg[0], op->arg[1]);
+            return;
+        case KOP_ALU:
+            snprintf(buf, nbuf, "%u\\nKOP_ALU\\n%s aux=%u\\na=#%u b=#%u",
+                     idx, op->imm.u < UOP_COUNT ? uop_names[op->imm.u] : "?",
+                     op->arg[2], op->arg[0], op->arg[1]);
+            return;
+        case KOP_ACC_INIT:
+            snprintf(buf, nbuf, "%u\\nKOP_ACC_INIT\\n%.6g", idx, (double)op->imm.f);
+            return;
+        case KOP_ACC:
+            snprintf(buf, nbuf, "%u\\nKOP_ACC\\n%s\\nacc=#%u val=#%u",
+                     idx, op->imm.u < UOP_COUNT ? uop_names[op->imm.u] : "?",
+                     op->arg[0], op->arg[1]);
+            return;
+        case KOP_IDX:
+            snprintf(buf, nbuf, "%u\\nKOP_IDX\\nbase=#%u add=#%u\\nscale=%u",
+                     idx, op->arg[0], op->arg[1], op->imm.u);
+            return;
+        case KOP_MOD:
+            snprintf(buf, nbuf, "%u\\nKOP_MOD\\na=#%u mod=%u",
+                     idx, op->arg[0], op->imm.u);
+            return;
+        case KOP_DIV:
+            snprintf(buf, nbuf, "%u\\nKOP_DIV\\na=#%u div=%u",
+                     idx, op->arg[0], op->imm.u);
+            return;
+        case KOP_MASK:
+            snprintf(buf, nbuf, "%u\\nKOP_MASK\\ncond=#%u val=#%u",
+                     idx, op->arg[0], op->arg[1]);
+            return;
+        default:
+            snprintf(buf, nbuf, "%u\\n%s", idx, lower_kop_name(op->type));
+            return;
+    }
+}
+
+static int lower_term_in_list(const Term *items, u32 count, Term t) {
+    for (u32 i = 0; i < count; i++) {
+        if (items[i] == t) return 1;
+    }
+    return 0;
+}
+
+static u32 lower_collect_terms(TinyHVM *ctx, Term root, Term *out_terms, u32 cap) {
+    if (!ctx || !out_terms || cap == 0 || term_tag(root) != TAG_TOP) return 0;
+    Term *stack = (Term *)calloc(cap, sizeof(Term));
+    u8 *seen_loc = (u8 *)calloc((size_t)(ctx->lower_ctx.heap_pos ? ctx->lower_ctx.heap_pos : 1), 1);
+    Term *seen_imm = (Term *)calloc(cap, sizeof(Term));
+    u32 sp = 0, count = 0, n_imm = 0;
+    stack[sp++] = root;
+    while (sp > 0 && count < cap) {
+        Term t = stack[--sp];
+        if (term_tag(t) != TAG_TOP) continue;
+        u32 arity = lower_term_arity(t);
+        if (arity > 0) {
+            u64 loc = term_val(t);
+            if (loc == 0 || loc >= ctx->lower_ctx.heap_pos || seen_loc[loc]) continue;
+            seen_loc[loc] = 1;
+        } else {
+            if (lower_term_in_list(seen_imm, n_imm, t)) continue;
+            seen_imm[n_imm++] = t;
+        }
+        out_terms[count++] = t;
+        if (arity == 0) continue;
+        u64 loc = term_val(t);
+        for (u32 i = 0; i < arity && sp < cap; i++)
+            stack[sp++] = lower_heap_read(ctx, loc + i);
+    }
+    free(seen_imm);
+    free(seen_loc);
+    free(stack);
+    return count;
+}
+
+static void lower_dump_manifest(TinyHVM *ctx, const char *path,
+                                const KernelEntry *ke, const UOpKernel *uk,
+                                u32 kid, u64 kernel_loc, u64 cache_sig, u64 lower_sig,
+                                Backend *backend, u32 out_buf,
+                                const u32 *leaf_bufs, u32 n_leaf_bufs,
+                                u32 step_index) {
+    if (!ctx || !path || !ke || !uk) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    char full_shape[96], raw_shape[96], out_shape[96], reduce_axes[96], result_view[256];
+    const char *interaction = thvm_step_graph_is_active() ? thvm_step_graph_last_name() : "";
+    lower_shape_str(&ke->full_shape, full_shape, sizeof(full_shape));
+    lower_shape_str(&ke->raw_out_shape, raw_shape, sizeof(raw_shape));
+    lower_shape_str(&ke->out_shape, out_shape, sizeof(out_shape));
+    lower_axes_str(ke->has_reduce ? &ke->reduce : NULL, uk->rank, reduce_axes, sizeof(reduce_axes));
+    if (ke->has_result_view) lower_view_str(&ke->result_view, result_view, sizeof(result_view));
+    else snprintf(result_view, sizeof(result_view), "none");
+    fprintf(f,
+            "step_index=%u\ninteraction=%s\nkid=%u\nkernel_loc=%llu\nbackend=%s\ncache_sig=0x%016llx\n"
+            "lower_sig=0x%016llx\nlower_heap=%llu\nrewrites=%u\n"
+            "full_shape=%s\nraw_out_shape=%s\nout_shape=%s\nresult_view=%s\n"
+            "output_slot=%u\nraw_output_tid=%u\noutput_tid=%u\nout_buf=%u\n"
+            "grid=[%u,%u,%u]\ntg=[%u,%u,%u]\nlocal_size=%u\nreduce_numel=%u\n"
+            "n_leaves=%u\nn_ops=%u\nreduce_type=%s\nreduce_axes=%s\n"
+            "dispatch_mode=%s/uop\n",
+            step_index, interaction && interaction[0] ? interaction : "none",
+            kid, (unsigned long long)kernel_loc,
+            lower_backend_short(ctx, backend),
+            (unsigned long long)cache_sig,
+            (unsigned long long)lower_sig,
+            (unsigned long long)ctx->lower_ctx.heap_pos,
+            ctx->lower_ctx.rewrite_count,
+            full_shape, raw_shape, out_shape, result_view,
+            ke->output_slot, ke->raw_output_tid, ke->output_tid, out_buf,
+            uk->grid[0], uk->grid[1], uk->grid[2],
+            uk->tg[0], uk->tg[1], uk->tg[2],
+            uk->local_size, uk->reduce_numel,
+            ke->n_leaves, ke->n_ops,
+            ke->has_reduce ? uop_names[ke->reduce.reduce_type] : "NONE",
+            reduce_axes,
+            lower_backend_short(ctx, backend));
+    fprintf(f, "\nfused_ops:\n");
+    for (u32 i = 0; i < ke->n_ops; i++) {
+        fprintf(f, "  %u: %s a=%u b=%u aux=%u\n",
+                i,
+                ke->ops[i].uop < UOP_COUNT ? uop_names[ke->ops[i].uop] : "?",
+                ke->ops[i].arg_a, ke->ops[i].arg_b, ke->ops[i].aux);
+    }
+    fprintf(f, "\nleaves:\n");
+    for (u32 i = 0; i < ke->n_leaves; i++) {
+        char view[256];
+        lower_view_str(&ke->leaf_views[i], view, sizeof(view));
+        if (ke->leaf_kinds[i] == KERNEL_LEAF_TENSOR && ke->leaf_ids[i] < ctx->tensor_count) {
+            TensorMeta *m = &ctx->tensors[ke->leaf_ids[i]];
+            fprintf(f,
+                    "  %u: tensor t%u dispatch_buf=%u tensor_buf=%u slot=%u dtype=%s st_views=%u %s\n",
+                    i, ke->leaf_ids[i],
+                    i < n_leaf_bufs ? leaf_bufs[i] : 0,
+                    m->buf_id, m->planned_slot, dtype_name(ke->leaf_dtypes[i]),
+                    ke->leaf_sts[i].n_views, view);
+        } else if (ke->leaf_kinds[i] == KERNEL_LEAF_NUM) {
+            fprintf(f,
+                    "  %u: const %.6g dispatch_buf=%u dtype=%s %s\n",
+                    i, (double)ke->leaf_nums[i],
+                    i < n_leaf_bufs ? leaf_bufs[i] : 0,
+                    dtype_name(ke->leaf_dtypes[i]), view);
+        } else {
+            fprintf(f, "  %u: leaf dispatch_buf=%u dtype=%s %s\n",
+                    i, i < n_leaf_bufs ? leaf_bufs[i] : 0,
+                    dtype_name(ke->leaf_dtypes[i]), view);
+        }
+    }
+    fprintf(f, "\nuop_ops:\n");
+    for (u32 i = 0; i < uk->n_ops; i++) {
+        char label[256];
+        lower_kop_label(uk, i, label, sizeof(label));
+        fprintf(f, "  %s\n", label);
+    }
+    fclose(f);
+}
+
+static void lower_dump_dot(TinyHVM *ctx, const char *path,
+                           const KernelEntry *ke, const UOpKernel *uk,
+                           u32 kid, u64 kernel_loc, u64 cache_sig, u64 lower_sig,
+                           Backend *backend, u32 out_buf,
+                           const u32 *leaf_bufs, u32 n_leaf_bufs,
+                           u32 step_index) {
+    if (!ctx || !path || !ke || !uk) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    char full_shape[96], raw_shape[96], out_shape[96], reduce_axes[96], result_view[256];
+    const char *interaction = thvm_step_graph_is_active() ? thvm_step_graph_last_name() : "";
+    lower_shape_str(&ke->full_shape, full_shape, sizeof(full_shape));
+    lower_shape_str(&ke->raw_out_shape, raw_shape, sizeof(raw_shape));
+    lower_shape_str(&ke->out_shape, out_shape, sizeof(out_shape));
+    lower_axes_str(ke->has_reduce ? &ke->reduce : NULL, uk->rank, reduce_axes, sizeof(reduce_axes));
+    if (ke->has_result_view) lower_view_str(&ke->result_view, result_view, sizeof(result_view));
+    else snprintf(result_view, sizeof(result_view), "none");
+
+    fprintf(f, "digraph Lowered {\n");
+    fprintf(f, "  graph [rankdir=LR, nodesep=0.35, ranksep=0.55];\n");
+    fprintf(f, "  node [shape=box, style=filled, fontname=\"Courier\", fontsize=10, margin=\"0.08,0.05\"];\n");
+    fprintf(f, "  edge [fontname=\"Courier\", fontsize=8];\n\n");
+
+    fprintf(f, "  subgraph cluster_meta {\n");
+    fprintf(f, "    label=\"Kernel Trace\";\n");
+    fprintf(f, "    color=\"#bbbbbb\";\n");
+    fprintf(f, "    meta0 [shape=note, fillcolor=\"#f8f8f8\", label=\"step=%03u\\ninteraction=%s\\nkid=%u\\nkernel_loc=@%llu\\nbackend=%s\\ncache_sig=0x%016llx\\nlower_sig=0x%016llx\\nlower_heap=%llu\\nrewrites=%u\"];\n",
+            step_index, interaction && interaction[0] ? interaction : "none",
+            kid, (unsigned long long)kernel_loc, lower_backend_short(ctx, backend),
+            (unsigned long long)cache_sig, (unsigned long long)lower_sig,
+            (unsigned long long)ctx->lower_ctx.heap_pos, ctx->lower_ctx.rewrite_count);
+    fprintf(f, "    meta1 [shape=note, fillcolor=\"#f8f8f8\", label=\"full=%s\\nraw_out=%s\\nout=%s\\nresult_view=%s\"];\n",
+            full_shape, raw_shape, out_shape, result_view);
+    fprintf(f, "    meta2 [shape=note, fillcolor=\"#f8f8f8\", label=\"reduce=%s axes=%s\\ngrid=[%u,%u,%u]\\ntg=[%u,%u,%u]\\nlocal=%u reduce_numel=%u\\nout_buf=%u slot=%u\"];\n",
+            ke->has_reduce ? uop_names[ke->reduce.reduce_type] : "NONE",
+            reduce_axes,
+            uk->grid[0], uk->grid[1], uk->grid[2],
+            uk->tg[0], uk->tg[1], uk->tg[2],
+            uk->local_size, uk->reduce_numel, out_buf, ke->output_slot);
+    fprintf(f, "  }\n\n");
+
+    fprintf(f, "  subgraph cluster_fused {\n");
+    fprintf(f, "    label=\"Fused Ops\";\n");
+    fprintf(f, "    color=\"#bbbbbb\";\n");
+    for (u32 i = 0; i < ke->n_ops; i++) {
+        fprintf(f, "    fop%u [fillcolor=\"#dbe8ff\", label=\"%u\\n%s\\na=%u b=%u aux=%u\"];\n",
+                i, i,
+                ke->ops[i].uop < UOP_COUNT ? uop_names[ke->ops[i].uop] : "?",
+                ke->ops[i].arg_a, ke->ops[i].arg_b, ke->ops[i].aux);
+        if (i > 0)
+            fprintf(f, "    fop%u -> fop%u [style=dotted, arrowhead=none, color=\"#888888\"];\n", i - 1, i);
+    }
+    fprintf(f, "  }\n\n");
+
+    fprintf(f, "  subgraph cluster_mem {\n");
+    fprintf(f, "    label=\"Memory Plan\";\n");
+    fprintf(f, "    color=\"#bbbbbb\";\n");
+    fprintf(f, "    mem_out [shape=box3d, fillcolor=\"#d9f2e6\", label=\"out\\nbuf=%u\\nslot=%u\\nraw_tid=%u\\nout_tid=%u\\ndtype=%s\"];\n",
+            out_buf, ke->output_slot, ke->raw_output_tid, ke->output_tid, dtype_name(uk->out_dtype));
+    for (u32 i = 0; i < ke->n_leaves; i++) {
+        char view[256];
+        lower_view_str(&ke->leaf_views[i], view, sizeof(view));
+        if (ke->leaf_kinds[i] == KERNEL_LEAF_TENSOR && ke->leaf_ids[i] < ctx->tensor_count) {
+            TensorMeta *m = &ctx->tensors[ke->leaf_ids[i]];
+            fprintf(f, "    mem_leaf%u [fillcolor=\"#eef5ff\", label=\"leaf%u t%u\\ndispatch_buf=%u\\ntensor_buf=%u\\nslot=%u\\ndtype=%s\\nst_views=%u\\n%s\"];\n",
+                    i, i, ke->leaf_ids[i],
+                    i < n_leaf_bufs ? leaf_bufs[i] : 0,
+                    m->buf_id, m->planned_slot, dtype_name(ke->leaf_dtypes[i]),
+                    ke->leaf_sts[i].n_views, view);
+        } else if (ke->leaf_kinds[i] == KERNEL_LEAF_NUM) {
+            fprintf(f, "    mem_leaf%u [fillcolor=\"#fff2cc\", label=\"leaf%u const\\n%.6g\\ndispatch_buf=%u\\ndtype=%s\\n%s\"];\n",
+                    i, i, (double)ke->leaf_nums[i],
+                    i < n_leaf_bufs ? leaf_bufs[i] : 0,
+                    dtype_name(ke->leaf_dtypes[i]), view);
+        } else {
+            fprintf(f, "    mem_leaf%u [fillcolor=\"#f0f0f0\", label=\"leaf%u\\ndispatch_buf=%u\\ndtype=%s\\n%s\"];\n",
+                    i, i, i < n_leaf_bufs ? leaf_bufs[i] : 0,
+                    dtype_name(ke->leaf_dtypes[i]), view);
+        }
+    }
+    fprintf(f, "  }\n\n");
+
+    fprintf(f, "  subgraph cluster_lower {\n");
+    fprintf(f, "    label=\"LowerCtx IC\";\n");
+    fprintf(f, "    color=\"#bbbbbb\";\n");
+    u32 cap = (u32)(ctx->lower_ctx.heap_pos + 64);
+    Term *terms = (Term *)calloc(cap ? cap : 1, sizeof(Term));
+    u32 n_terms = lower_collect_terms(ctx, ctx->lower_ctx.root, terms, cap ? cap : 1);
+    for (u32 i = 0; i < n_terms; i++) {
+        char id[64], label[256];
+        lower_term_id(terms[i], id, sizeof(id));
+        lower_term_label(ctx, terms[i], label, sizeof(label));
+        fprintf(f, "    %s [fillcolor=\"%s\", label=\"%s\"%s];\n",
+                id, lower_dot_fill(terms[i]), label,
+                terms[i] == ctx->lower_ctx.root ? ",color=\"#cc0000\",penwidth=2.0" : "");
+    }
+    for (u32 i = 0; i < n_terms; i++) {
+        Term t = terms[i];
+        u32 arity = lower_term_arity(t);
+        if (arity == 0) continue;
+        u64 loc = term_val(t);
+        char dst[64];
+        lower_term_id(t, dst, sizeof(dst));
+        for (u32 ai = 0; ai < arity; ai++) {
+            Term child = lower_heap_read(ctx, loc + ai);
+            if (term_tag(child) != TAG_TOP) continue;
+            char src[64];
+            lower_term_id(child, src, sizeof(src));
+            fprintf(f, "    %s -> %s [label=\"%s\"];\n",
+                    src, dst, lower_lop_port_name(term_ext(t), ai));
+        }
+        if (term_ext(t) == LOP_LOAD) {
+            u32 buf_idx = 0;
+            lower_is_const_u(lower_heap_read(ctx, loc + 1), &buf_idx);
+            if (buf_idx > 0)
+                fprintf(f, "    mem_leaf%u -> %s [style=dashed, color=\"#888888\", label=\"buf\"];\n",
+                        buf_idx - 1, dst);
+        } else if (term_ext(t) == LOP_STORE) {
+            fprintf(f, "    %s -> mem_out [style=dashed, color=\"#888888\", label=\"store\"];\n", dst);
+        }
+    }
+    fprintf(f, "  }\n\n");
+    free(terms);
+
+    fprintf(f, "  subgraph cluster_uop {\n");
+    fprintf(f, "    label=\"Emitted UOpKernel / KOP\";\n");
+    fprintf(f, "    color=\"#bbbbbb\";\n");
+    for (u32 i = 0; i < uk->n_ops; i++) {
+        char label[256];
+        lower_kop_label(uk, i, label, sizeof(label));
+        fprintf(f, "    k%u [fillcolor=\"%s\", label=\"%s\"];\n",
+                i, lower_kop_fill(&uk->ops[i]), label);
+        if (i > 0)
+            fprintf(f, "    k%u -> k%u [style=dotted, arrowhead=none, color=\"#888888\"];\n", i - 1, i);
+    }
+    for (u32 i = 0; i < uk->n_ops; i++) {
+        const KOp *op = &uk->ops[i];
+        for (u32 ai = 0; ai < 3; ai++) {
+            const char *port = lower_kop_port_name(op, ai);
+            if (!port[0]) continue;
+            if (op->arg[ai] >= uk->n_ops) continue;
+            fprintf(f, "    k%u -> k%u [label=\"%s\"];\n", op->arg[ai], i, port);
+        }
+        if (op->type == KOP_LOAD && op->imm.u > 0 && op->imm.u - 1 < ke->n_leaves) {
+            fprintf(f, "    mem_leaf%u -> k%u [style=dashed, color=\"#888888\", label=\"buf\"];\n",
+                    op->imm.u - 1, i);
+        } else if (op->type == KOP_STORE) {
+            fprintf(f, "    k%u -> mem_out [style=dashed, color=\"#888888\", label=\"store\"];\n", i);
+        }
+    }
+    fprintf(f, "  }\n");
+    fprintf(f, "}\n");
+    fclose(f);
+}
+
+static void thvm_lower_dump_graphs(TinyHVM *ctx, const KernelEntry *ke, const UOpKernel *uk,
+                                   u32 kid, u64 kernel_loc, u64 cache_sig, u64 lower_sig,
+                                   Backend *backend, u32 out_buf,
+                                   const u32 *leaf_bufs, u32 n_leaf_bufs) {
+    if (!ctx || !ke || !uk || !lower_env_enabled("THVM_LOWER_GRAPH")) return;
+    const char *anchor_name = thvm_step_graph_lower_anchor_name();
+    u32 anchor_index = thvm_step_graph_lower_anchor_index();
+    char dir[512];
+    const char *dir_env = getenv("THVM_LOWER_GRAPH_DIR");
+    if (dir_env && dir_env[0]) {
+        snprintf(dir, sizeof(dir), "%s", dir_env);
+    } else if (thvm_step_graph_is_active() ||
+               (getenv("THVM_STEP_GRAPH") && getenv("THVM_STEP_GRAPH_DIR"))) {
+        snprintf(dir, sizeof(dir), "%s_lower", thvm_step_graph_dir());
+    } else {
+        snprintf(dir, sizeof(dir), "graphs/lower");
+    }
+    char mkdir_cmd[1024];
+    snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s\"", dir);
+    system(mkdir_cmd);
+
+    u32 step_index = thvm_step_graph_is_active() ? thvm_step_graph_current_index()
+                    : (anchor_name && anchor_name[0]) ? anchor_index
+                    : kid;
+    u32 root_uop = (term_tag(ke->original_term) == TAG_TOP) ? term_ext(ke->original_term) : UOP_COUNT;
+    const char *root_name = (root_uop < UOP_COUNT) ? uop_names[root_uop] : "KERNEL";
+    const char *interaction = thvm_step_graph_is_active() ? thvm_step_graph_last_name()
+                             : (anchor_name && anchor_name[0]) ? anchor_name
+                             : "";
+    char stem[256];
+    if (interaction && interaction[0]) {
+        snprintf(stem, sizeof(stem), "step_%03u_%s_kid%u",
+                 step_index, interaction, kid);
+    } else if (thvm_step_graph_is_active() ||
+               (getenv("THVM_STEP_GRAPH") && getenv("THVM_STEP_GRAPH_DIR"))) {
+        snprintf(stem, sizeof(stem), "step_%03u_KERNEL_h%llu_%s_kid%u",
+                 step_index, (unsigned long long)kernel_loc, root_name, kid);
+    } else {
+        snprintf(stem, sizeof(stem), "kernel_%03u_h%llu_%s_kid%u",
+                 step_index, (unsigned long long)kernel_loc, root_name, kid);
+    }
+
+    char dot_path[768], txt_path[768];
+    snprintf(dot_path, sizeof(dot_path), "%s/%s.dot", dir, stem);
+    snprintf(txt_path, sizeof(txt_path), "%s/%s.txt", dir, stem);
+    lower_dump_dot(ctx, dot_path, ke, uk, kid, kernel_loc, cache_sig, lower_sig,
+                   backend, out_buf, leaf_bufs, n_leaf_bufs, step_index);
+    lower_dump_manifest(ctx, txt_path, ke, uk, kid, kernel_loc, cache_sig, lower_sig,
+                        backend, out_buf, leaf_bufs, n_leaf_bufs, step_index);
+#ifdef __OBJC__
+    if (backend && backend == ctx->backends[THVM_DEV_METAL]) {
+        char *src = thvm_metal_render_uop_kernel_source(uk);
+        if (src) {
+            char msl_path[768];
+            snprintf(msl_path, sizeof(msl_path), "%s/%s.msl", dir, stem);
+            FILE *mf = fopen(msl_path, "w");
+            if (mf) {
+                fputs(src, mf);
+                fclose(mf);
+            }
+            free(src);
+        }
+    }
+#endif
+    if (!lower_env_enabled("THVM_LOWER_NO_PNG") && !getenv("THVM_STEP_GRAPH_NO_PNG")) {
+        char png_cmd[1600];
+        snprintf(png_cmd, sizeof(png_cmd),
+                 "dot -Tpng -Gdpi=150 \"%s\" -o \"%s/%s.png\" 2>/dev/null",
+                 dot_path, dir, stem);
+        system(png_cmd);
     }
 }

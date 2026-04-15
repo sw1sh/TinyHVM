@@ -1519,6 +1519,12 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     }
                     color = "#ccffcc";
                 }
+            } else if (ext == UOP_EXEC) {
+                Term kid_term = heap_read(ctx, val + 0);
+                u32 kid = term_as_u32(kid_term);
+                snprintf(label,sizeof(label),"EXEC\\n#%u\\n@%llu",
+                         kid, (unsigned long long)val);
+                color = "#ccccff";  // light blue for exec triggers
             } else if (ext == UOP_GRAD) {
                 // GRAD bead: y (input below), gy (output above).
                 Term gx = thvm_grad_target_get(ctx, val);
@@ -1578,6 +1584,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (ext == UOP_GRAD) arity = 2;
             else if (ext == UOP_WHERE || ext == UOP_IFZ) arity = 3;
             else if (ext == UOP_KERNEL) arity = 2;
+            else if (ext == UOP_EXEC) arity = 2;  // kid + deps (flags hidden)
             else if (ext == UOP_FUSE) arity = 1;
             else if (ext == UOP_FUSE2) arity = 3;
             else if (ext == UOP_LOG_PRINT) arity = 1;

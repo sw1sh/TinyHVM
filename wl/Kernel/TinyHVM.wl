@@ -123,13 +123,22 @@ TEvalAccuracy::usage = "TEvalAccuracy[net, testImages, testLabels] evaluates cla
 (* ── Graph visualization ──────────────────────────────────────────────── *)
 
 TINetGraph::usage = "TINetGraph[tensor|term] returns a Graph of the interaction net by walking the C heap.";
+TInteractionGraph::usage = "TInteractionGraph[term] returns an interaction net graph with the next active pair highlighted in red.";
+
+(* ── Heap introspection ──────────────────────────────────────────────── *)
+
+THeap::usage = "THeap[<|...|>] represents a snapshot of the TinyHVM heap state. Access properties via THeap[h][\"Key\"].";
+TInteraction::usage = "TInteraction[<|...|>] represents a single interaction event with rule name and before/after tags.";
+THeapSnapshot::usage = "THeapSnapshot[] captures the current heap state as a THeap object.";
+THeapRead::usage = "THeapRead[loc] reads a term at a heap location. Returns <|\"Tag\", \"TagCode\", \"Ext\", \"Val\"|>.";
+TStepReduce::usage = "TStepReduce[term] reduces exactly one interaction. Returns {result, TInteraction, THeap}.";
 
 (* ── Single-step reduction & tracing ──────────────────────────────────── *)
 
 TTraceEnable::usage = "TTraceEnable[] enables interaction tracing.";
 TTraceDisable::usage = "TTraceDisable[] disables interaction tracing.";
 TTraceClear::usage = "TTraceClear[] clears the trace buffer.";
-TTrace::usage = "TTrace[] returns a list of interaction trace records.";
+TTrace::usage = "TTrace[] returns a list of TInteraction objects from the trace buffer.";
 TReduceSteps::usage = "TReduceSteps[tensor, n] reduces at most n interactions, returns {result, stepsTaken}.";
 
 (* ── Profiling ────────────────────────────────────────────────────────── *)
@@ -293,6 +302,9 @@ thvmTraceEnableFn = None;
 thvmTraceClearFn = None;
 thvmTraceDataFn = None;
 thvmReduceStepsFn = None;
+thvmHeapReadFn = None;
+thvmHeapSnapshotFn = None;
+thvmNextInteractionFn = None;
 
 loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
     $libraryLoaded = True;
@@ -460,6 +472,14 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
         {}, LibraryDataType[NumericArray]];
     thvmReduceStepsFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmReduceSteps",
         {Integer, Integer, Integer}, Integer];
+
+    (* Heap introspection *)
+    thvmHeapReadFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapRead",
+        {Integer}, {Integer, 1}];
+    thvmHeapSnapshotFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapSnapshot",
+        {}, {Integer, 1}];
+    thvmNextInteractionFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmNextInteraction",
+        {Integer}, {Integer, 1}];
 ];
 
 (* ════════════════════════════════════════════════════════════════════════ *)
@@ -1113,7 +1133,7 @@ TTerm /: MakeBoxes[t:TTerm[id_Integer], StandardForm] := Module[
     icon = Switch[tagStr,
         "Lam", Graphics[{RGBColor[0.5, 0.8, 0.3], Disk[]}, ImageSize -> {28, 28}],
         "App", Graphics[{RGBColor[0.7, 0.3, 0.7], Disk[]}, ImageSize -> {28, 28}],
-        "Era", Graphics[{GrayLevel[0.5], Thickness[0.08], Circle[{0.5, 0.5}, 0.35]}, ImageSize -> {28, 28}],
+        "Era", Graphics[{LightDarkSwitched[GrayLevel[0.5], GrayLevel[0.6]], Thickness[0.08], Circle[{0.5, 0.5}, 0.35]}, ImageSize -> {28, 28}],
         "Ref", Graphics[{RGBColor[0.8, 0.4, 0.1], Polygon[{{0.2,0},{0.8,0},{1,0.5},{0.8,1},{0.2,1},{0,0.5}}]}, ImageSize -> {28, 28}],
         "Sup", Graphics[{RGBColor[0.3, 0.7, 0.9], Disk[]}, ImageSize -> {28, 28}],
         _, None
@@ -1144,14 +1164,14 @@ TTraceClear[]   := (loadLibrary[]; thvmTraceClearFn[]);
 TTrace[] := Module[{raw, n},
     loadLibrary[];
     raw = Round[Normal[thvmTraceDataFn[]]];
-    n = Length[raw] / 5;
-    Table[<|
-        "BeforeTag" -> Lookup[$tagName, raw[[5 i - 4]], "?"],
-        "BeforeExt" -> raw[[5 i - 3]],
-        "AfterTag"  -> Lookup[$tagName, raw[[5 i - 2]], "?"],
-        "AfterExt"  -> raw[[5 i - 1]],
-        "RuleId"    -> raw[[5 i]]
-    |>, {i, n}]
+    n = Length[raw] / 7;
+    Table[
+        iMakeInteraction[
+            raw[[7 i - 6]], raw[[7 i - 5]],
+            raw[[7 i - 4]], raw[[7 i - 3]],
+            raw[[7 i - 2]], raw[[7 i - 1]], raw[[7 i]]
+        ],
+    {i, n}]
 ];
 
 TReduceSteps[t_TTensor, n_Integer] := Module[{out = allocId[], steps, tag},
@@ -1161,6 +1181,186 @@ TReduceSteps[t_TTensor, n_Integer] := Module[{out = allocId[], steps, tag},
     {If[tag === 10 || tag === 11, TTensor[out], TTerm[out]], steps}
 ];
 TReduceSteps[t_TTerm, n_Integer] := TReduceSteps[ToTTensor[t], n];
+
+(* ════════════════════════════════════════════════════════════════════════ *)
+(* Heap introspection — THeap, TInteraction, TStepReduce, THeapRead        *)
+(* ════════════════════════════════════════════════════════════════════════ *)
+
+(* ── Interaction rule classification ─────────────────────────────────── *)
+
+$interactionRuleName = <|
+    {"App", "Lam"} -> "Beta",
+    {"App", "Sup"} -> "APP-SUP Commutation",
+    {"App", "Era"} -> "APP-ERA Erasure",
+    {"App", "Ten"} -> "APP-TEN Sequencing",
+    {"App", "Num"} -> "APP-NUM Sequencing",
+    {"App", "Bri"} -> "APP-BRI Commutation",
+    {"Dp0", "Sup"} -> "DUP-SUP Annihilation",
+    {"Dp1", "Sup"} -> "DUP-SUP Annihilation",
+    {"Dp0", "Lam"} -> "DUP-LAM Commutation",
+    {"Dp1", "Lam"} -> "DUP-LAM Commutation",
+    {"Dp0", "Era"} -> "DUP-ERA Erasure",
+    {"Dp1", "Era"} -> "DUP-ERA Erasure",
+    {"Dp0", "Num"} -> "DUP-NUM Copy",
+    {"Dp1", "Num"} -> "DUP-NUM Copy",
+    {"Dp0", "Ten"} -> "DUP-TEN Copy",
+    {"Dp1", "Ten"} -> "DUP-TEN Copy",
+    {"Dp0", "Dp0"} -> "DUP-DUP Commutation",
+    {"Dp0", "Dp1"} -> "DUP-DUP Commutation",
+    {"Dp1", "Dp0"} -> "DUP-DUP Commutation",
+    {"Dp1", "Dp1"} -> "DUP-DUP Commutation",
+    {"Op2", "Num"} -> "OP2-NUM Compute",
+    {"Op2", "Sup"} -> "OP2-SUP Commutation",
+    {"Ann", "Bri"} -> "ANN-BRI Annihilation",
+    {"Ann", "Lam"} -> "ANN-LAM Commutation",
+    {"Ref", _}     -> "REF Expansion"
+|>;
+
+iRuleName[beforeTag_String, afterTag_String] :=
+    Lookup[$interactionRuleName, Key[{beforeTag, afterTag}],
+        Lookup[$interactionRuleName, Key[{beforeTag, _}],
+            Which[
+                beforeTag === afterTag, "Annihilation",
+                beforeTag === "Era" || afterTag === "Era", "Erasure",
+                True, "Commutation"
+            ]
+        ]
+    ];
+
+iRuleColor[ruleName_String] := Which[
+    StringContainsQ[ruleName, "Annihilation" | "Beta" | "Compute" | "Sequencing"], RGBColor[0.3, 0.7, 0.3],
+    StringContainsQ[ruleName, "Commutation" | "Expansion" | "Copy"], RGBColor[0.9, 0.6, 0.2],
+    StringContainsQ[ruleName, "Erasure"], GrayLevel[0.5],
+    True, GrayLevel[0.6]
+];
+
+(* Build a TInteraction from raw trace fields *)
+iMakeInteraction[beforeTagCode_, beforeExt_, afterTagCode_, afterExt_,
+                 ruleId_, beforeLoc_, afterLoc_] :=
+Module[{bt, at, rn},
+    bt = Lookup[$tagName, beforeTagCode, "?"];
+    at = Lookup[$tagName, afterTagCode, "?"];
+    rn = iRuleName[bt, at];
+    TInteraction[<|
+        "RuleName"   -> rn,
+        "BeforeTag"  -> bt,
+        "AfterTag"   -> at,
+        "BeforeExt"  -> beforeExt,
+        "AfterExt"   -> afterExt,
+        "RuleId"     -> ruleId,
+        "BeforeLoc"  -> beforeLoc,
+        "AfterLoc"   -> afterLoc
+    |>]
+];
+
+(* ── TInteraction SubValues and MakeBoxes ────────────────────────────── *)
+
+TInteraction[data_Association][key_String] := data[key];
+
+TInteraction /: MakeBoxes[t:TInteraction[data_Association], StandardForm] := Module[
+    {ruleName, beforeTag, afterTag, visibleItems, hiddenItems, icon, col},
+
+    ruleName = Lookup[data, "RuleName", "?"];
+    beforeTag = Lookup[data, "BeforeTag", "?"];
+    afterTag = Lookup[data, "AfterTag", "?"];
+    col = iRuleColor[ruleName];
+
+    visibleItems = {
+        tMakeItem["Rule", ruleName],
+        tMakeItem["Transition", beforeTag <> " \[RightArrow] " <> afterTag]
+    };
+
+    hiddenItems = {
+        tMakeItem["RuleId", Lookup[data, "RuleId", 0]],
+        tMakeItem["BeforeExt", Lookup[data, "BeforeExt", 0]],
+        tMakeItem["AfterExt", Lookup[data, "AfterExt", 0]],
+        tMakeItem["BeforeLoc", Lookup[data, "BeforeLoc", 0]],
+        tMakeItem["AfterLoc", Lookup[data, "AfterLoc", 0]]
+    };
+
+    icon = Graphics[{col, EdgeForm[{Thick, col}],
+        Polygon[{{0, 0}, {1, 0.5}, {0, 1}}]}, ImageSize -> {28, 28}];
+
+    InterpretationBox @@ {
+        BoxForm`ArrangeSummaryBox[
+            TInteraction, t, icon,
+            visibleItems, hiddenItems, StandardForm
+        ],
+        t,
+        Selectable -> False, Editable -> False, SelectWithContents -> True
+    }
+];
+
+(* ── THeap SubValues and MakeBoxes ───────────────────────────────────── *)
+
+THeap[data_Association][key_String] := data[key];
+
+THeapSnapshot[] := Module[{raw},
+    loadLibrary[];
+    raw = thvmHeapSnapshotFn[];
+    (* Subtract sentinels: heap_pos starts at 1, tensor_count starts at 1 *)
+    THeap[<|
+        "HeapSize"         -> raw[[1]] - 1,
+        "InteractionCount" -> raw[[2]],
+        "TensorCount"      -> raw[[3]] - 1,
+        "NextLabel"        -> raw[[4]],
+        "DefCount"         -> raw[[5]],
+        "Timestamp"        -> AbsoluteTime[]
+    |>]
+];
+
+THeap /: MakeBoxes[t:THeap[data_Association], StandardForm] := Module[
+    {visibleItems, hiddenItems, icon},
+
+    visibleItems = {
+        tMakeItem["Heap", ToString[Lookup[data, "HeapSize", 0]] <> " words"],
+        tMakeItem["Interactions", Lookup[data, "InteractionCount", 0]]
+    };
+
+    hiddenItems = {
+        tMakeItem["Tensors", Lookup[data, "TensorCount", 0]],
+        tMakeItem["NextLabel", Lookup[data, "NextLabel", 0]],
+        tMakeItem["Definitions", Lookup[data, "DefCount", 0]]
+    };
+
+    icon = Graphics[{RGBColor[0.2, 0.7, 0.7], EdgeForm[{LightDarkSwitched[GrayLevel[0.3], GrayLevel[0.6]]}],
+        Rectangle[{0, 0}, {1, 0.3}], Rectangle[{0, 0.35}, {1, 0.65}],
+        Rectangle[{0, 0.7}, {1, 1}]}, ImageSize -> {28, 28}];
+
+    InterpretationBox @@ {
+        BoxForm`ArrangeSummaryBox[
+            THeap, t, icon,
+            visibleItems, hiddenItems, StandardForm
+        ],
+        t,
+        Selectable -> False, Editable -> False, SelectWithContents -> True
+    }
+];
+
+(* ── THeapRead ───────────────────────────────────────────────────────── *)
+
+THeapRead[loc_Integer] := Module[{raw},
+    loadLibrary[];
+    raw = thvmHeapReadFn[loc];
+    <|"Tag" -> Lookup[$tagName, raw[[1]], "?"],
+      "TagCode" -> raw[[1]],
+      "Ext" -> raw[[2]],
+      "Val" -> raw[[3]]|>
+];
+
+(* ── TStepReduce ─────────────────────────────────────────────────────── *)
+
+TStepReduce[t_TTensor] := Module[{result, steps, traces, interaction, heap},
+    loadLibrary[];
+    TTraceEnable[]; TTraceClear[];
+    {result, steps} = TReduceSteps[t, 1];
+    traces = TTrace[];
+    TTraceDisable[];
+    interaction = If[Length[traces] > 0, First[traces], None];
+    heap = THeapSnapshot[];
+    {result, interaction, heap}
+];
+TStepReduce[t_TTerm] := TStepReduce[ToTTensor[t]];
 
 (* ════════════════════════════════════════════════════════════════════════ *)
 (* Load subpackages                                                        *)

@@ -1719,7 +1719,7 @@ EXTERN_C DLLEXPORT int thvmNextInteraction(
 
     u64 source_slot = 0;
     Term before = 0;
-    int found = thvm_phase1_find_next_actual(g_ctx, root, &source_slot, &before);
+    int found = thvm_step_find_next_actual(g_ctx, root, &source_slot, &before);
 
     mint dims[1] = {4};
     MTensor out;

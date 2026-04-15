@@ -298,6 +298,8 @@ static void thvm_maybe_normalize_binary_broadcast(TinyHVM *ctx, u32 uop, Term *a
     *b = thvm_explicit_broadcast_term(ctx, *b, target);
 }
 
+Term thvm_sum_axes(TinyHVM *ctx, Term x, const u32 *axes, u32 n_axes);
+
 // DUP tracking: detect when the same term is used in multiple op slots.
 // Creates a 1-slot DUP node (SUP with shared value) so the inet reducer
 // can evaluate the shared term once and cache the result for both projections.
@@ -570,19 +572,9 @@ Term thvm_op(TinyHVM *ctx, u32 uop, Term a, Term b) {
         }
     }
 
-    thvm_maybe_normalize_binary_broadcast(ctx, uop, &a, &b);
-
-    u64 loc = heap_alloc(ctx, 4); // 0-1: args (trampoline overwrites), 2-3: shadow (preserved)
-    a = linear_use(ctx, a, loc);
-    heap_set(ctx, loc, a);              // write before second linear_use
-    b = linear_use(ctx, b, loc + 1);    // may patch heap[loc] to DP0
-    heap_set(ctx, loc + 1, b);
-    heap_set(ctx, loc + 2, heap_read(ctx, loc)); // shadow: picks up DP0 patch
-    heap_set(ctx, loc + 3, b);
-
-    thvm_track_top_shape(ctx, loc, uop, heap_read(ctx, loc), b);
-
-    return term_top(uop, loc);
+    // UOP graphs share heap references directly; DUP boundaries should come
+    // from explicit combinator semantics, not constructor-time linear_use.
+    return thvm_op_raw(ctx, uop, a, b);
 }
 
 Term thvm_cast(TinyHVM *ctx, Term t, u32 dtype) {

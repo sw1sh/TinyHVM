@@ -7,8 +7,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 static void thvm_heap_dot_set_highlight(u64 slot, Term term);
 static int thvm_heap_dot_highlight_was_drawn(void);
 static void thvm_heap_dot_set_step_meta(const char *prev_name, const char *next_name);
-static int thvm_phase1_find_next_actual(TinyHVM *ctx, Term root, u64 *out_source_slot, Term *out_before);
-static u64 thvm_phase1_graph_source_slot(TinyHVM *ctx, u64 container_slot, Term container, Term before);
+static int thvm_step_find_next_actual(TinyHVM *ctx, Term root, u64 *out_source_slot, Term *out_before);
+static u64 thvm_step_redex_source_slot(TinyHVM *ctx, u64 container_slot, Term container, Term before);
 static const char *thvm_step_tag_name_short(u8 tag);
 static const char *thvm_step_graph_interaction_name(TinyHVM *ctx, Term before,
                                                     char *buf, size_t nbuf);
@@ -1191,12 +1191,12 @@ static int thvm_step_graph_find_next_interaction(TinyHVM *ctx, u64 *out_slot, Te
                                                  u64 *out_source_slot, Term *out_before) {
     u64 source_slot = 0;
     Term before = 0;
-    if (!thvm_phase1_find_next_actual(ctx, step_graph_root_term, &source_slot, &before))
+    if (!thvm_step_find_next_actual(ctx, step_graph_root_term, &source_slot, &before))
         return 0;
     Term container = step_graph_root_term;
-    if (source_slot != phase1_root_slot && source_slot < ctx->heap_pos)
+    if (source_slot != step_root_slot && source_slot < ctx->heap_pos)
         container = heap_read(ctx, source_slot);
-    u64 graph_source_slot = thvm_phase1_graph_source_slot(ctx, source_slot, container, before);
+    u64 graph_source_slot = thvm_step_redex_source_slot(ctx, source_slot, container, before);
     if (out_source_slot) *out_source_slot = graph_source_slot;
     if (out_before) *out_before = before;
     return thvm_step_graph_highlight_from_current_before(ctx, graph_source_slot, before, out_slot, out_term);
@@ -1501,7 +1501,7 @@ static void thvm_step_graph_finalize(TinyHVM *ctx) {
         u64 loc = term_val(step_graph_root_term);
         u64 hl_slot = (loc > 0 && loc < ctx->heap_pos) ? loc : 0;
         Term hl_term = hl_slot ? heap_read(ctx, hl_slot) : 0;
-        thvm_step_graph_display_name(ctx, phase1_root_slot, step_graph_root_term,
+        thvm_step_graph_display_name(ctx, step_root_slot, step_graph_root_term,
                                      hl_slot, hl_term,
                                      step_graph_lower_anchor_name, sizeof(step_graph_lower_anchor_name));
         step_graph_lower_anchor_index = step_graph_n;
@@ -1573,12 +1573,12 @@ finalize_rewrite_last:
 // while the interaction hasn't fired yet.
 void thvm_step_graph_on_pre_interaction(TinyHVM *ctx, Term before) {
     if (!getenv("THVM_STEP_GRAPH") || !step_graph_active) return;
-    thvm_phase1_capture_step_before_meta(ctx, before);
+    thvm_step_capture_step_before_meta(ctx, before);
 }
 
 // Post-interaction hook — called from TRACE_STEP in thvm_reduce_steps after
 // each fired interaction. Lazy-initializes the dump session on first call
-// when env is set. Updates phase1_root_slot's heap mirror so the dumper
+// when env is set. Updates step_root_slot's heap mirror so the dumper
 // sees the current root, and computes the correct source_slot via the
 // same helper structural_nf used.
 void thvm_step_graph_on_post_interaction(TinyHVM *ctx, Term before, Term root) {

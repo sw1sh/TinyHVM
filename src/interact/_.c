@@ -61,7 +61,6 @@ static u32 thvm_uop_storage_arity(u32 ext) {
     if (ext == UOP_KERNEL) return 3;
     if (ext == UOP_EXEC) return 3;   // [NUM(kid), deps, NUM(flags)]
     if (ext == UOP_FUSE) return 1;
-    if (ext == UOP_FUSE2) return 3;
     if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
     if (ext == UOP_GRAD) return 2;
     if (ext == UOP_LOG_PRINT || ext == UOP_DETACH) return 1;
@@ -70,8 +69,156 @@ static u32 thvm_uop_storage_arity(u32 ext) {
 }
 
 static u32 thvm_uop_visible_arity(u32 ext) {
-    if (ext == UOP_KERNEL || ext == UOP_FUSE2) return 2;
+    if (ext == UOP_KERNEL) return 2;
     return thvm_uop_storage_arity(ext);
+}
+
+static void thvm_fuse_copy_public_shape(TinyHVM *ctx, Term src, u64 dst_loc) {
+    if (!ctx || term_tag(src) != TAG_TOP || dst_loc == 0) return;
+    u64 src_loc = term_val(src);
+    const ShapeTracker *tracker = st_get_tracker(src_loc);
+    if (tracker) {
+        st_set_tracker(dst_loc, tracker);
+        return;
+    }
+    const View *view = st_get(src_loc);
+    if (view) st_set(dst_loc, view);
+}
+
+static u32 thvm_kernel_root_uop(TinyHVM *ctx, Term kernel);
+
+static int thvm_kernel_is_monolithic(TinyHVM *ctx, Term kernel) {
+    if (!ctx || term_tag(kernel) != TAG_TOP || term_ext(kernel) != UOP_KERNEL) return 0;
+    u64 loc = term_val(kernel);
+    if (loc == 0 || loc + 2 >= ctx->heap_pos) return 0;
+    return term_tag(heap_read(ctx, loc + 1)) == TAG_ANY;
+}
+
+static Term thvm_kernel_monolithic_payload(TinyHVM *ctx, Term kernel) {
+    if (!thvm_kernel_is_monolithic(ctx, kernel)) return term_era();
+    u64 loc = term_val(kernel);
+    return heap_read(ctx, loc + 0);
+}
+
+static Term thvm_make_public_kernel(TinyHVM *ctx, Term payload) {
+    if (!ctx || term_tag(payload) != TAG_TOP) return payload;
+    u32 uop = term_ext(payload);
+    u64 kloc = heap_alloc(ctx, 3);
+    heap_set(ctx, kloc + 0, payload);
+    heap_set(ctx, kloc + 1, thvm_any());  // monolithic public region marker
+    heap_set(ctx, kloc + 2, term_num_u32(uop));
+    thvm_fuse_copy_public_shape(ctx, payload, kloc);
+    return term_new(TAG_TOP, UOP_KERNEL, kloc);
+}
+
+static Term thvm_make_growing_kernel_from_uop(TinyHVM *ctx, u32 uop, Term left, Term right, Term shape_src) {
+    if (!ctx || uop >= UOP_COUNT) return 0;
+    u64 kloc = heap_alloc(ctx, 3);
+    heap_set(ctx, kloc + 0, left);
+    heap_set(ctx, kloc + 1, right);
+    heap_set(ctx, kloc + 2, term_num_u32(uop));
+    if (term_tag(shape_src) == TAG_TOP)
+        thvm_fuse_copy_public_shape(ctx, shape_src, kloc);
+    return term_new(TAG_TOP, UOP_KERNEL, kloc);
+}
+
+static int thvm_fuse_child_is_compute_like(Term child) {
+    if (term_tag(child) != TAG_TOP) return 0;
+    u32 uop = term_ext(child);
+    return is_binary(uop) || is_elementwise(uop) ||
+           uop == UOP_SUM || uop == UOP_RMAX ||
+           (uop >= UOP_RESHAPE && uop <= UOP_PAD);
+}
+
+static Term thvm_fuse_wrap_child(TinyHVM *ctx, Term child) {
+    if (!ctx || !thvm_fuse_child_is_compute_like(child)) return child;
+    u64 floc = heap_alloc(ctx, 1);
+    heap_set(ctx, floc, child);
+    return term_new(TAG_TOP, UOP_FUSE, floc);
+}
+
+static int thvm_kernel_local_child_ready(TinyHVM *ctx, Term child) {
+    u8 tag = term_tag(child);
+    if (tag == TAG_DP0 || tag == TAG_DP1) return 0;
+    if (tag == TAG_TOP) {
+        u32 ext = term_ext(child);
+        if (ext == UOP_FUSE) return 0;
+        if (ext == UOP_KERNEL) return thvm_kernel_is_monolithic(ctx, child);
+        return 1;
+    }
+    return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
+           tag == TAG_SEQ || tag == TAG_CTR || tag == TAG_LAM ||
+           tag == TAG_SUP || tag == TAG_ANY;
+}
+
+static int thvm_public_kernel_absorb_child(TinyHVM *ctx, Term child, Term *out, u32 depth) {
+    if (!out || depth > 64) return 0;
+    if (term_tag(child) == TAG_TOP && term_ext(child) == UOP_KERNEL) {
+        if (thvm_kernel_is_monolithic(ctx, child)) {
+            *out = thvm_kernel_monolithic_payload(ctx, child);
+            return 1;
+        }
+        return 0;
+    }
+    *out = child;
+    return 1;
+}
+
+static Term thvm_make_public_kernel_from_uop(TinyHVM *ctx, u32 uop, Term left, Term right, Term shape_src) {
+    if (!ctx || uop >= UOP_COUNT) return 0;
+    Term raw_left = left;
+    Term raw_right = right;
+    if (!thvm_public_kernel_absorb_child(ctx, left, &raw_left, 0)) return 0;
+    if (!thvm_public_kernel_absorb_child(ctx, right, &raw_right, 0)) return 0;
+    int unary = (!is_binary(uop) && is_elementwise(uop) && term_tag(right) == TAG_ERA);
+    u64 ploc = heap_alloc(ctx, unary ? 1 : 2);
+    heap_set(ctx, ploc + 0, raw_left);
+    if (!unary) heap_set(ctx, ploc + 1, raw_right);
+    if (term_tag(shape_src) == TAG_TOP)
+        thvm_fuse_copy_public_shape(ctx, shape_src, ploc);
+    return thvm_make_public_kernel(ctx, term_new(TAG_TOP, uop, ploc));
+}
+
+static Term thvm_fuse_public_term(TinyHVM *ctx, Term t, u32 depth) {
+    if (!ctx || depth > 64) return t;
+    if (term_tag(t) != TAG_TOP) return t;
+
+    u32 uop = term_ext(t);
+    if (uop == UOP_KERNEL || uop == UOP_FUSE) return t;
+
+    u64 loc = term_val(t);
+    if (loc == 0 || loc >= ctx->heap_pos) return t;
+
+    if (is_binary(uop)) {
+        if (loc + 1 >= ctx->heap_pos) return t;
+        return thvm_make_growing_kernel_from_uop(
+            ctx, uop,
+            thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0)),
+            thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 1)),
+            t
+        );
+    }
+
+    if (is_elementwise(uop)) {
+        return thvm_make_growing_kernel_from_uop(
+            ctx, uop,
+            thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0)),
+            term_era(),
+            t
+        );
+    }
+
+    if (uop == UOP_SUM || uop == UOP_RMAX || is_view_op(uop)) {
+        if (loc + 1 >= ctx->heap_pos) return t;
+        return thvm_make_growing_kernel_from_uop(
+            ctx, uop,
+            thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0)),
+            heap_read(ctx, loc + 1),
+            t
+        );
+    }
+
+    return t;
 }
 
 static u32 thvm_term_dtype_hint(TinyHVM *ctx, Term t) {
@@ -84,6 +231,8 @@ static u32 thvm_term_dtype_hint(TinyHVM *ctx, Term t) {
             u32 uop = term_ext(t);
             u64 loc = term_val(t);
             if (uop == UOP_KERNEL) {
+                if (thvm_kernel_is_monolithic(ctx, t))
+                    return thvm_term_dtype_hint(ctx, thvm_kernel_monolithic_payload(ctx, t));
                 if (loc > 0 && loc + 2 < ctx->heap_pos)
                     return thvm_term_dtype_hint(ctx, heap_read(ctx, loc + 0));
                 return DTYPE_F32;
@@ -154,9 +303,80 @@ static int thvm_kernel_child_resolve(Term child, Term *out) {
     return 1;
 }
 
+static int thvm_kernel_compute_uop(u32 uop) {
+    return is_binary(uop) || is_elementwise(uop) ||
+           uop == UOP_SUM || uop == UOP_RMAX || is_view_op(uop);
+}
+
+static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 depth) {
+    if (!ctx || !out || depth > 64) return 0;
+    for (u32 iter = 0; iter < 32; iter++) {
+        u8 tag = term_tag(t);
+        if (tag == TAG_TEN || tag == TAG_NUM || tag == TAG_ERA || tag == TAG_ANY) {
+            *out = t;
+            return 1;
+        }
+
+        if (tag == TAG_TOP && thvm_kernel_compute_uop(term_ext(t))) {
+            u32 uop = term_ext(t);
+            u64 loc = term_val(t);
+            if (loc == 0 || loc >= ctx->heap_pos) return 0;
+
+            Term a = term_era();
+            Term b = term_era();
+            if (!thvm_kernel_normalize_compute(ctx, heap_read(ctx, loc + 0), &a, depth + 1))
+                return 0;
+
+            int unary = (!is_binary(uop) && is_elementwise(uop));
+            if (!unary) {
+                if (loc + 1 >= ctx->heap_pos) return 0;
+                if (!thvm_kernel_normalize_compute(ctx, heap_read(ctx, loc + 1), &b, depth + 1))
+                    return 0;
+            }
+
+            u64 nloc = heap_alloc(ctx, unary ? 1 : 2);
+            heap_set(ctx, nloc + 0, a);
+            if (!unary) heap_set(ctx, nloc + 1, b);
+            *out = term_new(TAG_TOP, uop, nloc);
+            {
+                const View *sv = st_get(loc);
+                if (sv) st_set(nloc, sv);
+            }
+            return 1;
+        }
+
+        Term next = thvm_reduce(ctx, t);
+        if (next == t) {
+            if (tag == TAG_TOP) {
+                u32 uop = term_ext(t);
+                int maybe_force = (uop == UOP_KERNEL || uop == UOP_EXEC ||
+                                   uop == UOP_ASSIGN || uop == UOP_DETACH ||
+                                   uop == UOP_FUSE ||
+                                   uop == UOP_IFZ || uop == UOP_WHERE ||
+                                   uop == UOP_GRAD || uop == UOP_LOG_PRINT ||
+                                   uop == UOP_TODEVICE);
+                if (maybe_force) {
+                    next = thvm_eval(ctx, t);
+                    if (next != t) {
+                        t = next;
+                        continue;
+                    }
+                }
+            }
+            return 0;
+        }
+        t = next;
+    }
+    return 0;
+}
+
 static int thvm_kernel_to_compute(TinyHVM *ctx, Term t, Term *out_compute, u32 depth) {
     if (!out_compute || depth > 64) return 0;
     if (term_tag(t) == TAG_TOP && term_ext(t) == UOP_KERNEL) {
+        if (thvm_kernel_is_monolithic(ctx, t)) {
+            Term payload = thvm_kernel_monolithic_payload(ctx, t);
+            return thvm_kernel_normalize_compute(ctx, payload, out_compute, depth + 1);
+        }
         u64 loc = term_val(t);
         if (loc == 0 || loc + 2 >= ctx->heap_pos) return 0;
         Term left = heap_read(ctx, loc + 0);
@@ -315,6 +535,30 @@ static Term thvm_alo_suspend_child(TinyHVM *ctx, Term child, u32 state_id) {
     return thvm_alo_make(ctx, child, state_id);
 }
 
+static int thvm_alo_term_is_shared_alias(Term t) {
+    return term_tag(t) == TAG_ALO;
+}
+
+static int thvm_alo_try_share_child(TinyHVM *ctx, Term child, Term *out) {
+    Term cur = child;
+    for (u32 depth = 0; depth < 8; depth++) {
+        if (term_tag(cur) == TAG_VAR) {
+            u64 loc = term_val(cur);
+            if (loc < ctx->heap_pos) {
+                Term sub = heap_read(ctx, loc);
+                if (!term_is_sub(sub)) {
+                    cur = sub;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    if (!thvm_alo_term_is_shared_alias(cur)) return 0;
+    if (out) *out = cur;
+    return 1;
+}
+
 static u32 thvm_alo_top_arity(u32 ext) {
     return thvm_uop_storage_arity(ext);
 }
@@ -370,7 +614,11 @@ static Term thvm_alo_realize(TinyHVM *ctx, Term book_term, u32 state_id) {
         if (!thvm_alo_lookup_bind(ctx, walk_state, old_loc, &dyn_loc)) {
             dyn_loc = heap_alloc(ctx, 1);
             Term child = (old_loc > 0 && old_loc < ctx->book_heap_pos) ? ctx->book_heap[old_loc] : term_era();
-            heap_set(ctx, dyn_loc, thvm_alo_suspend_child(ctx, child, walk_state));
+            Term suspended = thvm_alo_suspend_child(ctx, child, walk_state);
+            Term shared = term_era();
+            if (thvm_alo_try_share_child(ctx, suspended, &shared))
+                return shared;
+            heap_set(ctx, dyn_loc, suspended);
             walk_state = thvm_alo_state_push(ctx, walk_state, 1, term_tag(book_term), old_loc, dyn_loc, 0, 0);
         }
         return term_new(tag, new_lab, dyn_loc);
@@ -420,6 +668,25 @@ static Term thvm_alo_force(TinyHVM *ctx, Term alo) {
     if (term_tag(sid_term) != TAG_NUM) return book_term;
     u32 state_id = term_as_u32(sid_term);
     Term out = thvm_alo_realize(ctx, book_term, state_id);
+    if (getenv("THVM_LOOP_DIAG")) {
+        fprintf(stderr,
+                "ALO_FORCE loc=%llu state=%u book=%u/%u@%llu out=%u/%u@%llu",
+                (unsigned long long)alo_loc, state_id,
+                (u32)term_tag(book_term), (u32)term_ext(book_term),
+                (unsigned long long)term_val(book_term),
+                (u32)term_tag(out), (u32)term_ext(out),
+                (unsigned long long)term_val(out));
+        for (u32 sid = state_id, depth = 0; sid != 0 && depth < 8; sid = ctx->alo_states[sid].parent, depth++) {
+            AloState *s = &ctx->alo_states[sid];
+            fprintf(stderr,
+                    " | S%u kind=%u tag=%u book=%llu dyn=%llu lab=%u->%u",
+                    sid, (u32)s->kind, (u32)s->bind_tag,
+                    (unsigned long long)s->bind_book,
+                    (unsigned long long)s->bind_dyn,
+                    (u32)s->label_old, (u32)s->label_new);
+        }
+        fputc('\n', stderr);
+    }
     // #region agent log
     do {
         static u32 alo_force_dbg_count = 0;

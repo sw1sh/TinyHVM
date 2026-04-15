@@ -1454,17 +1454,96 @@ static void lower_dump_manifest(TinyHVM *ctx, const char *path,
     fclose(f);
 }
 
-static void lower_dump_dot(TinyHVM *ctx, const char *path,
-                           const KernelEntry *ke, const UOpKernel *uk,
-                           u32 kid, u64 kernel_loc, u64 cache_sig, u64 lower_sig,
-                           Backend *backend, u32 out_buf,
-                           const u32 *leaf_bufs, u32 n_leaf_bufs,
-                           u32 step_index) {
-    if (!ctx || !path || !ke || !uk) return;
-    FILE *f = fopen(path, "w");
+static int lower_file_exists(const char *path) {
+    if (!path || !path[0]) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static char *lower_read_file(const char *path, size_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!path || !path[0]) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    long len = ftell(f);
+    if (len < 0) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t got = fread(buf, 1, (size_t)len, f);
+    fclose(f);
+    buf[got] = '\0';
+    if (out_len) *out_len = got;
+    return buf;
+}
+
+static size_t lower_trim_graph_footer_len(const char *buf, size_t len) {
+    if (!buf) return 0;
+    while (len > 0) {
+        char c = buf[len - 1];
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t')
+            len--;
+        else
+            break;
+    }
+    if (len > 0 && buf[len - 1] == '}')
+        len--;
+    while (len > 0) {
+        char c = buf[len - 1];
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t')
+            len--;
+        else
+            break;
+    }
+    return len;
+}
+
+static void lower_prefixed_name(char *dst, size_t nbuf, const char *prefix, const char *base) {
+    if (!dst || nbuf == 0) return;
+    if (prefix && prefix[0])
+        snprintf(dst, nbuf, "%s_%s", prefix, base);
+    else
+        snprintf(dst, nbuf, "%s", base);
+}
+
+static void lower_write_dot_header(FILE *f) {
     if (!f) return;
+    fprintf(f, "digraph Lowered {\n");
+    fprintf(f, "  graph [rankdir=LR, nodesep=0.35, ranksep=0.55];\n");
+    fprintf(f, "  node [shape=box, style=filled, fontname=\"Courier\", fontsize=10, margin=\"0.08,0.05\"];\n");
+    fprintf(f, "  edge [fontname=\"Courier\", fontsize=8];\n\n");
+}
+
+static void lower_write_dot_footer(FILE *f) {
+    if (!f) return;
+    fprintf(f, "}\n");
+}
+
+static void lower_write_dot_section(FILE *f, const char *prefix,
+                                    TinyHVM *ctx, const KernelEntry *ke, const UOpKernel *uk,
+                                    u32 kid, u64 kernel_loc, u64 cache_sig, u64 lower_sig,
+                                    Backend *backend, u32 out_buf,
+                                    const u32 *leaf_bufs, u32 n_leaf_bufs,
+                                    u32 step_index) {
+    if (!f || !ctx || !ke || !uk) return;
     char full_shape[96], raw_shape[96], out_shape[96], reduce_axes[96], result_view[256];
     const char *interaction = thvm_step_graph_is_active() ? thvm_step_graph_last_name() : "";
+    u32 root_uop = (term_tag(ke->original_term) == TAG_TOP) ? term_ext(ke->original_term) : UOP_COUNT;
+    const char *root_name = (root_uop < UOP_COUNT) ? uop_names[root_uop] : "KERNEL";
+    char section_label[96];
+    snprintf(section_label, sizeof(section_label), "kid=%u %s", kid, root_name);
     lower_shape_str(&ke->full_shape, full_shape, sizeof(full_shape));
     lower_shape_str(&ke->raw_out_shape, raw_shape, sizeof(raw_shape));
     lower_shape_str(&ke->out_shape, out_shape, sizeof(out_shape));
@@ -1472,22 +1551,31 @@ static void lower_dump_dot(TinyHVM *ctx, const char *path,
     if (ke->has_result_view) lower_view_str(&ke->result_view, result_view, sizeof(result_view));
     else snprintf(result_view, sizeof(result_view), "none");
 
-    fprintf(f, "digraph Lowered {\n");
-    fprintf(f, "  graph [rankdir=LR, nodesep=0.35, ranksep=0.55];\n");
-    fprintf(f, "  node [shape=box, style=filled, fontname=\"Courier\", fontsize=10, margin=\"0.08,0.05\"];\n");
-    fprintf(f, "  edge [fontname=\"Courier\", fontsize=8];\n\n");
+    char cluster_meta[64], cluster_fused[64], cluster_mem[64], cluster_lower[64], cluster_uop[64];
+    char meta0_id[64], meta1_id[64], meta2_id[64], mem_out_id[64];
+    lower_prefixed_name(cluster_meta, sizeof(cluster_meta), prefix, "cluster_meta");
+    lower_prefixed_name(cluster_fused, sizeof(cluster_fused), prefix, "cluster_fused");
+    lower_prefixed_name(cluster_mem, sizeof(cluster_mem), prefix, "cluster_mem");
+    lower_prefixed_name(cluster_lower, sizeof(cluster_lower), prefix, "cluster_lower");
+    lower_prefixed_name(cluster_uop, sizeof(cluster_uop), prefix, "cluster_uop");
+    lower_prefixed_name(meta0_id, sizeof(meta0_id), prefix, "meta0");
+    lower_prefixed_name(meta1_id, sizeof(meta1_id), prefix, "meta1");
+    lower_prefixed_name(meta2_id, sizeof(meta2_id), prefix, "meta2");
+    lower_prefixed_name(mem_out_id, sizeof(mem_out_id), prefix, "mem_out");
 
-    fprintf(f, "  subgraph cluster_meta {\n");
-    fprintf(f, "    label=\"Kernel Trace\";\n");
+    fprintf(f, "  subgraph %s {\n", cluster_meta);
+    fprintf(f, "    label=\"Kernel Trace %s\";\n", section_label);
     fprintf(f, "    color=\"#bbbbbb\";\n");
-    fprintf(f, "    meta0 [shape=note, fillcolor=\"#f8f8f8\", label=\"step=%03u\\ninteraction=%s\\nkid=%u\\nkernel_loc=@%llu\\nbackend=%s\\ncache_sig=0x%016llx\\nlower_sig=0x%016llx\\nlower_heap=%llu\\nrewrites=%u\"];\n",
+    fprintf(f, "    %s [shape=note, fillcolor=\"#f8f8f8\", label=\"step=%03u\\ninteraction=%s\\nkid=%u\\nkernel_loc=@%llu\\nbackend=%s\\ncache_sig=0x%016llx\\nlower_sig=0x%016llx\\nlower_heap=%llu\\nrewrites=%u\"];\n",
+            meta0_id,
             step_index, interaction && interaction[0] ? interaction : "none",
             kid, (unsigned long long)kernel_loc, lower_backend_short(ctx, backend),
             (unsigned long long)cache_sig, (unsigned long long)lower_sig,
             (unsigned long long)ctx->lower_ctx.heap_pos, ctx->lower_ctx.rewrite_count);
-    fprintf(f, "    meta1 [shape=note, fillcolor=\"#f8f8f8\", label=\"full=%s\\nraw_out=%s\\nout=%s\\nresult_view=%s\"];\n",
-            full_shape, raw_shape, out_shape, result_view);
-    fprintf(f, "    meta2 [shape=note, fillcolor=\"#f8f8f8\", label=\"reduce=%s axes=%s\\ngrid=[%u,%u,%u]\\ntg=[%u,%u,%u]\\nlocal=%u reduce_numel=%u\\nout_buf=%u slot=%u\"];\n",
+    fprintf(f, "    %s [shape=note, fillcolor=\"#f8f8f8\", label=\"full=%s\\nraw_out=%s\\nout=%s\\nresult_view=%s\"];\n",
+            meta1_id, full_shape, raw_shape, out_shape, result_view);
+    fprintf(f, "    %s [shape=note, fillcolor=\"#f8f8f8\", label=\"reduce=%s axes=%s\\ngrid=[%u,%u,%u]\\ntg=[%u,%u,%u]\\nlocal=%u reduce_numel=%u\\nout_buf=%u slot=%u\"];\n",
+            meta2_id,
             ke->has_reduce ? uop_names[ke->reduce.reduce_type] : "NONE",
             reduce_axes,
             uk->grid[0], uk->grid[1], uk->grid[2],
@@ -1495,56 +1583,67 @@ static void lower_dump_dot(TinyHVM *ctx, const char *path,
             uk->local_size, uk->reduce_numel, out_buf, ke->output_slot);
     fprintf(f, "  }\n\n");
 
-    fprintf(f, "  subgraph cluster_fused {\n");
-    fprintf(f, "    label=\"Fused Ops\";\n");
+    fprintf(f, "  subgraph %s {\n", cluster_fused);
+    fprintf(f, "    label=\"Fused Ops %s\";\n", section_label);
     fprintf(f, "    color=\"#bbbbbb\";\n");
     for (u32 i = 0; i < ke->n_ops; i++) {
-        fprintf(f, "    fop%u [fillcolor=\"#dbe8ff\", label=\"%u\\n%s\\na=%u b=%u aux=%u\"];\n",
-                i, i,
+        char fop_id[64], prev_fop_id[64];
+        char base_id[32];
+        snprintf(base_id, sizeof(base_id), "fop%u", i);
+        lower_prefixed_name(fop_id, sizeof(fop_id), prefix, base_id);
+        fprintf(f, "    %s [fillcolor=\"#dbe8ff\", label=\"%u\\n%s\\na=%u b=%u aux=%u\"];\n",
+                fop_id, i,
                 ke->ops[i].uop < UOP_COUNT ? uop_names[ke->ops[i].uop] : "?",
                 ke->ops[i].arg_a, ke->ops[i].arg_b, ke->ops[i].aux);
-        if (i > 0)
-            fprintf(f, "    fop%u -> fop%u [style=dotted, arrowhead=none, color=\"#888888\"];\n", i - 1, i);
+        if (i > 0) {
+            snprintf(base_id, sizeof(base_id), "fop%u", i - 1);
+            lower_prefixed_name(prev_fop_id, sizeof(prev_fop_id), prefix, base_id);
+            fprintf(f, "    %s -> %s [style=dotted, arrowhead=none, color=\"#888888\"];\n",
+                    prev_fop_id, fop_id);
+        }
     }
     fprintf(f, "  }\n\n");
 
-    fprintf(f, "  subgraph cluster_mem {\n");
-    fprintf(f, "    label=\"Memory Plan\";\n");
+    fprintf(f, "  subgraph %s {\n", cluster_mem);
+    fprintf(f, "    label=\"Memory Plan %s\";\n", section_label);
     fprintf(f, "    color=\"#bbbbbb\";\n");
-    fprintf(f, "    mem_out [shape=box3d, fillcolor=\"#d9f2e6\", label=\"out\\nbuf=%u\\nslot=%u\\nraw_tid=%u\\nout_tid=%u\\ndtype=%s\"];\n",
-            out_buf, ke->output_slot, ke->raw_output_tid, ke->output_tid, dtype_name(uk->out_dtype));
+    fprintf(f, "    %s [shape=box3d, fillcolor=\"#d9f2e6\", label=\"out\\nbuf=%u\\nslot=%u\\nraw_tid=%u\\nout_tid=%u\\ndtype=%s\"];\n",
+            mem_out_id, out_buf, ke->output_slot, ke->raw_output_tid, ke->output_tid, dtype_name(uk->out_dtype));
     for (u32 i = 0; i < ke->n_leaves; i++) {
-        char view[256];
+        char view[256], mem_leaf_id[64], base_id[32];
+        snprintf(base_id, sizeof(base_id), "mem_leaf%u", i);
+        lower_prefixed_name(mem_leaf_id, sizeof(mem_leaf_id), prefix, base_id);
         lower_view_str(&ke->leaf_views[i], view, sizeof(view));
         if (ke->leaf_kinds[i] == KERNEL_LEAF_TENSOR && ke->leaf_ids[i] < ctx->tensor_count) {
             TensorMeta *m = &ctx->tensors[ke->leaf_ids[i]];
-            fprintf(f, "    mem_leaf%u [fillcolor=\"#eef5ff\", label=\"leaf%u t%u\\ndispatch_buf=%u\\ntensor_buf=%u\\nslot=%u\\ndtype=%s\\nst_views=%u\\n%s\"];\n",
-                    i, i, ke->leaf_ids[i],
+            fprintf(f, "    %s [fillcolor=\"#eef5ff\", label=\"leaf%u t%u\\ndispatch_buf=%u\\ntensor_buf=%u\\nslot=%u\\ndtype=%s\\nst_views=%u\\n%s\"];\n",
+                    mem_leaf_id, i, ke->leaf_ids[i],
                     i < n_leaf_bufs ? leaf_bufs[i] : 0,
                     m->buf_id, m->planned_slot, dtype_name(ke->leaf_dtypes[i]),
                     ke->leaf_sts[i].n_views, view);
         } else if (ke->leaf_kinds[i] == KERNEL_LEAF_NUM) {
-            fprintf(f, "    mem_leaf%u [fillcolor=\"#fff2cc\", label=\"leaf%u const\\n%.6g\\ndispatch_buf=%u\\ndtype=%s\\n%s\"];\n",
-                    i, i, (double)ke->leaf_nums[i],
+            fprintf(f, "    %s [fillcolor=\"#fff2cc\", label=\"leaf%u const\\n%.6g\\ndispatch_buf=%u\\ndtype=%s\\n%s\"];\n",
+                    mem_leaf_id, i, (double)ke->leaf_nums[i],
                     i < n_leaf_bufs ? leaf_bufs[i] : 0,
                     dtype_name(ke->leaf_dtypes[i]), view);
         } else {
-            fprintf(f, "    mem_leaf%u [fillcolor=\"#f0f0f0\", label=\"leaf%u\\ndispatch_buf=%u\\ndtype=%s\\n%s\"];\n",
-                    i, i, i < n_leaf_bufs ? leaf_bufs[i] : 0,
+            fprintf(f, "    %s [fillcolor=\"#f0f0f0\", label=\"leaf%u\\ndispatch_buf=%u\\ndtype=%s\\n%s\"];\n",
+                    mem_leaf_id, i, i < n_leaf_bufs ? leaf_bufs[i] : 0,
                     dtype_name(ke->leaf_dtypes[i]), view);
         }
     }
     fprintf(f, "  }\n\n");
 
-    fprintf(f, "  subgraph cluster_lower {\n");
-    fprintf(f, "    label=\"LowerCtx IC\";\n");
+    fprintf(f, "  subgraph %s {\n", cluster_lower);
+    fprintf(f, "    label=\"LowerCtx IC %s\";\n", section_label);
     fprintf(f, "    color=\"#bbbbbb\";\n");
     u32 cap = (u32)(ctx->lower_ctx.heap_pos + 64);
     Term *terms = (Term *)calloc(cap ? cap : 1, sizeof(Term));
     u32 n_terms = lower_collect_terms(ctx, ctx->lower_ctx.root, terms, cap ? cap : 1);
     for (u32 i = 0; i < n_terms; i++) {
-        char id[64], label[256];
-        lower_term_id(terms[i], id, sizeof(id));
+        char base_id[64], id[96], label[256];
+        lower_term_id(terms[i], base_id, sizeof(base_id));
+        lower_prefixed_name(id, sizeof(id), prefix, base_id);
         lower_term_label(ctx, terms[i], label, sizeof(label));
         fprintf(f, "    %s [fillcolor=\"%s\", label=\"%s\"%s];\n",
                 id, lower_dot_fill(terms[i]), label,
@@ -1555,58 +1654,126 @@ static void lower_dump_dot(TinyHVM *ctx, const char *path,
         u32 arity = lower_term_arity(t);
         if (arity == 0) continue;
         u64 loc = term_val(t);
-        char dst[64];
-        lower_term_id(t, dst, sizeof(dst));
+        char base_dst[64], dst[96];
+        lower_term_id(t, base_dst, sizeof(base_dst));
+        lower_prefixed_name(dst, sizeof(dst), prefix, base_dst);
         for (u32 ai = 0; ai < arity; ai++) {
             Term child = lower_heap_read(ctx, loc + ai);
             if (term_tag(child) != TAG_TOP) continue;
-            char src[64];
-            lower_term_id(child, src, sizeof(src));
+            char base_src[64], src[96];
+            lower_term_id(child, base_src, sizeof(base_src));
+            lower_prefixed_name(src, sizeof(src), prefix, base_src);
             fprintf(f, "    %s -> %s [label=\"%s\"];\n",
                     src, dst, lower_lop_port_name(term_ext(t), ai));
         }
         if (term_ext(t) == LOP_LOAD) {
             u32 buf_idx = 0;
             lower_is_const_u(lower_heap_read(ctx, loc + 1), &buf_idx);
-            if (buf_idx > 0)
-                fprintf(f, "    mem_leaf%u -> %s [style=dashed, color=\"#888888\", label=\"buf\"];\n",
-                        buf_idx - 1, dst);
+            if (buf_idx > 0) {
+                char mem_leaf_id[64], base_id[32];
+                snprintf(base_id, sizeof(base_id), "mem_leaf%u", buf_idx - 1);
+                lower_prefixed_name(mem_leaf_id, sizeof(mem_leaf_id), prefix, base_id);
+                fprintf(f, "    %s -> %s [style=dashed, color=\"#888888\", label=\"buf\"];\n",
+                        mem_leaf_id, dst);
+            }
         } else if (term_ext(t) == LOP_STORE) {
-            fprintf(f, "    %s -> mem_out [style=dashed, color=\"#888888\", label=\"store\"];\n", dst);
+            fprintf(f, "    %s -> %s [style=dashed, color=\"#888888\", label=\"store\"];\n",
+                    dst, mem_out_id);
         }
     }
     fprintf(f, "  }\n\n");
     free(terms);
 
-    fprintf(f, "  subgraph cluster_uop {\n");
-    fprintf(f, "    label=\"Emitted UOpKernel / KOP\";\n");
+    fprintf(f, "  subgraph %s {\n", cluster_uop);
+    fprintf(f, "    label=\"Emitted UOpKernel / KOP %s\";\n", section_label);
     fprintf(f, "    color=\"#bbbbbb\";\n");
     for (u32 i = 0; i < uk->n_ops; i++) {
-        char label[256];
+        char label[256], k_id[64], prev_k_id[64], base_id[32];
+        snprintf(base_id, sizeof(base_id), "k%u", i);
+        lower_prefixed_name(k_id, sizeof(k_id), prefix, base_id);
         lower_kop_label(uk, i, label, sizeof(label));
-        fprintf(f, "    k%u [fillcolor=\"%s\", label=\"%s\"];\n",
-                i, lower_kop_fill(&uk->ops[i]), label);
-        if (i > 0)
-            fprintf(f, "    k%u -> k%u [style=dotted, arrowhead=none, color=\"#888888\"];\n", i - 1, i);
+        fprintf(f, "    %s [fillcolor=\"%s\", label=\"%s\"];\n",
+                k_id, lower_kop_fill(&uk->ops[i]), label);
+        if (i > 0) {
+            snprintf(base_id, sizeof(base_id), "k%u", i - 1);
+            lower_prefixed_name(prev_k_id, sizeof(prev_k_id), prefix, base_id);
+            fprintf(f, "    %s -> %s [style=dotted, arrowhead=none, color=\"#888888\"];\n",
+                    prev_k_id, k_id);
+        }
     }
     for (u32 i = 0; i < uk->n_ops; i++) {
         const KOp *op = &uk->ops[i];
+        char k_id[64], base_id[32];
+        snprintf(base_id, sizeof(base_id), "k%u", i);
+        lower_prefixed_name(k_id, sizeof(k_id), prefix, base_id);
         for (u32 ai = 0; ai < 3; ai++) {
             const char *port = lower_kop_port_name(op, ai);
             if (!port[0]) continue;
             if (op->arg[ai] >= uk->n_ops) continue;
-            fprintf(f, "    k%u -> k%u [label=\"%s\"];\n", op->arg[ai], i, port);
+            char src_id[64];
+            snprintf(base_id, sizeof(base_id), "k%u", op->arg[ai]);
+            lower_prefixed_name(src_id, sizeof(src_id), prefix, base_id);
+            fprintf(f, "    %s -> %s [label=\"%s\"];\n", src_id, k_id, port);
         }
         if (op->type == KOP_LOAD && op->imm.u > 0 && op->imm.u - 1 < ke->n_leaves) {
-            fprintf(f, "    mem_leaf%u -> k%u [style=dashed, color=\"#888888\", label=\"buf\"];\n",
-                    op->imm.u - 1, i);
+            char mem_leaf_id[64];
+            snprintf(base_id, sizeof(base_id), "mem_leaf%u", op->imm.u - 1);
+            lower_prefixed_name(mem_leaf_id, sizeof(mem_leaf_id), prefix, base_id);
+            fprintf(f, "    %s -> %s [style=dashed, color=\"#888888\", label=\"buf\"];\n",
+                    mem_leaf_id, k_id);
         } else if (op->type == KOP_STORE) {
-            fprintf(f, "    k%u -> mem_out [style=dashed, color=\"#888888\", label=\"store\"];\n", i);
+            fprintf(f, "    %s -> %s [style=dashed, color=\"#888888\", label=\"store\"];\n",
+                    k_id, mem_out_id);
         }
     }
-    fprintf(f, "  }\n");
-    fprintf(f, "}\n");
+    fprintf(f, "  }\n\n");
+}
+
+static void lower_dump_dot(TinyHVM *ctx, const char *path,
+                           const KernelEntry *ke, const UOpKernel *uk,
+                           u32 kid, u64 kernel_loc, u64 cache_sig, u64 lower_sig,
+                           Backend *backend, u32 out_buf,
+                           const u32 *leaf_bufs, u32 n_leaf_bufs,
+                           u32 step_index) {
+    if (!ctx || !path || !ke || !uk) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    lower_write_dot_header(f);
+    lower_write_dot_section(f, "", ctx, ke, uk, kid, kernel_loc, cache_sig, lower_sig,
+                            backend, out_buf, leaf_bufs, n_leaf_bufs, step_index);
+    lower_write_dot_footer(f);
     fclose(f);
+}
+
+static void lower_append_shared_dot(TinyHVM *ctx, const char *path,
+                                    const KernelEntry *ke, const UOpKernel *uk,
+                                    u32 kid, u64 kernel_loc, u64 cache_sig, u64 lower_sig,
+                                    Backend *backend, u32 out_buf,
+                                    const u32 *leaf_bufs, u32 n_leaf_bufs,
+                                    u32 step_index) {
+    if (!ctx || !path || !ke || !uk) return;
+    size_t existing_len = 0;
+    char *existing = lower_read_file(path, &existing_len);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        free(existing);
+        return;
+    }
+    if (!existing || existing_len == 0) {
+        lower_write_dot_header(f);
+    } else {
+        size_t body_len = lower_trim_graph_footer_len(existing, existing_len);
+        if (body_len > 0)
+            fwrite(existing, 1, body_len, f);
+        fprintf(f, "\n\n");
+    }
+    char prefix[32];
+    snprintf(prefix, sizeof(prefix), "kid%u", kid);
+    lower_write_dot_section(f, prefix, ctx, ke, uk, kid, kernel_loc, cache_sig, lower_sig,
+                            backend, out_buf, leaf_bufs, n_leaf_bufs, step_index);
+    lower_write_dot_footer(f);
+    fclose(f);
+    free(existing);
 }
 
 static void thvm_lower_dump_graphs(TinyHVM *ctx, const KernelEntry *ke, const UOpKernel *uk,
@@ -1616,15 +1783,21 @@ static void thvm_lower_dump_graphs(TinyHVM *ctx, const KernelEntry *ke, const UO
     if (!ctx || !ke || !uk || !lower_env_enabled("THVM_LOWER_GRAPH")) return;
     const char *anchor_name = thvm_step_graph_lower_anchor_name();
     u32 anchor_index = thvm_step_graph_lower_anchor_index();
+    char base_dir[512];
     char dir[512];
     const char *dir_env = getenv("THVM_LOWER_GRAPH_DIR");
     if (dir_env && dir_env[0]) {
-        snprintf(dir, sizeof(dir), "%s", dir_env);
+        snprintf(base_dir, sizeof(base_dir), "%s", dir_env);
     } else if (thvm_step_graph_is_active() ||
                (getenv("THVM_STEP_GRAPH") && getenv("THVM_STEP_GRAPH_DIR"))) {
-        snprintf(dir, sizeof(dir), "%s_lower", thvm_step_graph_dir());
+        snprintf(base_dir, sizeof(base_dir), "%s_lower", thvm_step_graph_dir());
     } else {
-        snprintf(dir, sizeof(dir), "graphs/lower");
+        snprintf(base_dir, sizeof(base_dir), "graphs/lower");
+    }
+    if (ctx->step_graph_settled_replay) {
+        snprintf(dir, sizeof(dir), "%s/settled", base_dir);
+    } else {
+        snprintf(dir, sizeof(dir), "%s", base_dir);
     }
     char mkdir_cmd[1024];
     snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s\"", dir);
@@ -1638,32 +1811,47 @@ static void thvm_lower_dump_graphs(TinyHVM *ctx, const KernelEntry *ke, const UO
     const char *interaction = thvm_step_graph_is_active() ? thvm_step_graph_last_name()
                              : (anchor_name && anchor_name[0]) ? anchor_name
                              : "";
-    char stem[256];
+    int share_settled_graph = ctx->step_graph_settled_replay ? 1 : 0;
+    char bundle_stem[256];
+    char graph_stem[256];
     if (interaction && interaction[0]) {
-        snprintf(stem, sizeof(stem), "step_%03u_%s_kid%u",
+        snprintf(bundle_stem, sizeof(bundle_stem), "step_%03u_%s_kid%u",
                  step_index, interaction, kid);
+        snprintf(graph_stem, sizeof(graph_stem), "step_%03u_%s",
+                 step_index, interaction);
     } else if (thvm_step_graph_is_active() ||
                (getenv("THVM_STEP_GRAPH") && getenv("THVM_STEP_GRAPH_DIR"))) {
-        snprintf(stem, sizeof(stem), "step_%03u_KERNEL_h%llu_%s_kid%u",
+        snprintf(bundle_stem, sizeof(bundle_stem), "step_%03u_KERNEL_h%llu_%s_kid%u",
                  step_index, (unsigned long long)kernel_loc, root_name, kid);
+        snprintf(graph_stem, sizeof(graph_stem), "step_%03u_KERNEL_h%llu_%s",
+                 step_index, (unsigned long long)kernel_loc, root_name);
     } else {
-        snprintf(stem, sizeof(stem), "kernel_%03u_h%llu_%s_kid%u",
+        snprintf(bundle_stem, sizeof(bundle_stem), "kernel_%03u_h%llu_%s_kid%u",
                  step_index, (unsigned long long)kernel_loc, root_name, kid);
+        snprintf(graph_stem, sizeof(graph_stem), "kernel_%03u_h%llu_%s",
+                 step_index, (unsigned long long)kernel_loc, root_name);
     }
 
-    char dot_path[768], txt_path[768];
-    snprintf(dot_path, sizeof(dot_path), "%s/%s.dot", dir, stem);
-    snprintf(txt_path, sizeof(txt_path), "%s/%s.txt", dir, stem);
-    lower_dump_dot(ctx, dot_path, ke, uk, kid, kernel_loc, cache_sig, lower_sig,
-                   backend, out_buf, leaf_bufs, n_leaf_bufs, step_index);
+    char dot_path[768], txt_path[768], msl_path[768], png_path[768];
+    snprintf(dot_path, sizeof(dot_path), "%s/%s.dot", dir,
+             share_settled_graph ? graph_stem : bundle_stem);
+    snprintf(txt_path, sizeof(txt_path), "%s/%s.txt", dir, bundle_stem);
+    snprintf(msl_path, sizeof(msl_path), "%s/%s.msl", dir, bundle_stem);
+    snprintf(png_path, sizeof(png_path), "%s/%s.png", dir,
+             share_settled_graph ? graph_stem : bundle_stem);
+    if (share_settled_graph) {
+        lower_append_shared_dot(ctx, dot_path, ke, uk, kid, kernel_loc, cache_sig, lower_sig,
+                                backend, out_buf, leaf_bufs, n_leaf_bufs, step_index);
+    } else {
+        lower_dump_dot(ctx, dot_path, ke, uk, kid, kernel_loc, cache_sig, lower_sig,
+                       backend, out_buf, leaf_bufs, n_leaf_bufs, step_index);
+    }
     lower_dump_manifest(ctx, txt_path, ke, uk, kid, kernel_loc, cache_sig, lower_sig,
                         backend, out_buf, leaf_bufs, n_leaf_bufs, step_index);
 #ifdef __OBJC__
     if (backend && backend == ctx->backends[THVM_DEV_METAL]) {
         char *src = thvm_metal_render_uop_kernel_source(uk);
         if (src) {
-            char msl_path[768];
-            snprintf(msl_path, sizeof(msl_path), "%s/%s.msl", dir, stem);
             FILE *mf = fopen(msl_path, "w");
             if (mf) {
                 fputs(src, mf);
@@ -1676,8 +1864,8 @@ static void thvm_lower_dump_graphs(TinyHVM *ctx, const KernelEntry *ke, const UO
     if (!lower_env_enabled("THVM_LOWER_NO_PNG") && !getenv("THVM_STEP_GRAPH_NO_PNG")) {
         char png_cmd[1600];
         snprintf(png_cmd, sizeof(png_cmd),
-                 "dot -Tpng -Gdpi=150 \"%s\" -o \"%s/%s.png\" 2>/dev/null",
-                 dot_path, dir, stem);
+                 "dot -Tpng -Gdpi=150 \"%s\" -o \"%s\" 2>/dev/null",
+                 dot_path, png_path);
         system(png_cmd);
     }
 }

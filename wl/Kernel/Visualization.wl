@@ -220,16 +220,20 @@ iDotInferShape[val_Integer] := Module[{seen = <||>, go, dims},
     dims = go[val];
     If[ListQ[dims], dims, None]];
 
-(* Multi-line label for a graph node, matching dump.c's \n-separated fields. *)
-iDotLabelLines[tag_, ext_, val_, hloc_] := Switch[tag,
+(* Multi-line label for a graph node, matching dump.c's \n-separated fields.
+   Optional `nodeRec` gives the captured-at-walk derived fields
+   (KernelOpChain, Shape) so trace replays don't read mutated heap. *)
+iDotLabelLines[tag_, ext_, val_, hloc_, nodeRec_:<||>] := Switch[tag,
     11,  (* TOP *)
         Module[{uop = Lookup[$uopName, ext, "UOP" <> ToString[ext]],
                 opLine = Nothing, dimLine = Nothing, dims, chain},
-            If[uop === "Kernel" && IntegerQ[val] && val > 0,
-                chain = iDotKernelOpChain[val];
-                If[StringQ[chain] && chain =!= "", opLine = chain]];
+            chain = Lookup[nodeRec, "KernelOpChain", None];
+            If[chain === None && uop === "Kernel" && IntegerQ[val] && val > 0,
+                chain = iDotKernelOpChain[val]];
+            If[StringQ[chain] && chain =!= "", opLine = chain];
             If[uop =!= "Fuse",
-                dims = iDotInferShape[val];
+                dims = Lookup[nodeRec, "Shape", None];
+                If[dims === None, dims = iDotInferShape[val]];
                 If[ListQ[dims] && Length[dims] > 0,
                     dimLine = "[" <> StringRiffle[ToString /@ dims, "\[Cross]"] <> "]"]];
             DeleteCases[{ToUpperCase[uop], opLine, dimLine, "@" <> ToString[hloc]},
@@ -328,7 +332,7 @@ TDotGraph[walkIn_?AssociationQ /; KeyExistsQ[walkIn, "Nodes"], opts___?OptionQ] 
 
     lineFor[k_] := With[{n = nodes[k]},
         iDotLabelLines[n["TagCode"], n["Ext"], n["Val"],
-            Lookup[n, "DisplayLoc", n["Loc"]]]];
+            Lookup[n, "DisplayLoc", n["Loc"]], n]];
     fillFor[k_] := With[{n = nodes[k]}, iDotFill[n["TagCode"], n["Ext"]]];
 
     (* Per-tag geometric shape, mirroring dump.c's shape= attribute. *)

@@ -1312,34 +1312,28 @@ walkerGraphSig[t_] := Module[{w = heapWalk[rootTermOf[t]]},
         Sort[Map[{#["From"], #["To"], #["Port"]} &, w["Edges"]]]
     }]];
 
-(* TStepTrace: repeatedly apply TStep and snapshot the walker output at
-   each step. Returns a list of <|"Term", "Walk"|> records — the walk is
-   captured at the moment of the step, so later reductions mutating heap
-   don't invalidate earlier snapshots.
+(* TStepTrace: fire one interaction per step (matching dump.c granularity)
+   and snapshot the walker output at each step. Returns a list of
+   <|"Term", "Walk"|> records. Each step is one TRACE_STEP fire from
+   the C-side trampoline; admin reductions are visible too. Snapshots
+   freeze the walk at capture time so later reductions can't invalidate
+   earlier captures.
 
-   Stops at fixed point, on dispatch to a pure tensor (TAG_TEN), or when
-   maxSteps reached. Pure public-graph reduction only — no materialization. *)
+   Stops at fixed point (0 interactions fired), on dispatch to a pure
+   tensor (TAG_TEN), or when maxSteps reached. Pure public-graph
+   reduction only — does not cross into materialization. *)
 TStepTrace[t_, maxSteps_Integer: 50] := Module[
-    {cur = t, acc, sigs, nxt, fired, tag, sig, walk, i = 0},
+    {cur = t, acc, nxt, fired, tag, walk, i = 0},
     walk = heapWalk[rootTermOf[t]];
-    sig = Hash[{
-        Sort[KeyValueMap[{#1, #2["Tag"], #2["Ext"]} &, walk["Nodes"]]],
-        Sort[Map[{#["From"], #["To"], #["Port"]} &, walk["Edges"]]]}];
     acc = {<|"Term" -> t, "Walk" -> walk|>};
-    sigs = {sig};
     While[i++ < maxSteps,
-        {nxt, fired} = TStep[cur, 200];
+        {nxt, fired} = TStep[cur];
         If[fired == 0, Break[]];
         tag = thvmTermTagFn[nxt[[1]]];
         If[tag === 10, Break[]];
         walk = heapWalk[rootTermOf[nxt]];
-        sig = Hash[{
-            Sort[KeyValueMap[{#1, #2["Tag"], #2["Ext"]} &, walk["Nodes"]]],
-            Sort[Map[{#["From"], #["To"], #["Port"]} &, walk["Edges"]]]}];
-        cur = nxt;
-        If[MemberQ[sigs, sig], Continue[]];
         AppendTo[acc, <|"Term" -> nxt, "Walk" -> walk|>];
-        AppendTo[sigs, sig]];
+        cur = nxt];
     acc
 ];
 

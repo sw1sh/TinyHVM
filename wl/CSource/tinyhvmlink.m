@@ -1551,11 +1551,12 @@ static u64 thvm_walker_sig(TinyHVM *ctx, Term root) {
 }
 
 // thvmStepToNextVisible(outId, termId, maxAttempts) → Integer (interactions fired).
-// Fires budget-1 reductions until the walker-visible graph from `root` changes,
-// or until `maxAttempts` admin reductions have been skipped with no visible
-// progress, or the reducer stalls. Stops at the first visible change — does
-// NOT cross into dispatch (KERNEL-TEN materialization). The returned term is
-// the new state; out_id holds it.
+// Fires exactly ONE interaction (budget-1 reduce). The maxAttempts arg is kept
+// for API stability but ignored — one call = one interaction, matching the
+// dump.c per-interaction tracer. Returns 0 if the reducer stalls (term is in
+// WNF). The "skip admin until visible change" coalescing was hiding kernel
+// op-chain progression (a kernel labelled "ADD" immediately becoming "MUL+ADD"
+// because two FUSE interactions fired before the walker noticed).
 EXTERN_C DLLEXPORT int thvmStepToNextVisible(
     WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
 {
@@ -1564,27 +1565,14 @@ EXTERN_C DLLEXPORT int thvmStepToNextVisible(
 
     mint out_id = MArgument_getInteger(args[0]);
     mint term_id = MArgument_getInteger(args[1]);
-    mint max_attempts = MArgument_getInteger(args[2]);
+    (void)MArgument_getInteger(args[2]);  // max_attempts unused
     ensure_term_cap(out_id);
 
     Term t = get_term(term_id);
-    u64 sig0 = thvm_walker_sig(g_ctx, t);
-    u32 total = 0;
-    for (u32 i = 0; i < (u32)max_attempts; i++) {
-        Term r = thvm_reduce_steps(g_ctx, t, 1);
-        u32 fired_now = (u32)g_ctx->steps_taken;
-        total += fired_now;
-        if (fired_now == 0 && r == t) break;  // reducer stalled
-        t = r;
-        u64 sig1 = thvm_walker_sig(g_ctx, t);
-        if (sig1 != sig0) {
-            set_term(out_id, t);
-            MArgument_setInteger(res, (mint)total);
-            return LIBRARY_NO_ERROR;
-        }
-    }
-    set_term(out_id, t);
-    MArgument_setInteger(res, (mint)total);
+    Term r = thvm_reduce_steps(g_ctx, t, 1);
+    u32 fired = (u32)g_ctx->steps_taken;
+    set_term(out_id, r);
+    MArgument_setInteger(res, (mint)fired);
     return LIBRARY_NO_ERROR;
 }
 

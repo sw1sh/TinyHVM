@@ -1120,6 +1120,25 @@ static int thvm_step_graph_highlight_from_before(TinyHVM *ctx, u64 source_slot, 
     if (tag == TAG_TOP) {
         u64 loc = term_val(before);
         if (loc >= ctx->heap_pos) return 0;
+        // KERNEL with a KERNEL arg is a fusable redex; the visible edge is
+        // the parent's arg slot referencing this child kernel. Highlight the
+        // parent slot that holds `before` so the n_child → n_parent edge
+        // gets the cc0000 styling.
+        if (term_ext(before) == UOP_KERNEL) {
+            for (u64 h = 1; h < ctx->heap_pos; h++) {
+                Term cur = ctx->heap[h];
+                if (term_tag(cur) != TAG_TOP || term_ext(cur) != UOP_KERNEL) continue;
+                if (term_val(cur) != term_val(before)) continue;
+                if (h == term_val(before)) continue;  // self-ref of args base
+                Term parent = thvm_step_parent_term_for_slot(ctx, h);
+                if (term_tag(parent) == TAG_TOP && term_ext(parent) == UOP_KERNEL &&
+                    term_val(parent) != term_val(before)) {
+                    *out_slot = h;
+                    *out_term = cur;
+                    return 1;
+                }
+            }
+        }
         if (term_ext(before) == UOP_GRAD) {
             Term y = heap_read(ctx, loc + 0);
             if (term_tag(y) == TAG_DP0 || term_tag(y) == TAG_DP1) {

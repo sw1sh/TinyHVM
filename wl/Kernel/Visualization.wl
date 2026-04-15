@@ -280,12 +280,17 @@ iDotPortLabel[childTag_, childExt_, argi_] := If[childTag == 11,
 ];
 
 TDotGraph[t_TTensor, opts___?OptionQ] := TDotGraph[ToTTerm[t], opts];
-TDotGraph[t_TTerm,   opts___?OptionQ] := Module[
-    {walk, nodes, edges, keys, textColor, bg, lineFor, fillFor, vsf, gEdges, eLabels,
+TDotGraph[t_TTerm,   opts___?OptionQ] := (loadLibrary[];
+    TDotGraph[heapWalk[rootTermOf[t]], opts, "TermId" -> termId[t]]);
+TDotGraph[snapshot_?AssociationQ /; KeyExistsQ[snapshot, "Walk"], opts___?OptionQ] :=
+    TDotGraph[snapshot["Walk"], opts,
+        "TermId" -> If[MissingQ[snapshot["Term"]], None, termId[snapshot["Term"]]]];
+TDotGraph[walkIn_?AssociationQ /; KeyExistsQ[walkIn, "Nodes"], opts___?OptionQ] := Module[
+    {walk = walkIn, nodes, edges, keys, textColor, bg, lineFor, fillFor, vsf, gEdges, eLabels,
      nextInfo, activeSlot = -1, activeKey = None, hlColor, eStyleRules,
-     vertexCoords = Automatic},
-    loadLibrary[];
-    walk   = heapWalk[rootTermOf[t]];
+     vertexCoords = Automatic, passedOpts = Flatten[{opts}],
+     termIdForHl = None},
+    termIdForHl = "TermId" /. passedOpts /. "TermId" -> None;
     nodes  = walk["Nodes"];
     edges  = walk["Edges"];
 
@@ -303,7 +308,8 @@ TDotGraph[t_TTerm,   opts___?OptionQ] := Module[
     (* Find next active pair. nextInfo = {found, sourceSlot, tag, ext}.
        sourceSlot==0 means the root term itself is the active source; the
        highlighted edge is then the one feeding the root's first arg. *)
-    nextInfo = Quiet@Check[thvmNextInteractionFn[termId[t]], {0, -1, -1, -1}];
+    nextInfo = If[termIdForHl === None, {0, -1, -1, -1},
+        Quiet@Check[thvmNextInteractionFn[termIdForHl], {0, -1, -1, -1}]];
     If[ListQ[nextInfo] && Length[nextInfo] >= 4 && nextInfo[[1]] == 1,
         activeSlot = nextInfo[[2]];
         Module[{slot = nextInfo[[2]], tagC = nextInfo[[3]], extC = nextInfo[[4]]},
@@ -426,7 +432,7 @@ TDotGraph[t_TTerm,   opts___?OptionQ] := Module[
                 {Min[ys] - 0.5, Max[ys] + 0.5}},
             ImageSize    -> 460,
             Background   -> White,
-            opts
+            Sequence @@ FilterRules[passedOpts, Except["TermId"]]
         ]
     ]
 ];

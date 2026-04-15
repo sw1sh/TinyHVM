@@ -38,6 +38,7 @@ TView::usage = "TView[tensor] returns an Association with view metadata.";
 TDimensions::usage = "TDimensions[tensor] returns the shape of a tensor or lazy op.";
 TTermTag::usage = "TTermTag[term] returns the tag name as a string (\"Ten\", \"Top\", \"Lam\", etc.).";
 TTermExt::usage = "TTermExt[term] returns the EXT field (UOp code for lazy ops, dtype for tensors).";
+TTermVal::usage = "TTermVal[term] returns the VAL field (heap location for compound terms, tensor id for TEN, etc.).";
 TTensorCount::usage = "TTensorCount[] returns the number of tensors in the context.";
 THeapPos::usage = "THeapPos[] returns the current heap position.";
 TInteractionCount::usage = "TInteractionCount[] returns the total interaction count.";
@@ -123,6 +124,7 @@ TEvalAccuracy::usage = "TEvalAccuracy[net, testImages, testLabels] evaluates cla
 (* ── Graph visualization ──────────────────────────────────────────────── *)
 
 TINetGraph::usage = "TINetGraph[tensor|term] returns a Graph of the interaction net by walking the C heap.";
+TDotGraph::usage = "TDotGraph[tensor|term] returns a dump.c-style Graph (boxed TOP/TEN nodes, port labels, heap-loc tail labels).";
 TInteractionGraph::usage = "TInteractionGraph[term] returns an interaction net graph with the next active pair highlighted in red.";
 
 (* ── Heap introspection ──────────────────────────────────────────────── *)
@@ -130,7 +132,8 @@ TInteractionGraph::usage = "TInteractionGraph[term] returns an interaction net g
 THeap::usage = "THeap[<|...|>] represents a snapshot of the TinyHVM heap state. Access properties via THeap[h][\"Key\"].";
 TInteraction::usage = "TInteraction[<|...|>] represents a single interaction event with rule name and before/after tags.";
 THeapSnapshot::usage = "THeapSnapshot[] captures the current heap state as a THeap object.";
-THeapRead::usage = "THeapRead[loc] reads a term at a heap location. Returns <|\"Tag\", \"TagCode\", \"Ext\", \"Val\"|>.";
+THeapRead::usage = "THeapRead[loc] reads a term at a heap location. Returns <|\"Tag\", \"TagCode\", \"Ext\", \"Val\", \"Loc\"|>.";
+THeapReadRange::usage = "THeapReadRange[lo, count] reads `count` consecutive heap slots starting at `lo`. Returns a list of THeapRead-style associations.";
 TStepReduce::usage = "TStepReduce[term] reduces exactly one interaction. Returns {result, TInteraction, THeap}.";
 
 (* ── Single-step reduction & tracing ──────────────────────────────────── *)
@@ -140,6 +143,8 @@ TTraceDisable::usage = "TTraceDisable[] disables interaction tracing.";
 TTraceClear::usage = "TTraceClear[] clears the trace buffer.";
 TTrace::usage = "TTrace[] returns a list of TInteraction objects from the trace buffer.";
 TReduceSteps::usage = "TReduceSteps[tensor, n] reduces at most n interactions, returns {result, stepsTaken}.";
+TStep::usage = "TStep[tensor] reduces until the walker-visible graph changes (skipping admin reductions). Returns {nextState, interactionsFired}.";
+TStepTrace::usage = "TStepTrace[tensor, maxSteps] repeatedly applies TStep, returning the list of visibly distinct states from the initial term to fixed point or maxSteps visible changes.";
 
 (* ── Profiling ────────────────────────────────────────────────────────── *)
 
@@ -190,36 +195,130 @@ $uopCode = <|
     "Add" -> 9, "Mul" -> 10, "Div" -> 11, "Max" -> 12, "Cmp" -> 13, "Sub" -> 14,
     "Sum" -> 15, "RMax" -> 16, "MatMul" -> 17,
     "Reshape" -> 18, "Permute" -> 19, "Expand" -> 20, "Shrink" -> 21, "Pad" -> 22,
-    "Fusing" -> 23, "Assign" -> 24, "Where" -> 25, "Ifz" -> 26,
-    "LogPrint" -> 27, "Grad" -> 28, "ToDevice" -> 29
+    "Kernel" -> 23, "Assign" -> 24, "Where" -> 25, "Ifz" -> 26,
+    "LogPrint" -> 27, "Grad" -> 28, "ToDevice" -> 29,
+    "Fuse" -> 31, "Exec" -> 33
 |>;
 
-(* Tag code → string name *)
+(* Tag code → string name. Mirrors TAG_* in src/tinyhvm.h. *)
 $tagName = <|
     0 -> "App", 1 -> "Lam", 2 -> "Var", 3 -> "Sup",
     4 -> "Dp0", 5 -> "Dp1", 6 -> "Era",
     7 -> "Num", 8 -> "Ref", 9 -> "Op2",
     10 -> "Ten", 11 -> "Top", 12 -> "Ctr",
     13 -> "Bri", 14 -> "Ann",
-    15 -> "Dsu", 16 -> "Ddu", 17 -> "Inc"
+    15 -> "Dsu", 16 -> "Ddu", 17 -> "Inc",
+    18 -> "Eql", 19 -> "And", 20 -> "Or",
+    21 -> "Mat", 22 -> "Any",
+    23 -> "Usp", 24 -> "Udp",
+    25 -> "Seq", 26 -> "Alo"
 |>;
 
 (* Device index → string name *)
 $deviceName = <|0 -> "cpu", 1 -> "metal"|>;
 
-(* UOp code → string name *)
+(* UOp code → string name. Mirrors UOP_* in src/tinyhvm.h. *)
 $uopName = <|
     0 -> "Load", 1 -> "Store", 2 -> "Copy",
     3 -> "Neg", 4 -> "Exp", 5 -> "Log", 6 -> "Relu", 7 -> "Cast", 8 -> "Sqrt",
     9 -> "Add", 10 -> "Mul", 11 -> "Div", 12 -> "Max", 13 -> "Cmp", 14 -> "Sub",
     15 -> "Sum", 16 -> "RMax", 17 -> "MatMul",
     18 -> "Reshape", 19 -> "Permute", 20 -> "Expand", 21 -> "Shrink", 22 -> "Pad",
-    23 -> "Fusing", 24 -> "Assign", 25 -> "Where", 26 -> "Ifz",
-    27 -> "LogPrint", 28 -> "Grad", 29 -> "ToDevice"
+    23 -> "Kernel", 24 -> "Assign", 25 -> "Where", 26 -> "Ifz",
+    27 -> "LogPrint", 28 -> "Grad", 29 -> "ToDevice",
+    30 -> "Detach", 31 -> "Fuse", 32 -> "Legacy32", 33 -> "Exec"
 |>;
 
+(* UOp categories (mirrors src/fuse/_.c is_view_op / is_elementwise / is_binary) *)
+$viewOps        = {"Reshape", "Permute", "Expand", "Shrink", "Pad"};
+$binaryOps      = {"Add", "Sub", "Mul", "Div", "Max", "Cmp"};
+$elementwiseOps = Join[$binaryOps, {"Neg", "Relu", "Exp", "Log", "Sqrt", "Cast"}];
+$reduceOps      = {"Sum", "RMax"};
+
 (* Unary ops (second arg = ERA) *)
-$unaryOps = {"Neg", "Exp", "Log", "Relu", "Sqrt", "Cast", "RMax", "LogPrint"};
+$unaryOps = {"Neg", "Exp", "Log", "Relu", "Sqrt", "Cast", "RMax",
+             "LogPrint", "Fuse"};
+
+(* Heap-tag arity: number of consecutive heap slots starting at term_val(t).
+   Mirrors dot_visible_heap_loc_tag + per-tag layout in dump.c.
+   Atoms (TEN, NUM, REF, VAR, ERA, ANY) → 0. *)
+$heapTagArity = <|
+    "App" -> 2, "Lam" -> 2, "Bri" -> 2,
+    "Sup" -> 2, "Usp" -> 2,
+    "Dp0" -> 2, "Dp1" -> 2,  (* share dup_loc; a/b at loc, loc+1 *)
+    "Op2" -> 2,
+    "Eql" -> 2, "And" -> 2, "Or" -> 2,
+    "Mat" -> 2,
+    "Ann" -> 2,
+    "Dsu" -> 3, "Ddu" -> 3,
+    "Udp" -> 1, "Inc" -> 1,
+    "Seq" -> 2,
+    "Ctr" -> 2,
+    "Alo" -> 2,
+    "Top" -> Automatic   (* arity depends on uop; see uopArity *)
+|>;
+
+(* UOp arity (number of heap slots at term_val of a TOP node).
+   Unary ops still allocate 2 slots; the second is ERA. *)
+uopArity[uop_String] := Which[
+    MemberQ[$viewOps, uop],            2,                   (* in, shape *)
+    MemberQ[$binaryOps, uop],          2,
+    uop === "MatMul",                   2,
+    uop === "Sum" || uop === "RMax",    2,                   (* in, axes *)
+    uop === "Grad",                     2,                   (* y, gy *)
+    uop === "Where",                    3,
+    uop === "Ifz",                      3,
+    uop === "Assign",                   2,
+    uop === "Kernel",                   3,                   (* left, right/meta, NUM(root_uop) *)
+    uop === "Fuse",                     1,
+    uop === "Exec",                     3,                   (* NUM(kid), deps, NUM(flags) *)
+    uop === "Detach" || uop === "LogPrint" || uop === "ToDevice", 1,
+    True,                                1
+];
+
+(* Port name for slot index i of a TOP/<uop>. Mirrors dot_uop_port_name. *)
+uopPortName[uop_String, i_Integer] := Which[
+    uop === "Sum" || uop === "RMax",   If[i == 0, "in", "axes"],
+    uop === "Grad",                     If[i == 0, "y", "gy"],
+    MemberQ[$viewOps, uop],             If[i == 0, "in", "shape"],
+    MemberQ[$binaryOps, uop] || uop === "MatMul", If[i == 0, "a", "b"],
+    uop === "Kernel",                   If[i == 0, "a", "b"],
+    True, "in"
+];
+
+(* Port name for slot index i of a heap tag. Mirrors dot_heap_port_name. *)
+heapPortName[tag_String, i_Integer] := Which[
+    tag === "Lam" || tag === "Bri",     If[i == 0, "var", "body"],
+    tag === "Sup" || tag === "Usp",     If[i == 0, "a", "b"],
+    tag === "Mat",                      If[i == 0, "ok", "fb"],
+    tag === "Ann",                      If[i == 0, "term", "type"],
+    tag === "Dsu" || tag === "Ddu",     {"label", "a", "b"}[[i + 1]],
+    tag === "Udp" || tag === "Inc",     "in",
+    tag === "Seq",                      If[i == 0, "first", "then"],
+    tag === "Alo",                      If[i == 0, "book", "env"],
+    True,                               If[i == 0, "a", "b"]
+];
+
+(* dump.c node colors, keyed by tag name. *)
+$heapTagFill = <|
+    "App" -> "#f3f3f3",
+    "Sup" -> "#e4d6fc", "Usp" -> "#e4d6fc",
+    "Mat" -> "#eaf2ff",
+    "Lam" -> "#f2e8ff", "Bri" -> "#f2e8ff",
+    "Ref" -> "#eeeeee", "Var" -> "#eeeeee",
+    "Alo" -> "#e8f7ff",
+    "Top" -> "#cce5ff",     (* dump.c uses #cce5ff for TOP boxes (e.g. ADD/MUL) *)
+    "Ten" -> "#e0e0e0",     (* tensor leaves *)
+    "Era" -> "#ffffff"
+|>;
+
+(* dump.c node shapes. *)
+$heapTagShape = <|
+    "Lam" -> "Triangle", "App" -> "InvTriangle",
+    "Sup" -> "Hexagon", "Usp" -> "Hexagon", "Ctr" -> "Hexagon",
+    "Ref" -> "Oval", "Var" -> "Oval",
+    "Alo" -> "Box3d"
+|>;
 
 (* ── Conversion between TTerm and TTensor ──────────────────────────────── *)
 
@@ -244,6 +343,7 @@ thvmToHostFn = None;
 thvmDimensionsFn = None;
 thvmTermTagFn = None;
 thvmTermExtFn = None;
+thvmTermValFn = None;
 thvmTensorCountFn = None;
 thvmOpFn = None;
 thvmReduceFn = None;
@@ -302,7 +402,9 @@ thvmTraceEnableFn = None;
 thvmTraceClearFn = None;
 thvmTraceDataFn = None;
 thvmReduceStepsFn = None;
+thvmStepToNextVisibleFn = None;
 thvmHeapReadFn = None;
+thvmHeapReadRangeFn = None;
 thvmHeapSnapshotFn = None;
 thvmNextInteractionFn = None;
 
@@ -329,6 +431,8 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
     thvmTermTagFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmTermTag",
         {Integer}, Integer];
     thvmTermExtFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmTermExt",
+        {Integer}, Integer];
+    thvmTermValFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmTermVal",
         {Integer}, Integer];
     thvmTensorCountFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmTensorCount",
         {}, Integer];
@@ -472,10 +576,14 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
         {}, LibraryDataType[NumericArray]];
     thvmReduceStepsFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmReduceSteps",
         {Integer, Integer, Integer}, Integer];
+    thvmStepToNextVisibleFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmStepToNextVisible",
+        {Integer, Integer, Integer}, Integer];
 
     (* Heap introspection *)
     thvmHeapReadFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapRead",
         {Integer}, {Integer, 1}];
+    thvmHeapReadRangeFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapReadRange",
+        {Integer, Integer}, {Integer, 2}];
     thvmHeapSnapshotFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapSnapshot",
         {}, {Integer, 1}];
     thvmNextInteractionFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmNextInteraction",
@@ -560,6 +668,9 @@ TTermTag[TTerm[id_Integer]] := Module[{tag},
 
 TTermExt[TTensor[id_Integer]] := (loadLibrary[]; thvmTermExtFn[id]);
 TTermExt[TTerm[id_Integer]] := (loadLibrary[]; thvmTermExtFn[id]);
+
+TTermVal[TTensor[id_Integer]] := (loadLibrary[]; thvmTermValFn[id]);
+TTermVal[TTerm[id_Integer]] := (loadLibrary[]; thvmTermValFn[id]);
 
 TTensorCount[] := (loadLibrary[]; thvmTensorCountFn[]);
 THeapPos[] := (loadLibrary[]; thvmHeapPosFn[]);
@@ -1182,6 +1293,56 @@ TReduceSteps[t_TTensor, n_Integer] := Module[{out = allocId[], steps, tag},
 ];
 TReduceSteps[t_TTerm, n_Integer] := TReduceSteps[ToTTensor[t], n];
 
+(* TStep: reduce until the walker-visible graph changes (skipping admin
+   reductions that don't affect the root-visible tree). Default budget 100
+   admin interactions. Returns {nextState, fired}. *)
+TStep[t_TTensor, maxAttempts_Integer: 100] := Module[{out = allocId[], fired, tag},
+    loadLibrary[];
+    fired = thvmStepToNextVisibleFn[out, t[[1]], maxAttempts];
+    tag = thvmTermTagFn[out];
+    {If[tag === 10 || tag === 11, TTensor[out], TTerm[out]], fired}
+];
+TStep[t_TTerm, args___] := TStep[ToTTensor[t], args];
+
+(* Signature from actual walker output — what TDotGraph renders. Two states
+   with identical node/edge sets hash to the same sig. *)
+walkerGraphSig[t_] := Module[{w = heapWalk[rootTermOf[t]]},
+    Hash[{
+        Sort[KeyValueMap[{#1, #2["Tag"], #2["Ext"]} &, w["Nodes"]]],
+        Sort[Map[{#["From"], #["To"], #["Port"]} &, w["Edges"]]]
+    }]];
+
+(* TStepTrace: repeatedly apply TStep and snapshot the walker output at
+   each step. Returns a list of <|"Term", "Walk"|> records — the walk is
+   captured at the moment of the step, so later reductions mutating heap
+   don't invalidate earlier snapshots.
+
+   Stops at fixed point, on dispatch to a pure tensor (TAG_TEN), or when
+   maxSteps reached. Pure public-graph reduction only — no materialization. *)
+TStepTrace[t_, maxSteps_Integer: 50] := Module[
+    {cur = t, acc, sigs, nxt, fired, tag, sig, walk, i = 0},
+    walk = heapWalk[rootTermOf[t]];
+    sig = Hash[{
+        Sort[KeyValueMap[{#1, #2["Tag"], #2["Ext"]} &, walk["Nodes"]]],
+        Sort[Map[{#["From"], #["To"], #["Port"]} &, walk["Edges"]]]}];
+    acc = {<|"Term" -> t, "Walk" -> walk|>};
+    sigs = {sig};
+    While[i++ < maxSteps,
+        {nxt, fired} = TStep[cur, 200];
+        If[fired == 0, Break[]];
+        tag = thvmTermTagFn[nxt[[1]]];
+        If[tag === 10, Break[]];
+        walk = heapWalk[rootTermOf[nxt]];
+        sig = Hash[{
+            Sort[KeyValueMap[{#1, #2["Tag"], #2["Ext"]} &, walk["Nodes"]]],
+            Sort[Map[{#["From"], #["To"], #["Port"]} &, walk["Edges"]]]}];
+        cur = nxt;
+        If[MemberQ[sigs, sig], Continue[]];
+        AppendTo[acc, <|"Term" -> nxt, "Walk" -> walk|>];
+        AppendTo[sigs, sig]];
+    acc
+];
+
 (* ════════════════════════════════════════════════════════════════════════ *)
 (* Heap introspection — THeap, TInteraction, TStepReduce, THeapRead        *)
 (* ════════════════════════════════════════════════════════════════════════ *)
@@ -1345,7 +1506,21 @@ THeapRead[loc_Integer] := Module[{raw},
     <|"Tag" -> Lookup[$tagName, raw[[1]], "?"],
       "TagCode" -> raw[[1]],
       "Ext" -> raw[[2]],
-      "Val" -> raw[[3]]|>
+      "Val" -> raw[[3]],
+      "Loc" -> loc|>
+];
+
+(* Bulk read [lo, lo+count). Returns a list of associations like THeapRead. *)
+THeapReadRange[lo_Integer, count_Integer] := Module[{raw},
+    loadLibrary[];
+    raw = Normal[thvmHeapReadRangeFn[lo, count]];
+    Table[
+        <|"Tag" -> Lookup[$tagName, raw[[i, 1]], "?"],
+          "TagCode" -> raw[[i, 1]],
+          "Ext" -> raw[[i, 2]],
+          "Val" -> raw[[i, 3]],
+          "Loc" -> lo + i - 1|>,
+        {i, count}]
 ];
 
 (* ── TStepReduce ─────────────────────────────────────────────────────── *)
@@ -1366,6 +1541,7 @@ TStepReduce[t_TTerm] := TStepReduce[ToTTensor[t]];
 (* Load subpackages                                                        *)
 (* ════════════════════════════════════════════════════════════════════════ *)
 
+Get[FileNameJoin[{DirectoryName[$InputFileName], "Heap.wl"}]];
 Get[FileNameJoin[{DirectoryName[$InputFileName], "Visualization.wl"}]];
 Get[FileNameJoin[{DirectoryName[$InputFileName], "Layers.wl"}]];
 Get[FileNameJoin[{DirectoryName[$InputFileName], "NetCompile.wl"}]];

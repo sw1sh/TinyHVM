@@ -306,6 +306,17 @@ EXTERN_C DLLEXPORT int thvmTermExt(
     return LIBRARY_NO_ERROR;
 }
 
+// thvmTermVal[termId] → Integer (VAL field — heap loc for compound tags, tensor id for TEN, etc.)
+EXTERN_C DLLEXPORT int thvmTermVal(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    mint term_id = MArgument_getInteger(args[0]);
+    Term t = get_term(term_id);
+    MArgument_setInteger(res, (mint)term_val(t));
+    return LIBRARY_NO_ERROR;
+}
+
 // thvmTensorCount[] → Integer
 EXTERN_C DLLEXPORT int thvmTensorCount(
     WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
@@ -1502,11 +1513,87 @@ EXTERN_C DLLEXPORT int thvmReduceSteps(
     return LIBRARY_NO_ERROR;
 }
 
+// Hash the visible-graph structure reachable from `root`. Matches what
+// TDotGraph's walker renders: compound terms keyed by their args-base val,
+// atoms by (tag, ext, val). Administrative reductions that shuffle heap
+// without altering this visible structure produce identical sigs.
+static void walker_sig_visit(TinyHVM *ctx, Term t, u64 *h, u8 *seen) {
+    u8 tag = term_tag(t);
+    u64 val = term_val(t);
+    #define WH_MIX(_x) do { *h ^= (u64)(_x); *h *= 1099511628211ULL; } while (0)
+    WH_MIX(tag); WH_MIX(term_ext(t)); WH_MIX(val);
+    int is_compound = (tag == TAG_TOP || tag == TAG_APP || tag == TAG_LAM ||
+                       tag == TAG_SEQ || tag == TAG_SUP || tag == TAG_DP0 ||
+                       tag == TAG_DP1 || tag == TAG_CTR || tag == TAG_OP2 ||
+                       tag == TAG_MAT || tag == TAG_ANN);
+    if (!is_compound) return;
+    if (val == 0 || val >= ctx->heap_pos) return;
+    if (seen[val]) return;  // dedupe shared subtrees by args-base val
+    seen[val] = 1;
+    u32 arity = 0;
+    if (tag == TAG_TOP) arity = thvm_uop_visible_arity(term_ext(t));
+    else if (tag == TAG_CTR) arity = term_ext(t);
+    else arity = 2;
+    for (u32 i = 0; i < arity; i++) {
+        u64 slot = val + i;
+        if (slot >= ctx->heap_pos) break;
+        walker_sig_visit(ctx, ctx->heap[slot], h, seen);
+    }
+    #undef WH_MIX
+}
+
+static u64 thvm_walker_sig(TinyHVM *ctx, Term root) {
+    u64 h = 1469598103934665603ULL;
+    u8 *seen = (u8 *)calloc(ctx->heap_pos ? ctx->heap_pos : 1, 1);
+    walker_sig_visit(ctx, root, &h, seen);
+    free(seen);
+    return h;
+}
+
+// thvmStepToNextVisible(outId, termId, maxAttempts) → Integer (interactions fired).
+// Fires budget-1 reductions until the walker-visible graph from `root` changes,
+// or until `maxAttempts` admin reductions have been skipped with no visible
+// progress, or the reducer stalls. Stops at the first visible change — does
+// NOT cross into dispatch (KERNEL-TEN materialization). The returned term is
+// the new state; out_id holds it.
+EXTERN_C DLLEXPORT int thvmStepToNextVisible(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint out_id = MArgument_getInteger(args[0]);
+    mint term_id = MArgument_getInteger(args[1]);
+    mint max_attempts = MArgument_getInteger(args[2]);
+    ensure_term_cap(out_id);
+
+    Term t = get_term(term_id);
+    u64 sig0 = thvm_walker_sig(g_ctx, t);
+    u32 total = 0;
+    for (u32 i = 0; i < (u32)max_attempts; i++) {
+        Term r = thvm_reduce_steps(g_ctx, t, 1);
+        u32 fired_now = (u32)g_ctx->steps_taken;
+        total += fired_now;
+        if (fired_now == 0 && r == t) break;  // reducer stalled
+        t = r;
+        u64 sig1 = thvm_walker_sig(g_ctx, t);
+        if (sig1 != sig0) {
+            set_term(out_id, t);
+            MArgument_setInteger(res, (mint)total);
+            return LIBRARY_NO_ERROR;
+        }
+    }
+    set_term(out_id, t);
+    MArgument_setInteger(res, (mint)total);
+    return LIBRARY_NO_ERROR;
+}
+
 // ============================================================
 // Heap introspection
 // ============================================================
 
-// thvmHeapRead(loc) → {Integer, 1} of 3 elements: {tag, ext, val_lo}
+// thvmHeapRead(loc) → {Integer, 1} of 3 elements: {tag, ext, val}
+// `val` is the full 64-bit term value (mint is 64-bit on this platform).
 EXTERN_C DLLEXPORT int thvmHeapRead(
     WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
 {
@@ -1527,7 +1614,40 @@ EXTERN_C DLLEXPORT int thvmHeapRead(
     mint *od = libData->MTensor_getIntegerData(out);
     od[0] = (mint)term_tag(t);
     od[1] = (mint)term_ext(t);
-    od[2] = (mint)(term_val(t) & 0xFFFFFFFF);
+    od[2] = (mint)term_val(t);
+    MArgument_setMTensor(res, out);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmHeapReadRange(lo, count) → {Integer, 2} of shape {count, 3}
+// Each row: {tag, ext, val}. Out-of-range slots become ERA.
+EXTERN_C DLLEXPORT int thvmHeapReadRange(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint lo = MArgument_getInteger(args[0]);
+    mint count = MArgument_getInteger(args[1]);
+    if (count < 0) count = 0;
+
+    mint dims[2] = { count, 3 };
+    MTensor out;
+    libData->MTensor_new(MType_Integer, 2, dims, &out);
+    mint *od = libData->MTensor_getIntegerData(out);
+
+    for (mint i = 0; i < count; i++) {
+        mint loc = lo + i;
+        Term t;
+        if (loc < 0 || (u64)loc >= g_ctx->heap_pos) {
+            t = term_era();
+        } else {
+            t = heap_read(g_ctx, (u64)loc);
+        }
+        od[i * 3 + 0] = (mint)term_tag(t);
+        od[i * 3 + 1] = (mint)term_ext(t);
+        od[i * 3 + 2] = (mint)term_val(t);
+    }
     MArgument_setMTensor(res, out);
     return LIBRARY_NO_ERROR;
 }

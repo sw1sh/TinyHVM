@@ -1,5 +1,9 @@
 # TinyHVM Heap & Trampoline: How Recursive Inet Training Works
 
+> **See also:** [docs/step_trampoline.md](../docs/step_trampoline.md) for the
+> step-graph tracer, walker, and WL `TStep`/`TStepTrace`/`TDotGraph` API
+> that build on top of the primitives documented here.
+
 ## Term Representation
 
 Every term is a 64-bit packed word: `[SUB:1 | TAG:7 | EXT:18 | VAL:38]`
@@ -32,6 +36,12 @@ TOP at heap[loc]:    [loc] = arg0 (left operand)
 ```
 
 ## Trampoline (`src/reduce/_.c`)
+
+**Primitive:** `thvm_reduce_steps(ctx, t, max_steps)` is the worker. It sets
+`ctx->step_budget = max_steps`, runs the two-phase loop below firing
+interactions until budget or WNF, and returns. `thvm_reduce(ctx, t)` is
+literally its fixed point — a one-liner that calls `thvm_reduce_steps` with
+`max_steps = 0` (unlimited).
 
 Two-phase loop, no recursion for the hot path:
 
@@ -96,3 +106,20 @@ A 3-arg TOP node. `counter` is a scalar `TEN([1])`:
 - `counter > 0`  → create `TEN(counter-1)`, return `APP(succ_lam, TEN(counter-1))`
 
 No O(n) heap allocation — just a single `TEN(N)` scalar at entry, decremented each step.
+
+## Single-step tracing
+
+Every interaction the trampoline fires passes through the `TRACE_STEP(before, result)`
+macro ([src/reduce/_.c:361](../src/reduce/_.c#L361)). This increments
+`ctx->steps_taken`, writes to an optional `ctx->trace_buf`, and — when
+step-graph tracing is active — triggers the per-interaction dump in
+`thvm_trace_step_graph_session` ([src/schedule/_.c](../src/schedule/_.c)).
+
+`thvm_interact`'s entry runs the pre-hook so `before`-redex metadata is
+read from live heap *before* the interaction mutates it; `TRACE_STEP` fires
+the post-hook after.
+
+From Wolfram, `TStep[t]` and `TStepTrace[t]` wrap the budget-1 cycle with
+walker-visible-change semantics (skip admin reductions that don't alter the
+rendered tree); see [docs/step_trampoline.md](../docs/step_trampoline.md)
+for the full API and the C ↔ WL correspondence table.

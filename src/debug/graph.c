@@ -1455,32 +1455,10 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
             shown_before = next_before;
         }
     }
-    if (!thvm_heap_dot_highlight_was_drawn() || !thvm_file_has_substr(tmp, "#cc0000")) {
-        // Edge highlight failed — re-render with node highlight instead.
-        if (term_tag(ht) != TAG_VAR) {
-            u64 node_hl = hs;
-            if (node_hl > 0 && node_hl < ctx->heap_pos) {
-                Term owner = heap_read(ctx, node_hl);
-                if (term_val(owner) != node_hl) {
-                    for (u64 back = 1; back <= 3 && node_hl >= back; back++) {
-                        u64 cand = node_hl - back;
-                        if (cand == 0 || cand >= ctx->heap_pos) continue;
-                        Term ct = heap_read(ctx, cand);
-                        u32 ar = thvm_step_term_arity(ct);
-                        if (term_val(ct) == cand && ar > back) {
-                            node_hl = cand;
-                            break;
-                        }
-                    }
-                }
-            }
-            heap_dot_node_hl = node_hl;
-            heap_dot_root_only = 1;
-            thvm_heap_dot_root(ctx, tmp, root);
-            heap_dot_root_only = 0;
-            heap_dot_node_hl = 0;
-        }
-    }
+    // Edge highlight is the only acceptable highlight for step graphs.
+    // If it couldn't be drawn, leave the snapshot un-highlighted rather
+    // than falling back to a node-highlight (which looks like a different
+    // kind of event and confuses readers).
     int rendered_highlight = thvm_heap_dot_highlight_was_drawn() && thvm_file_has_substr(tmp, "#cc0000");
     if (!rendered_highlight) {
         // Highlight couldn't be drawn (pre-fire slot already mutated). Keep
@@ -1490,6 +1468,11 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
     thvm_step_graph_display_name(ctx, shown_source_slot, shown_before, hs, ht,
                                  shown_name, sizeof(shown_name));
     if (!shown_name[0]) snprintf(shown_name, sizeof(shown_name), "state_no_highlight");
+    // If the interaction produced a tensor result, this is the terminal
+    // state — name the file accordingly so finalize() can skip writing
+    // a redundant state_final next to it.
+    if (term_tag(root) == TAG_TEN)
+        snprintf(shown_name, sizeof(shown_name), "state_final");
     char p[384];
     snprintf(p, sizeof(p), "%s/step_%03u_%s.dot", step_graph_dir, step_graph_n, shown_name);
     rename(tmp, p);
@@ -1536,6 +1519,12 @@ static void thvm_step_graph_finalize(TinyHVM *ctx) {
     heap_dot_root_only = 0;
     u64 dot_sig = thvm_file_sig(tmp_struct);
     remove(tmp_struct);
+    // If the last per-interaction snapshot already captured this state,
+    // don't write a redundant state_final duplicate.
+    if (dot_sig == step_graph_last_dot_sig) {
+        (void)sig;
+        goto finalize_rewrite_last;
+    }
     {
         char tmp[384];
         snprintf(tmp, sizeof(tmp), "%s/.tmp_step.dot", step_graph_dir);
@@ -1556,6 +1545,7 @@ static void thvm_step_graph_finalize(TinyHVM *ctx) {
         step_graph_n++;
         step_graph_last_dot_sig = dot_sig;
     }
+finalize_rewrite_last:
     step_graph_last_sig = sig;
     if (!getenv("THVM_STEP_GRAPH_NO_PNG")) {
         char cmd[256];

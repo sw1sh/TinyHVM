@@ -95,13 +95,22 @@
                         return t;
                     RETURN_REDUCED(thvm_seq(ctx, left, right));
                 }
-                // FUSE produces monolithic KERNELs directly — no separate
-                // settle interaction. If somehow we got a non-monolithic
-                // kernel here, leave it alone.
-                if (!thvm_kernel_is_monolithic(ctx, t)) return t;
-                // KERNEL stays a DAG node in step-by-step reduce — only
-                // phase-2 (which sets dispatch_enabled) is allowed to lower
-                // (register) and dispatch it.
+                if (!thvm_kernel_is_monolithic(ctx, t)) {
+                    if (!thvm_kernel_local_child_ready(ctx, left) ||
+                        !thvm_kernel_local_child_ready(ctx, right))
+                        return t;
+                    Term settled = thvm_make_public_kernel_from_uop(ctx, kernel_uop, left, right, t);
+                    if (!settled) return t;
+                    if (getenv("THVM_SCHED_DIAG"))
+                        fprintf(stderr, "KERNEL_SETTLE: op=%s tag=%u ext=%u val=%llu\n",
+                                uop_names[kernel_uop], term_tag(settled), term_ext(settled),
+                                (unsigned long long)term_val(settled));
+                    RETURN_REDUCED(settled);
+                }
+                // KERNEL stays a DAG node in phase-1 — only phase-2 (which sets
+                // dispatch_enabled) is allowed to lower (register) and dispatch it.
+                // KERNEL/KERNEL fusion above (the !monolithic settle path) still
+                // runs unconditionally so the DAG can grow during phase-1.
                 if (!ctx->dispatch_enabled) return t;
                 u32 kid = 0;
                 if (!thvm_kernel_register(ctx, t, &kid)) {

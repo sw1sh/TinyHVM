@@ -1576,6 +1576,27 @@ EXTERN_C DLLEXPORT int thvmStepToNextVisible(
     return LIBRARY_NO_ERROR;
 }
 
+// thvmKernelOpChain(tag, ext, val) → String (e.g. "MUL+ADD"). Empty if not a KERNEL.
+extern void thvm_kernel_op_chain(TinyHVM *ctx, Term kernel, char *buf, size_t bufsz);
+
+EXTERN_C DLLEXPORT int thvmKernelOpChain(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+    u8  tag = (u8)MArgument_getInteger(args[0]);
+    u32 ext = (u32)MArgument_getInteger(args[1]);
+    u64 val = (u64)MArgument_getInteger(args[2]);
+    Term t = term_new(tag, ext, val);
+    char buf[128] = {0};
+    thvm_kernel_op_chain(g_ctx, t, buf, sizeof(buf));
+    char *copy = (char *)malloc(strlen(buf) + 1);
+    if (!copy) return LIBRARY_FUNCTION_ERROR;
+    strcpy(copy, buf);
+    MArgument_setUTF8String(res, copy);
+    return LIBRARY_NO_ERROR;
+}
+
 // ============================================================
 // Heap introspection
 // ============================================================

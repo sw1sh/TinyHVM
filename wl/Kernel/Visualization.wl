@@ -180,21 +180,13 @@ TInteractionGraph[t_TTerm, opts___?OptionQ] := Module[
 
 (* ── TDotGraph — dump.c-style renderer (boxed nodes, port labels, heap locs) ── *)
 
-(* Walk inner KERNEL→KERNEL chain to build "INNER+OUTER" op label. *)
-iDotKernelOpChain[val_Integer] := Module[{seen = <||>, parts = {}, walk, lim = 0},
-    walk[loc_] := Module[{n, op, child},
-        If[loc <= 0 || lim > 8 || KeyExistsQ[seen, loc], Return[Null, Module]];
-        seen[loc] = True; lim++;
-        n = Quiet@Check[THeapRead[loc + 2], <||>];
-        If[!AssociationQ[n] || n["Tag"] =!= "Num", Return[Null, Module]];
-        op = ToUpperCase[Lookup[$uopName, n["Val"], "?"]];
-        child = Quiet@Check[THeapRead[loc], <||>];
-        If[AssociationQ[child] && child["Tag"] === "Top" &&
-           Lookup[$uopName, child["Ext"], ""] === "Kernel",
-            walk[child["Val"]]];
-        AppendTo[parts, op]];
-    walk[val];
-    If[parts === {}, "", StringRiffle[parts, "+"]]];
+(* Pull chain from cached KernelEntry's FusedOp[] via thvmKernelOpChainFn.
+   tagCode 11 = TAG_TOP, ext = UOP_KERNEL. *)
+iDotKernelOpChain[val_Integer] := Module[{s, kernelExt},
+    kernelExt = First[Select[Range[0, Length[$uopName]], Lookup[$uopName, #, ""] === "Kernel" &], -1];
+    If[!IntegerQ[kernelExt], Return[""]];
+    s = Quiet@Check[thvmKernelOpChainFn[11, kernelExt, val], ""];
+    If[StringQ[s], ToUpperCase[s], ""]];
 
 (* Infer shape of a compound term at heap base `val` by walking to first TEN leaf. *)
 iDotInferShape[val_Integer] := Module[{seen = <||>, go, dims},

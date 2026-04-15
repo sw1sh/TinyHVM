@@ -1038,6 +1038,12 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
             ctx->trace_enabled = saved_en;
 
             if (did_fire) {
+                // Phase-1 NF check: if the root just collapsed from a KERNEL
+                // (or other compute term) to a TEN, that was the kernel-dispatch
+                // interaction (phase-2). Don't apply it — leave traced as the
+                // pre-dispatch KERNEL DAG so finalize snapshots the NF.
+                if (term_tag(result) == TAG_TEN && term_tag(traced) != TAG_TEN)
+                    break;
                 traced = result;
                 if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
                     heap_set(ctx, phase1_root_slot, traced);
@@ -1120,9 +1126,11 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     }
     free(reach);
 
-    traced = reduce_net_quiesce(ctx, traced);
+    // Finalize BEFORE phase-2 quiesce so the final snapshot reflects the
+    // phase-1 normal form (e.g. the KERNEL DAG), not the dispatched tensor.
     thvm_step_graph_set_root(traced);
     thvm_step_graph_finalize(ctx);
+    traced = reduce_net_quiesce(ctx, traced);
     phase1_root_slot = 0;
     sched_planner_release_detached_slots();
     return traced;

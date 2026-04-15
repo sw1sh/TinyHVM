@@ -237,6 +237,113 @@ static const char *dot_tensor_edge_slot_attrs(u64 slot, char *buf, size_t nbuf) 
     return buf;
 }
 
+typedef struct {
+    int semantic;
+    int step;
+} DotLayers;
+
+static int dot_env_flag_enabled(const char *name, int default_value) {
+    const char *v = getenv(name);
+    if (!v || !v[0]) return default_value;
+    return !(v[0] == '0' && v[1] == '\0');
+}
+
+static DotLayers dot_layers_from_env(void) {
+    int raw_only = dot_env_flag_enabled("THVM_HEAP_DOT_RAW_ONLY", 0);
+    DotLayers layers = {
+        .semantic = raw_only ? 0 : dot_env_flag_enabled("THVM_HEAP_DOT_SEMANTIC", 1),
+        .step = raw_only ? 0 : dot_env_flag_enabled("THVM_HEAP_DOT_STEP", 1),
+    };
+    return layers;
+}
+
+static void dot_raw_slot_term_label(TinyHVM *ctx, Term t, char *buf, size_t nbuf) {
+    if (!buf || nbuf == 0) return;
+    buf[0] = '\0';
+    (void)ctx;
+    u8 tag = term_tag(t);
+    u32 ext = term_ext(t);
+    u64 val = term_val(t);
+    switch (tag) {
+        case TAG_TOP:
+            if (ext < UOP_COUNT) snprintf(buf, nbuf, "%s\\n@%llu", uop_names[ext], (unsigned long long)val);
+            else snprintf(buf, nbuf, "TOP\\n@%llu", (unsigned long long)val);
+            return;
+        case TAG_DP0:
+            snprintf(buf, nbuf, "DP0\\n@%llu", (unsigned long long)val);
+            return;
+        case TAG_DP1:
+            snprintf(buf, nbuf, "DP1\\n@%llu", (unsigned long long)val);
+            return;
+        case TAG_LAM:
+        case TAG_BRI:
+            snprintf(buf, nbuf, "%s\\n#%u@%llu", dot_heap_tag_name(tag), ext, (unsigned long long)val);
+            return;
+        case TAG_TEN:
+            snprintf(buf, nbuf, "TEN\\nt%llu", (unsigned long long)val);
+            return;
+        case TAG_ANY:
+            snprintf(buf, nbuf, "ANY\\n@%llu", (unsigned long long)val);
+            return;
+        case TAG_ERA:
+            snprintf(buf, nbuf, "ERA\\n@%llu", (unsigned long long)val);
+            return;
+        case TAG_REF:
+        case TAG_MAT:
+            snprintf(buf, nbuf, "%s\\n#%u@%llu", dot_heap_tag_name(tag), ext, (unsigned long long)val);
+            return;
+        case TAG_SUP:
+        case TAG_USP:
+            snprintf(buf, nbuf, "%s #%u@%llu", dot_heap_tag_name(tag), ext, (unsigned long long)val);
+            return;
+        case TAG_NUM: {
+            f32 fv;
+            u32 bv = (u32)val;
+            memcpy(&fv, &bv, 4);
+            snprintf(buf, nbuf, "NUM\\n%.4g", (double)fv);
+            return;
+        }
+        default: {
+            const char *name = dot_heap_tag_name(tag);
+            if (name[0] == '?' && name[1] == '\0')
+                snprintf(buf, nbuf, "tag=%u/%u\\n@%llu", (u32)tag, ext, (unsigned long long)val);
+            else
+                snprintf(buf, nbuf, "%s\\n@%llu", name, (unsigned long long)val);
+            return;
+        }
+    }
+}
+
+static void dot_emit_raw_alo_slots(TinyHVM *ctx, FILE *f, u64 alo_loc, int book_hl, int env_hl) {
+    if (!ctx || !f || alo_loc == 0 || alo_loc + 1 >= ctx->heap_pos) return;
+    Term book_term = heap_read(ctx, alo_loc + 0);
+    Term sid_term = heap_read(ctx, alo_loc + 1);
+    char book_label[96];
+    char env_label[96];
+    char book_node_label[112];
+    char env_node_label[112];
+    dot_raw_slot_term_label(ctx, book_term, book_label, sizeof(book_label));
+    if (term_tag(sid_term) == TAG_NUM) {
+        snprintf(env_label, sizeof(env_label), "STATE\\n#%u", term_as_u32(sid_term));
+    } else {
+        dot_raw_slot_term_label(ctx, sid_term, env_label, sizeof(env_label));
+    }
+    snprintf(book_node_label, sizeof(book_node_label), "BOOK\\n%s", book_label);
+    snprintf(env_node_label, sizeof(env_node_label), "ENV\\n%s", env_label);
+    fprintf(f, "  alobook%llu [label=\"%s\",shape=box,fillcolor=\"#eef4ff\",fontsize=8];\n",
+            (unsigned long long)alo_loc, book_node_label);
+    fprintf(f, "  aloenv%llu [label=\"%s\",shape=box,fillcolor=\"#f5f5f5\",fontsize=8];\n",
+            (unsigned long long)alo_loc, env_node_label);
+    if (book_hl) fprintf(f, "  alobook%llu -> n%llu [label=\"book\",color=\"#cc0000\",penwidth=2.0];\n",
+                         (unsigned long long)alo_loc, (unsigned long long)alo_loc);
+    else         fprintf(f, "  alobook%llu -> n%llu [label=\"book\"];\n",
+                         (unsigned long long)alo_loc, (unsigned long long)alo_loc);
+    if (env_hl) fprintf(f, "  aloenv%llu -> n%llu [label=\"env\",color=\"#cc0000\",penwidth=2.0];\n",
+                        (unsigned long long)alo_loc, (unsigned long long)alo_loc);
+    else        fprintf(f, "  aloenv%llu -> n%llu [label=\"env\"];\n",
+                        (unsigned long long)alo_loc, (unsigned long long)alo_loc);
+}
+
 static u32 dot_book_struct_arity(Term t);
 static Term dot_book_to_dynamic_term(TinyHVM *ctx, Term target);
 
@@ -350,8 +457,7 @@ static const char *dot_fuse_payload_label_r(TinyHVM *ctx, Term payload, char *bu
             }
         }
         if (uop < UOP_COUNT &&
-            uop != UOP_FUSE &&
-            uop != UOP_FUSE2) {
+            uop != UOP_FUSE) {
             snprintf(buf, nbuf, "%s", uop_names[uop]);
             return buf;
         }
@@ -503,6 +609,93 @@ static void dot_kernel_output_label(const KernelEntry *ke, char *buf, size_t buf
     snprintf(buf, bufsz, "out");
 }
 
+int dot_kernel_entry_for_term(TinyHVM *ctx, Term kernel,
+                                     KernelEntry *scratch, KernelEntry **out_ke, u32 *out_kid);
+void dot_kernel_ops_summary(const KernelEntry *ke, u32 fallback_uop,
+                                   char *buf, size_t bufsz);
+
+void thvm_kernel_op_chain(TinyHVM *ctx, Term kernel, char *buf, size_t bufsz) {
+    if (!buf || bufsz == 0) return;
+    buf[0] = '\0';
+    if (term_tag(kernel) != TAG_TOP || term_ext(kernel) != UOP_KERNEL) return;
+    KernelEntry scratch;
+    KernelEntry *ke = NULL;
+    u32 kid = ~0u;
+    u32 kop = thvm_kernel_root_uop(ctx, kernel);
+    int have = dot_kernel_entry_for_term(ctx, kernel, &scratch, &ke, &kid);
+    if (have) dot_kernel_ops_summary(ke, kop, buf, bufsz);
+    else if (kop < UOP_COUNT) snprintf(buf, bufsz, "%s", uop_names[kop]);
+}
+
+int dot_kernel_entry_for_term(TinyHVM *ctx, Term kernel,
+                                     KernelEntry *scratch, KernelEntry **out_ke, u32 *out_kid) {
+    extern KernelEntry sched_kernels[];
+    extern u32 sched_kernel_count;
+    if (out_ke) *out_ke = NULL;
+    if (out_kid) *out_kid = ~0u;
+    if (!ctx || term_tag(kernel) != TAG_TOP || term_ext(kernel) != UOP_KERNEL)
+        return 0;
+    u64 loc = term_val(kernel);
+    u32 kid = 0;
+    if (thvm_kernel_lookup_kid(loc, &kid) && kid < sched_kernel_count) {
+        if (out_ke) *out_ke = &sched_kernels[kid];
+        if (out_kid) *out_kid = kid;
+        return 1;
+    }
+    if (!scratch || !thvm_kernel_is_monolithic(ctx, kernel))
+        return 0;
+    memset(scratch, 0, sizeof(*scratch));
+    Term compute = term_era();
+    if (!thvm_kernel_to_compute(ctx, kernel, &compute, 0))
+        return 0;
+    if (term_tag(compute) != TAG_TOP)
+        return 0;
+    fuse_set_schedule_boundaries(NULL, NULL, NULL, 0, term_val(compute));
+    int ok = fuse_build_kernel(ctx, compute, scratch);
+    fuse_clear_schedule_boundaries();
+    if (!ok)
+        return 0;
+    scratch->original_term = compute;
+    if (out_ke) *out_ke = scratch;
+    return 1;
+}
+
+void dot_kernel_ops_summary(const KernelEntry *ke, u32 fallback_uop,
+                                   char *buf, size_t bufsz) {
+    if (bufsz == 0) return;
+    buf[0] = '\0';
+    if (!ke || ke->n_ops == 0) {
+        snprintf(buf, bufsz, "%s", fallback_uop < UOP_COUNT ? uop_names[fallback_uop] : "KERNEL");
+        return;
+    }
+    size_t used = 0;
+    u32 shown = 0;
+    for (u32 i = 0; i < ke->n_ops && shown < 4; i++) {
+        u32 u = ke->ops[i].uop;
+        const char *name = u < UOP_COUNT ? uop_names[u] : "?";
+        int wrote = snprintf(buf + used, bufsz > used ? bufsz - used : 0,
+                             "%s%s", shown ? "+" : "", name);
+        if (wrote < 0) break;
+        if ((size_t)wrote >= bufsz - used) {
+            used = bufsz - 1;
+            break;
+        }
+        used += (size_t)wrote;
+        shown++;
+    }
+    if (ke->has_reduce && shown < 4) {
+        const char *rname = ke->has_reduce < UOP_COUNT ? uop_names[ke->has_reduce] : "REDUCE";
+        int wrote = snprintf(buf + used, bufsz > used ? bufsz - used : 0,
+                             "%s%s", shown ? "+" : "", rname);
+        if (wrote > 0 && (size_t)wrote < bufsz - used) {
+            used += (size_t)wrote;
+            shown++;
+        }
+    }
+    if ((ke->n_ops > shown) || (ke->has_reduce && shown == 4))
+        snprintf(buf + used, bufsz > used ? bufsz - used : 0, "+...");
+}
+
 static int dot_infer_top_shape(TinyHVM *ctx, u32 uop, u64 loc, Shape *out);
 
 static int dot_term_shape(TinyHVM *ctx, Term t, Shape *out) {
@@ -556,6 +749,9 @@ static int dot_infer_top_shape(TinyHVM *ctx, u32 uop, u64 loc, Shape *out) {
     if (uop == UOP_FUSE) {
         a = heap_read(ctx, loc + 0);
     } else if (uop == UOP_KERNEL) {
+        Term kernel = term_new(TAG_TOP, UOP_KERNEL, loc);
+        if (thvm_kernel_is_monolithic(ctx, kernel))
+            return dot_term_shape(ctx, thvm_kernel_monolithic_payload(ctx, kernel), out);
         a = heap_read(ctx, loc + 0);
         b = heap_read(ctx, loc + 1);
         u32 kop = thvm_kernel_root_uop(ctx, term_new(TAG_TOP, UOP_KERNEL, loc));
@@ -577,35 +773,6 @@ static int dot_infer_top_shape(TinyHVM *ctx, u32 uop, u64 loc, Shape *out) {
             return 0;
         }
         if (is_binary(kop) || kop == UOP_CMP) {
-            if (has_a && has_b && dot_shape_broadcast(sa, sb, out)) return 1;
-            if (has_a) { *out = sa; return 1; }
-            if (has_b) { *out = sb; return 1; }
-            return 0;
-        }
-        if (has_a) { *out = sa; return 1; }
-        return 0;
-    } else if (uop == UOP_FUSE2) {
-        a = heap_read(ctx, loc + 1);
-        b = heap_read(ctx, loc + 2);
-        u32 fop = term_as_u32(heap_read(ctx, loc + 0));
-        Shape sa = SHAPE(1), sb = SHAPE(1);
-        int has_a = dot_term_shape(ctx, a, &sa);
-        int has_b = dot_term_shape(ctx, b, &sb);
-        if (fop == UOP_RESHAPE || fop == UOP_EXPAND) {
-            if (dot_meta_shape_from_tensor(ctx, b, out)) return 1;
-            if (has_a) { *out = sa; return 1; }
-            return 0;
-        }
-        if (fop == UOP_SUM || fop == UOP_RMAX) {
-            if (has_a) { *out = sa; return 1; }
-            return 0;
-        }
-        if (fop == UOP_COUNT) {
-            if (has_b) { *out = sb; return 1; }
-            if (has_a) { *out = sa; return 1; }
-            return 0;
-        }
-        if (is_binary(fop) || fop == UOP_CMP) {
             if (has_a && has_b && dot_shape_broadcast(sa, sb, out)) return 1;
             if (has_a) { *out = sa; return 1; }
             if (has_b) { *out = sb; return 1; }
@@ -671,11 +838,13 @@ static u64 dot_dup_canon_loc(TinyHVM *ctx, u64 dloc) {
     return dloc;
 }
 
-static u32 dot_term_arity(Term t) {
+static u32 dot_term_arity(TinyHVM *ctx, Term t) {
     u8 tag = term_tag(t);
     u32 ext = term_ext(t);
     switch (tag) {
         case TAG_TOP:
+            if (ctx && ext == UOP_KERNEL && thvm_kernel_is_monolithic(ctx, t))
+                return 0;
             return thvm_uop_storage_arity(ext);
         case TAG_APP:
         case TAG_LAM:
@@ -793,6 +962,7 @@ static void thvm_heap_dot(TinyHVM *ctx, const char *path) {
 static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     FILE *f = fopen(path, "w");
     if (!f) { fprintf(stderr, "heap_dot: can't open %s\n", path); return; }
+    DotLayers layers = dot_layers_from_env();
     fprintf(f, "digraph G {\n");
     if (heap_dot_prev_name[0]) fprintf(f, "  // PREV_INTERACTION: %s\n", heap_dot_prev_name);
     if (heap_dot_next_name[0]) fprintf(f, "  // NEXT_INTERACTION: %s\n", heap_dot_next_name);
@@ -858,6 +1028,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     u8 *slot_live = (u8 *)calloc((size_t)ctx->heap_pos, 1);
     u8 *loc_live = (u8 *)calloc((size_t)ctx->heap_pos, 1);
     u8 *ctr_children_emitted = (u8 *)calloc((size_t)ctx->heap_pos, 1);
+    u8 *var_source_emitted = (u8 *)calloc((size_t)ctx->heap_pos, 1);
     #define DP_SLOT_MARK(pos) do { if ((pos) < ctx->heap_pos) dp_slot_emitted[(pos)] = 1; } while(0)
     #define DP_SLOT_SEEN(pos) (((pos) < ctx->heap_pos) ? dp_slot_emitted[(pos)] : 0)
     #define RAW_NODE_KEY(v) ((v) + 0x200000)
@@ -969,7 +1140,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (tg == TAG_TOP) {
                 if (tv == 0 || tv >= ctx->heap_pos || top_live[tv]) continue;
                 top_live[tv] = 1;
-                u32 ar = dot_term_arity(tt);
+                u32 ar = dot_term_arity(ctx, tt);
                 for (u32 i = 0; i < ar; i++) {
                     u64 p = tv + i;
                     if (p < ctx->heap_pos && (!seen_slot || !seen_slot[p])) {
@@ -996,7 +1167,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 }
                 continue;
             }
-            u32 ar = dot_term_arity(tt);
+            u32 ar = dot_term_arity(ctx, tt);
             for (u32 i = 0; i < ar; i++) {
                 u64 p = tv + i;
                 if (p < ctx->heap_pos && (!seen_slot || !seen_slot[p])) {
@@ -1049,7 +1220,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             Term _pp = ctx->heap[_hh]; \
             if (term_tag(_pp) == (_ptag) && term_val(_pp) == (_dloc)) { _has = 1; break; } \
             u64 _pl = term_val(_pp); \
-            u32 _pa = dot_term_arity(_pp); \
+            u32 _pa = dot_term_arity(ctx, _pp); \
             if (_pa == 0 || _pl == 0 || _pl + _pa > ctx->heap_pos) continue; \
             for (u32 _pi = 0; _pi < _pa; _pi++) { \
                 Term _ch = heap_read(ctx, _pl + _pi); \
@@ -1074,10 +1245,18 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             } \
             if (!NODE_SEEN(_cur + 0x180000)) { \
                 NODE_MARK(_cur + 0x180000); \
-                if (!DUP_PORT_HAS_VISIBLE_CONSUMER(_cur, TAG_DP0)) \
-                    fprintf(f, "  dup%llu -> dup%llu [label=\"dp0\",style=dotted,color=\"#999999\"];\n", (unsigned long long)_cur, (unsigned long long)_cur); \
-                if (!DUP_PORT_HAS_VISIBLE_CONSUMER(_cur, TAG_DP1)) \
-                    fprintf(f, "  dup%llu -> dup%llu [label=\"dp1\",style=dotted,color=\"#999999\"];\n", (unsigned long long)_cur, (unsigned long long)_cur); \
+                if (!DUP_PORT_HAS_VISIBLE_CONSUMER(_cur, TAG_DP0)) { \
+                    fprintf(f, "  freedup%llu_0 [label=\"\",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor=\"#ffffff\",color=\"#888888\",fontsize=1];\n", \
+                            (unsigned long long)_cur); \
+                    fprintf(f, "  dup%llu -> freedup%llu_0 [label=\"dp0\",style=dotted,color=\"#999999\"];\n", \
+                            (unsigned long long)_cur, (unsigned long long)_cur); \
+                } \
+                if (!DUP_PORT_HAS_VISIBLE_CONSUMER(_cur, TAG_DP1)) { \
+                    fprintf(f, "  freedup%llu_1 [label=\"\",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor=\"#ffffff\",color=\"#888888\",fontsize=1];\n", \
+                            (unsigned long long)_cur); \
+                    fprintf(f, "  dup%llu -> freedup%llu_1 [label=\"dp1\",style=dotted,color=\"#999999\"];\n", \
+                            (unsigned long long)_cur, (unsigned long long)_cur); \
+                } \
             } \
             Term _shared = heap_read(ctx, _cur); \
             u8 _stag = term_tag(_shared); \
@@ -1195,7 +1374,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             } else if (dot_visible_heap_loc_tag(_pt)) { \
                 if (_pv == 0 || _pv >= ctx->heap_pos || !LOC_LIVE(_pv)) continue; \
             } \
-            u32 _pa = dot_term_arity(_pp); \
+            u32 _pa = dot_term_arity(ctx, _pp); \
             u64 _pl = term_val(_pp); \
             if (_pa == 0 || _pl == 0 || _pl + _pa > ctx->heap_pos) continue; \
             for (u32 _pi = 0; _pi < _pa; _pi++) { \
@@ -1204,7 +1383,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         } \
         for (u32 _di = 0; _di < ctx->def_count && !_hasp; _di++) { \
             Term _pp = ctx->defs[_di]; \
-            u32 _pa = dot_term_arity(_pp); \
+            u32 _pa = dot_term_arity(ctx, _pp); \
             u64 _pl = term_val(_pp); \
             if (_pa == 0 || _pl == 0 || _pl + _pa > ctx->heap_pos) continue; \
             for (u32 _pi = 0; _pi < _pa; _pi++) { \
@@ -1259,8 +1438,10 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     })
     #define EMIT_VAR_SOURCE_TO_VAR(var_term, var_loc, edge_hl) do { \
         (void)(var_term); \
+        if (!layers.semantic) break; \
         int _edge_hl = (edge_hl) || (heap_dot_hl_on && heap_dot_hl_slot == (var_loc) && \
                          term_tag(heap_dot_hl_term) == TAG_VAR && term_val(heap_dot_hl_term) == (var_loc)); \
+        if ((var_loc) < ctx->heap_pos && var_source_emitted && var_source_emitted[(var_loc)]) break; \
         u64 _cell = (var_loc); \
         Term _rv = (_cell < ctx->heap_pos) ? heap_read(ctx, _cell) : term_era(); \
         for (u32 _k = 0; _k < 16 && term_tag(_rv) == TAG_VAR; _k++) { \
@@ -1372,6 +1553,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             } \
             (void)_bound; \
         } \
+        if ((var_loc) < ctx->heap_pos && var_source_emitted) var_source_emitted[(var_loc)] = 1; \
     } while(0)
     #define EMIT_VAR_OR_RESOLVED_TO_NODE(var_term, var_loc, dst_loc, elbl, edge_hl) do { \
         int _var_src_hl = heap_dot_hl_on && heap_dot_hl_slot == (var_loc) && \
@@ -1489,8 +1671,13 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             }
             if (ext == UOP_KERNEL) {
                 u32 kop = thvm_kernel_root_uop(ctx, t);
-                char op_label[32] = "NULL";
-                if (kop < UOP_COUNT) snprintf(op_label, sizeof(op_label), "%s", uop_names[kop]);
+                KernelEntry ke_tmp;
+                KernelEntry *dot_ke = NULL;
+                u32 dot_kid = ~0u;
+                int have_ke = dot_kernel_entry_for_term(ctx, t, &ke_tmp, &dot_ke, &dot_kid);
+                char op_label[96] = "NULL";
+                if (have_ke) dot_kernel_ops_summary(dot_ke, kop, op_label, sizeof(op_label));
+                else if (kop < UOP_COUNT) snprintf(op_label, sizeof(op_label), "%s", uop_names[kop]);
                 else if (kop == UOP_COUNT) snprintf(op_label, sizeof(op_label), "SEQ");
                 if (kop == UOP_COUNT) {
                     if (has_shape)
@@ -1500,16 +1687,13 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                         snprintf(label,sizeof(label),"SEQ\\n@%llu",
                                  (unsigned long long)val);
                 } else {
-                    u32 kid = 0;
-                    if (thvm_kernel_lookup_kid(val, &kid)) {
-                        extern KernelEntry sched_kernels[];
-                        KernelEntry *ke = &sched_kernels[kid];
+                    if (have_ke && dot_kid != ~0u) {
                         if (has_shape)
                             snprintf(label,sizeof(label),"KERNEL\\n%s\\n#%u %s\\n[%s]\\n@%llu",
-                                     op_label, kid, dot_kernel_backend(ctx, ke), sh, (unsigned long long)val);
+                                     op_label, dot_kid, dot_kernel_backend(ctx, dot_ke), sh, (unsigned long long)val);
                         else
                             snprintf(label,sizeof(label),"KERNEL\\n%s\\n#%u %s\\n@%llu",
-                                     op_label, kid, dot_kernel_backend(ctx, ke), (unsigned long long)val);
+                                     op_label, dot_kid, dot_kernel_backend(ctx, dot_ke), (unsigned long long)val);
                     } else if (has_shape) {
                         snprintf(label,sizeof(label),"KERNEL\\n%s\\n[%s]\\n@%llu",
                                  op_label, sh, (unsigned long long)val);
@@ -1550,22 +1734,10 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 if (ext == UOP_FUSE) {
                     snprintf(label, sizeof(label), "%s\\n@%llu",
                              opn, (unsigned long long)val);
-                } else if (ext == UOP_FUSE2) {
-                    char op_label[32] = "?";
-                    Term op_term = heap_read(ctx, val + 0);
-                    if (term_tag(op_term) == TAG_NUM) {
-                        u32 fop = term_as_u32(op_term);
-                        if (fop < UOP_COUNT) snprintf(op_label, sizeof(op_label), "%s", uop_names[fop]);
-                        else if (fop == UOP_COUNT) snprintf(op_label, sizeof(op_label), "SEQ");
-                        else snprintf(op_label, sizeof(op_label), "%u", fop);
-                    }
-                    snprintf(label, sizeof(label), "%s\\n%s\\n@%llu",
-                             opn, op_label, (unsigned long long)val);
                 } else {
                 // Pure combinators (IFZ, DETACH, etc.) don't carry tensor shapes
                     int is_combinator = (ext == UOP_IFZ || ext == UOP_DETACH ||
-                                         ext == UOP_LOG_PRINT || ext == UOP_FUSE ||
-                                         ext == UOP_FUSE2);
+                                        ext == UOP_LOG_PRINT || ext == UOP_FUSE);
                     if (is_combinator || !has_shape)
                         snprintf(label, sizeof(label), "%s\\n@%llu", opn, (unsigned long long)val);
                     else
@@ -1580,18 +1752,23 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             fprintf(f, "  n%llu [label=\"%s\", shape=%s, fillcolor=\"%s\"%s];\n", val, label, nshape, color, NODE_HL_ATTRS(val));
 
             // Child edges: GRAD has 2 heap ports (y + gy). target pattern is metadata.
+            KernelEntry ke_tmp;
+            KernelEntry *dot_ke = NULL;
+            u32 dot_kid = ~0u;
+            int monolithic_kernel = (ext == UOP_KERNEL && thvm_kernel_is_monolithic(ctx, t));
+            int have_ke = (ext == UOP_KERNEL)
+                        ? dot_kernel_entry_for_term(ctx, t, &ke_tmp, &dot_ke, &dot_kid)
+                        : 0;
             u32 arity = 2;
             if (ext == UOP_GRAD) arity = 2;
             else if (ext == UOP_WHERE || ext == UOP_IFZ) arity = 3;
-            else if (ext == UOP_KERNEL) arity = 2;
+            else if (ext == UOP_KERNEL) arity = monolithic_kernel ? 0 : 2;
             else if (ext == UOP_EXEC) arity = 2;  // kid + deps (flags hidden)
             else if (ext == UOP_FUSE) arity = 1;
-            else if (ext == UOP_FUSE2) arity = 3;
             else if (ext == UOP_LOG_PRINT) arity = 1;
             else if (ext == UOP_DETACH) arity = 1;
             else if (!is_binary(ext) && is_elementwise(ext)) arity = 1;
-            u32 first_ai = (ext == UOP_FUSE2) ? 1 : 0;
-            for (u32 ai = first_ai; ai < arity; ai++) {
+            for (u32 ai = 0; ai < arity; ai++) {
                 Term child = heap_read(ctx, val + ai);
                 u64 cpos = val + ai;
                 u8 ctag = term_tag(child); u64 cval = term_val(child);
@@ -1611,7 +1788,6 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     else if (is_binary(kop)) elbl = ai==0 ? "a" : "b";
                     else elbl = ai==0 ? "in" : "";
                 }
-                else if (ext == UOP_FUSE2) elbl = ai==1 ? "a" : "b";
                 else if (ext == UOP_FUSE) elbl = "in";
                 else if (ext >= UOP_RESHAPE && ext <= UOP_PAD) elbl = ai==0 ? "in" : "shape";
                 else if (ext == UOP_SUM || ext == UOP_RMAX) elbl = ai==0 ? "in" : "axes";
@@ -1711,6 +1887,22 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                                          (unsigned long long)cpos, (unsigned long long)val, elbl);
                     else         fprintf(f, "  h%llu -> n%llu [label=\"%s\"];\n",
                                          (unsigned long long)cpos, (unsigned long long)val, elbl);
+                }
+            }
+            if (layers.semantic && ext == UOP_KERNEL && monolithic_kernel && have_ke) {
+                for (u32 li = 0; li < dot_ke->n_leaves; li++) {
+                    char leaf_lbl[48];
+                    dot_kernel_leaf_label(ctx, dot_ke, li, leaf_lbl, sizeof(leaf_lbl));
+                    if (dot_ke->leaf_kinds[li] == KERNEL_LEAF_TENSOR) {
+                        EMIT_TEN(dot_ke->leaf_ids[li]);
+                        fprintf(f, "  t%u -> n%llu [style=dashed,color=\"#009900\",fontcolor=\"#006600\",label=\"%s\"];\n",
+                                dot_ke->leaf_ids[li], (unsigned long long)val, leaf_lbl);
+                    } else if (dot_ke->leaf_kinds[li] == KERNEL_LEAF_NUM) {
+                        fprintf(f, "  nummono%llu_%u [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n",
+                                (unsigned long long)val, li, (double)dot_ke->leaf_nums[li]);
+                        fprintf(f, "  nummono%llu_%u -> n%llu [style=dashed,color=\"#009900\",fontcolor=\"#006600\",label=\"%s\"];\n",
+                                (unsigned long long)val, li, (unsigned long long)val, leaf_lbl);
+                    }
                 }
             }
             {
@@ -2031,6 +2223,13 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             fprintf(f, "  n%llu [label=\"%s\", shape=%s, fillcolor=\"%s\"];\n",
                     (unsigned long long)val, label, dot_heap_node_shape(tag), dot_heap_node_color(tag));
             if (tag == TAG_ALO && val + 1 < ctx->heap_pos) {
+                int book_hl = heap_dot_hl_on && (val + 0) == heap_dot_hl_slot;
+                int env_hl = heap_dot_hl_on && (val + 1) == heap_dot_hl_slot;
+                if (book_hl || env_hl) heap_dot_hl_hit = 1;
+                // Raw ALO slots: these are the actual heap cells at alo_loc+0/1.
+                dot_emit_raw_alo_slots(ctx, f, val, book_hl, env_hl);
+            }
+            if (layers.semantic && tag == TAG_ALO && val + 1 < ctx->heap_pos) {
                 Term book_term = heap_read(ctx, val + 0);
                 Term dyn_book = dot_book_to_dynamic_term(ctx, book_term);
                 char dst_id[64];
@@ -2055,7 +2254,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     // #endregion
                 }
             }
-            if (tag == TAG_ALO && val + 1 < ctx->heap_pos) {
+            if (layers.semantic && tag == TAG_ALO && val + 1 < ctx->heap_pos) {
                 Term alo_book_term = heap_read(ctx, val + 0);
                 Term sid_term = heap_read(ctx, val + 1);
                 if (term_tag(sid_term) == TAG_NUM) {
@@ -2163,7 +2362,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     }
                 }
             }
-            u32 ar = dot_term_arity(t);
+            u32 ar = dot_term_arity(ctx, t);
             for (u32 ai = 0; ai < ar; ai++) {
                 Term child = heap_read(ctx, val + ai);
                 u8 ctag = term_tag(child);
@@ -2502,7 +2701,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     #undef EMIT_FUSING_LEAF_CHILD
     #undef EMIT_TOP_NODE_LABEL
 
-    if (heap_dot_root_only && ctx->step_alo_subst_count > 0) {
+    if (layers.step && heap_dot_root_only && ctx->step_alo_subst_count > 0) {
         for (u32 si = 0; si < ctx->step_alo_subst_count; si++) {
             StepGraphAloSubst subst = ctx->step_alo_substs[si];
             if (subst.old_alo_loc == 0 || subst.out == 0) continue;
@@ -2572,6 +2771,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     fclose(f);
     free(dp_slot_emitted);
     free(ctr_children_emitted);
+    free(var_source_emitted);
     free(fusing_leaf_done);
     free(top_live);
     free(slot_live);

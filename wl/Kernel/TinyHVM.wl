@@ -403,6 +403,7 @@ thvmTraceClearFn = None;
 thvmTraceDataFn = None;
 thvmReduceStepsFn = None;
 thvmStepToNextVisibleFn = None;
+thvmKernelOpChainFn = None;
 thvmHeapReadFn = None;
 thvmHeapReadRangeFn = None;
 thvmHeapSnapshotFn = None;
@@ -578,6 +579,8 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
         {Integer, Integer, Integer}, Integer];
     thvmStepToNextVisibleFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmStepToNextVisible",
         {Integer, Integer, Integer}, Integer];
+    thvmKernelOpChainFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmKernelOpChain",
+        {Integer, Integer, Integer}, "UTF8String"];
 
     (* Heap introspection *)
     thvmHeapReadFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapRead",

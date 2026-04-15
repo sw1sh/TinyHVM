@@ -51,20 +51,12 @@ termKey[n_Association] := If[
 (* Walk the heap chain of nested KERNELs at args base `val`, returning the
    chained op label (e.g. "MUL+ADD"). Captured at walk time so renderers
    that consume a snapshot don't have to re-read mutated heap. *)
-kernelOpChainAt[val_Integer] := Module[{seen = <||>, parts = {}, walk, lim = 0},
-    walk[loc_] := Module[{n, op, child},
-        If[loc <= 0 || lim > 8 || KeyExistsQ[seen, loc], Return[Null, Module]];
-        seen[loc] = True; lim++;
-        n = Quiet@Check[THeapRead[loc + 2], <||>];
-        If[!AssociationQ[n] || n["Tag"] =!= "Num", Return[Null, Module]];
-        op = ToUpperCase[Lookup[$uopName, n["Val"], "?"]];
-        child = Quiet@Check[THeapRead[loc], <||>];
-        If[AssociationQ[child] && child["Tag"] === "Top" &&
-           Lookup[$uopName, child["Ext"], ""] === "Kernel",
-            walk[child["Val"]]];
-        AppendTo[parts, op]];
-    walk[val];
-    If[parts === {}, "", StringRiffle[parts, "+"]]];
+(* Chain comes from the cached KernelEntry's FusedOp[] (built lazily by
+   fuse_build_kernel for monolithic on-heap kernels). Same path dump.c uses,
+   exposed via thvm_kernel_op_chain. *)
+kernelOpChainAt[tagCode_Integer, ext_Integer, val_Integer] := Module[{s},
+    s = Quiet@Check[thvmKernelOpChainFn[tagCode, ext, val], ""];
+    If[StringQ[s], ToUpperCase[s], ""]];
 
 (* Infer shape of a compound term at heap base `val` by walking to first
    TEN leaf — also captured at walk time. *)
@@ -101,7 +93,7 @@ heapWalk[rootTerm_Association] := Module[
         derived = <||>;
         If[n["Tag"] === "Top" && IntegerQ[n["Val"]] && n["Val"] > 0,
             If[Lookup[$uopName, n["Ext"], ""] === "Kernel",
-                chain = kernelOpChainAt[n["Val"]];
+                chain = kernelOpChainAt[n["TagCode"], n["Ext"], n["Val"]];
                 If[StringQ[chain] && chain =!= "", derived["KernelOpChain"] = chain]];
             dims = inferShapeAt[n["Val"]];
             If[ListQ[dims] && Length[dims] > 0, derived["Shape"] = dims]];

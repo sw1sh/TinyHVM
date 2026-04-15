@@ -623,9 +623,8 @@ static int thvm_step_slot_is_rendered_parent_arg(TinyHVM *ctx, u64 slot) {
         u8 tag = term_tag(p);
         if (tag == TAG_TOP) {
             u64 loc = term_val(p);
-            u32 first_ai = term_ext(p) == UOP_FUSE2 ? 1 : 0;
             u32 arity = thvm_uop_visible_arity(term_ext(p));
-            for (u32 i = 0; i < arity; i++) if (loc + first_ai + i == slot) return 1;
+            for (u32 i = 0; i < arity; i++) if (loc + i == slot) return 1;
             continue;
         }
         if (tag == TAG_CTR) {
@@ -1136,7 +1135,7 @@ static int thvm_step_graph_highlight_from_before(TinyHVM *ctx, u64 source_slot, 
             return (*out_slot != 0 && *out_slot < ctx->heap_pos);
         if (thvm_step_top_has_add_zero_arg(ctx, before, out_slot, out_term))
             return (*out_slot != 0 && *out_slot < ctx->heap_pos);
-        *out_slot = loc + (term_ext(before) == UOP_FUSE2 ? 1 : 0);
+        *out_slot = loc;
         *out_term = heap_read(ctx, *out_slot);
         return (*out_slot != 0 && *out_slot < ctx->heap_pos);
     }
@@ -1595,12 +1594,12 @@ void thvm_step_graph_on_pre_interaction(TinyHVM *ctx, Term before) {
 
 // Post-interaction hook — called from TRACE_STEP in thvm_reduce_steps after
 // each fired interaction. Lazy-initializes the dump session on first call
-// when env is set.
+// when env is set. Updates phase1_root_slot's heap mirror so the dumper
+// sees the current root, and computes the correct source_slot via the
+// same helper structural_nf used.
 void thvm_step_graph_on_post_interaction(TinyHVM *ctx, Term before, Term root) {
-    if (!getenv("THVM_STEP_GRAPH")) return;
-    if (!step_graph_active) {
-        thvm_step_graph_eval_begin(ctx, root);
-        if (!step_graph_active) return;
-    }
-    thvm_step_graph_after_interaction(ctx, phase1_root_slot, before, root);
+    // Disabled: the in-reducer hook path can't maintain the root mirror
+    // reliably from deep reducer frames. The step-graph session now does
+    // its own budget-1 tracing loop in thvm_trace_step_graph_session.
+    (void)ctx; (void)before; (void)root;
 }

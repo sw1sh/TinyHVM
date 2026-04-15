@@ -977,13 +977,63 @@ static Term thvm_eval_reduce_fused(TinyHVM *ctx, Term t) {
 
 static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     phase1_root_slot = 0;
+    // Wrap in FUSE so the reducer actually fires compute-op interactions
+    // (ADD/MUL/etc. are WNF in phase-1 without a FUSE wrapper driving them).
+    u64 fuse_loc = heap_alloc(ctx, 1);
+    heap_set(ctx, fuse_loc, traced);
+    traced = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
     traced = thvm_phase1_seed_root_grad(ctx, traced);
-    // Per-interaction dumping now happens inside thvm_reduce via
-    // thvm_step_graph_on_{pre,post}_interaction hooks. Eval_begin is
-    // called lazily on first interaction; we still initialize eagerly
-    // here so the state_init snapshot is written before any reduction.
     thvm_step_graph_eval_begin(ctx, traced);
-    traced = thvm_reduce(ctx, traced);
+
+    // Per-interaction tracing loop: fire exactly one interaction via
+    // budget-1 reduce, then dump with the captured `before` redex.
+    // The budget forces the reducer to unwind to the outer root after
+    // each fired interaction, which is what the dumper's highlight logic
+    // expects. Replaces the old fire_one + structural_nf duo.
+    u32 max_guard = 100000;
+    for (u32 guard = 0; guard < max_guard; guard++) {
+        // Capture the next predicted redex for the step label, then fire.
+        Term predicted_before = traced;
+        thvm_phase1_predict_next_redex(ctx, traced, &predicted_before, NULL);
+        thvm_phase1_capture_step_before_meta(ctx, predicted_before);
+
+        struct InteractionTrace tr = {0};
+        struct InteractionTrace *saved_buf = ctx->trace_buf;
+        u32 saved_count = ctx->trace_count;
+        u32 saved_cap = ctx->trace_cap;
+        u8 saved_en = ctx->trace_enabled;
+        ctx->trace_buf = &tr;
+        ctx->trace_count = 0;
+        ctx->trace_cap = 1;
+        ctx->trace_enabled = 1;
+
+        u64 itrs_before = ctx->itrs;
+        Term result = thvm_reduce_steps(ctx, traced, 1);
+        int fired = (ctx->steps_taken > 0 && ctx->trace_count > 0) ||
+                    (ctx->itrs != itrs_before);
+
+        Term before = predicted_before;
+        if (ctx->trace_count > 0) {
+            Term traced_before = term_new((u8)tr.before_tag, tr.before_ext, tr.before_loc);
+            if (traced_before == predicted_before ||
+                (predicted_before == traced && traced_before != traced))
+                before = traced_before;
+        }
+
+        ctx->trace_buf = saved_buf;
+        ctx->trace_count = saved_count;
+        ctx->trace_cap = saved_cap;
+        ctx->trace_enabled = saved_en;
+
+        if (!fired) break;
+
+        traced = result;
+        if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
+            heap_set(ctx, phase1_root_slot, traced);
+        u64 src = thvm_phase1_graph_source_slot(ctx, phase1_root_slot, traced, before);
+        thvm_step_graph_after_interaction(ctx, src, before, traced);
+    }
+
     traced = reduce_net_quiesce(ctx, traced);
     thvm_step_graph_set_root(traced);
     thvm_step_graph_finalize(ctx);

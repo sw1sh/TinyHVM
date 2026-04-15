@@ -178,6 +178,259 @@ TInteractionGraph[t_TTerm, opts___?OptionQ] := Module[
     ]
 ];
 
+(* ── TDotGraph — dump.c-style renderer (boxed nodes, port labels, heap locs) ── *)
+
+(* Walk inner KERNEL→KERNEL chain to build "INNER+OUTER" op label. *)
+iDotKernelOpChain[val_Integer] := Module[{seen = <||>, parts = {}, walk, lim = 0},
+    walk[loc_] := Module[{n, op, child},
+        If[loc <= 0 || lim > 8 || KeyExistsQ[seen, loc], Return[Null, Module]];
+        seen[loc] = True; lim++;
+        n = Quiet@Check[THeapRead[loc + 2], <||>];
+        If[!AssociationQ[n] || n["Tag"] =!= "Num", Return[Null, Module]];
+        op = ToUpperCase[Lookup[$uopName, n["Val"], "?"]];
+        child = Quiet@Check[THeapRead[loc], <||>];
+        If[AssociationQ[child] && child["Tag"] === "Top" &&
+           Lookup[$uopName, child["Ext"], ""] === "Kernel",
+            walk[child["Val"]]];
+        AppendTo[parts, op]];
+    walk[val];
+    If[parts === {}, "", StringRiffle[parts, "+"]]];
+
+(* Infer shape of a compound term at heap base `val` by walking to first TEN leaf. *)
+iDotInferShape[val_Integer] := Module[{seen = <||>, go, dims},
+    go[loc_] := If[loc <= 0 || KeyExistsQ[seen, loc], None,
+        seen[loc] = True;
+        Module[{n = Quiet@Check[THeapRead[loc], None], arity, i, d},
+            If[!AssociationQ[n], Return[None, Module]];
+            Which[
+                n["Tag"] === "Ten",
+                    Quiet[TDimensions[TTensor[n["Val"]]]],
+                n["Tag"] === "Top",
+                    arity = uopArity[Lookup[$uopName, n["Ext"], "?"]];
+                    Do[d = go[n["Val"] + i];
+                       If[ListQ[d], Return[d, Module]],
+                       {i, 0, arity - 1}]; None,
+                KeyExistsQ[$heapTagArity, n["Tag"]] &&
+                    IntegerQ[$heapTagArity[n["Tag"]]],
+                    arity = $heapTagArity[n["Tag"]];
+                    Do[d = go[n["Val"] + i];
+                       If[ListQ[d], Return[d, Module]],
+                       {i, 0, arity - 1}]; None,
+                True, None]]];
+    dims = go[val];
+    If[ListQ[dims], dims, None]];
+
+(* Multi-line label for a graph node, matching dump.c's \n-separated fields. *)
+iDotLabelLines[tag_, ext_, val_, hloc_] := Switch[tag,
+    11,  (* TOP *)
+        Module[{uop = Lookup[$uopName, ext, "UOP" <> ToString[ext]],
+                opLine = Nothing, dimLine = Nothing, dims, chain},
+            If[uop === "Kernel" && IntegerQ[val] && val > 0,
+                chain = iDotKernelOpChain[val];
+                If[StringQ[chain] && chain =!= "", opLine = chain]];
+            If[uop =!= "Fuse",
+                dims = iDotInferShape[val];
+                If[ListQ[dims] && Length[dims] > 0,
+                    dimLine = "[" <> StringRiffle[ToString /@ dims, "\[Cross]"] <> "]"]];
+            DeleteCases[{ToUpperCase[uop], opLine, dimLine, "@" <> ToString[hloc]},
+                        Nothing]],
+    10,  (* TEN *)
+        Module[{tens = TTensor[val], dims, vv, dev, parts},
+            dims = Quiet[TDimensions[tens]];
+            dev  = Quiet[tens["Device"]];
+            vv = Quiet@Check[
+                Module[{v = Normal[TGet[tens]]},
+                    If[Length[Flatten[v]] <= 6,
+                        "vals=[" <> StringRiffle[
+                            ToString /@ Round[Flatten[v], 0.01], ","] <> "]",
+                        Nothing]],
+                Nothing];
+            parts = {"t" <> ToString[val]};
+            If[ListQ[dims],
+                AppendTo[parts, "[" <> StringRiffle[ToString /@ dims, "\[Cross]"] <> "]"]];
+            If[StringQ[dev], AppendTo[parts, "f32 " <> dev]];
+            If[StringQ[vv], AppendTo[parts, vv]];
+            parts],
+    7,  (* NUM *) {"NUM", ToString[ext]},
+    6,  (* ERA *) {"\[FilledSmallCircle]"},
+    _,  {ToUpperCase[Lookup[$tagName, tag, "?"]],
+         If[hloc > 0, "@" <> ToString[hloc], Nothing]}
+];
+
+(* Fill color for a node; dump.c palette with dark-mode variants. *)
+iDotFill[tag_, ext_] := Which[
+    tag == 10, RGBColor["#e0e0e0"],
+    tag ==  6, White,
+    tag == 11,
+        Module[{uop = Lookup[$uopName, ext, ""]},
+            Which[
+                uop === "Kernel",           RGBColor["#ccffcc"],
+                uop === "Fuse",             RGBColor["#f0f0f0"],
+                MemberQ[$viewOps, uop],     RGBColor["#fff3cd"],
+                MemberQ[$reduceOps, uop],   RGBColor["#d9edf7"],
+                True,                       RGBColor["#cce5ff"]
+            ]],
+    True, RGBColor["#f3f3f3"]
+];
+
+(* Port-label for the `argi`-th slot of a child (parent of an edge). *)
+iDotPortLabel[childTag_, childExt_, argi_] := If[childTag == 11,
+    uopPortName[Lookup[$uopName, childExt, ""], argi],
+    heapPortName[Lookup[$tagName, childTag, "?"], argi]
+];
+
+TDotGraph[t_TTensor, opts___?OptionQ] := TDotGraph[ToTTerm[t], opts];
+TDotGraph[t_TTerm,   opts___?OptionQ] := Module[
+    {walk, nodes, edges, keys, textColor, bg, lineFor, fillFor, vsf, gEdges, eLabels,
+     nextInfo, activeSlot = -1, activeKey = None, hlColor, eStyleRules,
+     vertexCoords = Automatic},
+    loadLibrary[];
+    walk   = heapWalk[rootTermOf[t]];
+    nodes  = walk["Nodes"];
+    edges  = walk["Edges"];
+
+    (* dump.c "out" free-slot above the root term. *)
+    Module[{rootKey = walk["Root"], freeKey = "free_out"},
+        If[StringQ[rootKey] && KeyExistsQ[nodes, rootKey],
+            nodes[freeKey] = <|"Tag" -> "Free", "TagCode" -> -1,
+                               "Ext" -> 0, "Val" -> 0, "Loc" -> 0,
+                               "Key" -> freeKey, "DisplayLoc" -> 0|>;
+            AppendTo[edges, <|"From" -> rootKey, "To" -> freeKey,
+                              "Port" -> "out", "FromSlot" -> 0|>]]];
+
+    keys = Keys[nodes];
+
+    (* Find next active pair. nextInfo = {found, sourceSlot, tag, ext}.
+       sourceSlot==0 means the root term itself is the active source; the
+       highlighted edge is then the one feeding the root's first arg. *)
+    nextInfo = Quiet@Check[thvmNextInteractionFn[termId[t]], {0, -1, -1, -1}];
+    If[ListQ[nextInfo] && Length[nextInfo] >= 4 && nextInfo[[1]] == 1,
+        activeSlot = nextInfo[[2]];
+        Module[{slot = nextInfo[[2]], tagC = nextInfo[[3]], extC = nextInfo[[4]]},
+            Do[With[{n = nodes[k]},
+                If[(slot > 0 && (n["Loc"] == slot || Lookup[n, "DisplayLoc", -2] == slot)) ||
+                   (slot <= 0 && n["TagCode"] == tagC && n["Ext"] == extC),
+                    activeKey = k; Break[]]],
+                {k, keys}]];
+        If[activeSlot <= 0 && activeKey =!= None,
+            activeSlot = nodes[activeKey]["Val"]]];
+    hlColor = RGBColor[0.85, 0.10, 0.10];
+
+    (* dump.c style: white bg, black text/edges. *)
+    textColor = GrayLevel[0.05];
+    bg        = White;
+
+    lineFor[k_] := With[{n = nodes[k]},
+        iDotLabelLines[n["TagCode"], n["Ext"], n["Val"],
+            Lookup[n, "DisplayLoc", n["Loc"]]]];
+    fillFor[k_] := With[{n = nodes[k]}, iDotFill[n["TagCode"], n["Ext"]]];
+
+    (* Per-tag geometric shape, mirroring dump.c's shape= attribute. *)
+    shapeFor[tag_String] := Switch[tag,
+        "Lam",  "Triangle",
+        "App",  "InvTriangle",
+        "Sup" | "Usp" | "Ctr", "Hexagon",
+        "Ref" | "Var", "Oval",
+        "Alo",  "Pentagon",
+        _,      "Box"
+    ];
+
+    shapePrim[shape_, pos_, sz_] := With[{w = sz[[1]], h = sz[[2]]},
+        Switch[shape,
+            "Triangle",    Polygon[{pos+{0,h}, pos+{-w,-h}, pos+{w,-h}}],
+            "InvTriangle", Polygon[{pos+{0,-h}, pos+{-w,h}, pos+{w,h}}],
+            "Hexagon",     Polygon[pos + # & /@ ({Cos[#], Sin[#]} & /@
+                               (Range[0, 5] 2 Pi/6 + Pi/6)) Transpose[{{w, w, w, w, w, w}, {h, h, h, h, h, h}}]],
+            "Oval",        Disk[pos, sz],
+            "Pentagon",    Polygon[pos + # & /@ ({Cos[#], Sin[#]} & /@
+                               (Range[0, 4] 2 Pi/5 + Pi/2)) Transpose[{{w, w, w, w, w}, {h, h, h, h, h}}]],
+            _,             Rectangle[pos - sz, pos + sz]
+        ]
+    ];
+
+    vsf[k_] := If[nodes[k]["Tag"] === "Free",
+        Function[{pos, name, sz},
+            Inset[Graphics[{GrayLevel[0.55], AbsoluteThickness[1.0],
+                            Circle[{0, 0}, 1]},
+                           ImageSize -> 14], pos, Center]],
+      With[{ls = lineFor[k], fill = fillFor[k]},
+        Function[{pos, name, sz},
+            Inset[
+                Framed[
+                    Column[
+                        Style[#, 11, FontFamily -> "Helvetica",
+                            FontColor -> GrayLevel[0.05]] & /@ ls,
+                        Alignment -> Center, Spacings -> 0.05],
+                    Background -> fill,
+                    FrameStyle -> Directive[GrayLevel[0.2], AbsoluteThickness[1.0]],
+                    FrameMargins -> 5,
+                    RoundingRadius -> 0],
+                pos, Center]
+        ]]];
+
+    gEdges = DirectedEdge[#["From"], #["To"], #["Port"] -> #["FromSlot"]] & /@ edges;
+    eLabels = Function[e, Module[{from = e[[1]], port = First[Last[e]],
+                                   slot = Last[Last[e]], srcTag},
+            srcTag = Lookup[nodes, from, <||>][["Tag"]];
+            e -> Placed[
+                Column[DeleteCases[{
+                    Style[port, 10, Bold, GrayLevel[0.05]],
+                    (* Only show @slot tail label for tensor sources (matches dump.c). *)
+                    If[slot > 0 && srcTag === "Ten",
+                        Style["@" <> ToString[slot], 7, Italic, GrayLevel[0.45]],
+                        Nothing]
+                }, Nothing], Alignment -> Center, Spacings -> 0.05],
+                {0.7, {0, 0}}]]] /@ gEdges;
+    (* Highlight only the single edge at the active source slot — matches dump.c. *)
+    eStyleRules = If[activeSlot < 0, {},
+        Cases[gEdges,
+            e:DirectedEdge[_, _, _ -> activeSlot] :>
+                (e -> Directive[hlColor, AbsoluteThickness[2.4], Arrowheads[0.035]])]];
+
+    (* Manual coords: y = longest path from leaf (root at top), x = slot per layer. *)
+    Module[{depth = <||>, layers, coords, sourcesOf, parentsOf, sources, queue, k0, d, maxD},
+        sourcesOf[v_] := Cases[edges, e_ /; e["To"] === v :> e["From"]];
+        parentsOf[v_] := Cases[edges, e_ /; e["From"] === v :> e["To"]];
+        Do[depth[k] = If[sourcesOf[k] === {}, 0, -1], {k, keys}];
+        sources = Select[keys, depth[#] == 0 &];
+        queue = sources;
+        While[queue =!= {},
+            k0 = First[queue]; queue = Rest[queue];
+            Do[
+                d = depth[k0] + 1;
+                If[d > depth[p], depth[p] = d; AppendTo[queue, p]],
+                {p, parentsOf[k0]}]];
+        maxD = Max[Values[depth]];
+        layers = GroupBy[keys, depth];
+        Module[{ySpacing = If[maxD <= 0, 1.0, Min[1.0, 4.0/maxD]]},
+            coords = Association@@Flatten@KeyValueMap[
+                Function[{lvl, ks},
+                    MapIndexed[#1 -> {(#2[[1]] - (Length[ks]+1)/2.) * 1.4,
+                                       lvl * ySpacing} &, ks]],
+                layers]];
+        vertexCoords = Normal[coords]];
+
+    Module[{xs = #[[2, 1]] & /@ vertexCoords,
+            ys = #[[2, 2]] & /@ vertexCoords,
+            pad = 1.0},
+        Graph[keys, gEdges,
+            VertexShapeFunction -> (# -> vsf[#] & /@ keys),
+            VertexSize   -> {0.55, 0.25},
+            VertexCoordinates -> vertexCoords,
+            EdgeLabels   -> eLabels,
+            EdgeStyle    -> Join[eStyleRules,
+                                 {Directive[Black, AbsoluteThickness[1.0], Arrowheads[0.025]]}],
+            PerformanceGoal -> "Quality",
+            PlotRange    -> {
+                {Min[xs] - pad, Max[xs] + pad},
+                {Min[ys] - 0.5, Max[ys] + 0.5}},
+            ImageSize    -> 460,
+            Background   -> White,
+            opts
+        ]
+    ]
+];
+
 (* ── Profile data ───────────────────────────────────────────────────────── *)
 
 TProfileEnable[] := (loadLibrary[]; thvmProfileEnableFn[]);

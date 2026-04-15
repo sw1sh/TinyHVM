@@ -1420,20 +1420,23 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
     char shown_name[160] = {0};
     u64 shown_source_slot = source_slot;
     Term shown_before = before;
-    int have_prev_hl = thvm_step_graph_highlight_from_before(ctx, source_slot, before, &hs, &ht);
+    // Highlight the NEXT interaction (forward-looking): the snapshot is
+    // the post-fire state, so the edge of the redex about to fire still
+    // exists. Prev (what just fired) is by definition consumed and often
+    // can't be drawn — use it only as a fallback for terminal snapshots.
     int have_next = thvm_step_graph_find_next_interaction(ctx, &next_hs, &next_ht, &next_source_slot, &next_before);
-    if (!have_prev_hl) {
-        if (thvm_step_graph_prefer_kernel_child_fuse(ctx, source_slot, before,
+    int have_prev_hl = 0;
+    if (have_next) {
+        hs = next_hs;
+        ht = next_ht;
+        shown_source_slot = next_source_slot;
+        shown_before = next_before;
+        have_prev_hl = 1;
+    } else {
+        have_prev_hl = thvm_step_graph_highlight_from_before(ctx, source_slot, before, &hs, &ht);
+        if (!have_prev_hl &&
+            thvm_step_graph_prefer_kernel_child_fuse(ctx, source_slot, before,
                                                      &hs, &ht, &shown_source_slot, &shown_before)) {
-            have_prev_hl = 1;
-        }
-    }
-    if (!have_prev_hl) {
-        if (have_next) {
-            hs = next_hs;
-            ht = next_ht;
-            shown_source_slot = next_source_slot;
-            shown_before = next_before;
             have_prev_hl = 1;
         }
     }
@@ -1442,19 +1445,6 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
     heap_dot_root_only = 1;
     thvm_heap_dot_root(ctx, tmp, root);
     heap_dot_root_only = 0;
-    if (!thvm_heap_dot_highlight_was_drawn() || !thvm_file_has_substr(tmp, "#cc0000")) {
-        if (have_next) {
-            thvm_heap_dot_set_highlight(next_hs, next_ht);
-            thvm_heap_dot_set_step_meta("pending", "pending");
-            heap_dot_root_only = 1;
-            thvm_heap_dot_root(ctx, tmp, root);
-            heap_dot_root_only = 0;
-            hs = next_hs;
-            ht = next_ht;
-            shown_source_slot = next_source_slot;
-            shown_before = next_before;
-        }
-    }
     // Edge highlight is the only acceptable highlight for step graphs.
     // If it couldn't be drawn, leave the snapshot un-highlighted rather
     // than falling back to a node-highlight (which looks like a different

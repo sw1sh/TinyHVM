@@ -1483,15 +1483,9 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
     }
     int rendered_highlight = thvm_heap_dot_highlight_was_drawn() && thvm_file_has_substr(tmp, "#cc0000");
     if (!rendered_highlight) {
-        remove(tmp);
-        step_graph_last_sig = sig;
-        step_graph_last_dot_sig = dot_sig;
-        step_graph_before_grad_y = 0;
-        step_graph_before_era_payload = 0;
-        step_graph_before_top_had_era = 0;
-        step_graph_before_top_had_add_zero = 0;
-        thvm_step_alo_substs_clear(ctx);
-        return;
+        // Highlight couldn't be drawn (pre-fire slot already mutated). Keep
+        // the snapshot anyway with no highlight so the step isn't dropped —
+        // the shown_name still captures what just fired.
     }
     thvm_step_graph_display_name(ctx, shown_source_slot, shown_before, hs, ht,
                                  shown_name, sizeof(shown_name));

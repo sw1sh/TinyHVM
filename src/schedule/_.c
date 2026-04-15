@@ -987,52 +987,138 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
 
     // Per-interaction tracing loop: fire exactly one interaction via
     // budget-1 reduce, then dump with the captured `before` redex.
-    // The budget forces the reducer to unwind to the outer root after
-    // each fired interaction, which is what the dumper's highlight logic
-    // expects. Replaces the old fire_one + structural_nf duo.
+    // Fires interactions in priority order: root term first, then
+    // heap-resident agents, then predictor-fallback for edge cases.
+    size_t reach_cap = (size_t)ctx->heap_pos;
+    u8 *reach = (u8 *)calloc(reach_cap ? reach_cap : 1, 1);
     u32 max_guard = 100000;
     for (u32 guard = 0; guard < max_guard; guard++) {
-        // Capture the next predicted redex for the step label, then fire.
-        Term predicted_before = traced;
-        thvm_phase1_predict_next_redex(ctx, traced, &predicted_before, NULL);
-        thvm_phase1_capture_step_before_meta(ctx, predicted_before);
+        if ((size_t)ctx->heap_pos > reach_cap) {
+            size_t new_cap = (size_t)ctx->heap_pos;
+            u8 *new_reach = (u8 *)realloc(reach, new_cap);
+            if (!new_reach) break;
+            memset(new_reach + reach_cap, 0, new_cap - reach_cap);
+            reach = new_reach;
+            reach_cap = new_cap;
+        }
+        int fired = 0;
 
-        struct InteractionTrace tr = {0};
-        struct InteractionTrace *saved_buf = ctx->trace_buf;
-        u32 saved_count = ctx->trace_count;
-        u32 saved_cap = ctx->trace_cap;
-        u8 saved_en = ctx->trace_enabled;
-        ctx->trace_buf = &tr;
-        ctx->trace_count = 0;
-        ctx->trace_cap = 1;
-        ctx->trace_enabled = 1;
+        // ── Root-driven attempt: reduce the visible root for one step. ──
+        {
+            Term predicted_before = traced;
+            thvm_phase1_predict_next_redex(ctx, traced, &predicted_before, NULL);
+            thvm_phase1_capture_step_before_meta(ctx, predicted_before);
 
-        u64 itrs_before = ctx->itrs;
-        Term result = thvm_reduce_steps(ctx, traced, 1);
-        int fired = (ctx->steps_taken > 0 && ctx->trace_count > 0) ||
-                    (ctx->itrs != itrs_before);
+            struct InteractionTrace tr = {0};
+            struct InteractionTrace *saved_buf = ctx->trace_buf;
+            u32 saved_count = ctx->trace_count;
+            u32 saved_cap = ctx->trace_cap;
+            u8 saved_en = ctx->trace_enabled;
+            ctx->trace_buf = &tr;
+            ctx->trace_count = 0;
+            ctx->trace_cap = 1;
+            ctx->trace_enabled = 1;
 
-        Term before = predicted_before;
-        if (ctx->trace_count > 0) {
-            Term traced_before = term_new((u8)tr.before_tag, tr.before_ext, tr.before_loc);
-            if (traced_before == predicted_before ||
-                (predicted_before == traced && traced_before != traced))
-                before = traced_before;
+            u64 itrs_before = ctx->itrs;
+            Term result = thvm_reduce_steps(ctx, traced, 1);
+            int did_fire = (ctx->steps_taken > 0 && ctx->trace_count > 0) ||
+                           (ctx->itrs != itrs_before);
+
+            Term before = predicted_before;
+            if (ctx->trace_count > 0) {
+                Term traced_before = term_new((u8)tr.before_tag, tr.before_ext, tr.before_loc);
+                if (traced_before == predicted_before ||
+                    (predicted_before == traced && traced_before != traced))
+                    before = traced_before;
+            }
+
+            ctx->trace_buf = saved_buf;
+            ctx->trace_count = saved_count;
+            ctx->trace_cap = saved_cap;
+            ctx->trace_enabled = saved_en;
+
+            if (did_fire) {
+                traced = result;
+                if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
+                    heap_set(ctx, phase1_root_slot, traced);
+                u64 src = thvm_phase1_graph_source_slot(ctx, phase1_root_slot, traced, before);
+                thvm_step_graph_after_interaction(ctx, src, before, traced);
+                fired = 1;
+                continue;
+            }
         }
 
-        ctx->trace_buf = saved_buf;
-        ctx->trace_count = saved_count;
-        ctx->trace_cap = saved_cap;
-        ctx->trace_enabled = saved_en;
+        // Stop once the visible root has hit a terminal tag — remaining
+        // administrative reductions fire silently after the loop ends.
+        if (phase1_trace_root_is_terminal(ctx, traced)) break;
+
+        // ── Heap sweep: fire on reachable heap-resident agents. ──
+        phase1_mark_reachable_slots(ctx, traced, reach);
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            if (h == phase1_root_slot) continue;
+            if (phase1_slot_is_local_assign_target(ctx, h)) continue;
+            Term ht = ctx->heap[h];
+            int reachable = !(reach && !reach[h]);
+            if (!reachable && !phase1_term_needs_global_cleanup(ctx, ht)) continue;
+            if (!phase1_term_maybe_active(ctx, ht)) continue;
+            if ((term_tag(ht) == TAG_DP0 || term_tag(ht) == TAG_DP1) &&
+                reachable &&
+                !phase1_term_first_reachable_occurrence(ctx, h, ht, reach))
+                continue;
+            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD &&
+                reachable &&
+                !phase1_term_first_reachable_occurrence(ctx, h, ht, reach))
+                continue;
+
+            Term predicted_before = ht;
+            thvm_phase1_predict_next_redex(ctx, ht, &predicted_before, NULL);
+            thvm_phase1_capture_step_before_meta(ctx, predicted_before);
+
+            struct InteractionTrace tr = {0};
+            struct InteractionTrace *saved_buf = ctx->trace_buf;
+            u32 saved_count = ctx->trace_count;
+            u32 saved_cap = ctx->trace_cap;
+            u8 saved_en = ctx->trace_enabled;
+            ctx->trace_buf = &tr;
+            ctx->trace_count = 0;
+            ctx->trace_cap = 1;
+            ctx->trace_enabled = 1;
+
+            u64 itrs_before = ctx->itrs;
+            Term hr = thvm_reduce_steps(ctx, ht, 1);
+            int did_fire = (ctx->steps_taken > 0 && ctx->trace_count > 0) ||
+                           (ctx->itrs != itrs_before);
+            Term before_h = predicted_before;
+            if (ctx->trace_count > 0) {
+                Term tb = term_new((u8)tr.before_tag, tr.before_ext, tr.before_loc);
+                if (tb == predicted_before ||
+                    (predicted_before == ht && tb != ht))
+                    before_h = tb;
+            }
+            ctx->trace_buf = saved_buf;
+            ctx->trace_count = saved_count;
+            ctx->trace_cap = saved_cap;
+            ctx->trace_enabled = saved_en;
+
+            if (!did_fire) continue;
+
+            u64 graph_src = thvm_phase1_graph_source_slot(ctx, h, ht, before_h);
+            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD) {
+                for (u64 i = 1; i < ctx->heap_pos; i++)
+                    if (ctx->heap[i] == ht) ctx->heap[i] = hr;
+            } else {
+                ctx->heap[h] = hr;
+            }
+            if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
+                heap_set(ctx, phase1_root_slot, traced);
+            thvm_step_graph_after_interaction(ctx, graph_src, before_h, traced);
+            fired = 1;
+            break;
+        }
 
         if (!fired) break;
-
-        traced = result;
-        if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
-            heap_set(ctx, phase1_root_slot, traced);
-        u64 src = thvm_phase1_graph_source_slot(ctx, phase1_root_slot, traced, before);
-        thvm_step_graph_after_interaction(ctx, src, before, traced);
     }
+    free(reach);
 
     traced = reduce_net_quiesce(ctx, traced);
     thvm_step_graph_set_root(traced);

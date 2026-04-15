@@ -1584,3 +1584,23 @@ static void thvm_step_graph_finalize(TinyHVM *ctx) {
     step_graph_last_file[0] = '\0';
     step_graph_n = 0;
 }
+
+// Pre-interaction hook — called from thvm_interact entry. Reads BEFORE
+// metadata from live heap (GRAD y, ERA payload, TOP era/add-zero args)
+// while the interaction hasn't fired yet.
+void thvm_step_graph_on_pre_interaction(TinyHVM *ctx, Term before) {
+    if (!getenv("THVM_STEP_GRAPH") || !step_graph_active) return;
+    thvm_phase1_capture_step_before_meta(ctx, before);
+}
+
+// Post-interaction hook — called from TRACE_STEP in thvm_reduce_steps after
+// each fired interaction. Lazy-initializes the dump session on first call
+// when env is set.
+void thvm_step_graph_on_post_interaction(TinyHVM *ctx, Term before, Term root) {
+    if (!getenv("THVM_STEP_GRAPH")) return;
+    if (!step_graph_active) {
+        thvm_step_graph_eval_begin(ctx, root);
+        if (!step_graph_active) return;
+    }
+    thvm_step_graph_after_interaction(ctx, phase1_root_slot, before, root);
+}

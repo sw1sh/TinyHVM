@@ -24,7 +24,6 @@ static inline int uop_allocates_fresh(u32 uop) {
         case UOP_DETACH:
         case UOP_KERNEL:
         case UOP_FUSE:
-        case UOP_FUSE2:
             return 0;  // returns sub-terms / passthrough, not a fresh tensor
         default:
             return 1;  // compute ops: ADD, SUB, MUL, MM, SUM, etc.
@@ -56,8 +55,7 @@ static inline int reduce_term_is_active_era_like(TinyHVM *ctx, Term t, Term *era
 static inline int reduce_top_has_era_arg(TinyHVM *ctx, Term t) {
     if (term_tag(t) != TAG_TOP) return 0;
     u32 uop = term_ext(t);
-    // FUSE2 uses ERA intentionally for unary ops — not an erasure case.
-    if (uop == UOP_FUSE2 || uop == UOP_FUSE) return 0;
+    if (uop == UOP_FUSE) return 0;
     u64 loc = term_val(t);
     u32 arity = reduce_top_arity(uop);
     for (u32 i = 0; i < arity; i++) {
@@ -80,7 +78,6 @@ static inline int reduce_fuse_payload_top_ready(u32 uop) {
     return uop == UOP_ASSIGN ||
            uop == UOP_KERNEL ||
            uop == UOP_FUSE ||
-           uop == UOP_FUSE2 ||
            is_binary(uop) ||
            is_elementwise(uop) ||
            uop == UOP_SUM ||
@@ -109,7 +106,12 @@ static inline int reduce_top_direct_uop(u32 uop) {
            uop == UOP_DETACH ||
            uop == UOP_WHERE ||
            uop == UOP_KERNEL ||
-           uop == UOP_FUSE || uop == UOP_FUSE2;
+           uop == UOP_FUSE;
+}
+
+static inline int reduce_top_direct_uop_ctx(TinyHVM *ctx, u32 uop) {
+    (void)ctx;
+    return reduce_top_direct_uop(uop);
 }
 
 static inline u32 reduce_net_term_arity(Term t) {
@@ -229,7 +231,7 @@ static int reduce_net_term_first_reachable_occurrence(TinyHVM *ctx, u64 h, Term 
 static int reduce_net_term_maybe_active(TinyHVM *ctx, Term t) {
     u8 tag = term_tag(t);
     if (tag == TAG_TOP) {
-        return reduce_top_direct_uop(term_ext(t)) ||
+        return reduce_top_direct_uop_ctx(ctx, term_ext(t)) ||
                reduce_top_has_era_arg(ctx, t) ||
                reduce_top_has_add_zero_arg(ctx, t);
     }
@@ -238,6 +240,19 @@ static int reduce_net_term_maybe_active(TinyHVM *ctx, Term t) {
         tag == TAG_BRI || tag == TAG_MAT || tag == TAG_ANY || tag == TAG_USP)
         return 0;
     return 1;
+}
+
+static inline int reduce_parent_waits_on_settled_kernel(TinyHVM *ctx, int sp, Term *stk, Term t) {
+    if (!ctx || sp <= 0 || term_tag(t) != TAG_TOP || term_ext(t) != UOP_KERNEL)
+        return 0;
+    if (!thvm_kernel_is_monolithic(ctx, t))
+        return 0;
+    Term frame = stk[sp - 1];
+    u8 ftag = term_tag(frame);
+    if ((ftag == TAG_TOP || ftag == TAG_TOP1 || ftag == TAG_TOP2) &&
+        term_ext(frame) == UOP_KERNEL)
+        return 1;
+    return 0;
 }
 
 static int reduce_net_fire_one(TinyHVM *ctx, Term in, Term *out_term) {
@@ -325,7 +340,9 @@ static void top_decref_inputs(TinyHVM *ctx, u64 loc, u32 uop, Term result) {
 static _Thread_local Term reduce_pool[REDUCE_SLICE * REDUCE_MAX_DEPTH];
 static _Thread_local int  reduce_depth = 0;
 
-Term thvm_reduce(TinyHVM *ctx, Term root) {
+Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
+    ctx->step_budget = max_steps;
+    ctx->steps_taken = 0;
     int depth = reduce_depth++;
     if (depth >= REDUCE_MAX_DEPTH) {
         fprintf(stderr, "REDUCE_OVERFLOW: depth=%d tag=%u ext=%u\n", depth, term_tag(root), term_ext(root));
@@ -351,7 +368,9 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             _tr->after_loc = term_val(result); \
             _tr->rule_id = term_tag(before); \
         } \
-        if (ctx->step_budget > 0 && ++ctx->steps_taken >= ctx->step_budget) { \
+        ctx->steps_taken++; \
+        thvm_step_graph_on_post_interaction(ctx, (before), (result)); \
+        if (ctx->step_budget > 0 && ctx->steps_taken >= ctx->step_budget) { \
             budget_exhausted = 1; \
             whnf = (result); \
             goto apply; \
@@ -388,25 +407,15 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             if (app_loc != 0 && app_loc < ctx->heap_pos && heap_read(ctx, app_loc + 0) == next)
                 top_forced_by_app = 1;
         }
+        if (reduce_parent_waits_on_settled_kernel(ctx, sp, stk, next)) {
+            whnf = next; goto apply;
+        }
         if (top_forced_by_app) {
             u64 loc = term_val(next);
             Term a0 = heap_read(ctx, loc + 0);
             PUSH(next);
             next = a0;
             goto enter;
-        }
-        if (ctx->step_graph_local_fuse && _uop == UOP_FUSE) {
-            u64 loc = term_val(next);
-            Term a0 = heap_read(ctx, loc + 0);
-            if (reduce_fuse_payload_ready(a0)) {
-                if (BUDGET_HIT()) { whnf = next; goto apply; }
-                Term r = thvm_interact(ctx, next);
-                if (r != next) {
-                    TRACE_STEP(next, r);
-                    next = r;
-                    goto enter;
-                }
-            }
         }
         if (_uop == UOP_DETACH) {
             if (BUDGET_HIT()) { whnf = next; goto apply; }
@@ -424,7 +433,7 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             next = r;
             goto enter;
         }
-        if (!reduce_top_direct_uop(_uop)) {
+        if (!reduce_top_direct_uop_ctx(ctx, _uop)) {
             whnf = next; goto apply;
         }
         // Non-compute: reduce args then fire interact
@@ -502,10 +511,13 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 (term_tag(whnf) == TAG_VAR && frame_uop == UOP_DETACH) ||
                 (frame_uop == UOP_FUSE &&
                  reduce_fuse_payload_ready(whnf)) ||
-                // UOP_FUSE2 accepts most WNF payloads, but NOT DP0/DP1 —
+                // UOP_KERNEL accepts most WNF payloads, but NOT DP0/DP1 —
                 // those must be resolved by reducer first.
-                ((frame_uop == UOP_FUSE2 || frame_uop == UOP_KERNEL) &&
+                (frame_uop == UOP_KERNEL &&
                  term_tag(whnf) != TAG_DP0 && term_tag(whnf) != TAG_DP1);
+            if (frame_uop == UOP_KERNEL &&
+                term_tag(whnf) == TAG_TOP && term_ext(whnf) == UOP_KERNEL)
+                arg0_ready = thvm_kernel_local_child_ready(ctx, whnf);
             if (!arg0_ready) {
                 heap_set(ctx, loc+0, whnf); whnf = frame; continue;
             }
@@ -550,7 +562,11 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
 
             // Any WNF in arg1 slot is "ready"
             if (a1t2 == TAG_TEN || a1t2 == TAG_ERA || a1t2 == TAG_NUM ||
-                a1t2 == TAG_LAM || a1t2 == TAG_SUP) {
+                a1t2 == TAG_LAM || a1t2 == TAG_SUP ||
+                (frame_uop == UOP_KERNEL &&
+                 (a1t2 == TAG_ANY ||
+                  (a1t2 == TAG_TOP && term_ext(a1) == UOP_KERNEL &&
+                   thvm_kernel_local_child_ready(ctx, a1))))) {
                 // Both args ready — fire
                 if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
@@ -579,13 +595,15 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
             u32 _uop1 = term_ext(frame);
             int _arg1_ok = (w1t == TAG_TEN || w1t == TAG_ERA || w1t == TAG_NUM ||
                             w1t == TAG_LAM || w1t == TAG_SUP);
-            // FUSE2: also accept TAG_TOP (ASSIGN, KERNEL, etc.) and TAG_SEQ
-            // as valid children. BUT NOT UOP_FUSE/UOP_FUSE2 — those must be
+            // KERNEL also accepts TAG_TOP (ASSIGN, KERNEL, etc.) and TAG_SEQ
+            // as valid children. BUT NOT UOP_FUSE — that must be
             // reduced first (they resolve to TEN/KERNEL/ASSIGN).
-            if (_uop1 == UOP_FUSE2 || _uop1 == UOP_KERNEL)
-                _arg1_ok = _arg1_ok || w1t == TAG_SEQ || w1t == TAG_CTR ||
-                           (w1t == TAG_TOP && term_ext(whnf) != UOP_FUSE &&
-                            term_ext(whnf) != UOP_FUSE2);
+            if (_uop1 == UOP_KERNEL)
+                _arg1_ok = _arg1_ok || w1t == TAG_SEQ || w1t == TAG_CTR || w1t == TAG_ANY ||
+                           (w1t == TAG_TOP && term_ext(whnf) != UOP_FUSE);
+            if (_uop1 == UOP_KERNEL &&
+                w1t == TAG_TOP && term_ext(whnf) == UOP_KERNEL)
+                _arg1_ok = thvm_kernel_local_child_ready(ctx, whnf);
             if (!_arg1_ok) {
                 // Reconstruct original TAG_TOP from TOP1 sentinel
                 heap_set(ctx, loc + 1, whnf);
@@ -593,18 +611,14 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
                 continue;
             }
             heap_set(ctx, loc + 1, whnf);  // store arg1 result
-            // 3-arg ops (WHERE, IFZ, FUSE2, KERNEL): reduce arg2 before firing
-            if (_uop1 == UOP_WHERE || _uop1 == UOP_IFZ ||
-                _uop1 == UOP_FUSE2 || _uop1 == UOP_KERNEL) {
+            // 3-arg ops (WHERE, IFZ, KERNEL): reduce arg2 before firing
+            if (_uop1 == UOP_WHERE || _uop1 == UOP_IFZ || _uop1 == UOP_KERNEL) {
                 Term a2 = heap_read(ctx, loc + 2);
                 u8 a2t = term_tag(a2);
                 int _arg2_ok = (_uop1 == UOP_KERNEL)
                              ? (a2t == TAG_NUM)
                              : (a2t == TAG_TEN || a2t == TAG_ERA || a2t == TAG_NUM ||
                                 a2t == TAG_CTR || a2t == TAG_ANY || a2t == TAG_LAM || a2t == TAG_SUP);
-                if (_uop1 == UOP_FUSE2)
-                    _arg2_ok = _arg2_ok || a2t == TAG_SEQ ||
-                               (a2t == TAG_TOP && term_ext(a2) != UOP_FUSE && term_ext(a2) != UOP_FUSE2);
                 if (!_arg2_ok) {
                     PUSH(term_new(TAG_TOP2, (u8)_uop1, loc));
                     next = a2;
@@ -634,9 +648,6 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
               u32 _uop2 = term_ext(frame);
               if (_uop2 == UOP_KERNEL)
                   _arg2_ok2 = (w2t == TAG_NUM);
-              if (_uop2 == UOP_FUSE2)
-                  _arg2_ok2 = _arg2_ok2 || w2t == TAG_SEQ ||
-                              (w2t == TAG_TOP && term_ext(whnf) != UOP_FUSE && term_ext(whnf) != UOP_FUSE2);
               if (!_arg2_ok2) { heap_set(ctx, loc+2, whnf); whnf = term_new(TAG_TOP, _uop2, loc); continue; }
             }
             heap_set(ctx, loc + 2, whnf);  // store arg2 result
@@ -765,15 +776,13 @@ Term thvm_reduce(TinyHVM *ctx, Term root) {
     // the normal trampoline. Quiesce's global heap scan corrupts FUSE payloads.
     // if (depth == 0 && ctx->step_budget == 0)
     //     whnf = reduce_net_quiesce(ctx, whnf);
+    ctx->step_budget = 0;
     return whnf;
 }
 
-Term thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps) {
-    ctx->step_budget = max_steps;
-    ctx->steps_taken = 0;
-    Term result = thvm_reduce(ctx, t);
-    ctx->step_budget = 0;
-    return result;
+// thvm_reduce is the fixed point of thvm_reduce_steps — unbounded budget.
+Term thvm_reduce(TinyHVM *ctx, Term t) {
+    return thvm_reduce_steps(ctx, t, 0);
 }
 
 // ============================================================

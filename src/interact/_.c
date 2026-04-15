@@ -480,6 +480,11 @@ static Term thvm_alo_force(TinyHVM *ctx, Term alo) {
 }
 
 static Term thvm_interact(TinyHVM *ctx, Term t) {
+    // Pre-interaction step-graph hook: capture BEFORE metadata from live
+    // heap while we still can (the interaction will mutate it). No-op
+    // unless THVM_STEP_GRAPH is set.
+    thvm_step_graph_on_pre_interaction(ctx, t);
+
     // Return result directly — the trampoline handles TAG_TOP results
     // via `next = r; goto enter;` (no need to force-reduce here).
     // Return directly — trampoline handles TAG_TOP via goto enter

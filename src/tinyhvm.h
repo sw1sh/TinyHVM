@@ -1088,7 +1088,7 @@ typedef struct TinyHVM_s {
     u8          dispatch_mode; // (legacy, unused)
     u8          step_graph_consumed;   // outermost THVM_STEP_GRAPH session already used
     u8          coarse_graph_consumed; // outermost THVM_GRAPH session already used
-    u8          step_graph_local_fuse; // traced step-graph pass lets FUSE fire locally before descending
+    u8          step_graph_settled_replay; // post-trace eval used only to settle/lower real execution
     u32         eval_depth;            // nested thvm_eval reentrancy depth
 
     // Named definitions for TAG_REF (global def table)
@@ -1286,6 +1286,13 @@ void     jit_replay(void);
 Term     thvm_reduce(TinyHVM *ctx, Term t);
 Term     thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps);
 Term     thvm_eval(TinyHVM *ctx, Term t);
+
+// Step-graph hooks. Called from inside the reducer; no-op unless
+// THVM_STEP_GRAPH is set. Pre-hook captures before-redex metadata from
+// live heap (needs to fire BEFORE the interaction mutates); post-hook
+// emits the .dot snapshot with the current root after the interaction.
+void     thvm_step_graph_on_pre_interaction(TinyHVM *ctx, Term before);
+void     thvm_step_graph_on_post_interaction(TinyHVM *ctx, Term before, Term root);
 
 // Tensor API
 Term     thvm_tensor(TinyHVM *ctx, const f32 *data, Shape s);

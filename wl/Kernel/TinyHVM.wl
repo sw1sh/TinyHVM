@@ -404,6 +404,7 @@ thvmTraceDataFn = None;
 thvmReduceStepsFn = None;
 thvmStepToNextVisibleFn = None;
 thvmKernelOpChainFn = None;
+thvmReduceCollectFn = None;
 thvmHeapReadFn = None;
 thvmHeapReadRangeFn = None;
 thvmHeapSnapshotFn = None;
@@ -581,6 +582,8 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
         {Integer, Integer, Integer}, Integer];
     thvmKernelOpChainFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmKernelOpChain",
         {Integer, Integer, Integer}, "UTF8String"];
+    thvmReduceCollectFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmReduceCollect",
+        {Integer, Integer, Integer}, Integer];
 
     (* Heap introspection *)
     thvmHeapReadFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapRead",
@@ -1326,19 +1329,18 @@ walkerGraphSig[t_] := Module[{w = heapWalk[rootTermOf[t]]},
    tensor (TAG_TEN), or when maxSteps reached. Pure public-graph
    reduction only — does not cross into materialization. *)
 TStepTrace[t_, maxSteps_Integer: 50] := Module[
-    {cur = t, acc, nxt, fired, tag, walk, i = 0},
-    walk = heapWalk[rootTermOf[t]];
-    acc = {<|"Term" -> t, "Walk" -> walk|>};
-    While[i++ < maxSteps,
-        {nxt, fired} = TStep[cur];
-        If[fired == 0, Break[]];
-        tag = thvmTermTagFn[nxt[[1]]];
-        If[tag === 10, Break[]];
-        walk = heapWalk[rootTermOf[nxt]];
-        AppendTo[acc, <|"Term" -> nxt, "Walk" -> walk|>];
-        cur = nxt];
-    acc
-];
+    {base, n, cap, tag, walk, acc = {}},
+    loadLibrary[];
+    cap = Min[maxSteps + 1, 256];
+    base = allocId[]; Do[allocId[], {cap - 1}];
+    n = thvmReduceCollectFn[termId[t], base, cap];
+    Do[
+        tag = thvmTermTagFn[base + i - 1];
+        Module[{h = If[tag === 10, TTensor[base + i - 1], TTerm[base + i - 1]]},
+            walk = heapWalk[rootTermOf[h]];
+            AppendTo[acc, <|"Term" -> h, "Walk" -> walk|>]],
+        {i, n}];
+    acc];
 
 (* ════════════════════════════════════════════════════════════════════════ *)
 (* Heap introspection — THeap, TInteraction, TStepReduce, THeapRead        *)

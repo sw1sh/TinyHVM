@@ -1132,6 +1132,83 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     return traced;
 }
 
+// Public: run the phase-1 per-interaction trace harness (same body as
+// thvm_trace_step_graph_session, minus DOT output) and collect the sequence
+// of post-step `traced` terms into `out_terms`. Returns the number written
+// (≤ cap). Does NOT enable dispatch, so the final term is the phase-1
+// KERNEL DAG, not a TEN. Caller is responsible for heap/tensor rollback
+// if they don't want the trace's side-effects persisting.
+u32 thvm_reduce_collect(TinyHVM *ctx, Term root,
+                              Term *out_terms, u32 cap) {
+    u32 n = 0;
+    phase1_root_slot = 0;
+    u64 fuse_loc = heap_alloc(ctx, 1);
+    heap_set(ctx, fuse_loc, root);
+    Term traced = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
+    traced = thvm_phase1_seed_root_grad(ctx, traced);
+    if (n < cap) out_terms[n++] = traced;
+
+    size_t reach_cap = (size_t)ctx->heap_pos;
+    u8 *reach = (u8 *)calloc(reach_cap ? reach_cap : 1, 1);
+    for (u32 guard = 0; guard < 100000 && n < cap; guard++) {
+        if ((size_t)ctx->heap_pos > reach_cap) {
+            size_t new_cap = (size_t)ctx->heap_pos;
+            u8 *nr = (u8 *)realloc(reach, new_cap);
+            if (!nr) break;
+            memset(nr + reach_cap, 0, new_cap - reach_cap);
+            reach = nr; reach_cap = new_cap;
+        }
+        int fired = 0;
+        {
+            u64 itrs_before = ctx->itrs;
+            Term result = thvm_reduce_steps(ctx, traced, 1);
+            if ((ctx->steps_taken > 0) || (ctx->itrs != itrs_before)) {
+                traced = result;
+                if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
+                    heap_set(ctx, phase1_root_slot, traced);
+                if (n < cap) out_terms[n++] = traced;
+                fired = 1;
+                continue;
+            }
+        }
+        if (phase1_trace_root_is_terminal(ctx, traced)) break;
+        phase1_mark_reachable_slots(ctx, traced, reach);
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            if (h == phase1_root_slot) continue;
+            if (phase1_slot_is_local_assign_target(ctx, h)) continue;
+            Term ht = ctx->heap[h];
+            int reachable = !(reach && !reach[h]);
+            if (!reachable && !phase1_term_needs_global_cleanup(ctx, ht)) continue;
+            if (!phase1_term_maybe_active(ctx, ht)) continue;
+            if ((term_tag(ht) == TAG_DP0 || term_tag(ht) == TAG_DP1) &&
+                reachable &&
+                !phase1_term_first_reachable_occurrence(ctx, h, ht, reach)) continue;
+            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD &&
+                reachable &&
+                !phase1_term_first_reachable_occurrence(ctx, h, ht, reach)) continue;
+            u64 itrs_before = ctx->itrs;
+            Term hr = thvm_reduce_steps(ctx, ht, 1);
+            int did_fire = (ctx->steps_taken > 0) || (ctx->itrs != itrs_before);
+            if (!did_fire) continue;
+            if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD) {
+                for (u64 i = 1; i < ctx->heap_pos; i++)
+                    if (ctx->heap[i] == ht) ctx->heap[i] = hr;
+            } else {
+                ctx->heap[h] = hr;
+            }
+            if (phase1_root_slot > 0 && phase1_root_slot < ctx->heap_pos)
+                heap_set(ctx, phase1_root_slot, traced);
+            if (n < cap) out_terms[n++] = traced;
+            fired = 1;
+            break;
+        }
+        if (!fired) break;
+    }
+    free(reach);
+    phase1_root_slot = 0;
+    return n;
+}
+
 static void sched_dump_heap(TinyHVM *ctx) {
     u32 counts[UOP_COUNT] = {0};
     u32 n_ten = 0, n_top = 0;

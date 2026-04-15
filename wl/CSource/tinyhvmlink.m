@@ -1576,6 +1576,30 @@ EXTERN_C DLLEXPORT int thvmStepToNextVisible(
     return LIBRARY_NO_ERROR;
 }
 
+// thvmReduceCollect(rootTermId, outBaseId, cap) → Integer n_terms_written.
+// Runs the per-interaction phase-1 trace harness and stores each post-step
+// term in slots [outBaseId..outBaseId+n). WL reads them back via the usual
+// thvmTermTagFn/ExtFn/ValFn accessors.
+extern u32 thvm_reduce_collect(TinyHVM *ctx, Term root,
+                                     Term *out_terms, u32 cap);
+EXTERN_C DLLEXPORT int thvmReduceCollect(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+    mint root_id = MArgument_getInteger(args[0]);
+    mint out_base = MArgument_getInteger(args[1]);
+    mint cap = MArgument_getInteger(args[2]);
+    if (cap <= 0 || cap > 1024) return LIBRARY_FUNCTION_ERROR;
+    ensure_term_cap((u32)(out_base + cap - 1));
+    Term root = get_term(root_id);
+    Term buf[1024];
+    u32 n = thvm_reduce_collect(g_ctx, root, buf, (u32)cap);
+    for (u32 i = 0; i < n; i++) set_term((u32)(out_base + i), buf[i]);
+    MArgument_setInteger(res, (mint)n);
+    return LIBRARY_NO_ERROR;
+}
+
 // thvmKernelOpChain(tag, ext, val) → String (e.g. "MUL+ADD"). Empty if not a KERNEL.
 extern void thvm_kernel_op_chain(TinyHVM *ctx, Term kernel, char *buf, size_t bufsz);
 

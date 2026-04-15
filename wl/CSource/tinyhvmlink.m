@@ -208,9 +208,11 @@ EXTERN_C DLLEXPORT int thvmToHost(
     mint term_id = MArgument_getInteger(args[0]);
     Term t = get_term(term_id);
 
-    // Reduce if not already a tensor
+    // Reduce if not already a tensor. Use thvm_eval so compute ops
+    // (MUL/ADD/etc.) go through the full FUSE+dispatch pipeline —
+    // thvm_reduce alone leaves them as WNF in the new phase-1 architecture.
     if (term_tag(t) != TAG_TEN) {
-        t = thvm_reduce(g_ctx, t);
+        t = thvm_eval(g_ctx, t);
         set_term(term_id, t);
     }
     if (term_tag(t) != TAG_TEN) return LIBRARY_FUNCTION_ERROR;

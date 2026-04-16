@@ -1,93 +1,283 @@
-# Evaluation: Reduce Then Fuse
+# Evaluation Pipeline
 
-## Core Principle
+TinyHVM now has two architectural layers during `thvm_eval`:
 
-`thvm_reduce` performs the pure interaction-calculus reduction and stops at WNF.
-Lazy compute ops remain as `TAG_TOP` nodes.
+1. A **local IC phase** that reduces the program and coarse-grains lazy tensor
+   structure into visible `KERNEL` nodes.
+2. A **global compiler phase** that can rewrite the settled coarse graph and
+   optionally install executable triggers before the final strict reduce.
 
-`thvm_eval` runs one extra uniform IC pass by wrapping the reduced program in
-`FUSE(...)`. That second pass:
+This matches the split we want from tinygrad-like systems:
 
-- propagates `FUSE`
-- materializes structural `KERNEL` nodes on the heap
-- dispatches those kernels only when a strict context demands `TEN`
+- local graph rewriting chooses and grows kernel regions
+- global passes reason about the settled kernel DAG
+- lowering and dispatch stay downstream runtime details
 
-## Overview
+## Live Pipeline
 
 ```text
-thvm_reduce(ctx, t)     -> pure IC reduction to WNF
-
 thvm_eval(ctx, t):
-  1. thvm_reduce(ctx, t)
-  2. thvm_reduce(ctx, FUSE(t))
+  local phase
+    1. structural reduction         -> lazy tensor frontier
+    2. local coarse-graining        -> growing KERNEL -> settled KERNEL
+
+  global phase
+    3. named compiler passes        -> rewrite settled coarse IC / install EXEC
+    4. second reduce                -> fire EXEC triggers if any
 ```
 
-There is no separate scheduling phase in the live eval path anymore.
-There is also no separate `UOP_SCHED` marker anymore: `FUSE` is the only
-propagating fusion agent.
+In code this is the `thvm_eval_reduce_fused()` + `thvm_run_global_passes()` +
+optional second `thvm_reduce()` sequence in `src/schedule/_.c`.
 
-## Phase 1: Structural Reduction
+## Local Phase
 
-The first pass performs the standard local rewrites:
+The local phase is still entirely IC-native.
+
+### Phase 1: Structural Reduction
+
+`thvm_reduce()` performs ordinary interaction-calculus reduction until the
+program reaches a lazy tensor frontier. Tensor compute remains represented as
+`TAG_TOP` nodes such as `MUL`, `ADD`, `SUM`, `RESHAPE`, and `PAD`.
+
+This phase handles the structural rewrites:
 
 - `APP/LAM`
 - `IFZ`
 - `GRAD`
 - `MAT/CTR`
 - `DUP` / `ERA`
+- strict sequencing such as `SEQ`
 
-Result: the program reaches a lazy frontier where tensor compute is still
-represented as `TAG_TOP` structure.
+### Phase 2: Local Coarse-Graining
 
-## Phase 2: Fusion and Demand-Driven Dispatch
+The reduced root is wrapped in `FUSE(...)`, and the reducer runs again.
 
-The second pass wraps the phase-1 result in `FUSE(...)`.
-
-`FUSE` does not dispatch anything directly. Instead it rewrites fuseable
-subgraphs into explicit `UOP_KERNEL` nodes:
+`FUSE` is only the **propagating pressure**. It does not dispatch kernels by
+itself. Instead it turns fuseable compute into visible structural `KERNEL`
+nodes:
 
 ```text
-FUSE(MUL(a,b)) -> KERNEL(FUSE(a), FUSE(b), MUL)
+FUSE(MUL(a,b)) -> KERNEL(FUSE(a), FUSE(b), NUM(MUL))
 ```
 
-Those `KERNEL` nodes stay visible until a strict context reaches them.
-Typical strict contexts are:
+There are now two meaningful public `KERNEL` states:
 
-- `ASSIGN(dst, src)` forcing `src`
-- `LOG_PRINT`
-- the final root result of `thvm_eval`
+- **Growing `KERNEL`**: local coarse region still absorbing children.
+- **Settled `KERNEL`**: monolithic public region whose payload is the full
+  compute subgraph that will lower as one kernel bundle.
 
-When a `KERNEL` is demanded:
+The key invariant is:
 
-1. its structural subtree is lowered into a `KernelEntry`
-2. the runtime cache is consulted
-3. epoch checks decide reuse vs re-dispatch
-4. the handler returns a concrete `TAG_TEN`
+- child `KERNEL`s can settle locally under a parent
+- a settled child is treated as absorbable WNF by the parent kernel
+- only the topmost settled kernel is allowed to register/lower/dispatch
 
-## Observable Phases in Step Graphs
+That is what keeps the public step graph incremental while the settled replay
+still lowers only one final monolithic kernel.
 
-The step tracer should now show:
+## Global Phase
 
-1. pure structural rewrites
+Once local coarse-graining has produced the settled coarse graph, TinyHVM runs
+the global compiler-pass layer.
+
+### Phase 3: Named Compiler Passes
+
+`thvm_run_global_passes()` walks the settled coarse IC and applies any passes
+registered via `thvm_register_pass()`.
+
+This is where future work belongs for:
+
+- explicit kernel DAG rewrites
+- dependency analysis
+- `EXEC` trigger installation
+- planner-style global transformations
+
+Today the default runtime often has `registered_passes=0`, but the phase is
+real and already dumped by `THVM_GRAPH`.
+
+### Phase 4: Second Reduce
+
+If global passes install `UOP_EXEC` triggers, TinyHVM runs one more strict
+reduce to fire them.
+
+That keeps the layering clean:
+
+- local phase chooses and settles public `KERNEL` structure
+- global phase rewrites the settled graph
+- second reduce executes whatever global passes made explicit
+
+## From Public KERNEL to Backend Program
+
+The runtime lowering path is:
+
+```text
+public KERNEL
+  -> KernelEntry          (fused ops + leaves + views + reduce spec)
+  -> LOP DAG              (private lowering IR in lower/_.c)
+  -> UOpKernel / KOP list (linear backend program)
+  -> backend dispatch
+```
+
+Each layer has a different job:
+
+- `KERNEL`: public coarse IR visible in the heap and graph dumps
+- `KernelEntry`: runtime description of one fused kernel region
+- `LOP`: normalization-friendly private lowering DAG
+- `KOP`: emitted linear kernel VM for CPU/Metal backends
+
+## KOPs
+
+`KOP`s live in `src/tinyhvm.h` as the emitted `UOpKernel` program.
+
+| KOP | Meaning |
+|-----|---------|
+| `KOP_NOOP` | Reserved empty instruction |
+| `KOP_GID` | Read one grid axis (`x/y/z`) |
+| `KOP_CONST_F` | Float literal |
+| `KOP_CONST_U` | Unsigned integer literal |
+| `KOP_RANGE` | Begin a reduction loop with a fixed trip count |
+| `KOP_ENDRANGE` | Close the range opened by `KOP_RANGE` |
+| `KOP_LOAD` | Read one kernel input buffer at a computed index |
+| `KOP_STORE` | Write one output buffer slot |
+| `KOP_ALU` | Scalar math op parameterized by a `UOP_*` opcode |
+| `KOP_ACC_INIT` | Initialize a reduction accumulator |
+| `KOP_ACC` | Combine a value into an accumulator (`SUM`/`RMAX`) |
+| `KOP_IDX` | Affine index arithmetic (`a * scale + b`) |
+| `KOP_MOD` | Integer modulo |
+| `KOP_DIV` | Integer division |
+| `KOP_MASK` | Conditional mask (`cond ? value : 0`) |
+
+The important point is that `KOP`s are not the user-visible IR. They are the
+final backend program that CPU and Metal execute.
+
+## LOPs
+
+`LOP`s live in `src/lower/_.c` as the private lowering DAG used before linear
+emission.
+
+| LOP | Meaning |
+|-----|---------|
+| `LSINK` | Root/sink node for the lowered program |
+| `LGID` | Grid-axis source in the lowering graph |
+| `LCONST_U` | Unsigned integer literal |
+| `LCONST_F` | Float literal |
+| `LRANGE` | Reduction loop start |
+| `LENDRANGE` | Reduction loop end |
+| `LLOAD` | Input-buffer load |
+| `LSTORE` | Output-buffer store |
+| `LALU` | Scalar arithmetic node |
+| `LACC_INIT` | Reduction accumulator initialization |
+| `LACC` | Reduction accumulator update |
+| `LINDEX` | Affine index node |
+| `LMOD` | Integer modulo node |
+| `LDIV` | Integer division node |
+| `LMASK` | Conditional masking node |
+
+`LOP` exists so TinyHVM can normalize, fold constants, simplify indexes, and
+only then emit the final linear `KOP` stream.
+
+## Observability
+
+TinyHVM exposes the two layers with different debug modes:
+
+### Local Phase Dumps
+
+Use `THVM_STEP_GRAPH=1`, optionally with `THVM_STEP_GRAPH_FUSE=1`.
+
+This should show:
+
+1. structural local rewrites
 2. `FUSE` propagation
-3. visible `KERNEL` nodes in the heap
-4. `KERNEL -> TEN` dispatch steps
-5. `ASSIGN` / cleanup
+3. growing public `KERNEL` nodes
+4. the final settled monolithic `KERNEL`
+5. only then downstream forcing such as `ASSIGN`
 
-That is the intended user-facing contract for fusion tracing.
+### Global Phase Dumps
 
-## Key State
+Use `THVM_GRAPH=1`.
 
-| Global | Purpose |
-|--------|---------|
-| `sched_kernels[SCHED_MAX_KERNELS]` | Lowered runtime kernels built from structural `KERNEL`s |
-| `sched_kernel_locs[SCHED_MAX_KERNELS]` | Map runtime kernel entries back to heap-visible `KERNEL` nodes |
-| `kid_results[SCHED_MAX_KERNELS]` | Cached dispatch results |
-| `buf_epoch[]` | ASSIGN invalidation tracking |
+This emits:
 
-## Files
+- `thvm_0_pre_reduce.dot`
+- `thvm_1_post_reduce.dot`
+- `thvm_2_post_dispatch.dot`
+- `thvm_3_post_passes.dot`
+- `thvm_4_post_exec.dot`
+- `thvm_global_passes.txt`
 
-- `src/schedule/_.c` — `thvm_eval`, dispatch/cache tables, step-graph driver
-- `src/interact/tensor_ops.c` — `FUSE` and `KERNEL` handlers
-- `src/interact/_.c` — shared helpers for structural kernels
-- `src/reduce/_.c` — reducer trampoline
+Those dumps are the right place to inspect the whole coarse pipeline rather
+than the local interaction-by-interaction trace. In debug-only runs, the dumped
+root can still be coarse IR; the loop harness validates the final buffer state
+separately from the displayed coarse root.
+
+## Simple Loop Example
+
+Run the end-to-end local+global harness with:
+
+```bash
+bash scripts/test_loop_local_global_eval.sh
+```
+
+By default that wrapper uses the full `n=0..3` local regression, but runs the
+global coarse dump at `THVM_GLOBAL_TRAIN_STEPS=1` so the coarse graph artifact
+and the observable buffer update stay aligned in one minimal loop iteration.
+
+That script:
+
+1. runs the local step-graph regression on `test/test_loop_assign_simple.m`
+2. checks the fused local trace contract
+3. checks kernel redispatch on repeated loop iterations
+4. runs a global `THVM_GRAPH` dump for the same loop example
+
+Artifacts land under:
+
+- local: `graphs/loop_assign_simple/n*_steps*`
+- global: `graphs/loop_assign_simple/global_eval/`
+
+## What Is Still Missing for Tinygrad-Style Architecture
+
+TinyHVM already has the right lazy graph shape, explicit public kernel
+boundaries, and ShapeTracker-style movement ops. The remaining gaps are mostly
+global compiler/runtime architecture, not more local rewrite tricks.
+
+### 1. Real global pass content
+
+The pass hook exists, but the default runtime still does little with it.
+To cover more of tinygrad's architecture, this layer needs actual kernel-DAG
+rewrites rather than just the empty pass dump.
+
+### 2. Dependency DAG around side effects
+
+`ASSIGN` makes ordering observable. A tinygrad-like global planner still needs
+explicit read/write dependency analysis over the settled kernel DAG.
+
+See `docs/dependencies.md`.
+
+### 3. Memory planning and slot reuse
+
+Tinygrad-style execution relies on a planner that separates logical values from
+physical buffers. TinyHVM still needs a proper buffer-lifetime planner and
+reuse policy over the kernel DAG.
+
+See `docs/memory.md`.
+
+### 4. Schedule search / rangeify / backend tuning
+
+Tinygrad does more work in the scheduler when choosing the final executable
+kernel shape. TinyHVM currently lowers one settled public kernel directly,
+without a richer search/tuning layer over alternative schedules.
+
+### 5. Broader global lowering contracts
+
+The current `LOP -> KOP` path covers the scalar/index/load/store/reduce core.
+If TinyHVM grows more aggressive backend optimization, that will likely show up
+as richer global passes first, and only secondarily as new lowering opcodes.
+
+## Key Files
+
+- `src/schedule/_.c` — `thvm_eval`, global passes, graph dump orchestration
+- `src/reduce/_.c` — reducer trampoline and local kernel readiness
+- `src/interact/_.c` — kernel helpers and public-kernel normalization
+- `src/interact/tensor_ops.c` — `FUSE`, `KERNEL`, `EXEC`, and dispatch behavior
+- `src/lower/_.c` — private lowering IR (`LOP`) and `UOpKernel` emission
+- `src/tinyhvm.h` — `KOP`, `UOpKernel`, and `KernelEntry` definitions

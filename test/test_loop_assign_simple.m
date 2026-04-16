@@ -71,9 +71,12 @@ static Term simple_loop(TinyHVM *ctx, Term w0, u32 n_steps) {
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     u32 n_steps = 3;
+    int allow_non_ten_result = 0;
     const char *env = getenv("THVM_TRAIN_STEPS");
     if (env && env[0]) n_steps = (u32)strtoul(env, NULL, 10);
     else if (argc > 1) n_steps = (u32)strtoul(argv[1], NULL, 10);
+    env = getenv("THVM_ALLOW_NON_TEN_RESULT");
+    if (env && env[0] && strcmp(env, "0") != 0) allow_non_ten_result = 1;
 
     TinyHVM *ctx = thvm_init("cpu");
 
@@ -90,9 +93,6 @@ int main(int argc, char **argv) {
            (unsigned long long)term_val(result),
            (unsigned long long)result);
 
-    // Result must be TAG_TEN — the reduced value, not a stuck SEQ/ERA
-    assert(term_tag(result) == TAG_TEN && "result must reduce to TEN");
-
     // Read w's buffer directly
     u32 dtype = DTYPE_F32;
     Shape sh = SHAPE(1);
@@ -104,6 +104,12 @@ int main(int argc, char **argv) {
            wd[0] * scale, wd[1] * scale, wd[2] * scale);
     assert(wf[0] == wd[0] * scale && wf[1] == wd[1] * scale && wf[2] == wd[2] * scale
            && "w values must match expected");
+
+    // Normal eval should return TAG_TEN. Diagnostic coarse-graph runs can opt
+    // out so they can inspect the settled coarse root while still validating
+    // the buffer-side effects.
+    if (!allow_non_ten_result)
+        assert(term_tag(result) == TAG_TEN && "result must reduce to TEN");
 
     // Also read from result term
     u32 dtype2 = DTYPE_F32;

@@ -74,18 +74,25 @@ static inline int reduce_top_has_add_zero_arg(TinyHVM *ctx, Term t) {
            (term_tag(b) == TAG_NUM && term_as_f32(b) == 0.0f);
 }
 
-static inline int reduce_fuse_payload_top_ready(u32 uop) {
-    return uop == UOP_ASSIGN ||
-           uop == UOP_KERNEL ||
-           uop == UOP_FUSE ||
-           is_binary(uop) ||
-           is_elementwise(uop) ||
-           uop == UOP_SUM ||
-           uop == UOP_RMAX ||
-           (uop >= UOP_RESHAPE && uop <= UOP_PAD);
+static inline int reduce_fuse_payload_top_ready(TinyHVM *ctx, Term t) {
+    if (!ctx || term_tag(t) != TAG_TOP) return 0;
+    u32 uop = term_ext(t);
+    if (uop == UOP_ASSIGN || uop == UOP_KERNEL || uop == UOP_FUSE)
+        return 1;
+    if (!(is_binary(uop) || is_elementwise(uop) ||
+          uop == UOP_SUM || uop == UOP_RMAX || is_view_op(uop)))
+        return 0;
+    u64 loc = term_val(t);
+    if (loc == 0 || loc >= ctx->heap_pos) return 0;
+    if (!thvm_kernel_local_child_ready(ctx, heap_read(ctx, loc + 0)))
+        return 0;
+    if (!is_binary(uop) && is_elementwise(uop))
+        return 1;
+    if (loc + 1 >= ctx->heap_pos) return 0;
+    return thvm_kernel_local_child_ready(ctx, heap_read(ctx, loc + 1));
 }
 
-static inline int reduce_fuse_payload_ready(Term t) {
+static inline int reduce_fuse_payload_ready(TinyHVM *ctx, Term t) {
     switch (term_tag(t)) {
         case TAG_TEN:
         case TAG_ERA:
@@ -94,7 +101,7 @@ static inline int reduce_fuse_payload_ready(Term t) {
         case TAG_CTR:
             return 1;
         case TAG_TOP:
-            return reduce_fuse_payload_top_ready(term_ext(t));
+            return reduce_fuse_payload_top_ready(ctx, t);
         default:
             return 0;
     }
@@ -509,14 +516,14 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
                 term_tag(whnf) == TAG_SUP ||
                 (term_tag(whnf) == TAG_TOP && frame_uop == UOP_GRAD) ||
                 (term_tag(whnf) == TAG_VAR && frame_uop == UOP_DETACH) ||
-                (frame_uop == UOP_FUSE &&
-                 reduce_fuse_payload_ready(whnf)) ||
+                (frame_uop == UOP_FUSE) ||
                 // UOP_KERNEL accepts most WNF payloads, but NOT DP0/DP1 —
                 // those must be resolved by reducer first.
                 (frame_uop == UOP_KERNEL &&
                  term_tag(whnf) != TAG_DP0 && term_tag(whnf) != TAG_DP1);
-            if (frame_uop == UOP_KERNEL &&
-                term_tag(whnf) == TAG_TOP && term_ext(whnf) == UOP_KERNEL)
+            if (frame_uop == UOP_FUSE)
+                arg0_ready = reduce_fuse_payload_ready(ctx, whnf);
+            if (frame_uop == UOP_KERNEL)
                 arg0_ready = thvm_kernel_local_child_ready(ctx, whnf);
             if (!arg0_ready) {
                 heap_set(ctx, loc+0, whnf); whnf = frame; continue;
@@ -564,9 +571,7 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
             if (a1t2 == TAG_TEN || a1t2 == TAG_ERA || a1t2 == TAG_NUM ||
                 a1t2 == TAG_LAM || a1t2 == TAG_SUP ||
                 (frame_uop == UOP_KERNEL &&
-                 (a1t2 == TAG_ANY ||
-                  (a1t2 == TAG_TOP && term_ext(a1) == UOP_KERNEL &&
-                   thvm_kernel_local_child_ready(ctx, a1))))) {
+                 thvm_kernel_local_child_ready(ctx, a1))) {
                 // Both args ready — fire
                 if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
@@ -601,8 +606,7 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
             if (_uop1 == UOP_KERNEL)
                 _arg1_ok = _arg1_ok || w1t == TAG_SEQ || w1t == TAG_CTR || w1t == TAG_ANY ||
                            (w1t == TAG_TOP && term_ext(whnf) != UOP_FUSE);
-            if (_uop1 == UOP_KERNEL &&
-                w1t == TAG_TOP && term_ext(whnf) == UOP_KERNEL)
+            if (_uop1 == UOP_KERNEL)
                 _arg1_ok = thvm_kernel_local_child_ready(ctx, whnf);
             if (!_arg1_ok) {
                 // Reconstruct original TAG_TOP from TOP1 sentinel

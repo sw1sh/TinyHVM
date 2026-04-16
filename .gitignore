@@ -61,4 +61,5 @@ thvm_steps/
 # Benchmark binaries
 /bench_*
 wl/LibraryResources/MacOSX-ARM64/TinyHVM.dylib
+wl/LibraryResources/MacOSX-ARM64/TinyHVM.dylib.*
 bench/

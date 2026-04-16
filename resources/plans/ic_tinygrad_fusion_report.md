@@ -22,7 +22,7 @@ blog:
 ### Old TinyHVM
 
 - `FUSE` propagated locally, which was good
-- but absorbed ops were turned into `FUSE2(op, left, right)`
+- but absorbed ops were turned into a separate intermediate carrier
 - `KERNEL` mostly acted like a dispatch handle (`kid`) rather than the visible
   fused structure itself
 - step graphs often had to reconstruct kernels later from tensor provenance
@@ -32,7 +32,7 @@ blog:
 The visible IR and the runtime IR were different things:
 
 ```text
-visible: FUSE / FUSE2 / ERA steps
+visible: FUSE / intermediate-carrier / ERA steps
 runtime reality: hidden dispatch-handle KERNELs
 ```
 
@@ -52,7 +52,7 @@ thvm_reduce(program)
 
 ## What Changed
 
-### 1. Structural KERNEL replaced FUSE2 in the live path
+### 1. Structural KERNEL replaced the intermediate carrier in the live path
 
 - `FUSE` now rewrites fuseable structure directly into `UOP_KERNEL`
 - structural kernel heap layout is:
@@ -60,8 +60,6 @@ thvm_reduce(program)
 ```text
 KERNEL(left, right_or_meta, NUM(root_uop))
 ```
-
-- `UOP_FUSE2` remains only as a deprecated compatibility shim
 
 ### 2. Runtime state moved behind the structural node
 

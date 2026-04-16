@@ -1459,6 +1459,8 @@ Term     thvm_grad_targets_get_term_at(TinyHVM *ctx, u64 grad_loc, u32 index);
 Term     thvm_grad_targets_get_slot_at(TinyHVM *ctx, u64 grad_loc, u32 index);
 void     thvm_grad_keep_bundle_set(TinyHVM *ctx, u64 grad_loc, Term bundle);
 Term     thvm_grad_keep_bundle_get(TinyHVM *ctx, u64 grad_loc);
+void     thvm_grad_keep_app_loc_set(TinyHVM *ctx, u64 grad_loc, u64 app_loc);
+u64      thvm_grad_keep_app_loc_get(TinyHVM *ctx, u64 grad_loc);
 void     thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad);
 void     term_use_clear(void);
 

@@ -133,13 +133,20 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
         case TAG_APP: {
             u64 old_loc = term_val(t);
             u64 new_loc = heap_alloc(ctx, 2);
-            heap_set(ctx, new_loc,
-                     term_clone_r(ctx, heap_read(ctx, old_loc),
-                                  relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
+            Term old_fun = heap_read(ctx, old_loc);
+            Term new_fun = term_clone_r(ctx, old_fun,
+                                        relocs, n_relocs, lmap, n_labels, tmap, n_tmap);
+            heap_set(ctx, new_loc, new_fun);
             heap_set(ctx, new_loc + 1,
                      term_clone_r(ctx, heap_read(ctx, old_loc + 1),
                                   relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
             Term out = term_new(tag, term_ext(t), new_loc);
+            if (tag == TAG_APP &&
+                term_tag(old_fun) == TAG_TOP && term_ext(old_fun) == UOP_GRAD &&
+                thvm_grad_keep_app_loc_get(ctx, term_val(old_fun)) == old_loc &&
+                term_tag(new_fun) == TAG_TOP && term_ext(new_fun) == UOP_GRAD) {
+                thvm_grad_keep_app_loc_set(ctx, term_val(new_fun), new_loc);
+            }
             clone_term_map_add(tmap, n_tmap, t, out);
             return out;
         }

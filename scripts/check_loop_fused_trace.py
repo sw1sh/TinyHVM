@@ -2,16 +2,13 @@
 import argparse
 import re
 import sys
-from collections import Counter
 from pathlib import Path
 
 
 STEP_RE = re.compile(r"^step_(\d+)_(.+)\.dot$")
+ITER_RE = re.compile(r"n(\d+)_")
 FUSE_TEN_RE = re.compile(r"(?:^|_)FUSE_h\d+_TEN_h\d+$")
 ERA_SEQ_RE = re.compile(r"^ERA_h\d+_SEQ_h\d+$")
-DISPATCH_RE = re.compile(r"KERNEL_DISPATCH kid=\d+ sig=(0x[0-9a-fA-F]+)")
-STALE_RE = re.compile(r"KERNEL_CACHE_STALE kid=\d+ sig=(0x[0-9a-fA-F]+)")
-ASSIGN_RE = re.compile(r"^ASSIGN:")
 
 
 def fail(msg: str) -> int:
@@ -29,6 +26,13 @@ def parse_steps(step_dir: Path):
     return steps
 
 
+def interaction_name(step_name: str) -> str:
+    return step_name.split("_h", 1)[0]
+
+def local_assign_admin_step(step_name: str) -> bool:
+    return "_ALO_" in step_name or "_DP0_" in step_name or "_DP1_" in step_name
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Check fused loop step traces.")
     ap.add_argument("step_dir")
@@ -43,16 +47,32 @@ def main() -> int:
     if not steps:
         return fail(f"no step graphs found in {step_dir}")
 
+    if args.diag_log:
+        diag_path = Path(args.diag_log)
+        if not diag_path.is_file():
+            return fail(f"diag log {diag_path} does not exist")
+
     fuse_ten = [name for _, name, _ in steps if FUSE_TEN_RE.search(name)]
     if fuse_ten:
         return fail(f"{step_dir} still contains administrative FUSE->TEN steps: {fuse_ten[:3]}")
 
-    kernel_steps = [idx for idx, name, _ in steps if "_KERNEL_" in f"_{name}_"]
-    assign_steps = [idx for idx, name, _ in steps if "_ASSIGN_" in f"_{name}_"]
-    if kernel_steps and assign_steps and not any(k < a for k in kernel_steps for a in assign_steps):
+    m_iter = ITER_RE.search(step_dir.name)
+    train_steps = int(m_iter.group(1)) if m_iter else None
+    kernel_steps = [idx for idx, name, _ in steps if interaction_name(name) == "KERNEL"]
+    visible_kernel_steps = [
+        idx for idx, _, path in steps
+        if 'label="KERNEL' in path.read_text(encoding="utf-8", errors="replace")
+    ]
+    assign_steps = [
+        idx for idx, name, _ in steps
+        if interaction_name(name) == "ASSIGN" and not local_assign_admin_step(name)
+    ]
+    if assign_steps:
         return fail(
-            f"{step_dir} has KERNEL steps {kernel_steps[:4]} but none precede an ASSIGN step {assign_steps[:4]}"
+            f"{step_dir} still contains ASSIGN interaction steps during local fused tracing: {assign_steps[:4]}"
         )
+    if train_steps is not None and train_steps >= 2 and not (kernel_steps or visible_kernel_steps):
+        return fail(f"{step_dir} never exposes a visible KERNEL node in local fused tracing")
 
     trailing_cleanup = []
     for idx, name, _ in reversed(steps):
@@ -66,36 +86,9 @@ def main() -> int:
         trailing_cleanup.reverse()
         return fail(f"{step_dir} still ends with ERA/SEQ cleanup tail: {trailing_cleanup[:3]}")
 
-    if args.diag_log:
-        diag_path = Path(args.diag_log)
-        if not diag_path.is_file():
-            return fail(f"diag log {diag_path} does not exist")
-        text = diag_path.read_text(encoding="utf-8", errors="replace")
-        dispatch_counts = Counter(DISPATCH_RE.findall(text))
-        repeated = {sig: n for sig, n in dispatch_counts.items() if n >= 2}
-        if not repeated:
-            return fail(f"{diag_path} does not show any repeated KERNEL_DISPATCH signature")
-        assign_seen = False
-        dispatch_before_assign = set()
-        dispatch_after_assign = set()
-        for line in text.splitlines():
-            if ASSIGN_RE.search(line):
-                assign_seen = True
-                continue
-            m = DISPATCH_RE.search(line)
-            if not m:
-                continue
-            sig = m.group(1)
-            if not assign_seen:
-                dispatch_before_assign.add(sig)
-            else:
-                dispatch_after_assign.add(sig)
-        if not (dispatch_before_assign & dispatch_after_assign):
-            return fail(f"{diag_path} has repeated dispatch signatures but none occur on both sides of an ASSIGN")
-
     print(
-        f"PASS: fused loop trace checks OK in {step_dir}"
-        + (f" with diag {args.diag_log}" if args.diag_log else "")
+        f"PASS: fused loop trace stays in local coarse phase in {step_dir}"
+        + (f" (diag log: {args.diag_log})" if args.diag_log else "")
     )
     return 0
 

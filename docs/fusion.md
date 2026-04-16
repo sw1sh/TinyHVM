@@ -17,10 +17,6 @@ FUSE(payload)
 KERNEL(left, right_or_meta, root_uop)
 ```
 
-`FUSE2` is no longer part of the intended IR contract. It only remains as a
-deprecated compatibility shim for older heaps/tests and is immediately lowered
-to `KERNEL`.
-
 ## Entry FUSE Interactions
 
 | Pattern | Result | Notes |
@@ -41,6 +37,8 @@ to `KERNEL`.
 `KERNEL` is lazy structural IR, not an already-dispatched result.
 
 - Heap layout: `TAG_TOP(UOP_KERNEL, loc)`, heap `[left, right_or_meta, NUM(root_uop)]`
+- Growing kernels stay public during local coarse-graining.
+- Settled kernels hold the monolithic public payload that lowers as one region.
 - The node stays visible in the net until a strict context reaches it.
 - `SEQ`-shaped kernels degrade back to `SEQ(left, right)` once both children are
   ready.
@@ -66,6 +64,8 @@ When a demanded `KERNEL` is ready:
 So the runtime still uses `KernelEntry`, `kid_results[]`, and epoch tracking, but
 those are implementation details behind the structural heap node.
 
+The global-pass layer that runs after local fusion is documented in `docs/eval.md`.
+
 ## Training Loop
 
 ```text
@@ -81,7 +81,7 @@ train(counter)(w) = IFZ(counter, w, λm. SEQ(ASSIGN(w, w*2), train(m)(w)))
 
 ## Files
 
-- `src/interact/tensor_ops.c` — `FUSE`, compatibility `FUSE2`, and `KERNEL` dispatch
+- `src/interact/tensor_ops.c` — `FUSE`, `KERNEL`, and `EXEC` behavior
 - `src/interact/_.c` — shared kernel helpers and arity metadata
 - `src/reduce/_.c` — reducer readiness for structural kernels
 - `src/interact/combinators.c` — `DUP`/`ERA` behavior for 3-slot kernels

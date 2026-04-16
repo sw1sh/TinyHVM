@@ -28,6 +28,7 @@ typedef struct {
     u8 modes[GRAD_LOC_MAX];
     u32 group_ids[GRAD_LOC_MAX]; // 1-based group id; 0 means none
     Term bundles[GRAD_LOC_MAX];
+    u64 keep_app_locs[GRAD_LOC_MAX];
     u32 n_loc;
     u64 locs[GRAD_LOC_MAX];
     Term xs[GRAD_LOC_MAX];
@@ -44,6 +45,7 @@ static void grad_targets_reset(GradTargetSet *s) {
         s->modes[i] = GRAD_MODE_DROP;
         s->group_ids[i] = 0;
         s->bundles[i] = term_era();
+        s->keep_app_locs[i] = 0;
         s->xs[i] = thvm_any();
     }
 }
@@ -118,6 +120,7 @@ static int grad_loc_ensure(GradTargetSet *s, u64 grad_loc) {
     s->modes[idx] = GRAD_MODE_DROP;
     s->group_ids[idx] = 0;
     s->bundles[idx] = term_era();
+    s->keep_app_locs[idx] = 0;
     return idx;
 }
 
@@ -203,16 +206,12 @@ static Term thvm_grad_bundle_whnf(TinyHVM *ctx, Term bundle) {
     if (term_tag(bundle) == TAG_APP) {
         u64 app_loc = term_val(bundle);
         if (app_loc + 1 < ctx->heap_pos) {
-            Term fun = heap_read(ctx, app_loc + 0);
-            if (term_tag(fun) == TAG_TOP && term_ext(fun) == UOP_GRAD) {
-                Term kept = thvm_grad_keep_bundle_get(ctx, term_val(fun));
-                if (term_tag(kept) == TAG_CTR) return kept;
-            }
+            return heap_read(ctx, app_loc + 1);
         }
     }
-    // Keep bundles are fixed-arity carriers. Do not reduce TAG_CTR directly:
-    // generic CTR reduction collapses arity-1 containers to their head term,
-    // which destroys bundle structure for single-parameter keep mode.
+    // Keep bundles are fixed-arity carriers when arity > 1. Do not reduce
+    // TAG_CTR directly: generic CTR reduction collapses arity-1 containers to
+    // their head term, which would destroy multi-keep bundle structure.
     if (term_tag(bundle) == TAG_CTR) return bundle;
     Term out = thvm_reduce(ctx, bundle);
     if (getenv("THVM_LOOP_DIAG")) {
@@ -247,6 +246,91 @@ static Term thvm_grad_force_slot_expr(TinyHVM *ctx, Term t, u32 depth) {
         }
     }
     return t;
+}
+
+static Term thvm_grad_slot_resolve(TinyHVM *ctx, Term t) {
+    for (u32 depth = 0; depth < 32; depth++) {
+        u8 tag = term_tag(t);
+        if (tag == TAG_DP0 || tag == TAG_DP1) {
+            t = heap_read(ctx, term_val(t));
+            continue;
+        }
+        if (tag == TAG_VAR) {
+            Term sub = heap_read(ctx, term_val(t));
+            if (term_is_sub(sub)) break;
+            t = sub;
+            continue;
+        }
+        break;
+    }
+    return t;
+}
+
+static void thvm_grad_slot_copy_into(TinyHVM *ctx, Term dst_t, Term src_t) {
+    if (term_tag(dst_t) != TAG_TEN || term_tag(src_t) != TAG_TEN) return;
+
+    u32 dst_id = (u32)term_val(dst_t);
+    u32 src_id = (u32)term_val(src_t);
+    if (dst_id >= ctx->tensor_count || src_id >= ctx->tensor_count) return;
+    if (dst_id == src_id) return;
+
+    TensorMeta *md = &ctx->tensors[dst_id];
+    TensorMeta *ms = &ctx->tensors[src_id];
+    ENSURE(ctx, src_id);
+    ms = &ctx->tensors[src_id];
+    md = &ctx->tensors[dst_id];
+    if (ms->buf_id == 0 || !md->backend) return;
+
+    if (md->backend->buf_copy && ms->view.contiguous &&
+        ms->view.numel == md->view.numel &&
+        ms->dtype == md->dtype) {
+        md->backend->buf_copy(md->buf_id, ms->buf_id,
+            (u64)md->view.numel * dtype_size(md->dtype));
+    } else if (md->backend->contiguify && ms->dtype == md->dtype) {
+        md->backend->contiguify(md->buf_id, md->view.numel,
+                                 ms->buf_id, &ms->view);
+    } else {
+        u32 src_dtype = ms->dtype;
+        void *src_host = thvm_to_host_raw(ctx, src_t, &src_dtype, NULL);
+        u64 n = md->view.numel;
+        u64 nbytes = n * dtype_size(md->dtype);
+        if (!src_host) return;
+        if (src_dtype == md->dtype) {
+            md->backend->buf_write(md->buf_id, src_host, nbytes);
+        } else {
+            void *dst_host = malloc((size_t)nbytes);
+            for (u32 i = 0; i < n; i++)
+                dtype_store_from_f32(dst_host, md->dtype, i,
+                                     dtype_load_as_f32(src_host, src_dtype, i));
+            md->backend->buf_write(md->buf_id, dst_host, nbytes);
+            free(dst_host);
+        }
+    }
+
+    if (md->host_ptr) {
+        free(md->host_ptr);
+        md->host_ptr = NULL;
+    }
+    extern u32 buf_epoch[];
+    if (md->buf_id < MAX_BUF_EPOCHS)
+        buf_epoch[md->buf_id]++;
+}
+
+static void thvm_grad_slot_accum(TinyHVM *ctx, Term slot, Term grad) {
+    slot = thvm_grad_slot_resolve(ctx, slot);
+    grad = thvm_grad_slot_resolve(ctx, grad);
+    if (term_tag(slot) != TAG_TEN) return;
+    if (term_tag(grad) == TAG_NUM && term_as_f32(grad) == 0.0f) return;
+    if (term_tag(grad) == TAG_ERA && term_val(grad) == 0) return;
+
+    // Keep the visible backward graph mathematical: slot writes happen here,
+    // not as APP(ASSIGN(...), ERA) terms inside GRAD/MUL and friends.
+    u8 saved_trace_enabled = ctx->trace_enabled;
+    ctx->trace_enabled = 0;
+    Term accum = thvm_eval(ctx, thvm_op_raw(ctx, UOP_ADD, slot, grad));
+    ctx->trace_enabled = saved_trace_enabled;
+    if (term_tag(accum) != TAG_TEN) return;
+    thvm_grad_slot_copy_into(ctx, slot, accum);
 }
 
 void thvm_grad_targets_clear(TinyHVM *ctx) {
@@ -298,6 +382,7 @@ void thvm_grad_targets_share(TinyHVM *ctx, u64 dst_loc, u64 src_loc) {
     s->modes[dst_idx] = s->modes[src_idx];
     s->group_ids[dst_idx] = s->group_ids[src_idx];
     s->bundles[dst_idx] = s->bundles[src_idx];
+    s->keep_app_locs[dst_idx] = s->keep_app_locs[src_idx];
 }
 
 static Term grad_resolve_target_term(TinyHVM *ctx, Term t) {
@@ -411,40 +496,64 @@ Term thvm_grad_keep_bundle_get(TinyHVM *ctx, u64 grad_loc) {
     return s->bundles[idx];
 }
 
+void thvm_grad_keep_app_loc_set(TinyHVM *ctx, u64 grad_loc, u64 app_loc) {
+    GradTargetSet *s = grad_targets_get(ctx, 1);
+    if (!s) return;
+    int idx = grad_loc_ensure(s, grad_loc);
+    if (idx < 0) return;
+    s->keep_app_locs[idx] = app_loc;
+}
+
+u64 thvm_grad_keep_app_loc_get(TinyHVM *ctx, u64 grad_loc) {
+    GradTargetSet *s = grad_targets_get(ctx, 0);
+    if (!s) return 0;
+    int idx = grad_loc_index(s, grad_loc);
+    if (idx < 0) return 0;
+    return s->keep_app_locs[idx];
+}
+
 void thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad) {
     GradTargetSet *s = grad_targets_get(ctx, 0);
     if (!s || index >= thvm_grad_targets_count_at(ctx, grad_loc)) return;
     Term bundle = thvm_grad_keep_bundle_get(ctx, grad_loc);
-    if (term_tag(bundle) != TAG_CTR) return;
-    u64 loc = term_val(bundle);
-    if (loc == 0 || loc + index >= ctx->heap_pos) return;
-    Term prev = heap_read(ctx, loc + index);
+    u64 app_loc = thvm_grad_keep_app_loc_get(ctx, grad_loc);
+    u64 loc = 0;
+    Term prev = term_era();
+    if (app_loc != 0) {
+        if (index != 0) return;
+        loc = app_loc;
+        if (loc + 1 >= ctx->heap_pos) return;
+        prev = heap_read(ctx, loc + 1);
+    } else if (term_tag(bundle) == TAG_CTR) {
+        loc = term_val(bundle);
+        if (loc == 0 || loc + index >= ctx->heap_pos) return;
+        prev = heap_read(ctx, loc + index);
+    } else {
+        return;
+    }
     if (getenv("THVM_LOOP_DIAG")) {
         fprintf(stderr,
                 "BUNDLE_ACCUM loc=%llu idx=%u slot=%llu prev_tag=%u prev_ext=%u grad_tag=%u grad_ext=%u grad_val=%llu\n",
                 (unsigned long long)grad_loc,
                 index,
-                (unsigned long long)(loc + index),
+                (unsigned long long)(app_loc != 0 ? (loc + 1) : (loc + index)),
                 (u32)term_tag(prev),
                 (u32)term_ext(prev),
                 (u32)term_tag(grad),
                 (u32)term_ext(grad),
                 (unsigned long long)term_val(grad));
     }
-    // Preserve a standalone copy in the bundle. Shared DP/TOP nodes from the
-    // in-flight backward net can collapse when other consumers reduce; cloning
-    // decouples each accumulated slot from that shared reduction state.
-    Term kept_grad = term_clone(ctx, grad);
-    // Keep bundle slots materializable: store realized tensor leaves, not
-    // lazy graph fragments that can collapse to ERA after backward completes.
-    kept_grad = thvm_force_tensor_term(ctx, kept_grad);
     if (term_tag(prev) == TAG_NUM && term_as_f32(prev) == 0.0f) {
-        heap_set(ctx, loc + index, kept_grad);
+        // Keep mode should expose the live backward net in the bundle. When the
+        // slot is still zero, move the incoming branch directly instead of
+        // cloning/forcing it into a detached tensor.
+        heap_set(ctx, app_loc != 0 ? (loc + 1) : (loc + index), grad);
         return;
     }
-    if (term_tag(kept_grad) == TAG_NUM && term_as_f32(kept_grad) == 0.0f) return;
-    Term prev_kept = thvm_force_tensor_term(ctx, prev);
-    heap_set(ctx, loc + index, thvm_op(ctx, UOP_ADD, prev_kept, kept_grad));
+    if (term_tag(grad) == TAG_NUM && term_as_f32(grad) == 0.0f) return;
+    heap_set(ctx,
+             app_loc != 0 ? (loc + 1) : (loc + index),
+             thvm_op_raw(ctx, UOP_ADD, prev, grad));
 }
 
 Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
@@ -492,13 +601,14 @@ Term thvm_grad_multi_keep(TinyHVM *ctx, Term loss, Term *params, u32 n_params) {
     heap_set(ctx, grad_loc + 1, seed);
     Term driver = term_new(TAG_TOP, UOP_GRAD, grad_loc);
 
-    Term bundle = thvm_grad_bundle_new(ctx, n_params);
+    Term bundle = n_params == 1 ? term_num_f32(0.0f) : thvm_grad_bundle_new(ctx, n_params);
     Term keep_root = thvm_app(ctx, driver, bundle);
 
     thvm_grad_target_set(ctx, grad_loc, thvm_any());
     thvm_grad_mode_set(ctx, grad_loc, GRAD_MODE_KEEP);
     thvm_grad_targets_set_for_loc(ctx, grad_loc, params, NULL, n_params);
-    thvm_grad_keep_bundle_set(ctx, grad_loc, bundle);
+    if (n_params == 1) thvm_grad_keep_app_loc_set(ctx, grad_loc, term_val(keep_root));
+    else               thvm_grad_keep_bundle_set(ctx, grad_loc, bundle);
     return keep_root;
 }
 

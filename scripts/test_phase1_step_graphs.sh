@@ -27,7 +27,8 @@ rm -f graphs/loop_assign_simple/n*_pre_reduce.dot \
       graphs/loop_assign_simple/n*_steps.log \
       graphs/loop_assign_simple/n*_steps_fuse_vals.log
 
-# Full-eval step graph checks (includes FUSE/dispatch interactions in sequence).
+# Step graph checks. THVM_STEP_GRAPH_FUSE traces only the local coarse phase;
+# the post-trace settled eval still runs afterward for the real result.
 FAIL=0
 for n in 0 1 2 3; do
   echo "=== n=$n ==="

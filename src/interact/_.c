@@ -13,6 +13,7 @@
 // Forward declarations (defined in rewrite/_.c, included after interact)
 static int is_view_op(u32 uop);
 static int is_elementwise(u32 uop);
+static void thvm_grad_slot_accum(TinyHVM *ctx, Term slot, Term grad);
 
 static Term thvm_era_payload(TinyHVM *ctx, Term item) {
     while (term_tag(item) == TAG_ERA) {
@@ -122,12 +123,14 @@ static Term thvm_make_growing_kernel_from_uop(TinyHVM *ctx, u32 uop, Term left, 
     return term_new(TAG_TOP, UOP_KERNEL, kloc);
 }
 
+static int thvm_kernel_compute_uop(u32 uop) {
+    return is_binary(uop) || is_elementwise(uop) ||
+           uop == UOP_SUM || uop == UOP_RMAX || is_view_op(uop);
+}
+
 static int thvm_fuse_child_is_compute_like(Term child) {
     if (term_tag(child) != TAG_TOP) return 0;
-    u32 uop = term_ext(child);
-    return is_binary(uop) || is_elementwise(uop) ||
-           uop == UOP_SUM || uop == UOP_RMAX ||
-           (uop >= UOP_RESHAPE && uop <= UOP_PAD);
+    return thvm_kernel_compute_uop(term_ext(child));
 }
 
 static Term thvm_fuse_wrap_child(TinyHVM *ctx, Term child) {
@@ -144,7 +147,7 @@ static int thvm_kernel_local_child_ready(TinyHVM *ctx, Term child) {
         u32 ext = term_ext(child);
         if (ext == UOP_FUSE) return 0;
         if (ext == UOP_KERNEL) return thvm_kernel_is_monolithic(ctx, child);
-        return 1;
+        return thvm_kernel_compute_uop(ext);
     }
     return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
            tag == TAG_SEQ || tag == TAG_CTR || tag == TAG_LAM ||
@@ -278,7 +281,7 @@ static int thvm_kernel_child_ready(Term t) {
         // Child UOP_KERNEL must be dispatched (have a cached result) before
         // the parent can proceed — no recursive flattening.
         if (ext == UOP_KERNEL) return 0;
-        return 1;
+        return thvm_kernel_compute_uop(ext);
     }
     return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
            tag == TAG_SEQ || tag == TAG_CTR || tag == TAG_LAM ||
@@ -303,11 +306,6 @@ static int thvm_kernel_child_resolve(Term child, Term *out) {
     }
     *out = child;
     return 1;
-}
-
-static int thvm_kernel_compute_uop(u32 uop) {
-    return is_binary(uop) || is_elementwise(uop) ||
-           uop == UOP_SUM || uop == UOP_RMAX || is_view_op(uop);
 }
 
 static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 depth) {

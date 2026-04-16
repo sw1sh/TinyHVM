@@ -72,7 +72,8 @@
 	                Term x  = thvm_grad_target_get(ctx, loc);
                     u32 grad_mode = thvm_grad_mode_get(ctx, loc);
                     Term keep_bundle = (grad_mode == GRAD_MODE_KEEP) ? thvm_grad_keep_bundle_get(ctx, loc) : term_era();
-                    int has_keep_bundle = term_tag(keep_bundle) == TAG_CTR;
+                    int has_keep_bundle = thvm_grad_keep_app_loc_get(ctx, loc) != 0 ||
+                                          !(term_tag(keep_bundle) == TAG_ERA && term_val(keep_bundle) == 0);
                     #define GRAD_SLOT_SEQ2(a_, b_) ({ \
                         Term _ga_seq = (a_); \
                         Term _gb_seq = (b_); \
@@ -169,10 +170,7 @@
                             GRAD_RETURN(GRAD_SLOT_ACCUM(slot, gy));
                         }
                         if (grad_mode == GRAD_MODE_KEEP && has_keep_bundle) {
-                            Term gy_keep = gy;
-                            GRAD_RESOLVE_ALIAS(gy_keep);
-                            gy_keep = thvm_force_tensor_term(ctx, gy_keep);
-                            thvm_grad_bundle_accum(ctx, loc, target_index, gy_keep);
+                            thvm_grad_bundle_accum(ctx, loc, target_index, gy);
                             GRAD_RETURN(term_num_f32(0.0f));
                         }
                         if (grad_mode == GRAD_MODE_DROP) GRAD_DROP(gy);
@@ -398,10 +396,7 @@
 	                                GRAD_RETURN(GRAD_SLOT_ACCUM(slot, gy));
 	                            }
                                 if (grad_mode == GRAD_MODE_KEEP && has_keep_bundle) {
-                                    Term gy_keep = gy;
-                                    GRAD_RESOLVE_ALIAS(gy_keep);
-                                    gy_keep = thvm_force_tensor_term(ctx, gy_keep);
-                                    thvm_grad_bundle_accum(ctx, loc, target_index, gy_keep);
+                                    thvm_grad_bundle_accum(ctx, loc, target_index, gy);
                                     GRAD_RETURN(term_num_f32(0.0f));
                                 }
                                 if (grad_mode == GRAD_MODE_DROP) {

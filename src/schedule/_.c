@@ -1212,10 +1212,12 @@ u32 thvm_reduce_collect(TinyHVM *ctx, Term root, Term *out_terms, u32 cap) {
     u8 *reach = NULL;
     size_t reach_cap = 0;
     Term traced = thvm_step_session_init(ctx, root, &reach, &reach_cap);
-    if (n < cap) out_terms[n++] = traced;
+    // Freeze each snapshot with a deep clone so WL can walk it later without
+    // seeing heap mutations from subsequent interactions.
+    if (n < cap) out_terms[n++] = term_clone(ctx, traced);
     while (n < cap &&
            thvm_reduce_step_collect(ctx, &traced, NULL, &reach, &reach_cap)) {
-        out_terms[n++] = traced;
+        out_terms[n++] = term_clone(ctx, traced);
     }
     free(reach);
     step_root_slot = 0;

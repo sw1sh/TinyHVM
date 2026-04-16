@@ -17,6 +17,17 @@ typedef struct { u64 old_loc; u64 new_loc; } Reloc;
 typedef struct { u32 old_label; u32 new_label; } LabelMap;
 typedef struct { Term old_term; Term new_term; } TermMap;
 
+static u32 clone_uop_storage_arity(u32 ext) {
+    if (ext == UOP_KERNEL) return 3;
+    if (ext == UOP_EXEC) return 3;
+    if (ext == UOP_FUSE) return 1;
+    if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
+    if (ext == UOP_GRAD) return 2;
+    if (ext == UOP_LOG_PRINT || ext == UOP_DETACH) return 1;
+    if (!is_binary(ext) && is_elementwise(ext)) return 1;
+    return 2;
+}
+
 static u32 clone_fresh_label(TinyHVM *ctx, u32 old_label, LabelMap *lmap, u32 *n_labels) {
     for (u32 i = 0; i < *n_labels; i++)
         if (lmap[i].old_label == old_label)
@@ -238,7 +249,7 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
         case TAG_TOP: {
             u32 uop = term_ext(t);
             u64 old_loc = term_val(t);
-            u32 arity = (uop == UOP_WHERE || uop == UOP_IFZ) ? 3 : 2;
+            u32 arity = clone_uop_storage_arity(uop);
             u64 new_loc = heap_alloc(ctx, arity);
             for (u32 i = 0; i < arity; i++)
                 heap_set(ctx, new_loc + i,

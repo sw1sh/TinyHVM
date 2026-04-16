@@ -197,14 +197,8 @@ iDotInferShape[val_Integer] := Module[{seen = <||>, go, dims},
             Which[
                 n["Tag"] === "Ten",
                     Quiet[TDimensions[TTensor[n["Val"]]]],
-                n["Tag"] === "Top",
-                    arity = uopArity[Lookup[$uopName, n["Ext"], "?"]];
-                    Do[d = go[n["Val"] + i];
-                       If[ListQ[d], Return[d, Module]],
-                       {i, 0, arity - 1}]; None,
-                KeyExistsQ[$heapTagArity, n["Tag"]] &&
-                    IntegerQ[$heapTagArity[n["Tag"]]],
-                    arity = $heapTagArity[n["Tag"]];
+                n["Tag"] === "Top" || KeyExistsQ[$heapTagArity, n["Tag"]],
+                    arity = termChildCount[n];
                     Do[d = go[n["Val"] + i];
                        If[ListQ[d], Return[d, Module]],
                        {i, 0, arity - 1}]; None,
@@ -283,7 +277,7 @@ TDotGraph[snapshot_?AssociationQ /; KeyExistsQ[snapshot, "Walk"], opts___?Option
         "TermId" -> If[MissingQ[snapshot["Term"]], None, termId[snapshot["Term"]]]];
 TDotGraph[walkIn_?AssociationQ /; KeyExistsQ[walkIn, "Nodes"], opts___?OptionQ] := Module[
     {walk = walkIn, nodes, edges, keys, textColor, bg, lineFor, fillFor, vsf, gEdges, eLabels,
-     nextInfo, activeSlot = -1, activeKey = None, hlColor, eStyleRules,
+     nextInfo, activeSlot = -1, activeKey = None, hlColor, edgePairs, baseEdgeStyles, eStyleRules,
      vertexCoords = Automatic, passedOpts = Flatten[{opts}],
      termIdForHl = None},
     termIdForHl = "TermId" /. passedOpts /. "TermId" -> None;
@@ -370,19 +364,37 @@ TDotGraph[walkIn_?AssociationQ /; KeyExistsQ[walkIn, "Nodes"], opts___?OptionQ] 
                 pos, Center]
         ]]];
 
-    gEdges = DirectedEdge[#["From"], #["To"], #["Port"] -> #["FromSlot"]] & /@ edges;
-    eLabels = Function[e, Module[{from = e[[1]], port = First[Last[e]],
-                                   slot = Last[Last[e]], srcTag},
-            srcTag = Lookup[nodes, from, <||>][["Tag"]];
+    edgePairs = Map[
+        Function[edge, {DirectedEdge[edge["From"], edge["To"],
+                                     edge["Port"] -> Lookup[edge, "FromSlot", 0]],
+                        edge}],
+        edges];
+    gEdges = edgePairs[[All, 1]];
+    eLabels = Map[
+        Function[pair, Module[{e = pair[[1]], edge = pair[[2]], from, port, slot, srcTag, labelColor},
+            from = e[[1]];
+            port = First[Last[e]];
+            slot = Last[Last[e]];
+            srcTag = Lookup[Lookup[nodes, from, <||>], "Tag", None];
+            labelColor = If[Lookup[edge, "Style", ""] === "KernelSemantic",
+                            RGBColor["#006600"], GrayLevel[0.05]];
             e -> Placed[
                 Column[DeleteCases[{
-                    Style[port, 10, Bold, GrayLevel[0.05]],
+                    Style[port, 10, Bold, labelColor],
                     (* Only show @slot tail label for tensor sources (matches dump.c). *)
                     If[slot > 0 && srcTag === "Ten",
                         Style["@" <> ToString[slot], 7, Italic, GrayLevel[0.45]],
                         Nothing]
                 }, Nothing], Alignment -> Center, Spacings -> 0.05],
-                {0.7, {0, 0}}]]] /@ gEdges;
+                {0.7, {0, 0}}]]],
+        edgePairs];
+    baseEdgeStyles = Map[
+        Function[pair,
+            pair[[1]] -> If[Lookup[pair[[2]], "Style", ""] === "KernelSemantic",
+                Directive[RGBColor["#009900"], AbsoluteThickness[1.0],
+                          Dashing[{0.02, 0.02}], Arrowheads[0.025]],
+                Directive[Black, AbsoluteThickness[1.0], Arrowheads[0.025]]]],
+        edgePairs];
     (* Highlight only the single edge at the active source slot — matches dump.c. *)
     eStyleRules = If[activeSlot < 0, {},
         Cases[gEdges,
@@ -420,8 +432,7 @@ TDotGraph[walkIn_?AssociationQ /; KeyExistsQ[walkIn, "Nodes"], opts___?OptionQ] 
             VertexSize   -> {0.55, 0.25},
             VertexCoordinates -> vertexCoords,
             EdgeLabels   -> eLabels,
-            EdgeStyle    -> Join[eStyleRules,
-                                 {Directive[Black, AbsoluteThickness[1.0], Arrowheads[0.025]]}],
+            EdgeStyle    -> Join[baseEdgeStyles, eStyleRules],
             PerformanceGoal -> "Quality",
             PlotRange    -> {
                 {Min[xs] - pad, Max[xs] + pad},

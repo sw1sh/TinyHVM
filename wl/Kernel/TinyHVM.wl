@@ -258,22 +258,22 @@ $heapTagArity = <|
     "Top" -> Automatic   (* arity depends on uop; see uopArity *)
 |>;
 
-(* UOp arity (number of heap slots at term_val of a TOP node).
-   Unary ops still allocate 2 slots; the second is ERA. *)
+(* UOp storage arity (number of heap slots at term_val of a TOP node).
+   Mirrors thvm_uop_storage_arity in src/interact/_.c. *)
 uopArity[uop_String] := Which[
-    MemberQ[$viewOps, uop],            2,                   (* in, shape *)
-    MemberQ[$binaryOps, uop],          2,
-    uop === "MatMul",                   2,
-    uop === "Sum" || uop === "RMax",    2,                   (* in, axes *)
-    uop === "Grad",                     2,                   (* y, gy *)
+    uop === "Kernel",                   3,
+    uop === "Exec",                     3,
+    uop === "Fuse",                     1,
     uop === "Where",                    3,
     uop === "Ifz",                      3,
-    uop === "Assign",                   2,
-    uop === "Kernel",                   3,                   (* left, right/meta, NUM(root_uop) *)
-    uop === "Fuse",                     1,
-    uop === "Exec",                     3,                   (* NUM(kid), deps, NUM(flags) *)
+    uop === "Grad",                     2,
     uop === "Detach" || uop === "LogPrint" || uop === "ToDevice", 1,
-    True,                                1
+    MemberQ[$viewOps, uop],             2,
+    MemberQ[$binaryOps, uop],           2,
+    uop === "MatMul",                   2,
+    uop === "Sum" || uop === "RMax",    2,
+    MemberQ[$elementwiseOps, uop],      1,
+    True,                               2
 ];
 
 (* Port name for slot index i of a TOP/<uop>. Mirrors dot_uop_port_name. *)

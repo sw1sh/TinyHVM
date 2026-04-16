@@ -21,8 +21,21 @@ static void thvm_step_graph_set_before_top_partner(Term partner, u64 slot);
 typedef struct {
     Term before;
     u64  source_slot;
+    u8   kind;
     char name[160];
 } StepMeta;
+
+static int thvm_reduce_step_collect(TinyHVM *ctx, Term *traced_io,
+                                    StepMeta *meta,
+                                    u8 **reach_io, size_t *reach_cap_io);
+
+static void thvm_step_meta_apply_kind_name(u8 kind, char *buf, size_t nbuf) {
+    if (!buf || nbuf == 0 || kind != THVM_STEP_KIND_SWEEP || !buf[0]) return;
+    if (strncmp(buf, "SWEEP_", 6) == 0) return;
+    char tmp[160];
+    snprintf(tmp, sizeof(tmp), "SWEEP_%s", buf);
+    snprintf(buf, nbuf, "%s", tmp);
+}
 
 // schedule/_.c — Unified IC eval: reduce + fuse in two passes.
 //
@@ -460,13 +473,6 @@ static void step_mark_reachable_slots(TinyHVM *ctx, Term root, u8 *reach) {
     if (!(term_tag(root) == TAG_ERA && term_val(root) == 0)) P1_PUSH(root);
     if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
         P1_PUSH(heap_read(ctx, step_root_slot));
-    for (u64 h = 1; h < ctx->heap_pos; h++) {
-        Term ht = ctx->heap[h];
-        if (term_tag(ht) == TAG_ERA && term_val(ht) != 0) {
-            reach[h] = 1;
-            P1_PUSH(ht);
-        }
-        }
 
     while (work && wp > 0) {
         Term tt = work[--wp];
@@ -872,12 +878,25 @@ static int thvm_step_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before, 
 }
 
 static int thvm_step_find_next_actual(TinyHVM *ctx, Term root,
-                                        u64 *out_source_slot, Term *out_before) {
+                                      u64 *out_source_slot, Term *out_before,
+                                      u8 *out_kind) {
     Term before = 0;
     Term whnf = root;
     if (thvm_step_predict_next_redex(ctx, root, &before, &whnf)) {
         if (out_source_slot) *out_source_slot = step_root_slot;
         if (out_before) *out_before = before;
+        if (out_kind) *out_kind = THVM_STEP_KIND_ROOT;
+        return 1;
+    }
+    // The collector still gives the mirrored root one real step even when the
+    // predictor classifies FUSE(TEN/ERA/NUM) as a hidden terminal passthrough.
+    // Keep next-step discovery aligned with that behavior so the handoff from
+    // mainline root work to detached sweep cleanup doesn't skip the final root
+    // interaction in filenames/highlights.
+    if (step_top_is_hidden_trace_passthru(ctx, root)) {
+        if (out_source_slot) *out_source_slot = step_root_slot;
+        if (out_before) *out_before = root;
+        if (out_kind) *out_kind = THVM_STEP_KIND_ROOT;
         return 1;
     }
 
@@ -904,6 +923,8 @@ static int thvm_step_find_next_actual(TinyHVM *ctx, Term root,
         if (thvm_step_predict_next_redex(ctx, ht, &before, &w)) {
             if (out_source_slot) *out_source_slot = h;
             if (out_before) *out_before = before;
+            if (out_kind) *out_kind = reachable ? THVM_STEP_KIND_HEAP
+                                                : THVM_STEP_KIND_SWEEP;
             free(reach);
             return 1;
         }
@@ -1010,16 +1031,40 @@ static void thvm_step_graph_scrub_detached_eras(TinyHVM *ctx) {
 }
 
 
-static Term thvm_eval_reduce_fused(TinyHVM *ctx, Term t) {
+static int thvm_eval_mixed_dispatch_enabled(void) {
+    const char *env = getenv("THVM_EVAL_MIXED_DISPATCH");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static Term thvm_eval_collect_fixed_point(TinyHVM *ctx, Term t, int dispatch_enabled) {
+    u8 *reach = NULL;
+    size_t reach_cap = 0;
+    step_root_slot = 0;
+    Term traced = thvm_step_seed_root_grad(ctx, t);
+    ctx->dispatch_enabled = dispatch_enabled;
+    while (thvm_reduce_step_collect(ctx, &traced, NULL, &reach, &reach_cap)) {}
+    ctx->dispatch_enabled = 0;
+    free(reach);
+    if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
+        heap_set(ctx, step_root_slot, term_era());
+    step_root_slot = 0;
+    return traced;
+}
+
+static Term thvm_eval_fuse_fixed_point(TinyHVM *ctx, Term t, int mixed_dispatch) {
     u64 fuse_loc = heap_alloc(ctx, 1);
     heap_set(ctx, fuse_loc, t);
-    Term fuse_term = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
-    ctx->step_budget = 1000000;  // suppress quiesce (budget>0 → no quiesce)
-    ctx->dispatch_enabled = 1;   // phase-2: allow KERNEL register + dispatch
-    t = thvm_reduce(ctx, fuse_term);
-    ctx->dispatch_enabled = 0;
-    ctx->step_budget = 0;
-    return t;
+    return thvm_eval_collect_fixed_point(ctx, term_new(TAG_TOP, UOP_FUSE, fuse_loc),
+                                         mixed_dispatch);
+}
+
+static Term thvm_eval_exec_fixed_point(TinyHVM *ctx, Term t) {
+    return thvm_eval_collect_fixed_point(ctx, t, 1);
+}
+
+static Term thvm_eval_reduce_fused(TinyHVM *ctx, Term t) {
+    int mixed_dispatch = thvm_eval_mixed_dispatch_enabled();
+    return thvm_eval_fuse_fixed_point(ctx, t, mixed_dispatch);
 }
 
 // One step-by-step IC reduction: fires a single visible interaction at the
@@ -1107,16 +1152,16 @@ static int thvm_reduce_step_collect(TinyHVM *ctx, Term *traced_io,
                 if (meta) {
                     meta->before = before;
                     meta->source_slot = predicted_source_slot;
+                    meta->kind = THVM_STEP_KIND_ROOT;
                     snprintf(meta->name, sizeof(meta->name), "%s", predicted_name);
                 }
                 return 1;
             }
         }
     }
+    int root_terminal = step_trace_root_is_terminal(ctx, traced);
 
-    if (step_trace_root_is_terminal(ctx, traced)) return 0;
-
-    // ── Heap sweep: fire on the first reachable heap-resident agent. ──
+    // ── Heap sweep: fire on the first reachable heap redex, then detached cleanup. ──
     u8 *reach = *reach_io;
     step_mark_reachable_slots(ctx, traced, reach);
     for (u64 h = 1; h < ctx->heap_pos; h++) {
@@ -1136,12 +1181,17 @@ static int thvm_reduce_step_collect(TinyHVM *ctx, Term *traced_io,
         Term container_before = ht;
         Term predicted_before = ht;
         u64 predicted_source_slot = h;
+        u8 predicted_kind = reachable ? THVM_STEP_KIND_HEAP
+                                      : THVM_STEP_KIND_SWEEP;
         char predicted_name[160] = {0};
         thvm_step_predict_next_redex(ctx, ht, &predicted_before, NULL);
         thvm_step_capture_step_before_meta(ctx, predicted_before);
         predicted_source_slot = thvm_step_redex_source_slot(ctx, h, ht, predicted_before);
         thvm_step_graph_name_for_interaction(ctx, predicted_source_slot, predicted_before,
                                              predicted_name, sizeof(predicted_name));
+        if (predicted_kind == THVM_STEP_KIND_SWEEP || root_terminal)
+            thvm_step_meta_apply_kind_name(THVM_STEP_KIND_SWEEP,
+                                           predicted_name, sizeof(predicted_name));
 
         u64 target_slot = (predicted_source_slot > 0 && predicted_source_slot < ctx->heap_pos &&
                            heap_read(ctx, predicted_source_slot) == predicted_before)
@@ -1177,6 +1227,9 @@ static int thvm_reduce_step_collect(TinyHVM *ctx, Term *traced_io,
                 thvm_step_graph_set_before_top_partner(term_era(), 0);
                 thvm_step_graph_name_for_interaction(ctx, predicted_source_slot, tb,
                                                      predicted_name, sizeof(predicted_name));
+                if (predicted_kind == THVM_STEP_KIND_SWEEP || root_terminal)
+                    thvm_step_meta_apply_kind_name(THVM_STEP_KIND_SWEEP,
+                                                   predicted_name, sizeof(predicted_name));
             }
         }
         ctx->trace_buf = saved_buf;
@@ -1198,6 +1251,9 @@ static int thvm_reduce_step_collect(TinyHVM *ctx, Term *traced_io,
         if (meta) {
             meta->before = before_h;
             meta->source_slot = predicted_source_slot;
+            meta->kind = (predicted_kind == THVM_STEP_KIND_SWEEP || root_terminal)
+                       ? THVM_STEP_KIND_SWEEP
+                       : THVM_STEP_KIND_HEAP;
             snprintf(meta->name, sizeof(meta->name), "%s", predicted_name);
         }
         return 1;
@@ -1285,7 +1341,8 @@ static void sched_dump_heap(TinyHVM *ctx) {
 
 
 
-// Walk through view ops and DP refs to find the innermost compute/leaf term.
+// Walk through view ops, monolithic local KERNELs, and DP refs to find the
+// innermost schedulable compute/leaf term.
 static Term sched_unwrap_views(TinyHVM *ctx, Term t) {
     for (int d = 0; d < 20; d++) {
         // DUP is a hard boundary — do not unwrap through DP0/DP1.
@@ -1296,6 +1353,11 @@ static Term sched_unwrap_views(TinyHVM *ctx, Term t) {
                 t = sub;
                 continue;
             }
+        }
+        if (term_tag(t) == TAG_TOP && term_ext(t) == UOP_KERNEL &&
+            thvm_kernel_is_monolithic(ctx, t)) {
+            t = thvm_kernel_monolithic_payload(ctx, t);
+            continue;
         }
         if (term_tag(t) != TAG_TOP || !is_view_op(term_ext(t))) break;
         t = heap_read(ctx, term_val(t));
@@ -1518,6 +1580,14 @@ static void sched_collect_boundaries(TinyHVM *ctx, Term root) {
         SchedParentClass pclass = sched_parent_class(tt);
         if (pclass == SCHED_PARENT_NONE && tg == TAG_TOP && is_view_op(term_ext(tt)))
             pclass = item.inherited_class;
+        if (tg == TAG_TOP && term_ext(tt) == UOP_KERNEL && thvm_kernel_is_monolithic(ctx, tt)) {
+            // Monolithic public kernels are just wrappers around the real
+            // compute payload. Do not count the payload as a second consumer of
+            // itself, or boundary selection collapses KERNEL@loc back to
+            // payload@loc and rewrites miss the actual parent slot.
+            SCHED_PUSH(thvm_kernel_monolithic_payload(ctx, tt), item.inherited_class);
+            continue;
+        }
         for (u32 i = 0; i < ar; i++) {
             u64 p = tv + i;
             if (p >= ctx->heap_pos) continue;
@@ -1594,6 +1664,8 @@ static void sched_exec_order_visit(u32 kid, u8 *seen) {
     if (sched_exec_count < SCHED_MAX_KERNELS)
         sched_exec_order[sched_exec_count++] = kid;
 }
+
+static Term thvm_build_exec_trigger(TinyHVM *ctx, u32 kid, Term dep_chain, u32 flags);
 
 static void sched_plan_output_liveness(TinyHVM *ctx) {
     memset(sched_output_remaining_uses, 0, sizeof(sched_output_remaining_uses));
@@ -1698,33 +1770,17 @@ static void sched_replace_term_everywhere(TinyHVM *ctx, Term original, Term rewr
 }
 
 static Term sched_install_kernel(TinyHVM *ctx, SchedBoundary *b, KernelEntry *ke) {
-    u64 floc = ctx->heap_pos;
-    ctx->heap_pos += 2;
-    heap_set(ctx, floc, term_era());
-    heap_set(ctx, floc + 1, term_num_u32(b->kid));
-    Term ft = term_new(TAG_TOP, UOP_KERNEL, floc);
-    sched_kernel_locs[b->kid] = floc;
-
-    const ShapeTracker *out_st = tensor_st_get(&ctx->tensors[b->output_tid]);
-    if (out_st && out_st->n_views > 0) st_set_tracker(floc, out_st);
-    else {
-        const View *out_v = tensor_view_get(&ctx->tensors[b->output_tid]);
-        View fallback = out_v ? *out_v : view_create(ke->out_shape);
-        st_set(floc, &fallback);
-    }
-
-    // Encode dependencies as DAG edges in the kernel's heap slot.
-    // Deps are stored as a right-nested CTR chain: CTR(dep0, CTR(dep1, ERA)).
-    // The UOP_KERNEL/UOP_EXEC handler checks dep readiness before dispatch.
+    // Encode dependencies as a right-nested CTR chain: CTR(dep0, CTR(dep1, ERA)).
+    // Global passes install executable triggers, not structural UOP_KERNEL
+    // shells — phase 3 consumes UOP_EXEC nodes directly.
     extern Term fuse_assign_deps[];
     extern u32  fuse_n_assign_deps;
 
-    // Collect all deps into a single right-nested CTR chain
     Term dep_chain = term_era();
     for (u32 di = 0; di < ke->n_deps; di++) {
         u32 dep_kid = ke->dep_kids[di];
         if (dep_kid < SCHED_MAX_KERNELS && sched_kernel_locs[dep_kid]) {
-            Term dep_kernel = term_new(TAG_TOP, UOP_KERNEL, sched_kernel_locs[dep_kid]);
+            Term dep_kernel = term_new(TAG_TOP, UOP_EXEC, sched_kernel_locs[dep_kid]);
             u64 ctr_loc = heap_alloc(ctx, 2);
             heap_set(ctx, ctr_loc + 0, dep_kernel);
             heap_set(ctx, ctr_loc + 1, dep_chain);
@@ -1738,14 +1794,22 @@ static Term sched_install_kernel(TinyHVM *ctx, SchedBoundary *b, KernelEntry *ke
         dep_chain = term_new(TAG_CTR, 0, ctr_loc);
     }
 
-    // Store dep chain in kernel's slot 0 (was ERA before)
-    heap_set(ctx, floc, dep_chain);
+    Term ft = thvm_build_exec_trigger(ctx, b->kid, dep_chain, 0);
+    u64 floc = term_val(ft);
+    sched_kernel_locs[b->kid] = floc;
+
+    const ShapeTracker *out_st = tensor_st_get(&ctx->tensors[b->output_tid]);
+    if (out_st && out_st->n_views > 0) st_set_tracker(floc, out_st);
+    else {
+        const View *out_v = tensor_view_get(&ctx->tensors[b->output_tid]);
+        View fallback = out_v ? *out_v : view_create(ke->out_shape);
+        st_set(floc, &fallback);
+    }
 
     // Legacy SEQ wrapping kept for backward compatibility until
-    // UOP_KERNEL handler checks dep_chain directly.
-    // TODO: remove once UOP_KERNEL handles CTR deps natively.
+    // nested EXEC dependency chains are fully normalized.
     if (term_tag(dep_chain) != TAG_ERA) {
-        // Walk the CTR chain and wrap as SEQ for now
+        // Walk the CTR chain and wrap as SEQ for now.
         Term walk = dep_chain;
         while (term_tag(walk) == TAG_CTR) {
             Term dep = heap_read(ctx, term_val(walk));
@@ -1964,6 +2028,17 @@ u32 sched_all(TinyHVM *ctx, Term root) {
     return selected;
 }
 
+static Term thvm_sched_global_pass(TinyHVM *ctx, Term root) {
+    if (!ctx) return root;
+    Term sched_root = root;
+    if (term_tag(root) == TAG_TOP && term_ext(root) == UOP_KERNEL &&
+        thvm_kernel_is_monolithic(ctx, root))
+        sched_root = thvm_kernel_monolithic_payload(ctx, root);
+    if (sched_all(ctx, sched_root) == 0) return root;
+    Term rewritten = thvm_sched_rewrite_get(ctx, sched_root);
+    return term_tag(rewritten) != TAG_ERA ? rewritten : root;
+}
+
 // === DELETED: 500+ lines of merge passes (4-9), memory analysis, dead kernel redirect ===
 // These were post-hoc merge attempts that created broken kernels.
 // Replaced by: nothing. The simple 3-pass scheduling is sufficient.
@@ -1986,6 +2061,7 @@ static Term thvm_run_global_passes(TinyHVM *ctx, Term t) {
             char summary[128];
             thvm_graph_term_summary(t, summary, sizeof(summary));
             fprintf(dump, "registered_passes=%u\n", ctx->n_compiler_passes);
+            fprintf(dump, "mixed_dispatch=%d\n", thvm_eval_mixed_dispatch_enabled());
             fprintf(dump, "input=%s\n", summary);
         }
     }
@@ -2116,17 +2192,10 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
         if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
             heap_set(ctx, step_root_slot, term_era());
 
-        // Phase 2: wrap in UOP_FUSE and reduce — fuses compute + dispatches + fires ASSIGN.
-        {
-            u64 fuse_loc = heap_alloc(ctx, 1);
-            heap_set(ctx, fuse_loc, traced);
-            Term fuse_term = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
-            ctx->step_budget = 1000000;  // suppress quiesce (budget>0 → no quiesce)
-            ctx->dispatch_enabled = 1;
-            traced = thvm_reduce(ctx, fuse_term);
-            ctx->dispatch_enabled = 0;
-            ctx->step_budget = 0;
-        }
+        // Phase 2: wrap in UOP_FUSE and reduce. By default this produces the
+        // post-local coarse graph only; THVM_EVAL_MIXED_DISPATCH=1 preserves
+        // the legacy mixed path that also dispatches during this pass.
+        traced = thvm_eval_fuse_fixed_point(ctx, traced, thvm_eval_mixed_dispatch_enabled());
         traced = thvm_step_seed_root_grad(ctx, traced);
         thvm_graph_dump_path(path, sizeof(path), "thvm_2_post_dispatch.dot");
         thvm_heap_dot_set_sched_kernels(0);
@@ -2147,11 +2216,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
 
         // Phase 3: second reduce for exec triggers.
         if (ctx->n_compiler_passes > 0) {
-            ctx->step_budget = 1000000;
-            ctx->dispatch_enabled = 1;
-            traced = thvm_reduce(ctx, traced);
-            ctx->dispatch_enabled = 0;
-            ctx->step_budget = 0;
+            traced = thvm_eval_exec_fixed_point(ctx, traced);
         }
         traced = thvm_step_seed_root_grad(ctx, traced);
         thvm_graph_dump_path(path, sizeof(path), "thvm_4_post_exec.dot");
@@ -2177,9 +2242,7 @@ Term thvm_eval(TinyHVM *ctx, Term t) {
     t = thvm_run_global_passes(ctx, t);
     // Phase 3: second reduce — fires any UOP_EXEC triggers from passes
     if (ctx->n_compiler_passes > 0) {
-        ctx->step_budget = 1000000;
-        t = thvm_reduce(ctx, t);
-        ctx->step_budget = 0;
+        t = thvm_eval_exec_fixed_point(ctx, t);
     }
     sched_planner_release_detached_slots();
     ctx->eval_depth--;

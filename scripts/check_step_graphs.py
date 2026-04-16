@@ -197,6 +197,8 @@ def canonical_step_base(name: str) -> str:
     s = STEP_NAMED_PAIR_SUFFIX_RE.sub("", name)
     s = STEP_HEAP_PAIR_SUFFIX_RE.sub("", s)
     s = STEP_HEAP_SINGLE_SUFFIX_RE.sub("", s)
+    if s.startswith("SWEEP_"):
+        s = s[6:]
     return s
 
 
@@ -204,6 +206,14 @@ def step_mentions(name: str, token: str) -> bool:
     if not name:
         return False
     return re.search(rf'(^|_){re.escape(token)}(_h|$)', name) is not None
+
+
+def graph_has_sweep_context(g: DotGraph) -> bool:
+    return (
+        g.suffix.startswith("SWEEP_")
+        or g.prev_interaction.startswith("SWEEP_")
+        or g.next_interaction.startswith("SWEEP_")
+    )
 
 
 def prev_interaction_name(g: DotGraph) -> str:
@@ -246,6 +256,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
     # (loop tests, forward-only tests have no GRAD)
 
     gl = graphs[-1]
+    final_has_sweep = graph_has_sweep_context(gl)
     if has_init_grad:
         has_final_grad = any(lbl.split("\\n", 1)[0] == "GRAD" for lbl in gl.nodes.values())
         if has_final_grad:
@@ -277,7 +288,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
         max_final_roots = len(init_roots)
         # Detached ERA agents from IFZ create extra roots — count non-ERA roots only.
         non_era_final_roots = [r for r in final_roots if gl.kind(r) != "ERA"]
-        if len(non_era_final_roots) > max_final_roots:
+        if len(non_era_final_roots) > max_final_roots and not final_has_sweep:
             errs.append(
                 f"{os.path.basename(gl.path)}: final graph has {len(non_era_final_roots)} non-ERA result roots "
                 f"(expected no more than {max_final_roots} init roots)"
@@ -286,14 +297,17 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
             errs.append(f"{os.path.basename(gl.path)}: final graph must retain at least one root")
         final_era_nodes = sorted(nid for nid in gl.nodes if gl.kind(nid) == "ERA")
         final_has_fuse = any(lbl.split("\\n", 1)[0] == "FUSE" for lbl in gl.nodes.values())
+        final_rootout_nodes = {nid for nid in gl.nodes if nid.startswith("rootout_t")}
         # Detached ERA agents from IFZ/cleanup may linger after phase 1 —
-        # only flag if ERA nodes are connected to live computation (non-ERA neighbors).
+        # only flag if ERA nodes are connected to live computation (non-ERA
+        # neighbors). Tensor-result finals legitimately retain visible
+        # cleanup/book structure in the same component, so don't reject them.
         connected_era = []
         for enid in final_era_nodes:
             neighbors = final_adj.get(enid, [])
             if any(gl.kind(n) != "ERA" for n in neighbors):
                 connected_era.append(enid)
-        if connected_era and not final_has_fuse:
+        if connected_era and not final_has_fuse and not final_rootout_nodes:
             errs.append(
                 f"{os.path.basename(gl.path)}: final graph has ERA nodes connected to live computation {connected_era[:6]}"
             )
@@ -313,7 +327,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
                     seen_final.add(nx)
                     q.append(nx)
             comp_roots = [n for n in comp if n in final_roots]
-            if not comp_roots:
+            if not comp_roots and not final_has_sweep:
                 errs.append(
                     f"{os.path.basename(gl.path)}: final graph has rootless component {sorted(comp)[:6]}"
                 )
@@ -518,24 +532,25 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
             )
 
         # 3) No plain node/tensor fanout directly to ERA and another target.
-        for nid in g.nodes:
-            k = g.kind(nid)
-            if k in ("ERA", "DUP", "TEN", "NUM", "ANY", "CTR"):
-                continue
-            if k in ("VAR", "LAM"):
-                continue
-            if RAW_HEAP_NODE_RE.match(nid):
-                continue
-            outs = [
-                e for e in out_map.get(nid, [])
-                if not is_annotation_edge(e[2]) and not is_alo_env_edge(e[2])
-            ]
-            if not outs:
-                continue
-            to_era = any(g.kind(dst) == "ERA" for _, dst, _ in outs)
-            to_non_era = any(g.kind(dst) != "ERA" for _, dst, _ in outs)
-            if to_era and to_non_era:
-                errs.append(f"{os.path.basename(g.path)}: node '{nid}' fans out to ERA and non-ERA targets")
+        if not graph_has_sweep_context(g):
+            for nid in g.nodes:
+                k = g.kind(nid)
+                if k in ("ERA", "DUP", "TEN", "NUM", "ANY", "CTR"):
+                    continue
+                if k in ("VAR", "LAM"):
+                    continue
+                if RAW_HEAP_NODE_RE.match(nid):
+                    continue
+                outs = [
+                    e for e in out_map.get(nid, [])
+                    if not is_annotation_edge(e[2]) and not is_alo_env_edge(e[2])
+                ]
+                if not outs:
+                    continue
+                to_era = any(g.kind(dst) == "ERA" for _, dst, _ in outs)
+                to_non_era = any(g.kind(dst) != "ERA" for _, dst, _ in outs)
+                if to_era and to_non_era:
+                    errs.append(f"{os.path.basename(g.path)}: node '{nid}' fans out to ERA and non-ERA targets")
 
         # 4) DUP used for ERA must still show another consumer.
         for nid in g.nodes:

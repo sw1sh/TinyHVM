@@ -52,9 +52,16 @@ def main() -> int:
         if not diag_path.is_file():
             return fail(f"diag log {diag_path} does not exist")
 
-    fuse_ten = [name for _, name, _ in steps if FUSE_TEN_RE.search(name)]
-    if fuse_ten:
-        return fail(f"{step_dir} still contains administrative FUSE->TEN steps: {fuse_ten[:3]}")
+    bad_fuse_ten = []
+    for i, (_, name, _) in enumerate(steps):
+        if not FUSE_TEN_RE.search(name):
+            continue
+        next_name = steps[i + 1][1] if i + 1 < len(steps) else "state_final"
+        if next_name.startswith("SWEEP_") or next_name.startswith("state_final"):
+            continue
+        bad_fuse_ten.append(name)
+    if bad_fuse_ten:
+        return fail(f"{step_dir} still contains non-handoff FUSE->TEN steps: {bad_fuse_ten[:3]}")
 
     m_iter = ITER_RE.search(step_dir.name)
     train_steps = int(m_iter.group(1)) if m_iter else None

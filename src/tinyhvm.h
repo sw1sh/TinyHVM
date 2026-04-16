@@ -211,6 +211,14 @@ static inline void thvm_agent_debug_log(const char *run_id, const char *hypothes
 
 static const char *phase_names[] = {"forward", "backward", "adam", "reset", "other"};
 
+// Step-trace interaction origin:
+//   ROOT  - the visible root redex fired
+//   HEAP  - an interior reachable redex fired
+//   SWEEP - detached cleanup outside the single-root reduction frontier
+#define THVM_STEP_KIND_ROOT   0
+#define THVM_STEP_KIND_HEAP   1
+#define THVM_STEP_KIND_SWEEP  2
+
 typedef struct {
     // Per-UOp dispatch stats (compute ops)
     u64 uop_ns[PROF_UOP_MAX];       // total nanoseconds per UOp

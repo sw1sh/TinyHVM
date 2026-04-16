@@ -7,10 +7,14 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 static void thvm_heap_dot_set_highlight(u64 slot, Term term);
 static int thvm_heap_dot_highlight_was_drawn(void);
 static void thvm_heap_dot_set_step_meta(const char *prev_name, const char *next_name);
-static int thvm_step_find_next_actual(TinyHVM *ctx, Term root, u64 *out_source_slot, Term *out_before);
+static int thvm_step_find_next_actual(TinyHVM *ctx, Term root,
+                                      u64 *out_source_slot, Term *out_before,
+                                      u8 *out_kind);
 static u64 thvm_step_redex_source_slot(TinyHVM *ctx, u64 container_slot, Term container, Term before);
 static int thvm_step_graph_highlight_from_before(TinyHVM *ctx, u64 source_slot, Term before,
                                                  u64 *out_slot, Term *out_term);
+static int thvm_step_graph_highlight_from_current_before(TinyHVM *ctx, u64 source_slot, Term before,
+                                                         u64 *out_slot, Term *out_term);
 static const char *thvm_step_tag_name_short(u8 tag);
 static const char *thvm_step_graph_interaction_name(TinyHVM *ctx, Term before,
                                                     char *buf, size_t nbuf);
@@ -21,6 +25,8 @@ static const char *thvm_step_graph_interaction_name_current_at(TinyHVM *ctx, u64
 static void thvm_step_graph_append_focus_suffix(TinyHVM *ctx, u64 source_slot, Term before,
                                                 u64 hl_slot, Term hl_term,
                                                 char *buf, size_t nbuf);
+static void thvm_step_graph_apply_kind_name(u8 kind, char *buf, size_t nbuf);
+static void thvm_step_graph_rewrite_sweep_highlight(const char *path);
 
 // Simple open-addressing hash set for visited Term values
 typedef struct {
@@ -179,6 +185,7 @@ static int step_graph_active = 0;
 static u32 step_graph_n = 0;
 static u64 step_graph_last_sig = 0;
 static u64 step_graph_last_dot_sig = 0; // signature of unhighlighted structural DOT
+static u64 step_graph_last_render_sig = 0; // signature of last written visible DOT before meta rewrite
 static Term step_graph_root_term = 0;
 static Term step_graph_before_grad_y = 0;
 static Term step_graph_before_era_payload = 0;
@@ -224,6 +231,105 @@ static u32 thvm_step_graph_max_steps(void) {
         if (n > 0) return (u32)n;
     }
     return 512;
+}
+
+static void thvm_step_graph_apply_kind_name(u8 kind, char *buf, size_t nbuf) {
+    if (!buf || nbuf == 0 || kind != THVM_STEP_KIND_SWEEP || !buf[0]) return;
+    if (strncmp(buf, "SWEEP_", 6) == 0) return;
+    char tmp[160];
+    snprintf(tmp, sizeof(tmp), "SWEEP_%s", buf);
+    snprintf(buf, nbuf, "%s", tmp);
+}
+
+static void thvm_step_graph_rewrite_sweep_highlight(const char *path) {
+    if (!path || !path[0]) return;
+    FILE *in = fopen(path, "rb");
+    if (!in) return;
+    fseek(in, 0, SEEK_END);
+    long len = ftell(in);
+    fseek(in, 0, SEEK_SET);
+    if (len < 0) {
+        fclose(in);
+        return;
+    }
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(in);
+        return;
+    }
+    size_t got = fread(buf, 1, (size_t)len, in);
+    fclose(in);
+    buf[got] = '\0';
+
+    const char *needle_a = "[color=\"#cc0000\",penwidth=2.0]";
+    const char *replace_a = "[color=\"#cc0000\",penwidth=2.0,style=dashed]";
+    const char *needle_b = ",color=\"#cc0000\",penwidth=2.0";
+    const char *replace_b = ",color=\"#cc0000\",penwidth=2.0,style=dashed";
+
+    size_t cap = got + 256;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        free(buf);
+        return;
+    }
+    size_t wi = 0;
+    for (size_t i = 0; i < got; ) {
+        if (i + strlen(needle_a) <= got &&
+            memcmp(buf + i, needle_a, strlen(needle_a)) == 0) {
+            size_t need = strlen(replace_a);
+            if (wi + need + 1 > cap) {
+                cap = (cap + need + 256) * 2;
+                char *grown = (char *)realloc(out, cap);
+                if (!grown) {
+                    free(out);
+                    free(buf);
+                    return;
+                }
+                out = grown;
+            }
+            memcpy(out + wi, replace_a, need);
+            wi += need;
+            i += strlen(needle_a);
+            continue;
+        }
+        if (i + strlen(needle_b) <= got &&
+            memcmp(buf + i, needle_b, strlen(needle_b)) == 0) {
+            size_t need = strlen(replace_b);
+            if (wi + need + 1 > cap) {
+                cap = (cap + need + 256) * 2;
+                char *grown = (char *)realloc(out, cap);
+                if (!grown) {
+                    free(out);
+                    free(buf);
+                    return;
+                }
+                out = grown;
+            }
+            memcpy(out + wi, replace_b, need);
+            wi += need;
+            i += strlen(needle_b);
+            continue;
+        }
+        if (wi + 2 > cap) {
+            cap *= 2;
+            char *grown = (char *)realloc(out, cap);
+            if (!grown) {
+                free(out);
+                free(buf);
+                return;
+            }
+            out = grown;
+        }
+        out[wi++] = buf[i++];
+    }
+    out[wi] = '\0';
+    FILE *fp = fopen(path, "wb");
+    if (fp) {
+        fwrite(out, 1, wi, fp);
+        fclose(fp);
+    }
+    free(out);
+    free(buf);
 }
 
 static void thvm_step_graph_set_before_grad_y(Term y) {
@@ -649,6 +755,20 @@ static int thvm_step_slot_is_rendered_parent_arg(TinyHVM *ctx, u64 slot) {
     return 0;
 }
 
+static int thvm_step_find_active_era_for_payload_slot(TinyHVM *ctx, u64 payload_slot,
+                                                      u64 *out_era_slot, Term *out_era_term) {
+    if (!ctx || payload_slot == 0 || payload_slot >= ctx->heap_pos) return 0;
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term p = ctx->heap[h];
+        if (term_tag(p) != TAG_ERA) continue;
+        if (term_val(p) != payload_slot) continue;
+        if (out_era_slot) *out_era_slot = h;
+        if (out_era_term) *out_era_term = p;
+        return 1;
+    }
+    return 0;
+}
+
 static Term thvm_step_parent_term_for_slot(TinyHVM *ctx, u64 slot) {
     for (u64 h = 1; h < ctx->heap_pos; h++) {
         Term p = ctx->heap[h];
@@ -679,11 +799,16 @@ static int thvm_step_has_parent_ref(TinyHVM *ctx, Term target) {
 static int thvm_step_candidate_visible(TinyHVM *ctx, u64 slot, Term t) {
     u8 tag = term_tag(t);
     if (tag == TAG_ERA) {
-        if (term_val(t) == 0 || term_val(t) >= ctx->heap_pos) return 0;
-        return 1;
+        if (slot == 0 || slot >= ctx->heap_pos) return 0;
+        return ctx->heap[slot] == t;
     }
     if (tag == TAG_DP0 || tag == TAG_DP1) {
         if (slot == term_val(t)) return 1;
+        return thvm_step_slot_is_rendered_parent_arg(ctx, slot);
+    }
+    if (tag == TAG_ALO) {
+        if (slot > 0 && slot < ctx->heap_pos && ctx->heap[slot] == t)
+            return 1;
         return thvm_step_slot_is_rendered_parent_arg(ctx, slot);
     }
     if (tag == TAG_TOP) {
@@ -702,6 +827,179 @@ static int thvm_step_candidate_visible(TinyHVM *ctx, u64 slot, Term t) {
         return 0;
     }
     return 1;
+}
+
+static int thvm_step_find_next_visible_candidate(TinyHVM *ctx, Term root,
+                                                 u64 *out_slot, Term *out_term,
+                                                 u64 *out_source_slot, Term *out_before,
+                                                 u8 *out_kind) {
+    Term before = 0;
+    Term whnf = root;
+    if (thvm_step_predict_next_redex(ctx, root, &before, &whnf)) {
+        u64 source_slot = step_root_slot;
+        u64 graph_source_slot = thvm_step_redex_source_slot(ctx, source_slot, root, before);
+        u64 hs = 0;
+        Term ht = 0;
+        if (thvm_step_graph_highlight_from_current_before(ctx, graph_source_slot, before, &hs, &ht) &&
+            thvm_step_candidate_visible(ctx, hs, ht)) {
+            if (out_slot) *out_slot = hs;
+            if (out_term) *out_term = ht;
+            if (out_source_slot) *out_source_slot = graph_source_slot;
+            if (out_before) *out_before = before;
+            if (out_kind) *out_kind = THVM_STEP_KIND_ROOT;
+            return 1;
+        }
+    }
+    if (step_top_is_hidden_trace_passthru(ctx, root)) {
+        u64 source_slot = step_root_slot;
+        u64 graph_source_slot = thvm_step_redex_source_slot(ctx, source_slot, root, root);
+        u64 hs = 0;
+        Term ht = 0;
+        if (thvm_step_graph_highlight_from_current_before(ctx, graph_source_slot, root, &hs, &ht) &&
+            thvm_step_candidate_visible(ctx, hs, ht)) {
+            if (out_slot) *out_slot = hs;
+            if (out_term) *out_term = ht;
+            if (out_source_slot) *out_source_slot = graph_source_slot;
+            if (out_before) *out_before = root;
+            if (out_kind) *out_kind = THVM_STEP_KIND_ROOT;
+            return 1;
+        }
+    }
+
+    u8 *reach = (u8 *)calloc((size_t)ctx->heap_pos, 1);
+    step_mark_reachable_slots(ctx, root, reach);
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        if (h == step_root_slot) continue;
+        if (step_slot_is_local_assign_target(ctx, h)) continue;
+        Term ht = ctx->heap[h];
+        int reachable = !(reach && !reach[h]);
+        if (!reachable && !step_term_needs_global_cleanup(ctx, ht)) continue;
+        if (!step_term_maybe_active(ctx, ht)) continue;
+        if ((term_tag(ht) == TAG_DP0 || term_tag(ht) == TAG_DP1) &&
+            reachable &&
+            !step_term_first_reachable_occurrence(ctx, h, ht, reach)) {
+            continue;
+        }
+        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD &&
+            reachable &&
+            !step_term_first_reachable_occurrence(ctx, h, ht, reach)) {
+            continue;
+        }
+        Term before_h = 0;
+        Term w = ht;
+        if (!thvm_step_predict_next_redex(ctx, ht, &before_h, &w)) continue;
+        u64 graph_source_slot = thvm_step_redex_source_slot(ctx, h, ht, before_h);
+        u64 hs = 0;
+        Term hterm = 0;
+        if (!thvm_step_graph_highlight_from_current_before(ctx, graph_source_slot, before_h, &hs, &hterm))
+            continue;
+        if (!thvm_step_candidate_visible(ctx, hs, hterm))
+            continue;
+        if (out_slot) *out_slot = hs;
+        if (out_term) *out_term = hterm;
+        if (out_source_slot) *out_source_slot = graph_source_slot;
+        if (out_before) *out_before = before_h;
+        if (out_kind) *out_kind = reachable ? THVM_STEP_KIND_HEAP
+                                            : THVM_STEP_KIND_SWEEP;
+        free(reach);
+        return 1;
+    }
+    free(reach);
+    return 0;
+}
+
+static int thvm_step_graph_write_pending_snapshot(TinyHVM *ctx, const char *path, Term root,
+                                                  u64 hs, Term ht, u8 kind) {
+    thvm_heap_dot_set_highlight(hs, ht);
+    thvm_heap_dot_set_step_meta("pending", "pending");
+    heap_dot_root_only = 1;
+    thvm_heap_dot_root(ctx, path, root);
+    heap_dot_root_only = 0;
+    if (kind == THVM_STEP_KIND_SWEEP)
+        thvm_step_graph_rewrite_sweep_highlight(path);
+    return thvm_heap_dot_highlight_was_drawn() && thvm_file_has_substr(path, "#cc0000");
+}
+
+static int thvm_step_find_next_renderable_candidate(TinyHVM *ctx, Term root, const char *tmp_path,
+                                                    u64 *out_slot, Term *out_term,
+                                                    u64 *out_source_slot, Term *out_before,
+                                                    u8 *out_kind) {
+    u8 *reach = NULL;
+    Term before = 0;
+    Term whnf = root;
+    if (thvm_step_predict_next_redex(ctx, root, &before, &whnf)) {
+        u64 source_slot = step_root_slot;
+        u64 graph_source_slot = thvm_step_redex_source_slot(ctx, source_slot, root, before);
+        u64 hs = 0;
+        Term ht = 0;
+        if (thvm_step_graph_highlight_from_current_before(ctx, graph_source_slot, before, &hs, &ht) &&
+            thvm_step_graph_write_pending_snapshot(ctx, tmp_path, root, hs, ht,
+                                                   THVM_STEP_KIND_ROOT)) {
+            if (out_slot) *out_slot = hs;
+            if (out_term) *out_term = ht;
+            if (out_source_slot) *out_source_slot = graph_source_slot;
+            if (out_before) *out_before = before;
+            if (out_kind) *out_kind = THVM_STEP_KIND_ROOT;
+            return 1;
+        }
+    }
+    if (step_top_is_hidden_trace_passthru(ctx, root)) {
+        u64 source_slot = step_root_slot;
+        u64 graph_source_slot = thvm_step_redex_source_slot(ctx, source_slot, root, root);
+        u64 hs = 0;
+        Term ht = 0;
+        if (thvm_step_graph_highlight_from_current_before(ctx, graph_source_slot, root, &hs, &ht) &&
+            thvm_step_graph_write_pending_snapshot(ctx, tmp_path, root, hs, ht,
+                                                   THVM_STEP_KIND_ROOT)) {
+            if (out_slot) *out_slot = hs;
+            if (out_term) *out_term = ht;
+            if (out_source_slot) *out_source_slot = graph_source_slot;
+            if (out_before) *out_before = root;
+            if (out_kind) *out_kind = THVM_STEP_KIND_ROOT;
+            return 1;
+        }
+    }
+
+    reach = (u8 *)calloc((size_t)ctx->heap_pos, 1);
+    step_mark_reachable_slots(ctx, root, reach);
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        if (h == step_root_slot) continue;
+        if (step_slot_is_local_assign_target(ctx, h)) continue;
+        Term ht = ctx->heap[h];
+        int reachable = !(reach && !reach[h]);
+        if (!reachable && !step_term_needs_global_cleanup(ctx, ht)) continue;
+        if (!step_term_maybe_active(ctx, ht)) continue;
+        if ((term_tag(ht) == TAG_DP0 || term_tag(ht) == TAG_DP1) &&
+            reachable &&
+            !step_term_first_reachable_occurrence(ctx, h, ht, reach)) {
+            continue;
+        }
+        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD &&
+            reachable &&
+            !step_term_first_reachable_occurrence(ctx, h, ht, reach)) {
+            continue;
+        }
+        Term before_h = 0;
+        Term w = ht;
+        if (!thvm_step_predict_next_redex(ctx, ht, &before_h, &w)) continue;
+        u64 graph_source_slot = thvm_step_redex_source_slot(ctx, h, ht, before_h);
+        u64 hs = 0;
+        Term hterm = 0;
+        if (!thvm_step_graph_highlight_from_current_before(ctx, graph_source_slot, before_h, &hs, &hterm))
+            continue;
+        u8 kind = reachable ? THVM_STEP_KIND_HEAP : THVM_STEP_KIND_SWEEP;
+        if (!thvm_step_graph_write_pending_snapshot(ctx, tmp_path, root, hs, hterm, kind))
+            continue;
+        if (out_slot) *out_slot = hs;
+        if (out_term) *out_term = hterm;
+        if (out_source_slot) *out_source_slot = graph_source_slot;
+        if (out_before) *out_before = before_h;
+        if (out_kind) *out_kind = kind;
+        free(reach);
+        return 1;
+    }
+    free(reach);
+    return 0;
 }
 
 // Second heap index involved in the redex (for filenames). Returns 0 if unknown.
@@ -730,6 +1028,18 @@ static u64 thvm_step_graph_term_display_loc(TinyHVM *ctx, u64 slot_hint, Term t)
 static u64 thvm_step_graph_partner_loc(TinyHVM *ctx, u64 source_slot, Term before,
                                        u64 hl_slot, Term hl_term, u64 self_loc) {
     u8 tag = term_tag(before);
+    if (tag == TAG_ALO) {
+        u64 era_slot = 0;
+        Term era_term = 0;
+        if (hl_slot != 0 &&
+            thvm_step_find_active_era_for_payload_slot(ctx, hl_slot, &era_slot, &era_term) &&
+            era_slot != self_loc)
+            return era_slot;
+        if (source_slot != 0 &&
+            thvm_step_find_active_era_for_payload_slot(ctx, source_slot, &era_slot, &era_term) &&
+            era_slot != self_loc)
+            return era_slot;
+    }
     if (tag == TAG_ERA) {
         Term payload = step_graph_before_era_payload;
         if (payload == 0 || (term_tag(payload) == TAG_ERA && term_val(payload) == 0)) {
@@ -803,6 +1113,16 @@ static const char *thvm_step_graph_focus_term_name(Term t, char *buf, size_t nbu
 static Term thvm_step_graph_partner_term(TinyHVM *ctx, u64 source_slot, Term before,
                                          u64 hl_slot, Term hl_term) {
     u8 tag = term_tag(before);
+    if (tag == TAG_ALO) {
+        u64 era_slot = 0;
+        Term era_term = 0;
+        if (hl_slot != 0 &&
+            thvm_step_find_active_era_for_payload_slot(ctx, hl_slot, &era_slot, &era_term))
+            return era_term;
+        if (source_slot != 0 &&
+            thvm_step_find_active_era_for_payload_slot(ctx, source_slot, &era_slot, &era_term))
+            return era_term;
+    }
     if (tag == TAG_ERA) {
         Term payload = step_graph_before_era_payload;
         if (payload == 0 || (term_tag(payload) == TAG_ERA && term_val(payload) == 0)) {
@@ -949,6 +1269,35 @@ static void thvm_step_graph_append_focus_suffix(TinyHVM *ctx, u64 source_slot, T
 static int thvm_step_graph_highlight_from_before(TinyHVM *ctx, u64 source_slot, Term before,
                                                  u64 *out_slot, Term *out_term) {
     u8 tag = term_tag(before);
+    if (tag == TAG_ALO) {
+        u64 era_slot = 0;
+        Term era_term = 0;
+        if (source_slot != 0 &&
+            thvm_step_find_active_era_for_payload_slot(ctx, source_slot, &era_slot, &era_term)) {
+            *out_slot = era_slot;
+            *out_term = era_term;
+            return 1;
+        }
+        if (source_slot != 0 && source_slot < ctx->heap_pos &&
+            thvm_step_slot_is_rendered_parent_arg(ctx, source_slot)) {
+            *out_slot = source_slot;
+            *out_term = before;
+            return 1;
+        }
+        for (u64 h = 1; h < ctx->heap_pos; h++) {
+            if (heap_read(ctx, h) == before && thvm_step_slot_is_rendered_parent_arg(ctx, h)) {
+                *out_slot = h;
+                *out_term = before;
+                return 1;
+            }
+        }
+        if (source_slot != 0 && source_slot < ctx->heap_pos) {
+            *out_slot = source_slot;
+            *out_term = before;
+            return 1;
+        }
+        return 0;
+    }
     if (tag == TAG_CTR) {
         u64 loc = term_val(before);
         if (loc == 0 || loc >= ctx->heap_pos) return 0;
@@ -1265,7 +1614,8 @@ static int thvm_step_graph_highlight_from_current_before(TinyHVM *ctx, u64 sourc
 }
 
 static int thvm_step_graph_find_next_interaction(TinyHVM *ctx, u64 *out_slot, Term *out_term,
-                                                 u64 *out_source_slot, Term *out_before) {
+                                                 u64 *out_source_slot, Term *out_before,
+                                                 u8 *out_kind) {
     Term saved_before_grad_y = step_graph_before_grad_y;
     Term saved_before_era_payload = step_graph_before_era_payload;
     int  saved_before_top_had_era = step_graph_before_top_had_era;
@@ -1280,7 +1630,8 @@ static int thvm_step_graph_find_next_interaction(TinyHVM *ctx, u64 *out_slot, Te
     step_graph_before_top_partner_slot = 0;
     u64 source_slot = 0;
     Term before = 0;
-    if (!thvm_step_find_next_actual(ctx, step_graph_root_term, &source_slot, &before)) {
+    u8 kind = THVM_STEP_KIND_ROOT;
+    if (!thvm_step_find_next_actual(ctx, step_graph_root_term, &source_slot, &before, &kind)) {
         step_graph_before_grad_y = saved_before_grad_y;
         step_graph_before_era_payload = saved_before_era_payload;
         step_graph_before_top_had_era = saved_before_top_had_era;
@@ -1295,7 +1646,14 @@ static int thvm_step_graph_find_next_interaction(TinyHVM *ctx, u64 *out_slot, Te
     u64 graph_source_slot = thvm_step_redex_source_slot(ctx, source_slot, container, before);
     if (out_source_slot) *out_source_slot = graph_source_slot;
     if (out_before) *out_before = before;
+    if (out_kind) *out_kind = kind;
     int ok = thvm_step_graph_highlight_from_current_before(ctx, graph_source_slot, before, out_slot, out_term);
+    if ((!ok || !thvm_step_candidate_visible(ctx, out_slot ? *out_slot : 0, out_term ? *out_term : 0)) &&
+        thvm_step_find_next_visible_candidate(ctx, step_graph_root_term,
+                                              out_slot, out_term,
+                                              out_source_slot, out_before, out_kind)) {
+        ok = 1;
+    }
     step_graph_before_grad_y = saved_before_grad_y;
     step_graph_before_era_payload = saved_before_era_payload;
     step_graph_before_top_had_era = saved_before_top_had_era;
@@ -1357,19 +1715,24 @@ static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root) {
     char tmp0[256];
     snprintf(tmp0, sizeof(tmp0), "%s/.tmp_step_init.dot", step_graph_dir);
     u64 hs = 0; Term ht = 0; u64 next_source_slot = 0; Term next_before = 0;
+    u8 next_kind = THVM_STEP_KIND_ROOT;
     char shown_name[160] = {0};
-    if (thvm_step_graph_find_next_interaction(ctx, &hs, &ht, &next_source_slot, &next_before)) {
+    if (thvm_step_graph_find_next_interaction(ctx, &hs, &ht, &next_source_slot, &next_before,
+                                              &next_kind)) {
         thvm_step_graph_display_name_current(ctx, next_source_slot, next_before, hs, ht,
                                              shown_name, sizeof(shown_name));
+        thvm_step_graph_apply_kind_name(next_kind, shown_name, sizeof(shown_name));
         thvm_heap_dot_set_highlight(hs, ht);
     } else {
         thvm_heap_dot_set_highlight(0, 0);
     }
     char p0[384];
-    thvm_heap_dot_set_step_meta(shown_name[0] ? shown_name : "state_init", "pending");
+    thvm_heap_dot_set_step_meta("pending", "pending");
     heap_dot_root_only = 1;
     thvm_heap_dot_root(ctx, tmp0, root);
     heap_dot_root_only = 0;
+    if (shown_name[0] && next_kind == THVM_STEP_KIND_SWEEP)
+        thvm_step_graph_rewrite_sweep_highlight(tmp0);
     step_graph_last_sig = thvm_step_graph_sig(ctx);
     {
         char p0s[256];
@@ -1386,6 +1749,7 @@ static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root) {
              shown_name[0] ? shown_name : "state_init");
     rename(tmp0, p0);
     thvm_step_graph_prune_isolated_tensor_nodes(p0);
+    step_graph_last_render_sig = thvm_file_sig(p0);
     thvm_step_graph_rewrite_meta(p0, "", shown_name[0] ? shown_name : "");
     snprintf(step_graph_last_file, sizeof(step_graph_last_file), "%s", p0);
     snprintf(step_graph_last_name, sizeof(step_graph_last_name), "%s",
@@ -1517,15 +1881,14 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
     char tmp[384];
     snprintf(tmp, sizeof(tmp), "%s/.tmp_step.dot", step_graph_dir);
     u64 next_hs = 0; Term next_ht = 0; u64 next_source_slot = 0; Term next_before = 0;
+    u8 next_kind = THVM_STEP_KIND_ROOT;
     char current_name[160] = {0};
     char shown_name[160] = {0};
     // Step files should follow the highlighted pending interaction in the
     // snapshot, while metadata can still keep the fired interaction name.
-    int have_next = thvm_step_graph_find_next_interaction(ctx, &next_hs, &next_ht, &next_source_slot, &next_before);
-    if (have_next) {
-        thvm_step_graph_display_name_current(ctx, next_source_slot, next_before, next_hs, next_ht,
-                                             shown_name, sizeof(shown_name));
-    }
+    int have_next = thvm_step_graph_find_next_interaction(ctx, &next_hs, &next_ht,
+                                                          &next_source_slot, &next_before,
+                                                          &next_kind);
     if (!have_next) {
         step_graph_last_sig = sig;
         step_graph_before_grad_y = 0;
@@ -1550,19 +1913,39 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
                 (unsigned long long)next_source_slot,
                 (u32)term_tag(root), (u32)term_ext(root), (unsigned long long)term_val(root));
     }
-    thvm_heap_dot_set_highlight(have_next ? next_hs : 0, have_next ? next_ht : 0);
-    thvm_heap_dot_set_step_meta("pending", "pending");
-    heap_dot_root_only = 1;
-    thvm_heap_dot_root(ctx, tmp, root);
-    heap_dot_root_only = 0;
+    int rendered_highlight = 0;
+    if (have_next) {
+        thvm_step_graph_display_name_current(ctx, next_source_slot, next_before, next_hs, next_ht,
+                                             shown_name, sizeof(shown_name));
+        thvm_step_graph_apply_kind_name(next_kind, shown_name, sizeof(shown_name));
+        rendered_highlight = thvm_step_graph_write_pending_snapshot(ctx, tmp, root, next_hs, next_ht,
+                                                                    next_kind);
+    } else {
+        thvm_heap_dot_set_highlight(0, 0);
+        thvm_heap_dot_set_step_meta("pending", "pending");
+        heap_dot_root_only = 1;
+        thvm_heap_dot_root(ctx, tmp, root);
+        heap_dot_root_only = 0;
+    }
     // Edge highlight is the only acceptable highlight for step graphs.
     // If it couldn't be drawn, leave the snapshot un-highlighted rather
     // than falling back to a node-highlight (which looks like a different
     // kind of event and confuses readers).
-    int rendered_highlight = thvm_heap_dot_highlight_was_drawn() && thvm_file_has_substr(tmp, "#cc0000");
     if (!rendered_highlight) {
-        // Highlight couldn't be drawn (pre-fire slot already mutated). Keep
-        // the snapshot anyway with no highlight so the step isn't dropped.
+        if (thvm_step_find_next_renderable_candidate(ctx, root, tmp,
+                                                     &next_hs, &next_ht,
+                                                     &next_source_slot, &next_before,
+                                                     &next_kind)) {
+            have_next = 1;
+            rendered_highlight = 1;
+            thvm_step_graph_display_name_current(ctx, next_source_slot, next_before, next_hs, next_ht,
+                                                 shown_name, sizeof(shown_name));
+            thvm_step_graph_apply_kind_name(next_kind, shown_name, sizeof(shown_name));
+        } else {
+            // Highlight couldn't be drawn (pre-fire slot already mutated or
+            // only hidden cleanup remains). Keep the snapshot anyway with no
+            // highlight so the step isn't dropped.
+        }
     }
     if (current_name_in && current_name_in[0]) {
         snprintf(current_name, sizeof(current_name), "%s", current_name_in);
@@ -1571,15 +1954,28 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
                                              current_name, sizeof(current_name));
     }
     if (!current_name[0]) snprintf(current_name, sizeof(current_name), "state_no_highlight");
-    int is_final_state = !have_next || term_tag(root) == TAG_TEN;
+    int is_final_state = !have_next;
     const char *next_name = (have_next && shown_name[0]) ? shown_name : "";
     const char *file_name = next_name[0] ? next_name : current_name;
     char p[384];
     snprintf(p, sizeof(p), "%s/step_%03u_%s.dot", step_graph_dir, step_graph_n,
              is_final_state ? "state_final" : file_name);
     rename(tmp, p);
-    if (term_tag(root) != TAG_TEN)
-        thvm_step_graph_prune_isolated_tensor_nodes(p);
+    thvm_step_graph_prune_isolated_tensor_nodes(p);
+    u64 render_sig = thvm_file_sig(p);
+    if (render_sig == step_graph_last_render_sig) {
+        remove(p);
+        step_graph_last_sig = sig;
+        step_graph_last_dot_sig = dot_sig;
+        step_graph_before_grad_y = 0;
+        step_graph_before_era_payload = 0;
+        step_graph_before_top_had_era = 0;
+        step_graph_before_top_had_add_zero = 0;
+        step_graph_before_top_partner = 0;
+        step_graph_before_top_partner_slot = 0;
+        thvm_step_alo_substs_clear(ctx);
+        return;
+    }
     thvm_step_graph_rewrite_meta(p, current_name, is_final_state ? "" : next_name);
     if (step_graph_last_file[0])
         thvm_step_graph_rewrite_meta(step_graph_last_file, step_graph_last_prev_name,
@@ -1592,6 +1988,7 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
     step_graph_n++;
     step_graph_last_sig = sig;
     step_graph_last_dot_sig = dot_sig;
+    step_graph_last_render_sig = render_sig;
     step_graph_before_grad_y = 0;
     step_graph_before_era_payload = 0;
     step_graph_before_top_had_era = 0;
@@ -1644,10 +2041,7 @@ static void thvm_step_graph_finalize(TinyHVM *ctx) {
         char p[384];
         snprintf(p, sizeof(p), "%s/step_%03u_state_final.dot", step_graph_dir, step_graph_n);
         rename(tmp, p);
-        if (term_tag(step_graph_root_term) == TAG_TEN)
-            thvm_step_graph_keep_only_root_tensor_result(p, (u32)term_val(step_graph_root_term));
-        else
-            thvm_step_graph_prune_isolated_tensor_nodes(p);
+        thvm_step_graph_prune_isolated_tensor_nodes(p);
         thvm_step_graph_rewrite_meta(p, step_graph_last_name[0] ? step_graph_last_name : "state_init", "");
         if (step_graph_last_file[0])
             thvm_step_graph_rewrite_meta(step_graph_last_file, step_graph_last_prev_name, "");
@@ -1685,6 +2079,7 @@ finalize_done:
     step_graph_last_prev_name[0] = '\0';
     step_graph_last_file[0] = '\0';
     step_graph_n = 0;
+    step_graph_last_render_sig = 0;
 }
 
 // Pre-interaction hook — called from thvm_interact entry. Reads BEFORE

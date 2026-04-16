@@ -52,6 +52,7 @@ TDup::usage = "TDup[z] duplicates a term with a fresh label. TDup[label, z] uses
 TFreshLabel::usage = "TFreshLabel[] allocates a fresh SUP/DUP label (monotonic counter).";
 TDefine::usage = "TDefine[body] registers a named definition. Returns the name (Integer).";
 TRef::usage = "TRef[name] creates a reference to a named definition.";
+TSeq::usage = "TSeq[effect, continuation] creates a strict sequencing term SEQ(effect, continuation).";
 TNum::usage = "TNum[n] creates an integer term (TAG_NUM). n must be a non-negative integer.";
 TOp2::usage = "TOp2[op, x, y] creates a binary integer operation (TAG_OP2). op: \"Add\", \"Sub\", \"Mul\", \"Div\", \"Eq\", \"Mod\".";
 TNumValue::usage = "TNumValue[term] extracts the integer value from a reduced TAG_NUM term.";
@@ -132,9 +133,10 @@ TInteractionGraph::usage = "TInteractionGraph[term] returns an interaction net g
 THeap::usage = "THeap[<|...|>] represents a snapshot of the TinyHVM heap state. Access properties via THeap[h][\"Key\"].";
 TInteraction::usage = "TInteraction[<|...|>] represents a single interaction event with rule name and before/after tags.";
 THeapSnapshot::usage = "THeapSnapshot[] captures the current heap state as a THeap object.";
-THeapRead::usage = "THeapRead[loc] reads a term at a heap location. Returns <|\"Tag\", \"TagCode\", \"Ext\", \"Val\", \"Loc\"|>.";
-THeapReadRange::usage = "THeapReadRange[lo, count] reads `count` consecutive heap slots starting at `lo`. Returns a list of THeapRead-style associations.";
+THeapRead::usage = "THeapRead[loc] reads a term at a heap location. Returns <|\"Tag\", \"TagCode\", \"Ext\", \"Val\", \"Loc\"|>, plus \"UOp\" for TOP terms.";
+THeapReadRange::usage = "THeapReadRange[lo, count] reads `count` consecutive heap slots starting at `lo`. Returns a list of THeapRead-style associations, each with \"UOp\" on TOP terms.";
 TStepReduce::usage = "TStepReduce[term] reduces exactly one interaction. Returns {result, TInteraction, THeap}.";
+THintShape::usage = "THintShape[term, shape] records a host-side shape hint for a lazy VAR or TOP term.";
 
 (* ── Single-step reduction & tracing ──────────────────────────────────── *)
 
@@ -214,6 +216,8 @@ $tagName = <|
     25 -> "Seq", 26 -> "Alo"
 |>;
 
+$tagCode = AssociationThread[Values[$tagName], Keys[$tagName]];
+
 (* Device index → string name *)
 $deviceName = <|0 -> "cpu", 1 -> "metal"|>;
 
@@ -280,6 +284,8 @@ uopArity[uop_String] := Which[
 uopPortName[uop_String, i_Integer] := Which[
     uop === "Sum" || uop === "RMax",   If[i == 0, "in", "axes"],
     uop === "Grad",                     If[i == 0, "y", "gy"],
+    uop === "Assign",                   If[i == 0, "tgt", "src"],
+    uop === "Where" || uop === "Ifz",   {"cond", "then", "else"}[[i + 1]],
     MemberQ[$viewOps, uop],             If[i == 0, "in", "shape"],
     MemberQ[$binaryOps, uop] || uop === "MatMul", If[i == 0, "a", "b"],
     uop === "Kernel",                   If[i == 0, "a", "b"],
@@ -288,6 +294,7 @@ uopPortName[uop_String, i_Integer] := Which[
 
 (* Port name for slot index i of a heap tag. Mirrors dot_heap_port_name. *)
 heapPortName[tag_String, i_Integer] := Which[
+    tag === "App",                      If[i == 0, "fun", "arg"],
     tag === "Lam" || tag === "Bri",     If[i == 0, "var", "body"],
     tag === "Sup" || tag === "Usp",     If[i == 0, "a", "b"],
     tag === "Mat",                      If[i == 0, "ok", "fb"],
@@ -356,6 +363,7 @@ thvmShrinkFn = None;
 thvmSumAxesFn = None;
 thvmLamFn = None;
 thvmAppFn = None;
+thvmSeqFn = None;
 thvmSupFn = None;
 thvmDupFn = None;
 thvmFreshLabelFn = None;
@@ -376,6 +384,7 @@ thvmWhereFn = None;
 thvmAssignFn = None;
 thvmIfzFn = None;
 thvmLogPrintFn = None;
+thvmHintShapeFn = None;
 thvmSetRequiresGradFn = None;
 thvmGradFn = None;
 thvmGradMultiFn = None;
@@ -406,6 +415,7 @@ thvmStepToNextVisibleFn = None;
 thvmKernelOpChainFn = None;
 thvmReduceCollectFn = None;
 thvmHeapReadFn = None;
+thvmDefReadFn = None;
 thvmHeapReadRangeFn = None;
 thvmHeapSnapshotFn = None;
 thvmNextInteractionFn = None;
@@ -468,6 +478,8 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
         {Integer, Integer, Integer}, "Void"];
     thvmAppFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmApp",
         {Integer, Integer, Integer}, "Void"];
+    thvmSeqFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmSeq",
+        {Integer, Integer, Integer}, "Void"];
     thvmSupFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmSup",
         {Integer, Integer, Integer, Integer}, "Void"];
     thvmDupFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmDup",
@@ -510,6 +522,8 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
         {Integer, Integer, Integer, Integer}, "Void"];
     thvmLogPrintFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmLogPrint",
         {Integer, Integer}, "Void"];
+    thvmHintShapeFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHintShape",
+        {Integer, {Integer, 1}}, "Void"];
 
     (* Autograd *)
     thvmSetRequiresGradFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmSetRequiresGrad",
@@ -587,6 +601,8 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
 
     (* Heap introspection *)
     thvmHeapReadFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapRead",
+        {Integer}, {Integer, 1}];
+    thvmDefReadFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmDefRead",
         {Integer}, {Integer, 1}];
     thvmHeapReadRangeFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapReadRange",
         {Integer, Integer}, {Integer, 2}];
@@ -833,6 +849,15 @@ TApp[fun_TTensor, arg_TTensor] := TApp[ToTTerm[fun], ToTTerm[arg]];
 TApp[fun_TTensor, arg_TTerm]   := TApp[ToTTerm[fun], arg];
 TApp[fun_TTerm, arg_TTensor]   := TApp[fun, ToTTerm[arg]];
 
+TSeq[effect_TTerm, continuation_TTerm] := Module[{out = allocId[]},
+    loadLibrary[];
+    thvmSeqFn[out, effect[[1]], continuation[[1]]];
+    TTerm[out]
+];
+TSeq[effect_TTensor, continuation_TTensor] := TSeq[ToTTerm[effect], ToTTerm[continuation]];
+TSeq[effect_TTensor, continuation_TTerm]   := TSeq[ToTTerm[effect], continuation];
+TSeq[effect_TTerm, continuation_TTensor]   := TSeq[effect, ToTTerm[continuation]];
+
 (* TSup[a, b] — fresh label; TSup[label, a, b] — explicit label *)
 TSup[a_TTerm, b_TTerm] := TSup[TFreshLabel[], a, b];
 TSup[label_Integer, a_TTerm, b_TTerm] := Module[{out = allocId[]},
@@ -1043,6 +1068,9 @@ TIfz[counter_TTerm, zeroCase_TTensor, succLam_TTerm] := Module[{out = allocId[]}
     thvmIfzFn[out, counter[[1]], zeroCase[[1]], succLam[[1]]];
     TTensor[out]
 ];
+
+THintShape[term_TTerm, shape_List] := (loadLibrary[]; thvmHintShapeFn[term[[1]], shape]; term);
+THintShape[term_TTensor, shape_List] := (loadLibrary[]; thvmHintShapeFn[term[[1]], shape]; term);
 
 TLogPrint[t_TTensor] := Module[{out = allocId[]},
     loadLibrary[];
@@ -1499,14 +1527,28 @@ THeap /: MakeBoxes[t:THeap[data_Association], StandardForm] := Module[
 
 (* ── THeapRead ───────────────────────────────────────────────────────── *)
 
+iHeapTermAssoc[tagCode_Integer, ext_Integer, val_Integer, loc_Integer] := Module[
+    {tag = Lookup[$tagName, tagCode, "?"], assoc},
+    assoc = <|"Tag" -> tag, "TagCode" -> tagCode,
+              "Ext" -> ext, "Val" -> val, "Loc" -> loc|>;
+    If[tag === "Top",
+        Append[assoc, "UOp" -> Lookup[$uopName, ext, "?"]],
+        assoc
+    ]
+];
+
 THeapRead[loc_Integer] := Module[{raw},
     loadLibrary[];
     raw = thvmHeapReadFn[loc];
-    <|"Tag" -> Lookup[$tagName, raw[[1]], "?"],
-      "TagCode" -> raw[[1]],
-      "Ext" -> raw[[2]],
-      "Val" -> raw[[3]],
-      "Loc" -> loc|>
+    iHeapTermAssoc[raw[[1]], raw[[2]], raw[[3]], loc]
+];
+
+TDefRead[name_Integer] := Module[{raw, tag},
+    loadLibrary[];
+    raw = thvmDefReadFn[name];
+    tag = Lookup[$tagName, raw[[1]], "?"];
+    iHeapTermAssoc[raw[[1]], raw[[2]], raw[[3]],
+        If[tag === "Top" || KeyExistsQ[$heapTagArity, tag], raw[[3]], 0]]
 ];
 
 (* Bulk read [lo, lo+count). Returns a list of associations like THeapRead. *)
@@ -1514,11 +1556,7 @@ THeapReadRange[lo_Integer, count_Integer] := Module[{raw},
     loadLibrary[];
     raw = Normal[thvmHeapReadRangeFn[lo, count]];
     Table[
-        <|"Tag" -> Lookup[$tagName, raw[[i, 1]], "?"],
-          "TagCode" -> raw[[i, 1]],
-          "Ext" -> raw[[i, 2]],
-          "Val" -> raw[[i, 3]],
-          "Loc" -> lo + i - 1|>,
+        iHeapTermAssoc[raw[[i, 1]], raw[[i, 2]], raw[[i, 3]], lo + i - 1],
         {i, count}]
 ];
 

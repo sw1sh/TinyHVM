@@ -573,6 +573,23 @@ EXTERN_C DLLEXPORT int thvmApp(
     return LIBRARY_NO_ERROR;
 }
 
+// thvmSeq[outId, effectId, continuationId] → Void
+EXTERN_C DLLEXPORT int thvmSeq(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc; (void)res;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint out_id  = MArgument_getInteger(args[0]);
+    mint eff_id  = MArgument_getInteger(args[1]);
+    mint cont_id = MArgument_getInteger(args[2]);
+
+    Term result = thvm_seq(g_ctx, get_term(eff_id), get_term(cont_id));
+    set_term(out_id, result);
+
+    return LIBRARY_NO_ERROR;
+}
+
 // thvmSup[outId, label, aId, bId] → Void
 EXTERN_C DLLEXPORT int thvmSup(
     WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
@@ -945,6 +962,26 @@ EXTERN_C DLLEXPORT int thvmLogPrint(
     Term result = thvm_log_print(g_ctx, get_term(term_id));
     set_term(out_id, result);
 
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmHintShape[termId, dims] → Void
+EXTERN_C DLLEXPORT int thvmHintShape(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)argc; (void)res;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint term_id = MArgument_getInteger(args[0]);
+    MTensor dims_mt = MArgument_getMTensor(args[1]);
+    mint *dd = libData->MTensor_getIntegerData(dims_mt);
+    mint dlen = libData->MTensor_getFlattenedLength(dims_mt);
+
+    Shape shape = SHAPE(1);
+    shape.rank = (u32)dlen;
+    for (mint i = 0; i < dlen && i < MAX_DIM; i++) shape.dims[i] = (u32)dd[i];
+
+    thvm_hint_shape(g_ctx, get_term(term_id), shape);
     return LIBRARY_NO_ERROR;
 }
 
@@ -1640,6 +1677,30 @@ EXTERN_C DLLEXPORT int thvmHeapRead(
     } else {
         t = heap_read(g_ctx, (u64)loc);
     }
+
+    mint dims[1] = {3};
+    MTensor out;
+    libData->MTensor_new(MType_Integer, 1, dims, &out);
+    mint *od = libData->MTensor_getIntegerData(out);
+    od[0] = (mint)term_tag(t);
+    od[1] = (mint)term_ext(t);
+    od[2] = (mint)term_val(t);
+    MArgument_setMTensor(res, out);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmDefRead(name) → {Integer, 1} of 3 elements: {tag, ext, val}
+// Reads the live dynamic definition root from g_ctx->defs[name].
+EXTERN_C DLLEXPORT int thvmDefRead(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint name = MArgument_getInteger(args[0]);
+    Term t = term_era();
+    if (name >= 0 && (u32)name < g_ctx->def_count)
+        t = g_ctx->defs[(u32)name];
 
     mint dims[1] = {3};
     MTensor out;

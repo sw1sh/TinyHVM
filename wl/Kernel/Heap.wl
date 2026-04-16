@@ -5,11 +5,15 @@
 (* Synthetic atom key — TEN nodes don't own a heap slot, so we key by tensor id. *)
 atomKey[n_Association] := Switch[n["Tag"],
     "Ten",  "t" <> ToString[n["Val"]],
-    "Num",  "num" <> ToString[n["Val"]] <> "_" <> ToString[n["Ext"]],
-    "Era",  "era",
-    "Ref",  "ref" <> ToString[n["Val"]],
+    "Num",  If[Lookup[n, "Loc", 0] > 0,
+               "num" <> ToString[n["Loc"]],
+               "num" <> ToString[n["Val"]] <> "_" <> ToString[n["Ext"]]],
+    "Era",  If[Lookup[n, "Loc", 0] > 0, "era" <> ToString[n["Loc"]], "era"],
+    "Ref",  If[Lookup[n, "Loc", 0] > 0,
+               "ref" <> ToString[n["Loc"]],
+               "ref" <> ToString[n["Ext"]]],
     "Var",  "var" <> ToString[n["Val"]],
-    "Any",  "any",
+    "Any",  If[Lookup[n, "Loc", 0] > 0, "any" <> ToString[n["Loc"]], "any"],
     _,      "h" <> ToString[n["Loc"]]
 ];
 
@@ -24,7 +28,7 @@ uopDataArity[uop_String] := Which[
 termChildCount[n_Association] := Module[{tag = n["Tag"]},
     Which[
         tag === "Top",
-            Module[{uop = Lookup[$uopName, n["Ext"], "?"]},
+            Module[{uop = Lookup[n, "UOp", Lookup[$uopName, n["Ext"], "?"]]},
                 If[uop === "Kernel" && IntegerQ[n["Val"]] && n["Val"] > 0 &&
                    kernelMonolithicAt[n["Val"]],
                     0,
@@ -37,7 +41,7 @@ termChildCount[n_Association] := Module[{tag = n["Tag"]},
 
 (* Port name for child slot i of term n. *)
 termPortName[n_Association, i_Integer] := Which[
-    n["Tag"] === "Top", uopPortName[Lookup[$uopName, n["Ext"], "?"], i],
+    n["Tag"] === "Top", uopPortName[Lookup[n, "UOp", Lookup[$uopName, n["Ext"], "?"]], i],
     True,               heapPortName[n["Tag"], i]
 ];
 
@@ -50,8 +54,9 @@ computeUOpQ[uop_String] := MemberQ[$elementwiseOps, uop] ||
     MemberQ[$reduceOps, uop] || MemberQ[$viewOps, uop];
 
 walkNodeDisplayLoc[n_Association] := If[
-    n["Tag"] === "Top" || KeyExistsQ[$heapTagArity, n["Tag"]],
-    n["Val"], n["Loc"]
+    n["Tag"] === "Var", n["Val"],
+    If[n["Tag"] === "Top" || KeyExistsQ[$heapTagArity, n["Tag"]],
+        n["Val"], n["Loc"]]
 ];
 
 (* Walk the heap from `rootTerm` (a THeapRead-shaped association).
@@ -68,7 +73,8 @@ termKey[n_Association] := If[
 
 walkNodeRecord[n_Association] := Module[{derived = <||>, chain, dims},
     If[n["Tag"] === "Top" && IntegerQ[n["Val"]] && n["Val"] > 0,
-        If[Lookup[$uopName, n["Ext"], ""] === "Kernel",
+        derived["UOp"] = Lookup[n, "UOp", Lookup[$uopName, n["Ext"], "?"]];
+        If[derived["UOp"] === "Kernel",
             chain = kernelOpChainAt[n["TagCode"], n["Ext"], n["Val"]];
             If[StringQ[chain] && chain =!= "", derived["KernelOpChain"] = chain]];
         dims = inferShapeAt[n["Val"]];
@@ -77,6 +83,12 @@ walkNodeRecord[n_Association] := Module[{derived = <||>, chain, dims},
         "Key" -> termKey[n],
         "DisplayLoc" -> walkNodeDisplayLoc[n],
         derived|>
+];
+
+refDefRoot[n_Association] := Module[{d},
+    If[n["Tag"] =!= "Ref", Return[None]];
+    d = Quiet@Check[TDefRead[n["Ext"]], None];
+    If[AssociationQ[d] && d["Tag"] =!= "Era", d, None]
 ];
 
 (* Walk the heap chain of nested KERNELs at args base `val`, returning the
@@ -145,11 +157,22 @@ kernelSemanticLeavesAt[val_Integer] := Module[{payload, leaves = <||>, seen = <|
 heapWalk[rootTerm_Association] := Module[
     {nodes = <||>, edges = {}, rootKey, visit},
     visit[nAssoc_Association] := Module[
-        {n = nAssoc, k, nChildren, childLoc, child, pname, semanticLeaves},
+        {n = nAssoc, k, dk, defRoot, nChildren, childLoc, child, pname, ck, semanticLeaves},
         k = termKey[n];
         If[KeyExistsQ[nodes, k], Return[k]];
         nodes[k] = walkNodeRecord[n];
-        If[n["Tag"] === "Top" && Lookup[$uopName, n["Ext"], ""] === "Kernel" &&
+        n = nodes[k];
+        If[n["Tag"] === "Ref",
+            defRoot = refDefRoot[n];
+            If[AssociationQ[defRoot],
+                dk = visit[defRoot];
+                AppendTo[edges, <|
+                    "From" -> k, "To" -> dk,
+                    "Port" -> "def", "FromSlot" -> 0,
+                    "Style" -> "RefDef"|>]
+            ]
+        ];
+        If[n["Tag"] === "Top" && Lookup[n, "UOp", ""] === "Kernel" &&
            IntegerQ[n["Val"]] && n["Val"] > 0 && kernelMonolithicAt[n["Val"]],
             semanticLeaves = kernelSemanticLeavesAt[n["Val"]];
             Do[
@@ -169,7 +192,11 @@ heapWalk[rootTerm_Association] := Module[
                 (* Skip ANY placeholders — unreduced slots have no source to render. *)
                 If[child["Tag"] =!= "Any",
                     pname = termPortName[n, i];
-                    With[{ck = visit[child]},
+                    ck = visit[child];
+                    If[MemberQ[{"Lam", "Bri"}, n["Tag"]] && i == 0 && child["Tag"] === "Var",
+                        AppendTo[edges, <|
+                            "From" -> k, "To" -> ck,
+                            "Port" -> pname, "FromSlot" -> childLoc|>],
                         AppendTo[edges, <|
                             "From" -> ck, "To" -> k,
                             "Port" -> pname, "FromSlot" -> childLoc|>]
@@ -189,6 +216,6 @@ rootTermOf[t_] := Module[{id, tagCode, ext, val, tag},
     ext     = thvmTermExtFn[id];
     val     = thvmTermValFn[id];
     tag     = Lookup[$tagName, tagCode, "?"];
-    <|"Tag" -> tag, "TagCode" -> tagCode, "Ext" -> ext, "Val" -> val,
-      "Loc" -> If[tag === "Top" || KeyExistsQ[$heapTagArity, tag], val, 0]|>
+    iHeapTermAssoc[tagCode, ext, val,
+      If[tag === "Top" || KeyExistsQ[$heapTagArity, tag], val, 0]]
 ];

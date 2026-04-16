@@ -296,8 +296,9 @@
                         RETURN_REDUCED(payload);
                     }
 
-                    // Compute-like payloads first become growing public KERNEL
-                    // carriers so local step traces expose region buildup.
+                    // Compute-like payloads become visible KERNEL carriers.
+                    // Leaf ops can be monolithic immediately; parents with
+                    // still-fused children keep the growing shell.
                     if (is_elementwise(puop) || puop == UOP_SUM || puop == UOP_RMAX ||
                         (puop >= UOP_RESHAPE && puop <= UOP_PAD)) {
                         Term public_term = thvm_fuse_public_term(ctx, payload, 0);

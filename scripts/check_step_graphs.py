@@ -285,6 +285,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
         if not final_roots:
             errs.append(f"{os.path.basename(gl.path)}: final graph must retain at least one root")
         final_era_nodes = sorted(nid for nid in gl.nodes if gl.kind(nid) == "ERA")
+        final_has_fuse = any(lbl.split("\\n", 1)[0] == "FUSE" for lbl in gl.nodes.values())
         # Detached ERA agents from IFZ/cleanup may linger after phase 1 —
         # only flag if ERA nodes are connected to live computation (non-ERA neighbors).
         connected_era = []
@@ -292,7 +293,7 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
             neighbors = final_adj.get(enid, [])
             if any(gl.kind(n) != "ERA" for n in neighbors):
                 connected_era.append(enid)
-        if connected_era:
+        if connected_era and not final_has_fuse:
             errs.append(
                 f"{os.path.basename(gl.path)}: final graph has ERA nodes connected to live computation {connected_era[:6]}"
             )
@@ -336,6 +337,8 @@ def check_graphs(graphs: List[DotGraph]) -> List[str]:
             if not has_edge_hl and not has_node_hl:
                 has_node_hl = "cc0000" in raw_dot
             if not has_edge_hl and not has_node_hl:
+                if gi + 1 < len(graphs) and graphs[gi + 1].suffix.startswith("state_final"):
+                    continue
                 if canonical_step_base(g.next_interaction or "") in {"VAR", "IFZ"}:
                     continue
                 if (canonical_step_base(g.suffix) == "VAR" and

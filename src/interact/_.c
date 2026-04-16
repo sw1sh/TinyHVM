@@ -179,6 +179,18 @@ static Term thvm_make_public_kernel_from_uop(TinyHVM *ctx, u32 uop, Term left, T
     return thvm_make_public_kernel(ctx, term_new(TAG_TOP, uop, ploc));
 }
 
+static Term thvm_make_visible_kernel_from_uop(TinyHVM *ctx, u32 uop, Term left, Term right, Term shape_src) {
+    // Emit a monolithic kernel only when both immediate children are already
+    // locally ready; otherwise keep the visible growing shell so inner FUSE
+    // work can still show up as its own step.
+    if (thvm_kernel_local_child_ready(ctx, left) &&
+        thvm_kernel_local_child_ready(ctx, right)) {
+        Term public_term = thvm_make_public_kernel_from_uop(ctx, uop, left, right, shape_src);
+        if (public_term) return public_term;
+    }
+    return thvm_make_growing_kernel_from_uop(ctx, uop, left, right, shape_src);
+}
+
 static Term thvm_fuse_public_term(TinyHVM *ctx, Term t, u32 depth) {
     if (!ctx || depth > 64) return t;
     if (term_tag(t) != TAG_TOP) return t;
@@ -191,31 +203,21 @@ static Term thvm_fuse_public_term(TinyHVM *ctx, Term t, u32 depth) {
 
     if (is_binary(uop)) {
         if (loc + 1 >= ctx->heap_pos) return t;
-        return thvm_make_growing_kernel_from_uop(
-            ctx, uop,
-            thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0)),
-            thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 1)),
-            t
-        );
+        Term left = thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0));
+        Term right = thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 1));
+        return thvm_make_visible_kernel_from_uop(ctx, uop, left, right, t);
     }
 
     if (is_elementwise(uop)) {
-        return thvm_make_growing_kernel_from_uop(
-            ctx, uop,
-            thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0)),
-            term_era(),
-            t
-        );
+        Term left = thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0));
+        return thvm_make_visible_kernel_from_uop(ctx, uop, left, term_era(), t);
     }
 
     if (uop == UOP_SUM || uop == UOP_RMAX || is_view_op(uop)) {
         if (loc + 1 >= ctx->heap_pos) return t;
-        return thvm_make_growing_kernel_from_uop(
-            ctx, uop,
-            thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0)),
-            heap_read(ctx, loc + 1),
-            t
-        );
+        Term left = thvm_fuse_wrap_child(ctx, heap_read(ctx, loc + 0));
+        Term right = heap_read(ctx, loc + 1);
+        return thvm_make_visible_kernel_from_uop(ctx, uop, left, right, t);
     }
 
     return t;

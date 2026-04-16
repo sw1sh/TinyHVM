@@ -10,6 +10,7 @@ static void thvm_step_graph_set_before_grad_y(Term y);
 static void thvm_step_graph_set_before_era_payload(Term payload);
 static void thvm_step_graph_set_before_top_era(int had_era);
 static void thvm_step_graph_set_before_top_add_zero(int had_add_zero);
+static void thvm_step_graph_set_before_top_partner(Term partner, u64 slot);
 
 // Per-step metadata captured by thvm_reduce_step_collect for the dumper /
 // trace consumers. `before` is the redex term as it existed pre-fire;
@@ -711,6 +712,13 @@ static int thvm_step_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before, 
     if (tag == TAG_TOP) {
         u32 uop = term_ext(t);
         u64 loc = term_val(t);
+        // Phase-1 traces stop at the visible KERNEL DAG; settled monolithic
+        // kernels only become reducible again once phase-2 enables dispatch.
+        if (uop == UOP_KERNEL && thvm_kernel_is_monolithic(ctx, t) &&
+            !ctx->dispatch_enabled) {
+            if (out_whnf) *out_whnf = t;
+            return 0;
+        }
         if (uop == UOP_GRAD) {
             Term y = heap_read(ctx, loc + 0);
             Term wy = y;
@@ -919,6 +927,34 @@ static void thvm_step_capture_step_before_meta(TinyHVM *ctx, Term before) {
         thvm_step_graph_set_before_top_add_zero(step_top_has_add_zero_arg(ctx, before, NULL, NULL));
     else
         thvm_step_graph_set_before_top_add_zero(0);
+    if (term_tag(before) == TAG_TOP && term_ext(before) != UOP_GRAD) {
+        u64 loc = term_val(before);
+        Term partner = term_era();
+        u64 partner_slot = 0;
+        if (loc > 0 && loc < ctx->heap_pos) {
+            u32 uop = term_ext(before);
+            if (uop == UOP_FUSE) {
+                partner_slot = loc;
+                partner = heap_read(ctx, loc);
+            } else if (uop == UOP_KERNEL && loc + 1 < ctx->heap_pos) {
+                Term a0 = heap_read(ctx, loc + 0);
+                Term a1 = heap_read(ctx, loc + 1);
+                if (term_tag(a0) == TAG_TOP && term_ext(a0) == UOP_KERNEL) {
+                    partner_slot = loc + 0;
+                    partner = a0;
+                } else if (term_tag(a1) == TAG_TOP && term_ext(a1) == UOP_KERNEL) {
+                    partner_slot = loc + 1;
+                    partner = a1;
+                } else {
+                    partner_slot = loc + 0;
+                    partner = a0;
+                }
+            }
+        }
+        thvm_step_graph_set_before_top_partner(partner, partner_slot);
+    } else {
+        thvm_step_graph_set_before_top_partner(term_era(), 0);
+    }
     if (term_tag(before) == TAG_ERA) {
         u64 el = term_val(before);
         Term payload = (el > 0 && el < ctx->heap_pos) ? thvm_era_payload(ctx, heap_read(ctx, el)) : term_era();

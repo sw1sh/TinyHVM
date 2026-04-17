@@ -66,6 +66,12 @@
                                 (_tt) = _sub; \
                                 continue; \
                             } \
+                            if (_tag == TAG_ALO) { \
+                                Term _forced = thvm_interact(ctx, _tt); \
+                                if (_forced == (_tt)) break; \
+                                (_tt) = _forced; \
+                                continue; \
+                            } \
                             break; \
                         } \
 	                } while (0)
@@ -127,13 +133,17 @@
                 }
                 if (getenv("THVM_LOOP_DIAG")) {
                     fprintf(stderr,
-                            "GRAD_ENTRY loc=%llu y_tag=%u y_val=%llu gy_tag=%u gy_val=%llu mode=%u targets=%u\n",
+                            "GRAD_ENTRY loc=%llu y_tag=%u y_val=%llu gy_tag=%u gy_val=%llu x_tag=%u x_ext=%u x_val=%llu mode=%u has_keep=%d targets=%u\n",
                             (unsigned long long)loc,
                             (u32)term_tag(y),
                             (unsigned long long)term_val(y),
                             (u32)term_tag(gy),
                             (unsigned long long)term_val(gy),
+                            (u32)term_tag(x),
+                            (u32)term_ext(x),
+                            (unsigned long long)term_val(x),
                             grad_mode,
+                            has_keep_bundle,
                             thvm_grad_targets_count_at(ctx, loc));
                 }
                 if (grad_mode == GRAD_MODE_DROP) {
@@ -141,6 +151,20 @@
                 }
                 GRAD_RESOLVE_ALIAS(y);
                 GRAD_RESOLVE_ALIAS(x);
+                if (getenv("THVM_LOOP_DIAG")) {
+                    fprintf(stderr,
+                            "GRAD_RESOLVED loc=%llu y_tag=%u y_ext=%u y_val=%llu x_tag=%u x_ext=%u x_val=%llu gy_tag=%u gy_ext=%u gy_val=%llu\n",
+                            (unsigned long long)loc,
+                            (u32)term_tag(y),
+                            (u32)term_ext(y),
+                            (unsigned long long)term_val(y),
+                            (u32)term_tag(x),
+                            (u32)term_ext(x),
+                            (unsigned long long)term_val(x),
+                            (u32)term_tag(gy),
+                            (u32)term_ext(gy),
+                            (unsigned long long)term_val(gy));
+                }
                 if (getenv("THVM_SCHED_DIAG")) {
                     static int _yc=0; _yc++; if (_yc<=20)
                     fprintf(stderr, "  GRAD_RESOLVE[%d]: y_tag=%u y_ext=%u y_val=%llu gy_tag=%u\n", _yc, term_tag(y), term_ext(y), term_val(y), term_tag(gy));
@@ -162,9 +186,33 @@
                 if (term_tag(x) == TAG_ANY) {
                     Term slot = term_era();
                     u32 target_index = 0;
-                    if (term_tag(y) == TAG_TEN &&
-                        (thvm_grad_targets_find_index_at(ctx, loc, (u32)term_val(y), &target_index, &slot) ||
-                         thvm_grad_targets_find_term_at(ctx, loc, y, &target_index, &slot))) {
+                    u64 keep_app_loc = thvm_grad_keep_app_loc_get(ctx, loc);
+                    int matched_target = 0;
+                    if (term_tag(y) == TAG_TEN) {
+                        matched_target =
+                            thvm_grad_targets_find_index_at(ctx, loc, (u32)term_val(y), &target_index, &slot) ||
+                            thvm_grad_targets_find_term_at(ctx, loc, y, &target_index, &slot);
+                    }
+                    if (matched_target) {
+                        if (getenv("THVM_LOOP_DIAG")) {
+                            fprintf(stderr,
+                                    "GRAD_TARGET_MULTI_HIT loc=%llu y_id=%u idx=%u mode=%u has_keep=%d keep_tag=%u keep_ext=%u keep_val=%llu keep_app=%llu slot_tag=%u slot_ext=%u slot_val=%llu gy_tag=%u gy_ext=%u gy_val=%llu\n",
+                                    (unsigned long long)loc,
+                                    (u32)term_val(y),
+                                    target_index,
+                                    grad_mode,
+                                    has_keep_bundle,
+                                    (u32)term_tag(keep_bundle),
+                                    (u32)term_ext(keep_bundle),
+                                    (unsigned long long)term_val(keep_bundle),
+                                    (unsigned long long)keep_app_loc,
+                                    (u32)term_tag(slot),
+                                    (u32)term_ext(slot),
+                                    (unsigned long long)term_val(slot),
+                                    (u32)term_tag(gy),
+                                    (u32)term_ext(gy),
+                                    (unsigned long long)term_val(gy));
+                        }
                         if (grad_mode == GRAD_MODE_SLOT &&
                             !(term_tag(slot) == TAG_ERA && term_val(slot) == 0)) {
                             GRAD_RETURN(GRAD_SLOT_ACCUM(slot, gy));
@@ -176,6 +224,27 @@
                         if (grad_mode == GRAD_MODE_DROP) GRAD_DROP(gy);
                         if (grad_mode == GRAD_MODE_SLOT) GRAD_DROP(gy);
                         GRAD_ZERO(gy);
+                    }
+                    if (term_tag(y) == TAG_TEN && getenv("THVM_LOOP_DIAG")) {
+                        u32 nt = thvm_grad_targets_count_at(ctx, loc);
+                        fprintf(stderr, "GRAD_TARGET_MISS loc=%llu y_id=%u nt=%u\n",
+                                (unsigned long long)loc,
+                                (u32)term_val(y),
+                                nt);
+                        for (u32 i = 0; i < nt; i++) {
+                            Term pt = thvm_grad_targets_get_term_at(ctx, loc, i);
+                            Term ps = thvm_grad_targets_get_slot_at(ctx, loc, i);
+                            fprintf(stderr,
+                                    "  target[%u]=tag%u ext%u val%llu tid=%u slot=(tag%u ext%u val%llu)\n",
+                                    i,
+                                    (u32)term_tag(pt),
+                                    (u32)term_ext(pt),
+                                    (unsigned long long)term_val(pt),
+                                    thvm_grad_targets_get_tid_at(ctx, loc, i),
+                                    (u32)term_tag(ps),
+                                    (u32)term_ext(ps),
+                                    (unsigned long long)term_val(ps));
+                        }
                     }
                 }
 
@@ -220,7 +289,12 @@
 	                    Term bt = heap_read(ctx, y_loc + 1);
 	                    const View *yv = st_get(y_loc);
                     Shape y_shape = yv ? yv->shape : SHAPE(1);
-                    Shape a_shape = SHAPE(1), b_shape = SHAPE(1);
+                    // Default arg shapes to y_shape: elementwise ops preserve
+                    // shape, so when the arg is a DP/VAR/ALO (not resolvable
+                    // yet to TEN or TOP), y_shape is the correct assumption.
+                    // Reshape/expand/permute overrides this via the TEN/TOP
+                    // lookup below.
+                    Shape a_shape = y_shape, b_shape = y_shape;
                     { Term _at = at;
                       GRAD_RESOLVE_ALIAS(_at);
                       if (term_tag(_at)==TAG_TEN) a_shape=ctx->tensors[(u32)term_val(_at)].view.shape;
@@ -353,6 +427,9 @@
                                 u32 sp[MAX_DIM*2]; for(u32 j=0;j<nd;j++){sp[j*2]=pf2[j*2];sp[j*2+1]=pf2[j*2]+a_shape.dims[j];}
                                 UG_DROP(bt, thvm_shrink(ctx,gy,sp,nd));
 	                            } else GRAD_RETURN(GRAD_ERASE(gy)); }
+                        // ASSIGN(dst, src) returns dst; gradient flows through dst
+                        // and drops the src branch (src only feeds the side effect).
+                        case UOP_ASSIGN: UG_DROP(bt, gy);
 	                        default: GRAD_RETURN(GRAD_ERASE(gy));
 	                    }
 		                    #undef GRAD2_H
@@ -375,6 +452,17 @@
                     }
                     // Base case: y == x.
                     if (term_tag(x) == TAG_TEN && (u32)term_val(x) == y_id) {
+                        if (getenv("THVM_LOOP_DIAG")) {
+                            fprintf(stderr,
+                                    "GRAD_TARGET_DIRECT loc=%llu y_id=%u mode=%u has_keep=%d gy_tag=%u gy_ext=%u gy_val=%llu\n",
+                                    (unsigned long long)loc,
+                                    y_id,
+                                    grad_mode,
+                                    has_keep_bundle,
+                                    (u32)term_tag(gy),
+                                    (u32)term_ext(gy),
+                                    (unsigned long long)term_val(gy));
+                        }
                         if (grad_mode == GRAD_MODE_DROP) {
                             GRAD_DROP(gy);
                         }
@@ -391,6 +479,21 @@
                         u32 target_index = 0;
 	                        if (thvm_grad_targets_find_term_at(ctx, loc, y, &target_index, &slot) ||
                                 thvm_grad_targets_find_index_at(ctx, loc, y_id, &target_index, &slot)) {
+                                if (getenv("THVM_LOOP_DIAG")) {
+                                    fprintf(stderr,
+                                            "GRAD_TARGET_MULTI_HIT loc=%llu y_id=%u idx=%u mode=%u has_keep=%d slot_tag=%u slot_ext=%u slot_val=%llu gy_tag=%u gy_ext=%u gy_val=%llu\n",
+                                            (unsigned long long)loc,
+                                            y_id,
+                                            target_index,
+                                            grad_mode,
+                                            has_keep_bundle,
+                                            (u32)term_tag(slot),
+                                            (u32)term_ext(slot),
+                                            (unsigned long long)term_val(slot),
+                                            (u32)term_tag(gy),
+                                            (u32)term_ext(gy),
+                                            (unsigned long long)term_val(gy));
+                                }
 	                            if (grad_mode == GRAD_MODE_SLOT &&
                                     !(term_tag(slot) == TAG_ERA && term_val(slot) == 0)) {
 	                                GRAD_RETURN(GRAD_SLOT_ACCUM(slot, gy));

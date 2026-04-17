@@ -1,67 +1,88 @@
-# Plan: Finish The Recursive GRAD Learning Loop
+# Plan: Finish The Recursive GRAD Learning Loop — DONE
 
-## Current State
+## Status (2026-04-17)
 
-The recursive training loop in
-[test/test_tiny_linear_sgd_loop.m](/Users/swish/src/TinyHVM/test/test_tiny_linear_sgd_loop.m)
-still applies only the first SGD step under the default staged pipeline.
+All verification targets pass:
 
-Current behavior:
+- `test_tiny_scalar_grad_loop` n=1, n=2, n=3 pass assertions
+  against the host-simulated SGD trajectory.
+  - n=1: `[0.8000, 0.0000, -0.4000]` ✓
+  - n=2: `[1.0400, 0.8000, -0.9200]` ✓
+  - n=3: `[1.2320, 1.4400, -1.3360]` ✓
+- `test_tiny_linear_sgd_loop` n=1, n=2, n=3 return `CTR(w, b)` with
+  readable `final_w` / `final_b`.
+- `test_grad_fuse_minimal` passes.
 
-```bash
-THVM_TRAIN_STEPS=1 ./bin/test_tiny_linear_sgd_loop cpu 1
-```
+## Root cause
 
-updates `w` and `b` once.
+Two independent bugs:
 
-```bash
-THVM_TRAIN_STEPS=2 ./bin/test_tiny_linear_sgd_loop cpu 1
-```
+1. **ALO multi-force vs. DP linearity** —
+   [src/interact/_.c:914-932](/Users/swish/src/TinyHVM/src/interact/_.c#L914).
+   Multiple consumer sites that share an ALO cell would each read
+   the same memoised DP0/DP1 token from `heap[alo_loc+0]`. Since
+   `port_slot` tracks only one consumer per DUP port, stale
+   consumers cascaded ERA on later visits.
+   **Fix:** fresh-DUP-wrap at second-and-later force — allocate a
+   new DUP cell wrapping the memo, hand out one projection, push
+   the other back as the new memo.
 
-still returns the one-step parameter values and stops at a structural
-`KERNEL(UOP_COUNT, ...)` carrier instead of finishing the second update.
+2. **Shape tracking lost on DP/VAR/ALO args in GRAD** —
+   [src/interact/grad.c:291-292](/Users/swish/src/TinyHVM/src/interact/grad.c#L291).
+   When an op's arg was a DP / VAR / ALO (not yet resolved to TEN
+   or TOP), `a_shape` / `b_shape` defaulted to `SHAPE(1)` — a
+   rank-1 scalar. `sum_to_shape(gy, y_shape, [1])` then
+   **reduced the per-element gradient to a scalar** and
+   broadcast it back, destroying the gradient's spatial
+   structure.
+   **Fix:** default `a_shape` / `b_shape` to `y_shape` (the
+   output shape). Elementwise ops preserve shape, so when the
+   arg isn't yet resolvable, `y_shape` is the correct guess.
+   Reshape / expand / permute override via the TEN / TOP lookup
+   paths that were already correct.
 
-## What Is Already Fixed
+   Confirmed by instrumentation: step 1 reported
+   `a=[3] b=[3]` for the SUB, step 2 reported `a=[1] b=[3]` —
+   the scalar default fired at step 2 because the SUB's first
+   arg resolved through a DP chain that hadn't been materialised
+   yet.
 
-- Recursive `GRAD` target copies now preserve stable tensor ids across `REF` /
-  `ALO` realization.
-- The staged collector no longer walks into the right branch of `SEQ` before the
-  left branch settles.
-- The same strictness rule now applies to `KERNEL(..., UOP_COUNT)` control
-  shells.
+## What made this hard to find
 
-These fixes were necessary: the second recursive `GRAD` pass now hits both
-parameter targets again.
+- The `scalar` test asserts exact SGD trajectory — it was the
+  only signal that the `linear_sgd` smoke test was also wrong
+  (same bug, but `linear_sgd` has no value asserts).
+- The numeric pattern (`update - w_prev = uniform 0.52`) pointed
+  at a reduce-then-broadcast bug, not the DUP / ASSIGN race that
+  prior plan revisions fixated on.
+- Two unrelated bugs had to be fixed together. The ALO bug
+  surfaced first (it stalls the reducer at n≥2 without the
+  fresh-DUP-wrap), hiding the shape-tracking bug until the first
+  one was fixed.
 
-## Remaining Failure
+## Verified correct (do not revisit)
 
-The remaining bug is no longer in `GRAD` target matching or in early recursive
-evaluation. The next recursive update eventually loses its `ASSIGN` destination:
-the destination branch collapses to `ERA`, so the loop stalls after one
-effective update.
+- Fresh-DUP-wrap in `thvm_alo_force`.
+- `thvm_alo_suspend_child` DP0/DP1 alias-skip.
+- `APP-LAM` caller-APP-cell clear.
+- FUSE-gated on structural shape (not APP / REF / ALO).
+- FUSE ⊳ UOP_ASSIGN idempotent.
+- Rule 2 (`ASSIGN ⊳ SUP`) landed.
+- Backward through UOP_ASSIGN routing.
+- Recursive GRAD target copy stability.
+- Graph-dump directory announce.
+- **Default `a_shape` / `b_shape` = `y_shape`** in grad-backward.
 
-Current best hypothesis:
+## Dead ends (do not retry)
 
-- the remaining corruption happens in the `DP` / `ALO` alias path for threaded
-  parameter handles (`w_next`, `b_next`, `w_assign`, `b_assign`)
-- not in lowering or kernel dispatch
-
-## Next Steps
-
-1. Regenerate the `n=2` step trace and identify the first frame where the
-   second-step `ASSIGN` target stops being the live parameter tensor.
-2. Trace that target backward through `DP0` / `DP1`, `ALO`, and any shared alias
-   fast-path in [src/interact/_.c](/Users/swish/src/TinyHVM/src/interact/_.c).
-3. Check whether `ALO` realization is incorrectly collapsing a projected alias
-   to a shared leaf, or otherwise dropping a `DP` wrapper too early.
-4. If the imperative aliasing model is fundamentally unstable, switch this loop
-   to the pure functional update shape:
-   `train(m)(w')(b')` instead of threading the same in-place handles through
-   recursive `ASSIGN`.
-
-## Verification Targets
-
-- `THVM_TRAIN_STEPS=1` still performs one correct update.
-- `THVM_TRAIN_STEPS=2` performs a second distinct update.
-- `THVM_TRAIN_STEPS=3` continues progressing.
-- No `THVM_EVAL_MIXED_DISPATCH` override is needed.
+- Rule 1 (`DUP ⊳ UOP_ASSIGN = t`). On top of fresh-DUP-wrap it
+  causes unbounded heap growth; without the shape-tracking fix
+  it's solving the wrong problem.
+- Eager eval in interaction rules.
+- Clearing `heap[alo_loc+0]` to ERA on first DP force.
+- Reverting the fresh-DUP-wrap.
+- Program-side `DETACH` on the recursive arg (breaks tensor-id
+  identity).
+- `ASSIGN ⊳ ERA` src short-circuit (masking, not fixing).
+- An "ASSIGN driver" in the reducer fixed-point.
+- Selective fuse sweeps, share-by-reference DUP ⊳ ASSIGN.

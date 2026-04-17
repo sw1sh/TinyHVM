@@ -9,12 +9,75 @@
                     fprintf(stderr, "ASSIGN: dst_tag=%u src_tag=%u src_ext=%u\n",
                         term_tag(dst_r), term_tag(src_t),
                         term_tag(src_t)==TAG_TOP?term_ext(src_t):0);
+                // ASSIGN ⊳ SUP on dst (HVM4 FFI pattern, paired with
+                // DUP ⊳ UOP_ASSIGN = t in combinators.c):
+                // ASSIGN(&L{d0,d1}, s)
+                //   --> &L{ ASSIGN(d0, DP0_L(s)), ASSIGN(d1, DP1_L(s)) }
+                // The ASSIGN redistributes itself when an upstream DUP
+                // pushes a SUP into either arg. One blit per branch, each
+                // with an independent projection of the shared src.
+                // See resources/hvm4_ffi_design.md.
+                if (term_tag(dst_r) == TAG_SUP) {
+                    u32 lab = term_ext(dst_r);
+                    u64 sup_loc = term_val(dst_r);
+                    Term d0 = heap_read(ctx, sup_loc + 0);
+                    Term d1 = heap_read(ctx, sup_loc + 1);
+                    u64 sdup = heap_alloc(ctx, 1);
+                    heap_set(ctx, sdup, src_t);
+                    Term s0 = term_new(TAG_DP0, lab, sdup);
+                    Term s1 = term_new(TAG_DP1, lab, sdup);
+                    ctx->itrs++;
+                    RETURN_REDUCED(thvm_sup(ctx, lab,
+                        thvm_assign(ctx, d0, s0),
+                        thvm_assign(ctx, d1, s1)));
+                }
+                // Symmetric ASSIGN ⊳ SUP on src:
+                // ASSIGN(d, &L{s0,s1})
+                //   --> &L{ ASSIGN(DP0_L(d), s0), ASSIGN(DP1_L(d), s1) }
+                if (term_tag(src_t) == TAG_SUP) {
+                    u32 lab = term_ext(src_t);
+                    u64 sup_loc = term_val(src_t);
+                    Term s0 = heap_read(ctx, sup_loc + 0);
+                    Term s1 = heap_read(ctx, sup_loc + 1);
+                    u64 ddup = heap_alloc(ctx, 1);
+                    heap_set(ctx, ddup, dst_r);
+                    Term d0 = term_new(TAG_DP0, lab, ddup);
+                    Term d1 = term_new(TAG_DP1, lab, ddup);
+                    ctx->itrs++;
+                    RETURN_REDUCED(thvm_sup(ctx, lab,
+                        thvm_assign(ctx, d0, s0),
+                        thvm_assign(ctx, d1, s1)));
+                }
+                // ASSIGN ⊳ ERA on src: the update expression reached ERA
+                // (e.g. an entire grad branch erased). ASSIGN returns its
+                // dst either way, so yield dst and consume the ASSIGN node.
+                // This is a normal IC interaction rule — the same way
+                // ADD ⊳ ERA returns the non-erased operand.
+                if (term_tag(dst_r) == TAG_TEN && term_tag(src_t) == TAG_ERA) {
+                    heap_set(ctx, loc + 0, term_era());
+                    heap_set(ctx, loc + 1, term_era());
+                    ctx->itrs++;
+                    RETURN_REDUCED(dst_r);
+                }
                 if (term_tag(dst_r) != TAG_TEN || term_tag(src_t) != TAG_TEN)
                     return t;  // not ready — reducer will reduce args first
                 {
                     u32 dst_id = (u32)term_val(dst_r);
                     u32 src_id = (u32)term_val(src_t);
                     if (ctx->defer_all && ctx->tensors[src_id].buf_id == 0) return t; // scheduler handles
+                    if (getenv("THVM_LOOP_DIAG")) {
+                        TensorMeta *dbg_dst = &ctx->tensors[dst_id];
+                        TensorMeta *dbg_src = &ctx->tensors[src_id];
+                        u32 src_dtype = DTYPE_F32, dst_dtype = DTYPE_F32;
+                        f32 *src_host = (f32 *)thvm_to_host_raw(ctx, src_t, &src_dtype, NULL);
+                        f32 *dst_host = (f32 *)thvm_to_host_raw(ctx, dst_r, &dst_dtype, NULL);
+                        fprintf(stderr,
+                                "ASSIGN_FIRE dst=%u src=%u same=%d dst_buf=%u src_buf=%u src0=%.6f dst0=%.6f\n",
+                                dst_id, src_id, dst_id == src_id,
+                                dbg_dst->buf_id, dbg_src->buf_id,
+                                (src_host && src_dtype == DTYPE_F32) ? src_host[0] : 0.0f,
+                                (dst_host && dst_dtype == DTYPE_F32) ? dst_host[0] : 0.0f);
+                    }
                     if (dst_id != src_id) {
                         TensorMeta *md = &ctx->tensors[dst_id];
                         TensorMeta *ms = &ctx->tensors[src_id];
@@ -69,6 +132,15 @@
                         { extern u32 buf_epoch[];
                           if (md->buf_id < MAX_BUF_EPOCHS)
                               buf_epoch[md->buf_id]++; }
+                    }
+                    if (getenv("THVM_LOOP_DIAG")) {
+                        TensorMeta *dbg_dst = &ctx->tensors[dst_id];
+                        u32 dst_dtype = DTYPE_F32;
+                        f32 *dst_host = (f32 *)thvm_to_host_raw(ctx, dst_r, &dst_dtype, NULL);
+                        fprintf(stderr,
+                                "ASSIGN_DONE dst=%u dst_buf=%u dst0=%.6f\n",
+                                dst_id, dbg_dst->buf_id,
+                                (dst_host && dst_dtype == DTYPE_F32) ? dst_host[0] : 0.0f);
                     }
                     ctx->itrs++;
                     RETURN_REDUCED(dst_r);
@@ -204,16 +276,10 @@
                 extern KernelEntry sched_kernels[];
                 Term kid_term = heap_read(ctx, loc + 0);
                 Term deps     = heap_read(ctx, loc + 1);
-                // Check dependencies are resolved
-                if (term_tag(deps) == TAG_TOP &&
-                    (term_ext(deps) == UOP_KERNEL || term_ext(deps) == UOP_EXEC))
-                    return t;  // dep not yet fired
-                if (term_tag(deps) == TAG_CTR) {
-                    Term d0 = heap_read(ctx, term_val(deps) + 0);
-                    Term d1 = heap_read(ctx, term_val(deps) + 1);
-                    if (!thvm_kernel_child_ready(d0) || !thvm_kernel_child_ready(d1))
-                        return t;  // deps not ready
-                }
+                if (!thvm_exec_dep_force(ctx, &deps, 0))
+                    return t;
+                if (deps != heap_read(ctx, loc + 1))
+                    heap_set(ctx, loc + 1, deps);
                 if (!ctx->dispatch_enabled) return t;
                 u32 kid = term_as_u32(kid_term);
                 if (kid >= sched_kernel_count) {
@@ -283,12 +349,18 @@
                     if (puop == UOP_KERNEL || puop == UOP_FUSE)
                         RETURN_REDUCED(payload);
 
-                    // ASSIGN: wrap src in FUSE, return ASSIGN.
+                    // ASSIGN: wrap src in FUSE (once), return ASSIGN.
                     // Pure interaction — no sub-reduce. Reducer handles the rest.
+                    // Do NOT rewrap an already-FUSE/KERNEL src or we grow
+                    // nested FUSE layers on every sweep revisit.
                     if (puop == UOP_ASSIGN) {
                         u64 aloc = term_val(payload);
                         Term src = heap_read(ctx, aloc + 1);
-                        if (term_tag(src) != TAG_TEN && term_tag(src) != TAG_ERA) {
+                        u8 st = term_tag(src);
+                        int already_wrapped = (st == TAG_TOP &&
+                                               (term_ext(src) == UOP_FUSE ||
+                                                term_ext(src) == UOP_KERNEL));
+                        if (st != TAG_TEN && st != TAG_ERA && !already_wrapped) {
                             u64 fl = heap_alloc(ctx, 1);
                             heap_set(ctx, fl, src);
                             heap_set(ctx, aloc + 1, term_new(TAG_TOP, UOP_FUSE, fl));
@@ -316,19 +388,13 @@
                     RETURN_REDUCED(payload);
                 }
 
-                // SEQ: absorb → KERNEL(FUSE(a), FUSE(b), SEQ-marker)
-                if (ptag == TAG_SEQ) {
-                    u64 sloc = term_val(payload);
-                    Term a = heap_read(ctx, sloc);
-                    Term b = heap_read(ctx, sloc + 1);
-                    u64 fa = heap_alloc(ctx, 1); heap_set(ctx, fa, a);
-                    u64 fb = heap_alloc(ctx, 1); heap_set(ctx, fb, b);
-                    u64 kloc = heap_alloc(ctx, 3);
-                    heap_set(ctx, kloc + 0, term_new(TAG_TOP, UOP_FUSE, fa));
-                    heap_set(ctx, kloc + 1, term_new(TAG_TOP, UOP_FUSE, fb));
-                    heap_set(ctx, kloc + 2, term_num_u32(UOP_COUNT));
-                    RETURN_REDUCED(term_new(TAG_TOP, UOP_KERNEL, kloc));
-                }
+                // SEQ: pass through. Do NOT absorb into a parallel
+                // KERNEL — that breaks SEQ's strict ordering (the whole
+                // point of SEQ is to force a's side effects before b is
+                // considered). The reducer's TAG_SEQ handler fires a
+                // first, discards, then returns b, and FUSE can wrap b
+                // later on the next root pass.
+                if (ptag == TAG_SEQ) RETURN_REDUCED(payload);
 
                 // CTR: distribute
                 if (ptag == TAG_CTR) {

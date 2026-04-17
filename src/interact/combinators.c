@@ -72,6 +72,12 @@
                     if (term_tag(forced) == TAG_TEN) arg = forced;
                 }
                 heap_set(ctx, lam_loc, arg);      // link: write arg at var slot
+                // Clear the APP's arg slot so ALO/DP tokens move exclusively to
+                // the lambda binder. Without this, a linear ALO stays aliased
+                // from both heap[loc+1] and heap[lam_loc], and the second
+                // reader walks into a stale memoised projection.
+                heap_set(ctx, loc + 0, term_era());
+                heap_set(ctx, loc + 1, term_era());
                 ctx->itrs++;
                 t = heap_read(ctx, lam_loc + 1);  // body (may be ALO; let it interact explicitly next)
                 INET_RECURSE();

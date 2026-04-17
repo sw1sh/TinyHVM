@@ -99,19 +99,19 @@ static inline int reduce_fuse_payload_ready(TinyHVM *ctx, Term t) {
         case TAG_NUM:
         case TAG_SEQ:
         case TAG_CTR:
-        case TAG_APP:
         case TAG_LAM:
         case TAG_BRI:
-        case TAG_REF:
         case TAG_SUP:
         case TAG_USP:
         case TAG_MAT:
         case TAG_ANN:
         case TAG_ANY:
-        case TAG_ALO:
             return 1;
         case TAG_TOP:
             return reduce_fuse_payload_top_ready(ctx, t);
+        // APP / REF / ALO / VAR / DP / etc. are not useful shapes for FUSE
+        // to act on — let the reducer collapse them first, then FUSE sees
+        // whatever CTR / compute TOP / SEQ they expose.
         default:
             return 0;
     }

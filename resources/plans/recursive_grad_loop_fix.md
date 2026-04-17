@@ -1,17 +1,30 @@
-# Plan: Finish The Recursive GRAD Learning Loop — DONE
+# Plan: Recursive GRAD Learning Loop — Status & Open Work
 
 ## Status (2026-04-17)
 
-All verification targets pass:
+**Single-parameter elementwise loop: done.**
 
 - `test_tiny_scalar_grad_loop` n=1, n=2, n=3 pass assertions
-  against the host-simulated SGD trajectory.
+  against host-simulated SGD trajectory.
   - n=1: `[0.8000, 0.0000, -0.4000]` ✓
   - n=2: `[1.0400, 0.8000, -0.9200]` ✓
   - n=3: `[1.2320, 1.4400, -1.3360]` ✓
-- `test_tiny_linear_sgd_loop` n=1, n=2, n=3 return `CTR(w, b)` with
-  readable `final_w` / `final_b`.
 - `test_grad_fuse_minimal` passes.
+- `test_tiny_linear_sgd_loop` (matmul-based) returns `CTR(w, b)` with
+  readable tensors (smoke pass, no value asserts).
+
+**Multi-parameter / matmul in loop: broken numerically.**
+
+- `test_tiny_twoparam_grad_loop` (NEW diagnostic, elementwise
+  `loss = sum((w + b - t)^2)` with multi-target GRAD + MAT):
+  - n=1: w's grad is **exact**; b's grad is uniformly **0.8x**
+    expected. Pattern holds across positions (uniform ratio).
+  - n=2/3: ratios drift further — step 2 w becomes 1.025x, b becomes
+    0.82x.
+  - XFAIL'd (prints "XFAIL" instead of asserting).
+- `test_tiny_linear_sgd_loop` numerics vs. host-simulated SGD:
+  n=1 W[0,0] observed 0.1441, expected 0.1109. Not a clean scaling
+  factor — matmul backward in the loop computes different values.
 
 ## Root cause
 
@@ -86,3 +99,33 @@ Two independent bugs:
 - `ASSIGN ⊳ ERA` src short-circuit (masking, not fixing).
 - An "ASSIGN driver" in the reducer fixed-point.
 - Selective fuse sweeps, share-by-reference DUP ⊳ ASSIGN.
+
+## Open work — multi-target GRAD in the loop
+
+The twoparam XFAIL is the next investigation. Observed:
+
+- w's gradient is correct at step 1 (matches host simulation).
+- b's gradient is uniformly **0.8x** expected at step 1; drifts
+  further at step 2/3.
+- w and b have structurally identical 5-DUP chains and both feed
+  `thvm_grad_multi_keep(loss, [w, b], 2)`. Suggests the bug is in
+  how the second slot of a multi-keep bundle is wired (first slot
+  seems fine).
+
+Hypotheses to test next:
+
+1. **Bundle slot routing** — `thvm_grad_multi_keep` might be
+   incorrectly sharing the keep-target's DP chain between slots,
+   with slot 1 getting a partially-consumed view.
+2. **MAT destructuring** — the `thvm_mat(ctx, 2, lam_gw, era)`
+   wrapping `λgw. λgb. body` might leak one of the bundled
+   gradients.
+3. **ASSIGN ordering** — both ASSIGNs run inside a `SEQ(assign_w,
+   SEQ(assign_b, rec))`; the second ASSIGN may see a stale DP
+   projection of its dst because the first ASSIGN already
+   consumed some consumer.
+
+For matmul: deeper issue. Linear_sgd_loop W[0,0] is ~4x expected
+at step 1 — not a clean factor. Likely matmul backward in the
+loop uses a stale or wrong input activations tensor after the
+first step.

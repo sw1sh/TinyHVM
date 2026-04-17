@@ -264,19 +264,63 @@ So the asymmetry at the term level is limited to that outermost
 DP0-vs-DP1 wrapper. Everything inside the chain is the same
 cloned structure. Yet b's final value is 0.8× w's.
 
-### Next round — trace the inner DUP firings
+### Round 3 (2026-04-18): DP0 vs DP1 chain firing asymmetry
 
-Hypothesis: when the outer DUP (at cell 230 for b, or 221 for w)
-fires via DP1 vs DP0, the inner DUP firing order differs. Since
-the inner chain is identical, but the OUTER trampoline walk may
-visit inner DUPs in different orders depending on whether it
-arrived via DP0 or DP1, that order can produce different
-port_slot registration/discard timings.
+Captured full `DUP_FIRE` sequence and diffed w vs b chains.
 
-Concrete: run `THVM_GRAD_TRACE=1` and capture the `DUP_FIRE`
-sequence for cells 221/222/... (w's chain) vs 230/231/... (b's
-chain). Diff them. Any cell that fires with an orphan port_slot
-in one chain but not the other is a candidate for the bug.
+**Finding — the firing patterns are NOT symmetric:**
+
+```
+w's chain (outer label 20):
+  dup=222 DP0  [ORPHAN s1=0]  (inner cdup, w only consumer)
+  dup=281 DP0  [ORPHAN s1=0]  (inner cdup, w only consumer)
+  dup=221 DP0  [ORPHAN s1=0]  (outer DUP from clone, w only)
+  dup=280 DP0  [ORPHAN s1=0]
+  dup=377 DP0  [s0=389 s1=375 non-orphan]  ← cdup with both
+  dup=389 DP0  [s0=385 s1=387 non-orphan]
+  dup=378 DP0
+  ...all DP0 all the way down.
+
+b's chain (outer label 22):
+  dup=231 DP0  [ORPHAN s1=0]  (inner)
+  dup=295 DP0  [ORPHAN s1=0]
+  dup=230 DP1  [ORPHAN s0=0]  (OUTER — the DP1 twist!)
+  dup=294 DP1  [ORPHAN s0=0]
+  dup=527 DP0  [s0=539 s1=525 non-orphan]
+  dup=539 DP1  [s0=535 s1=537 non-orphan]  ← ALTERNATES!
+  dup=528 DP0
+  dup=540 DP1
+  ...alternates DP0, DP1 throughout.
+```
+
+**Root pattern**: `bundle_accum`'s `term_clone` on `DP1(cell_209)`
+produces outer wrapper DP1(new_cell=230). Inner `heap[cell_209]`
+= DP0(cell_192) so the inner is DP0. Result: b's outermost DUP
+fires via DP1 (because the consumer is DP1 at ADD's arg slot),
+while inner DUPs created by the commute have BOTH port_slots
+registered (because both n0's and n1's args point to the same
+cdups via `heap_set`).
+
+When a non-orphan inner DUP fires via DP1, `DUP_STATE_RETURN`
+writes `_v1` to the live consumer (b's arg slot) AND writes
+`_v0` to the DEAD n0-side arg slot (the "sibling" MUL that was
+orphaned at outer commute time). The write to the dead slot
+has `port_forget`/`port_remember` side effects that can clear
+or re-register DUP port_slots in the cdup's children.
+
+**Hypothesis for next round**: the side-effectful writes to
+DEAD n0/n1 arg slots during b's DP1-side reduction cascade into
+heap cells that w's chain also depends on (if the dead and
+live sides share further-down cdups via label collision?). Or
+the extra `port_forget` during the double-write clears a
+port_slot needed by some later DUP firing.
+
+Concrete probe: log every `port_forget` triggered from a
+heap_set that's happening during DUP_STATE_RETURN (i.e.,
+"side-effect writes"). Count how many port_slot registrations
+get torn down during b's chain vs w's chain. If b's side-effect
+writes tear down twice as many registrations, that's the
+mechanism.
 
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.

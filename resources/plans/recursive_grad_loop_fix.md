@@ -908,6 +908,55 @@ Given 13 rounds of investigation, recommend user pick a
 direction before further attempts — continued iteration on
 APP-MAT-CTR alone isn't productive.
 
+## ROUND 14 (2026-04-18): FORCE_WNF flakiness measured — NOT safe as default
+
+Tested `THVM_MAT_FORCE_WNF=1` determinism with 20 runs each:
+
+| Test           | Default-off (20 runs)   | With flag (20 runs)        |
+|----------------|-------------------------|----------------------------|
+| scalar n=1/2/3 | 20/20 PASS              | 20/20 PASS                 |
+| twoparam_sum n=1 | 20/20 PASS (exit 0)  | 17/20 FAIL (exit 133, no output) ⚠️ |
+| twoparam_grad n=1/2/3 | XFAIL (the bug) | 20/20 PASS with exact values |
+| grad_fuse      | 20/20 PASS              | 20/20 PASS                 |
+
+**The FORCE_WNF fix is 85% flaky-abort on twoparam_sum.** Likely
+an assertion or heap-corruption race in the scheduler when
+`thvm_eval` is called recursively on a UOP_EXPAND child from
+within an interaction rule. The 3/20 runs that pass suggest
+the race depends on heap allocation order.
+
+This is NOT safe to land as default. The working fix delivers
+correct numerics for the target bug but breaks a passing
+regression non-deterministically.
+
+### Remaining direction for a real fix
+
+The bug is now understood, the symptomatic fix identified, and
+the cost of that fix (flakiness, eager-eval policy violation)
+measured. To land a stable fix, one of:
+
+1. **Fix the EXPAND race.** Investigate what `thvm_eval` on a
+   UOP_EXPAND child touches during a recursive re-entry that
+   fails non-deterministically. Likely a scheduler assertion
+   around tensor-id state or view-tracker state.
+
+2. **Switch to option B (scheduler write-fence).** ASSIGN's blit
+   defers until no live backward kernel references the dst tid.
+   Bigger surgery; the most IC-aligned approach. Deterministic
+   by design (no recursive eval from rules).
+
+3. **Option A (PyTorch-style saved tensors).** At GRAD construction
+   time, materialise forward activations that the backward
+   references and use those saved TENs as leaves in backward
+   kernels.
+
+Options 2 and 3 are architecturally cleaner than option 1.
+Option 1 is the minimum surgical fix if we accept the policy
+violation. Option 2 is my strongest recommendation.
+
+All 14 rounds of investigation are now documented. The cron
+should stop; next step requires user direction.
+
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.
 Investigate only after twoparam is closed.

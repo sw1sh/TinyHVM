@@ -709,6 +709,70 @@ The real fix requires either (1) or (2) above. Both are
 non-trivial and need user guidance on which direction to
 pursue.
 
+## ROUND 11 (2026-04-18): WORKING FIX (env-gated) — force MAT-CTR children to WNF
+
+Added `THVM_MAT_FORCE_WNF=1` env knob in APP-MAT-CTR
+([src/interact/combinators.c](/Users/swish/src/TinyHVM/src/interact/combinators.c)
+line ~192): when set, each CTR child of TAG_TOP kind is passed
+through `thvm_eval` to materialise as a TEN BEFORE binding into
+the lambda variables.
+
+**Result: twoparam_grad passes at n=1, 2, 3 with EXACT SGD
+trajectory match:**
+
+| n | final_w                              | final_b                              | Status |
+|---|--------------------------------------|--------------------------------------|--------|
+| 1 | `[0.7800, -0.0400, -0.3400]`         | `[0.3800, 1.1600, -0.8900]`          | ✓ PASS |
+| 2 | `[0.9480, 0.5360, -0.6940]`          | `[0.5480, 1.7360, -1.2440]`          | ✓ PASS |
+| 3 | `[1.0488, 0.8816, -0.9064]`          | `[0.6488, 2.0816, -1.4564]`          | ✓ PASS |
+
+Why it works: when the grad bundle's ADD-accumulator children are
+materialised to fresh TENs before the lambda body runs, the
+gradient TENs are cached (stable tensor ids). ASSIGN reads
+`gw_var` / `gb_var` which now point to cached TENs, not to live
+forward chains. No more stale-read when the other ASSIGN mutates
+a forward input buffer.
+
+### Known limitations
+
+1. **Violates "no eager eval in interaction rules" policy.**
+   `thvm_eval` called from APP-MAT-CTR is eager evaluation from
+   an interaction rule. Gated to `THVM_MAT_FORCE_WNF=1` so it
+   doesn't run by default. User's call on whether to relax the
+   policy or find a different materialisation point.
+2. **Aborts on twoparam_sum** (`SIGTRAP` exit 133). That test's
+   bundle children are `TOP/UOP_EXPAND` (lazy view ops).
+   `thvm_eval` on an EXPAND term hits an assertion somewhere in
+   the scheduler. Would need to either (a) restrict force-WNF to
+   non-view UOPs or (b) fix whatever scheduler assertion fires.
+
+### Behaviour summary
+
+- Default (no env flag): all tests behave exactly as before
+  (scalar PASS, twoparam_sum PASS, twoparam_grad XFAIL,
+  grad_fuse_minimal PASS). No regression.
+- With flag: twoparam_grad PASSES, scalar still PASSES,
+  grad_fuse_minimal still PASSES, twoparam_sum ABORTS.
+
+### Next steps (require user decision)
+
+The fix mechanism is proven. To land it cleanly:
+
+1. **Decision needed**: is calling `thvm_eval` from an
+   interaction rule acceptable for MAT-CTR destructuring? The
+   rule's semantics arguably SHOULD force WNF children since it
+   binds them as lambda arguments. Or prefer option 2/3 from
+   round 10.
+
+2. **Fix the UOP_EXPAND abort.** Restrict the force path to ops
+   that reliably materialise, or fix the scheduler assertion
+   that fires on EXPAND evaluation.
+
+3. **Consider replacing `thvm_eval` with a less-eager
+   alternative** — e.g., emit a FUSE wrapper and let the
+   normal reducer handle materialisation through its fixed
+   point.
+
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.
 Investigate only after twoparam is closed.

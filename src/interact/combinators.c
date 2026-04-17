@@ -191,8 +191,47 @@
                     if (match_tag == ctr_tag) {
                         Term r = heap_read(ctx, mat_loc + 0);
                         u64 ctr_loc = term_val(arg);
-                        for (u32 i = 0; i < ctr_tag; i++)
-                            r = thvm_app(ctx, r, heap_read(ctx, ctr_loc + i));
+                        for (u32 i = 0; i < ctr_tag; i++) {
+                            Term child = heap_read(ctx, ctr_loc + i);
+                            /* EXPERIMENT (THVM_MAT_FORCE_WNF=1): eagerly
+                             * reduce each CTR child to WNF before binding
+                             * it into the lambda. Tests whether forcing
+                             * grad bundle contents to materialise as TENs
+                             * before the body runs fixes the stale-read
+                             * bug where b's backward kernel reads
+                             * post-update w via a shared forward chain.
+                             * Violates the "no eager eval in interaction
+                             * rules" policy — diagnostic only. */
+                            /* Experimental gated fix for the multi-grad
+                             * stale-read bug (see
+                             * resources/plans/recursive_grad_loop_fix.md,
+                             * round 11). With THVM_MAT_FORCE_WNF=1, force
+                             * each CTR child to materialise via thvm_eval
+                             * before binding into the lambda. For a grad
+                             * bundle's ADD accumulator children, this
+                             * produces a cached TEN so later ASSIGNs don't
+                             * re-traverse the backward chain and read
+                             * post-mutation forward tensors. ARIDIAGNOSTIC
+                             * ONLY: thvm_eval here is eager eval from an
+                             * interaction rule (violates policy), and the
+                             * call crashes on lazy view ops like UOP_EXPAND
+                             * in twoparam_sum. Use only for twoparam_grad
+                             * investigation.
+                             */
+                            if (getenv("THVM_MAT_FORCE_WNF") &&
+                                getenv("THVM_MAT_FORCE_WNF")[0] != '0') {
+                                if (term_tag(child) == TAG_TOP) {
+                                    Term reduced = thvm_eval(ctx, child);
+                                    if (term_tag(reduced) == TAG_TEN ||
+                                        term_tag(reduced) == TAG_NUM ||
+                                        term_tag(reduced) == TAG_ERA) {
+                                        heap_set(ctx, ctr_loc + i, reduced);
+                                        child = reduced;
+                                    }
+                                }
+                            }
+                            r = thvm_app(ctx, r, child);
+                        }
                         t = r;
                     } else {
                         t = thvm_app(ctx, heap_read(ctx, mat_loc + 1), arg);

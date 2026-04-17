@@ -150,29 +150,47 @@ TEN yet, so `tid` is unset. The loop gets around this via
 dyn-loc and letting `find_term_at` resolve via ALO force later —
 but that path has the multi-slot numerical bug in (2).
 
-**Hypothesis**: the BG rule's `GRAD_SPLIT_AT()` + `_bt_dup` double
-duplication interacts poorly with the LOOP's book-realize +
-`thvm_alo_force` fresh-DUP-wrap. In a loop, each unfold
-re-realizes the BG's internal DUPs through the book path, and one
-of the projections (the one feeding b through DP1) ends up going
-through an extra level of splitting that drops ~20% of its
-contribution.
+### Experiment: pre-reduce grad before clone (2026-04-18)
 
-Specifically: w's DP0 flow reaches target via one `find_term_at`
-resolve → hit. b's DP1 flow reaches target via `find_term_at`
-too — but the DP1 projection has to walk one extra heap slot
-through the BG's inner `_at_dup` DUP (because `at = DP1(_at_dup)`
-is the outer rebind inside the `_db` block). That extra DUP layer,
-re-realized through book/ALO, is the likely source of the 0.8×.
+Inserting `grad = thvm_reduce(ctx, grad);` before `term_clone`
+in `thvm_grad_bundle_accum` — **flips the bug**:
 
-Concrete next diagnostic:
-- Add a probe in `thvm_grad_bundle_accum` that forces
-  `grad` to WNF (TEN) before cloning, and prints the actual
-  tensor values for w and b contributions at each deposit. If
-  b's deposits are tensor values with wrong numbers (not 0.8× w's),
-  the DUP propagation is fine and the bug is in accumulation. If
-  b's deposits numerically equal w's deposits, the bug is in how
-  the add-chain reduces.
+- Normal: w exact, b = 0.8× expected.
+- With pre-reduce: w = 0 (no update), b = exact.
+
+Striking. Reducing grad to TEN before cloning makes whichever
+target is processed *second* correct and whichever is *first*
+lose its deposit. Conclusion: the bug is **order-dependent** and
+lives in how the two sides of BG's DUP chain interact when
+multiple targets hit the same DUP cells (cell_209, cell_272)
+with DP0 (→ w) and DP1 (→ b).
+
+Normal operation: w (first hit) reads DP0 correctly, then b
+(second hit) reads DP1 and the DUP has already fired for DP0 via
+some side-effect path → b gets a partial view (80%).
+
+Pre-reduced: w's pre-reduce fires full backward chain eagerly,
+which consumes the subsequent path's contribution, landing b
+correctly but w with nothing.
+
+This isn't a 0.8× multiplier hiding anywhere — it's a linearity
+violation where DP0 and DP1 of the same gy DUP cell resolve to
+**different** effective values depending on which fires first.
+
+### Next step
+
+Look at `DUP_STATE_RETURN` when val is TAG_TEN (or when val
+commutes through TOP) in the loop context. The symmetric
+share-by-reference rule `DUP_STATE_RETURN(val, val, val)` should
+write the same TEN to both port_slots. If one of the port_slots
+hasn't been registered yet when DUP fires (because the second
+target hit is still pending), the write is discarded and the
+late-arriving DP reads ERA or stale data.
+
+Specifically: in `port_slot[dup, 0]` and `[dup, 1]` — is one of
+them being set to 0 transiently, causing the late write to be
+discarded? Instrument `thvm_dup_port_slot` and its setters to
+check.
 
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.

@@ -191,46 +191,54 @@
                     if (match_tag == ctr_tag) {
                         Term r = heap_read(ctx, mat_loc + 0);
                         u64 ctr_loc = term_val(arg);
+                        /* Fix for multi-grad-in-loop stale-read bug.
+                         *   THVM_MAT_FORCE_WNF=1 — eagerly thvm_eval each
+                         *     CTR child to materialise as TEN (works but
+                         *     violates no-eager-eval policy; aborts on
+                         *     UOP_EXPAND).
+                         *   THVM_MAT_SEQ_FUSE=1 — wrap children in FUSE
+                         *     and prepend a SEQ chain that forces each
+                         *     FUSE to materialise before the APP chain.
+                         *     Uses only IC primitives (SEQ, FUSE, APP).
+                         *   Default — no modification (preserves current
+                         *     behaviour).
+                         */
+                        int do_eager = getenv("THVM_MAT_FORCE_WNF") &&
+                                       getenv("THVM_MAT_FORCE_WNF")[0] != '0';
+                        int do_seqfuse = getenv("THVM_MAT_SEQ_FUSE") &&
+                                         getenv("THVM_MAT_SEQ_FUSE")[0] != '0';
                         for (u32 i = 0; i < ctr_tag; i++) {
                             Term child = heap_read(ctx, ctr_loc + i);
-                            /* EXPERIMENT (THVM_MAT_FORCE_WNF=1): eagerly
-                             * reduce each CTR child to WNF before binding
-                             * it into the lambda. Tests whether forcing
-                             * grad bundle contents to materialise as TENs
-                             * before the body runs fixes the stale-read
-                             * bug where b's backward kernel reads
-                             * post-update w via a shared forward chain.
-                             * Violates the "no eager eval in interaction
-                             * rules" policy — diagnostic only. */
-                            /* Experimental gated fix for the multi-grad
-                             * stale-read bug (see
-                             * resources/plans/recursive_grad_loop_fix.md,
-                             * round 11). With THVM_MAT_FORCE_WNF=1, force
-                             * each CTR child to materialise via thvm_eval
-                             * before binding into the lambda. For a grad
-                             * bundle's ADD accumulator children, this
-                             * produces a cached TEN so later ASSIGNs don't
-                             * re-traverse the backward chain and read
-                             * post-mutation forward tensors. ARIDIAGNOSTIC
-                             * ONLY: thvm_eval here is eager eval from an
-                             * interaction rule (violates policy), and the
-                             * call crashes on lazy view ops like UOP_EXPAND
-                             * in twoparam_sum. Use only for twoparam_grad
-                             * investigation.
-                             */
-                            if (getenv("THVM_MAT_FORCE_WNF") &&
-                                getenv("THVM_MAT_FORCE_WNF")[0] != '0') {
-                                if (term_tag(child) == TAG_TOP) {
-                                    Term reduced = thvm_eval(ctx, child);
-                                    if (term_tag(reduced) == TAG_TEN ||
-                                        term_tag(reduced) == TAG_NUM ||
-                                        term_tag(reduced) == TAG_ERA) {
-                                        heap_set(ctx, ctr_loc + i, reduced);
-                                        child = reduced;
-                                    }
+                            if (do_eager && term_tag(child) == TAG_TOP) {
+                                Term reduced = thvm_eval(ctx, child);
+                                if (term_tag(reduced) == TAG_TEN ||
+                                    term_tag(reduced) == TAG_NUM ||
+                                    term_tag(reduced) == TAG_ERA) {
+                                    heap_set(ctx, ctr_loc + i, reduced);
+                                }
+                            } else if (do_seqfuse &&
+                                       term_tag(child) == TAG_TOP &&
+                                       term_ext(child) != UOP_FUSE) {
+                                u64 fuse_loc = heap_alloc(ctx, 1);
+                                heap_set(ctx, fuse_loc, child);
+                                Term fused = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
+                                heap_set(ctx, ctr_loc + i, fused);
+                            }
+                        }
+                        /* Build the APP chain: r = handler(child0)(child1)... */
+                        for (u32 i = 0; i < ctr_tag; i++) {
+                            r = thvm_app(ctx, r, heap_read(ctx, ctr_loc + i));
+                        }
+                        /* SEQ_FUSE mode: prefix APP chain with SEQ per
+                         * FUSE'd child so they materialise first. */
+                        if (do_seqfuse) {
+                            for (u32 i = ctr_tag; i > 0; i--) {
+                                Term c = heap_read(ctx, ctr_loc + (i - 1));
+                                if (term_tag(c) == TAG_TOP &&
+                                    term_ext(c) == UOP_FUSE) {
+                                    r = thvm_seq(ctx, c, r);
                                 }
                             }
-                            r = thvm_app(ctx, r, child);
                         }
                         t = r;
                     } else {

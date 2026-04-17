@@ -773,6 +773,70 @@ The fix mechanism is proven. To land it cleanly:
    normal reducer handle materialisation through its fixed
    point.
 
+## ROUND 12 (2026-04-18): FUSE-wrapping approaches FAIL
+
+Tried two lazy alternatives to the `thvm_eval` eager path:
+
+### Attempt 1 — `THVM_MAT_FUSE_CHILDREN=1`
+
+Wrap each CTR child in a `FUSE(child)` term, then let the
+lambda body consume the FUSE'd version. Result: all tests fail
+— `final_b` stays at initial value (no ASSIGN fires). The lazy
+FUSE doesn't materialise before the body runs; the ordering
+guarantee needed for correctness isn't enforced.
+
+### Attempt 2 — `THVM_MAT_SEQ_FUSE=1`
+
+Same FUSE wrapping, PLUS prepend a SEQ chain `SEQ(FUSE(c0),
+SEQ(FUSE(c1), original_APP_chain))` so each FUSE materialises
+in order before the body runs. Also fails — same result as
+above (b=initial, no progress). The SEQ-chain reduces each
+FUSE and discards, but the APP chain still reads ctr_loc[i]
+which holds FUSE — and the lambda binding receives FUSE, not
+the materialised TEN. The FUSE-materialisation side effect
+isn't propagating to where the body reads.
+
+### Why lazy approaches fail, eager works
+
+- `thvm_eval(child)` — runs the entire reducer fixed-point in
+  the child's chain. Produces a TEN (or ERA/NUM). We then
+  `heap_set(ctr_loc + i, reduced)` — the CTR slot now holds
+  the cached TEN. APP chain reads the TEN. Body gets TEN.
+  Key insight: `thvm_eval` COMPLETES before MAT-CTR returns,
+  so the heap_set happens synchronously.
+
+- `FUSE(child)` — just marks the child for materialisation.
+  The SEQ chain reduces the FUSE — but the reduced value goes
+  into the FUSE wrapper's inner cell, not back to the CTR slot.
+  When APP chain reads ctr_loc[i], it gets the FUSE term, not
+  a TEN. When the body reduces that FUSE later, it's TOO LATE
+  — by then interleaving with ASSIGN has already happened.
+
+### Fundamentally, the fix needs eager materialisation
+
+The stale-read bug requires SYNCHRONOUS materialisation at MAT
+time. Lazy IC primitives (FUSE, SEQ) can order work but can't
+force synchronous completion across the boundary between
+interaction rule firing and subsequent term consumption.
+
+`thvm_eval` (round 11) is the only mechanism that achieves
+this, and it remains the sole working fix — with the
+documented policy-violation and UOP_EXPAND-abort caveats.
+
+### Recommendation
+
+Unless user has a less-intrusive alternative, the pragmatic
+path is:
+1. Accept `thvm_eval`-in-MAT-CTR for grad bundle destructuring.
+2. Fix the UOP_EXPAND abort (likely an assertion the scheduler
+   throws on certain view-op shapes mid-reduction).
+3. Make `THVM_MAT_FORCE_WNF=1` the default once EXPAND is
+   fixed.
+
+Alternatively the scheduler-side write-fence (option B) is
+the canonical IC-aligned solution but requires non-trivial
+scheduler work.
+
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.
 Investigate only after twoparam is closed.

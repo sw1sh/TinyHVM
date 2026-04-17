@@ -189,56 +189,41 @@
                         }
                     }
                     if (match_tag == ctr_tag) {
-                        Term r = heap_read(ctx, mat_loc + 0);
                         u64 ctr_loc = term_val(arg);
                         /* Fix for multi-grad-in-loop stale-read bug.
-                         *   THVM_MAT_FORCE_WNF=1 — eagerly thvm_eval each
-                         *     CTR child to materialise as TEN (works but
-                         *     violates no-eager-eval policy; aborts on
-                         *     UOP_EXPAND).
-                         *   THVM_MAT_SEQ_FUSE=1 — wrap children in FUSE
-                         *     and prepend a SEQ chain that forces each
-                         *     FUSE to materialise before the APP chain.
-                         *     Uses only IC primitives (SEQ, FUSE, APP).
-                         *   Default — no modification (preserves current
-                         *     behaviour).
+                         * THVM_MAT_FORCE_WNF=1: eagerly thvm_eval each
+                         * TAG_TOP CTR child to materialise as TEN before
+                         * binding. Works for the target bug but:
+                         *   - Violates "no eager eval in interaction
+                         *     rules" policy.
+                         *   - Aborts (SIGTRAP) on UOP_EXPAND children
+                         *     in twoparam_sum (scheduler assertion).
+                         * Three lazy alternatives (FUSE-wrap children,
+                         * SEQ-chain FUSE wrappers, FUSE-wrap the CTR
+                         * arg to trigger FUSE⊳CTR distribution) all
+                         * tried and all fail — the FUSE-based paths
+                         * disrupt the APP-MAT-CTR binding flow such
+                         * that ASSIGNs never fire. See round 12-13
+                         * in resources/plans/recursive_grad_loop_fix.md.
                          */
                         int do_eager = getenv("THVM_MAT_FORCE_WNF") &&
                                        getenv("THVM_MAT_FORCE_WNF")[0] != '0';
-                        int do_seqfuse = getenv("THVM_MAT_SEQ_FUSE") &&
-                                         getenv("THVM_MAT_SEQ_FUSE")[0] != '0';
-                        for (u32 i = 0; i < ctr_tag; i++) {
-                            Term child = heap_read(ctx, ctr_loc + i);
-                            if (do_eager && term_tag(child) == TAG_TOP) {
-                                Term reduced = thvm_eval(ctx, child);
-                                if (term_tag(reduced) == TAG_TEN ||
-                                    term_tag(reduced) == TAG_NUM ||
-                                    term_tag(reduced) == TAG_ERA) {
-                                    heap_set(ctx, ctr_loc + i, reduced);
+                        if (do_eager) {
+                            for (u32 i = 0; i < ctr_tag; i++) {
+                                Term child = heap_read(ctx, ctr_loc + i);
+                                if (term_tag(child) == TAG_TOP) {
+                                    Term reduced = thvm_eval(ctx, child);
+                                    if (term_tag(reduced) == TAG_TEN ||
+                                        term_tag(reduced) == TAG_NUM ||
+                                        term_tag(reduced) == TAG_ERA) {
+                                        heap_set(ctx, ctr_loc + i, reduced);
+                                    }
                                 }
-                            } else if (do_seqfuse &&
-                                       term_tag(child) == TAG_TOP &&
-                                       term_ext(child) != UOP_FUSE) {
-                                u64 fuse_loc = heap_alloc(ctx, 1);
-                                heap_set(ctx, fuse_loc, child);
-                                Term fused = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
-                                heap_set(ctx, ctr_loc + i, fused);
                             }
                         }
-                        /* Build the APP chain: r = handler(child0)(child1)... */
+                        Term r = heap_read(ctx, mat_loc + 0);
                         for (u32 i = 0; i < ctr_tag; i++) {
                             r = thvm_app(ctx, r, heap_read(ctx, ctr_loc + i));
-                        }
-                        /* SEQ_FUSE mode: prefix APP chain with SEQ per
-                         * FUSE'd child so they materialise first. */
-                        if (do_seqfuse) {
-                            for (u32 i = ctr_tag; i > 0; i--) {
-                                Term c = heap_read(ctx, ctr_loc + (i - 1));
-                                if (term_tag(c) == TAG_TOP &&
-                                    term_ext(c) == UOP_FUSE) {
-                                    r = thvm_seq(ctx, c, r);
-                                }
-                            }
                         }
                         t = r;
                     } else {

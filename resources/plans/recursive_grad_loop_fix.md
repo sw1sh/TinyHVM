@@ -837,6 +837,77 @@ Alternatively the scheduler-side write-fence (option B) is
 the canonical IC-aligned solution but requires non-trivial
 scheduler work.
 
+## ROUND 13 (2026-04-18): third lazy attempt fails too
+
+User feedback: "why you MAT to work on phase1 anyway? let it
+remain WNF, fuse everything below, final reduce should have
+materialized children"
+
+This is the right IC intuition. Investigation found the
+FUSE ⊳ CTR rule (tensor_ops.c ~line 411) already distributes
+FUSE to each CTR child when fire on `FUSE(CTR(...))`. So the
+IC primitive exists. Tried:
+
+### Attempt 3 — `THVM_MAT_FUSE_CTR_ARG=1`
+
+When MAT-CTR sees any unreduced TAG_TOP child, wrap the CTR
+itself in FUSE and rewrite the APP's second arg to FUSE(CTR),
+then return `t` to defer. The reducer's next step fires
+FUSE ⊳ CTR which distributes FUSE to each child. Then the
+children materialise via normal FUSE propagation. Eventually
+MAT-CTR fires again with TEN children.
+
+**Result**: fails like the other lazy attempts — `final_b`
+stays at initial, ASSIGNs never fire. The FUSE-wrapped children
+don't resolve through the scheduler in a way that reaches
+MAT-CTR again with TEN values.
+
+Same pattern as rounds 11-12 lazy attempts: IC-native FUSE
+propagation CAN materialise things, but the trigger point
+from APP-MAT-CTR doesn't reach completion before MAT's
+continuation runs.
+
+### All three lazy approaches now ruled out
+
+| Attempt | Mechanism | Result |
+|---------|-----------|--------|
+| FUSE_CHILDREN | Wrap each child in FUSE | Fails: ASSIGNs never fire |
+| SEQ_FUSE | FUSE + SEQ chain before APP | Fails: same |
+| FUSE_CTR_ARG | FUSE the CTR itself, retry | Fails: same |
+
+### What works: `THVM_MAT_FORCE_WNF=1` (eager `thvm_eval`)
+
+The ONLY mechanism that fixes the bug remains eagerly calling
+`thvm_eval` on each TAG_TOP CTR child from inside APP-MAT-CTR.
+Synchronous materialisation is essential; lazy IC primitives
+can't achieve it from within an interaction rule.
+
+### Code state
+
+Cleaned up in this round: removed the three failing env-gated
+lazy experiments (THVM_MAT_FUSE_CHILDREN, THVM_MAT_SEQ_FUSE,
+THVM_MAT_FUSE_CTR_ARG) from src/interact/combinators.c.
+`THVM_MAT_FORCE_WNF=1` remains the sole env-gated fix. Default
+behaviour unchanged (all regressions pass with flag off).
+
+### Remaining path forward
+
+User's "MAT should remain WNF, fuse below" is architecturally
+correct but requires either:
+(a) making the reducer's fixed point retry APP-MAT-CTR after
+    CTR children materialise — requires the outer scheduler to
+    know about the pending APP-MAT and re-drive it.
+(b) accepting synchronous eager materialisation at MAT-CTR
+    (round 11's thvm_eval path).
+(c) scheduler-level write-fence on ASSIGN (plan option B):
+    ASSIGN defers its blit until no backward kernel has the
+    dst tid as a live leaf. Most IC-aligned but largest
+    surgery.
+
+Given 13 rounds of investigation, recommend user pick a
+direction before further attempts — continued iteration on
+APP-MAT-CTR alone isn't productive.
+
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.
 Investigate only after twoparam is closed.

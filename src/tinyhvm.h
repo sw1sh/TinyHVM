@@ -1217,6 +1217,35 @@ static inline void thvm_dup_ports_clear_entry(TinyHVM *ctx, u64 dup_loc) {
     e->port_slot[1] = 0;
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Diagnostic flags — cheap env-var probes for targeted investigation.
+// THVM_GRAD_TRACE=1 enables ALL grad-investigation logs at once.
+// Finer-grained flags (LOOP_DIAG, SCHED_DIAG, DUP_DIAG) can be set
+// individually for a single slice of the pipeline.
+// ────────────────────────────────────────────────────────────────────
+static inline int thvm_grad_trace_enabled(void) {
+    const char *e = getenv("THVM_GRAD_TRACE");
+    return e && e[0] && e[0] != '0';
+}
+static inline int thvm_dup_diag_enabled(void) {
+    const char *e = getenv("THVM_DUP_DIAG");
+    if (e && e[0] && e[0] != '0') return 1;
+    return thvm_grad_trace_enabled();
+}
+static inline int thvm_loop_diag_enabled(void) {
+    const char *e = getenv("THVM_LOOP_DIAG");
+    if (e && e[0] && e[0] != '0') return 1;
+    return thvm_grad_trace_enabled();
+}
+static inline int thvm_sched_diag_enabled(void) {
+    const char *e = getenv("THVM_SCHED_DIAG");
+    if (e && e[0] && e[0] != '0') return 1;
+    return thvm_grad_trace_enabled();
+}
+
+// Tensor-value probe helpers (thvm_probe_ten_tid, thvm_probe_print_ten)
+// live in src/grad/_.c, past the term/heap primitives.
+
 static inline void thvm_step_alo_substs_clear(TinyHVM *ctx) {
     if (!ctx) return;
     ctx->step_alo_subst_count = 0;

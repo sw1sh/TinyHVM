@@ -368,13 +368,28 @@ era_continue:
                 Term _v1 = (_dp1v); \
                 u64 _s0 = thvm_dup_port_slot(ctx, dup_loc, 0); \
                 u64 _s1 = thvm_dup_port_slot(ctx, dup_loc, 1); \
-                if (getenv("THVM_DUP_DIAG")) { \
+                if (thvm_dup_diag_enabled()) { \
+                    Term _c0 = (_s0 > 0 && _s0 < ctx->heap_pos) ? heap_read(ctx, _s0) : term_era(); \
+                    Term _c1 = (_s1 > 0 && _s1 < ctx->heap_pos) ? heap_read(ctx, _s1) : term_era(); \
                     fprintf(stderr, \
-                            "DUP_FIRE dup=%llu fire_from_dp=%u val_tag=%u port_s0=%llu port_s1=%llu missing=%d\n", \
-                            (unsigned long long)dup_loc, dp_index, \
-                            (u32)term_tag(_src), \
-                            (unsigned long long)_s0, (unsigned long long)_s1, \
-                            (_s0 == 0 || _s1 == 0) ? 1 : 0); \
+                            "DUP_FIRE dup=%llu lab=%u fire=DP%u val=%u/%u@%llu " \
+                            "s0=%llu(cur=%u/%u@%llu)->%u/%u@%llu " \
+                            "s1=%llu(cur=%u/%u@%llu)->%u/%u@%llu%s\n", \
+                            (unsigned long long)dup_loc, \
+                            dup_label, dp_index, \
+                            (u32)term_tag(_src), (u32)term_ext(_src), \
+                            (unsigned long long)term_val(_src), \
+                            (unsigned long long)_s0, \
+                            (u32)term_tag(_c0), (u32)term_ext(_c0), \
+                            (unsigned long long)term_val(_c0), \
+                            (u32)term_tag(_v0), (u32)term_ext(_v0), \
+                            (unsigned long long)term_val(_v0), \
+                            (unsigned long long)_s1, \
+                            (u32)term_tag(_c1), (u32)term_ext(_c1), \
+                            (unsigned long long)term_val(_c1), \
+                            (u32)term_tag(_v1), (u32)term_ext(_v1), \
+                            (unsigned long long)term_val(_v1), \
+                            (_s0 == 0 || _s1 == 0) ? " [ORPHAN]" : ""); \
                 } \
                 if (_s0 > 0 && _s0 < ctx->heap_pos) heap_set(ctx, _s0, _v0); \
                 if (_s1 > 0 && _s1 < ctx->heap_pos) heap_set(ctx, _s1, _v1); \

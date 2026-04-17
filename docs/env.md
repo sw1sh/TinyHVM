@@ -54,7 +54,9 @@ Some helpers explicitly treat `"0"` as false; those are called out below.
 |---|---|---|
 | `THVM_SCHED_DIAG` | bool | Scheduler, dispatch, and kernel-readiness diagnostics. This is the main coarse scheduling debug flag. |
 | `THVM_SCHED_DIAG2` | bool | Extra fusion-walk diagnostics on top of `THVM_SCHED_DIAG`. |
-| `THVM_LOOP_DIAG` | bool | Focused diagnostics for recursive loops, `ALO`, `GRAD`, keep-bundle handling, and related net rewrites. |
+| `THVM_LOOP_DIAG` | bool | Focused diagnostics for recursive loops, `ALO`, `GRAD`, keep-bundle handling, and related net rewrites. `BUNDLE_ACCUM*` entries include a non-destructive tensor-value probe on each deposit (`probe=`, `prev_v=`, `grad_v=`). `ASSIGN_FIRE` shows the first 3 elements of src/dst tensors. |
+| `THVM_DUP_DIAG` | bool | Logs every DUP firing (`DUP_FIRE`) with label, firing DP index, backing `val`, both consumer slots' current contents, and the values about to be written. Flags cases where one port_slot is 0 (`[ORPHAN]`) — useful when the other DUP port has no consumer yet, which can indicate a race. |
+| `THVM_GRAD_TRACE` | bool | Umbrella flag — turns on `THVM_LOOP_DIAG`, `THVM_SCHED_DIAG`, and `THVM_DUP_DIAG` together for end-to-end grad investigation. |
 | `THVM_LOWER_DIAG` | bool | Prints lowering summaries, including whether a kernel was lowered or left alone. |
 | `THVM_LOWER_TRACE` | bool | Per-kernel lowering trace output. |
 | `THVM_KERN_DIAG` | bool | Additional kernel diagnostics in fusion/lowering paths, especially for reduction kernels. |

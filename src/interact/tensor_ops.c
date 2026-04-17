@@ -65,18 +65,30 @@
                     u32 dst_id = (u32)term_val(dst_r);
                     u32 src_id = (u32)term_val(src_t);
                     if (ctx->defer_all && ctx->tensors[src_id].buf_id == 0) return t; // scheduler handles
-                    if (getenv("THVM_LOOP_DIAG")) {
+                    if (thvm_loop_diag_enabled()) {
                         TensorMeta *dbg_dst = &ctx->tensors[dst_id];
                         TensorMeta *dbg_src = &ctx->tensors[src_id];
                         u32 src_dtype = DTYPE_F32, dst_dtype = DTYPE_F32;
                         f32 *src_host = (f32 *)thvm_to_host_raw(ctx, src_t, &src_dtype, NULL);
                         f32 *dst_host = (f32 *)thvm_to_host_raw(ctx, dst_r, &dst_dtype, NULL);
+                        u32 n = dbg_src->view.numel < 4 ? dbg_src->view.numel : 3;
                         fprintf(stderr,
-                                "ASSIGN_FIRE dst=%u src=%u same=%d dst_buf=%u src_buf=%u src0=%.6f dst0=%.6f\n",
+                                "ASSIGN_FIRE dst=%u src=%u same=%d dst_buf=%u src_buf=%u",
                                 dst_id, src_id, dst_id == src_id,
-                                dbg_dst->buf_id, dbg_src->buf_id,
-                                (src_host && src_dtype == DTYPE_F32) ? src_host[0] : 0.0f,
-                                (dst_host && dst_dtype == DTYPE_F32) ? dst_host[0] : 0.0f);
+                                dbg_dst->buf_id, dbg_src->buf_id);
+                        if (src_host && src_dtype == DTYPE_F32) {
+                            fprintf(stderr, " src=[");
+                            for (u32 i = 0; i < n; i++)
+                                fprintf(stderr, "%s%.4f", i ? "," : "", src_host[i]);
+                            fprintf(stderr, "%s]", dbg_src->view.numel > n ? ",..." : "");
+                        }
+                        if (dst_host && dst_dtype == DTYPE_F32) {
+                            fprintf(stderr, " dst=[");
+                            for (u32 i = 0; i < n; i++)
+                                fprintf(stderr, "%s%.4f", i ? "," : "", dst_host[i]);
+                            fprintf(stderr, "%s]", dbg_dst->view.numel > n ? ",..." : "");
+                        }
+                        fputc('\n', stderr);
                     }
                     if (dst_id != src_id) {
                         TensorMeta *md = &ctx->tensors[dst_id];

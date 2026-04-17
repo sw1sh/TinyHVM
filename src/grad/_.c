@@ -8,6 +8,57 @@
 #define GRAD_GROUP_MAX 8192
 #define GRAD_GROUP_ENTRIES_MAX 16384
 
+// ────────────────────────────────────────────────────────────────────
+// Non-destructive tensor-value probe. Walks a term's DP/ALO/VAR chain
+// following heap pointers; returns the underlying TAG_TEN tensor id
+// if the chain is already resolved, or ~0u if still unreduced. Never
+// fires DUP interactions, never allocates, never mutates heap. Safe
+// to call from diagnostic log sites mid-reduction.
+// ────────────────────────────────────────────────────────────────────
+static u32 thvm_probe_ten_tid(TinyHVM *ctx, Term t) {
+    for (u32 depth = 0; depth < 64; depth++) {
+        u8 tag = term_tag(t);
+        if (tag == TAG_TEN) return (u32)term_val(t);
+        if (tag == TAG_ERA || tag == TAG_NUM || tag == TAG_ANY) return ~0u;
+        if (tag == TAG_DP0 || tag == TAG_DP1 || tag == TAG_VAR) {
+            u64 l = term_val(t);
+            if (l == 0 || l >= ctx->heap_pos) return ~0u;
+            Term next = heap_read(ctx, l);
+            if (tag == TAG_VAR && term_is_sub(next)) return ~0u;
+            if (next == t) return ~0u;
+            t = next;
+            continue;
+        }
+        if (tag == TAG_ALO) {
+            u64 l = term_val(t);
+            if (l == 0 || l >= ctx->heap_pos) return ~0u;
+            Term memo = heap_read(ctx, l);
+            if (memo == t) return ~0u;
+            t = memo;
+            continue;
+        }
+        return ~0u;  // compute op or other — caller needs to reduce first
+    }
+    return ~0u;
+}
+
+// Print the first 3 f32 values of a tensor reachable via non-destructive
+// probe. Intended for compact one-line log entries. No trailing newline.
+static void thvm_probe_print_ten(TinyHVM *ctx, Term t, const char *label) {
+    u32 tid = thvm_probe_ten_tid(ctx, t);
+    if (tid == ~0u) {
+        fprintf(stderr, " %s=<%u/%u@%llu>", label,
+                (u32)term_tag(t), (u32)term_ext(t),
+                (unsigned long long)term_val(t));
+        return;
+    }
+    u32 dt = DTYPE_F32;
+    Shape sh = SHAPE(1);
+    f32 *v = (f32 *)thvm_to_host_raw(ctx, term_ten(tid, DTYPE_F32), &dt, &sh);
+    if (!v) { fprintf(stderr, " %s=t%u<?>", label, tid); return; }
+    fprintf(stderr, " %s=t%u[%.4f,%.4f,%.4f]", label, tid, v[0], v[1], v[2]);
+}
+
 typedef struct {
     Term term;
     u32  tid;
@@ -738,39 +789,39 @@ void thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad) {
         // GRAD/TEN hit. Clone the branch into the bundle so later erasure on
         // the source path cannot mutate the kept result.
         Term stored = term_clone(ctx, grad);
-        if (getenv("THVM_LOOP_DIAG")) {
+        if (thvm_loop_diag_enabled()) {
             fprintf(stderr,
-                    "BUNDLE_ACCUM_STORE loc=%llu idx=%u dst_slot=%llu stored_tag=%u stored_ext=%u stored_val=%llu src_tag=%u src_ext=%u src_val=%llu\n",
-                    (unsigned long long)grad_loc,
-                    index,
+                    "BUNDLE_ACCUM_STORE loc=%llu idx=%u dst_slot=%llu "
+                    "stored=%u/%u@%llu src=%u/%u@%llu",
+                    (unsigned long long)grad_loc, index,
                     (unsigned long long)dst_slot,
-                    (u32)term_tag(stored),
-                    (u32)term_ext(stored),
+                    (u32)term_tag(stored), (u32)term_ext(stored),
                     (unsigned long long)term_val(stored),
-                    (u32)term_tag(grad),
-                    (u32)term_ext(grad),
+                    (u32)term_tag(grad), (u32)term_ext(grad),
                     (unsigned long long)term_val(grad));
+            thvm_probe_print_ten(ctx, grad, "probe");
+            fputc('\n', stderr);
         }
         heap_set(ctx, dst_slot, stored);
         return;
     }
     if (term_tag(grad) == TAG_NUM && term_as_f32(grad) == 0.0f) return;
     Term stored = term_clone(ctx, grad);
-    if (getenv("THVM_LOOP_DIAG")) {
+    if (thvm_loop_diag_enabled()) {
         fprintf(stderr,
-                "BUNDLE_ACCUM_ADD loc=%llu idx=%u dst_slot=%llu prev_tag=%u prev_ext=%u prev_val=%llu stored_tag=%u stored_ext=%u stored_val=%llu src_tag=%u src_ext=%u src_val=%llu\n",
-                (unsigned long long)grad_loc,
-                index,
+                "BUNDLE_ACCUM_ADD loc=%llu idx=%u dst_slot=%llu "
+                "prev=%u/%u@%llu stored=%u/%u@%llu src=%u/%u@%llu",
+                (unsigned long long)grad_loc, index,
                 (unsigned long long)dst_slot,
-                (u32)term_tag(prev),
-                (u32)term_ext(prev),
+                (u32)term_tag(prev), (u32)term_ext(prev),
                 (unsigned long long)term_val(prev),
-                (u32)term_tag(stored),
-                (u32)term_ext(stored),
+                (u32)term_tag(stored), (u32)term_ext(stored),
                 (unsigned long long)term_val(stored),
-                (u32)term_tag(grad),
-                (u32)term_ext(grad),
+                (u32)term_tag(grad), (u32)term_ext(grad),
                 (unsigned long long)term_val(grad));
+        thvm_probe_print_ten(ctx, prev, "prev_v");
+        thvm_probe_print_ten(ctx, grad, "grad_v");
+        fputc('\n', stderr);
     }
     heap_set(ctx, dst_slot, thvm_op_raw(ctx, UOP_ADD, prev, stored));
 }

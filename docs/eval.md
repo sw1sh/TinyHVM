@@ -13,6 +13,8 @@ This matches the split we want from tinygrad-like systems:
 - global passes reason about the settled kernel DAG
 - lowering and dispatch stay downstream runtime details
 
+For the debug and runtime knobs that control these stages, see `docs/env.md`.
+
 ## Live Pipeline
 
 ```text

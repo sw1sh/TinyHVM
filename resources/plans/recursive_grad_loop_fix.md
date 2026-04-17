@@ -624,6 +624,91 @@ Next round: look at where the scheduler assigns kernel leaves
 (fuse_build_kernel) and identify the right hook point for a
 write-fence.
 
+## ROUND 10 (2026-04-18): more fix attempts fail, cross-cutting change needed
+
+### Failed fix attempt 3
+
+**SEQ(gw_var, SEQ(gb_var, ...))** before the assigns — force each
+lambda-bound gradient var to materialise to a TEN in its
+binder slot before either ASSIGN fires.
+
+Result: w exact, **b worse than ever** (`[-0.0060, 0.1080,
+-0.2070]` vs expected `[0.38, 1.16, -0.89]`). Some side effect
+between gw_var's reduction and gb_var's chain — possibly the
+reduction chain for gw_var consumes shared DUP cells that
+gb_var's chain relies on. The DUPs at cell 209 / 272 (the
+ADD-backward gy-dups) have both DP0 (w side) and DP1 (b side)
+consumers; when gw_var reduces, it fires these DUPs via its
+DP0 side, which writes to both port_slots. But b's bundle slot
+stores a CLONED DP1, not the original — so the port_slot write
+to the original DP1 (in the backward chain) doesn't affect b's
+cloned chain. Net effect: gw_var's reduction drains *some*
+shared state without updating b's cloned path, leaving b's
+reduction to hit dead cells.
+
+### Why the scheduler/kernel layer is the right place to fix
+
+Fundamentally, the backward kernels built by the scheduler
+reference **forward input tensors** (t1, t2, t3) as leaves —
+NOT materialised forward intermediate TENs (like diff's TEN).
+
+In PyTorch autograd, forward ops save their outputs (activations)
+and the backward references those saves. In TinyHVM IC, the
+forward is lazy, so each grad target's backward chain
+independently walks back to forward tensor reads.
+
+When ASSIGN mutates a forward tensor between backward dispatches,
+any subsequent backward reads get the stale value.
+
+### The architectural fix options, ranked
+
+1. **Forward-activation save** (PyTorch-style).
+   At GRAD time, identify forward op outputs that the backward
+   references and materialise them to fresh TENs. Store those
+   TENs in the GRAD node's metadata. Backward references these
+   saved TENs (stable tensor ids) instead of re-traversing
+   forward chains.
+
+   Pros: canonical autograd pattern, robust to any number of
+   ASSIGNs.
+
+   Cons: touches grad construction (src/grad/_.c) and possibly
+   BG/BG_GY rules (src/interact/grad.c). Structural change.
+
+2. **ASSIGN write-fence** (scheduler-level).
+   ASSIGN's dst blit defers until no live backward kernel
+   references the dst tid as a leaf. Refcount per tid of
+   backward readers; multi_keep increments, bundle_accum
+   decrements.
+
+   Pros: isolates the fix to scheduler, doesn't change grad rules.
+
+   Cons: need a mechanism to detect "live backward kernel
+   references". fuse_build_kernel doesn't currently expose this.
+
+3. **Two-phase ASSIGN** (split compute and blit).
+   Add an op that's "compute src to fresh TEN, but don't blit
+   yet". Pair with a deferred blit op. Then SEQ can sequence
+   all computes before all blits.
+
+   Pros: conceptually simple.
+
+   Cons: introduces a new op pair, changes IC semantics, may
+   conflict with existing fusion decisions.
+
+### Still stuck on direct IC fix; architectural work needed
+
+Rounds 1–7 debugged the wrong layer (DUP/GRAD/bundle mechanics).
+Rounds 8–10 located the bug (stale forward read in backward
+kernel leaf) and confirmed it via SEQ flip + numeric match.
+Three fix attempts at IC term level (SEQ updates, SEQ gw_var,
+DETACH updates) all fail due to IC laziness not caching
+reductions back at the original Term's heap location.
+
+The real fix requires either (1) or (2) above. Both are
+non-trivial and need user guidance on which direction to
+pursue.
+
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.
 Investigate only after twoparam is closed.

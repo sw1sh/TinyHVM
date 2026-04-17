@@ -436,6 +436,42 @@ Currently stuck without user guidance on which of these three
 directions to pursue; each is a non-trivial change touching
 code currently "verified correct" in the plan.
 
+### Round 7 (2026-04-18): SCHED_DIAG confirms symmetric chain
+
+Ran `THVM_SCHED_DIAG=1` on twoparam_grad n=1 and walked the
+`GRAD_ENTRY` / `GRAD_TOP` sequence. Both MUL(diff,diff) backward
+branches produce the same structural chain through SUB → ADD →
+target hit:
+
+```
+Branch 1: SUM → MUL(diff,diff) → SUB(w+b, t) → ADD(w, b)
+           hit w (gy=DP0) + hit b (gy=DP1)  [branch 1's contributions]
+Branch 2: (MUL's other BG side) → SUB → ADD
+           hit w (gy=DP0) + hit b (gy=DP1)  [branch 2's contributions]
+```
+
+All 4 target hits have structurally identical gy (DP0-tagged
+for w, DP1-tagged for b). The DP-structure symmetry holds.
+The numerical asymmetry must therefore come from how the
+reducer resolves those DP chains, not from the backward-rule
+construction.
+
+### Round 7 addition to bisection proposals
+
+**4. Dump all tensor IDs produced during the backward chain**
+(both MUL intermediates and the final w/b grads). If b's path
+reuses a buffer that's then overwritten by w's path or by an
+ENSURE side-effect, the numerical corruption could originate at
+the scheduler/materializer level — not in the interaction rules
+at all. Would need a probe at `thvm_op_raw` and `ENSURE` sites
+that logs `(op, input_tids, output_tid, buf_id)` for the grad
+chain. If user can enable this trace and run twoparam_grad n=1,
+the log would reveal any buffer aliasing or early-ENSURE.
+
+Still stuck after 7 rounds. Moving from interaction-rule
+instrumentation to scheduler-side instrumentation is the
+obvious next step but requires broader tool changes.
+
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.
 Investigate only after twoparam is closed.

@@ -125,8 +125,7 @@ TEvalAccuracy::usage = "TEvalAccuracy[net, testImages, testLabels] evaluates cla
 (* ── Graph visualization ──────────────────────────────────────────────── *)
 
 TINetGraph::usage = "TINetGraph[tensor|term] returns a Graph of the interaction net by walking the C heap.";
-TDotGraph::usage = "TDotGraph[tensor|term] returns a dump.c-style Graph (boxed TOP/TEN nodes, port labels, heap-loc tail labels).";
-TInteractionGraph::usage = "TInteractionGraph[term] returns an interaction net graph with the next active pair highlighted in red.";
+TINetGraph::usage = "TINetGraph[tensor|term|snapshot] renders the interaction-net graph rooted at the given term — boxed nodes with per-tag shapes, port labels, heap-location tails, and the next active pair highlighted in red when one exists. Accepts a live term, a walk snapshot (from TStepTrace), or a raw walker association with \"Nodes\" and \"Edges\".";
 
 (* ── Heap introspection ──────────────────────────────────────────────── *)
 
@@ -1338,7 +1337,7 @@ TStep[t_TTensor, maxAttempts_Integer: 100] := Module[{out = allocId[], fired, ta
 ];
 TStep[t_TTerm, args___] := TStep[ToTTensor[t], args];
 
-(* Signature from actual walker output — what TDotGraph renders. Two states
+(* Signature from actual walker output — what TINetGraph renders. Two states
    with identical node/edge sets hash to the same sig. *)
 walkerGraphSig[t_] := Module[{w = heapWalk[rootTermOf[t]]},
     Hash[{

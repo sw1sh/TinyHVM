@@ -1,185 +1,18 @@
 (* Visualization.wl — Graph visualization and profiling for TinyHVM *)
 (* Get'd from TinyHVM.wl inside Begin["`Private`"]. All public symbols declared there. *)
 
-(* ── Inet graph from C heap ───────────────────────────────────────────── *)
-
 (* $tagName is defined in TinyHVM.wl — do not redefine here *)
 
-(* Tag colors for vertices *)
-$tagColor = <|
-    "App" -> RGBColor[0.63, 0.28, 0.64],   (* APP — purple *)
-    "Lam" -> RGBColor[0.63, 0.28, 0.64],   (* LAM — purple *)
-    "Var" -> LightDarkSwitched[GrayLevel[0.7], GrayLevel[0.5]],
-    "Sup" -> RGBColor[0.85, 0.33, 0.10],
-    "Dp0" -> RGBColor[0.85, 0.33, 0.10],
-    "Dp1" -> RGBColor[0.85, 0.33, 0.10],
-    "Era" -> LightDarkSwitched[GrayLevel[0.5], GrayLevel[0.6]],
-    "Num" -> LightDarkSwitched[GrayLevel[0.6], GrayLevel[0.5]],
-    "Ref" -> RGBColor[0.44, 0.74, 0.27],
-    "Op2" -> RGBColor[0.93, 0.49, 0.19],
-    "Ten" -> RGBColor[0.2, 0.6, 0.9],
-    "Top" -> RGBColor[0.93, 0.49, 0.19],
-    "Ctr" -> LightDarkSwitched[GrayLevel[0.6], GrayLevel[0.5]]
-|>;
+(* ── TINetGraph — dump.c-style renderer (boxed nodes, port labels, heap locs) ── *)
 
-(* Build label for a graph node *)
-iNodeLabel[tag_String, ext_, val_] := Switch[tag,
-    "Ten",
-        Module[{dims = Quiet[TDimensions[TTensor[val]]]},
-            If[ListQ[dims],
-                "T" <> ToString[val] <> "\n" <> ToString[dims],
-                "T" <> ToString[val]
-            ]
-        ],
-    "Top",
-        If[KeyExistsQ[$uopName, ext], $uopName[ext], "UOp" <> ToString[ext]],
-    "Num", "NUM",
-    "Era", "\[FilledSmallCircle]",
-    "Ref", "REF",
-    _, tag
-];
-
-(* ── Shared graph data extraction ────────────────────────────────────── *)
-
-iNetGraphData[t_] := Module[
-    {raw, nNodes, nEdges, nodesRaw, edgesRaw,
-     tagCodes, tags, exts, vals, hlocs, i, j, tag, ext, val,
-     dupGroups, rep, nodeMap, keptNodes,
-     edges, labels, colors, elabels, heapLocs,
-     src, dst, mSrc, mDst, portLabel, edge, seen},
-    loadLibrary[];
-    raw = Round[Normal[thvmHeapGraphFn[termId[t]]]];
-    nNodes = raw[[1]];
-    nEdges = raw[[2]];
-    nodesRaw = raw[[3 ;; 2 + nNodes * 4]];
-    edgesRaw = raw[[3 + nNodes * 4 ;; 2 + nNodes * 4 + nEdges * 2]];
-
-    (* Extract per-node data: 4 fields per node *)
-    tagCodes = Table[nodesRaw[[4 i - 3]], {i, nNodes}];
-    tags  = Lookup[$tagName, #, "?"] & /@ tagCodes;
-    exts  = Table[nodesRaw[[4 i - 2]], {i, nNodes}];
-    vals  = Table[nodesRaw[[4 i - 1]], {i, nNodes}];
-    hlocs = Table[nodesRaw[[4 i]],     {i, nNodes}];
-
-    (* Group DP0/DP1 nodes by val (dup_loc) — merge into single DUP vertex *)
-    dupGroups = <||>;
-    Do[If[MemberQ[{"Dp0", "Dp1"}, tags[[i]]],
-        val = vals[[i]];
-        If[KeyExistsQ[dupGroups, val],
-            AppendTo[dupGroups[val], i - 1],
-            dupGroups[val] = {i - 1}]],
-        {i, nNodes}];
-
-    (* Build node remapping: DP nodes -> first representative *)
-    nodeMap = Association[Table[i -> i, {i, 0, nNodes - 1}]];
-    Do[rep = First[group]; Do[nodeMap[n] = rep, {n, group}],
-        {group, Values[dupGroups]}];
-    keptNodes = DeleteDuplicates[Values[nodeMap]];
-
-    (* Build labels, colors, and heap-location map for kept nodes *)
-    labels = <||>; colors = <||>; heapLocs = <||>;
-    Do[tag = tags[[idx + 1]]; ext = exts[[idx + 1]]; val = vals[[idx + 1]];
-        heapLocs[idx] = hlocs[[idx + 1]];
-        If[MemberQ[{"Dp0", "Dp1"}, tag],
-            labels[idx] = "Dup"; colors[idx] = RGBColor[0.85, 0.33, 0.10],
-            labels[idx] = iNodeLabel[tag, ext, val];
-            colors[idx] = Lookup[$tagColor, tag, GrayLevel[0.7]]],
-        {idx, keptNodes}];
-
-    (* Build edges with port labels, remapping and deduplicating *)
-    edges = {}; elabels = <||>; seen = <||>;
-    Do[src = edgesRaw[[2 j - 1]]; dst = edgesRaw[[2 j]];
-        mSrc = nodeMap[src]; mDst = nodeMap[dst];
-        If[mSrc =!= mDst,
-            If[MemberQ[{"Dp0", "Dp1"}, tags[[src + 1]]],
-                (* Edge from DP node: labeled multi-edge from merged DUP *)
-                portLabel = If[tags[[src + 1]] === "Dp0", "dp0", "dp1"];
-                edge = DirectedEdge[mSrc, mDst, portLabel];
-                If[!KeyExistsQ[seen, edge],
-                    seen[edge] = True; AppendTo[edges, edge];
-                    elabels[edge] = Placed[portLabel, {0.5, {0, -1.5}}]],
-                (* Regular edge: dedup by endpoints *)
-                If[!KeyExistsQ[seen, {mSrc, mDst}],
-                    seen[{mSrc, mDst}] = True;
-                    AppendTo[edges, DirectedEdge[mSrc, mDst]]]]],
-        {j, nEdges}];
-
-    <|"KeptNodes" -> keptNodes, "Edges" -> edges,
-      "Labels" -> labels, "Colors" -> colors, "EdgeLabels" -> elabels,
-      "HeapLocs" -> heapLocs, "Tags" -> tags, "NodeMap" -> nodeMap|>
-];
-
-(* ── TINetGraph — standard graph (unchanged behavior) ────────────────── *)
-
-TINetGraph[t_TTensor, opts___?OptionQ] := TINetGraph[ToTTerm[t], opts];
-TINetGraph[t_TTerm, opts___?OptionQ] := Module[{gd},
-    gd = iNetGraphData[t];
-    Graph[gd["KeptNodes"], gd["Edges"],
-        VertexLabels -> Normal[gd["Labels"]],
-        VertexStyle -> Normal[gd["Colors"]],
-        VertexSize -> 0.6,
-        VertexLabelStyle -> Directive[9, Bold],
-        GraphLayout -> {"LayeredDigraphEmbedding", "Orientation" -> Left},
-        EdgeStyle -> LightDarkSwitched[GrayLevel[0.5], GrayLevel[0.6]],
-        EdgeLabels -> Normal[gd["EdgeLabels"]],
-        EdgeLabelStyle -> Directive[8, Italic, LightDarkSwitched[GrayLevel[0.3], GrayLevel[0.7]]],
-        ImageSize -> Medium,
-        opts
-    ]
-];
-
-(* ── TInteractionGraph — graph with highlighted active pair ──────────── *)
-
-TInteractionGraph[t_TTensor, opts___?OptionQ] := TInteractionGraph[ToTTerm[t], opts];
-TInteractionGraph[t_TTerm, opts___?OptionQ] := Module[
-    {gd, nextInfo, found, sourceSlot, hlNode = None,
-     vstyle, estyleRules},
-    loadLibrary[];
-    gd = iNetGraphData[t];
-
-    (* Find the next active pair *)
-    nextInfo = thvmNextInteractionFn[termId[t]];
-    found = nextInfo[[1]];
-    sourceSlot = nextInfo[[2]];
-
-    (* Find graph node whose heap location matches the source slot *)
-    If[found == 1,
-        Do[If[gd["HeapLocs"][idx] == sourceSlot, hlNode = idx; Break[]],
-            {idx, gd["KeptNodes"]}]
-    ];
-
-    (* Build vertex styles: highlight the active node with red border *)
-    vstyle = Normal[gd["Colors"]];
-    If[hlNode =!= None,
-        vstyle = Join[vstyle,
-            {hlNode -> Directive[
-                EdgeForm[{Thick, RGBColor[0.9, 0.2, 0.2]}],
-                Lookup[gd["Colors"], hlNode, GrayLevel[0.7]]]}]
-    ];
-
-    (* Build edge styles: highlight edges from the active node *)
-    estyleRules = {};
-    If[hlNode =!= None,
-        Do[If[MatchQ[e, DirectedEdge[hlNode, _, ___] | DirectedEdge[_, hlNode, ___]],
-            AppendTo[estyleRules, e -> Directive[Thick, RGBColor[0.9, 0.2, 0.2]]]],
-            {e, gd["Edges"]}]
-    ];
-
-    Graph[gd["KeptNodes"], gd["Edges"],
-        VertexLabels -> Normal[gd["Labels"]],
-        VertexStyle -> vstyle,
-        VertexSize -> 0.6,
-        VertexLabelStyle -> Directive[9, Bold],
-        GraphLayout -> {"LayeredDigraphEmbedding", "Orientation" -> Left},
-        EdgeStyle -> Join[{LightDarkSwitched[GrayLevel[0.5], GrayLevel[0.6]]}, estyleRules],
-        EdgeLabels -> Normal[gd["EdgeLabels"]],
-        EdgeLabelStyle -> Directive[8, Italic, LightDarkSwitched[GrayLevel[0.3], GrayLevel[0.7]]],
-        ImageSize -> Medium,
-        opts
-    ]
-];
-
-(* ── TDotGraph — dump.c-style renderer (boxed nodes, port labels, heap locs) ── *)
+(* NUM carries ext=0 for u32, ext=1 for f32. Render the raw value accordingly. *)
+iNumText[ext_Integer, val_Integer] := If[ext == 1,
+    Quiet@Check[
+        ToString[First[ImportByteArray[
+            ByteArray[IntegerDigits[BitAnd[val, 16^^FFFFFFFF], 256, 4]],
+            "Real32"]]],
+        ToString[val]],
+    ToString[val]];
 
 (* Pull chain from cached KernelEntry's FusedOp[] via thvmKernelOpChainFn. *)
 iDotKernelOpChain[val_Integer] := Module[{s, topTagCode},
@@ -241,7 +74,7 @@ iDotLabelLines[tag_String, uop_String, ext_, val_, hloc_, nodeRec_:<||>] := Swit
             If[StringQ[dev], AppendTo[parts, "f32 " <> dev]];
             If[StringQ[vv], AppendTo[parts, vv]];
             parts],
-    "Num", {"NUM", ToString[ext]},
+    "Num", {"NUM", iNumText[ext, val]},
     "Era", {"\[FilledSmallCircle]"},
     "App", {"APP", "#" <> ToString[ext] <> "@" <> ToString[hloc]},
     "Lam", {"LAM", "#" <> ToString[ext] <> "@" <> ToString[hloc]},
@@ -275,13 +108,13 @@ iDotPortLabel[childTag_String, childUOp_String, argi_] := If[childTag === "Top",
     heapPortName[childTag, argi]
 ];
 
-TDotGraph[t_TTensor, opts___?OptionQ] := TDotGraph[ToTTerm[t], opts];
-TDotGraph[t_TTerm,   opts___?OptionQ] := (loadLibrary[];
-    TDotGraph[heapWalk[rootTermOf[t]], opts, "TermId" -> termId[t]]);
-TDotGraph[snapshot_?AssociationQ /; KeyExistsQ[snapshot, "Walk"], opts___?OptionQ] :=
-    TDotGraph[snapshot["Walk"], opts,
+TINetGraph[t_TTensor, opts___?OptionQ] := TINetGraph[ToTTerm[t], opts];
+TINetGraph[t_TTerm,   opts___?OptionQ] := (loadLibrary[];
+    TINetGraph[heapWalk[rootTermOf[t]], opts, "TermId" -> termId[t]]);
+TINetGraph[snapshot_?AssociationQ /; KeyExistsQ[snapshot, "Walk"], opts___?OptionQ] :=
+    TINetGraph[snapshot["Walk"], opts,
         "TermId" -> If[MissingQ[snapshot["Term"]], None, termId[snapshot["Term"]]]];
-TDotGraph[walkIn_?AssociationQ /; KeyExistsQ[walkIn, "Nodes"], opts___?OptionQ] := Module[
+TINetGraph[walkIn_?AssociationQ /; KeyExistsQ[walkIn, "Nodes"], opts___?OptionQ] := Module[
     {walk = walkIn, nodes, edges, keys, textColor, bg, lineFor, fillFor, vsf, gEdges, eLabels,
      nextInfo, activeSlot = -1, activeKey = None, hlColor, edgePairs, baseEdgeStyles, eStyleRules,
      passedOpts = Flatten[{opts}],

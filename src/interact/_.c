@@ -688,14 +688,18 @@ static Term thvm_alo_suspend_child(TinyHVM *ctx, Term child, u32 state_id) {
             return term_new(TAG_VAR, term_ext(child), dyn_loc);
         return child;
     }
+    // DP0/DP1 book tokens for the same DUP location L are DIFFERENT linear
+    // consumer ports — they must NOT share an ALO cell. Each gets its own
+    // ALO storing its specific tag; memoization of the shared dynamic DUP
+    // cell happens inside alo_realize via the kind=1 bind lookup on L.
     u64 old_loc = term_val(child);
-    if (old_loc != 0) {
+    if (old_loc != 0 && tag != TAG_DP0 && tag != TAG_DP1) {
         u64 alo_loc = 0;
         if (thvm_alo_lookup_alias(ctx, state_id, old_loc, &alo_loc))
             return term_new(TAG_ALO, 0, alo_loc);
     }
     Term alo = thvm_alo_make(ctx, child, state_id);
-    if (old_loc != 0)
+    if (old_loc != 0 && tag != TAG_DP0 && tag != TAG_DP1)
         (void)thvm_alo_state_push(ctx, state_id, 3, 0, old_loc, term_val(alo), 0, 0);
     return alo;
 }
@@ -907,7 +911,26 @@ static Term thvm_alo_force(TinyHVM *ctx, Term alo) {
     if (alo_loc == 0 || alo_loc + 1 >= ctx->heap_pos) return alo;
     Term book_term = heap_read(ctx, alo_loc + 0);
     Term sid_term = heap_read(ctx, alo_loc + 1);
-    if (term_tag(sid_term) != TAG_NUM) return book_term;
+    if (term_tag(sid_term) != TAG_NUM) {
+        // ALO already realized (memoised). If the memoised value is a
+        // linear DP0/DP1 port, a second consumer cannot reuse it — a
+        // shared DP token would violate IC linearity (port_slot only
+        // tracks one consumer per DUP port, so stale references cascade
+        // ERA). Fresh-DUP-wrap: split the memoised DP into two new
+        // linear ports, hand out one, push the other back as the new
+        // memo so a third force can split again.
+        u8 bt = term_tag(book_term);
+        if (bt == TAG_DP0 || bt == TAG_DP1) {
+            u64 new_dup = heap_alloc(ctx, 1);
+            heap_set(ctx, new_dup, book_term);
+            u32 new_lab = thvm_fresh_label(ctx);
+            Term dp0 = term_new(TAG_DP0, new_lab, new_dup);
+            Term dp1 = term_new(TAG_DP1, new_lab, new_dup);
+            heap_set(ctx, alo_loc + 0, dp1);
+            return dp0;
+        }
+        return book_term;
+    }
     u32 state_id = term_as_u32(sid_term);
     Term out = thvm_alo_realize(ctx, book_term, state_id);
     if (getenv("THVM_LOOP_DIAG")) {
@@ -968,21 +991,6 @@ static Term thvm_alo_force(TinyHVM *ctx, Term alo) {
     } while (0);
     // #endregion
     thvm_step_alo_subst_record(ctx, alo_loc, out, book_term);
-    // #region agent log
-    do {
-        static u32 alo_subst_dbg_count = 0;
-        if (alo_subst_dbg_count >= 12) break;
-        alo_subst_dbg_count++;
-        char _dbg[224];
-        snprintf(_dbg, sizeof(_dbg),
-                 "{\"old_alo_loc\":%llu,\"out_tag\":%u,\"out_val\":%llu}",
-                 (unsigned long long)alo_loc,
-                 (u32)term_tag(out),
-                 (unsigned long long)term_val(out));
-        thvm_agent_debug_log("pre-fix", "H11", "src/interact/_.c:264",
-                             "alo_subst_recorded", _dbg);
-    } while (0);
-    // #endregion
     heap_set(ctx, alo_loc + 0, out);
     heap_set(ctx, alo_loc + 1, term_era());
     return out;

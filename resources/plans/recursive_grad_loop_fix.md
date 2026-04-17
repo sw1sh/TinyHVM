@@ -104,11 +104,24 @@ Two independent bugs:
 
 Bisection narrows where the bug appears, not yet why:
 
-| Test                                  | Result                       |
-|---------------------------------------|------------------------------|
-| `test_tiny_twoparam_noloop`           | ✓ both grads exact           |
-| `test_tiny_twoparam_lam` (LAM-APP, no recursion) | ✗ bundle never materialises to TEN (raw slot stays `TOP/UOP_FUSE`) |
-| `test_tiny_twoparam_grad_loop` (recursion)       | ✗ w exact, b = 0.8× expected |
+| Test                                                | Loss                         | Result                       |
+|-----------------------------------------------------|------------------------------|------------------------------|
+| `test_tiny_twoparam_noloop`                         | `sum((w+b-t)^2)`             | ✓ both grads exact           |
+| `test_tiny_twoparam_lam` (LAM-APP, no recursion)    | `sum((w+b-t)^2)`             | ✗ bundle never materialises to TEN (raw slot stays `TOP/UOP_FUSE`) |
+| `test_tiny_twoparam_sum_loop` (recursion, no MUL)   | `sum(w+b)` (only ADD backward) | ✓ both grads = 1.0 exact     |
+| `test_tiny_twoparam_grad_loop` (recursion)          | `sum((w+b-t)^2)`             | ✗ w exact, b = 0.8× expected |
+
+**Key narrowing:** the 0.8× bug only manifests when the backward
+chain contains `MUL(diff, diff)` — i.e., the `BG` rule in grad.c
+which duplicates both `at` and `bt` via `GRAD_SPLIT_AT()` +
+`_bt_dup`. A plain `ADD` loss (`BG_GY` only, one branch per target)
+works correctly at all n values.
+
+Swapping `params = [b_grad, w_grad]` in `thvm_grad_multi_keep`
+still gives b's tensor the 0.8× factor (not w's) — so the bug is
+attached to the b tensor's DUP chain, not to bundle slot position.
+The DP0-projection of gy always flows to the first arg of each
+ADD backward (which resolves to w), DP1 to the second (b).
 
 So multi-target GRAD works correctly when called on plain tensor
 inputs (`noloop`), but breaks the moment the params arrive via a
@@ -137,14 +150,30 @@ TEN yet, so `tid` is unset. The loop gets around this via
 dyn-loc and letting `find_term_at` resolve via ALO force later —
 but that path has the multi-slot numerical bug in (2).
 
-Next diagnostic steps:
-- Print the raw TEN values of heap[dup_cell_209] and
-  heap[dup_cell_272] (the gy sources for w/b's two hits). If both
-  DP0 and DP1 projections of the same cell give different TEN
-  tids, the DUP of gy is firing asymmetrically.
-- Instrument `grad_group_alloc` to log when `tid` stays `~0u`
-  after resolve.
+**Hypothesis**: the BG rule's `GRAD_SPLIT_AT()` + `_bt_dup` double
+duplication interacts poorly with the LOOP's book-realize +
+`thvm_alo_force` fresh-DUP-wrap. In a loop, each unfold
+re-realizes the BG's internal DUPs through the book path, and one
+of the projections (the one feeding b through DP1) ends up going
+through an extra level of splitting that drops ~20% of its
+contribution.
 
-For matmul: separate deeper issue. `test_tiny_linear_sgd_loop`
-W[0,0] is ~4x expected at step 1 — not a clean factor. Investigate
-only after (1) and (2) are closed.
+Specifically: w's DP0 flow reaches target via one `find_term_at`
+resolve → hit. b's DP1 flow reaches target via `find_term_at`
+too — but the DP1 projection has to walk one extra heap slot
+through the BG's inner `_at_dup` DUP (because `at = DP1(_at_dup)`
+is the outer rebind inside the `_db` block). That extra DUP layer,
+re-realized through book/ALO, is the likely source of the 0.8×.
+
+Concrete next diagnostic:
+- Add a probe in `thvm_grad_bundle_accum` that forces
+  `grad` to WNF (TEN) before cloning, and prints the actual
+  tensor values for w and b contributions at each deposit. If
+  b's deposits are tensor values with wrong numbers (not 0.8× w's),
+  the DUP propagation is fine and the bug is in accumulation. If
+  b's deposits numerically equal w's deposits, the bug is in how
+  the add-chain reduces.
+
+For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
+step 1 — separate deeper issue involving MM backward in the loop.
+Investigate only after twoparam is closed.

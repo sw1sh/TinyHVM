@@ -177,20 +177,55 @@ This isn't a 0.8× multiplier hiding anywhere — it's a linearity
 violation where DP0 and DP1 of the same gy DUP cell resolve to
 **different** effective values depending on which fires first.
 
-### Next step
+### DUP_DIAG instrumentation added — lets us audit port_slot state at fire time
 
-Look at `DUP_STATE_RETURN` when val is TAG_TEN (or when val
-commutes through TOP) in the loop context. The symmetric
-share-by-reference rule `DUP_STATE_RETURN(val, val, val)` should
-write the same TEN to both port_slots. If one of the port_slots
-hasn't been registered yet when DUP fires (because the second
-target hit is still pending), the write is discarded and the
-late-arriving DP reads ERA or stale data.
+Added `DUP_FIRE` log (gated on `THVM_DUP_DIAG=1`) inside
+`DUP_STATE_RETURN` in
+[src/interact/combinators.c](/Users/swish/src/TinyHVM/src/interact/combinators.c):
+prints `dup_loc`, firing DP index, val tag, port_s0, port_s1,
+and a `missing` flag when either is 0.
 
-Specifically: in `port_slot[dup, 0]` and `[dup, 1]` — is one of
-them being set to 0 transiently, causing the late write to be
-discarded? Instrument `thvm_dup_port_slot` and its setters to
-check.
+### Findings
+
+Counted DP-fire patterns (DP0/DP1, with each port slot
+registered or not) across the three loop tests at n=1:
+
+| Test             | DP0 both | DP0 s1=0 | DP1 both | DP1 s0=0 |
+|------------------|---------:|---------:|---------:|---------:|
+| scalar (PASS)    |       49 |        8 |       46 |       10 |
+| twoparam_sum (PASS) |    29 |       10 |        0 |       30 |
+| twoparam_grad (0.8×) | 55 |       21 |       10 |       33 |
+
+Both passing tests also have cases where DUP fires with one
+port_slot unregistered — so `missing=1` alone isn't the bug.
+
+The cells the bundle reads from (cell 209, 272, etc. in the
+BUNDLE_ACCUM log) don't appear in `DUP_FIRE` — the clones in
+bundle_accum create fresh cells (221, 230, 280, 294) which *do*
+fire. Each cloned DUP fires with only one port registered (the
+one matching its firing DP) — expected, since cloning gave each
+DP its own cell.
+
+### Experiments tried and ruled out
+
+- Skipping `term_clone` entirely in `thvm_grad_bundle_accum`:
+  twoparam still 0.8×, scalar still passes. **term_clone is not
+  the cause.**
+- Fresh BG-label DUPs (was hardcoded `label=0`): no effect.
+- Pre-reducing grad to WNF before clone: **flips** the bug —
+  b becomes exact but w becomes zero. Order-dependent.
+
+### Next diagnostic
+
+Instrument the actual *tensor values* of b's two contributions
+at deposit time. If each is g/2 (correct per-branch), b's sum
+should be g. If each is 0.4g, something's halving. If one is g
+and the other is -0.2g (negative), something is subtracting.
+Knowing the per-contribution values will reveal whether the bug
+is in a specific backward rule or in the accumulator itself.
+
+Currently stuck on the mechanism — need deeper instrumentation
+(live tensor value probing mid-reduction) to make further progress.
 
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.

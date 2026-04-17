@@ -368,6 +368,14 @@ era_continue:
                 Term _v1 = (_dp1v); \
                 u64 _s0 = thvm_dup_port_slot(ctx, dup_loc, 0); \
                 u64 _s1 = thvm_dup_port_slot(ctx, dup_loc, 1); \
+                if (getenv("THVM_DUP_DIAG")) { \
+                    fprintf(stderr, \
+                            "DUP_FIRE dup=%llu fire_from_dp=%u val_tag=%u port_s0=%llu port_s1=%llu missing=%d\n", \
+                            (unsigned long long)dup_loc, dp_index, \
+                            (u32)term_tag(_src), \
+                            (unsigned long long)_s0, (unsigned long long)_s1, \
+                            (_s0 == 0 || _s1 == 0) ? 1 : 0); \
+                } \
                 if (_s0 > 0 && _s0 < ctx->heap_pos) heap_set(ctx, _s0, _v0); \
                 if (_s1 > 0 && _s1 < ctx->heap_pos) heap_set(ctx, _s1, _v1); \
                 thvm_dup_ports_clear_entry(ctx, dup_loc); \

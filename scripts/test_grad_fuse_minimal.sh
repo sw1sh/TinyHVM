@@ -102,8 +102,13 @@ do
   test -f "$path"
 done
 
-if ! compgen -G "$OUT_DIR/kernel_*.dot" > /dev/null; then
-  echo "expected kernel lowering graphs in $OUT_DIR" >&2
+if ! compgen -G "$OUT_DIR/kernel_*_kid0.dot" > /dev/null; then
+  echo "expected kid0 lowering graph in $OUT_DIR" >&2
+  exit 1
+fi
+
+if ! compgen -G "$OUT_DIR/kernel_*_kid1.dot" > /dev/null; then
+  echo "expected kid1 lowering graph in $OUT_DIR" >&2
   exit 1
 fi
 

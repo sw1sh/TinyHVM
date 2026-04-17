@@ -38,17 +38,22 @@ int main(int argc, char **argv) {
     Term fused = thvm_op(ctx, UOP_ADD, fuse_mul, b);
 
     Term program = thvm_ctr(ctx, (Term[]){grad_out, fused}, 2);
-    Term result = thvm_eval(ctx, program);
-    if (getenv("THVM_LOWER_GRAPH") && term_tag(result) == TAG_CTR) {
-        u64 loc = term_val(result);
-        u32 arity = term_ext(result);
-        for (u32 i = 0; i < arity; i++) {
-            Term child = heap_read(ctx, loc + i);
-            if (term_tag(child) != TAG_TOP) continue;
-            Term forced = thvm_force_tensor_term(ctx, child);
-            if (term_tag(forced) == TAG_TEN) (void)thvm_to_host(ctx, forced);
+    if (getenv("THVM_LOWER_GRAPH")) {
+        Term phase1 = term_clone(ctx, program);
+        Term states[64];
+        u32 n_states = thvm_reduce_collect(ctx, phase1, states, 64);
+        Term settled = n_states ? states[n_states - 1] : phase1;
+        if (term_tag(settled) == TAG_CTR) {
+            u64 loc = term_val(settled);
+            u32 arity = term_ext(settled);
+            for (u32 i = 0; i < arity; i++) {
+                Term child = heap_read(ctx, loc + i);
+                if (term_tag(child) != TAG_TOP) continue;
+                (void)thvm_force_tensor_term(ctx, child);
+            }
         }
     }
+    Term result = thvm_eval(ctx, program);
     (void)result;
 
     thvm_free(ctx);

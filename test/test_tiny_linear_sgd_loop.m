@@ -53,22 +53,24 @@ static Term tiny_linear_sgd_loop(TinyHVM *ctx,
     heap_set(ctx, l_next + 0, term_set_sub(next_counter));
 
     // DUP w and b for multiple uses in body:
-    // forward, grad_target, sgd_update, assign_dst, base_case
-    Term w_fwd, w_grad, w_sgd, w_assign, w_done;
+    // forward, grad_target, sgd_update, assign_dst, recurse_param, base_case
+    Term w_fwd, w_grad, w_sgd, w_assign, w_next, w_done;
     {
         Term w1, w2, w3, w4;
         thvm_dup(ctx, thvm_fresh_label(ctx), w_var, &w_fwd, &w1);
         thvm_dup(ctx, thvm_fresh_label(ctx), w1, &w_grad, &w2);
         thvm_dup(ctx, thvm_fresh_label(ctx), w2, &w_sgd, &w3);
-        thvm_dup(ctx, thvm_fresh_label(ctx), w3, &w_assign, &w_done);
+        thvm_dup(ctx, thvm_fresh_label(ctx), w3, &w_assign, &w4);
+        thvm_dup(ctx, thvm_fresh_label(ctx), w4, &w_next, &w_done);
     }
-    Term b_fwd, b_grad, b_sgd, b_assign, b_done;
+    Term b_fwd, b_grad, b_sgd, b_assign, b_next, b_done;
     {
         Term b1, b2, b3, b4;
         thvm_dup(ctx, thvm_fresh_label(ctx), b_var, &b_fwd, &b1);
         thvm_dup(ctx, thvm_fresh_label(ctx), b1, &b_grad, &b2);
         thvm_dup(ctx, thvm_fresh_label(ctx), b2, &b_sgd, &b3);
-        thvm_dup(ctx, thvm_fresh_label(ctx), b3, &b_assign, &b_done);
+        thvm_dup(ctx, thvm_fresh_label(ctx), b3, &b_assign, &b4);
+        thvm_dup(ctx, thvm_fresh_label(ctx), b4, &b_next, &b_done);
     }
 
     // Forward: pred = x @ w + b
@@ -107,17 +109,20 @@ static Term tiny_linear_sgd_loop(TinyHVM *ctx,
     Term assign_w = thvm_assign(ctx, w_assign, update_w);
     Term assign_b = thvm_assign(ctx, b_assign, update_b);
 
-    // Recursive call: train(m)(ASSIGN(w,...))(ASSIGN(b,...))
-    // ASSIGN result flows as the next iteration's w/b parameter.
-    // In phase 1: ASSIGN is TAG_TOP (WNF) → builds lazy dependency chain.
-    // In phase 3: ASSIGN fires → returns dst tensor → feeds next iteration.
+    // Recursive call threads w_tail / b_tail as the next iteration's
+    // w/b. The SEQ chain below forces both ASSIGNs to fire *before*
+    // the recursion reads w/b, so each step's update is observed by
+    // the next step — standard HVM4 FFI-style ordering. See
+    // resources/hvm4_ffi_design.md.
     Term rec = thvm_app(ctx,
                thvm_app(ctx,
                thvm_app(ctx, thvm_ref(ctx, train_id), next_counter),
-                        assign_w),
-                        assign_b);
+                        w_next),
+                        b_next);
 
-    heap_set(ctx, l_gb + 1, rec);
+    Term seq_body = thvm_seq(ctx, assign_w, thvm_seq(ctx, assign_b, rec));
+
+    heap_set(ctx, l_gb + 1, seq_body);
     Term lam_gb = term_new(TAG_LAM, 0, l_gb);
     heap_set(ctx, l_gw + 1, lam_gb);
     Term lam_gw = term_new(TAG_LAM, 0, l_gw);

@@ -308,19 +308,48 @@ orphaned at outer commute time). The write to the dead slot
 has `port_forget`/`port_remember` side effects that can clear
 or re-register DUP port_slots in the cdup's children.
 
-**Hypothesis for next round**: the side-effectful writes to
-DEAD n0/n1 arg slots during b's DP1-side reduction cascade into
-heap cells that w's chain also depends on (if the dead and
-live sides share further-down cdups via label collision?). Or
-the extra `port_forget` during the double-write clears a
-port_slot needed by some later DUP firing.
+### Round 4 (2026-04-18): teardown hypothesis FALSIFIED
 
-Concrete probe: log every `port_forget` triggered from a
-heap_set that's happening during DUP_STATE_RETURN (i.e.,
-"side-effect writes"). Count how many port_slot registrations
-get torn down during b's chain vs w's chain. If b's side-effect
-writes tear down twice as many registrations, that's the
-mechanism.
+Added `TEARDOWN` diagnostic inside `DUP_STATE_RETURN`: flags any
+case where the cell being overwritten (`_c0` / `_c1`) is a DP of
+SOME OTHER DUP (i.e., `term_val(_c) != dup_loc`), which would
+mean the side-effect `heap_set` clears another DUP's port_slot.
+
+**Count across all three tests at n=1: 0 TEARDOWN events.** The
+overwritten cells are DPs of the firing dup itself (the standard
+consumer-side writes), never of other DUPs. So the side-effect
+writes do NOT cascade port_slot teardowns.
+
+**Conclusion**: the DP0/DP1 alternation in b's chain is not
+corrupting port_slot state. Both sides' writes land on their
+intended consumers, and both n0 and n1 of each commute are
+reduced by the trampoline. The bug must be in the NUMERIC
+VALUES produced by the DP1-side chain, not in broken state.
+
+### Hypothesis for round 5 — DP1-side commute produces wrong numeric
+
+DUP⊳TOP commute creates `n0 = TOP(r0)` with DP0-wrapped args
+and `n1 = TOP(r1)` with DP1-wrapped args, where both sets of
+args point to the same cdups. Semantically n0 and n1 should
+reduce to the SAME tensor value (cdup children are shared; the
+only difference is which DP-side projects them).
+
+But b's chain ends up consuming `n1` at every level (DP1 writes
+to port_slot[1]), while w consumes `n0`. If n1's chain somehow
+yields a different tensor than n0's (e.g. if `thvm_op_raw(MUL,
+...)` or the scheduler creates tensor IDs differently depending
+on which DP side first triggers reduction), we'd see exactly
+this: two semantically-equivalent computations yielding
+different numbers.
+
+Concrete probe: add logging that, for each DUP firing where
+val=TOP, prints the n0 and n1 terms produced, and (after the
+outer reducer completes) prints the resulting tensor id and
+values from each side. If n0's reduced tensor != n1's reduced
+tensor, we've found the bug. Alternatively: temporarily hack
+`DUP_STATE_RETURN` to always write `_v0` to BOTH port slots
+(ignoring DP1-side projection) — if b then matches w exactly,
+it confirms the DP1-side reduction is the diverging path.
 
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.

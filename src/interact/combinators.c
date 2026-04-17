@@ -435,6 +435,33 @@ era_continue:
                             (u32)term_tag(_v1), (u32)term_ext(_v1), \
                             (unsigned long long)term_val(_v1), \
                             (_s0 == 0 || _s1 == 0) ? " [ORPHAN]" : ""); \
+                    /* If the cell being overwritten is a DP of SOME OTHER */ \
+                    /* DUP, the heap_set will port_forget that other DUP's */ \
+                    /* registration. Flag it as a teardown side effect. */ \
+                    if (_s0 > 0) { \
+                        u8 _ct = term_tag(_c0); \
+                        if ((_ct == TAG_DP0 || _ct == TAG_DP1) && \
+                            term_val(_c0) != dup_loc) { \
+                            fprintf(stderr, \
+                                    "  TEARDOWN dup=%llu fires, heap_set(s0=%llu) clears port_slot[other_dup=%llu, %u]\n", \
+                                    (unsigned long long)dup_loc, \
+                                    (unsigned long long)_s0, \
+                                    (unsigned long long)term_val(_c0), \
+                                    (_ct == TAG_DP1) ? 1 : 0); \
+                        } \
+                    } \
+                    if (_s1 > 0) { \
+                        u8 _ct = term_tag(_c1); \
+                        if ((_ct == TAG_DP0 || _ct == TAG_DP1) && \
+                            term_val(_c1) != dup_loc) { \
+                            fprintf(stderr, \
+                                    "  TEARDOWN dup=%llu fires, heap_set(s1=%llu) clears port_slot[other_dup=%llu, %u]\n", \
+                                    (unsigned long long)dup_loc, \
+                                    (unsigned long long)_s1, \
+                                    (unsigned long long)term_val(_c1), \
+                                    (_ct == TAG_DP1) ? 1 : 0); \
+                        } \
+                    } \
                 } \
                 if (_s0 > 0 && _s0 < ctx->heap_pos) heap_set(ctx, _s0, _v0); \
                 if (_s1 > 0 && _s1 < ctx->heap_pos) heap_set(ctx, _s1, _v1); \

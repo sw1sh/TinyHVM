@@ -102,30 +102,49 @@ Two independent bugs:
 
 ## Open work — multi-target GRAD in the loop
 
-The twoparam XFAIL is the next investigation. Observed:
+Bisection narrows where the bug appears, not yet why:
 
-- w's gradient is correct at step 1 (matches host simulation).
-- b's gradient is uniformly **0.8x** expected at step 1; drifts
-  further at step 2/3.
-- w and b have structurally identical 5-DUP chains and both feed
-  `thvm_grad_multi_keep(loss, [w, b], 2)`. Suggests the bug is in
-  how the second slot of a multi-keep bundle is wired (first slot
-  seems fine).
+| Test                                  | Result                       |
+|---------------------------------------|------------------------------|
+| `test_tiny_twoparam_noloop`           | ✓ both grads exact           |
+| `test_tiny_twoparam_lam` (LAM-APP, no recursion) | ✗ bundle never materialises to TEN (raw slot stays `TOP/UOP_FUSE`) |
+| `test_tiny_twoparam_grad_loop` (recursion)       | ✗ w exact, b = 0.8× expected |
 
-Hypotheses to test next:
+So multi-target GRAD works correctly when called on plain tensor
+inputs (`noloop`), but breaks the moment the params arrive via a
+lambda binder. Two distinct failure modes:
 
-1. **Bundle slot routing** — `thvm_grad_multi_keep` might be
-   incorrectly sharing the keep-target's DP chain between slots,
-   with slot 1 getting a partially-consumed view.
-2. **MAT destructuring** — the `thvm_mat(ctx, 2, lam_gw, era)`
-   wrapping `λgw. λgb. body` might leak one of the bundled
-   gradients.
-3. **ASSIGN ordering** — both ASSIGNs run inside a `SEQ(assign_w,
-   SEQ(assign_b, rec))`; the second ASSIGN may see a stale DP
-   projection of its dst because the first ASSIGN already
-   consumed some consumer.
+1. **LAM-APP never materialises the bundle**: after `thvm_eval`
+   on `(λw. λb. multi_keep(...)) w0 b0`, `BUNDLE_GET` reports the
+   raw slots still hold `TAG_TOP/UOP_FUSE` terms. The FUSE
+   wrappers don't resolve through the scheduler. `thvm_to_host`
+   returns NULL. Target `tid` entries stay `~0u` because
+   `grad_resolve_target_term` walks DP→heap_read→VAR and breaks on
+   the unbound `term_is_sub` cell.
+2. **Loop case gives different wrong answer**: recursion makes the
+   bundle materialise (the reducer fires through the loop further
+   than the LAM-APP case), but b's grad slot lands at 0.8× the
+   correct value while w's is exact. Both targets hit their slots
+   twice (one STORE + one ADD — the two MUL(diff,diff) backward
+   branches). w's two contributions sum correctly; b's sum
+   under-counts by 20%.
 
-For matmul: deeper issue. Linear_sgd_loop W[0,0] is ~4x expected
-at step 1 — not a clean factor. Likely matmul backward in the
-loop uses a stale or wrong input activations tensor after the
-first step.
+Likely root cause for (1): targets are captured at
+`thvm_grad_multi_keep` time, long before APP-LAM substitution
+fills the binder cells. `grad_group_alloc` can't resolve them to
+TEN yet, so `tid` is unset. The loop gets around this via
+`thvm_book_from_dynamic_r` copying GRAD metadata into a fresh
+dyn-loc and letting `find_term_at` resolve via ALO force later —
+but that path has the multi-slot numerical bug in (2).
+
+Next diagnostic steps:
+- Print the raw TEN values of heap[dup_cell_209] and
+  heap[dup_cell_272] (the gy sources for w/b's two hits). If both
+  DP0 and DP1 projections of the same cell give different TEN
+  tids, the DUP of gy is firing asymmetrically.
+- Instrument `grad_group_alloc` to log when `tid` stays `~0u`
+  after resolve.
+
+For matmul: separate deeper issue. `test_tiny_linear_sgd_loop`
+W[0,0] is ~4x expected at step 1 — not a clean factor. Investigate
+only after (1) and (2) are closed.

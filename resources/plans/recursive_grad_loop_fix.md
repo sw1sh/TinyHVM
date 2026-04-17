@@ -227,20 +227,56 @@ ambient heap state (forward tensors, scheduled kernel outputs)
 that the clone has no access to. Cannot probe contribution
 values via clone+reduce during mid-reduction.
 
-### Next diagnostic — probe at MAT-CTR destructuring
+### Round 2 (2026-04-18): MAT-CTR probe lands
 
-The right probe site is where the bundle is consumed:
-`APP-MAT-CTR` in `src/interact/combinators.c` (line 141-156).
-At that moment the CTR's children are about to be bound to the
-lambda variables in the test's `λgw. λgb. body`. The children
-must be WNF (MAT requires it), so they're either TEN or something
-the scheduler chose to defer. Print each child's term; if TEN,
-print values. This will show whether both bundle slots hold
-the numerically-correct value, at the last point before they're
-consumed.
+Added a diagnostic at `APP-MAT-CTR` in `src/interact/combinators.c`
+that prints each CTR child and recurses one level into TOP args
+(showing the `heap[dup_loc]` of each DP).
 
-Currently stuck on the mechanism — probe-at-MAT-CTR is the next
-concrete step.
+**Finding:** at MAT-CTR time, both bundle slots hold unresolved
+ADD ops:
+
+```
+MAT_CTR match_tag=2 ctr_tag=2 ctr_loc=219
+  [0]=11/9@291 (ADD)
+      arg0=DP0/20@221 dup[221]=DP0/20@222
+      arg1=DP0/30@280 dup[280]=DP0/30@281
+  [1]=11/9@305 (ADD)
+      arg0=DP1/22@230 dup[230]=DP0/22@231
+      arg1=DP1/32@294 dup[294]=DP0/32@295
+```
+
+Two observations:
+
+1. **CTR children are not WNF** when MAT fires — they're still
+   ADD compute ops. The reducer lets MAT destructure on a CTR
+   with lazy children, because CTR itself is WNF (arity 2). So
+   the bundle values aren't materialised at MAT time; they
+   materialise later when ASSIGN's src is reduced.
+2. **Outer wrapper asymmetry**: w's ADD args are DP0, b's args
+   are DP1. Both inner `heap[dup_loc]` values are DP0 — because
+   both clones cloned the *same* source `heap[cell_209]` which
+   contained `DP0(cell_192)`. The outer wrapper differs only
+   because `bundle_accum` cloned DP0 for w and DP1 for b.
+   Structurally equivalent below the outer layer.
+
+So the asymmetry at the term level is limited to that outermost
+DP0-vs-DP1 wrapper. Everything inside the chain is the same
+cloned structure. Yet b's final value is 0.8× w's.
+
+### Next round — trace the inner DUP firings
+
+Hypothesis: when the outer DUP (at cell 230 for b, or 221 for w)
+fires via DP1 vs DP0, the inner DUP firing order differs. Since
+the inner chain is identical, but the OUTER trampoline walk may
+visit inner DUPs in different orders depending on whether it
+arrived via DP0 or DP1, that order can produce different
+port_slot registration/discard timings.
+
+Concrete: run `THVM_GRAD_TRACE=1` and capture the `DUP_FIRE`
+sequence for cells 221/222/... (w's chain) vs 230/231/... (b's
+chain). Diff them. Any cell that fires with an orphan port_slot
+in one chain but not the other is a candidate for the bug.
 
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.

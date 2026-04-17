@@ -19,6 +19,9 @@ static Term thvm_eval_exec_fixed_point(TinyHVM *ctx, Term t);
 static Term thvm_force_dispatch_kid(TinyHVM *ctx, u32 kid, u32 depth);
 static int thvm_kernel_register(TinyHVM *ctx, Term kernel, u32 *out_kid);
 static Term thvm_alo_force(TinyHVM *ctx, Term alo);
+// Defined in grad/_.c (included after interact). Used by diag sites here.
+static u32 thvm_probe_ten_tid(TinyHVM *ctx, Term t);
+static void thvm_probe_print_ten(TinyHVM *ctx, Term t, const char *label);
 
 static Term thvm_era_payload(TinyHVM *ctx, Term item) {
     while (term_tag(item) == TAG_ERA) {

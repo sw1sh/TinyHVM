@@ -143,6 +143,51 @@
                     u32 match_tag = term_ext(fun);
                     u32 ctr_tag = term_ext(arg);
                     ctx->itrs++;
+                    if (thvm_loop_diag_enabled()) {
+                        u64 ctr_loc_dbg = term_val(arg);
+                        fprintf(stderr,
+                                "MAT_CTR match_tag=%u ctr_tag=%u ctr_loc=%llu\n",
+                                match_tag, ctr_tag,
+                                (unsigned long long)ctr_loc_dbg);
+                        for (u32 i = 0; i < ctr_tag && i < 8; i++) {
+                            Term child = heap_read(ctx, ctr_loc_dbg + i);
+                            fprintf(stderr, "  [%u]=%u/%u@%llu", i,
+                                    (u32)term_tag(child), (u32)term_ext(child),
+                                    (unsigned long long)term_val(child));
+                            thvm_probe_print_ten(ctx, child, "v");
+                            /* If child is TAG_TOP with 2 args (like ADD),
+                               recurse one level to show args, and for each
+                               arg that's a DP, show what's at its DUP cell. */
+                            if (term_tag(child) == TAG_TOP) {
+                                u64 cloc = term_val(child);
+                                if (cloc > 0 && cloc + 1 < ctx->heap_pos) {
+                                    for (u32 ai = 0; ai < 2; ai++) {
+                                        Term a = heap_read(ctx, cloc + ai);
+                                        fprintf(stderr, " arg%u=%u/%u@%llu",
+                                                ai, (u32)term_tag(a),
+                                                (u32)term_ext(a),
+                                                (unsigned long long)term_val(a));
+                                        thvm_probe_print_ten(ctx, a, "v");
+                                        /* If arg is DP, show heap[dup_loc] */
+                                        if (term_tag(a) == TAG_DP0 ||
+                                            term_tag(a) == TAG_DP1) {
+                                            u64 dl = term_val(a);
+                                            if (dl > 0 && dl < ctx->heap_pos) {
+                                                Term dv = heap_read(ctx, dl);
+                                                fprintf(stderr,
+                                                        " dup[%llu]=%u/%u@%llu",
+                                                        (unsigned long long)dl,
+                                                        (u32)term_tag(dv),
+                                                        (u32)term_ext(dv),
+                                                        (unsigned long long)term_val(dv));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            fputc('\n', stderr);
+                        }
+                    }
                     if (match_tag == ctr_tag) {
                         Term r = heap_read(ctx, mat_loc + 0);
                         u64 ctr_loc = term_val(arg);

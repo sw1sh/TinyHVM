@@ -14,6 +14,11 @@
 static int is_view_op(u32 uop);
 static int is_elementwise(u32 uop);
 static void thvm_grad_slot_accum(TinyHVM *ctx, Term slot, Term grad);
+static Term thvm_force_tensor_term(TinyHVM *ctx, Term t);
+static Term thvm_eval_exec_fixed_point(TinyHVM *ctx, Term t);
+static Term thvm_force_dispatch_kid(TinyHVM *ctx, u32 kid, u32 depth);
+static int thvm_kernel_register(TinyHVM *ctx, Term kernel, u32 *out_kid);
+static Term thvm_alo_force(TinyHVM *ctx, Term alo);
 
 static Term thvm_era_payload(TinyHVM *ctx, Term item) {
     while (term_tag(item) == TAG_ERA) {
@@ -74,9 +79,8 @@ static u32 thvm_uop_visible_arity(u32 ext) {
     return thvm_uop_storage_arity(ext);
 }
 
-static void thvm_fuse_copy_public_shape(TinyHVM *ctx, Term src, u64 dst_loc) {
-    if (!ctx || term_tag(src) != TAG_TOP || dst_loc == 0) return;
-    u64 src_loc = term_val(src);
+static void thvm_copy_shape_state_loc(TinyHVM *ctx, u64 src_loc, u64 dst_loc) {
+    if (!ctx || src_loc == 0 || dst_loc == 0) return;
     const ShapeTracker *tracker = st_get_tracker(src_loc);
     if (tracker) {
         st_set_tracker(dst_loc, tracker);
@@ -84,6 +88,11 @@ static void thvm_fuse_copy_public_shape(TinyHVM *ctx, Term src, u64 dst_loc) {
     }
     const View *view = st_get(src_loc);
     if (view) st_set(dst_loc, view);
+}
+
+static void thvm_fuse_copy_public_shape(TinyHVM *ctx, Term src, u64 dst_loc) {
+    if (!ctx || term_tag(src) != TAG_TOP || dst_loc == 0) return;
+    thvm_copy_shape_state_loc(ctx, term_val(src), dst_loc);
 }
 
 static u32 thvm_kernel_root_uop(TinyHVM *ctx, Term kernel);
@@ -147,7 +156,11 @@ static int thvm_kernel_local_child_ready(TinyHVM *ctx, Term child) {
         u32 ext = term_ext(child);
         if (ext == UOP_FUSE) return 0;
         if (ext == UOP_KERNEL) return thvm_kernel_is_monolithic(ctx, child);
-        return thvm_kernel_compute_uop(ext);
+        // Raw TOP children are not locally ready. They still need phase-1
+        // reduction/fusion before a parent public KERNEL can treat them as a
+        // stable leaf. Otherwise unresolved view/admin structure can leak into
+        // the coarse graph and fail later kernel lowering.
+        return 0;
     }
     return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
            tag == TAG_SEQ || tag == TAG_CTR || tag == TAG_LAM ||
@@ -290,7 +303,7 @@ static int thvm_kernel_child_ready(Term t) {
 
 // Resolve a child UOP_KERNEL to its cached result (TAG_TEN).
 // Returns 0 if the child has not yet been dispatched (not ready).
-static int thvm_kernel_child_resolve(Term child, Term *out) {
+static int thvm_kernel_child_resolve(TinyHVM *ctx, Term child, Term *out) {
     extern Term kid_results[];
     extern u32 sched_kernel_count;
     extern u64 sched_kernel_locs[];
@@ -302,10 +315,53 @@ static int thvm_kernel_child_resolve(Term child, Term *out) {
                 return 1;
             }
         }
+        if (ctx && ctx->dispatch_enabled) {
+            u32 kid = 0;
+            if (thvm_kernel_register(ctx, child, &kid)) {
+                Term forced = thvm_force_dispatch_kid(ctx, kid, 0);
+                if (term_tag(forced) != TAG_ERA || term_val(forced) != 0) {
+                    *out = forced;
+                    return 1;
+                }
+            }
+        }
         return 0;  // child kernel not yet dispatched
     }
     *out = child;
     return 1;
+}
+
+static int thvm_exec_dep_force(TinyHVM *ctx, Term *dep_io, u32 depth) {
+    if (!dep_io || depth > 64) return 0;
+    Term dep = *dep_io;
+    if (term_tag(dep) == TAG_CTR) {
+        u64 loc = term_val(dep);
+        if (loc == 0 || loc + 1 >= ctx->heap_pos) return 0;
+        Term d0 = heap_read(ctx, loc + 0);
+        Term d1 = heap_read(ctx, loc + 1);
+        int r0 = thvm_exec_dep_force(ctx, &d0, depth + 1);
+        int r1 = thvm_exec_dep_force(ctx, &d1, depth + 1);
+        if (d0 != heap_read(ctx, loc + 0)) heap_set(ctx, loc + 0, d0);
+        if (d1 != heap_read(ctx, loc + 1)) heap_set(ctx, loc + 1, d1);
+        return r0 && r1;
+    }
+    if (term_tag(dep) == TAG_TOP) {
+        if (term_ext(dep) == UOP_EXEC) {
+            Term next = thvm_eval_exec_fixed_point(ctx, dep);
+            if (next != dep) *dep_io = next;
+            dep = *dep_io;
+            return !(term_tag(dep) == TAG_TOP && term_ext(dep) == UOP_EXEC);
+        }
+        if (term_ext(dep) == UOP_KERNEL) {
+            Term next = dep;
+            if (thvm_kernel_child_resolve(ctx, dep, &next)) {
+                *dep_io = next;
+                dep = next;
+            }
+            return !(term_tag(dep) == TAG_TOP && term_ext(dep) == UOP_KERNEL);
+        }
+    }
+    return thvm_kernel_child_ready(dep);
 }
 
 static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 depth) {
@@ -317,7 +373,44 @@ static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 de
             return 1;
         }
 
-        if (tag == TAG_TOP && thvm_kernel_compute_uop(term_ext(t))) {
+        if (tag == TAG_TOP && term_ext(t) == UOP_KERNEL) {
+            Term resolved = term_era();
+            if (!thvm_kernel_child_resolve(ctx, t, &resolved)) return 0;
+            t = resolved;
+            continue;
+        }
+
+        if (tag == TAG_TOP && is_view_op(term_ext(t))) {
+            u32 uop = term_ext(t);
+            u64 loc = term_val(t);
+            if (loc == 0 || loc + 1 >= ctx->heap_pos) return 0;
+
+            Term a = term_era();
+            if (!thvm_kernel_normalize_compute(ctx, heap_read(ctx, loc + 0), &a, depth + 1))
+                return 0;
+
+            Term b = heap_read(ctx, loc + 1);
+            if (term_tag(b) == TAG_TOP || term_tag(b) == TAG_SEQ) {
+                b = thvm_force_tensor_term(ctx, b);
+            } else {
+                b = thvm_reduce(ctx, b);
+            }
+            if (term_tag(b) != TAG_TEN) return 0;
+
+            u64 nloc = heap_alloc(ctx, 2);
+            heap_set(ctx, nloc + 0, a);
+            heap_set(ctx, nloc + 1, b);
+            *out = term_new(TAG_TOP, uop, nloc);
+            {
+                const View *sv = st_get(loc);
+                if (sv) st_set(nloc, sv);
+            }
+            return 1;
+        }
+
+        if (tag == TAG_TOP &&
+            (is_binary(term_ext(t)) || is_elementwise(term_ext(t)) ||
+             term_ext(t) == UOP_SUM || term_ext(t) == UOP_RMAX)) {
             u32 uop = term_ext(t);
             u64 loc = term_val(t);
             if (loc == 0 || loc >= ctx->heap_pos) return 0;
@@ -356,11 +449,21 @@ static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 de
                                    uop == UOP_GRAD || uop == UOP_LOG_PRINT ||
                                    uop == UOP_TODEVICE);
                 if (maybe_force) {
-                    next = thvm_eval(ctx, t);
+                    next = (uop == UOP_EXEC) ? thvm_eval_exec_fixed_point(ctx, t)
+                                             : thvm_eval(ctx, t);
                     if (next != t) {
                         t = next;
                         continue;
                     }
+                }
+                if (uop != UOP_FUSE && uop != UOP_GRAD &&
+                    uop != UOP_EXEC && uop != UOP_KERNEL &&
+                    uop != UOP_ASSIGN && uop != UOP_DETACH &&
+                    uop != UOP_IFZ && uop != UOP_WHERE &&
+                    uop != UOP_LOG_PRINT && uop != UOP_TODEVICE &&
+                    st_get(term_val(t)) != NULL) {
+                    *out = t;
+                    return 1;
                 }
             }
             return 0;
@@ -388,12 +491,12 @@ static int thvm_kernel_to_compute(TinyHVM *ctx, Term t, Term *out_compute, u32 d
         Term raw_left = left;
         Term raw_right = right;
         if (term_tag(left) == TAG_TOP && term_ext(left) == UOP_KERNEL) {
-            if (!thvm_kernel_child_resolve(left, &raw_left)) return 0;
+            if (!thvm_kernel_child_resolve(ctx, left, &raw_left)) return 0;
         } else if (!thvm_kernel_child_ready(left)) {
             return 0;
         }
         if (term_tag(right) == TAG_TOP && term_ext(right) == UOP_KERNEL) {
-            if (!thvm_kernel_child_resolve(right, &raw_right)) return 0;
+            if (!thvm_kernel_child_resolve(ctx, right, &raw_right)) return 0;
         } else if (!thvm_kernel_child_ready(right)) {
             return 0;
         }
@@ -416,8 +519,11 @@ static int thvm_kernel_to_compute(TinyHVM *ctx, Term t, Term *out_compute, u32 d
 static int thvm_kernel_lookup_kid(u64 loc, u32 *out_kid) {
     extern u32 sched_kernel_count;
     extern u64 sched_kernel_locs[];
+    extern KernelEntry sched_kernels[];
     for (u32 kid = 0; kid < sched_kernel_count; kid++) {
-        if (sched_kernel_locs[kid] == loc) {
+        Term original = sched_kernels[kid].original_term;
+        if (sched_kernel_locs[kid] == loc ||
+            (term_tag(original) == TAG_TOP && term_val(original) == loc)) {
             if (out_kid) *out_kid = kid;
             return 1;
         }
@@ -438,13 +544,41 @@ static int thvm_kernel_register(TinyHVM *ctx, Term kernel, u32 *out_kid) {
         return 1;
     }
     Term compute = 0;
-    if (!thvm_kernel_to_compute(ctx, kernel, &compute, 0)) return 0;
+    if (!thvm_kernel_to_compute(ctx, kernel, &compute, 0)) {
+        if (getenv("THVM_LOOP_DIAG")) {
+            fprintf(stderr,
+                    "KERNEL_REGISTER normalize_fail kernel=(tag=%u ext=%u val=%llu)\n",
+                    (u32)term_tag(kernel), (u32)term_ext(kernel),
+                    (unsigned long long)term_val(kernel));
+        }
+        return 0;
+    }
     if (sched_kernel_count >= SCHED_MAX_KERNELS) return 0;
 
     KernelEntry ke;
     memset(&ke, 0, sizeof(ke));
     fuse_set_schedule_boundaries(NULL, NULL, NULL, 0, term_val(compute));
     if (!fuse_build_kernel(ctx, compute, &ke)) {
+        if (getenv("THVM_LOOP_DIAG")) {
+            fprintf(stderr,
+                    "KERNEL_REGISTER build_fail kernel=(tag=%u ext=%u val=%llu) compute=(tag=%u ext=%u val=%llu) fail_code=%u\n",
+                    (u32)term_tag(kernel), (u32)term_ext(kernel),
+                    (unsigned long long)term_val(kernel),
+                    (u32)term_tag(compute), (u32)term_ext(compute),
+                    (unsigned long long)term_val(compute),
+                    ke.fail_code);
+            if (term_tag(compute) == TAG_TOP) {
+                u64 cloc = term_val(compute);
+                if (cloc != 0 && cloc + 1 < ctx->heap_pos) {
+                    Term a = heap_read(ctx, cloc + 0);
+                    Term b = heap_read(ctx, cloc + 1);
+                    fprintf(stderr,
+                            "KERNEL_REGISTER build_fail_slots a=(tag=%u ext=%u val=%llu) b=(tag=%u ext=%u val=%llu)\n",
+                            (u32)term_tag(a), (u32)term_ext(a), (unsigned long long)term_val(a),
+                            (u32)term_tag(b), (u32)term_ext(b), (unsigned long long)term_val(b));
+                }
+            }
+        }
         fuse_clear_schedule_boundaries();
         return 0;
     }
@@ -504,6 +638,28 @@ static int thvm_alo_lookup_bind(TinyHVM *ctx, u32 state_id, u64 bind_book, u64 *
     return 0;
 }
 
+static int thvm_alo_lookup_alias(TinyHVM *ctx, u32 state_id, u64 book_loc, u64 *out_alo_loc) {
+    for (u32 sid = state_id; sid != 0; sid = ctx->alo_states[sid].parent) {
+        AloState *s = &ctx->alo_states[sid];
+        if (s->kind == 3 && s->bind_book == book_loc) {
+            if (out_alo_loc) *out_alo_loc = s->bind_dyn;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int thvm_alo_lookup_node(TinyHVM *ctx, u32 state_id, u64 book_loc, u64 *out_dyn_loc) {
+    for (u32 sid = state_id; sid != 0; sid = ctx->alo_states[sid].parent) {
+        AloState *s = &ctx->alo_states[sid];
+        if (s->kind == 4 && s->bind_book == book_loc) {
+            if (out_dyn_loc) *out_dyn_loc = s->bind_dyn;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static u32 thvm_alo_get_or_add_label(TinyHVM *ctx, u32 state_id, u32 old_label, u32 *io_state_id) {
     for (u32 sid = state_id; sid != 0; sid = ctx->alo_states[sid].parent) {
         AloState *s = &ctx->alo_states[sid];
@@ -532,7 +688,16 @@ static Term thvm_alo_suspend_child(TinyHVM *ctx, Term child, u32 state_id) {
             return term_new(TAG_VAR, term_ext(child), dyn_loc);
         return child;
     }
-    return thvm_alo_make(ctx, child, state_id);
+    u64 old_loc = term_val(child);
+    if (old_loc != 0) {
+        u64 alo_loc = 0;
+        if (thvm_alo_lookup_alias(ctx, state_id, old_loc, &alo_loc))
+            return term_new(TAG_ALO, 0, alo_loc);
+    }
+    Term alo = thvm_alo_make(ctx, child, state_id);
+    if (old_loc != 0)
+        (void)thvm_alo_state_push(ctx, state_id, 3, 0, old_loc, term_val(alo), 0, 0);
+    return alo;
 }
 
 static int thvm_alo_term_is_shared_alias(Term t) {
@@ -616,8 +781,13 @@ static Term thvm_alo_realize(TinyHVM *ctx, Term book_term, u32 state_id) {
             Term child = (old_loc > 0 && old_loc < ctx->book_heap_pos) ? ctx->book_heap[old_loc] : term_era();
             Term suspended = thvm_alo_suspend_child(ctx, child, walk_state);
             Term shared = term_era();
-            if (thvm_alo_try_share_child(ctx, suspended, &shared))
-                return shared;
+            if (thvm_alo_try_share_child(ctx, suspended, &shared)) {
+                Term forced = thvm_alo_force(ctx, shared);
+                if (term_tag(forced) == TAG_TEN ||
+                    term_tag(forced) == TAG_NUM ||
+                    (term_tag(forced) == TAG_ERA && term_val(forced) == 0))
+                    return forced;
+            }
             heap_set(ctx, dyn_loc, suspended);
             walk_state = thvm_alo_state_push(ctx, walk_state, 1, term_tag(book_term), old_loc, dyn_loc, 0, 0);
         }
@@ -643,6 +813,7 @@ static Term thvm_alo_realize(TinyHVM *ctx, Term book_term, u32 state_id) {
         u64 new_loc = heap_alloc(ctx, 2);
         Term var = term_new(TAG_VAR, 0, new_loc);
         heap_set(ctx, new_loc + 0, term_set_sub(var));
+        thvm_copy_shape_state_loc(ctx, thvm_st_book_loc_key(old_loc), new_loc);
         u32 body_state = thvm_alo_state_push(ctx, state_id, 1, tag, old_loc, new_loc, 0, 0);
         Term body = (old_loc > 0 && old_loc + 1 < ctx->book_heap_pos) ? ctx->book_heap[old_loc + 1] : term_era();
         heap_set(ctx, new_loc + 1, thvm_alo_suspend_child(ctx, body, body_state));
@@ -653,9 +824,80 @@ static Term thvm_alo_realize(TinyHVM *ctx, Term book_term, u32 state_id) {
     if (ar == 0) return book_term;
     u64 old_loc = term_val(book_term);
     u64 new_loc = heap_alloc(ctx, ar);
+    thvm_copy_shape_state_loc(ctx, thvm_st_book_loc_key(old_loc), new_loc);
+    u32 node_state = thvm_alo_state_push(ctx, state_id, 4, 0, old_loc, new_loc, 0, 0);
     for (u32 i = 0; i < ar; i++) {
         Term child = (old_loc > 0 && old_loc + i < ctx->book_heap_pos) ? ctx->book_heap[old_loc + i] : term_era();
-        heap_set(ctx, new_loc + i, thvm_alo_suspend_child(ctx, child, state_id));
+        heap_set(ctx, new_loc + i, thvm_alo_suspend_child(ctx, child, node_state));
+    }
+    if (tag == TAG_APP && ar == 2) {
+        Term fun_book = (old_loc > 0 && old_loc < ctx->book_heap_pos) ? ctx->book_heap[old_loc + 0] : term_era();
+        Term fun_dyn  = heap_read(ctx, new_loc + 0);
+        if (term_tag(fun_book) == TAG_TOP && term_ext(fun_book) == UOP_GRAD &&
+            term_tag(fun_dyn)  == TAG_TOP && term_ext(fun_dyn)  == UOP_GRAD) {
+            u64 grad_loc = term_val(fun_dyn);
+            thvm_grad_keep_app_loc_set(ctx, grad_loc, new_loc);
+            thvm_grad_keep_bundle_set(ctx, grad_loc, heap_read(ctx, new_loc + 1));
+        }
+    }
+    if (tag == TAG_TOP && term_ext(book_term) == UOP_GRAD) {
+        u64 book_grad_loc = thvm_grad_book_loc_key(old_loc);
+        Term dyn_target = thvm_alo_suspend_child(ctx, thvm_grad_target_get(ctx, book_grad_loc), state_id);
+        u32 dyn_mode = thvm_grad_mode_get(ctx, book_grad_loc);
+        thvm_grad_target_set(ctx, new_loc, dyn_target);
+        thvm_grad_mode_set(ctx, new_loc, dyn_mode);
+        u32 nt = thvm_grad_targets_count_at(ctx, book_grad_loc);
+        if (nt > 0) {
+            Term params[THVM_GRAD_TARGETS_MAX];
+            Term slots[THVM_GRAD_TARGETS_MAX];
+            assert(nt <= THVM_GRAD_TARGETS_MAX);
+            for (u32 i = 0; i < nt; i++) {
+                params[i] = thvm_alo_suspend_child(ctx,
+                                                   thvm_grad_targets_get_term_at(ctx, book_grad_loc, i),
+                                                   state_id);
+                slots[i] = thvm_alo_suspend_child(ctx,
+                                                  thvm_grad_targets_get_slot_at(ctx, book_grad_loc, i),
+                                                  state_id);
+            }
+            thvm_grad_targets_set_for_loc(ctx, new_loc, params, slots, nt);
+        }
+        Term bundle = thvm_grad_keep_bundle_get(ctx, book_grad_loc);
+        if (!(term_tag(bundle) == TAG_ERA && term_val(bundle) == 0)) {
+            thvm_grad_keep_bundle_set(ctx, new_loc, thvm_alo_suspend_child(ctx, bundle, state_id));
+        }
+        u64 book_app_loc = thvm_grad_keep_app_loc_get(ctx, book_grad_loc);
+        if (book_app_loc != 0) {
+            u64 dyn_or_book_app_loc = book_app_loc;
+            if (thvm_grad_is_book_loc(book_app_loc)) {
+                u64 dyn_app_loc = 0;
+                if (thvm_alo_lookup_node(ctx, state_id, thvm_grad_unkey_book_loc(book_app_loc), &dyn_app_loc))
+                    dyn_or_book_app_loc = dyn_app_loc;
+            }
+            thvm_grad_keep_app_loc_set(ctx, new_loc, dyn_or_book_app_loc);
+        }
+        if (getenv("THVM_LOOP_DIAG")) {
+            fprintf(stderr,
+                    "ALO_GRAD book_loc=%llu dyn_loc=%llu mode=%u targets=%u target_tag=%u target_ext=%u target_val=%llu bundle_tag=%u bundle_ext=%u bundle_val=%llu\n",
+                    (unsigned long long)old_loc,
+                    (unsigned long long)new_loc,
+                    dyn_mode,
+                    nt,
+                    (u32)term_tag(dyn_target),
+                    (u32)term_ext(dyn_target),
+                    (unsigned long long)term_val(dyn_target),
+                    (u32)term_tag(bundle),
+                    (u32)term_ext(bundle),
+                    (unsigned long long)term_val(bundle));
+            for (u32 i = 0; i < nt; i++) {
+                Term pt = thvm_grad_targets_get_term_at(ctx, new_loc, i);
+                Term ps = thvm_grad_targets_get_slot_at(ctx, new_loc, i);
+                fprintf(stderr,
+                        "  ALO_GRAD_TARGET[%u]=term(tag=%u ext=%u val=%llu) slot(tag=%u ext=%u val=%llu)\n",
+                        i,
+                        (u32)term_tag(pt), (u32)term_ext(pt), (unsigned long long)term_val(pt),
+                        (u32)term_tag(ps), (u32)term_ext(ps), (unsigned long long)term_val(ps));
+            }
+        }
     }
     return term_new(tag, term_ext(book_term), new_loc);
 }

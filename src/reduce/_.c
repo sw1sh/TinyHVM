@@ -34,8 +34,8 @@ static inline u32 reduce_top_arity(u32 uop) {
     return thvm_uop_storage_arity(uop);
 }
 
-static inline int reduce_term_is_active_era_like(TinyHVM *ctx, Term t, Term *era_out) {
-    if (term_tag(t) == TAG_ERA && term_val(t) != 0) {
+static inline int reduce_term_is_era_like(TinyHVM *ctx, Term t, Term *era_out) {
+    if (term_tag(t) == TAG_ERA) {
         if (era_out) *era_out = t;
         return 1;
     }
@@ -43,7 +43,7 @@ static inline int reduce_term_is_active_era_like(TinyHVM *ctx, Term t, Term *era
         u64 loc = term_val(t);
         if (loc < ctx->heap_pos) {
             Term sub = heap_read(ctx, loc);
-            if (term_tag(sub) == TAG_ERA && term_val(sub) != 0) {
+            if (term_tag(sub) == TAG_ERA) {
                 if (era_out) *era_out = sub;
                 return 1;
             }
@@ -60,7 +60,7 @@ static inline int reduce_top_has_era_arg(TinyHVM *ctx, Term t) {
     u32 arity = reduce_top_arity(uop);
     for (u32 i = 0; i < arity; i++) {
         Term child = heap_read(ctx, loc + i);
-        if (reduce_term_is_active_era_like(ctx, child, NULL)) return 1;
+        if (reduce_term_is_era_like(ctx, child, NULL)) return 1;
     }
     return 0;
 }
@@ -99,6 +99,16 @@ static inline int reduce_fuse_payload_ready(TinyHVM *ctx, Term t) {
         case TAG_NUM:
         case TAG_SEQ:
         case TAG_CTR:
+        case TAG_APP:
+        case TAG_LAM:
+        case TAG_BRI:
+        case TAG_REF:
+        case TAG_SUP:
+        case TAG_USP:
+        case TAG_MAT:
+        case TAG_ANN:
+        case TAG_ANY:
+        case TAG_ALO:
             return 1;
         case TAG_TOP:
             return reduce_fuse_payload_top_ready(ctx, t);
@@ -112,6 +122,7 @@ static inline int reduce_top_direct_uop(u32 uop) {
            uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_CAST ||
            uop == UOP_DETACH ||
            uop == UOP_WHERE ||
+           uop == UOP_EXEC ||
            uop == UOP_KERNEL ||
            uop == UOP_FUSE;
 }
@@ -170,6 +181,14 @@ static int reduce_net_has_parent_ref(TinyHVM *ctx, Term target) {
     return 0;
 }
 
+static int reduce_net_term_is_seq_kernel(TinyHVM *ctx, Term t) {
+    if (term_tag(t) != TAG_TOP || term_ext(t) != UOP_KERNEL) return 0;
+    u64 loc = term_val(t);
+    if (loc == 0 || loc + 2 >= ctx->heap_pos) return 0;
+    Term root_uop = heap_read(ctx, loc + 2);
+    return term_tag(root_uop) == TAG_NUM && (u32)term_val(root_uop) == UOP_COUNT;
+}
+
 static void reduce_net_mark_reachable_slots(TinyHVM *ctx, Term root, u8 *reach) {
     if (!reach || ctx->heap_pos == 0) return;
     memset(reach, 0, (size_t)ctx->heap_pos);
@@ -207,6 +226,41 @@ static void reduce_net_mark_reachable_slots(TinyHVM *ctx, Term root, u8 *reach) 
         // are only reduced when entered by ordinary APP-driven evaluation, not
         // by the heap-wide reachable scan.
         if (tg == TAG_LAM || tg == TAG_BRI || tg == TAG_MAT || tg == TAG_ANN) {
+            continue;
+        }
+
+        // SEQ is strict in its left branch. The heap-wide reachable scan must
+        // not descend into the continuation before the ordinary SEQ
+        // interaction returns it.
+        if (tg == TAG_SEQ) {
+            u64 p = tv + 0;
+            if (p < ctx->heap_pos && (!seen_slot || !seen_slot[p])) {
+                if (seen_slot) seen_slot[p] = 1;
+                reach[p] = 1;
+                REDUCE_PUSH(heap_read(ctx, p));
+            }
+            continue;
+        }
+
+        if (reduce_net_term_is_seq_kernel(ctx, tt)) {
+            u64 left_p = tv + 0;
+            Term left = term_era();
+            if (left_p < ctx->heap_pos && (!seen_slot || !seen_slot[left_p])) {
+                if (seen_slot) seen_slot[left_p] = 1;
+                reach[left_p] = 1;
+                left = heap_read(ctx, left_p);
+                REDUCE_PUSH(left);
+            } else if (left_p < ctx->heap_pos) {
+                left = heap_read(ctx, left_p);
+            }
+            if (term_tag(left) != TAG_TOP) {
+                u64 right_p = tv + 1;
+                if (right_p < ctx->heap_pos && (!seen_slot || !seen_slot[right_p])) {
+                    if (seen_slot) seen_slot[right_p] = 1;
+                    reach[right_p] = 1;
+                    REDUCE_PUSH(heap_read(ctx, right_p));
+                }
+            }
             continue;
         }
 
@@ -348,9 +402,27 @@ static _Thread_local Term reduce_pool[REDUCE_SLICE * REDUCE_MAX_DEPTH];
 static _Thread_local int  reduce_depth = 0;
 
 Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
+    int depth = reduce_depth++;
+    u32 saved_step_budget = 0;
+    u32 saved_steps_taken = 0;
+    struct InteractionTrace *saved_trace_buf = NULL;
+    u32 saved_trace_count = 0;
+    u32 saved_trace_cap = 0;
+    u8 saved_trace_enabled = 0;
+    if (depth > 0) {
+        saved_step_budget = ctx->step_budget;
+        saved_steps_taken = ctx->steps_taken;
+        saved_trace_buf = ctx->trace_buf;
+        saved_trace_count = ctx->trace_count;
+        saved_trace_cap = ctx->trace_cap;
+        saved_trace_enabled = ctx->trace_enabled;
+        ctx->trace_buf = NULL;
+        ctx->trace_count = 0;
+        ctx->trace_cap = 0;
+        ctx->trace_enabled = 0;
+    }
     ctx->step_budget = max_steps;
     ctx->steps_taken = 0;
-    int depth = reduce_depth++;
     if (depth >= REDUCE_MAX_DEPTH) {
         fprintf(stderr, "REDUCE_OVERFLOW: depth=%d tag=%u ext=%u\n", depth, term_tag(root), term_ext(root));
         assert(0 && "reduce depth overflow");
@@ -446,6 +518,14 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
         // Non-compute: reduce args then fire interact
         u64 loc = term_val(next);
         Term a0 = heap_read(ctx, loc + 0);
+        if (_uop == UOP_FUSE && reduce_fuse_payload_ready(ctx, a0)) {
+            if (BUDGET_HIT()) { whnf = next; goto apply; }
+            Term r = thvm_interact(ctx, next);
+            if (r == next) { whnf = next; goto apply; }
+            TRACE_STEP(next, r);
+            next = r;
+            goto enter;
+        }
         PUSH(next);
         next = a0;
         goto enter;
@@ -580,6 +660,17 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
                 top_decref_inputs(ctx, loc, term_ext(frame), r);
                 next = r; goto enter;
             }
+            if (frame_uop == UOP_EXEC &&
+                (a1t2 == TAG_CTR ||
+                 (a1t2 == TAG_TOP &&
+                  (term_ext(a1) == UOP_KERNEL || term_ext(a1) == UOP_EXEC)))) {
+                if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
+                Term r = thvm_interact(ctx, frame);
+                if (r == frame) { whnf = frame; continue; }
+                TRACE_STEP(frame, r);
+                top_decref_inputs(ctx, loc, term_ext(frame), r);
+                next = r; goto enter;
+            }
             // arg1 not ready: push TOP1 sentinel frame
             PUSH(term_new(TAG_TOP1, (u8)term_ext(frame), loc));
             next = a1;
@@ -608,6 +699,10 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
                            (w1t == TAG_TOP && term_ext(whnf) != UOP_FUSE);
             if (_uop1 == UOP_KERNEL)
                 _arg1_ok = thvm_kernel_local_child_ready(ctx, whnf);
+            if (_uop1 == UOP_EXEC)
+                _arg1_ok = _arg1_ok || w1t == TAG_CTR ||
+                           (w1t == TAG_TOP &&
+                            (term_ext(whnf) == UOP_KERNEL || term_ext(whnf) == UOP_EXEC));
             if (!_arg1_ok) {
                 // Reconstruct original TAG_TOP from TOP1 sentinel
                 heap_set(ctx, loc + 1, whnf);
@@ -780,7 +875,16 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
     // the normal trampoline. Quiesce's global heap scan corrupts FUSE payloads.
     // if (depth == 0 && ctx->step_budget == 0)
     //     whnf = reduce_net_quiesce(ctx, whnf);
-    ctx->step_budget = 0;
+    if (depth > 0) {
+        ctx->step_budget = saved_step_budget;
+        ctx->steps_taken = saved_steps_taken;
+        ctx->trace_buf = saved_trace_buf;
+        ctx->trace_count = saved_trace_count;
+        ctx->trace_cap = saved_trace_cap;
+        ctx->trace_enabled = saved_trace_enabled;
+    } else {
+        ctx->step_budget = 0;
+    }
     return whnf;
 }
 

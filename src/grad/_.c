@@ -35,6 +35,9 @@ typedef struct {
 } GradTargetSet;
 
 static GradTargetSet grad_target_sets[GRAD_TARGET_CTX_MAX];
+static GradTargetSet grad_book_target_sets[GRAD_TARGET_CTX_MAX];
+
+static Term grad_resolve_target_term(TinyHVM *ctx, Term t);
 
 static void grad_targets_reset(GradTargetSet *s) {
     if (!s) return;
@@ -102,6 +105,27 @@ static GradTargetSet *grad_targets_get(TinyHVM *ctx, int create) {
     return NULL;
 }
 
+static GradTargetSet *grad_book_targets_get(TinyHVM *ctx, int create) {
+    for (u32 i = 0; i < GRAD_TARGET_CTX_MAX; i++) {
+        if (grad_book_target_sets[i].ctx == ctx) return &grad_book_target_sets[i];
+    }
+    if (!create) return NULL;
+    for (u32 i = 0; i < GRAD_TARGET_CTX_MAX; i++) {
+        if (grad_book_target_sets[i].ctx == NULL) {
+            grad_book_target_sets[i].ctx = ctx;
+            grad_targets_reset(&grad_book_target_sets[i]);
+            return &grad_book_target_sets[i];
+        }
+    }
+    return NULL;
+}
+
+static GradTargetSet *grad_targets_domain_get(TinyHVM *ctx, u64 grad_loc, int create) {
+    return thvm_grad_is_book_loc(grad_loc)
+        ? grad_book_targets_get(ctx, create)
+        : grad_targets_get(ctx, create);
+}
+
 static int grad_loc_index(GradTargetSet *s, u64 grad_loc) {
     if (!s) return -1;
     for (u32 i = 0; i < s->n_loc; i++) {
@@ -124,24 +148,41 @@ static int grad_loc_ensure(GradTargetSet *s, u64 grad_loc) {
     return idx;
 }
 
-static u32 grad_group_alloc(GradTargetSet *s, Term *params, Term *slots, u32 n_params) {
-    if (!s || n_params == 0) return 0;
-    assert(n_params <= THVM_GRAD_TARGETS_MAX);
+static u32 grad_group_alloc_entries(GradTargetSet *s, GradTargetEntry *entries, u32 n_entries) {
+    if (!s || n_entries == 0) return 0;
+    assert(n_entries <= THVM_GRAD_TARGETS_MAX);
     if (s->n_group >= GRAD_GROUP_MAX) return 0;
-    if (s->n_entry + n_params > GRAD_GROUP_ENTRIES_MAX) return 0;
+    if (s->n_entry + n_entries > GRAD_GROUP_ENTRIES_MAX) return 0;
     u32 gid = ++s->n_group; // 1-based
     GradTargetGroup *g = &s->groups[gid - 1];
     g->start = s->n_entry;
-    g->n = n_params;
+    g->n = n_entries;
+    for (u32 i = 0; i < n_entries; i++) {
+        s->entries[s->n_entry++] = entries[i];
+    }
+    return gid;
+}
+
+static u32 grad_group_alloc(TinyHVM *ctx, GradTargetSet *s, u64 grad_loc, Term *params, Term *slots, u32 n_params) {
+    if (!s || n_params == 0) return 0;
+    assert(n_params <= THVM_GRAD_TARGETS_MAX);
+    GradTargetEntry entries[THVM_GRAD_TARGETS_MAX];
     for (u32 i = 0; i < n_params; i++) {
         Term p = params[i];
-        s->entries[s->n_entry++] = (GradTargetEntry){
+        u32 tid = term_tag(p) == TAG_TEN ? (u32)term_val(p) : ~0u;
+        if (tid == ~0u && !thvm_grad_is_book_loc(grad_loc)) {
+            Term rp = grad_resolve_target_term(ctx, p);
+            if (term_tag(rp) == TAG_TEN) {
+                tid = (u32)term_val(rp);
+            }
+        }
+        entries[i] = (GradTargetEntry){
             .term = p,
-            .tid  = term_tag(p) == TAG_TEN ? (u32)term_val(p) : ~0u,
+            .tid  = tid,
             .slot = slots ? slots[i] : term_era(),
         };
     }
-    return gid;
+    return grad_group_alloc_entries(s, entries, n_params);
 }
 
 static int grad_loc_group(GradTargetSet *s, u64 grad_loc, GradTargetGroup **out_group) {
@@ -335,12 +376,13 @@ static void thvm_grad_slot_accum(TinyHVM *ctx, Term slot, Term grad) {
 
 void thvm_grad_targets_clear(TinyHVM *ctx) {
     GradTargetSet *s = grad_targets_get(ctx, 0);
-    if (!s) return;
-    grad_targets_reset(s);
+    if (s) grad_targets_reset(s);
+    GradTargetSet *bs = grad_book_targets_get(ctx, 0);
+    if (bs) grad_targets_reset(bs);
 }
 
 void thvm_grad_target_set(TinyHVM *ctx, u64 grad_loc, Term x) {
-    GradTargetSet *s = grad_targets_get(ctx, 1);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 1);
     if (!s) return;
     int idx = grad_loc_ensure(s, grad_loc);
     if (idx < 0) return;
@@ -348,7 +390,7 @@ void thvm_grad_target_set(TinyHVM *ctx, u64 grad_loc, Term x) {
 }
 
 Term thvm_grad_target_get(TinyHVM *ctx, u64 grad_loc) {
-    GradTargetSet *s = grad_targets_get(ctx, 0);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 0);
     if (!s) return thvm_any();
     int idx = grad_loc_index(s, grad_loc);
     if (idx >= 0) return s->xs[idx];
@@ -356,7 +398,7 @@ Term thvm_grad_target_get(TinyHVM *ctx, u64 grad_loc) {
 }
 
 void thvm_grad_mode_set(TinyHVM *ctx, u64 grad_loc, u32 mode) {
-    GradTargetSet *s = grad_targets_get(ctx, 1);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 1);
     if (!s) return;
     int idx = grad_loc_ensure(s, grad_loc);
     if (idx < 0) return;
@@ -364,30 +406,53 @@ void thvm_grad_mode_set(TinyHVM *ctx, u64 grad_loc, u32 mode) {
 }
 
 void thvm_grad_targets_set_for_loc(TinyHVM *ctx, u64 grad_loc, Term *params, Term *grad_slots, u32 n_params) {
-    GradTargetSet *s = grad_targets_get(ctx, 1);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 1);
     if (!s) return;
     int idx = grad_loc_ensure(s, grad_loc);
     if (idx < 0) return;
-    s->group_ids[idx] = grad_group_alloc(s, params, grad_slots, n_params);
+    s->group_ids[idx] = grad_group_alloc(ctx, s, grad_loc, params, grad_slots, n_params);
 }
 
 void thvm_grad_targets_share(TinyHVM *ctx, u64 dst_loc, u64 src_loc) {
-    GradTargetSet *s = grad_targets_get(ctx, 1);
-    if (!s) return;
-    int src_idx = grad_loc_index(s, src_loc);
+    GradTargetSet *src_set = grad_targets_domain_get(ctx, src_loc, 0);
+    GradTargetSet *dst_set = grad_targets_domain_get(ctx, dst_loc, 1);
+    if (!src_set || !dst_set) return;
+    int src_idx = grad_loc_index(src_set, src_loc);
     if (src_idx < 0) return;
-    int dst_idx = grad_loc_ensure(s, dst_loc);
+    int dst_idx = grad_loc_ensure(dst_set, dst_loc);
     if (dst_idx < 0) return;
-    s->xs[dst_idx] = s->xs[src_idx];
-    s->modes[dst_idx] = s->modes[src_idx];
-    s->group_ids[dst_idx] = s->group_ids[src_idx];
-    s->bundles[dst_idx] = s->bundles[src_idx];
-    s->keep_app_locs[dst_idx] = s->keep_app_locs[src_idx];
+    dst_set->xs[dst_idx] = src_set->xs[src_idx];
+    dst_set->modes[dst_idx] = src_set->modes[src_idx];
+    dst_set->bundles[dst_idx] = src_set->bundles[src_idx];
+    dst_set->keep_app_locs[dst_idx] = src_set->keep_app_locs[src_idx];
+    GradTargetGroup *g = NULL;
+    if (grad_loc_group(src_set, src_loc, &g) && g && g->n > 0) {
+        GradTargetEntry entries[THVM_GRAD_TARGETS_MAX];
+        assert(g->n <= THVM_GRAD_TARGETS_MAX);
+        for (u32 i = 0; i < g->n; i++) {
+            entries[i] = src_set->entries[g->start + i];
+        }
+        dst_set->group_ids[dst_idx] = grad_group_alloc_entries(dst_set, entries, g->n);
+    } else {
+        dst_set->group_ids[dst_idx] = 0;
+    }
 }
 
 static Term grad_resolve_target_term(TinyHVM *ctx, Term t) {
     for (u32 depth = 0; depth < 32; depth++) {
         u8 tag = term_tag(t);
+        if (tag == TAG_ALO) {
+            Term forced = thvm_alo_force(ctx, t);
+            if (forced == t) break;
+            t = forced;
+            continue;
+        }
+        if (tag == TAG_TOP && term_ext(t) == UOP_ASSIGN) {
+            u64 loc = term_val(t);
+            if (loc >= ctx->heap_pos) break;
+            t = heap_read(ctx, loc + 0);
+            continue;
+        }
         if (tag == TAG_DP0 || tag == TAG_DP1) {
             t = heap_read(ctx, term_val(t));
             continue;
@@ -410,7 +475,7 @@ static Term grad_resolve_target_term(TinyHVM *ctx, Term t) {
 }
 
 int thvm_grad_targets_find_term_at(TinyHVM *ctx, u64 grad_loc, Term t, u32 *out_index, Term *out_slot) {
-    GradTargetSet *s = grad_targets_get(ctx, 0);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 0);
     if (!s) return 0;
     GradTargetGroup *g = NULL;
     if (!grad_loc_group(s, grad_loc, &g)) return 0;
@@ -427,7 +492,7 @@ int thvm_grad_targets_find_term_at(TinyHVM *ctx, u64 grad_loc, Term t, u32 *out_
 }
 
 int thvm_grad_targets_find_index_at(TinyHVM *ctx, u64 grad_loc, u32 tid, u32 *out_index, Term *out_slot) {
-    GradTargetSet *s = grad_targets_get(ctx, 0);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 0);
     if (!s) return 0;
     GradTargetGroup *g = NULL;
     if (!grad_loc_group(s, grad_loc, &g)) return 0;
@@ -446,34 +511,34 @@ int thvm_grad_targets_find_slot_at(TinyHVM *ctx, u64 grad_loc, u32 tid, Term *ou
 }
 
 u32 thvm_grad_targets_count_at(TinyHVM *ctx, u64 grad_loc) {
-    GradTargetSet *s = grad_targets_get(ctx, 0);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 0);
     GradTargetGroup *g = NULL;
     return grad_loc_group(s, grad_loc, &g) ? g->n : 0;
 }
 
 u32 thvm_grad_targets_get_tid_at(TinyHVM *ctx, u64 grad_loc, u32 index) {
-    GradTargetSet *s = grad_targets_get(ctx, 0);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 0);
     GradTargetGroup *g = NULL;
     if (!grad_loc_group(s, grad_loc, &g) || index >= g->n) return ~0u;
     return s->entries[g->start + index].tid;
 }
 
 Term thvm_grad_targets_get_term_at(TinyHVM *ctx, u64 grad_loc, u32 index) {
-    GradTargetSet *s = grad_targets_get(ctx, 0);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 0);
     GradTargetGroup *g = NULL;
     if (!grad_loc_group(s, grad_loc, &g) || index >= g->n) return term_era();
     return s->entries[g->start + index].term;
 }
 
 Term thvm_grad_targets_get_slot_at(TinyHVM *ctx, u64 grad_loc, u32 index) {
-    GradTargetSet *s = grad_targets_get(ctx, 0);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 0);
     GradTargetGroup *g = NULL;
     if (!grad_loc_group(s, grad_loc, &g) || index >= g->n) return term_era();
     return s->entries[g->start + index].slot;
 }
 
 u32 thvm_grad_mode_get(TinyHVM *ctx, u64 grad_loc) {
-    GradTargetSet *s = grad_targets_get(ctx, 0);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 0);
     if (!s) return GRAD_MODE_DROP;
     int idx = grad_loc_index(s, grad_loc);
     if (idx >= 0) return s->modes[idx];
@@ -481,7 +546,7 @@ u32 thvm_grad_mode_get(TinyHVM *ctx, u64 grad_loc) {
 }
 
 void thvm_grad_keep_bundle_set(TinyHVM *ctx, u64 grad_loc, Term bundle) {
-    GradTargetSet *s = grad_targets_get(ctx, 1);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 1);
     if (!s) return;
     int idx = grad_loc_ensure(s, grad_loc);
     if (idx < 0) return;
@@ -489,7 +554,7 @@ void thvm_grad_keep_bundle_set(TinyHVM *ctx, u64 grad_loc, Term bundle) {
 }
 
 Term thvm_grad_keep_bundle_get(TinyHVM *ctx, u64 grad_loc) {
-    GradTargetSet *s = grad_targets_get(ctx, 0);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 0);
     if (!s) return term_era();
     int idx = grad_loc_index(s, grad_loc);
     if (idx < 0) return term_era();
@@ -497,7 +562,7 @@ Term thvm_grad_keep_bundle_get(TinyHVM *ctx, u64 grad_loc) {
 }
 
 void thvm_grad_keep_app_loc_set(TinyHVM *ctx, u64 grad_loc, u64 app_loc) {
-    GradTargetSet *s = grad_targets_get(ctx, 1);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 1);
     if (!s) return;
     int idx = grad_loc_ensure(s, grad_loc);
     if (idx < 0) return;
@@ -505,7 +570,7 @@ void thvm_grad_keep_app_loc_set(TinyHVM *ctx, u64 grad_loc, u64 app_loc) {
 }
 
 u64 thvm_grad_keep_app_loc_get(TinyHVM *ctx, u64 grad_loc) {
-    GradTargetSet *s = grad_targets_get(ctx, 0);
+    GradTargetSet *s = grad_targets_domain_get(ctx, grad_loc, 0);
     if (!s) return 0;
     int idx = grad_loc_index(s, grad_loc);
     if (idx < 0) return 0;
@@ -514,21 +579,140 @@ u64 thvm_grad_keep_app_loc_get(TinyHVM *ctx, u64 grad_loc) {
 
 void thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad) {
     GradTargetSet *s = grad_targets_get(ctx, 0);
-    if (!s || index >= thvm_grad_targets_count_at(ctx, grad_loc)) return;
+    if (!s || index >= thvm_grad_targets_count_at(ctx, grad_loc)) {
+        if (getenv("THVM_LOOP_DIAG")) {
+            fprintf(stderr,
+                    "BUNDLE_ACCUM_SKIP loc=%llu idx=%u reason=missing_set_or_bad_index have_set=%d count=%u\n",
+                    (unsigned long long)grad_loc,
+                    index,
+                    s != NULL,
+                    thvm_grad_targets_count_at(ctx, grad_loc));
+        }
+        return;
+    }
     Term bundle = thvm_grad_keep_bundle_get(ctx, grad_loc);
+    Term bundle_alias = bundle;
     u64 app_loc = thvm_grad_keep_app_loc_get(ctx, grad_loc);
+    if (app_loc != 0 && thvm_grad_is_book_loc(app_loc) && term_tag(bundle_alias) == TAG_ALO) {
+        u64 alo_loc = term_val(bundle_alias);
+        if (alo_loc != 0 && alo_loc + 1 < ctx->heap_pos) {
+            Term sid_term = heap_read(ctx, alo_loc + 1);
+            if (term_tag(sid_term) == TAG_NUM) {
+                u64 dyn_app_loc = 0;
+                if (thvm_alo_lookup_node(ctx, term_as_u32(sid_term), thvm_grad_unkey_book_loc(app_loc), &dyn_app_loc))
+                    app_loc = dyn_app_loc;
+            }
+        }
+    }
+    if (term_tag(bundle) == TAG_ALO) {
+        bundle = thvm_alo_force(ctx, bundle);
+    }
+    int bundle_fallback_ok = 0;
+    if (term_tag(bundle) == TAG_CTR) {
+        u64 bundle_loc = term_val(bundle);
+        bundle_fallback_ok = bundle_loc != 0 &&
+                             index < (u32)term_ext(bundle) &&
+                             bundle_loc + index < ctx->heap_pos;
+    }
     u64 loc = 0;
     Term prev = term_era();
     if (app_loc != 0) {
-        if (index != 0) return;
-        loc = app_loc;
-        if (loc + 1 >= ctx->heap_pos) return;
-        prev = heap_read(ctx, loc + 1);
-    } else if (term_tag(bundle) == TAG_CTR) {
+        if (thvm_grad_is_book_loc(app_loc) && bundle_fallback_ok) {
+            app_loc = 0;
+        }
+        if (app_loc + 1 >= ctx->heap_pos) {
+            if (bundle_fallback_ok) {
+                app_loc = 0;
+            } else {
+                if (getenv("THVM_LOOP_DIAG")) {
+                    fprintf(stderr,
+                            "BUNDLE_ACCUM_SKIP loc=%llu idx=%u reason=bad_keep_app keep_app=%llu heap_pos=%llu\n",
+                            (unsigned long long)grad_loc,
+                            index,
+                            (unsigned long long)app_loc,
+                            (unsigned long long)ctx->heap_pos);
+                }
+                return;
+            }
+        }
+        if (app_loc != 0) {
+            Term app_arg = heap_read(ctx, app_loc + 1);
+            if (term_tag(app_arg) == TAG_ALO) {
+                app_arg = thvm_alo_force(ctx, app_arg);
+                heap_set(ctx, app_loc + 1, app_arg);
+            }
+            if (term_tag(app_arg) == TAG_CTR) {
+                loc = term_val(app_arg);
+                if (loc == 0 || loc + index >= ctx->heap_pos) {
+                    if (bundle_fallback_ok) {
+                        app_loc = 0;
+                        loc = 0;
+                    } else {
+                        if (getenv("THVM_LOOP_DIAG")) {
+                            fprintf(stderr,
+                                    "BUNDLE_ACCUM_SKIP loc=%llu idx=%u reason=bad_app_ctr keep_app=%llu arg_tag=%u arg_ext=%u arg_val=%llu heap_pos=%llu\n",
+                                    (unsigned long long)grad_loc,
+                                    index,
+                                    (unsigned long long)app_loc,
+                                    (u32)term_tag(app_arg),
+                                    (u32)term_ext(app_arg),
+                                    (unsigned long long)term_val(app_arg),
+                                    (unsigned long long)ctx->heap_pos);
+                        }
+                        return;
+                    }
+                }
+                if (app_loc != 0)
+                    prev = heap_read(ctx, loc + index);
+            } else if (index == 0) {
+                loc = app_loc;
+                prev = app_arg;
+            } else if (bundle_fallback_ok) {
+                app_loc = 0;
+                loc = 0;
+            } else {
+                if (getenv("THVM_LOOP_DIAG")) {
+                    fprintf(stderr,
+                            "BUNDLE_ACCUM_SKIP loc=%llu idx=%u reason=non_ctr_app_arg keep_app=%llu arg_tag=%u arg_ext=%u arg_val=%llu\n",
+                            (unsigned long long)grad_loc,
+                            index,
+                            (unsigned long long)app_loc,
+                            (u32)term_tag(app_arg),
+                            (u32)term_ext(app_arg),
+                            (unsigned long long)term_val(app_arg));
+                }
+                return;
+            }
+        }
+    }
+    if (loc == 0 && app_loc == 0 && term_tag(bundle) == TAG_CTR) {
         loc = term_val(bundle);
-        if (loc == 0 || loc + index >= ctx->heap_pos) return;
+        if (loc == 0 || loc + index >= ctx->heap_pos) {
+            if (getenv("THVM_LOOP_DIAG")) {
+                fprintf(stderr,
+                        "BUNDLE_ACCUM_SKIP loc=%llu idx=%u reason=bad_bundle_loc keep_tag=%u keep_ext=%u keep_val=%llu heap_pos=%llu\n",
+                        (unsigned long long)grad_loc,
+                        index,
+                        (u32)term_tag(bundle),
+                        (u32)term_ext(bundle),
+                        (unsigned long long)term_val(bundle),
+                        (unsigned long long)ctx->heap_pos);
+            }
+            return;
+        }
         prev = heap_read(ctx, loc + index);
-    } else {
+    }
+    if (loc == 0) {
+        if (getenv("THVM_LOOP_DIAG")) {
+            fprintf(stderr,
+                    "BUNDLE_ACCUM_SKIP loc=%llu idx=%u reason=non_bundle keep_tag=%u keep_ext=%u keep_val=%llu keep_app=%llu\n",
+                    (unsigned long long)grad_loc,
+                    index,
+                    (u32)term_tag(bundle),
+                    (u32)term_ext(bundle),
+                    (unsigned long long)term_val(bundle),
+                    (unsigned long long)app_loc);
+        }
         return;
     }
     if (getenv("THVM_LOOP_DIAG")) {
@@ -536,24 +720,59 @@ void thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad) {
                 "BUNDLE_ACCUM loc=%llu idx=%u slot=%llu prev_tag=%u prev_ext=%u grad_tag=%u grad_ext=%u grad_val=%llu\n",
                 (unsigned long long)grad_loc,
                 index,
-                (unsigned long long)(app_loc != 0 ? (loc + 1) : (loc + index)),
+                (unsigned long long)(app_loc != 0
+                    ? (term_tag(heap_read(ctx, app_loc + 1)) == TAG_CTR ? (loc + index) : (loc + 1))
+                    : (loc + index)),
                 (u32)term_tag(prev),
                 (u32)term_ext(prev),
                 (u32)term_tag(grad),
                 (u32)term_ext(grad),
                 (unsigned long long)term_val(grad));
     }
+    u64 dst_slot = app_loc != 0
+        ? (term_tag(heap_read(ctx, app_loc + 1)) == TAG_CTR ? (loc + index) : (loc + 1))
+        : (loc + index);
     if (term_tag(prev) == TAG_NUM && term_as_f32(prev) == 0.0f) {
-        // Keep mode should expose the live backward net in the bundle. When the
-        // slot is still zero, move the incoming branch directly instead of
-        // cloning/forcing it into a detached tensor.
-        heap_set(ctx, app_loc != 0 ? (loc + 1) : (loc + index), grad);
+        // Keep mode should preserve the backward branch in the bundle even if
+        // the reducer continues cleaning up the original path after the
+        // GRAD/TEN hit. Clone the branch into the bundle so later erasure on
+        // the source path cannot mutate the kept result.
+        Term stored = term_clone(ctx, grad);
+        if (getenv("THVM_LOOP_DIAG")) {
+            fprintf(stderr,
+                    "BUNDLE_ACCUM_STORE loc=%llu idx=%u dst_slot=%llu stored_tag=%u stored_ext=%u stored_val=%llu src_tag=%u src_ext=%u src_val=%llu\n",
+                    (unsigned long long)grad_loc,
+                    index,
+                    (unsigned long long)dst_slot,
+                    (u32)term_tag(stored),
+                    (u32)term_ext(stored),
+                    (unsigned long long)term_val(stored),
+                    (u32)term_tag(grad),
+                    (u32)term_ext(grad),
+                    (unsigned long long)term_val(grad));
+        }
+        heap_set(ctx, dst_slot, stored);
         return;
     }
     if (term_tag(grad) == TAG_NUM && term_as_f32(grad) == 0.0f) return;
-    heap_set(ctx,
-             app_loc != 0 ? (loc + 1) : (loc + index),
-             thvm_op_raw(ctx, UOP_ADD, prev, grad));
+    Term stored = term_clone(ctx, grad);
+    if (getenv("THVM_LOOP_DIAG")) {
+        fprintf(stderr,
+                "BUNDLE_ACCUM_ADD loc=%llu idx=%u dst_slot=%llu prev_tag=%u prev_ext=%u prev_val=%llu stored_tag=%u stored_ext=%u stored_val=%llu src_tag=%u src_ext=%u src_val=%llu\n",
+                (unsigned long long)grad_loc,
+                index,
+                (unsigned long long)dst_slot,
+                (u32)term_tag(prev),
+                (u32)term_ext(prev),
+                (unsigned long long)term_val(prev),
+                (u32)term_tag(stored),
+                (u32)term_ext(stored),
+                (unsigned long long)term_val(stored),
+                (u32)term_tag(grad),
+                (u32)term_ext(grad),
+                (unsigned long long)term_val(grad));
+    }
+    heap_set(ctx, dst_slot, thvm_op_raw(ctx, UOP_ADD, prev, stored));
 }
 
 Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
@@ -607,8 +826,9 @@ Term thvm_grad_multi_keep(TinyHVM *ctx, Term loss, Term *params, u32 n_params) {
     thvm_grad_target_set(ctx, grad_loc, thvm_any());
     thvm_grad_mode_set(ctx, grad_loc, GRAD_MODE_KEEP);
     thvm_grad_targets_set_for_loc(ctx, grad_loc, params, NULL, n_params);
-    if (n_params == 1) thvm_grad_keep_app_loc_set(ctx, grad_loc, term_val(keep_root));
-    else               thvm_grad_keep_bundle_set(ctx, grad_loc, bundle);
+    thvm_grad_keep_app_loc_set(ctx, grad_loc, term_val(keep_root));
+    if (n_params != 1)
+        thvm_grad_keep_bundle_set(ctx, grad_loc, bundle);
     return keep_root;
 }
 
@@ -627,6 +847,29 @@ Term thvm_grad_bundle_get(TinyHVM *ctx, Term bundle, u32 index) {
                 (unsigned long long)term_val(bundle), index);
     }
     if (term_tag(bundle) != TAG_CTR) return index == 0 ? bundle : term_era();
+    {
+        u64 bloc = term_val(bundle);
+        u32 arity = (u32)term_ext(bundle);
+        int need_stage = 0;
+        if (bloc != 0 && bloc + arity <= ctx->heap_pos) {
+            for (u32 i = 0; i < arity; i++) {
+                Term child = heap_read(ctx, bloc + i);
+                if (term_tag(child) == TAG_TOP) {
+                    need_stage = 1;
+                    break;
+                }
+            }
+        }
+        if (need_stage) {
+            bundle = thvm_eval_exec_fixed_point(ctx, bundle);
+            bundle = thvm_grad_bundle_whnf(ctx, bundle);
+            if (getenv("THVM_LOOP_DIAG")) {
+                fprintf(stderr, "BUNDLE_GET staged tag=%u ext=%u val=%llu\n",
+                        (u32)term_tag(bundle), (u32)term_ext(bundle),
+                        (unsigned long long)term_val(bundle));
+            }
+        }
+    }
     if (index >= (u32)term_ext(bundle)) return term_era();
     u64 loc = term_val(bundle);
     if (loc == 0 || loc + index >= ctx->heap_pos) return term_era();

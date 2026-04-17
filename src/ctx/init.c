@@ -45,6 +45,7 @@ TinyHVM *thvm_init(const char *default_device) {
     // SHRINK terms are the real IR we want to reduce and schedule; eager
     // TAG_TEN alias allocation only hides that structure from phase 1/2.
     ctx->no_grad_alloc = 1;
+    thvm_register_pass(ctx, thvm_sched_global_pass, "sched");
 
     return ctx;
 }
@@ -61,6 +62,8 @@ static struct {
 void term_use_clear(void) { memset(term_use_table, 0, sizeof(term_use_table)); }
 
 void thvm_free(TinyHVM *ctx) {
+    thvm_grad_targets_clear(ctx);
+    thvm_sched_reset_runtime();
     // Free GPU buffers via each tensor's own backend
     for (u32 i = 0; i < ctx->tensor_count; i++) {
         if (ctx->tensors[i].buf_id && ctx->tensors[i].backend)
@@ -83,6 +86,7 @@ void thvm_free(TinyHVM *ctx) {
     free(ctx->sched_rewrites);
     free(ctx->alo_states);
     free(ctx);
+    memset(st_keys, 0, sizeof(st_keys));
     // Clear stale DUP tracking — TAG_TEN terms encode low tensor IDs
     // (0,1,2...) that collide across ctx instances.
     memset(term_use_table, 0, sizeof(term_use_table));
@@ -372,6 +376,10 @@ static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc) {
 static void thvm_track_top_shape(TinyHVM *ctx, u64 loc, u32 uop, Term a, Term b) {
     const View *va = term_view(ctx, a);
     const View *vb_dbg = (term_tag(b) != TAG_ERA) ? term_view(ctx, b) : NULL;
+    const ShapeTracker *ast =
+        (term_tag(a) == TAG_TOP || term_tag(a) == TAG_VAR)
+            ? st_get_tracker(term_val(a))
+            : NULL;
     {
         View out = {0};
         int stored = 0;
@@ -385,9 +393,8 @@ static void thvm_track_top_shape(TinyHVM *ctx, u64 loc, u32 uop, Term a, Term b)
                 for (u32 i = 0; i < bn; i++) ns.dims[i] = bf[i];
                 u32 nn = 1;
                 for (u32 i = 0; i < ns.rank; i++) nn *= ns.dims[i];
-                const ShapeTracker *input_st = st_get_tracker(term_val(a));
-                if (input_st && va && nn == va->numel) {
-                    ShapeTracker composed = st_reshape(*input_st, ns);
+                if (ast && va && nn == va->numel) {
+                    ShapeTracker composed = st_reshape(*ast, ns);
                     st_set_tracker(loc, &composed);
                 } else if (va && nn == va->numel) {
                     ShapeTracker composed = st_reshape(st_from_view(*va), ns);
@@ -398,9 +405,8 @@ static void thvm_track_top_shape(TinyHVM *ctx, u64 loc, u32 uop, Term a, Term b)
                 }
                 stored = 1;
             } else if (bn && uop == UOP_EXPAND) {
-                const ShapeTracker *input_st = st_get_tracker(term_val(a));
-                if (input_st && va) {
-                    ShapeTracker composed = st_expand(*input_st, bf, bn);
+                if (ast && va) {
+                    ShapeTracker composed = st_expand(*ast, bf, bn);
                     st_set_tracker(loc, &composed);
                 } else if (va) {
                     ShapeTracker composed = st_expand(st_from_view(*va), bf, bn);
@@ -416,9 +422,8 @@ static void thvm_track_top_shape(TinyHVM *ctx, u64 loc, u32 uop, Term a, Term b)
                 u32 ndim = bn / 2;
                 u32 starts[MAX_DIM], ends[MAX_DIM];
                 for (u32 i = 0; i < ndim; i++) { starts[i] = bf[i * 2]; ends[i] = bf[i * 2 + 1]; }
-                const ShapeTracker *input_st = st_get_tracker(term_val(a));
-                if (input_st && va) {
-                    ShapeTracker composed = st_shrink(*input_st, starts, ends, ndim);
+                if (ast && va) {
+                    ShapeTracker composed = st_shrink(*ast, starts, ends, ndim);
                     st_set_tracker(loc, &composed);
                 } else {
                     Shape ns = {.rank = ndim};
@@ -431,9 +436,8 @@ static void thvm_track_top_shape(TinyHVM *ctx, u64 loc, u32 uop, Term a, Term b)
                 u32 ndim = bn / 2;
                 u32 pb[MAX_DIM], pa[MAX_DIM];
                 for (u32 i = 0; i < ndim; i++) { pb[i] = bf[i * 2]; pa[i] = bf[i * 2 + 1]; }
-                const ShapeTracker *input_st = st_get_tracker(term_val(a));
-                if (input_st && va) {
-                    ShapeTracker composed = st_pad(*input_st, pb, pa);
+                if (ast && va) {
+                    ShapeTracker composed = st_pad(*ast, pb, pa);
                     st_set_tracker(loc, &composed);
                 } else if (va) {
                     ShapeTracker composed = st_pad(st_from_view(*va), pb, pa);
@@ -448,9 +452,8 @@ static void thvm_track_top_shape(TinyHVM *ctx, u64 loc, u32 uop, Term a, Term b)
             } else if (bn && uop == UOP_PERMUTE && va) {
                 u32 axes[MAX_DIM];
                 for (u32 i = 0; i < bn; i++) axes[i] = bf[i];
-                const ShapeTracker *input_st = st_get_tracker(term_val(a));
-                if (input_st) {
-                    ShapeTracker composed = st_permute(*input_st, axes, bn);
+                if (ast) {
+                    ShapeTracker composed = st_permute(*ast, axes, bn);
                     st_set_tracker(loc, &composed);
                 } else {
                     ShapeTracker composed = st_permute(st_from_view(*va), axes, bn);

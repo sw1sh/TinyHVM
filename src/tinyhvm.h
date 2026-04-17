@@ -620,6 +620,14 @@ static inline const View *st_get(u64 heap_loc) {
     return &st->views[st->n_views - 1];
 }
 
+// Book terms live in a separate heap namespace but reuse small integer locs.
+// Key their shape-tracker entries into a disjoint high-bit range so ALO copies
+// do not accidentally read shape metadata from unrelated live heap nodes.
+#define THVM_ST_BOOK_LOC_BIT (1ULL << 62)
+static inline u64 thvm_st_book_loc_key(u64 book_loc) {
+    return book_loc ? (book_loc | THVM_ST_BOOK_LOC_BIT) : 0;
+}
+
 // ============================================================
 // Fused Op / ReduceSpec (used by fuser + codegen + scheduler)
 // ============================================================
@@ -1297,6 +1305,7 @@ void     jit_replay(void);
 Term     thvm_reduce(TinyHVM *ctx, Term t);
 Term     thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps);
 Term     thvm_eval(TinyHVM *ctx, Term t);
+void     thvm_sched_reset_runtime(void);
 
 // Step-graph hooks. Called from inside the reducer; no-op unless
 // THVM_STEP_GRAPH is set. Pre-hook captures before-redex metadata from
@@ -1450,6 +1459,16 @@ Term     thvm_grad_bundle_get(TinyHVM *ctx, Term bundle, u32 index);
 
 // Internal GRAD target registry used by phase-1 GRAD interactions and debug labels.
 #define THVM_GRAD_TARGETS_MAX 512
+#define THVM_GRAD_BOOK_LOC_BIT (1ULL << 63)
+static inline u64 thvm_grad_book_loc_key(u64 book_loc) {
+    return book_loc ? (book_loc | THVM_GRAD_BOOK_LOC_BIT) : 0;
+}
+static inline int thvm_grad_is_book_loc(u64 grad_loc) {
+    return (grad_loc & THVM_GRAD_BOOK_LOC_BIT) != 0;
+}
+static inline u64 thvm_grad_unkey_book_loc(u64 grad_loc) {
+    return grad_loc & ~THVM_GRAD_BOOK_LOC_BIT;
+}
 void     thvm_grad_targets_clear(TinyHVM *ctx);
 void     thvm_grad_target_set(TinyHVM *ctx, u64 grad_loc, Term x);
 Term     thvm_grad_target_get(TinyHVM *ctx, u64 grad_loc);

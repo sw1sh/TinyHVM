@@ -1216,6 +1216,10 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 u64 dl = tv;
                 if (dl == 0 || dl >= ctx->heap_pos || (seen_dup && seen_dup[dl])) continue;
                 if (seen_dup) seen_dup[dl] = 1;
+                if (!seen_slot || !seen_slot[dl]) {
+                    if (seen_slot) seen_slot[dl] = 1;
+                    if (slot_live) slot_live[dl] = 1;
+                }
                 PUSH_TERM(heap_read(ctx, dl));
                 continue;
             }
@@ -1559,6 +1563,14 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             fprintf(f, "  n%llu -> " dst_prefix "%llu [label=\"%s\"%s%s];\n", \
                     (unsigned long long)_rvv, (unsigned long long)(dst_loc), (elbl), _extra_attrs, _hl_attrs); \
         } else if (_rt == TAG_TOP || dot_visible_heap_loc_tag(_rt)) { \
+            if (!NODE_SEEN(_rvv)) { \
+                NODE_MARK(_rvv); \
+                char _rlabel[96]; \
+                dot_raw_slot_term_label(ctx, _rv, _rlabel, sizeof(_rlabel)); \
+                fprintf(f, "  n%llu [label=\"%s\", shape=%s, fillcolor=\"%s\"];\n", \
+                        (unsigned long long)_rvv, _rlabel, \
+                        dot_heap_node_shape(_rt), dot_heap_node_color(_rt)); \
+            } \
             fprintf(f, "  n%llu -> " dst_prefix "%llu [label=\"%s\"%s%s];\n", \
                     (unsigned long long)_rvv, (unsigned long long)(dst_loc), (elbl), _extra_attrs, _hl_attrs); \
         } else { \
@@ -2475,6 +2487,14 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                             fprintf(f, "  n%llu -> n%llu [label=\"%s\",style=dotted,color=\"#7a7a7a\"];\n",
                                     (unsigned long long)bval, (unsigned long long)val, env_lbl);
                         } else if (btag == TAG_TOP || dot_visible_heap_loc_tag(btag)) {
+                            if (!NODE_SEEN(bval)) {
+                                NODE_MARK(bval);
+                                char blabel[96];
+                                dot_raw_slot_term_label(ctx, bound, blabel, sizeof(blabel));
+                                fprintf(f, "  n%llu [label=\"%s\", shape=%s, fillcolor=\"%s\"];\n",
+                                        (unsigned long long)bval, blabel,
+                                        dot_heap_node_shape(btag), dot_heap_node_color(btag));
+                            }
                             fprintf(f, "  n%llu -> n%llu [label=\"%s\",style=dotted,color=\"#7a7a7a\"];\n",
                                     (unsigned long long)bval, (unsigned long long)val, env_lbl);
                         }

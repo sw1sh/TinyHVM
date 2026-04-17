@@ -84,6 +84,19 @@ u32 thvm_fresh_label(TinyHVM *ctx) {
 }
 
 typedef struct { u64 old_loc; u64 new_loc; } BookReloc;
+
+static inline void thvm_book_copy_shape_state(TinyHVM *ctx, u64 src_loc, u64 book_loc) {
+    if (!ctx || src_loc == 0 || book_loc == 0) return;
+    u64 keyed_book_loc = thvm_st_book_loc_key(book_loc);
+    const ShapeTracker *tracker = st_get_tracker(src_loc);
+    if (tracker) {
+        st_set_tracker(keyed_book_loc, tracker);
+        return;
+    }
+    const View *view = st_get(src_loc);
+    if (view) st_set(keyed_book_loc, view);
+}
+
 static u64 thvm_book_heap_alloc(TinyHVM *ctx, u32 n) {
     if (n == 0) return 0;
     if (!ctx->book_heap) {
@@ -166,6 +179,7 @@ static Term thvm_book_from_dynamic_r(TinyHVM *ctx, Term t,
             u64 old_loc = term_val(t);
             u64 new_loc = thvm_book_heap_alloc(ctx, 2);
             if (*n_relocs < 4096) relocs[(*n_relocs)++] = (BookReloc){old_loc, new_loc};
+            thvm_book_copy_shape_state(ctx, old_loc, new_loc);
             Term var = term_new(TAG_VAR, 0, new_loc);
             ctx->book_heap[new_loc + 0] = term_set_sub(var);
             ctx->book_heap[new_loc + 1] = thvm_book_from_dynamic_r(ctx, heap_read(ctx, old_loc + 1),
@@ -194,11 +208,76 @@ static Term thvm_book_from_dynamic_r(TinyHVM *ctx, Term t,
             if (ar == 0) return t;
             u64 old_loc = term_val(t);
             u64 new_loc = thvm_book_heap_alloc(ctx, ar);
+            thvm_book_copy_shape_state(ctx, old_loc, new_loc);
+            if ((tag == TAG_APP || (tag == TAG_TOP && term_ext(t) == UOP_GRAD)) &&
+                *n_relocs < 4096)
+                relocs[(*n_relocs)++] = (BookReloc){old_loc, new_loc};
             for (u32 i = 0; i < ar; i++) {
                 ctx->book_heap[new_loc + i] = thvm_book_from_dynamic_r(ctx, heap_read(ctx, old_loc + i),
                                                                         relocs, n_relocs);
             }
             Term out = term_new(tag, term_ext(t), new_loc);
+            if (tag == TAG_TOP && term_ext(t) == UOP_GRAD) {
+                u64 book_grad_loc = thvm_grad_book_loc_key(new_loc);
+                Term book_target = thvm_book_from_dynamic_r(ctx, thvm_grad_target_get(ctx, old_loc),
+                                                            relocs, n_relocs);
+                u32 book_mode = thvm_grad_mode_get(ctx, old_loc);
+                thvm_grad_target_set(ctx, book_grad_loc, book_target);
+                thvm_grad_mode_set(ctx, book_grad_loc, book_mode);
+                u32 nt = thvm_grad_targets_count_at(ctx, old_loc);
+                if (nt > 0) {
+                    Term params[THVM_GRAD_TARGETS_MAX];
+                    Term slots[THVM_GRAD_TARGETS_MAX];
+                    assert(nt <= THVM_GRAD_TARGETS_MAX);
+                    for (u32 i = 0; i < nt; i++) {
+                        params[i] = thvm_book_from_dynamic_r(ctx,
+                                                             thvm_grad_targets_get_term_at(ctx, old_loc, i),
+                                                             relocs, n_relocs);
+                        slots[i] = thvm_book_from_dynamic_r(ctx,
+                                                            thvm_grad_targets_get_slot_at(ctx, old_loc, i),
+                                                            relocs, n_relocs);
+                    }
+                    thvm_grad_targets_set_for_loc(ctx, book_grad_loc, params, slots, nt);
+                }
+                Term bundle = thvm_grad_keep_bundle_get(ctx, old_loc);
+                if (!(term_tag(bundle) == TAG_ERA && term_val(bundle) == 0)) {
+                    thvm_grad_keep_bundle_set(ctx, book_grad_loc,
+                                              thvm_book_from_dynamic_r(ctx, bundle, relocs, n_relocs));
+                }
+                u64 app_loc = thvm_grad_keep_app_loc_get(ctx, old_loc);
+                if (app_loc != 0) {
+                    for (u32 i = 0; i < *n_relocs; i++) {
+                        if (relocs[i].old_loc == app_loc) {
+                            thvm_grad_keep_app_loc_set(ctx, book_grad_loc,
+                                                       thvm_grad_book_loc_key(relocs[i].new_loc));
+                            break;
+                        }
+                    }
+                }
+                if (getenv("THVM_LOOP_DIAG")) {
+                    fprintf(stderr,
+                            "BOOK_GRAD old_loc=%llu book_loc=%llu mode=%u targets=%u target_tag=%u target_ext=%u target_val=%llu bundle_tag=%u bundle_ext=%u bundle_val=%llu\n",
+                            (unsigned long long)old_loc,
+                            (unsigned long long)new_loc,
+                            book_mode,
+                            nt,
+                            (u32)term_tag(book_target),
+                            (u32)term_ext(book_target),
+                            (unsigned long long)term_val(book_target),
+                            (u32)term_tag(bundle),
+                            (u32)term_ext(bundle),
+                            (unsigned long long)term_val(bundle));
+                    for (u32 i = 0; i < nt; i++) {
+                        Term pt = thvm_grad_targets_get_term_at(ctx, book_grad_loc, i);
+                        Term ps = thvm_grad_targets_get_slot_at(ctx, book_grad_loc, i);
+                        fprintf(stderr,
+                                "  BOOK_GRAD_TARGET[%u]=term(tag=%u ext=%u val=%llu) slot(tag=%u ext=%u val=%llu)\n",
+                                i,
+                                (u32)term_tag(pt), (u32)term_ext(pt), (unsigned long long)term_val(pt),
+                                (u32)term_tag(ps), (u32)term_ext(ps), (unsigned long long)term_val(ps));
+                    }
+                }
+            }
             return out;
         }
     }

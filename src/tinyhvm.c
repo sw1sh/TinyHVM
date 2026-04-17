@@ -71,6 +71,7 @@ static u32  tensor_fill(TinyHVM *ctx, Shape s, f32 val);
 static u32  tensor_transpose_2d(TinyHVM *ctx, u32 src_id);
 static Term sum_to_shape(TinyHVM *ctx, Term grad, Shape src_shape, Shape target);
 static Term thvm_sched_dispatch_kernel(TinyHVM *ctx, u32 kid);
+static Term thvm_eval_exec_fixed_point(TinyHVM *ctx, Term t);
 f32 *thvm_to_host(TinyHVM *ctx, Term t);
 i32 *thvm_to_host_i32(TinyHVM *ctx, Term t);
 u32 *thvm_to_host_u32(TinyHVM *ctx, Term t);
@@ -82,6 +83,7 @@ static u32 reduce_id(TinyHVM *ctx, Term t);
 static int is_elementwise(u32 uop);
 static int is_binary(u32 uop);
 static Term linear_use(TinyHVM *ctx, Term t, u64 dest_loc);
+static int thvm_kernel_register(TinyHVM *ctx, Term kernel, u32 *out_kid);
 int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke);
 void fuse_set_schedule_boundaries(const u64 *locs, const u32 *output_tids,
                                   const u32 *kids, u32 n_boundaries, u64 root_compute_loc);
@@ -97,6 +99,9 @@ static int  materialize_walk(TinyHVM *ctx, u32 tid,
 static int  thvm_lower_kernel_uop(TinyHVM *ctx, const KernelEntry *ke,
                                   UOpKernel *out, u64 *out_lower_sig);
 static void thvm_lower_dump_uop_kernel(const UOpKernel *uk);
+void thvm_register_pass(TinyHVM *ctx, ThvmCompilerPass pass, const char *name);
+static Term thvm_sched_global_pass(TinyHVM *ctx, Term root);
+static Term thvm_eval_fuse_fixed_point(TinyHVM *ctx, Term t, int mixed_dispatch);
 Term thvm_op2(TinyHVM *ctx, u32 opr, Term x, Term y);
 Term thvm_op_raw(TinyHVM *ctx, u32 uop, Term a, Term b);
 Term thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b);

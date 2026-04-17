@@ -209,6 +209,24 @@ static const char *thvm_graph_dir(void) {
     return (dir && dir[0]) ? dir : "graphs";
 }
 
+static void thvm_graph_dir_announce(const char *kind) {
+    static u8 announced[4];
+    u32 slot = 0;
+    const char *dir = thvm_graph_dir();
+    if (strcmp(kind, "coarse") == 0) {
+        slot = 1;
+    } else if (strcmp(kind, "step") == 0) {
+        slot = 2;
+        const char *step_dir = getenv("THVM_STEP_GRAPH_DIR");
+        if (step_dir && step_dir[0]) dir = step_dir;
+    } else if (strcmp(kind, "lower") == 0) {
+        slot = 3;
+    }
+    if (announced[slot]) return;
+    announced[slot] = 1;
+    fprintf(stderr, "THVM %s graph dump -> %s/\n", kind, dir);
+}
+
 static void thvm_graph_dump_path(char *buf, size_t nbuf, const char *name) {
     snprintf(buf, nbuf, "%s/%s", thvm_graph_dir(), name);
 }
@@ -2554,6 +2572,8 @@ static Term thvm_eval_internal(TinyHVM *ctx, Term t, int pre_reduce_phase) {
                             !step_term_is_seq_kernel(ctx, t)));
     int run_step_graph = outermost && getenv("THVM_STEP_GRAPH") && !ctx->step_graph_consumed;
     int run_coarse_graph = outermost && getenv("THVM_GRAPH") && !ctx->coarse_graph_consumed;
+    if (run_step_graph) thvm_graph_dir_announce("step");
+    if (run_coarse_graph) thvm_graph_dir_announce("coarse");
     if (run_step_graph) {
         ctx->step_graph_consumed = 1;
         u32 snap_count = 0;

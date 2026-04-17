@@ -1799,6 +1799,13 @@ static void thvm_lower_dump_graphs(TinyHVM *ctx, const KernelEntry *ke, const UO
     } else {
         snprintf(dir, sizeof(dir), "%s", base_dir);
     }
+    {
+        static char announced_dir[1024];
+        if (strcmp(announced_dir, base_dir) != 0) {
+            snprintf(announced_dir, sizeof(announced_dir), "%s", base_dir);
+            fprintf(stderr, "THVM lower graph dump -> %s/\n", base_dir);
+        }
+    }
     char mkdir_cmd[1024];
     snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s\"", dir);
     system(mkdir_cmd);

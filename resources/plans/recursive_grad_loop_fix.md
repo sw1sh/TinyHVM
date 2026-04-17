@@ -326,30 +326,58 @@ intended consumers, and both n0 and n1 of each commute are
 reduced by the trampoline. The bug must be in the NUMERIC
 VALUES produced by the DP1-side chain, not in broken state.
 
-### Hypothesis for round 5 — DP1-side commute produces wrong numeric
+### Round 5 (2026-04-18): FORCE_V0 experiment — v0 and v1 are NOT interchangeable
 
-DUP⊳TOP commute creates `n0 = TOP(r0)` with DP0-wrapped args
-and `n1 = TOP(r1)` with DP1-wrapped args, where both sets of
-args point to the same cdups. Semantically n0 and n1 should
-reduce to the SAME tensor value (cdup children are shared; the
-only difference is which DP-side projects them).
+Added `THVM_DUP_FORCE_V0=1` env knob inside `DUP_STATE_RETURN`
+that writes `_v0` to BOTH port_slots (replacing `_v1`). This
+tests the hypothesis "DP1-side commute is the diverging path".
 
-But b's chain ends up consuming `n1` at every level (DP1 writes
-to port_slot[1]), while w consumes `n0`. If n1's chain somehow
-yields a different tensor than n0's (e.g. if `thvm_op_raw(MUL,
-...)` or the scheduler creates tensor IDs differently depending
-on which DP side first triggers reduction), we'd see exactly
-this: two semantically-equivalent computations yielding
-different numbers.
+**Results:**
 
-Concrete probe: add logging that, for each DUP firing where
-val=TOP, prints the n0 and n1 terms produced, and (after the
-outer reducer completes) prints the resulting tensor id and
-values from each side. If n0's reduced tensor != n1's reduced
-tensor, we've found the bug. Alternatively: temporarily hack
-`DUP_STATE_RETURN` to always write `_v0` to BOTH port slots
-(ignoring DP1-side projection) — if b then matches w exactly,
-it confirms the DP1-side reduction is the diverging path.
+| Test | Baseline | With `FORCE_V0=1` |
+|---|---|---|
+| scalar (1 param) | pass [0.8, 0, -0.4] | **BREAKS** [0.65, -0.5, -0.075] |
+| twoparam_sum | pass (no MUL backward) | pass |
+| twoparam_grad | w=0.78, b=0.324 (0.8×) | **both worse**: w=0.64, b=0.226 |
+
+**Findings:**
+
+1. Forcing v0 on both sides does NOT fix b. w's result gets
+   worse too. So DP1-side reduction is not "wrong" in a way
+   that swapping to DP0 fixes.
+2. `v0` and `v1` from a commute are NOT numerically
+   interchangeable at the consumer level. This contradicts the
+   naive IC semantics that `n0` and `n1` compute the same
+   value — something about how their argument DPs share cdups
+   creates real numerical divergence when you substitute one
+   for the other.
+3. Scalar broke because it ALSO has non-orphan commute DUPs
+   (the diag shows ~49 DP0-both + 10 DP1-both firings in the
+   scalar backward chain). Forcing v0 on DP1 consumers in
+   scalar corrupts its normally-correct grad.
+
+### Hypothesis for round 6 — cdup timing matters
+
+Commute produces cdups that are shared between n0 and n1.
+When n0's DP0(cdup) fires, DUP@cdup is consumed (heap[cdup] =
+ERA after fire). But n1's DP1(cdup) needs to consume the same
+DUP@cdup. The share-by-reference writes cover this: DUP@cdup's
+fire writes v0_cdup to port_slot[0]=r0+i AND v1_cdup to
+port_slot[1]=r1+i. Both consumer slots updated.
+
+But if the DP1 consumer's slot was ALREADY reduced/mutated by
+then (e.g. its parent MUL@r1 was pushed through a trampoline
+frame that cached the old DP1 value before the write), the
+write is "too late" — the stale DP1 gets used.
+
+Or: the parent MUL@r0 and MUL@r1 fire at different trampoline
+moments. Whichever fires first triggers the cdup firing; the
+other sees a DUP@cdup=ERA when it tries to reduce its args.
+
+**Concrete probe for round 6**: add a log at DUP ⊳ ERA (the
+case where a DP fires on a DUP whose cell is already ERA). If
+b's chain hits DUP⊳ERA significantly more often than w's —
+that's the mechanism.
 
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.

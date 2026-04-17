@@ -463,8 +463,14 @@ era_continue:
                         } \
                     } \
                 } \
-                if (_s0 > 0 && _s0 < ctx->heap_pos) heap_set(ctx, _s0, _v0); \
-                if (_s1 > 0 && _s1 < ctx->heap_pos) heap_set(ctx, _s1, _v1); \
+                /* EXPERIMENT (THVM_DUP_FORCE_V0=1): write _v0 to BOTH */ \
+                /* port slots to test whether DP1-side projection is the */ \
+                /* diverging path for b's grad in twoparam_grad_loop. */ \
+                { Term _w0 = _v0, _w1 = _v1; \
+                  if (getenv("THVM_DUP_FORCE_V0") && getenv("THVM_DUP_FORCE_V0")[0] != '0') _w1 = _v0; \
+                  if (_s0 > 0 && _s0 < ctx->heap_pos) heap_set(ctx, _s0, _w0); \
+                  if (_s1 > 0 && _s1 < ctx->heap_pos) heap_set(ctx, _s1, _w1); \
+                } \
                 thvm_dup_ports_clear_entry(ctx, dup_loc); \
                 heap_set(ctx, dup_loc, term_era()); \
                 ctx->itrs++; \

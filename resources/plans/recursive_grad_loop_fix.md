@@ -468,9 +468,94 @@ that logs `(op, input_tids, output_tid, buf_id)` for the grad
 chain. If user can enable this trace and run twoparam_grad n=1,
 the log would reveal any buffer aliasing or early-ENSURE.
 
-Still stuck after 7 rounds. Moving from interaction-rule
-instrumentation to scheduler-side instrumentation is the
-obvious next step but requires broader tool changes.
+## ROUND 8 (2026-04-18): BUG FOUND — stale forward leaf in backward kernel
+
+User hint: "debugging wrong layer, did you verify fused kernels
+and codegen? cpu vs metal?" — this was the unlock.
+
+**CPU and Metal produce IDENTICAL 0.8× output.** So the bug is
+in the shared layer (scheduler/fuser), not in backend numerics.
+
+**Kernel diag (`THVM_LOOP_DIAG=1`) reveals the bug:**
+
+```
+Kernel for w (out=11, dispatched first):
+  op[0]=ADD a=0 b=3     -- ADD leaf[0] leaf[3] = w + b
+  leaf[0]=t1 v0=0.500   -- w (correct pre-update value)
+  leaf[3]=t2 v0=0.100   -- b (original)
+  ...
+  → SCHED_DISPATCH_DONE out0=0.780   -- w's update computed correctly
+
+Kernel for b (out=12, dispatched AFTER assign_w has blit t1):
+  op[0]=ADD a=3 b=0     -- same ADD, args swapped
+  leaf[0]=t2 v0=0.100   -- b
+  leaf[3]=t1 v0=0.780   ← *** W's POST-UPDATE VALUE, NOT 0.5! ***
+  ...
+  → SCHED_DISPATCH_DONE out0=0.324
+```
+
+**Root cause:** the backward kernel for b references `t1` as a
+leaf (the live w buffer). After `assign_w` fires and blits the
+computed update into `t1`, b's backward kernel dispatches and
+reads the mutated buffer instead of the pre-ASSIGN value.
+
+Numerical verification:
+```
+With w_post=0.78, b=0.1, target=2:
+  diff = 0.78 + 0.1 - 2 = -1.12
+  g = 2 * diff = -2.24
+  b_new = 0.1 - 0.1 * (-2.24) = 0.324
+```
+Exactly matches observed `b = [0.324, 0.968, -0.772]`.
+
+**Why scalar passes:** only one target; no second ASSIGN mutates a
+forward leaf between backward dispatches.
+
+**Why twoparam_sum passes:** `sum(w+b)` backward doesn't depend
+on forward tensor VALUES (gradient is uniform 1). Stale reads
+don't matter when the read data is unused.
+
+**Why noloop passes:** no in-place ASSIGN, so forward leaves
+never mutate.
+
+### The real fix direction
+
+The bug is in the shared scheduler/fuser, NOT in DUP/GRAD/KEEP
+interaction rules. Ruled-out hypotheses from rounds 1-7
+(term_clone, fresh labels, port_slot teardowns, FORCE_V0,
+DUP⊳ERA, heap mutation between hits) were all at the wrong
+layer.
+
+Fix options:
+
+1. **Snapshot forward activations before ASSIGN can mutate.**
+   In PyTorch terms: "saved tensors" in autograd. The backward
+   graph should reference materialised TEN intermediates, not
+   live input tensors. Would require changes to how grad
+   construction interacts with the scheduler.
+
+2. **Order ALL backward dispatches before ANY ASSIGN fires.**
+   Currently SEQ orders the lazy `assign_w` and `assign_b`
+   expressions, but evaluating `assign_w` triggers its own
+   backward dispatch first, then blits. If we could force "all
+   backwards, then all blits" ordering, the stale-read
+   disappears.
+
+3. **Copy-on-write ASSIGN buffers.** Expensive; defeats the
+   in-place semantics of ASSIGN.
+
+4. **Test-level workaround**: insert a DETACH or explicit
+   materialisation on each `g_var` so grads resolve to fresh
+   TENs before any ASSIGN executes.
+
+Option 2 is the most IC-aligned. Needs scheduler-level work.
+
+### Credit
+
+User's one-line hint ("check fused kernels and codegen, cpu vs
+metal?") unlocked 7 rounds of wrong-layer debugging. Moral:
+when stuck at one layer, verify the layer before climbing deeper
+into it.
 
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.

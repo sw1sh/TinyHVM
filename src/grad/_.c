@@ -59,6 +59,36 @@ static void thvm_probe_print_ten(TinyHVM *ctx, Term t, const char *label) {
     fprintf(stderr, " %s=t%u[%.4f,%.4f,%.4f]", label, tid, v[0], v[1], v[2]);
 }
 
+// Heavy probe: clone the term and thvm_reduce the clone. Returns the
+// reduced Term. The clone's fresh heap cells absorb the mutation; the
+// original heap state is unaffected (apart from heap growth from the
+// clone itself — call only from `THVM_BUNDLE_PROBE=1` gated sites).
+static Term thvm_probe_reduce_clone(TinyHVM *ctx, Term t) {
+    Term cloned = term_clone(ctx, t);
+    return thvm_reduce(ctx, cloned);
+}
+
+static void thvm_probe_print_clone_reduce(TinyHVM *ctx, Term t, const char *label) {
+    Term r = thvm_probe_reduce_clone(ctx, t);
+    u8 tag = term_tag(r);
+    if (tag == TAG_TEN) {
+        u32 tid = (u32)term_val(r);
+        u32 dt = DTYPE_F32;
+        Shape sh = SHAPE(1);
+        f32 *v = (f32 *)thvm_to_host_raw(ctx, r, &dt, &sh);
+        if (!v) { fprintf(stderr, " %s~=t%u<?>", label, tid); return; }
+        fprintf(stderr, " %s~=t%u[%.4f,%.4f,%.4f]", label, tid, v[0], v[1], v[2]);
+    } else {
+        fprintf(stderr, " %s~=%u/%u@%llu", label, (u32)tag, (u32)term_ext(r),
+                (unsigned long long)term_val(r));
+    }
+}
+
+static inline int thvm_bundle_probe_enabled(void) {
+    const char *e = getenv("THVM_BUNDLE_PROBE");
+    return e && e[0] && e[0] != '0';
+}
+
 typedef struct {
     Term term;
     u32  tid;
@@ -800,6 +830,8 @@ void thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad) {
                     (u32)term_tag(grad), (u32)term_ext(grad),
                     (unsigned long long)term_val(grad));
             thvm_probe_print_ten(ctx, grad, "probe");
+            if (thvm_bundle_probe_enabled())
+                thvm_probe_print_clone_reduce(ctx, grad, "grad");
             fputc('\n', stderr);
         }
         heap_set(ctx, dst_slot, stored);
@@ -821,6 +853,10 @@ void thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad) {
                 (unsigned long long)term_val(grad));
         thvm_probe_print_ten(ctx, prev, "prev_v");
         thvm_probe_print_ten(ctx, grad, "grad_v");
+        if (thvm_bundle_probe_enabled()) {
+            thvm_probe_print_clone_reduce(ctx, prev, "prev");
+            thvm_probe_print_clone_reduce(ctx, grad, "grad");
+        }
         fputc('\n', stderr);
     }
     heap_set(ctx, dst_slot, thvm_op_raw(ctx, UOP_ADD, prev, stored));

@@ -215,17 +215,32 @@ DP its own cell.
 - Pre-reducing grad to WNF before clone: **flips** the bug —
   b becomes exact but w becomes zero. Order-dependent.
 
-### Next diagnostic
+### Clone+reduce probe tried (2026-04-18) — reveals chain isn't self-contained
 
-Instrument the actual *tensor values* of b's two contributions
-at deposit time. If each is g/2 (correct per-branch), b's sum
-should be g. If each is 0.4g, something's halving. If one is g
-and the other is -0.2g (negative), something is subtracting.
-Knowing the per-contribution values will reveal whether the bug
-is in a specific backward rule or in the accumulator itself.
+Added `THVM_BUNDLE_PROBE=1` heavy probe: clones the grad term and
+calls `thvm_reduce` on the clone, then prints the reduced Term.
 
-Currently stuck on the mechanism — need deeper instrumentation
-(live tensor value probing mid-reduction) to make further progress.
+**Finding:** at `BUNDLE_ACCUM` time, the cloned grad reduces only
+to a `TAG_TOP/UOP_MUL` (tag 11, ext 10) — stops at an unresolved
+MUL. The grad chain **is not self-contained**: it depends on
+ambient heap state (forward tensors, scheduled kernel outputs)
+that the clone has no access to. Cannot probe contribution
+values via clone+reduce during mid-reduction.
+
+### Next diagnostic — probe at MAT-CTR destructuring
+
+The right probe site is where the bundle is consumed:
+`APP-MAT-CTR` in `src/interact/combinators.c` (line 141-156).
+At that moment the CTR's children are about to be bound to the
+lambda variables in the test's `λgw. λgb. body`. The children
+must be WNF (MAT requires it), so they're either TEN or something
+the scheduler chose to defer. Print each child's term; if TEN,
+print values. This will show whether both bundle slots hold
+the numerically-correct value, at the last point before they're
+consumed.
+
+Currently stuck on the mechanism — probe-at-MAT-CTR is the next
+concrete step.
 
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.

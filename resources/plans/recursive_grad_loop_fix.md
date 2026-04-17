@@ -557,6 +557,73 @@ metal?") unlocked 7 rounds of wrong-layer debugging. Moral:
 when stuck at one layer, verify the layer before climbing deeper
 into it.
 
+## ROUND 9 (2026-04-18): diagnosis CONFIRMED, fix attempts failed
+
+**Confirmation experiment**: flip `SEQ(assign_w, ...) → SEQ(assign_b, ...)` —
+fire b's ASSIGN first. Result: **w becomes 0.8×, b becomes exact**.
+Exactly the mirror predicted by the stale-read hypothesis.
+With b_post=0.38, w=0.5, target=2: diff=-1.12, g=-2.24,
+w_new=0.5+0.224=0.724 ✓ matches observed w. Diagnosis locked in.
+
+### Failed fix attempts this round
+
+1. **SEQ update_w and update_b before the assigns**:
+   ```c
+   seq_body = SEQ(update_w, SEQ(update_b, SEQ(assign_w, SEQ(assign_b, rec))))
+   ```
+   No effect — b still 0.8×. Root cause: IC reducer reduces
+   the Term once (to TEN) but doesn't cache the TEN back at
+   the original Term's heap location. The subsequent
+   `assign_w` reading `update_w` re-traverses the SUB chain
+   and re-reads the live forward tensors.
+
+2. **DETACH(update_w) and DETACH(update_b)**:
+   ```c
+   update_w = DETACH(SUB(w_sgd, MUL(lr_w, gw_var)));
+   update_b = DETACH(SUB(b_sgd, MUL(lr_b, gb_var)));
+   ```
+   w's ASSIGN fires correctly with the DETACHed TEN. But
+   **b's ASSIGN doesn't fire at all** — final_b stays at its
+   initial value. DETACH on the src term appears to break the
+   ASSIGN chain when combined with the MAT-bound gb_var. The
+   ASSIGN's dst (b_assign, a DP projection) doesn't resolve in
+   time.
+
+### Real mechanism
+
+IC semantics: a Term is a REFERENCE (tag+loc). Reducing a Term
+walks its heap content and computes a value. The VALUE is
+returned to the caller, but the original heap content at the
+Term's location is typically NOT overwritten with the reduced
+value. So repeated reductions of the same Term re-compute.
+
+For ASSIGN with in-place mutation of forward inputs:
+- 1st ASSIGN reduces its src → walks forward chain → reads t1, t2 → computes → blits new w into t1.
+- 2nd ASSIGN reduces its src → walks forward chain → re-reads t1 (now mutated) → computes with stale t1.
+
+The fix must either:
+(A) Cache the src TEN at the Term's heap location so second-read gets TEN directly (no re-traversal).
+(B) Dispatch both srcs in one atomic pass, then both blits.
+(C) Block ASSIGN's blit until all live backward dependencies on its dst have completed.
+
+### Next round direction
+
+(C) is the IC-natural fix — an ASSIGN dependency tracker. An
+ASSIGN's dst blit should be deferred until no other live
+computation references that dst's tid as a forward input. This
+is analogous to a write-fence in concurrency terms.
+
+Concretely: the scheduler maintains a refcount of "backward
+readers" per tensor id. thvm_grad_multi_keep increments
+the refcount on each param for the duration of the backward
+dispatch window. ASSIGN fires its blit only when the refcount
+drops to zero. With both w and b's backward sharing the
+window, both backwards complete before either blit fires.
+
+Next round: look at where the scheduler assigns kernel leaves
+(fuse_build_kernel) and identify the right hook point for a
+write-fence.
+
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.
 Investigate only after twoparam is closed.

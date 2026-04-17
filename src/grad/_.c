@@ -830,6 +830,18 @@ void thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad) {
                     (u32)term_tag(grad), (u32)term_ext(grad),
                     (unsigned long long)term_val(grad));
             thvm_probe_print_ten(ctx, grad, "probe");
+            /* Show heap[grad.val] — the DUP cell's current val — so we can
+             * tell if it changes between w's hit and b's hit. */
+            if (term_tag(grad) == TAG_DP0 || term_tag(grad) == TAG_DP1) {
+                u64 dl = term_val(grad);
+                if (dl > 0 && dl < ctx->heap_pos) {
+                    Term dv = heap_read(ctx, dl);
+                    fprintf(stderr, " heap[%llu]=%u/%u@%llu",
+                            (unsigned long long)dl,
+                            (u32)term_tag(dv), (u32)term_ext(dv),
+                            (unsigned long long)term_val(dv));
+                }
+            }
             if (thvm_bundle_probe_enabled())
                 thvm_probe_print_clone_reduce(ctx, grad, "grad");
             fputc('\n', stderr);

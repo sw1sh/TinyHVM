@@ -356,28 +356,85 @@ tests the hypothesis "DP1-side commute is the diverging path".
    scalar backward chain). Forcing v0 on DP1 consumers in
    scalar corrupts its normally-correct grad.
 
-### Hypothesis for round 6 — cdup timing matters
+### Round 6 (2026-04-18): DUP⊳ERA hypothesis also FALSIFIED
 
-Commute produces cdups that are shared between n0 and n1.
-When n0's DP0(cdup) fires, DUP@cdup is consumed (heap[cdup] =
-ERA after fire). But n1's DP1(cdup) needs to consume the same
-DUP@cdup. The share-by-reference writes cover this: DUP@cdup's
-fire writes v0_cdup to port_slot[0]=r0+i AND v1_cdup to
-port_slot[1]=r1+i. Both consumer slots updated.
+Added `DUP_ON_ERA` log for the TAG_ERA branch of the DUP rule.
 
-But if the DP1 consumer's slot was ALREADY reduced/mutated by
-then (e.g. its parent MUL@r1 was pushed through a trampoline
-frame that cached the old DP1 value before the write), the
-write is "too late" — the stale DP1 gets used.
+**Result**: 0 `DUP_ON_ERA` events across all three tests at
+n=1. No DP ever fires on a pre-erased DUP cell. cdup-timing-ERA
+hypothesis is wrong.
 
-Or: the parent MUL@r0 and MUL@r1 fire at different trampoline
-moments. Whichever fires first triggers the cdup firing; the
-other sees a DUP@cdup=ERA when it tries to reduce its args.
+Also added a `heap[grad.val]` probe at bundle_accum_store:
 
-**Concrete probe for round 6**: add a log at DUP ⊳ ERA (the
-case where a DP fires on a DUP whose cell is already ERA). If
-b's chain hits DUP⊳ERA significantly more often than w's —
-that's the mechanism.
+```
+BUNDLE_ACCUM_STORE loc=210 idx=0 src=4/0@209 heap[209]=4/0@192
+BUNDLE_ACCUM_STORE loc=212 idx=1 src=5/0@209 heap[209]=4/0@192
+```
+
+`heap[209]` is IDENTICAL at both w's and b's deposit times
+(DP0(192) both times). So both `term_clone` calls clone the
+same source structure. The clones themselves end up with
+structurally-equivalent inner chains (confirmed round 2).
+
+## STUCK — proposing bisection that needs user input
+
+After 6 rounds, ruled out:
+
+- `term_clone` (not the cause)
+- Fresh BG DUP labels (no effect)
+- Port_slot teardowns via side-effect writes (0 events)
+- DP0/DP1 interchangeability via `FORCE_V0` (breaks scalar, doesn't fix b)
+- `DUP ⊳ ERA` cascades (0 events)
+- `heap[gy_dup]` mutation between w and b hits (unchanged)
+
+Confirmed bug locus:
+- Only manifests when **all three** of the following hold:
+  recursion, multi-target GRAD, and MUL(diff, diff) backward (BG rule).
+- Dropping any one of these three makes the test pass.
+
+Confirmed bug signature:
+- b's gradient is uniformly 0.8× expected (ratios identical
+  across all 3 positions).
+- Swapping params = [b, w] in `multi_keep` keeps b at 0.8×
+  (attached to b's tensor, not slot position).
+- Pre-reducing grad in bundle_accum_store flips it: b becomes
+  exact, w becomes zero. Suggests order-dependent interaction
+  between the two deposits' reductions.
+
+### Proposals requiring user input
+
+1. **Re-examine the MUL `BG` rule's GRAD_SPLIT_AT + `_bt_dup` double
+   duplication.** This is the only structural thing that appears only
+   in the MUL case. Specifically: when `at == bt` (same tensor, as in
+   `MUL(diff, diff)`), the two DUPs have REDUNDANT purpose — each
+   duplicates `diff` on its own. The grad chain then has 4 DP tokens
+   all pointing at `diff`'s materialised TEN (via separate DUP cells).
+   Share-by-reference should make them all equivalent, but in the
+   recursive case the ALO/book realization may create non-symmetric
+   clone structures where one of those 4 tokens resolves differently.
+
+   User could bisect by rewriting MUL's `BG` as a single-DUP rule
+   specialised for `at==bt` — avoid creating `_bt_dup` entirely when
+   the same tensor is on both sides.
+
+2. **Compare MM(x, w) backward vs MUL(diff, diff) backward** in the
+   loop. Both use `BG`, both duplicate both args. But matmul
+   (`test_tiny_linear_sgd_loop`) is ~4× wrong, not 0.8×. If user sees
+   MM misbehaving differently, that narrows the issue further (or
+   confirms it's all one rule).
+
+3. **Try without the fresh-DUP-wrap ALO fix**. The plan marked this
+   as "verified correct", but our bug may be specific to a race
+   between ALO fresh-DUP-wrap and multi-target backward. Test:
+   temporarily remove the fresh-DUP-wrap and run scalar n=1 +
+   twoparam_grad n=1. Expected: scalar n=1 fails (that was the
+   reason we landed the wrap). But if twoparam_grad's b gradient
+   improves, it's evidence that the wrap's handling of multi-consumer
+   ALOs is creating the asymmetry.
+
+Currently stuck without user guidance on which of these three
+directions to pursue; each is a non-trivial change touching
+code currently "verified correct" in the plan.
 
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.

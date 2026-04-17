@@ -560,7 +560,15 @@ era_continue:
 
             // DUP ⊳ atoms: copy (both projections get same value)
             if (term_tag(val) == TAG_TEN) DUP_STATE_RETURN(val, val, val);
-            if (term_tag(val) == TAG_ERA) DUP_STATE_RETURN(val, val, val);
+            if (term_tag(val) == TAG_ERA) {
+                if (thvm_dup_diag_enabled()) {
+                    fprintf(stderr,
+                            "DUP_ON_ERA dup=%llu lab=%u fire=DP%u val_era=%llu [cell was erased by prior fire]\n",
+                            (unsigned long long)dup_loc, dup_label, dp_index,
+                            (unsigned long long)term_val(val));
+                }
+                DUP_STATE_RETURN(val, val, val);
+            }
             if (term_tag(val) == TAG_NUM) DUP_STATE_RETURN(val, val, val);
             if (term_tag(val) == TAG_ANY) DUP_STATE_RETURN(val, val, val);
             if (term_tag(val) == TAG_CTR) DUP_STATE_RETURN(val, val, val);

@@ -854,7 +854,15 @@ void thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad) {
         return;
     }
     if (term_tag(grad) == TAG_NUM && term_as_f32(grad) == 0.0f) return;
-    Term stored = term_clone(ctx, grad);
+    // Store grad by reference — see the STORE path comment above: cloning
+    // reads heap cells that may already be ERA (DUP backing cells whose
+    // firings wrote both port slots during forward, leaving old_loc=ERA).
+    // A cloned DP0/DP1 with ERA-backing reduces to ERA, ADD⊳ERA drops
+    // that arm, and only the first ACCUM'd grad survives — observed as
+    // MNIST linear W freezing while B trains. No aliasing issue: grad was
+    // just emitted by GRAD_RETURN which cleared its source slot, and prev
+    // already lives at dst_slot — each has its own live subgraph.
+    Term stored = grad;
     if (thvm_loop_diag_enabled()) {
         fprintf(stderr,
                 "BUNDLE_ACCUM_ADD loc=%llu idx=%u dst_slot=%llu "

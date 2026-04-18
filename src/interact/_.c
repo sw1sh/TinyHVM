@@ -145,6 +145,8 @@ static int thvm_fuse_child_is_compute_like(Term child) {
     return thvm_kernel_compute_uop(term_ext(child));
 }
 
+static void fuse_wrap_memo_reset(void) { (void)0; }
+
 static Term thvm_fuse_wrap_child(TinyHVM *ctx, Term child) {
     if (!ctx || !thvm_fuse_child_is_compute_like(child)) return child;
     u64 floc = heap_alloc(ctx, 1);

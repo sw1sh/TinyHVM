@@ -307,6 +307,31 @@
 	                      GRAD_RESOLVE_ALIAS(_bt);
 	                      if (term_tag(_bt)==TAG_TEN) b_shape=ctx->tensors[(u32)term_val(_bt)].view.shape;
 	                      else if (term_tag(_bt)==TAG_TOP) { const View *bv=st_get(term_val(_bt)); if(bv) b_shape=bv->shape; } }
+	                    /* LINEAR IR: consume y_loc's arg cells now. The grad
+	                     * rule is the sole consumer of y's args. Leaving DP
+	                     * refs in y_loc+0/+1 creates non-linear placements
+	                     * when subsequent rule construction (GRAD2_H,
+	                     * GRAD_SPLIT_AT, thvm_op_raw) stores at/bt in new
+	                     * heap cells. Clearing here removes y_loc's
+	                     * tracking slot for any DP, so downstream placements
+	                     * are the sole holders. Values stay in local
+	                     * variables at/bt so grad formulas can still use
+	                     * them. Gated on THVM_GRAD_LINEAR_IR. */
+	                    if (getenv("THVM_GRAD_LINEAR_IR")) {
+	                        u8 _lia = term_tag(at);
+	                        u8 _lib = term_tag(bt);
+	                        u8 _ligy = term_tag(gy);
+	                        if (getenv("LINEAR_IR_TRACE"))
+	                            fprintf(stderr, "LIN_IR y=%u/%u@%llu at_tag=%u bt_tag=%u gy_tag=%u\n",
+	                                (u32)term_tag(y), (u32)term_ext(y), (unsigned long long)y_loc,
+	                                _lia, _lib, _ligy);
+	                        if (_lia == TAG_DP0 || _lia == TAG_DP1)
+	                            heap_set(ctx, y_loc, term_era());
+	                        if (_lib == TAG_DP0 || _lib == TAG_DP1)
+	                            heap_set(ctx, y_loc + 1, term_era());
+	                        if (_ligy == TAG_DP0 || _ligy == TAG_DP1)
+	                            heap_set(ctx, loc + 1, term_era());
+	                    }
                     // Recover y_shape from operands when the TOP node lost its
                     // View tracker (e.g., ALO realize copied LAM body without
                     // tracker). For elementwise ops the output shape is the

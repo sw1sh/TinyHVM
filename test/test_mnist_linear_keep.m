@@ -40,7 +40,7 @@ int main(int argc, char **argv) {
     double t0 = now_s();
     u32 step = 0;
 
-    for (u32 ep = 0; ep < 1; ep++) {
+    for (u32 ep = 0; ep < 3; ep++) {
         f32 lr = 0.1f * powf(0.7f, (f32)ep);
         for (u32 bi = 0; bi < nb; bi++) {
           @autoreleasepool {
@@ -105,6 +105,17 @@ int main(int argc, char **argv) {
                 u32 pid = (u32)term_val(p);
                 if (ctx->tensors[pid].host_ptr) { free(ctx->tensors[pid].host_ptr); ctx->tensors[pid].host_ptr = NULL; }
                 if (p == B) break;
+            }
+            if (getenv("MNK_TRACE") && (step < 5 || step == 50 || step == 100 || step == 233)) {
+                u32 wid = (u32)term_val(W);
+                u32 bid = (u32)term_val(B);
+                TensorMeta *mW = &ctx->tensors[wid];
+                TensorMeta *mB = &ctx->tensors[bid];
+                f32 wbuf[6], bbuf[10];
+                if (mW->backend && mW->buf_id) mW->backend->buf_read(mW->buf_id, wbuf, sizeof(wbuf));
+                if (mB->backend && mB->buf_id) mB->backend->buf_read(mB->buf_id, bbuf, sizeof(bbuf));
+                fprintf(stderr, "  step %u W[0..2]=%.9f,%.9f,%.9f B[0..2]=%.9f,%.9f,%.9f\n",
+                    step, wbuf[0], wbuf[1], wbuf[2], bbuf[0], bbuf[1], bbuf[2]);
             }
             thvm_reset(ctx, nw);
             step++;

@@ -257,9 +257,17 @@ static int fuse_leaf_reshape_target(Shape op_shape, Shape rs_shape,
 // Returns WALK_LEAF_BASE + leaf_idx for leaves,
 //         WALK_LEAF_BASE*2 + op_idx for ops, or -1 on failure.
 
+/* Recursion depth guard (thread-local). Under transparent DP, recursive
+ * train loops can create structures where walk reaches the same shared
+ * body cyclically before the refcount-cleanup collects it. 256 is well
+ * above any realistic non-cyclic grad chain. */
+static __thread int _fuse_walk_depth = 0;
+
 static int fuse_walk_inner(TinyHVM *ctx, Term t,
                            FusedOp *ops, u32 *n_ops,
                            u32 *leaf_ids, const View **leaf_views, u32 *n_leaves) {
+    if (_fuse_walk_depth >= 256) return -1;
+    _fuse_walk_depth++;
     if (getenv("THVM_SCHED_DIAG") && term_tag(t) == TAG_TOP)
         fprintf(stderr, "  fuse_walk: %s@%llu bidx=%d\n",
                 term_ext(t) < UOP_COUNT ? uop_names[term_ext(t)] : "?",
@@ -1043,7 +1051,9 @@ int fuse_build_kernel(TinyHVM *ctx, Term t, KernelEntry *ke) {
     _fuse_absorbed_reduce = term_era();
     FusedOp ops[FUSE_MAX_OPS]; u32 n_ops = 0;
     u32 leaf_ids[FUSE_MAX_LEAVES]; const View *leaf_views_p[FUSE_MAX_LEAVES]; u32 n_leaves = 0;
+    _fuse_walk_depth = 0;  // reset guard before entering the walk
     int walk_result = fuse_walk_inner(ctx, ew_root, ops, &n_ops, leaf_ids, leaf_views_p, &n_leaves);
+    _fuse_walk_depth = 0;  // reset after (balances depth on any early return)
     if (walk_result < 0) { _fuse_can_absorb_reduce = 0; ke->fail_code = 1; return 0; }
     fuse_remap(ops, n_ops, n_leaves);
     // If a reduce was absorbed during the walk, record it + mark absorbed

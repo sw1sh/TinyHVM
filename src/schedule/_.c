@@ -2610,6 +2610,13 @@ static Term thvm_eval_internal(TinyHVM *ctx, Term t, int pre_reduce_phase) {
             if (ctx->backends[bi] && ctx->backends[bi]->pool_set_persistent)
                 ctx->backends[bi]->pool_set_persistent(max_pb);
     }
+    /* Followup-round loop: the tail call at the end of this function
+     * used to recurse when progress + followup_round — with recursive
+     * train loops under transparent-DP that chain can grow unbounded
+     * and blow the C stack. Loop here instead. Cap iterations to guard
+     * against pathological infinite progress. */
+    for (u32 _followup_iter = 0; _followup_iter < 1024; _followup_iter++) {
+        eval_itrs_start = ctx->itrs;
     if (pre_reduce_phase)
         t = thvm_reduce(ctx, t);
     Term round_start = t;
@@ -2809,10 +2816,16 @@ static Term thvm_eval_internal(TinyHVM *ctx, Term t, int pre_reduce_phase) {
     }
     if (round_progressed && followup_round) {
         sched_planner_release_detached_slots();
-        ctx->eval_depth--;
-        return thvm_eval_internal(ctx, t, 1);
+        pre_reduce_phase = 1;
+        continue;  // loop back to the start of the followup-round loop
     }
     sched_planner_release_detached_slots();
+    ctx->eval_depth--;
+    return t;
+    }  // end followup-round loop
+    /* Hit the 1024 iteration cap — something is looping indefinitely.
+     * Return whatever we have; the caller will see a non-TEN term and
+     * can decide how to handle it. */
     ctx->eval_depth--;
     return t;
 }

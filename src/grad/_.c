@@ -814,11 +814,15 @@ void thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad) {
         ? (term_tag(heap_read(ctx, app_loc + 1)) == TAG_CTR ? (loc + index) : (loc + 1))
         : (loc + index);
     if (term_tag(prev) == TAG_NUM && term_as_f32(prev) == 0.0f) {
-        // Keep mode should preserve the backward branch in the bundle even if
-        // the reducer continues cleaning up the original path after the
-        // GRAD/TEN hit. Clone the branch into the bundle so later erasure on
-        // the source path cannot mutate the kept result.
-        Term stored = term_clone(ctx, grad);
+        // Keep mode: move the gy subterm into the bundle by reference.
+        // GRAD_RETURN clears loc+1 to ERA but doesn't cascade into the
+        // gy tree — no heap slot except the bundle's dst_slot points at
+        // it, so the structure stays valid as long as the bundle holds
+        // it. Avoiding term_clone here removes a parallel copy of the
+        // gy DUP/EXPAND/MUL chain that was leaving orphan DP ports on
+        // the original side (the cloned consumer replaced the bundle's
+        // expected consumer, so the original DUP saw one side go dead).
+        Term stored = grad;
         if (thvm_loop_diag_enabled()) {
             fprintf(stderr,
                     "BUNDLE_ACCUM_STORE loc=%llu idx=%u dst_slot=%llu "

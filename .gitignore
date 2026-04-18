@@ -63,3 +63,4 @@ thvm_steps/
 wl/LibraryResources/MacOSX-ARM64/TinyHVM.dylib
 wl/LibraryResources/MacOSX-ARM64/TinyHVM.dylib.*
 bench/
+.claude/scheduled_tasks.lock

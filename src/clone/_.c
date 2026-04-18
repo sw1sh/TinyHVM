@@ -262,8 +262,16 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
                 heap_set(ctx, new_loc + i,
                          term_clone_r(ctx, heap_read(ctx, old_loc + i),
                                       relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
-            const View *vv = st_get(old_loc);
-            if (vv) st_set(new_loc, vv);
+            /* Copy the full ShapeTracker, not just the last view.
+             * Composed view chains (e.g. reshape(expand(x))) need 2+ views
+             * to index correctly; st_get/st_set would flatten to the output
+             * shape only, and the scheduler would later emit strides that
+             * read the wrong buffer positions. Observed break: the matmul
+             * decomposition's backward chain (reshape→expand→mul→sum→reshape)
+             * produces uniform-per-row gradients because the EXPAND's
+             * stride-0 on broadcast dims gets lost across the clone. */
+            const ShapeTracker *ast = st_get_tracker(old_loc);
+            if (ast) st_set_tracker(new_loc, ast);
             if (uop == UOP_GRAD) {
                 Term gx = term_clone_r(ctx, thvm_grad_target_get(ctx, old_loc),
                                        relocs, n_relocs, lmap, n_labels, tmap, n_tmap);

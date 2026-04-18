@@ -416,6 +416,12 @@
 	                        GRAD_RETURN(_u); \
 	                    } while(0)
 
+	                    if (getenv("THVM_SCHED_DIAG")) {
+	                        static int _mt=0; _mt++;
+	                        if (_mt<=10) fprintf(stderr, "  GRAD_MUL_TAGS[%d]: at.tag=%u at.ext=%u at.val=%llu bt.tag=%u bt.ext=%u bt.val=%llu (cop=%u)\n",
+	                            _mt, (u32)term_tag(at), (u32)term_ext(at), (unsigned long long)term_val(at),
+	                                 (u32)term_tag(bt), (u32)term_ext(bt), (unsigned long long)term_val(bt), cop);
+	                    }
 	                    switch (cop) {
 	                        case UOP_ADD: BG_GY(sum_to_shape(ctx,gy,y_shape,a_shape), sum_to_shape(ctx,gy,y_shape,b_shape));
 	                        case UOP_SUB: BG_GY(sum_to_shape(ctx,gy,y_shape,a_shape), thvm_op_raw(ctx,UOP_NEG,sum_to_shape(ctx,gy,y_shape,b_shape),term_era()));

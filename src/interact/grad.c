@@ -100,9 +100,13 @@
                         Term _ga_keep = (a_); \
                         Term _gb_keep = (b_); \
                         Term _gr_keep; \
-                        if (term_tag(_ga_keep) == TAG_ERA && term_val(_ga_keep) == 0) { \
+                        int _ga_zero = (term_tag(_ga_keep) == TAG_ERA && term_val(_ga_keep) == 0) || \
+                                       (term_tag(_ga_keep) == TAG_NUM && term_val(_ga_keep) == 0); \
+                        int _gb_zero = (term_tag(_gb_keep) == TAG_ERA && term_val(_gb_keep) == 0) || \
+                                       (term_tag(_gb_keep) == TAG_NUM && term_val(_gb_keep) == 0); \
+                        if (_ga_zero) { \
                             _gr_keep = _gb_keep; \
-                        } else if (term_tag(_gb_keep) == TAG_ERA && term_val(_gb_keep) == 0) { \
+                        } else if (_gb_zero) { \
                             _gr_keep = _ga_keep; \
                         } else { \
                             _gr_keep = thvm_app(ctx, _ga_keep, _gb_keep); \

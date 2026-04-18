@@ -405,8 +405,8 @@ static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 de
             heap_set(ctx, nloc + 1, b);
             *out = term_new(TAG_TOP, uop, nloc);
             {
-                const View *sv = st_get(loc);
-                if (sv) st_set(nloc, sv);
+                const ShapeTracker *ast = st_get_tracker(loc);
+                if (ast) st_set_tracker(nloc, ast);
             }
             return 1;
         }
@@ -435,8 +435,8 @@ static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 de
             if (!unary) heap_set(ctx, nloc + 1, b);
             *out = term_new(TAG_TOP, uop, nloc);
             {
-                const View *sv = st_get(loc);
-                if (sv) st_set(nloc, sv);
+                const ShapeTracker *ast = st_get_tracker(loc);
+                if (ast) st_set_tracker(nloc, ast);
             }
             return 1;
         }

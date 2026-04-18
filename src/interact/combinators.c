@@ -166,22 +166,17 @@
                      * trivial EXPAND(scalar) (e.g. sum(w+b) gradient)
                      * never get picked up by the scheduler's global
                      * pass, so deferring on them would livelock. */
-                    if (match_tag == ctr_tag) {
-                        u64 ctr_loc = term_val(arg);
-                        for (u32 i = 0; i < ctr_tag; i++) {
-                            Term child = heap_read(ctx, ctr_loc + i);
-                            if (term_tag(child) != TAG_TOP) continue;
-                            u32 cuop = term_ext(child);
-                            int safe_to_bind =
-                                (cuop == UOP_FUSE ||
-                                 cuop == UOP_RESHAPE ||
-                                 cuop == UOP_PERMUTE ||
-                                 cuop == UOP_EXPAND ||
-                                 cuop == UOP_SHRINK ||
-                                 cuop == UOP_PAD);
-                            if (!safe_to_bind) return t;
-                        }
-                    }
+                    /* Previously this deferred when CTR children were
+                     * unreduced compute TOPs (ADD/MUL/etc.), waiting
+                     * for the scheduler to materialize them to TENs
+                     * first. Under the transparent-DP-projection rule
+                     * for atom-shared DUP⊳TOP, scheduler can't build
+                     * kernels for backward chains that contain VARs
+                     * bound by this very MAT-CTR — creating a
+                     * deadlock. Bind eagerly: the LAM body can use
+                     * compute TOP children just fine; they'll reduce
+                     * when consumed. */
+                    (void)match_tag; (void)ctr_tag;
                     ctx->itrs++;
                     if (thvm_loop_diag_enabled()) {
                         u64 ctr_loc_dbg = term_val(arg);
@@ -480,6 +475,27 @@ era_continue:
             u64 dup_loc = term_val(t);
             Term val = heap_read(ctx, dup_loc); // WNF from trampoline
             heap_set(ctx, dup_loc, val);
+            /* DP as transparent projection for pure compute TOPs: don't
+             * fire DUP eagerly. Return body directly as the reduced
+             * value. The DUP node stays intact with port tracking
+             * intact so:
+             *  - ERA on one projection → existing ERA⊳DP collapse rule
+             *    correctly transfers body to the other port (refcount
+             *    semantics via port_count).
+             *  - Multiple reads through DP each return body without
+             *    consuming the DUP.
+             *  - Backward GRAD walks resolve through DP to the shared
+             *    body without destroying structure.
+             * Effectful and LAM/BRI/SUP bodies still follow the full
+             * commute/annihilate path below. */
+            if (term_tag(val) == TAG_TOP) {
+                u32 _vuop = term_ext(val);
+                if (_vuop != UOP_DETACH && _vuop != UOP_ASSIGN &&
+                    _vuop != UOP_KERNEL && _vuop != UOP_EXEC &&
+                    _vuop != UOP_GRAD) {
+                    RETURN_REDUCED(val);
+                }
+            }
             #define DUP_STATE_RETURN(_src, _dp0v, _dp1v) do { \
                 Term _v0 = (_dp0v); \
                 Term _v1 = (_dp1v); \
@@ -544,7 +560,10 @@ era_continue:
                   if (_s1 > 0 && _s1 < ctx->heap_pos) heap_set(ctx, _s1, _w1); \
                 } \
                 thvm_dup_ports_clear_entry(ctx, dup_loc); \
-                heap_set(ctx, dup_loc, term_era()); \
+                /* EXPERIMENT: never clear body. Let DUP fire be purely \
+                 * about distribution — body stays as a memoized shared \
+                 * reference forever. Re-fires and backward walks read \
+                 * the same preserved body. */ \
                 ctx->itrs++; \
                 RETURN_REDUCED(dp_index == 0 ? _v0 : _v1); \
             } while (0)
@@ -630,8 +649,14 @@ era_continue:
                 DUP_STATE_RETURN(val, a0, a1);
             }
 
-            // DUP ⊳ atoms: copy (both projections get same value)
-            if (term_tag(val) == TAG_TEN) DUP_STATE_RETURN(val, val, val);
+            // DUP ⊳ atoms: copy (both projections get same value).
+            // For TEN: duplicate tensor reference — both DP projections alias
+            // the same tensor_id. Bump tensor refcount so that an ERA on one
+            // branch doesn't tensor_release the still-live other branch.
+            if (term_tag(val) == TAG_TEN) {
+                tensor_incref(ctx, (u32)term_val(val));
+                DUP_STATE_RETURN(val, val, val);
+            }
             if (term_tag(val) == TAG_ERA) {
                 if (thvm_dup_diag_enabled()) {
                     fprintf(stderr,
@@ -645,6 +670,9 @@ era_continue:
             if (term_tag(val) == TAG_ANY) DUP_STATE_RETURN(val, val, val);
             if (term_tag(val) == TAG_CTR) DUP_STATE_RETURN(val, val, val);
 	            // DUP ⊳ TOP: commute by duplicating the node and splitting children.
+	            // Note: pure compute TOPs are handled earlier as transparent DP
+	            // projection (body returned without firing DUP). This branch
+	            // only runs for effectful TOPs (ASSIGN/KERNEL/EXEC/DETACH/GRAD).
 	            if (term_tag(val) == TAG_TOP) {
 	                u32 uop = term_ext(val);
                     if (uop == UOP_DETACH) {

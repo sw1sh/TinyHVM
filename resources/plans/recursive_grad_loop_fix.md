@@ -1132,3 +1132,37 @@ should stop; next step requires user direction.
 For matmul (`test_tiny_linear_sgd_loop`) W[0,0] is ~4x expected at
 step 1 — separate deeper issue involving MM backward in the loop.
 Investigate only after twoparam is closed.
+
+---
+
+## Cron cycle: BG MUL bt-force reveals mechanism (2026-04-18)
+
+Minimal repro: `test_dupmul_in_ref_grad_outside.m` — MUL of SUM-outputs
+inside REF body, grad outside, produces `gw = [0.8, 0.8, 0.8, 0.8]`
+uniform-per-row instead of per-element `[0.8, -1.6, 2.4, 3.2]`.
+
+**Critical experiment**: in `src/interact/grad.c` BG macro, added
+`if (term_tag(bt) == TAG_ALO) bt = thvm_force_tensor_term(ctx, bt);`
+before the DUP-wrap of bt. Result: `gw = [0.4, -0.8, 1.2, 1.6]` —
+per-element CORRECT but exactly HALF magnitude.
+
+**What this proves**:
+- Each BG MUL arm (a-arm computing `MUL(gy, bt)`, b-arm computing
+  `MUL(gy, at)`) was contributing `0.4 * uniform_broadcast` to the
+  final gradient. Sum = `0.8 * uniform`. Matches observed failure.
+- Forcing bt fixed the a-arm (correct per-element 0.4) but killed
+  the b-arm by making its recursive GRAD walk terminate at a
+  non-requires_grad TEN leaf (returns 0).
+- Root cause pinpointed: when `bt` stays TAG_ALO, the symbolic
+  `MUL(gy, bt_alo)` term evaluates wrong — reads bt as the `[0,0]`
+  scalar broadcast instead of the per-element `[1,4]` tensor.
+
+**Fix direction**: split bt usage. a-arm needs bt's VALUE (force to
+TEN) for correct `MUL(gy, bt_ten)`. b-arm needs original `bt` (ALO)
+for recursive GRAD walk preserving provenance back to requires_grad
+leaves. Don't DUP-wrap the ALO — pass forced-TEN to a-arm's value
+slot and original-ALO directly to b-arm's GRAD2_H target.
+
+Similar structural fix likely needed for MAX, DIV (also use BG
+macro). ADD uses BG_GY which doesn't reuse bt — different path.
+

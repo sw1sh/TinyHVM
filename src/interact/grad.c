@@ -531,7 +531,12 @@
                         case UOP_EXP: UG(thvm_op_raw(ctx,UOP_MUL,gy,y));
                         case UOP_LOG: UG(thvm_op_raw(ctx,UOP_DIV,gy,at));
                         case UOP_SQRT: { f32 two=2; UG(thvm_op_raw(ctx,UOP_DIV,gy,thvm_op_raw(ctx,UOP_MUL,thvm_tensor(ctx,&two,SHAPE(1)),y))); }
-                        case UOP_DIV: { Term ng=thvm_op_raw(ctx,UOP_NEG,gy,term_era()); BG(thvm_op_raw(ctx,UOP_DIV,gy,bt), thvm_op_raw(ctx,UOP_DIV,thvm_op_raw(ctx,UOP_MUL,ng,at),thvm_op_raw(ctx,UOP_MUL,bt,bt))); }
+                        /* d(a/b)/da = 1/b = gy/bt
+                           d(a/b)/db = -a/b^2 = -(a/b)/b = -y/bt
+                           Using `y` in the b-arm avoids MUL(bt, bt) which
+                           reused bt without DUP (linearity violation when
+                           bt is a compute TOP like e_sum_bc in softmax). */
+                        case UOP_DIV: { BG(thvm_op_raw(ctx,UOP_DIV,gy,bt), thvm_op_raw(ctx,UOP_NEG,thvm_op_raw(ctx,UOP_DIV,thvm_op_raw(ctx,UOP_MUL,gy,y),bt),term_era())); }
                         case UOP_MAX: { Term mask=thvm_op_raw(ctx,UOP_CMP,at,bt); f32 one=1; Term inv=thvm_op_raw(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),mask);
                             BG(sum_to_shape(ctx,thvm_op_raw(ctx,UOP_MUL,gy,mask),y_shape,a_shape), sum_to_shape(ctx,thvm_op_raw(ctx,UOP_MUL,gy,inv),y_shape,b_shape)); }
 	                        case UOP_CMP: GRAD_RETURN(GRAD_ERASE(gy));

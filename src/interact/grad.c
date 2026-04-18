@@ -303,6 +303,33 @@
 	                      GRAD_RESOLVE_ALIAS(_bt);
 	                      if (term_tag(_bt)==TAG_TEN) b_shape=ctx->tensors[(u32)term_val(_bt)].view.shape;
 	                      else if (term_tag(_bt)==TAG_TOP) { const View *bv=st_get(term_val(_bt)); if(bv) b_shape=bv->shape; } }
+                    // Recover y_shape from operands when the TOP node lost its
+                    // View tracker (e.g., ALO realize copied LAM body without
+                    // tracker). For elementwise ops the output shape is the
+                    // broadcast of operand shapes; without this, y_shape stays
+                    // SHAPE(1) and sum_to_shape squashes grads to one element
+                    // and rebroadcasts uniformly.
+                    if (!yv) {
+                        u32 ar = a_shape.rank, br = b_shape.rank;
+                        u32 r = ar > br ? ar : br;
+                        if (r > 0 && r <= MAX_DIM) {
+                            Shape s = {.rank = r};
+                            int ok = 1;
+                            for (u32 i = 0; i < r && ok; i++) {
+                                int ia = (int)ar - 1 - (int)i;
+                                int ib = (int)br - 1 - (int)i;
+                                u32 da = ia >= 0 ? a_shape.dims[ia] : 1;
+                                u32 db = ib >= 0 ? b_shape.dims[ib] : 1;
+                                u32 d;
+                                if (da == db) d = da;
+                                else if (da == 1) d = db;
+                                else if (db == 1) d = da;
+                                else { ok = 0; d = 0; }
+                                s.dims[r - 1 - i] = d;
+                            }
+                            if (ok) y_shape = s;
+                        }
+                    }
                     if (getenv("THVM_SCHED_DIAG")) {
                         static int _gs = 0;
                         if (++_gs <= 100) {

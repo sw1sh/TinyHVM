@@ -688,10 +688,19 @@ era_continue:
 
 	                Term n0 = term_new(TAG_TOP, uop, r0);
 	                Term n1 = term_new(TAG_TOP, uop, r1);
-	                const View *vv = st_get(val_loc);
-	                if (vv) {
-	                    st_set(r0, vv);
-	                    st_set(r1, vv);
+	                /* Copy the full multi-view ShapeTracker, not just the
+	                 * last view. For composed view chains (reshape+expand
+	                 * that can't merge into a single View), flattening
+	                 * here loses the stride-0 broadcast info and makes
+	                 * downstream kernels index the buffer as if it were
+	                 * dense contiguous — reading the same element for
+	                 * every broadcast position. Hits the matmul-in-loop
+	                 * backward where both BG branches DUP-commute through
+	                 * the EXPAND wrappers. */
+	                const ShapeTracker *ast = st_get_tracker(val_loc);
+	                if (ast) {
+	                    st_set_tracker(r0, ast);
+	                    st_set_tracker(r1, ast);
 	                }
 	                if (uop == UOP_GRAD) {
 	                    thvm_grad_targets_share(ctx, r0, val_loc);

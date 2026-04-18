@@ -2111,6 +2111,10 @@ static void sched_plan_output_liveness(TinyHVM *ctx) {
 }
 
 static void sched_replace_term_everywhere(TinyHVM *ctx, Term original, Term rewritten) {
+    if (getenv("SCHED_REPLACE_TRACE"))
+        fprintf(stderr, "SCHED_REPLACE (%u/%u@%llu) -> (%u/%u@%llu)\n",
+            (u32)term_tag(original), (u32)term_ext(original), (unsigned long long)term_val(original),
+            (u32)term_tag(rewritten), (u32)term_ext(rewritten), (unsigned long long)term_val(rewritten));
     for (u64 h = 1; h < ctx->heap_pos; h++)
         if (ctx->heap[h] == original) ctx->heap[h] = rewritten;
 }
@@ -2431,6 +2435,23 @@ u32 sched_all(TinyHVM *ctx, Term root) {
             Term root_before = b->root_term;
             Term root_after = reduce_net_quiesce(ctx, root_before);
             if (root_after == root_before) continue;
+            /* Guard against quiesce accidentally collapsing a live
+             * kernel-boundary root to ERA. Under atom-shared TOP DUPs,
+             * the shared structure can be visited by multiple paths
+             * during quiesce; partial-fire interactions may propagate
+             * ERA into intermediate cells even though the boundary's
+             * real value is non-erased. Skip the global replacement in
+             * that case — the subsequent fuse_build_kernel pass will
+             * rebuild from the live structure. */
+            if (term_tag(root_after) == TAG_ERA &&
+                term_tag(root_before) != TAG_ERA) {
+                if (getenv("THVM_SCHED_DIAG"))
+                    fprintf(stderr,
+                            "SCHED_QUIESCE_ERA skip: root_before=(%u/%u@%llu) would replace with ERA\n",
+                            (u32)term_tag(root_before), (u32)term_ext(root_before),
+                            (unsigned long long)term_val(root_before));
+                continue;
+            }
             sched_replace_term_everywhere(ctx, root_before, root_after);
             if (root == root_before) root = root_after;
             rescanned = 1;
@@ -2579,6 +2600,16 @@ void thvm_register_pass(TinyHVM *ctx, ThvmCompilerPass pass, const char *name) {
 static Term thvm_eval_internal(TinyHVM *ctx, Term t, int pre_reduce_phase) {
     int outermost = (ctx->eval_depth++ == 0);
     u64 eval_itrs_start = ctx->itrs;
+    // Mark current-max buf_id as persistent floor so decref during reduction
+    // can't free weight/bias buffers (keep-mode training aliases them).
+    if (outermost) {
+        u32 max_pb = 0;
+        for (u32 i = 0; i < ctx->tensor_count; i++)
+            if (ctx->tensors[i].buf_id > max_pb) max_pb = ctx->tensors[i].buf_id;
+        for (u32 bi = 0; bi < ctx->n_backends; bi++)
+            if (ctx->backends[bi] && ctx->backends[bi]->pool_set_persistent)
+                ctx->backends[bi]->pool_set_persistent(max_pb);
+    }
     if (pre_reduce_phase)
         t = thvm_reduce(ctx, t);
     Term round_start = t;

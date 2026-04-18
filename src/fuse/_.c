@@ -380,6 +380,24 @@ static int fuse_walk_inner(TinyHVM *ctx, Term t,
     // not fused through. Each consumer gets its own kernel with the shared
     // value as a leaf tensor.
     if (term_tag(t) == TAG_DP0 || term_tag(t) == TAG_DP1) {
+        /* Under atom-share DUP⊳TOP, the DUP body is preserved as a
+         * shared reference: both DP projections resolve to the same TOP.
+         * Walk through the DP by reading the body and continuing. This
+         * lets fuse_build_kernel traverse the atom-shared compute graph
+         * for both arms of a DUP without each arm getting a separate
+         * leaf-tensor boundary. */
+        u64 dl = term_val(t);
+        if (dl > 0 && dl < ctx->heap_pos) {
+            Term body = heap_read(ctx, dl);
+            u8 bt = term_tag(body);
+            if (bt == TAG_TOP || bt == TAG_TEN) {
+                if (getenv("THVM_SCHED_DIAG"))
+                    fprintf(stderr, "  dp_resolve: dp%u@%llu -> (%u/%u@%llu)\n",
+                        (term_tag(t)==TAG_DP1)?1:0, (unsigned long long)dl,
+                        (u32)bt, (u32)term_ext(body), (unsigned long long)term_val(body));
+                return fuse_walk_inner(ctx, body, ops, n_ops, leaf_ids, leaf_views, n_leaves);
+            }
+        }
         if (getenv("THVM_SCHED_DIAG"))
             fprintf(stderr, "  dp_boundary: dp%u@%llu (hard boundary)\n",
                     (term_tag(t)==TAG_DP1)?1:0, (unsigned long long)term_val(t));

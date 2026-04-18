@@ -374,6 +374,21 @@ static Term reduce_net_quiesce(TinyHVM *ctx, Term root) {
             }
             Term hr = ht;
             if (!reduce_net_fire_one(ctx, ht, &hr)) continue;
+            /* Atom-share ERA guard: if firing a cell's term collapses
+             * it to ERA while the term itself is a live compute TOP,
+             * suppress the write. Atom-shared TOP DUPs cause quiesce
+             * to visit the shared structure from multiple arms; partial
+             * resolutions can return ERA even though the value is still
+             * referenced by other arms. Letting ERA through here
+             * propagates up to the root (prior boundary fix) or to a
+             * parent's arg slot, silently dropping live computation. */
+            if (term_tag(hr) == TAG_ERA && term_tag(ht) == TAG_TOP) {
+                u32 htu = term_ext(ht);
+                if (htu != UOP_DETACH && htu != UOP_ASSIGN &&
+                    htu != UOP_KERNEL && htu != UOP_EXEC) {
+                    continue;
+                }
+            }
             if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD) {
                 for (u64 i = 1; i < ctx->heap_pos; i++) {
                     if (ctx->heap[i] == ht) heap_set(ctx, i, hr);

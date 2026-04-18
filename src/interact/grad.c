@@ -374,8 +374,7 @@
 	                                        _iu != UOP_ASSIGN && _iu != UOP_KERNEL && \
 	                                        _iu != UOP_DETACH && _iu != UOP_IFZ && \
 	                                        _iu != UOP_TODEVICE && _iu != UOP_LOG_PRINT && \
-	                                        _iu != UOP_RESHAPE && _iu != UOP_EXPAND && \
-	                                        _iu != UOP_PERMUTE && _iu != UOP_SHRINK && _iu != UOP_PAD) _ok = 1; \
+	                                        _iu != UOP_RESHAPE) _ok = 1; \
 	                                } \
 	                                else if (_it == TAG_DP0 || _it == TAG_DP1) _ok = 1; \
 	                            } \

@@ -434,7 +434,41 @@
 			                       force to TEN so the a-arm's MUL(gy, bt0)
 			                       reads bt per-element; keep original bt as
 			                       the b-arm's GRAD walk target (provenance). */
+			                    /* Short-circuit: if bt resolves through ALO/RESHAPE */ \
+			                    /* wrappers to a non-req-grad TEN (a constant), skip */ \
+			                    /* DUP(gy) and the b-arm entirely. The bt-DUP over a */ \
+			                    /* const-ALO(RESHAPE(TEN)) halves gy via IC orphans */ \
+			                    /* (see test_sum_sq_ref_scale). */ \
+			                    #define BG_BT_CONST_PEEK(_bt) ({ \
+			                        u32 _tid = UINT32_MAX; \
+			                        Term _c = (_bt); \
+			                        for (int _d = 0; _d < 8; _d++) { \
+			                            if (term_tag(_c) == TAG_ALO) { \
+			                                u64 _aloc = term_val(_c); \
+			                                if (_aloc + 1 >= ctx->heap_pos) break; \
+			                                _c = heap_read(ctx, _aloc + 0); continue; \
+			                            } \
+			                            if (term_tag(_c) == TAG_TOP && term_ext(_c) == UOP_RESHAPE) { \
+			                                u64 _tloc = term_val(_c); \
+			                                if (_tloc + 1 >= ctx->heap_pos) break; \
+			                                _c = heap_read(ctx, _tloc + 0); continue; \
+			                            } \
+			                            if (term_tag(_c) == TAG_TEN) { \
+			                                u32 _tt = (u32)term_val(_c); \
+			                                if (_tt < ctx->tensor_count && !ctx->tensors[_tt].requires_grad) _tid = _tt; \
+			                            } \
+			                            break; \
+			                        } \
+			                        _tid; })
 			                    #define BG(da_of_gy_bt, db_of_gy_at) do { \
+			                        u32 _bt_const = BG_BT_CONST_PEEK(bt); \
+			                        if (_bt_const != UINT32_MAX) { \
+			                            Term bt_val = term_new(TAG_TEN, 0, _bt_const); \
+			                            Term _da; { Term bt=bt_val; (void)bt; _da=(da_of_gy_bt); } \
+			                            GRAD_SPAWN_ERA(bt); \
+			                            Term _ga = GRAD2_H(at, _da, x); \
+			                            GRAD_RETURN(_ga); \
+			                        } \
 			                        GRAD_SPLIT_AT(); \
 			                        u64 _gyd = heap_alloc(ctx, 1); \
 			                        heap_set(ctx, _gyd, gy); \

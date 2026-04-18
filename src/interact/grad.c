@@ -356,10 +356,11 @@
 	                       - at is used as VALUE by the BG arm's MUL(gy, at)
 	                       For ALO/TOP at, force-to-TEN for VALUE and keep
 	                       original for GRAD walk. */
-	                    /* Peek ALO's inner book term; force only if it's a
-	                       compute op or book DP (which realizes via ALO
-	                       memo). Avoid VAR (linear bindings) and GRAD
-	                       (recursive entry). */
+	                    /* Peek ALO's inner book term; force only for pure
+	                       view/reduce compute ops that don't dispatch to
+	                       backend kernels or side-effect. Exclude MM (BLAS),
+	                       ASSIGN, KERNEL, IFZ, DETACH, LOG_PRINT, TODEVICE,
+	                       GRAD (would recurse). */
 	                    #define GRAD_ALO_SAFE_TO_FORCE(_t) ({ \
 	                        int _ok = 0; \
 	                        if (term_tag(_t) == TAG_ALO) { \
@@ -367,7 +368,10 @@
 	                            if (_al + 1 < ctx->heap_pos) { \
 	                                Term _inner = heap_read(ctx, _al + 0); \
 	                                u8 _it = term_tag(_inner); \
-	                                if (_it == TAG_TOP && term_ext(_inner) != UOP_GRAD) _ok = 1; \
+	                                u32 _iu = term_ext(_inner); \
+	                                if (_it == TAG_TOP) { \
+	                                    if (_iu == UOP_SUM || _iu == UOP_RMAX) _ok = 1; \
+	                                } \
 	                                else if (_it == TAG_DP0 || _it == TAG_DP1) _ok = 1; \
 	                            } \
 	                        } \

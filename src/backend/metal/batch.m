@@ -49,6 +49,15 @@ static id<MTLComputeCommandEncoder> get_encoder(void) {
 
 // GPU-to-GPU buffer copy via blit encoder (zero compute dispatch overhead)
 void metal_buf_copy(u32 dst_buf, u32 src_buf, u64 nbytes) {
+    // Guard against nil buffers: callers may race thvm_reset with a
+    // copy request when a buffer was freed but still referenced.
+    // Dispatching blit on nil buffer crashes AGXMetalG15X::copyBufferToBuffer.
+    if (dst_buf == 0 || dst_buf >= metal_pool.count || !metal_pool.bufs[dst_buf] ||
+        src_buf == 0 || src_buf >= metal_pool.count || !metal_pool.bufs[src_buf]) {
+        fprintf(stderr, "metal_buf_copy: SKIP nil buffer (dst=%u src=%u pool.count=%u)\n",
+            dst_buf, src_buf, metal_pool.count);
+        return;
+    }
     if (batch_encoder) {
         [batch_encoder endEncoding];
         batch_encoder = nil;

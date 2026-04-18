@@ -1,6 +1,92 @@
 # Plan: Recursive GRAD Learning Loop — Status & Open Work
 
-## Status (2026-04-17)
+## Status (2026-04-18) — RESOLVED
+
+Multi-target GRAD in the recursive training loop works correctly for the
+elementwise elementwise case. Rounds 8–15 landed the stale-read fix.
+
+| Test                             | n=1  | n=2  | n=3  | 20× determinism |
+|----------------------------------|------|------|------|-----------------|
+| `test_tiny_scalar_grad_loop`     | PASS | PASS | PASS | 20/20           |
+| `test_tiny_twoparam_sum_loop`    | PASS | PASS | PASS | 20/20           |
+| `test_tiny_twoparam_grad_loop`   | PASS | PASS | PASS | 20/20           |
+| `test_grad_fuse_minimal`         | PASS | —    | —    | 20/20           |
+
+XFAIL in `test_tiny_twoparam_grad_loop` flipped to a hard assertion.
+
+## Resolution (round 15)
+
+APP-MAT-CTR now defers (returns `t` unchanged, no `ctx->itrs++`)
+when any CTR child is a TOP with a non-view uop
+(ADD/MUL/SUB/SUM/RMAX/MM/.../KERNEL/EXEC). View-op children
+(RESHAPE/PERMUTE/EXPAND/SHRINK/PAD) and FUSE are bound
+directly — they don't feed a multi-leaf backward kernel that
+would read forward tensors at dispatch time.
+
+The change is a ~15-line addition in
+[src/interact/combinators.c:139](/Users/swish/src/TinyHVM/src/interact/combinators.c#L139)
+that inspects child TOP uops before firing the bind chain. No
+changes to grad.c, tensor_ops.c, scheduler, or the IC framework.
+
+### What the defer actually unlocks
+
+Clarification: the defer has **nothing to do with fusion**. IC
+fusion is the `FUSE ⊳ compute_uop` interaction rule in
+[src/interact/tensor_ops.c:386](/Users/swish/src/TinyHVM/src/interact/tensor_ops.c#L386),
+driven by the root FUSE wrapper. It doesn't reach the CTR's
+children through `APP(MAT, CTR)` because `FUSE ⊳ APP` has no
+explicit rule and passes through.
+
+The materialisation happens via the scheduler pipeline in the
+outer `thvm_eval_internal` loop
+([src/schedule/_.c:2562](/Users/swish/src/TinyHVM/src/schedule/_.c#L2562)):
+
+1. Phase 1 (`thvm_eval_reduce_fused`): MAT-CTR defers, nothing
+   progresses through it.
+2. Phase 2 (`thvm_run_global_passes` → `thvm_sched_global_pass`
+   → `sched_all`): walks heap reachable from root, finds the
+   compute TOPs at `ctr_loc[i]` as boundary roots, calls
+   `fuse_build_kernel` on each, installs EXEC triggers,
+   rewrites ADDs in place to EXEC terms.
+3. Phase 3 (`thvm_eval_exec_fixed_point`): EXEC fires,
+   dispatches kernel, produces TEN. `ctr_loc[i]` now holds
+   TEN (or KERNEL if an EXEC isn't installed yet; either
+   way, not the original compute TOP).
+4. Phase 4 (follow-up round re-enters phase 1): APP-MAT-CTR
+   re-fires, children are no longer raw compute TOPs → falls
+   through to the bind loop → succeeds.
+
+So the defer says "don't bind yet; let the outer scheduler
+pipeline complete before I commit the binding" — not "wait
+for fusion."
+
+The view-op exemption is about stale-read risk, not about
+the scheduler's reach. EXPAND(scalar) in particular is
+trivial and the scheduler may never schedule it (no compute
+to fuse), so deferring on views would livelock. Views are
+also provably safe to bind lazily — they just re-view a
+single source buffer, not a fused read of multiple forward
+tensors, so there's no stale-read issue even if ASSIGNs
+later mutate a forward input.
+
+### Why this corresponds to user direction (b)
+
+The user asked for "retry-from-fixed-point: after MAT-CTR
+defers ... the outer reducer fixed-point would need to
+re-drive the stuck APP-MAT pair once children materialize."
+The retry is implicit in the existing pipeline: each
+follow-up round in `thvm_eval_internal` re-enters phase 1,
+which fires APP-MAT-CTR again with the now-materialised
+children. No new scheduler machinery was required.
+
+Earlier lazy attempts (rounds 12-13) failed because they
+tried to express the defer as an IC-level primitive (wrap
+CTR in FUSE, emit SEQ chains, etc.) — that broke the
+trampoline's interaction of APP-MAT with CTR. The working
+form is just "return `t` unchanged" so the phase pipeline
+continues around it.
+
+## Status (2026-04-17) — prior status kept below for history
 
 **Single-parameter elementwise loop: done.**
 

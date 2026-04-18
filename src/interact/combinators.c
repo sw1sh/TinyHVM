@@ -142,6 +142,46 @@
                     u64 mat_loc = term_val(fun);
                     u32 match_tag = term_ext(fun);
                     u32 ctr_tag = term_ext(arg);
+                    /* Retry-from-fixed-point for multi-target GRAD.
+                     *
+                     * When a CTR child is an unreduced compute TOP
+                     * (ADD/MUL/.../KERNEL/EXEC), defer this rule. The
+                     * scheduler's global pass then materialises each
+                     * child to TEN before MAT-CTR re-fires and binds.
+                     *
+                     * Why: in a training loop the body of MAT is a
+                     * SEQ chain of ASSIGNs that blit-mutate forward
+                     * tensors in place. If the n'th ASSIGN's src is
+                     * still an unreduced backward TOP at binding
+                     * time, reducing it later (from inside the SEQ)
+                     * fires after the (n-1)'th ASSIGN has already
+                     * blitted — so the n'th backward reads stale
+                     * forward values.
+                     *
+                     * Pure view ops (RESHAPE/PERMUTE/EXPAND/SHRINK/
+                     * PAD) are exempt: they re-view a single source
+                     * and don't pull values from multiple forward
+                     * tensors, so no stale-read risk. Also required
+                     * for correctness: backward chains that are
+                     * trivial EXPAND(scalar) (e.g. sum(w+b) gradient)
+                     * never get picked up by the scheduler's global
+                     * pass, so deferring on them would livelock. */
+                    if (match_tag == ctr_tag) {
+                        u64 ctr_loc = term_val(arg);
+                        for (u32 i = 0; i < ctr_tag; i++) {
+                            Term child = heap_read(ctx, ctr_loc + i);
+                            if (term_tag(child) != TAG_TOP) continue;
+                            u32 cuop = term_ext(child);
+                            int safe_to_bind =
+                                (cuop == UOP_FUSE ||
+                                 cuop == UOP_RESHAPE ||
+                                 cuop == UOP_PERMUTE ||
+                                 cuop == UOP_EXPAND ||
+                                 cuop == UOP_SHRINK ||
+                                 cuop == UOP_PAD);
+                            if (!safe_to_bind) return t;
+                        }
+                    }
                     ctx->itrs++;
                     if (thvm_loop_diag_enabled()) {
                         u64 ctr_loc_dbg = term_val(arg);

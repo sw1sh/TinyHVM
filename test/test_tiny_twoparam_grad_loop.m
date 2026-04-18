@@ -192,18 +192,13 @@ int main(int argc, char **argv) {
     printf("final_b = [%.4f, %.4f, %.4f]\n", bf[0], bf[1], bf[2]);
     printf("expect_w= [%.4f, %.4f, %.4f]\n", ew[0], ew[1], ew[2]);
     printf("expect_b= [%.4f, %.4f, %.4f]\n", eb[0], eb[1], eb[2]);
-    // KNOWN FAILURE: multi-parameter GRAD in a recursive loop is broken.
-    // At n=1, w's gradient is exact but b's gradient is uniformly 0.8x the
-    // expected value. The ratio drifts further at n=2, n=3. Cause not yet
-    // identified — likely in how thvm_grad_multi_keep's bundle routes the
-    // two grad targets through the DUP chain when wrapped by MAT.
-    // See resources/plans/recursive_grad_loop_fix.md.
     int all_match = 1;
     for (u32 i = 0; i < N; i++) {
         if (fabsf(wf[i] - ew[i]) >= 1e-4f) all_match = 0;
         if (fabsf(bf[i] - eb[i]) >= 1e-4f) all_match = 0;
     }
-    printf(all_match ? "PASS\n" : "XFAIL (multi-grad-in-loop bug — see plan)\n");
+    assert(all_match && "multi-parameter GRAD in loop must match host SGD");
+    printf("PASS\n");
 
     thvm_free(ctx);
     return 0;

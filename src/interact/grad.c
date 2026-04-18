@@ -370,7 +370,12 @@
 	                                u8 _it = term_tag(_inner); \
 	                                u32 _iu = term_ext(_inner); \
 	                                if (_it == TAG_TOP) { \
-	                                    if (_iu == UOP_SUM || _iu == UOP_RMAX) _ok = 1; \
+	                                    if (_iu != UOP_GRAD && _iu != UOP_MM && \
+	                                        _iu != UOP_ASSIGN && _iu != UOP_KERNEL && \
+	                                        _iu != UOP_DETACH && _iu != UOP_IFZ && \
+	                                        _iu != UOP_TODEVICE && _iu != UOP_LOG_PRINT && \
+	                                        _iu != UOP_RESHAPE && _iu != UOP_EXPAND && \
+	                                        _iu != UOP_PERMUTE && _iu != UOP_SHRINK && _iu != UOP_PAD) _ok = 1; \
 	                                } \
 	                                else if (_it == TAG_DP0 || _it == TAG_DP1) _ok = 1; \
 	                            } \
@@ -380,7 +385,10 @@
 	                        if (!_at_split) { \
 	                            if (GRAD_ALO_SAFE_TO_FORCE(at)) { \
 	                                Term _at_forced = thvm_force_tensor_term(ctx, at); \
-	                                if (term_tag(_at_forced) == TAG_TEN) { \
+	                                u8 _atft = term_tag(_at_forced); \
+	                                u32 _atfu = term_ext(_at_forced); \
+	                                if (_atft == TAG_TEN || _atft == TAG_DP0 || _atft == TAG_DP1 || \
+	                                    (_atft == TAG_TOP && (_atfu == UOP_SUM || _atfu == UOP_RMAX))) { \
 	                                    at_cons = at; \
 	                                    at = _at_forced; \
 	                                    _at_split = 1; \
@@ -434,7 +442,10 @@
 			                        int _bt_split_done = 0; \
 			                        if (GRAD_ALO_SAFE_TO_FORCE(bt)) { \
 			                            Term _bt_forced = thvm_force_tensor_term(ctx, bt); \
-			                            if (term_tag(_bt_forced) == TAG_TEN) { \
+			                            u8 _btft = term_tag(_bt_forced); \
+			                            u32 _btfu = term_ext(_bt_forced); \
+			                            if (_btft == TAG_TEN || _btft == TAG_DP0 || _btft == TAG_DP1 || \
+			                                (_btft == TAG_TOP && (_btfu == UOP_SUM || _btfu == UOP_RMAX))) { \
 			                                bt0 = _bt_forced; bt1 = bt; _bt_split_done = 1; \
 			                            } \
 			                        } \

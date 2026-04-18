@@ -73,14 +73,17 @@ static BNResult batchnorm_forward(TinyHVM *ctx, Term x,
                 thvm_op(ctx, UOP_SUB, x, mean_bc), invstd_bc), gamma_bc),
             beta_bc);
 
-        // Wrap each ASSIGN in APP(ASSIGN, ERA) so that ASSIGN enters
-        // as the fun of an APP (trampoline reduces args) rather than
-        // the arg (inet_step skips arg reduction).
-        Term a_rm = thvm_app(ctx, thvm_assign(ctx, rmean, new_rm), term_era());
-        Term a_rv = thvm_app(ctx, thvm_assign(ctx, rvar, new_rv), term_era());
+        // Chain via SEQ: assign rm, assign rv, then return out.
+        // SEQ fires the effect and discards its result, then returns
+        // the continuation. Previous APP(APP(a_rm, ERA), APP(a_rv, ERA))
+        // chain was miswired — APP is function application, not
+        // sequencing — caused infinite loop in eval for running-stats
+        // path.
+        Term a_rm = thvm_assign(ctx, rmean, new_rm);
+        Term a_rv = thvm_assign(ctx, rvar, new_rv);
         return (BNResult){
             .output = out,
-            .assigns = thvm_app(ctx, a_rm, a_rv),
+            .assigns = thvm_seq(ctx, a_rm, a_rv),
         };
     }
 
@@ -111,6 +114,6 @@ static Term batchnorm_term(TinyHVM *ctx, Term x,
                             Term gamma, Term beta, Term rmean, Term rvar,
                             u32 B, u32 C, u32 H, u32 W, int training) {
     BNResult r = batchnorm_forward(ctx, x, gamma, beta, rmean, rvar, B, C, H, W, training);
-    if (training) return thvm_app(ctx, r.assigns, r.output);
+    if (training) return thvm_seq(ctx, r.assigns, r.output);
     return r.output;
 }

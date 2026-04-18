@@ -351,8 +351,38 @@
 	                    // continuation views.
 	                    Term at_cons = at;
 	                    u8 _at_split = 0;
+	                    /* Split at into (at_cons, at):
+	                       - at_cons goes into recursive GRAD walk (provenance)
+	                       - at is used as VALUE by the BG arm's MUL(gy, at)
+	                       For ALO/TOP at, force-to-TEN for VALUE and keep
+	                       original for GRAD walk. */
+	                    /* Peek ALO's inner book term; force only if it's a
+	                       compute op or book DP (which realizes via ALO
+	                       memo). Avoid VAR (linear bindings) and GRAD
+	                       (recursive entry). */
+	                    #define GRAD_ALO_SAFE_TO_FORCE(_t) ({ \
+	                        int _ok = 0; \
+	                        if (term_tag(_t) == TAG_ALO) { \
+	                            u64 _al = term_val(_t); \
+	                            if (_al + 1 < ctx->heap_pos) { \
+	                                Term _inner = heap_read(ctx, _al + 0); \
+	                                u8 _it = term_tag(_inner); \
+	                                if (_it == TAG_TOP && term_ext(_inner) != UOP_GRAD) _ok = 1; \
+	                                else if (_it == TAG_DP0 || _it == TAG_DP1) _ok = 1; \
+	                            } \
+	                        } \
+	                        _ok; })
 	                    #define GRAD_SPLIT_AT() do { \
 	                        if (!_at_split) { \
+	                            if (GRAD_ALO_SAFE_TO_FORCE(at)) { \
+	                                Term _at_forced = thvm_force_tensor_term(ctx, at); \
+	                                if (term_tag(_at_forced) == TAG_TEN) { \
+	                                    at_cons = at; \
+	                                    at = _at_forced; \
+	                                    _at_split = 1; \
+	                                    break; \
+	                                } \
+	                            } \
 	                            u64 _ad = heap_alloc(ctx, 1); \
 	                            heap_set(ctx, _ad, at); \
 	                            u32 _alab = thvm_fresh_label(ctx); \
@@ -384,25 +414,38 @@
 	                        Term _gb = GRAD2_H(bt, _db, x); \
 	                        GRAD_RETURN(GRAD_COMBINE(_ga, _gb)); \
 	                    } while (0)
-		                    // BG: DUP bt/gy and keep two GRAD branches connected by ADD.
-		                    #define BG(da_of_gy_bt, db_of_gy_at) do { \
-		                        GRAD_SPLIT_AT(); \
-		                        u64 _gyd = heap_alloc(ctx, 1); \
-		                        heap_set(ctx, _gyd, gy); \
-		                        u32 _gylab = thvm_fresh_label(ctx); \
-		                        Term gy0 = term_new(TAG_DP0, _gylab, _gyd); \
-		                        Term gy1 = term_new(TAG_DP1, _gylab, _gyd); \
-		                        u64 _btd = heap_alloc(ctx, 1); \
-		                        heap_set(ctx, _btd, bt); \
-		                        u32 _btlab = thvm_fresh_label(ctx); \
-		                        Term bt0 = term_new(TAG_DP0, _btlab, _btd); \
-		                        Term bt1 = term_new(TAG_DP1, _btlab, _btd); \
-		                        Term _da; { Term gy=gy0,bt=bt0; (void)gy;(void)bt; _da=(da_of_gy_bt); } \
-		                        Term _db; { Term gy=gy1; Term _at=at; Term at=_at; (void)gy;(void)at; _db=(db_of_gy_at); } \
-		                        /* table cleared at GRAD entry */ \
-		                        Term _ga=GRAD2_H(at_cons,_da,x), _gb=GRAD2_H(bt1,_db,x); \
-		                        GRAD_RETURN(GRAD_COMBINE(_ga, _gb)); \
-		                    } while(0)
+			                    /* BG: DUP bt/gy and keep two GRAD branches
+			                       connected by ADD. For ALO-wrapped TOP bt,
+			                       force to TEN so the a-arm's MUL(gy, bt0)
+			                       reads bt per-element; keep original bt as
+			                       the b-arm's GRAD walk target (provenance). */
+			                    #define BG(da_of_gy_bt, db_of_gy_at) do { \
+			                        GRAD_SPLIT_AT(); \
+			                        u64 _gyd = heap_alloc(ctx, 1); \
+			                        heap_set(ctx, _gyd, gy); \
+			                        u32 _gylab = thvm_fresh_label(ctx); \
+			                        Term gy0 = term_new(TAG_DP0, _gylab, _gyd); \
+			                        Term gy1 = term_new(TAG_DP1, _gylab, _gyd); \
+			                        Term bt0 = term_era(), bt1 = term_era(); \
+			                        int _bt_split_done = 0; \
+			                        if (GRAD_ALO_SAFE_TO_FORCE(bt)) { \
+			                            Term _bt_forced = thvm_force_tensor_term(ctx, bt); \
+			                            if (term_tag(_bt_forced) == TAG_TEN) { \
+			                                bt0 = _bt_forced; bt1 = bt; _bt_split_done = 1; \
+			                            } \
+			                        } \
+			                        if (!_bt_split_done) { \
+			                            u64 _btd = heap_alloc(ctx, 1); \
+			                            heap_set(ctx, _btd, bt); \
+			                            u32 _btlab = thvm_fresh_label(ctx); \
+			                            bt0 = term_new(TAG_DP0, _btlab, _btd); \
+			                            bt1 = term_new(TAG_DP1, _btlab, _btd); \
+			                        } \
+			                        Term _da; { Term gy=gy0,bt=bt0; (void)gy;(void)bt; _da=(da_of_gy_bt); } \
+			                        Term _db; { Term gy=gy1; Term _at=at; Term at=_at; (void)gy;(void)at; _db=(db_of_gy_at); } \
+			                        Term _ga=GRAD2_H(at_cons,_da,x), _gb=GRAD2_H(bt1,_db,x); \
+			                        GRAD_RETURN(GRAD_COMBINE(_ga, _gb)); \
+			                    } while(0)
 	                    // UG: keep sub-GRAD on the returned net.
 	                    #define UG(da_) do { \
 	                        Term _da_ug = (da_); \

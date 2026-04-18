@@ -100,7 +100,8 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
         thvm_prof_global.heap_at_reset = ctx->heap_pos;
     }
     // Sum bytes being freed for memory tracking
-    // Decref shared buffers before pool_reset — ensures correct per-buffer freeing
+    // Decref shared buffers before pool_reset — ensures correct per-buffer freeing.
+    // Backends gate persistent buf_ids via their own persistent_floor.
     for (u32 i = keep; i < ctx->tensor_count; i++) {
         TensorMeta *m = &ctx->tensors[i];
         if (m->buf_id && m->backend && m->backend->buf_decref)
@@ -126,6 +127,7 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
     for (u32 i = 1; i < ctx->tensor_count; i++) {
         ctx->tensors[i].defer_consumers = 0;
     }
+    fuse_wrap_memo_reset();
     ctx->heap_pos = 1;
     ctx->heap[0] = term_era();
     if (ctx->lower_ctx.heap) {

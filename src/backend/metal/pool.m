@@ -1,5 +1,10 @@
 // metal/pool.m — Metal buffer pool functions (state in init.m)
 
+// Floor for decref-driven buffer freeing. buf_ids <= this value are
+// persistent (weights, biases) and must never be released by buf_decref.
+// Set by metal_pool_set_persistent from thvm_reset.
+static u32 metal_persistent_floor = 0;
+
 // Tracks total Metal buffer bytes currently allocated (pool + free list).
 // Only changes on newBufferWithLength (up) and actual buffer release (down).
 // Free list reuse doesn't change this — the Metal memory is still committed.
@@ -138,6 +143,7 @@ static void metal_buf_incref(u32 id) {
 
 static void metal_buf_decref(u32 id) {
     if (id == 0) return;
+    if (id <= metal_persistent_floor) return; // persistent — never free via decref
     if (buf_refcount[id] == 0) return; // guard against double-decref
     if (--buf_refcount[id] == 0) {
         if (pending_free_count < PENDING_FREE_CAP)
@@ -372,7 +378,11 @@ reset_counters:
 }
 
 static void metal_pool_set_persistent(u32 max_persistent_buf) {
-    (void)max_persistent_buf; // now handled by buf_cpu_only tracking
+    // Protect buf_ids <= max_persistent_buf from decref-driven freeing.
+    // Keep-mode training aliases persistent buffers (e.g., ephemeral view
+    // of W) — thvm_reset's ephemeral decref would otherwise drop the
+    // persistent buf's refcount and nil the MTLBuffer.
+    metal_persistent_floor = max_persistent_buf;
 }
 
 // Memory checkpoint: try to recycle consumed buffers when memory is high.
@@ -390,11 +400,12 @@ static void metal_mem_checkpoint(u32 *leaf_buf_ids, u32 n_leaves) {
         if (bid && bid < MAX_BUFS) {
             buf_last_use[bid] = dispatch_counter;
             // Heap-backed: release consumed buffers back to heap immediately.
-            // Metal's heap auto-reclaims the region for future allocs.
-            // Safe: Metal hazard tracking handles GPU read ordering.
+            // Only safe if no outstanding refs — otherwise ASSIGN blits or
+            // later kernels with this buf as src see a nil MTLBuffer.
             if (mem_plan_heap &&
                 metal_pool.bufs[bid] &&
-                metal_pool.bufs[bid].heap == mem_plan_heap) {
+                metal_pool.bufs[bid].heap == mem_plan_heap &&
+                buf_refcount[bid] == 0) {
                 metal_pool.bufs[bid] = nil;
                 metal_pool.sizes[bid] = 0;
             }

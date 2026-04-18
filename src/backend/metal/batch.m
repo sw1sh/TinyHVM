@@ -54,8 +54,12 @@ void metal_buf_copy(u32 dst_buf, u32 src_buf, u64 nbytes) {
     // Dispatching blit on nil buffer crashes AGXMetalG15X::copyBufferToBuffer.
     if (dst_buf == 0 || dst_buf >= metal_pool.count || !metal_pool.bufs[dst_buf] ||
         src_buf == 0 || src_buf >= metal_pool.count || !metal_pool.bufs[src_buf]) {
-        fprintf(stderr, "metal_buf_copy: SKIP nil buffer (dst=%u src=%u pool.count=%u)\n",
-            dst_buf, src_buf, metal_pool.count);
+        extern id<MTLBuffer> metal_pool_bufs_at(u32); (void)metal_pool_bufs_at;
+        fprintf(stderr, "metal_buf_copy: SKIP nil buffer (dst=%u[%p] src=%u[%p] pool.count=%u)\n",
+            dst_buf, (void*)(dst_buf<metal_pool.count?metal_pool.bufs[dst_buf]:nil),
+            src_buf, (void*)(src_buf<metal_pool.count?metal_pool.bufs[src_buf]:nil),
+            metal_pool.count);
+        fflush(stderr);
         return;
     }
     if (batch_encoder) {

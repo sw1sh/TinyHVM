@@ -80,31 +80,15 @@ static u32 metal_buf_alloc(u64 bytes) {
     }
 
     // 2. Mid-step steal: reuse buffers not recently used.
-    // Safety: buf_refcount > 1 means shared (view alias), skip.
-    // buf_last_use window must be large enough to cover the longest FUSING
-    // chain depth (backward chains can be 30+ dispatches deep).
-    if (!mem_plan_active && bytes >= 4096 && dispatch_counter > 4) {
-        u32 reuse_id = 0;
-        u64 reuse_size = UINT64_MAX;
-        for (u32 i = 1; i < id; i++) {
-            if (!metal_pool.bufs[i]) continue;
-            u64 sz = metal_pool.sizes[i];
-            if (sz < bytes) continue;
-            if (buf_refcount[i] > 1) continue;
-            if (buf_last_use[i] == 0) continue;
-            if (buf_last_use[i] + 16 > dispatch_counter) continue;
-            if (sz < reuse_size) { reuse_id = i; reuse_size = sz; }
-        }
-        if (reuse_id) {
-            metal_pool.bufs[id] = metal_pool.bufs[reuse_id];
-            metal_pool.sizes[id] = metal_pool.sizes[reuse_id];
-            metal_pool.bufs[reuse_id] = nil;
-            metal_pool.sizes[reuse_id] = 0;
-            buf_refcount[reuse_id] = 0;
-            buf_last_use[reuse_id] = 0;
-            goto done;
-        }
-    }
+    // DISABLED: the `buf_last_use[i] + 16 > dispatch_counter` heuristic
+    // doesn't actually prove the buffer is safe to reuse — pending
+    // dispatches within the un-flushed batch_cmd may still reference it.
+    // Stealing it hands the SAME MTLBuffer to a new dispatch while the
+    // old one is still in flight, causing a GPU read/write race that
+    // surfaces as intermittent heap corruption (libmalloc/objc asserts
+    // on subsequent Metal API calls).
+    // TODO: re-enable behind a flush-batch-first path or a proper
+    // write-fence check.
 
     // 3. Fresh allocation
     metal_pool.bufs[id] = [mtl_dev newBufferWithLength:bytes

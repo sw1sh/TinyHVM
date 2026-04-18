@@ -328,8 +328,9 @@
 	                        if (!_at_split) { \
 	                            u64 _ad = heap_alloc(ctx, 1); \
 	                            heap_set(ctx, _ad, at); \
-	                            at_cons = term_new(TAG_DP0, 0, _ad); \
-	                            at      = term_new(TAG_DP1, 0, _ad); \
+	                            u32 _alab = thvm_fresh_label(ctx); \
+	                            at_cons = term_new(TAG_DP0, _alab, _ad); \
+	                            at      = term_new(TAG_DP1, _alab, _ad); \
 	                            _at_split = 1; \
 	                        } \
 	                    } while (0)
@@ -347,8 +348,9 @@
 	                    #define BG_GY(da_of_gy, db_of_gy) do { \
 	                        u64 _gyd = heap_alloc(ctx, 1); \
 	                        heap_set(ctx, _gyd, gy); \
-	                        Term gy0 = term_new(TAG_DP0, 0, _gyd); \
-	                        Term gy1 = term_new(TAG_DP1, 0, _gyd); \
+	                        u32 _gylab = thvm_fresh_label(ctx); \
+	                        Term gy0 = term_new(TAG_DP0, _gylab, _gyd); \
+	                        Term gy1 = term_new(TAG_DP1, _gylab, _gyd); \
 	                        Term _da; { Term gy = gy0; (void)gy; _da = (da_of_gy); } \
 	                        Term _db; { Term gy = gy1; (void)gy; _db = (db_of_gy); } \
 	                        Term _ga = GRAD2_H(at, _da, x); \
@@ -360,12 +362,14 @@
 		                        GRAD_SPLIT_AT(); \
 		                        u64 _gyd = heap_alloc(ctx, 1); \
 		                        heap_set(ctx, _gyd, gy); \
-		                        Term gy0 = term_new(TAG_DP0, 0, _gyd); \
-		                        Term gy1 = term_new(TAG_DP1, 0, _gyd); \
+		                        u32 _gylab = thvm_fresh_label(ctx); \
+		                        Term gy0 = term_new(TAG_DP0, _gylab, _gyd); \
+		                        Term gy1 = term_new(TAG_DP1, _gylab, _gyd); \
 		                        u64 _btd = heap_alloc(ctx, 1); \
 		                        heap_set(ctx, _btd, bt); \
-		                        Term bt0 = term_new(TAG_DP0, 0, _btd); \
-		                        Term bt1 = term_new(TAG_DP1, 0, _btd); \
+		                        u32 _btlab = thvm_fresh_label(ctx); \
+		                        Term bt0 = term_new(TAG_DP0, _btlab, _btd); \
+		                        Term bt1 = term_new(TAG_DP1, _btlab, _btd); \
 		                        Term _da; { Term gy=gy0,bt=bt0; (void)gy;(void)bt; _da=(da_of_gy_bt); } \
 		                        Term _db; { Term gy=gy1; Term _at=at; Term at=_at; (void)gy;(void)at; _db=(db_of_gy_at); } \
 		                        /* table cleared at GRAD entry */ \

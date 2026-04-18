@@ -387,7 +387,7 @@
 	                                u8 _atft = term_tag(_at_forced); \
 	                                u32 _atfu = term_ext(_at_forced); \
 	                                if (_atft == TAG_TEN || _atft == TAG_DP0 || _atft == TAG_DP1 || \
-	                                    (_atft == TAG_TOP && (_atfu == UOP_SUM || _atfu == UOP_RMAX))) { \
+	                                    (_atft == TAG_TOP && _atfu != UOP_GRAD)) { \
 	                                    at_cons = at; \
 	                                    at = _at_forced; \
 	                                    _at_split = 1; \
@@ -444,7 +444,7 @@
 			                            u8 _btft = term_tag(_bt_forced); \
 			                            u32 _btfu = term_ext(_bt_forced); \
 			                            if (_btft == TAG_TEN || _btft == TAG_DP0 || _btft == TAG_DP1 || \
-			                                (_btft == TAG_TOP && (_btfu == UOP_SUM || _btfu == UOP_RMAX))) { \
+			                                (_btft == TAG_TOP && _btfu != UOP_GRAD)) { \
 			                                bt0 = _bt_forced; bt1 = bt; _bt_split_done = 1; \
 			                            } \
 			                        } \

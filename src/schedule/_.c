@@ -708,6 +708,23 @@ static int step_top_arg0_ready(Term t) {
     return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM || tag == TAG_SUP;
 }
 
+/* Mirror of reduce_fuse_child_absorbable in reduce/_.c. A raw compute TOP
+ * child is acceptable — thvm_fuse_public_term will wrap it in FUSE via
+ * thvm_fuse_wrap_child during kernel construction. Without this relaxed
+ * predicate the step-trace predictor stalls on FUSE(MUL(EXPAND, t)) and
+ * never reports the FUSE as a next redex, so the step trace ends with
+ * the FUSE wrappers still present instead of KERNELs. */
+static int step_fuse_child_absorbable(TinyHVM *ctx, Term child) {
+    if (thvm_kernel_local_child_ready(ctx, child)) return 1;
+    if (term_tag(child) == TAG_TOP) {
+        u32 cu = term_ext(child);
+        if (is_binary(cu) || is_elementwise(cu) || cu == UOP_SUM ||
+            cu == UOP_RMAX || is_view_op(cu) || cu == UOP_FUSE)
+            return 1;
+    }
+    return 0;
+}
+
 static int step_fuse_payload_top_ready(TinyHVM *ctx, Term t) {
     if (!ctx || term_tag(t) != TAG_TOP) return 0;
     u32 uop = term_ext(t);
@@ -718,12 +735,12 @@ static int step_fuse_payload_top_ready(TinyHVM *ctx, Term t) {
         return 0;
     u64 loc = term_val(t);
     if (loc == 0 || loc >= ctx->heap_pos) return 0;
-    if (!thvm_kernel_local_child_ready(ctx, heap_read(ctx, loc + 0)))
+    if (!step_fuse_child_absorbable(ctx, heap_read(ctx, loc + 0)))
         return 0;
     if (!is_binary(uop) && is_elementwise(uop))
         return 1;
     if (loc + 1 >= ctx->heap_pos) return 0;
-    return thvm_kernel_local_child_ready(ctx, heap_read(ctx, loc + 1));
+    return step_fuse_child_absorbable(ctx, heap_read(ctx, loc + 1));
 }
 
 static int step_fuse_payload_ready(TinyHVM *ctx, Term t) {

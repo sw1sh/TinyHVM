@@ -74,6 +74,23 @@ static inline int reduce_top_has_add_zero_arg(TinyHVM *ctx, Term t) {
            (term_tag(b) == TAG_NUM && term_as_f32(b) == 0.0f);
 }
 
+/* A FUSE child is "absorbable" when thvm_fuse_public_term can either
+ * bind it as a kernel leaf (TEN/KERNEL/atom) OR wrap it in FUSE so it
+ * fires next. Compute-like raw TOPs (ADD/MUL/.../view ops) fall into
+ * the second bucket via thvm_fuse_wrap_child. Rejecting them here
+ * strands the parent FUSE forever when the outer scheduler pipeline
+ * is not going to run (e.g. during pure IC step tracing). */
+static inline int reduce_fuse_child_absorbable(TinyHVM *ctx, Term child) {
+    if (thvm_kernel_local_child_ready(ctx, child)) return 1;
+    if (term_tag(child) == TAG_TOP) {
+        u32 cu = term_ext(child);
+        if (is_binary(cu) || is_elementwise(cu) || cu == UOP_SUM ||
+            cu == UOP_RMAX || is_view_op(cu) || cu == UOP_FUSE)
+            return 1;
+    }
+    return 0;
+}
+
 static inline int reduce_fuse_payload_top_ready(TinyHVM *ctx, Term t) {
     if (!ctx || term_tag(t) != TAG_TOP) return 0;
     u32 uop = term_ext(t);
@@ -84,12 +101,12 @@ static inline int reduce_fuse_payload_top_ready(TinyHVM *ctx, Term t) {
         return 0;
     u64 loc = term_val(t);
     if (loc == 0 || loc >= ctx->heap_pos) return 0;
-    if (!thvm_kernel_local_child_ready(ctx, heap_read(ctx, loc + 0)))
+    if (!reduce_fuse_child_absorbable(ctx, heap_read(ctx, loc + 0)))
         return 0;
     if (!is_binary(uop) && is_elementwise(uop))
         return 1;
     if (loc + 1 >= ctx->heap_pos) return 0;
-    return thvm_kernel_local_child_ready(ctx, heap_read(ctx, loc + 1));
+    return reduce_fuse_child_absorbable(ctx, heap_read(ctx, loc + 1));
 }
 
 static inline int reduce_fuse_payload_ready(TinyHVM *ctx, Term t) {

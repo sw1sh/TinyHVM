@@ -1,5 +1,91 @@
 # Plan: Recursive GRAD Learning Loop — Status & Open Work
 
+## Status (2026-04-18, late) — MATMUL-IN-LOOP STILL OPEN
+
+The twoparam_grad case is resolved (see below). A separate bug was
+found in `test_tiny_linear_sgd_loop` (matmul in a training loop)
+that cron-loop bisection has localised but not fixed.
+
+### Matmul-in-loop bug — current narrowing
+
+Minimum trigger (commit `0aa157e` and follow-ups):
+- Forward contains a reduction (SUM/RMAX) producing a TEN with
+  singleton dims (stride 0 on reduced axes)
+- Downstream self-MUL on that reduction's output (e.g. MUL(X, X)
+  where X = sum_axes(expand(w, …), {ax}))
+- grad_multi_keep on this loss
+- Forward expression evaluated through REF + book→dyn ALO realize
+
+Observed: gw collapses to scalar — gw[k, j] = s · sum_i(x[i, k])
+uniform over j, with s = the [0,0] element of the correct gy.
+
+Bisection matrix:
+| Path                                       | Result |
+|--------------------------------------------|--------|
+| Pure compute, no grad                      | PASS   |
+| grad + ASSIGN, no loop/REF                 | PASS   |
+| grad + MAT-CTR, pre-eval'd bundle, no REF  | PASS   |
+| grad + REF with pre-eval'd bundle          | PASS   |
+| grad + MAT-CTR defer via REF               | FAIL   |
+| grad + REF body, no MAT-CTR                | FAIL   |
+| grad OUTSIDE REF on loss from REF body     | FAIL   |
+| direct LAM-APP in dyn heap                 | PASS   |
+| forward-only (no grad) via REF             | PASS   |
+| forward user-DUP⊳SUM via REF               | PASS   |
+
+Key observations:
+- MAT-CTR defer is NOT the trigger (commit `1a9dd51`).
+- Direct LAM-APP works; the issue is specifically book→dyn ALO
+  realization (commit `0aa157e`).
+- Forward IC through ALO works (test_dup_sum_forward_ref,
+  commit `afec3da`); only backward via BG on an ALO-realized
+  SUM output breaks.
+- EXPAND + self-MUL through ALO works (commit `a2dc053`); the
+  reduction's singleton-dim output is what triggers.
+- DETACH cleanly short-circuits — no memory corruption,
+  confirming the collapse needs live gradient flow (commit
+  `7ad295a`).
+
+### Attempted fixes that did NOT work
+1. `term_clone_r` TAG_TOP ShapeTracker preservation (`2e0e847`)
+2. DUP⊳TOP commute ShapeTracker preservation (`ed54175`)
+3. `thvm_kernel_normalize_compute` tracker preservation (`34e26fb`)
+4. BG rule fresh labels instead of 0 (`8274630`) — defensively
+   correct, no behavioural change on this bug
+5. Witness heap slot for DP-token grad targets — reverted
+6. `thvm_track_top_shape` recompute at ALO-realize time —
+   catastrophic garbage values (ALO children views aren't
+   resolved yet), reverted
+
+### Tests isolating the bug
+- `test_matmul_grad_mat_ref_noassign` — minimal failing repro
+  (matmul variant)
+- `test_sum_sq_ref_nomat` — simpler failing repro (SUM +
+  self-MUL, no matmul needed)
+- `test_sum_sq_noref` — passing counterpart (no REF)
+- `test_sum_sq_lam_app` — passing direct LAM-APP variant
+- `test_dup_sum_forward_ref` — forward user-DUP via REF works
+- `test_kernel_out_sq_ref` — self-MUL on elementwise kernel
+  output (no reduction) works
+
+### Fix directions for future iterations
+1. **ALO-force hook**: when an ALO-suspended SUM child finally
+   resolves, recompute its parent's tracker using the resolved
+   child's view. Tracker rebuild at ALO-realize time failed
+   because children are still suspended then.
+2. **Eager reduction realization**: at ALO realize for a
+   reduction TOP (SUM/RMAX), force the reduction to dispatch
+   early so it's a concrete TEN (atomic, no DUP commute
+   issues). Violates "no eager eval in rules" policy but may
+   be the only IC-clean fix.
+3. **DUP⊳ALO'd-TOP specialization**: custom commute rule
+   for DP firing on a TOP whose source is an ALO. Resolve
+   the ALO first, then commute with the resolved dyn term.
+4. **Fuse BG DUP with forward dedup**: forward MUL(X, X)
+   dedups X in the kernel builder. Make backward's BG rule
+   do the same — when at==bt semantically (even through
+   ALO indirection), avoid parallel DUPs.
+
 ## Status (2026-04-18) — RESOLVED
 
 Multi-target GRAD in the recursive training loop works correctly for the

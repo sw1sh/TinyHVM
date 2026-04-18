@@ -674,8 +674,11 @@ era_continue:
 	                    Term child = heap_read(ctx, val_loc + i);
 	                    u8 ct = term_tag(child);
 	                    // Copyable atoms commute by shared reference.
+	                    // TAG_ALO is memoized — sharing by reference is safe
+	                    // because force returns the same realized value for
+	                    // every consumer (or fresh-DUP-wraps for DP results).
 	                    if (ct == TAG_TEN || ct == TAG_NUM || ct == TAG_ERA ||
-	                        ct == TAG_ANY || ct == TAG_CTR) {
+	                        ct == TAG_ANY || ct == TAG_CTR || ct == TAG_ALO) {
 	                        heap_set(ctx, r0 + i, child);
 	                        heap_set(ctx, r1 + i, child);
 	                    } else {

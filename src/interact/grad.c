@@ -66,12 +66,6 @@
                                 (_tt) = _sub; \
                                 continue; \
                             } \
-                            if (_tag == TAG_ALO) { \
-                                Term _forced = thvm_interact(ctx, _tt); \
-                                if (_forced == (_tt)) break; \
-                                (_tt) = _forced; \
-                                continue; \
-                            } \
                             break; \
                         } \
 	                } while (0)
@@ -411,18 +405,6 @@
 	                        _ok; })
 	                    #define GRAD_SPLIT_AT() do { \
 	                        if (!_at_split) { \
-	                            if (GRAD_ALO_SAFE_TO_FORCE(at)) { \
-	                                Term _at_forced = thvm_force_tensor_term(ctx, at); \
-	                                u8 _atft = term_tag(_at_forced); \
-	                                u32 _atfu = term_ext(_at_forced); \
-	                                if (_atft == TAG_TEN || _atft == TAG_DP0 || _atft == TAG_DP1 || \
-	                                    (_atft == TAG_TOP && _atfu != UOP_GRAD)) { \
-	                                    at_cons = at; \
-	                                    at = _at_forced; \
-	                                    _at_split = 1; \
-	                                    break; \
-	                                } \
-	                            } \
 	                            u64 _ad = heap_alloc(ctx, 1); \
 	                            heap_set(ctx, _ad, at); \
 	                            u32 _alab = thvm_fresh_label(ctx); \
@@ -501,17 +483,7 @@
 			                        Term gy0 = term_new(TAG_DP0, _gylab, _gyd); \
 			                        Term gy1 = term_new(TAG_DP1, _gylab, _gyd); \
 			                        Term bt0 = term_era(), bt1 = term_era(); \
-			                        int _bt_split_done = 0; \
-			                        if (GRAD_ALO_SAFE_TO_FORCE(bt)) { \
-			                            Term _bt_forced = thvm_force_tensor_term(ctx, bt); \
-			                            u8 _btft = term_tag(_bt_forced); \
-			                            u32 _btfu = term_ext(_bt_forced); \
-			                            if (_btft == TAG_TEN || _btft == TAG_DP0 || _btft == TAG_DP1 || \
-			                                (_btft == TAG_TOP && _btfu != UOP_GRAD)) { \
-			                                bt0 = _bt_forced; bt1 = bt; _bt_split_done = 1; \
-			                            } \
-			                        } \
-			                        if (!_bt_split_done) { \
+			                        { \
 			                            u64 _btd = heap_alloc(ctx, 1); \
 			                            heap_set(ctx, _btd, bt); \
 			                            u32 _btlab = thvm_fresh_label(ctx); \

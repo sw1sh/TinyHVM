@@ -750,15 +750,15 @@
                                 }
 	                                GRAD_RETURN(GRAD_ERASE(gy));
 	                            }
-	                            default: GRAD_RETURN(GRAD_ERASE(gy));
+	                            default: GRAD_ZERO(gy);
 	                        }
                         #undef GRAD2_TEN
                         #undef WALK
                     }
                 }
-	                // y is TAG_TOP but not handled by GRAD_TOP above → ERA
+	                // Unknown y shape → no local derivative contribution → NUM(0).
 	                if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  GRAD_FALLTHROUGH: y_tag=%u y_ext=%u y_val=%llu\n", term_tag(y), term_ext(y), term_val(y));
-	                GRAD_RETURN(GRAD_ERASE(gy));
+	                GRAD_ZERO(gy);
                     #undef GRAD_SLOT_ACCUM
                     #undef GRAD_COMBINE
                     #undef GRAD_KEEP_SEQ2

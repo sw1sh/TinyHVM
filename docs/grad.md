@@ -4,6 +4,37 @@ GRAD is the backward-mode automatic differentiation agent in TinyHVM's interacti
 It propagates through the compute graph as a first-class IC node, following standard
 interaction calculus rules.
 
+## Design Principles
+
+1. **Pure rewriting.** GRAD is an interaction rule. Its firing consumes its
+   principal pair and emits replacement terms on the heap. No internal call
+   to `thvm_reduce`, `thvm_interact`, `thvm_force_tensor_term`, or any other
+   full-reducer. Forcing forward evaluation from inside a rule defeats
+   compositional backward — the forced TEN loses provenance into the
+   TAG_TOP branch and falls into the degenerate TEN path.
+
+2. **Chain rule as rewriting.** `GRAD⊳f(x)` rewrites to DUP of operands
+   (one copy feeds forward `f`, one feeds the local derivative `df`) and
+   a recursive `GRAD` on the inner term. No `creator_op` / `src_ids` /
+   forward-tape walk. The per-op backward rule (`UG`, `BG`, `BG_GY`) emits
+   the rewrite; recursion proceeds by normal IC reduction.
+
+3. **GRAD⊳TEN is a matcher.** When GRAD reaches a TEN leaf, there are
+   only two cases:
+   - Leaf is the target → emit `NUM(1.0)` (or accumulate `gy` into the
+     multi-target bundle, which is the bundled-form equivalent).
+   - Leaf is not the target → emit `NUM(0.0)`.
+   No `requires_grad` inspection, no provenance switch, no ERA.
+
+4. **Zero is NUM(0), not ERA.** A gradient of zero is a real value. Use
+   `NUM(0.0)` so downstream arithmetic simplifies (`MUL(_, NUM(0)) →
+   NUM(0)`, `ADD(_, NUM(0)) → _`) and branches drop naturally.
+
+5. **Forward compute TOPs stay as TOPs through backward.** GRAD walks
+   the TAG_TOP compositional branch. Forward materialization of compute
+   TOPs into TENs before GRAD reaches them is a scheduler bug, not
+   something the GRAD rule should paper over.
+
 ## Node Structure
 
 GRAD is a **2-port node**:
@@ -24,22 +55,31 @@ GRAD is a **2-port node**:
 GRAD does NOT allocate tensors on construction. The seed gradient is a scalar tensor
 matching the loss dtype, created by `thvm_grad_seed_like()`.
 
-## Label Matching (Differentiate vs Annihilate)
+## GRAD⊳TEN: the matcher
 
-GRAD works like labeled nodes in HVM. When GRAD reaches a `TAG_TEN` leaf, the outcome
-depends on whether the GRAD label matches the tensor:
+When GRAD reaches a `TAG_TEN` leaf:
 
-| GRAD label | TEN leaf | Result |
-|------------|----------|--------|
-| matches (target tensor) | requires_grad=true | **Differentiate**: return gy (or accumulate) |
-| doesn't match | requires_grad=true | **Annihilate**: ERA the gradient |
-| any | requires_grad=false | **Annihilate**: ERA the gradient |
-| any | has creator_op | **Walk**: continue backward through provenance |
+| case | result |
+|------|--------|
+| leaf == target (single-target mode) | return `gy` (the `NUM(1)`·`gy` chain product) |
+| leaf ∈ multi-target set | accumulate `gy` into the bundle slot, return `NUM(0.0)` |
+| leaf ∉ targets | return `NUM(0.0)` (and ERA the incoming `gy` branch) |
 
 Matching is resolved via the `GradTargetSet` — a table of `(term, tid, slot)` entries
 keyed by GRAD heap location. The pattern stored in `x` can be:
 - `TAG_TEN` (single target) — match one specific tensor
-- `TAG_ANY` (wildcard) — match all requires_grad tensors
+- `TAG_ANY` (wildcard) — match against the target set
+
+### Legacy: TEN-provenance walk
+
+For tensors whose forward compute materialized eagerly into TEN (movement
+ops like RESHAPE/PERMUTE/EXPAND applied in-place at tensor construction),
+there is a compatibility walk that emits `GRAD(src_ten, inverse_view(gy))`
+— essentially re-doing the work that the TAG_TOP compositional rule would
+have done if the movement had stayed a TOP. This walk is bounded to
+movement ops only; all other `creator_op` values fall through to
+`NUM(0.0)`. The long-term direction is to keep movement ops as TOPs and
+delete this walk.
 
 ## GRAD Modes
 
@@ -90,7 +130,13 @@ GRAD interacts with lazy compute ops via backward rules:
 - `UOP_RMAX`: masked expansion based on argmax
 
 **Non-differentiable**:
-- `UOP_CMP`: `GRAD_ERASE(gy)` — comparison ops have zero gradient
+- `UOP_CMP`: `NUM(0.0)` — comparison ops have zero gradient
+
+### Fallthrough
+
+Any TAG_TOP uop not listed above, or an unrecognized `y` tag, falls
+through to `NUM(0.0)` (not ERA). Gradient = 0 is a real value and
+propagates correctly through downstream `MUL`/`ADD` simplification.
 
 ### Superposition (TAG_SUP)
 - Split into two GRAD branches with DP0/DP1 labels (DUP fan-out)
@@ -252,16 +298,23 @@ the eventual releases by ERA⊳TEN on downstream consumers.
 
 ## Known Limitation
 
-`test_tiny_twoparam_grad_loop` — a recursive SGD loop using
-`thvm_grad_multi_keep` inside `REF`-based recursion — still fails the
-assertion. No crash, but `update_w`'s SUB reduces to ERA somewhere in the
-loop-state unfolding. The SUB-bit rewrite did not fix this; investigation
-in the grad/scheduler path, not the DUP layer, is required.
+`test_tiny_twoparam_grad_loop` still fails the assertion across the
+full 3-step loop. As of the 2026-04-21 pure-rewriting pass:
+
+- Gradients flow (w/b update each iteration) — no longer frozen.
+- Single-step (`test_tiny_twoparam_noloop`) passes exact.
+- Loop iteration accumulates a ~0.8× scale on `b` gradient vs host.
+  Root cause appears to be a DP1-asymmetric path under the HVM4 SUB-bit
+  DUP when `ADD(DP0_of_A, DP0_of_B)` vs `ADD(DP1_of_A, DP1_of_B)` feed
+  into the bundle accumulator. This is a DUP-commutation detail, not a
+  GRAD rule issue — investigate in the combinators layer.
 
 Non-loop tests pass:
 - [`test/test_mm_dup_exp_sum.m`](../test/test_mm_dup_exp_sum.m) — MM+DUP+EXP+SUM
 - [`test/test_mm_dup_2arm.m`](../test/test_mm_dup_2arm.m) — MM+DUP+SUM (MNIST pattern)
 - [`test/test_dup_chain.m`](../test/test_dup_chain.m) — 5-deep DUP chain with CTR-wrapped ERA arm
+- [`test/test_backward_minimal_cpu.m`](../test/test_backward_minimal_cpu.m) — mul/mm/linear+bias keep
+- [`test/test_tiny_twoparam_noloop.m`](../test/test_tiny_twoparam_noloop.m) — single-step multi-target GRAD
 
 ## Bounded Recursion Guards (implementation detail)
 

@@ -1558,9 +1558,10 @@ static int thvm_reduce_step_collect(TinyHVM *ctx, Term *traced_io,
 
         if (term_tag(target_before) == TAG_TOP && term_ext(target_before) == UOP_GRAD) {
             for (u64 i = 1; i < ctx->heap_pos; i++)
-                if (ctx->heap[i] == target_before) ctx->heap[i] = hr;
+                if (ctx->heap[i] == target_before)
+                    heap_set(ctx, i, hr);
         } else {
-            ctx->heap[target_slot] = hr;
+            heap_set(ctx, target_slot, hr);
         }
         if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
             heap_set(ctx, step_root_slot, traced);
@@ -2116,7 +2117,7 @@ static void sched_replace_term_everywhere(TinyHVM *ctx, Term original, Term rewr
             (u32)term_tag(original), (u32)term_ext(original), (unsigned long long)term_val(original),
             (u32)term_tag(rewritten), (u32)term_ext(rewritten), (unsigned long long)term_val(rewritten));
     for (u64 h = 1; h < ctx->heap_pos; h++)
-        if (ctx->heap[h] == original) ctx->heap[h] = rewritten;
+        if (ctx->heap[h] == original) heap_set(ctx, h, rewritten);
 }
 
 static u32 sched_count_term_occurrences(TinyHVM *ctx, Term t) {

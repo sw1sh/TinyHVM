@@ -1040,14 +1040,6 @@ typedef struct {
     Term result;   // TAG_APP term (== heap loc since TAG_APP=0)
 } HCSlot;
 
-#define DUP_PORT_CAP (1U << 16)
-#define DUP_PORT_MAX_REFS 8
-typedef struct {
-    u64 dup_loc;
-    u64 port_slot[2][DUP_PORT_MAX_REFS];
-    u8  port_count[2];
-} DupPortEntry;
-
 #define SCHED_REWRITE_CAP (1U << 16)
 typedef struct {
     u64 top_loc;
@@ -1137,7 +1129,6 @@ typedef struct TinyHVM_s {
 
     // Hash-consing table (NULL = disabled, lazy-allocated by thvm_app_hc)
     HCSlot     *hc_table;
-    DupPortEntry *dup_ports;
     SchedRewriteEntry *sched_rewrites;
     AloState   *alo_states;
     u32         alo_state_count;
@@ -1171,102 +1162,6 @@ static inline Term term_era(void);
 static inline u32  term_tag(Term t);
 static inline u32  term_ext(Term t);
 static inline u64  term_val(Term t);
-
-static inline DupPortEntry *thvm_dup_ports_find(TinyHVM *ctx, u64 dup_loc, int create) {
-    if (!ctx || !ctx->dup_ports || dup_loc == 0) return NULL;
-    u32 idx = (u32)((dup_loc * 11400714819323198485ull) & (DUP_PORT_CAP - 1));
-    for (u32 probe = 0; probe < DUP_PORT_CAP; probe++, idx = (idx + 1) & (DUP_PORT_CAP - 1)) {
-        DupPortEntry *e = &ctx->dup_ports[idx];
-        if (e->dup_loc == dup_loc) return e;
-        if (e->dup_loc == 0) {
-            if (!create) return NULL;
-            e->dup_loc = dup_loc;
-            e->port_count[0] = 0;
-            e->port_count[1] = 0;
-            for (u32 i = 0; i < DUP_PORT_MAX_REFS; i++) {
-                e->port_slot[0][i] = 0;
-                e->port_slot[1][i] = 0;
-            }
-            return e;
-        }
-    }
-    return NULL;
-}
-
-static inline void thvm_dup_port_remember(TinyHVM *ctx, u64 slot, Term t) {
-    u8 tag = term_tag(t);
-    if (tag != TAG_DP0 && tag != TAG_DP1) return;
-    DupPortEntry *e = thvm_dup_ports_find(ctx, term_val(t), 1);
-    if (!e) return;
-    u32 pi = (tag == TAG_DP1) ? 1 : 0;
-    for (u32 i = 0; i < e->port_count[pi]; i++)
-        if (e->port_slot[pi][i] == slot) return;
-    if (e->port_count[pi] < DUP_PORT_MAX_REFS)
-        e->port_slot[pi][e->port_count[pi]++] = slot;
-}
-
-static inline void thvm_dup_port_forget(TinyHVM *ctx, u64 slot, Term t) {
-    u8 tag = term_tag(t);
-    if (tag != TAG_DP0 && tag != TAG_DP1) return;
-    u64 dup_loc = term_val(t);
-    DupPortEntry *e = thvm_dup_ports_find(ctx, dup_loc, 0);
-    if (!e) return;
-    u32 pi = (tag == TAG_DP1) ? 1 : 0;
-    for (u32 i = 0; i < e->port_count[pi]; i++) {
-        if (e->port_slot[pi][i] == slot) {
-            u32 last = e->port_count[pi] - 1;
-            e->port_slot[pi][i] = e->port_slot[pi][last];
-            e->port_slot[pi][last] = 0;
-            e->port_count[pi] = (u8)last;
-            /* Refcount cleanup: if both ports now have zero tracked
-             * consumer cells, the DUP is unreferenced. Clear the body
-             * so its structure can be garbage-collected by subsequent
-             * ERA interactions on orphaned references. This is the
-             * "last reference drops" side of refcount semantics for
-             * the transparent-DP-projection rule. */
-            if (e->port_count[0] == 0 && e->port_count[1] == 0 &&
-                dup_loc < ctx->heap_pos) {
-                Term body = ctx->heap[dup_loc];
-                if (term_tag(body) != TAG_ERA) {
-                    ctx->heap[dup_loc] = term_era();
-                }
-            }
-            return;
-        }
-    }
-}
-
-static inline u64 thvm_dup_port_slot(TinyHVM *ctx, u64 dup_loc, u32 port) {
-    DupPortEntry *e = thvm_dup_ports_find(ctx, dup_loc, 0);
-    if (!e || port > 1) return 0;
-    if (e->port_count[port] == 0) return 0;
-    if (getenv("THVM_DUP_USE_FIRST"))
-        return e->port_slot[port][0];
-    return e->port_slot[port][e->port_count[port] - 1];
-}
-
-static inline u32 thvm_dup_port_count(TinyHVM *ctx, u64 dup_loc, u32 port) {
-    DupPortEntry *e = thvm_dup_ports_find(ctx, dup_loc, 0);
-    if (!e || port > 1) return 0;
-    return e->port_count[port];
-}
-
-static inline u64 thvm_dup_port_slot_at(TinyHVM *ctx, u64 dup_loc, u32 port, u32 idx) {
-    DupPortEntry *e = thvm_dup_ports_find(ctx, dup_loc, 0);
-    if (!e || port > 1 || idx >= e->port_count[port]) return 0;
-    return e->port_slot[port][idx];
-}
-
-static inline void thvm_dup_ports_clear_entry(TinyHVM *ctx, u64 dup_loc) {
-    DupPortEntry *e = thvm_dup_ports_find(ctx, dup_loc, 0);
-    if (!e) return;
-    e->port_count[0] = 0;
-    e->port_count[1] = 0;
-    for (u32 i = 0; i < DUP_PORT_MAX_REFS; i++) {
-        e->port_slot[0][i] = 0;
-        e->port_slot[1][i] = 0;
-    }
-}
 
 // ────────────────────────────────────────────────────────────────────
 // Diagnostic flags — cheap env-var probes for targeted investigation.

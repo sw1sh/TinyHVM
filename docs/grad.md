@@ -134,174 +134,152 @@ Term thvm_grad_multi_keep(ThvmCtx* ctx, Term loss,
 
 ---
 
-# How Sharing Interacts with GRAD: the DUP/ERA Protocol
+# How Sharing Interacts with GRAD: HVM4-style SUB-bit DUP
 
-> This section documents the theory landed 2026-04-19 that finally resolved the
-> MM+DUP backward grad-drop (after 20+ attempts). It explains *why* DUP, ERA,
-> and GRAD compose correctly for shared subexpressions — the subtle invariants
-> that break if you use the wrong rule.
+> **History.** The earlier "transparent DP + refcount body-clear" protocol
+> was replaced 2026-04-20 with an HVM4-style substitution model after the
+> refcount side channel proved fragile. The new scheme is local, uses no
+> global tracking table, and removes ~250 lines of bookkeeping code.
 
 ## The Problem Shape
-
-Consider a program that duplicates a compute node and reads both projections:
 
 ```
 (l1, l2) = DUP(MM(x, W))
 loss     = sum(exp(l1)) + sum(exp(l2))
 ```
 
-Expected `∂loss/∂W = 2 · xᵀ @ exp(logits)` — both arms contribute.
+Expected `∂loss/∂W = 2 · xᵀ @ exp(logits)` — both arms must contribute.
 
-The classical IC `DUP ⊳ TOP` **commutation rule** (creates per-arm copies
-with sub-DUPs for every non-atom child) produces correct forward values, but
-for backward it creates the **grad-drop bug**: each non-atom child becomes a
-fresh sub-DUP whose port tracking has two slots; `DUP_STATE_RETURN` writes
-the post-fire value only to the **latest** tracked slot, orphaning the other.
-The orphaned arm's backward chain reads ERA and dies silently. `W` gets only
-one arm's gradient; the other is lost.
+## Mechanism
 
-## The Correct Theory (three cooperating rules)
+Each DUP cell at heap slot `L` holds one of:
 
-The resolution is that `DUP` should not eagerly fire when its body is pure
-compute — it is a **transparent projection**, not an effect. Three rule
-changes cooperate:
+- **body** (plain term) — DUP not yet fired.
+- **SUB(value)** — either
+  (a) the other aux already fired normally and left *our* pre-computed clone
+  here (HVM4 `heap_subst_cop` pattern), or
+  (b) the other aux's consumer was erased and the DUP collapsed to
+  identity — `value` is body itself, this surviving aux takes it as-is.
+  Both cases share the same reader: strip the SUB bit and return the stored
+  term.
+- **ERA** — the DUP has been fully consumed/swept.
 
-### Rule 1: DP as transparent projection for pure compute TOP
+The SUB bit is the existing `term_set_sub` flag (bit 63), previously only
+used on VAR binder slots. The DUP slot and the VAR slot never share
+readers, so reusing the bit is safe.
 
-When a `TAG_DP0` or `TAG_DP1` dispatch reads `val = heap[dup_loc]` and finds
-a pure-compute `TAG_TOP` (any uop that is not `UOP_DETACH`, `UOP_ASSIGN`,
-`UOP_KERNEL`, `UOP_EXEC`, or `UOP_GRAD`), **do not fire the DUP**. Simply
-`RETURN_REDUCED(val)`. Both consumers read `body` through DP transparently
-each time. The DUP node stays intact with port tracking intact.
+### DP aux reduce (consumer pulls its DP)
+
+Ported from [HVM4 `wnf/_.c` DP0/DP1 dispatch](../../HVM4/clang/wnf/_.c)
+and [`heap_subst_cop`](../../HVM4/clang/heap/subst_cop.c):
 
 ```
-DP0(dup_loc) reduces  →  heap_read(dup_loc)  →  val (TOP)
-                         return val directly
-                         — no port_slot writes
-                         — no commutation
-                         — no sub-cdup creation
+cell = heap[dup_loc]
+if term_is_sub(cell):
+    # sibling already fired or collapsed-to-identity; take the value
+    return term_strip_sub(cell)
+else:
+    # fire DUP⊳WHNF(cell). Produce (r0, r1) per the rule for cell's tag
+    # (annihilate, commute, atom, TEN-incref, etc.).
+    sibling = (my_side == 0) ? r1 : r0
+    mine    = (my_side == 0) ? r0 : r1
+    heap[dup_loc] = term_set_sub(sibling)    # sibling reads this later
+    return mine
 ```
 
-This is [`src/interact/combinators.c`](../src/interact/combinators.c) in the
-`case TAG_DP0: case TAG_DP1:` dispatch, just after reading `val`.
+Implementation: [`src/interact/combinators.c` DP0/DP1
+dispatch](../src/interact/combinators.c) + the `DUP_STATE_RETURN` macro.
 
-### Rule 2: Refcount-based DUP cleanup on `port_forget`
+### ERA⊳DP (garbage-collection-style, local)
 
-When does the shared body get garbage-collected? Answer: when the *last*
-consumer drops its DP ref. Implementation is in
-[`thvm_dup_port_forget`](../src/tinyhvm.h): after decrementing the port
-count for a tracked slot, check if both `port_count[0] == 0` and
-`port_count[1] == 0`. If yes, the DUP is unreferenced — clear the body to
-`ERA`:
+When a consumer slot holding `DPx_L` is erased, the DUP cell at `L` needs
+to handle "one of my aux consumers just went away":
 
-```c
-if (e->port_count[0] == 0 && e->port_count[1] == 0) {
-    ctx->heap[dup_loc] = term_era();  // last ref dropped, body is garbage
-}
+```
+cell = heap[L]
+if term_is_sub(cell):
+    # sibling already fired and left a clone for us, but we got erased
+    # before consuming it. Emit a visible detached ERA on the orphan.
+    thvm_spawn_detached_era(ctx, term_strip_sub(cell))
+    heap[L] = ERA
+else:
+    # first aux to drop. Body survives for the sibling to take as identity.
+    heap[L] = term_set_sub(cell)
 ```
 
-This is the "shared resource lifetime" side of refcount semantics. ERA on a
-*reference* (e.g., `heap_set(cell, ERA)` on a consumer cell holding a DP ref)
-only erases that one reference — `port_forget` removes the slot from
-tracking. The body lives on as long as any consumer holds a DP. When the
-final reference drops, body is ERA'd and the standard `ERA ⊳ TOP` cascade
-cleans up its args. **This is NOT deferred garbage collection** — it's
-refcounted cleanup at the moment of last-reference drop.
-
-### Rule 3: `MAT-CTR` eager binding
-
-A deadlock arises under rule 1 in programs with multi-target gradient + LAM
-destructuring (`thvm_grad_multi_keep` → `MAT(lam, ctr)`):
-
-- The CTR's children are unreduced compute TOPs (the grad formulas).
-- The LAM body contains backward chains that reference `VAR`s only
-  `MAT-CTR` can substitute.
-- Pre-fix, `MAT-CTR` deferred on unreduced compute TOP children, waiting
-  for the scheduler to materialize them to TENs first.
-- But the scheduler can't build kernels for chains with unbound `VAR`s.
-- Deadlock.
-
-Fix: [`src/interact/combinators.c` APP-MAT-CTR rule](../src/interact/combinators.c)
-— remove the "defer on non-movement TOP child" guard. The LAM body binds
-compute TOPs directly and reduces them on demand. The `VAR`s get their
-values, the scheduler can then make progress, kernels dispatch, everything
-resolves.
+This is local: touches only `heap[L]`. No sibling-slot lookup, no global
+table. The detached ERA emitted in the SUB case keeps cleanup visible in
+the step graph (no silent orphans).
 
 ## Why This Composes Correctly
 
-The key invariant: **ERA on a DP reference does not destroy shared structure**.
+- No `DupPortEntry` / `port_slot` / `port_count`: no global hash table,
+  no stale entries from raw writes, no side channel.
+- `heap_set` is a plain write — any code path (including scheduler
+  rewrites, parallel workers, step-trace) can update slots without
+  breaking DUP invariants.
+- The DUP cell itself is the meeting point for both auxes, coordinating
+  by the SUB bit in its body slot.
+- Identity-collapse after one-aux ERA avoids the wasteful clone
+  allocation entirely (the surviving aux reads body directly).
 
-- `heap_set(cell, ERA)` where `cell` held `DP0(dup)` → `port_forget` drops
-  `cell` from DUP's port tracking. Count decrements. If 0/0, body ERA'd via
-  rule 2. Otherwise, the DUP still has live consumers and the body stays.
+## Transparent Projection for Pure Compute TOP
 
-- The existing `ERA ⊳ TAG_DP0/DP1` rule ([combinators.c:373](../src/interact/combinators.c#L373))
-  handles the case where an active ERA reduces *against* a DP: it collapses
-  the DUP, projecting the body to the other port's tracked slot. That is
-  also refcount-correct: one consumer ERAing projects the value to the
-  remaining consumer.
-
-- The `ERA ⊳ TAG_TOP` cascade at [combinators.c:422](../src/interact/combinators.c#L422)
-  fires only when the TOP is genuinely orphaned (e.g., the DUP body was
-  cleared by rule 2 because all consumers released, and then something
-  tries to ERA the orphan). At that point the cascade is correct — no
-  other consumer references the args.
+The pre-fire early-return for pure compute TOP bodies is *kept*: when a
+DP reduces and reads a non-effectful `TAG_TOP` at the DUP cell, both
+auxes can share the same TAG_TOP handle without firing the DUP (the
+scheduler materializes the TOP once and both auxes read the resulting
+TEN). Effectful uops (`UOP_ASSIGN`, `UOP_KERNEL`, `UOP_EXEC`,
+`UOP_DETACH`, `UOP_GRAD`) still go through the full fire + subst_cop
+path.
 
 ## GRAD Walks Compose
 
-Under these rules, two backward arms of a `DUP(TOP)` both resolve through
-the preserved body transparently. Each arm emits its own backward formula
-referencing the shared structure; `GRAD_RETURN` clears only the GRAD
-node's own `loc/loc+1`, never `y_loc` (the body's args). So multiple walks
-coexist. The grads accumulate at parameters via `BUNDLE_ACCUM_ADD`.
+Two backward arms of a `DUP(TOP)` both read body through the cell.
+Whichever pulls first either (a) transparently projects for pure compute
+TOP (both arms share), or (b) fires the DUP with HVM4 subst_cop (the
+other arm reads the SUB-stored clone on its pull). `GRAD_RETURN` still
+clears only the GRAD node's own `loc/loc+1`, never `y_loc`, so walks
+coexist safely.
 
-## What Still Commutes
+## TEN Refcount Notes
 
-Effectful TOPs (`UOP_ASSIGN`, `UOP_KERNEL`, `UOP_EXEC`, `UOP_DETACH`) and
-`UOP_GRAD` itself still take the classical commutation path. Their
-semantics require per-arm independence: each arm of a DUP through an
-ASSIGN must fire its own write, each KERNEL is an independent dispatch.
-
-Non-TOP compound terms (`TAG_LAM`, `TAG_BRI`, `TAG_SUP`, `TAG_ANN`) also
-still commute — they are structural compounds with scope-dependent
-substitution that would be unsound to share atomically.
-
-## Side Effect: MNIST Trains Better
-
-Because both arms of every `DUP ⊳ MM` now contribute correctly, the W
-parameter actually receives its gradient (pre-fix: W was frozen, only B
-trained, 68% ceiling). Metal MNIST goes from 68.3% → 90.2% in 3 epochs
-without any hyperparameter change.
-
-## Bounded Recursion Guards (implementation detail)
-
-Under this regime, two recursion paths need explicit caps:
-
-- `fuse_walk_inner` depth-capped at 256
-  ([src/fuse/_.c](../src/fuse/_.c)) — shared bodies can appear in walks
-  before refcount cleanup collects them.
-- `thvm_eval_internal` followup-round loop capped at 1024 iterations
-  ([src/schedule/_.c](../src/schedule/_.c)) — converted from tail
-  recursion to avoid C stack growth in programs that make genuine
-  per-round progress without finalizing (e.g., recursive train loops).
-
-Neither cap fires in healthy programs. They are safety nets.
+`DUP ⊳ TEN` does `tensor_incref(val)` before `DUP_STATE_RETURN(val, val,
+val)`. The SUB-bit reader also `incref`s when the stripped value is TEN.
+The SUB cell itself holds a reference until the DUP is ERA'd (via the
+SUB-seen-on-second-ERA path above), which balances the two increfs against
+the eventual releases by ERA⊳TEN on downstream consumers.
 
 ## Known Limitation
 
 `test_tiny_twoparam_grad_loop` — a recursive SGD loop using
-`thvm_grad_multi_keep` inside a `REF`-based recursion — fails the
-assertion. No crash, just ASSIGN doesn't fire because `update_w`'s SUB
-reduces to ERA somewhere in the loop-state unfolding. Separate
-investigation. The per-step tests `test_tiny_twoparam_noloop` and
-`test_mm_dup_exp_sum` pass, as does MNIST which exercises a similar
-MAT-CTR → SEQ → ASSIGN chain but without the recursive REF unfolding.
+`thvm_grad_multi_keep` inside `REF`-based recursion — still fails the
+assertion. No crash, but `update_w`'s SUB reduces to ERA somewhere in the
+loop-state unfolding. The SUB-bit rewrite did not fix this; investigation
+in the grad/scheduler path, not the DUP layer, is required.
 
-## Files Changed (the MM+DUP fix)
+Non-loop tests pass:
+- [`test/test_mm_dup_exp_sum.m`](../test/test_mm_dup_exp_sum.m) — MM+DUP+EXP+SUM
+- [`test/test_mm_dup_2arm.m`](../test/test_mm_dup_2arm.m) — MM+DUP+SUM (MNIST pattern)
+- [`test/test_dup_chain.m`](../test/test_dup_chain.m) — 5-deep DUP chain with CTR-wrapped ERA arm
 
-- [`src/interact/combinators.c`](../src/interact/combinators.c) — transparent DP, MAT-CTR eager
-- [`src/tinyhvm.h`](../src/tinyhvm.h) — refcount cleanup in `thvm_dup_port_forget`
-- [`src/fuse/_.c`](../src/fuse/_.c) — fuse_walk DP resolve + depth cap
-- [`src/reduce/_.c`](../src/reduce/_.c) — quiesce HEAP-fire ERA guard
-- [`src/schedule/_.c`](../src/schedule/_.c) — quiesce ROOT ERA guard + followup-round loop
-- [`test/test_mm_dup_exp_sum.m`](../test/test_mm_dup_exp_sum.m) — regression test
+## Bounded Recursion Guards (implementation detail)
+
+- `fuse_walk_inner` depth-capped at 256
+  ([src/fuse/_.c](../src/fuse/_.c)) — shared bodies can appear in walks.
+- `thvm_eval_internal` followup-round loop capped at 1024 iterations
+  ([src/schedule/_.c](../src/schedule/_.c)) — safety net for recursive
+  train loops.
+
+## Files (SUB-bit rewrite, 2026-04-20)
+
+- [`src/term/sub.c`](../src/term/sub.c) — added `term_strip_sub` helper.
+- [`src/interact/combinators.c`](../src/interact/combinators.c) — DP
+  dispatch SUB-check early return, `DUP_STATE_RETURN` rewritten to HVM4
+  subst_cop shape, ERA⊳DP rewritten to local SUB-or-sweep.
+- [`src/tinyhvm.h`](../src/tinyhvm.h) — deleted `DupPortEntry` struct and
+  all `thvm_dup_port_*` helpers.
+- [`src/heap/set.c`](../src/heap/set.c) — reverted to plain write.
+- [`src/ctx/init.c`](../src/ctx/init.c) — removed `dup_ports` alloc/free.
+- New tests: [`test/test_dup_chain.m`](../test/test_dup_chain.m),
+  [`test/test_mm_dup_2arm.m`](../test/test_mm_dup_2arm.m).

@@ -366,14 +366,27 @@
             // DUP collapse: if ERA consumes one DP port, project shared value
             // to the opposite port and clear the shared slot.
             if (vtag == TAG_DP0 || vtag == TAG_DP1) {
+                /* HVM4-style: ERA on an aux DP port is handled via the
+                 * DUP cell itself, not via a side channel into the
+                 * sibling's consumer slot. Two cases:
+                 *  a) cell has SUB bit — the sibling already fired and
+                 *     stored its clone here for us. We got erased before
+                 *     consuming it; emit an explicit detached ERA on the
+                 *     orphan clone so the step graph shows the sweep.
+                 *  b) cell has no SUB bit — we are the first aux to
+                 *     drop. Body survives so the sibling can take it
+                 *     as identity. Mark the cell SUB-of-body. */
                 u64 dl = vval;
                 if (dl < ctx->heap_pos) {
-                    u32 other_pi = (vtag == TAG_DP0) ? 1 : 0;
-                    u64 other_slot = thvm_dup_port_slot(ctx, dl, other_pi);
-                    if (other_slot > 0 && other_slot < ctx->heap_pos)
-                        heap_set(ctx, other_slot, heap_read(ctx, dl));
-                    thvm_dup_ports_clear_entry(ctx, dl);
-                    heap_set(ctx, dl, term_era());
+                    Term cell = heap_read(ctx, dl);
+                    if (term_is_sub(cell)) {
+                        Term orphan = term_strip_sub(cell);
+                        if (term_tag(orphan) != TAG_ERA)
+                            thvm_spawn_detached_era(ctx, orphan);
+                        heap_set(ctx, dl, term_era());
+                    } else {
+                        heap_set(ctx, dl, term_set_sub(cell));
+                    }
                 }
                 goto era_done;
             } else if (vtag == TAG_VAR) {
@@ -473,21 +486,27 @@ era_continue:
             u32 dp_index = (tag == TAG_DP1) ? 1 : 0;
             u32 dup_label = term_ext(t);
             u64 dup_loc = term_val(t);
-            Term val = heap_read(ctx, dup_loc); // WNF from trampoline
-            heap_set(ctx, dup_loc, val);
-            /* DP as transparent projection for pure compute TOPs: don't
-             * fire DUP eagerly. Return body directly as the reduced
-             * value. The DUP node stays intact with port tracking
-             * intact so:
-             *  - ERA on one projection → existing ERA⊳DP collapse rule
-             *    correctly transfers body to the other port (refcount
-             *    semantics via port_count).
-             *  - Multiple reads through DP each return body without
-             *    consuming the DUP.
-             *  - Backward GRAD walks resolve through DP to the shared
-             *    body without destroying structure.
-             * Effectful and LAM/BRI/SUP bodies still follow the full
-             * commute/annihilate path below. */
+            Term cell = heap_read(ctx, dup_loc);
+            /* HVM4-style consumer-driven DUP:
+             *  - cell has SUB bit → sibling fired and stored our value
+             *    here, or our sibling was ERA'd and the DUP collapsed
+             *    to identity-of-body. Either way, take the stored
+             *    value and we're done. */
+            if (term_is_sub(cell)) {
+                Term v = term_strip_sub(cell);
+                /* TEN refcount: the SUB cell counted once for the
+                 * sibling's stored ref. Reading it into this aux's
+                 * output creates another live holder. */
+                if (term_tag(v) == TAG_TEN)
+                    tensor_incref(ctx, (u32)term_val(v));
+                ctx->itrs++;
+                RETURN_REDUCED(v);
+            }
+            Term val = cell; // body, WNF from trampoline
+            /* Transparent projection for pure compute TOPs:
+             * return body directly without firing DUP so both auxes
+             * share the same TAG_TOP (materialize once, share tensor).
+             * Only non-effectful compute uops qualify. */
             if (term_tag(val) == TAG_TOP) {
                 u32 _vuop = term_ext(val);
                 if (_vuop != UOP_DETACH && _vuop != UOP_ASSIGN &&
@@ -496,76 +515,19 @@ era_continue:
                     RETURN_REDUCED(val);
                 }
             }
+            /* HVM4 heap_subst_cop: write the SIBLING's clone into this
+             * DUP cell with SUB bit set, return the FIRING aux's clone.
+             * The sibling, when its consumer later pulls it, will read
+             * the SUB cell above and take its value directly — no side
+             * channel, no sibling-slot lookup. */
             #define DUP_STATE_RETURN(_src, _dp0v, _dp1v) do { \
                 Term _v0 = (_dp0v); \
                 Term _v1 = (_dp1v); \
-                u64 _s0 = thvm_dup_port_slot(ctx, dup_loc, 0); \
-                u64 _s1 = thvm_dup_port_slot(ctx, dup_loc, 1); \
-                if (thvm_dup_diag_enabled()) { \
-                    Term _c0 = (_s0 > 0 && _s0 < ctx->heap_pos) ? heap_read(ctx, _s0) : term_era(); \
-                    Term _c1 = (_s1 > 0 && _s1 < ctx->heap_pos) ? heap_read(ctx, _s1) : term_era(); \
-                    fprintf(stderr, \
-                            "DUP_FIRE dup=%llu lab=%u fire=DP%u val=%u/%u@%llu " \
-                            "s0=%llu(cur=%u/%u@%llu)->%u/%u@%llu " \
-                            "s1=%llu(cur=%u/%u@%llu)->%u/%u@%llu%s\n", \
-                            (unsigned long long)dup_loc, \
-                            dup_label, dp_index, \
-                            (u32)term_tag(_src), (u32)term_ext(_src), \
-                            (unsigned long long)term_val(_src), \
-                            (unsigned long long)_s0, \
-                            (u32)term_tag(_c0), (u32)term_ext(_c0), \
-                            (unsigned long long)term_val(_c0), \
-                            (u32)term_tag(_v0), (u32)term_ext(_v0), \
-                            (unsigned long long)term_val(_v0), \
-                            (unsigned long long)_s1, \
-                            (u32)term_tag(_c1), (u32)term_ext(_c1), \
-                            (unsigned long long)term_val(_c1), \
-                            (u32)term_tag(_v1), (u32)term_ext(_v1), \
-                            (unsigned long long)term_val(_v1), \
-                            (_s0 == 0 || _s1 == 0) ? " [ORPHAN]" : ""); \
-                    /* If the cell being overwritten is a DP of SOME OTHER */ \
-                    /* DUP, the heap_set will port_forget that other DUP's */ \
-                    /* registration. Flag it as a teardown side effect. */ \
-                    if (_s0 > 0) { \
-                        u8 _ct = term_tag(_c0); \
-                        if ((_ct == TAG_DP0 || _ct == TAG_DP1) && \
-                            term_val(_c0) != dup_loc) { \
-                            fprintf(stderr, \
-                                    "  TEARDOWN dup=%llu fires, heap_set(s0=%llu) clears port_slot[other_dup=%llu, %u]\n", \
-                                    (unsigned long long)dup_loc, \
-                                    (unsigned long long)_s0, \
-                                    (unsigned long long)term_val(_c0), \
-                                    (_ct == TAG_DP1) ? 1 : 0); \
-                        } \
-                    } \
-                    if (_s1 > 0) { \
-                        u8 _ct = term_tag(_c1); \
-                        if ((_ct == TAG_DP0 || _ct == TAG_DP1) && \
-                            term_val(_c1) != dup_loc) { \
-                            fprintf(stderr, \
-                                    "  TEARDOWN dup=%llu fires, heap_set(s1=%llu) clears port_slot[other_dup=%llu, %u]\n", \
-                                    (unsigned long long)dup_loc, \
-                                    (unsigned long long)_s1, \
-                                    (unsigned long long)term_val(_c1), \
-                                    (_ct == TAG_DP1) ? 1 : 0); \
-                        } \
-                    } \
-                } \
-                /* EXPERIMENT (THVM_DUP_FORCE_V0=1): write _v0 to BOTH */ \
-                /* port slots to test whether DP1-side projection is the */ \
-                /* diverging path for b's grad in twoparam_grad_loop. */ \
-                { Term _w0 = _v0, _w1 = _v1; \
-                  if (getenv("THVM_DUP_FORCE_V0") && getenv("THVM_DUP_FORCE_V0")[0] != '0') _w1 = _v0; \
-                  if (_s0 > 0 && _s0 < ctx->heap_pos) heap_set(ctx, _s0, _w0); \
-                  if (_s1 > 0 && _s1 < ctx->heap_pos) heap_set(ctx, _s1, _w1); \
-                } \
-                thvm_dup_ports_clear_entry(ctx, dup_loc); \
-                /* EXPERIMENT: never clear body. Let DUP fire be purely \
-                 * about distribution — body stays as a memoized shared \
-                 * reference forever. Re-fires and backward walks read \
-                 * the same preserved body. */ \
+                Term _sibling = dp_index == 0 ? _v1 : _v0; \
+                Term _mine    = dp_index == 0 ? _v0 : _v1; \
+                heap_set(ctx, dup_loc, term_set_sub(_sibling)); \
                 ctx->itrs++; \
-                RETURN_REDUCED(dp_index == 0 ? _v0 : _v1); \
+                RETURN_REDUCED(_mine); \
             } while (0)
 
             // DUP ⊳ SUP

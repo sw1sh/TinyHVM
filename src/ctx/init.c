@@ -5,7 +5,6 @@ TinyHVM *thvm_init(const char *default_device) {
     ctx->book_heap_cap = (1u << 20);
     ctx->book_heap = calloc((size_t)ctx->book_heap_cap, sizeof(Term));
     ctx->book_heap_pos = 1;
-    ctx->dup_ports = calloc(DUP_PORT_CAP, sizeof(DupPortEntry));
     ctx->sched_rewrites = calloc(SCHED_REWRITE_CAP, sizeof(SchedRewriteEntry));
     ctx->alo_state_cap = (1u << 16);
     ctx->alo_states = calloc(ctx->alo_state_cap, sizeof(AloState));
@@ -82,7 +81,6 @@ void thvm_free(TinyHVM *ctx) {
     free(ctx->heap);
     free(ctx->book_heap);
     free(ctx->lower_ctx.heap);
-    free(ctx->dup_ports);
     free(ctx->sched_rewrites);
     free(ctx->alo_states);
     free(ctx);
@@ -137,7 +135,6 @@ void thvm_reset(TinyHVM *ctx, u32 keep) {
     ctx->lower_ctx.root = term_era();
     ctx->lower_ctx.rewrite_count = 0;
     ctx->lower_ctx.normalized_sig = 0;
-    if (ctx->dup_ports) memset(ctx->dup_ports, 0, DUP_PORT_CAP * sizeof(DupPortEntry));
     if (ctx->sched_rewrites) memset(ctx->sched_rewrites, 0, SCHED_REWRITE_CAP * sizeof(SchedRewriteEntry));
     if (ctx->alo_states) {
         memset(ctx->alo_states, 0, (size_t)ctx->alo_state_cap * sizeof(AloState));

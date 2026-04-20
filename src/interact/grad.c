@@ -29,10 +29,6 @@
 	                    /* don't set dispatch_mode — let lazy trampoline handle gradient TAG_TOPs */ \
 	                    return _gr; \
 	                } while(0)
-	                #define GRAD_ERASE(term_to_erase) ({ \
-	                    Term _ge = (term_to_erase); \
-	                    thvm_make_active_era(ctx, _ge); \
-	                })
 	                #define GRAD_ERASE2(term_a, term_b) ({ \
 	                    Term _qa = (term_a); \
 	                    Term _qb = (term_b); \
@@ -536,7 +532,7 @@
                         case UOP_DIV: { BG(thvm_op_raw(ctx,UOP_DIV,gy,bt), thvm_op_raw(ctx,UOP_NEG,thvm_op_raw(ctx,UOP_DIV,thvm_op_raw(ctx,UOP_MUL,gy,y),bt),term_era())); }
                         case UOP_MAX: { Term mask=thvm_op_raw(ctx,UOP_CMP,at,bt); f32 one=1; Term inv=thvm_op_raw(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),mask);
                             BG(sum_to_shape(ctx,thvm_op_raw(ctx,UOP_MUL,gy,mask),y_shape,a_shape), sum_to_shape(ctx,thvm_op_raw(ctx,UOP_MUL,gy,inv),y_shape,b_shape)); }
-	                        case UOP_CMP: GRAD_RETURN(GRAD_ERASE(gy));
+	                        case UOP_CMP: GRAD_ZERO(gy);
                         case UOP_SUM: { UG_DROP(bt, thvm_expand(ctx, gy, a_shape)); }
                         case UOP_RMAX: { Term max_bc=thvm_expand(ctx,thvm_reshape(ctx,y,y_shape),a_shape); f32 one=1;
                             Term mask=thvm_op_raw(ctx,UOP_SUB,thvm_tensor(ctx,&one,SHAPE(1)),thvm_op_raw(ctx,UOP_CMP,max_bc,at));
@@ -547,24 +543,24 @@
                                 u32 nd=mp->view.numel; u32 pf[MAX_DIM]; tensor_meta_read_u32(ctx, pid, pf, MAX_DIM);
                                 u32 inv[MAX_DIM]; for(u32 j=0;j<nd;j++) inv[pf[j]]=j;
                                 UG_DROP(bt, thvm_permute(ctx,gy,inv,nd));
-	                            } else GRAD_RETURN(GRAD_ERASE(gy)); }
+	                            } else GRAD_ZERO(gy); }
                         case UOP_EXPAND: UG_DROP(bt, sum_to_shape(ctx,gy,y_shape,a_shape));
                         case UOP_SHRINK: {
                             if (term_tag(bt)==TAG_TEN) { u32 sid=(u32)term_val(bt); TensorMeta *ms=&ctx->tensors[sid];
                                 u32 nd=ms->view.numel/2; u32 sf[MAX_DIM*2]; tensor_meta_read_u32(ctx, sid, sf, MAX_DIM*2);
                                 u32 pp[MAX_DIM*2]; for(u32 j=0;j<nd;j++){pp[j*2]=sf[j*2];pp[j*2+1]=a_shape.dims[j]-sf[j*2+1];}
                                 UG_DROP(bt, thvm_pad(ctx,gy,pp,nd));
-	                            } else GRAD_RETURN(GRAD_ERASE(gy)); }
+	                            } else GRAD_ZERO(gy); }
                         case UOP_PAD: {
                             if (term_tag(bt)==TAG_TEN) { u32 pid2=(u32)term_val(bt); TensorMeta *mp2=&ctx->tensors[pid2];
                                 u32 nd=mp2->view.numel/2; u32 pf2[MAX_DIM*2]; tensor_meta_read_u32(ctx, pid2, pf2, MAX_DIM*2);
                                 u32 sp[MAX_DIM*2]; for(u32 j=0;j<nd;j++){sp[j*2]=pf2[j*2];sp[j*2+1]=pf2[j*2]+a_shape.dims[j];}
                                 UG_DROP(bt, thvm_shrink(ctx,gy,sp,nd));
-	                            } else GRAD_RETURN(GRAD_ERASE(gy)); }
+	                            } else GRAD_ZERO(gy); }
                         // ASSIGN(dst, src) returns dst; gradient flows through dst
                         // and drops the src branch (src only feeds the side effect).
                         case UOP_ASSIGN: UG_DROP(bt, gy);
-	                        default: GRAD_RETURN(GRAD_ERASE(gy));
+	                        default: GRAD_ZERO(gy);
 	                    }
 		                    #undef GRAD2_H
 	                    #undef BG_GY
@@ -574,187 +570,42 @@
 		                    #undef UG_DROP
                 }
 
+                // GRAD⊳TEN: pure matcher.
+                //   y == target   → NUM(1)·gy (accumulate gy into bundle/slot, or return gy)
+                //   y ∉ targets   → NUM(0)      (and ERA the incoming gy branch)
+                // No requires_grad / creator_op / src_ids inspection. No
+                // provenance walk. Movement ops that materialize eagerly into
+                // TEN are handled by keeping them as TOPs (scheduler's job).
                 if (term_tag(y) == TAG_TEN) {
                     u32 y_id = (u32)term_val(y);
-                    TensorMeta *my = &ctx->tensors[y_id];
-                    if (getenv("THVM_SCHED_DIAG")) { static int _gc=0; _gc++; if (_gc<=10) fprintf(stderr,"  GRAD_TEN[%d]: y_id=%u tag_x=%u\n",_gc,y_id,term_tag(x)); }
-                    // Non-grad tensors are constants: produce explicit zero,
-                    // and erase the consumed incoming gy branch separately.
-                    if (!my->requires_grad) {
-                        if (grad_mode == GRAD_MODE_SLOT) GRAD_DROP(gy);
-                        GRAD_ZERO(gy);
-                    }
-                    // Base case: y == x.
+
+                    // Single-target base case: y == x.
                     if (term_tag(x) == TAG_TEN && (u32)term_val(x) == y_id) {
-                        if (getenv("THVM_LOOP_DIAG")) {
-                            fprintf(stderr,
-                                    "GRAD_TARGET_DIRECT loc=%llu y_id=%u mode=%u has_keep=%d gy_tag=%u gy_ext=%u gy_val=%llu\n",
-                                    (unsigned long long)loc,
-                                    y_id,
-                                    grad_mode,
-                                    has_keep_bundle,
-                                    (u32)term_tag(gy),
-                                    (u32)term_ext(gy),
-                                    (unsigned long long)term_val(gy));
-                        }
-                        if (grad_mode == GRAD_MODE_DROP) {
-                            GRAD_DROP(gy);
-                        }
+                        if (grad_mode == GRAD_MODE_DROP) GRAD_DROP(gy);
                         GRAD_RETURN(gy);
                     }
 
-                    // Multi-target: x = ANY pattern. Param->slot mapping lives in
-                    // the internal GRAD target table and is resolved at target
-                    // terms before descending into their internals.
-                    if (getenv("THVM_SCHED_DIAG") && y_id < 10)
-                        fprintf(stderr, "  GRAD_TEN_X: y_id=%u x_tag=%u x_ext=%u\n", y_id, term_tag(x), term_ext(x));
-	                    if (term_tag(x) == TAG_ANY) {
+                    // Multi-target matcher (x = ANY). Check target table.
+                    if (term_tag(x) == TAG_ANY) {
                         Term slot = term_era();
                         u32 target_index = 0;
-	                        if (thvm_grad_targets_find_term_at(ctx, loc, y, &target_index, &slot) ||
-                                thvm_grad_targets_find_index_at(ctx, loc, y_id, &target_index, &slot)) {
-                                if (getenv("THVM_LOOP_DIAG")) {
-                                    fprintf(stderr,
-                                            "GRAD_TARGET_MULTI_HIT loc=%llu y_id=%u idx=%u mode=%u has_keep=%d slot_tag=%u slot_ext=%u slot_val=%llu gy_tag=%u gy_ext=%u gy_val=%llu\n",
-                                            (unsigned long long)loc,
-                                            y_id,
-                                            target_index,
-                                            grad_mode,
-                                            has_keep_bundle,
-                                            (u32)term_tag(slot),
-                                            (u32)term_ext(slot),
-                                            (unsigned long long)term_val(slot),
-                                            (u32)term_tag(gy),
-                                            (u32)term_ext(gy),
-                                            (unsigned long long)term_val(gy));
-                                }
-	                            if (grad_mode == GRAD_MODE_SLOT &&
-                                    !(term_tag(slot) == TAG_ERA && term_val(slot) == 0)) {
-	                                GRAD_RETURN(GRAD_SLOT_ACCUM(slot, gy));
-	                            }
-                                if (grad_mode == GRAD_MODE_KEEP && has_keep_bundle) {
-                                    thvm_grad_bundle_accum(ctx, loc, target_index, gy);
-                                    GRAD_RETURN(term_num_f32(0.0f));
-                                }
-                                if (grad_mode == GRAD_MODE_DROP) {
-                                    GRAD_DROP(gy);
-                                }
-                                if (grad_mode == GRAD_MODE_SLOT) {
-                                    GRAD_DROP(gy);
-                                }
-                                GRAD_ZERO(gy);
-	                        }
-                            if (getenv("THVM_LOOP_DIAG")) {
-                                u32 nt = thvm_grad_targets_count_at(ctx, loc);
-                                fprintf(stderr, "GRAD_TARGET_MISS loc=%llu y_id=%u nt=%u\n",
-                                        (unsigned long long)loc, y_id, nt);
-                                for (u32 i = 0; i < nt; i++) {
-                                    Term pt = thvm_grad_targets_get_term_at(ctx, loc, i);
-                                    GRAD_RESOLVE_ALIAS(pt);
-                                    fprintf(stderr, "  target[%u]=tag%u val%llu\n",
-                                            i, (u32)term_tag(pt), (unsigned long long)term_val(pt));
-                                }
+                        if (thvm_grad_targets_find_term_at(ctx, loc, y, &target_index, &slot) ||
+                            thvm_grad_targets_find_index_at(ctx, loc, y_id, &target_index, &slot)) {
+                            if (grad_mode == GRAD_MODE_SLOT &&
+                                !(term_tag(slot) == TAG_ERA && term_val(slot) == 0)) {
+                                GRAD_RETURN(GRAD_SLOT_ACCUM(slot, gy));
                             }
-	                    }
-
-                    // "all params" pattern: only requires_grad leaves survive.
-                    // If an explicit multi-target table exists and this leaf is
-                    // not in it, the local derivative is zero.
-	                    if (term_tag(x) == TAG_ANY) {
-                            u32 n_targets = thvm_grad_targets_count_at(ctx, loc);
-                            // With explicit targets, only non-provenance leaves can be
-                            // concluded as zero immediately. Provenance-backed tensors
-                            // must continue walking to reach target leaves.
-                            if (n_targets > 0 && !my->creator_op) {
-                                if (grad_mode == GRAD_MODE_SLOT) GRAD_DROP(gy);
-                                GRAD_ZERO(gy);
+                            if (grad_mode == GRAD_MODE_KEEP && has_keep_bundle) {
+                                thvm_grad_bundle_accum(ctx, loc, target_index, gy);
+                                GRAD_RETURN(term_num_f32(0.0f));
                             }
-                            // "all params" mode (no explicit targets): a requires_grad
-                            // leaf receives gy directly.
-                            if (n_targets == 0 && !my->creator_op) {
-	                            if (grad_mode == GRAD_MODE_SLOT) GRAD_DROP(gy);
-	                            if (my->requires_grad) GRAD_RETURN(gy);
-	                            if (grad_mode == GRAD_MODE_SLOT) GRAD_DROP(gy);
-	                            GRAD_ZERO(gy);
-                            }
-	                    }
-
-                    // Leaf (no provenance, not target) is constant wrt the
-                    // current target, so its local derivative is zero.
-	                    if (!my->creator_op) {
-                            if (grad_mode == GRAD_MODE_SLOT) GRAD_DROP(gy);
-	                            GRAD_ZERO(gy);
-	                    }
-
-                    // Movement ops fire eagerly → TAG_TEN with creator_op.
-                    // Walk backward through provenance for movement ops only.
-                    {
-                        u32 cop = my->creator_op;
-                        u32 aid = my->src_ids[0], bid = my->src_ids[1];
-                        // (term_use_table cleared at GRAD entry)
-                        // Cycle detection: provenance must go to earlier tensors
-                        if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  PROV: y_id=%u cop=%u aid=%u bid=%u tc=%u\n", y_id, cop, aid, bid, ctx->tensor_count);
-	                        if (aid >= y_id || aid >= ctx->tensor_count) GRAD_RETURN(GRAD_ERASE(gy));
-                        Term at = term_ten(aid, ctx->tensors[aid].dtype);
-
-                        // Rebuild GRAD(input, backward_gy) and recurse
-                        #define GRAD2_TEN(y_,gy_,x_) ({ \
-                            u64 _l = heap_alloc(ctx, 2); \
-                            heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); thvm_grad_targets_share(ctx, _l, loc); thvm_grad_target_set(ctx, _l, x_); \
-                            term_new(TAG_TOP, UOP_GRAD, _l); })
-	                        // WALK: place sub-GRAD on heap — one interaction per step
-	                        #define WALK(da_) do { \
-	                            Term _da_val = (da_); \
-	                            /* table cleared at GRAD entry */ \
-	                            Term _w = GRAD2_TEN(at, _da_val, x); \
-	                            if (getenv("THVM_SCHED_DIAG")) { \
-	                                u64 _gl = term_val(_w); \
-	                                fprintf(stderr, "  WALK: grad_loc=%llu y_tag=%u y_val=%llu\n", \
-	                                    _gl, term_tag(ctx->heap[_gl]), term_val(ctx->heap[_gl])); \
-	                            } \
-	                            GRAD_RETURN(_w); \
-	                        } while(0)
-
-                        switch (cop) {
-                            case UOP_RESHAPE: WALK(thvm_reshape(ctx, gy, ctx->tensors[aid].view.shape));
-                            case UOP_PERMUTE: {
-                                if (bid) {
-                                    TensorMeta *mp = &ctx->tensors[bid];
-                                    u32 nd = mp->view.numel;
-                                    u32 pf[MAX_DIM]; tensor_meta_read_u32(ctx, bid, pf, MAX_DIM);
-                                    u32 inv[MAX_DIM]; for(u32 j=0;j<nd;j++) inv[pf[j]]=j;
-                                    WALK(thvm_permute(ctx, gy, inv, nd));
-                                }
-	                                GRAD_RETURN(GRAD_ERASE(gy));
-	                            }
-                            case UOP_EXPAND: WALK(sum_to_shape(ctx, gy, my->view.shape, ctx->tensors[aid].view.shape));
-                            case UOP_SHRINK: {
-                                if (bid) {
-                                    TensorMeta *ms = &ctx->tensors[bid];
-                                    u32 nd = ms->view.numel/2;
-                                    u32 sf[MAX_DIM*2]; tensor_meta_read_u32(ctx, bid, sf, MAX_DIM*2);
-                                    u32 pp[MAX_DIM*2];
-                                    for(u32 j=0;j<nd;j++){pp[j*2]=sf[j*2];pp[j*2+1]=ctx->tensors[aid].view.shape.dims[j]-sf[j*2+1];}
-                                    WALK(thvm_pad(ctx, gy, pp, nd));
-                                }
-	                                GRAD_RETURN(GRAD_ERASE(gy));
-	                            }
-                            case UOP_PAD: {
-                                if (bid) {
-                                    TensorMeta *mp = &ctx->tensors[bid];
-                                    u32 nd = mp->view.numel/2;
-                                    u32 pf[MAX_DIM*2]; tensor_meta_read_u32(ctx, bid, pf, MAX_DIM*2);
-                                    u32 sp[MAX_DIM*2];
-                                    for(u32 j=0;j<nd;j++){sp[j*2]=pf[j*2];sp[j*2+1]=pf[j*2]+ctx->tensors[aid].view.shape.dims[j];}
-                                    WALK(thvm_shrink(ctx, gy, sp, nd));
-                                }
-	                                GRAD_RETURN(GRAD_ERASE(gy));
-	                            }
-	                            default: GRAD_ZERO(gy);
-	                        }
-                        #undef GRAD2_TEN
-                        #undef WALK
+                            // DROP mode or unbacked target: zero.
+                            GRAD_ZERO(gy);
+                        }
                     }
+
+                    // Non-matching TEN leaf: zero local derivative.
+                    GRAD_ZERO(gy);
                 }
 	                // Unknown y shape → no local derivative contribution → NUM(0).
 	                if (getenv("THVM_SCHED_DIAG")) fprintf(stderr, "  GRAD_FALLTHROUGH: y_tag=%u y_ext=%u y_val=%llu\n", term_tag(y), term_ext(y), term_val(y));
@@ -766,7 +617,6 @@
 	                #undef GRAD_SPAWN_ERA
 	                #undef GRAD_ZERO
                     #undef GRAD_DROP
-	                #undef GRAD_ERASE
 	                #undef GRAD_ERASE2
 	                #undef GRAD_RETURN
 	            }

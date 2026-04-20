@@ -70,16 +70,13 @@ keyed by GRAD heap location. The pattern stored in `x` can be:
 - `TAG_TEN` (single target) — match one specific tensor
 - `TAG_ANY` (wildcard) — match against the target set
 
-### Legacy: TEN-provenance walk
-
-For tensors whose forward compute materialized eagerly into TEN (movement
-ops like RESHAPE/PERMUTE/EXPAND applied in-place at tensor construction),
-there is a compatibility walk that emits `GRAD(src_ten, inverse_view(gy))`
-— essentially re-doing the work that the TAG_TOP compositional rule would
-have done if the movement had stayed a TOP. This walk is bounded to
-movement ops only; all other `creator_op` values fall through to
-`NUM(0.0)`. The long-term direction is to keep movement ops as TOPs and
-delete this walk.
+The TAG_TEN branch is **only** these three cases. No `requires_grad`
+inspection, no `creator_op`/`src_ids` walk, no provenance recursion.
+Any tensor that reaches GRAD as a TAG_TEN leaf is treated as a leaf —
+match it, or zero it. If you need gradient flow through a transform
+(RESHAPE/PERMUTE/EXPAND/SHRINK/PAD), keep that transform as a TAG_TOP
+in the graph so the compositional GRAD⊳TOP rule handles it. Don't
+materialize movement into a TEN before GRAD has a chance to walk it.
 
 ## GRAD Modes
 

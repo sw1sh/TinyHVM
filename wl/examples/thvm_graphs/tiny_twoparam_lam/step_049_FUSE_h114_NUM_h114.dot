@@ -1,0 +1,13 @@
+digraph G {
+  // PREV_INTERACTION: SWEEP_ERA_h131_TEN_h130
+  // NEXT_INTERACTION: FUSE_h114_NUM_h114
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  ctr47 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n114 [label="FUSE", shape=box, fillcolor="#f0f0f0"];
+  n114 -> ctr47 [label="c0"];
+  n115 [label="FUSE", shape=box, fillcolor="#f0f0f0"];
+  n115 -> ctr47 [label="c1"];
+}

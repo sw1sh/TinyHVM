@@ -1,0 +1,59 @@
+digraph G {
+  // PREV_INTERACTION: DP0_h36_MUL_h22
+  // NEXT_INTERACTION: GRAD_h45_MUL_h22
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n45 [label="GRAD\nd/d(t2)\n@45", shape=box, fillcolor="#e8d0ff"];
+  n22 -> n45 [label="y",color="#cc0000",penwidth=2.0];
+  n43 -> n45 [label="gy"];
+  n22 [label="MUL\n[2,3]\n@22", shape=box, fillcolor="#cce5ff"];
+  t1 [label="t1\n[2,3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t1 -> n22 [label="a",taillabel="@22",labelfontsize=7,fontcolor="#666666"];
+  n24 -> n22 [label="b"];
+  n24 [label="EXPAND\n[2,3]\n@24", shape=box, fillcolor="#fff3cd"];
+  n26 -> n24 [label="in"];
+  t4 [label="t4\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 -> n24 [label="shape",taillabel="@25",labelfontsize=7,fontcolor="#666666"];
+  n26 [label="RESHAPE\n[1,3]\n@26", shape=box, fillcolor="#fff3cd"];
+  t2 [label="t2\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t2 -> n26 [label="in",taillabel="@26",labelfontsize=7,fontcolor="#666666"];
+  t3 [label="t3\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n26 [label="shape",taillabel="@27",labelfontsize=7,fontcolor="#666666"];
+  n15 [label="APP\n#0@15", shape=invtriangle, fillcolor="#f3f3f3"];
+  n45 -> n15 [label="fun"];
+  num_app15_1 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num_app15_1 -> n15 [label="arg"];
+  n28 [label="FUSE\n@28", shape=box, fillcolor="#f0f0f0",color="#1f78ff",penwidth=2.2];
+  n15 -> n28 [label="in"];
+  free28_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n28 -> free28_1000 [label="out"];
+  era31 [label="ERA\n@31",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  t5 [label="t5\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t5 -> era31 [label="p",taillabel="@30",labelfontsize=7,fontcolor="#666666"];
+  n37 [label="RESHAPE\n[1,1]\n@37", shape=box, fillcolor="#fff3cd"];
+  t8 [label="t8\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t8 -> n37 [label="in",taillabel="@37",labelfontsize=7,fontcolor="#666666"];
+  t9 [label="t9\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t9 -> n37 [label="shape",taillabel="@38",labelfontsize=7,fontcolor="#666666"];
+  n39 [label="EXPAND\n[2,3]\n@39", shape=box, fillcolor="#fff3cd"];
+  n37 -> n39 [label="in"];
+  t10 [label="t10\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t10 -> n39 [label="shape",taillabel="@40",labelfontsize=7,fontcolor="#666666"];
+  n32 [label="EXPAND\n[2,3]\n@32", shape=box, fillcolor="#fff3cd"];
+  t6 [label="t6\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t6 -> n32 [label="in",taillabel="@32",labelfontsize=7,fontcolor="#666666"];
+  t7 [label="t7\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t7 -> n32 [label="shape",taillabel="@33",labelfontsize=7,fontcolor="#666666"];
+  n41 [label="CMP\n[2,3]\n@41", shape=box, fillcolor="#cce5ff"];
+  dup36 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup36_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup36 -> freedup36_1 [label="dp1@36",style=dotted,color="#999999"];
+  n22 -> dup36;
+  dup36 -> n41 [label="a (dp0@41)"];
+  n39 -> n41 [label="b"];
+  n43 [label="MUL\n[2,3]\n@43", shape=box, fillcolor="#cce5ff"];
+  n32 -> n43 [label="a"];
+  n41 -> n43 [label="b"];
+}

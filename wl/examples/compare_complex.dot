@@ -1,0 +1,48 @@
+/* ImportDOT stress test — many nodes, mixed shapes, styles, feedback, parallel paths. */
+digraph Flow {
+  rankdir=LR;
+  splines=true;
+  node [fontname="Helvetica", fontsize=11];
+
+  start [label="start", shape=ellipse, fillcolor="#ffe8e8", style=filled];
+  parse [label="parse", shape=box, fillcolor="#e8f4ff", style=filled];
+  scan [label="scan", shape=ellipse, fillcolor="#eef8ff", style=filled];
+  check [label="check", shape=ellipse, fillcolor="#fff4e8", style=filled];
+  split [label="split", shape=ellipse, fillcolor="#e8f4ff", style=filled];
+  build [label="build", shape=box, fillcolor="#e8ffe8", style=filled];
+  pack [label="pack", shape=box, fillcolor="#f0fff0", style=filled];
+  opt [label="optimize", shape=ellipse, fillcolor="#f5f0ff", style=filled];
+  fuse [label="fuse", shape=ellipse, fillcolor="#fff0f5", style=filled];
+  layout [label="layout", shape=ellipse, fillcolor="#f0e8ff", style=filled];
+  render [label="render", shape=box, fillcolor="#e0e0e0", style=filled];
+  cache [label="cache", shape=box, fillcolor="#fffce8", style=filled];
+  log [label="log", shape=ellipse, fillcolor="#f8f8f8", style=filled];
+  err [label="error", shape=box, fillcolor="#ffe0e0", style=filled];
+  ship [label="ship", shape=ellipse, fillcolor="#e8f4e8", style=filled];
+  end [label="done", shape=ellipse, fillcolor="#e8f4e8", style=filled];
+
+  start -> parse [label="read"];
+  parse -> scan [label="lex"];
+  scan -> check [label="tok"];
+  check -> split [label="fork"];
+  split -> build [label="left"];
+  split -> opt [label="right"];
+  split -> pack [label="alt", style=dashed, color="#888888", fontcolor="#666666"];
+  build -> fuse [label="asm"];
+  opt -> fuse [label="join"];
+  fuse -> layout [label="gv"];
+  pack -> layout [label="zip"];
+  layout -> render [label="coords"];
+  render -> ship [label="png"];
+  ship -> end [label="out"];
+
+  parse -> cache [label="store", style=dotted, color="#888888", fontcolor="#555555"];
+  cache -> check [label="hit", style=dotted, color="#888888", fontcolor="#555555"];
+  render -> cache [label="warm", style=dashed, color="#666666", fontcolor="#666666"];
+  check -> log [label="note", style=dotted, color="#999999", fontcolor="#777777"];
+  log -> cache [label="sink", style=dotted, color="#999999", fontcolor="#777777"];
+
+  check -> parse [label="retry", style=dashed, color="#444444", fontcolor="#444444"];
+  render -> err [label="fail", style=dashed, color="#aa4444", fontcolor="#882222"];
+  err -> parse [label="fix", style=dashed, color="#aa4444", fontcolor="#882222"];
+}

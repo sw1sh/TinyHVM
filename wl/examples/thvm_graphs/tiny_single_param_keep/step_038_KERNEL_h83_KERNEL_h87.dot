@@ -1,0 +1,45 @@
+digraph G {
+  // PREV_INTERACTION: KERNEL_h87_KERNEL_h433
+  // NEXT_INTERACTION: KERNEL_h83_KERNEL_h502
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n24 [label="EXPAND\n[2,3]\n@24", shape=box, fillcolor="#fff3cd"];
+  n26 -> n24 [label="in"];
+  t4 [label="t4\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 -> n24 [label="shape",taillabel="@25",labelfontsize=7,fontcolor="#666666"];
+  n26 [label="RESHAPE\n[1,3]\n@26", shape=box, fillcolor="#fff3cd"];
+  t2 [label="t2\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t2 -> n26 [label="in",taillabel="@26",labelfontsize=7,fontcolor="#666666"];
+  t3 [label="t3\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n26 [label="shape",taillabel="@27",labelfontsize=7,fontcolor="#666666"];
+  n77 [label="KERNEL\nRESHAPE\nkid=0\n[3]\n@77", shape=box, fillcolor="#ccffcc",color="#1f78ff",penwidth=2.2];
+  n83 -> n77 [label="in"];
+  t13 [label="t13\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t13 -> n77 [label="shape",taillabel="@78",labelfontsize=7,fontcolor="#666666"];
+  free77_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n77 -> free77_1000 [label="out"];
+  n83 [label="KERNEL\nRESHAPE\nkid=1\n[1,3]\n@83", shape=box, fillcolor="#ccffcc"];
+  n87 -> n83 [label="in",color="#cc0000",penwidth=2.0];
+  t12 [label="t12\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t12 -> n83 [label="shape",taillabel="@84",labelfontsize=7,fontcolor="#666666"];
+  era81 [label="ERA\n@81",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  dup49 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup49_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup49 -> freedup49_1 [label="dp1@49",style=dotted,color="#999999"];
+  n24 -> dup49;
+  dup49 -> era81 [label="dp0@80"];
+  n87 [label="KERNEL\nSUM\nkid=2\n[1,3]\n@87", shape=box, fillcolor="#ccffcc"];
+  n502 -> n87 [label="in"];
+  t11 [label="t11\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t11 -> n87 [label="axes",taillabel="@88",labelfontsize=7,fontcolor="#666666"];
+  n502 [label="KERNEL\nMUL+CMP+MUL+MUL\nkid=3 cpu\n[2,3]\n@502", shape=box, fillcolor="#ccffcc"];
+  t6 [label="t6\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t6 -> n502 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:a"];
+  t1 [label="t1\n[2,3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t1 -> n502 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:a"];
+  t2 -> n502 [style=dashed,color="#009900",fontcolor="#006600",label="MUL:b"];
+  t8 [label="t8\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t8 -> n502 [style=dashed,color="#009900",fontcolor="#006600",label="CMP:b"];
+}

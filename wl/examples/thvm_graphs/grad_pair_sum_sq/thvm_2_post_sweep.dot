@@ -1,0 +1,24 @@
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n28 [label="ADD\n[4]\n@28", shape=box, fillcolor="#cce5ff"];
+  n24 -> n28 [label="a"];
+  n26 -> n28 [label="b"];
+  n15 [label="EXPAND\n[4]\n@15", shape=box, fillcolor="#fff3cd",color="#1f78ff",penwidth=2.2];
+  n28 -> n15 [label="in"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n15 [label="shape",taillabel="@16",labelfontsize=7,fontcolor="#666666"];
+  free15_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n15 -> free15_1000 [label="out"];
+  n24 [label="MUL\n[4]\n@24", shape=box, fillcolor="#cce5ff"];
+  num24_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num24_0 -> n24 [label="a"];
+  t1 [label="t1\n[4]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> n24 [label="b",taillabel="@25",labelfontsize=7,fontcolor="#666666"];
+  n26 [label="MUL\n[4]\n@26", shape=box, fillcolor="#cce5ff"];
+  t1 -> n26 [label="a",taillabel="@26",labelfontsize=7,fontcolor="#666666"];
+  num26_1 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num26_1 -> n26 [label="b"];
+}

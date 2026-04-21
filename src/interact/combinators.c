@@ -809,12 +809,28 @@ era_continue:
                 RETURN_REDUCED(_mine); \
             } while (0)
 
-            // GRAD ⊳ TEN(t):  fwd = t, bwd = 1 if t == target else 0
+            // GRAD ⊳ TEN(t):  fwd = t, bwd is a tensor of the appropriate
+            // Jacobian shape. For the target leaf (t == target) the
+            // gradient is the identity — in the scalar-loss reverse-mode
+            // case that's `ones(t.shape)`, expressed as
+            // EXPAND(NUM(1), t.shape). For a non-target leaf the gradient
+            // is zero of t's shape: EXPAND(NUM(0), t.shape). Using plain
+            // scalar NUM would collapse shape and give incorrect Jacobians
+            // once the chain rule composes via sum_to_shape.
             if (term_tag(y) == TAG_TEN) {
                 u32 tid = (u32)term_val(y);
                 Term fwd = y;
-                Term bwd = (tid == target_tid) ? term_num_f32(1.0f)
-                                               : term_num_f32(0.0f);
+                Shape sh = (tid < ctx->tensor_count)
+                    ? ctx->tensors[tid].view.shape
+                    : SHAPE(1);
+                Term scalar = (tid == target_tid) ? term_num_f32(1.0f)
+                                                  : term_num_f32(0.0f);
+                Term bwd;
+                if (sh.rank > 0 && !(sh.rank == 1 && sh.dims[0] == 1)) {
+                    bwd = thvm_expand(ctx, scalar, sh);
+                } else {
+                    bwd = scalar;
+                }
                 GRAD_STATE_RETURN(fwd, bwd);
             }
 

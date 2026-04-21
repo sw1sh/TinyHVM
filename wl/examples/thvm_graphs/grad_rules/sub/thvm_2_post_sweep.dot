@@ -8,12 +8,20 @@ digraph G {
   t1 -> n11 [label="a",taillabel="@11",labelfontsize=7,fontcolor="#666666"];
   t2 [label="t2\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t2 -> n11 [label="b",taillabel="@12",labelfontsize=7,fontcolor="#666666"];
-  n13 [label="SUB\n[1]\n@13", shape=box, fillcolor="#cce5ff"];
-  num13_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num13_0 -> n13 [label="a"];
-  num13_1 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num13_1 -> n13 [label="b"];
+  n13 [label="SUB\n[3]\n@13", shape=box, fillcolor="#cce5ff"];
+  n15 -> n13 [label="a"];
+  n17 -> n13 [label="b"];
   ctr6 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
   n11 -> ctr6 [label="c0"];
   n13 -> ctr6 [label="c1"];
+  n15 [label="EXPAND\n[3]\n@15", shape=box, fillcolor="#fff3cd"];
+  num15_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num15_0 -> n15 [label="in"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n15 [label="shape",taillabel="@16",labelfontsize=7,fontcolor="#666666"];
+  n17 [label="EXPAND\n[3]\n@17", shape=box, fillcolor="#fff3cd"];
+  num17_0 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num17_0 -> n17 [label="in"];
+  t4 [label="t4\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 -> n17 [label="shape",taillabel="@18",labelfontsize=7,fontcolor="#666666"];
 }

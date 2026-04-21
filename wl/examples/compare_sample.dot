@@ -1,0 +1,6 @@
+digraph G {
+  rankdir=BT;
+  t0 [label="a", fillcolor="#e8f4e8", style=filled];
+  t1 [label="b", fillcolor="#e0e0e0", style=filled];
+  t0 -> t1 [label="e"];
+}

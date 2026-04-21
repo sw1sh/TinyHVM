@@ -56,8 +56,7 @@ digraph G {
   t3 [label="t3\n[3]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t3 -> n58 [label="shape",taillabel="@59",labelfontsize=7,fontcolor="#666666"];
   n60 [label="RESHAPE\n[2,3]\n@60", shape=box, fillcolor="#fff3cd"];
-  num60_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num60_0 -> n60 [label="in"];
+  n67 -> n60 [label="in"];
   t15 [label="t15\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t15 -> n60 [label="shape",taillabel="@61",labelfontsize=7,fontcolor="#666666"];
   n46 [label="SUM\n[2,3]\n@46", shape=box, fillcolor="#ffcccc"];
@@ -70,12 +69,21 @@ digraph G {
   t5 [label="t5\n[3]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t5 -> n63 [label="shape",taillabel="@64",labelfontsize=7,fontcolor="#666666"];
   n65 [label="RESHAPE\n[3,2]\n@65", shape=box, fillcolor="#fff3cd"];
-  num65_0 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num65_0 -> n65 [label="in"];
+  n69 -> n65 [label="in"];
   t16 [label="t16\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t16 -> n65 [label="shape",taillabel="@66",labelfontsize=7,fontcolor="#666666"];
   n53 [label="SUM\n[1,2]\n@53", shape=box, fillcolor="#ffcccc"];
   n65 -> n53 [label="in"];
   t13 [label="t13\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t13 -> n53 [label="axes",taillabel="@54",labelfontsize=7,fontcolor="#666666"];
+  n67 [label="EXPAND\n[2,3]\n@67", shape=box, fillcolor="#fff3cd"];
+  num67_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num67_0 -> n67 [label="in"];
+  t17 [label="t17\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t17 -> n67 [label="shape",taillabel="@68",labelfontsize=7,fontcolor="#666666"];
+  n69 [label="EXPAND\n[3,2]\n@69", shape=box, fillcolor="#fff3cd"];
+  num69_0 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num69_0 -> n69 [label="in"];
+  t18 [label="t18\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t18 -> n69 [label="shape",taillabel="@70",labelfontsize=7,fontcolor="#666666"];
 }

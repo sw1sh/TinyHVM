@@ -1,0 +1,20 @@
+digraph G {
+  // PREV_INTERACTION: SWEEP_ERA_h78_TEN_h77
+  // NEXT_INTERACTION: SWEEP_ERA_h80_TEN_h79
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  era80 [label="ERA\n@80",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  t11 [label="t11\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t11 -> era80 [label="p",taillabel="@79",labelfontsize=7,fontcolor="#666666",color="#cc0000",penwidth=2.0,style=dashed];
+  era82 [label="ERA\n@82",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  t10 [label="t10\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t10 -> era82 [label="p",taillabel="@81",labelfontsize=7,fontcolor="#666666"];
+  era84 [label="ERA\n@84",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  t7 [label="t7\n[3]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t7 -> era84 [label="p",taillabel="@83",labelfontsize=7,fontcolor="#666666"];
+  era86 [label="ERA\n@86",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  t6 [label="t6\n[3]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t6 -> era86 [label="p",taillabel="@85",labelfontsize=7,fontcolor="#666666"];
+}

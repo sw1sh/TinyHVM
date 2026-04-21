@@ -1,0 +1,48 @@
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n11 [label="SUM\n@11", shape=box, fillcolor="#ffcccc"];
+  grad10 [label="GRAD\n@10", shape=invtriangle, fillcolor="#e8d0ff"];
+  n22 -> grad10 [label="y",color="#cc0000",penwidth=2.0];
+  grad10 -> n11 [label="fwd"];
+  t2 [label="t2\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n11 [label="axes",taillabel="@12",labelfontsize=7,fontcolor="#666666"];
+  free11_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n11 -> free11_1000 [label="out"];
+  era9 [label="ERA\n@9",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  h8 [label="h8\ntag=27", shape=box, fillcolor="#dddddd", fontsize=8];
+  h8 -> era9 [label="p"];
+  n22 [label="MUL\n[4]\n@22", shape=box, fillcolor="#cce5ff"];
+  dup20 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup20_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup20 -> freedup20_1 [label="dp1@20",style=dotted,color="#999999"];
+  t1 [label="t1\n[4]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> dup20[label="",taillabel="@20",labelfontsize=7,fontcolor="#666666"];
+  dup20 -> n22 [label="a (dp0@22)"];
+  dup21 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup21_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup21 -> freedup21_1 [label="dp1@21",style=dotted,color="#999999"];
+  t1 -> dup21[label="",taillabel="@21",labelfontsize=7,fontcolor="#666666"];
+  dup21 -> n22 [label="b (dp0@23)"];
+  free22_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n22 -> free22_1000 [label="out"];
+  n28 [label="ADD\n[4]\n@28", shape=box, fillcolor="#cce5ff"];
+  n24 -> n28 [label="a"];
+  n26 -> n28 [label="b"];
+  n15 [label="EXPAND\n[4]\n@15", shape=box, fillcolor="#fff3cd",color="#1f78ff",penwidth=2.2];
+  n28 -> n15 [label="in"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n15 [label="shape",taillabel="@16",labelfontsize=7,fontcolor="#666666"];
+  free15_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n15 -> free15_1000 [label="out"];
+  n24 [label="MUL\n[4]\n@24", shape=box, fillcolor="#cce5ff"];
+  num24_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num24_0 -> n24 [label="a"];
+  t1 -> n24 [label="b",taillabel="@25",labelfontsize=7,fontcolor="#666666"];
+  n26 [label="MUL\n[4]\n@26", shape=box, fillcolor="#cce5ff"];
+  t1 -> n26 [label="a",taillabel="@26",labelfontsize=7,fontcolor="#666666"];
+  num26_1 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num26_1 -> n26 [label="b"];
+}

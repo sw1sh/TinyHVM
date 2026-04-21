@@ -11,13 +11,21 @@ digraph G {
   n24 -> n10 [label="b"];
   free10_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
   n10 -> free10_1000 [label="out"];
+  n26 [label="EXPAND\n[3]\n@26", shape=box, fillcolor="#fff3cd"];
+  num26_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num26_0 -> n26 [label="in"];
+  t2 [label="t2\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n26 [label="shape",taillabel="@27",labelfontsize=7,fontcolor="#666666"];
+  n28 [label="EXPAND\n[3]\n@28", shape=box, fillcolor="#fff3cd"];
+  num28_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num28_0 -> n28 [label="in"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n28 [label="shape",taillabel="@29",labelfontsize=7,fontcolor="#666666"];
   n20 [label="MUL\n[3]\n@20", shape=box, fillcolor="#cce5ff"];
-  num20_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num20_0 -> n20 [label="a"];
+  n26 -> n20 [label="a"];
   t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
   t1 -> n20 [label="b",taillabel="@21",labelfontsize=7,fontcolor="#666666"];
   n22 [label="MUL\n[3]\n@22", shape=box, fillcolor="#cce5ff"];
   t1 -> n22 [label="a",taillabel="@22",labelfontsize=7,fontcolor="#666666"];
-  num22_1 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num22_1 -> n22 [label="b"];
+  n28 -> n22 [label="b"];
 }

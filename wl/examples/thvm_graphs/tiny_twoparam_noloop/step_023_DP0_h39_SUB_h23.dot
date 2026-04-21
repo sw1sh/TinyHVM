@@ -1,0 +1,67 @@
+digraph G {
+  // PREV_INTERACTION: DP0_h38_EXPAND_h33
+  // NEXT_INTERACTION: DP0_h39_SUB_h23
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  ctr27 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n90 [label="FUSE", shape=box, fillcolor="#f0f0f0"];
+  n90 -> ctr27 [label="c0"];
+  n91 [label="FUSE", shape=box, fillcolor="#f0f0f0"];
+  n91 -> ctr27 [label="c1"];
+  n23 [label="SUB\n[3]\n@23", shape=box, fillcolor="#cce5ff"];
+  n25 -> n23 [label="a"];
+  t3 [label="t3\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n23 [label="b",taillabel="@24",labelfontsize=7,fontcolor="#666666"];
+  n25 [label="ADD\n[3]\n@25", shape=box, fillcolor="#cce5ff"];
+  t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> n25 [label="a",taillabel="@25",labelfontsize=7,fontcolor="#666666"];
+  t2 [label="t2\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t2 -> n25 [label="b",taillabel="@26",labelfontsize=7,fontcolor="#666666"];
+  n33 [label="EXPAND\n[3]\n@33", shape=box, fillcolor="#fff3cd"];
+  t5 [label="t5\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t5 -> n33 [label="in",taillabel="@33",labelfontsize=7,fontcolor="#666666"];
+  t6 [label="t6\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t6 -> n33 [label="shape",taillabel="@34",labelfontsize=7,fontcolor="#666666"];
+  n40 [label="MUL\n[3]\n@40", shape=box, fillcolor="#cce5ff"];
+  n33 -> n40 [label="a"];
+  dup39 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1,penwidth=2.0];
+  freedup39_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup39 -> freedup39_1 [label="dp1@39",style=dotted,color="#999999"];
+  n23 -> dup39 [color="#cc0000",penwidth=2.0];
+  dup39 -> n40 [label="b (dp0@41)"];
+  n51 [label="NEG\n[3]\n@51", shape=box, fillcolor="#cce5ff"];
+  dup50 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  n40 -> dup50;
+  dup50 -> n51 [label="dp1@51"];
+  era67 [label="ERA\n@67",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  n51 -> era67 [label="p"];
+  n42 [label="MUL\n[3]\n@42", shape=box, fillcolor="#cce5ff"];
+  dup38 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup38_0 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup38 -> freedup38_0 [label="dp0@38",style=dotted,color="#999999"];
+  n33 -> dup38;
+  dup38 -> n42 [label="a (dp1@42)"];
+  dup37 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup37_0 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup37 -> freedup37_0 [label="dp0@37",style=dotted,color="#999999"];
+  n23 -> dup37;
+  dup37 -> n42 [label="b (dp1@43)"];
+  n69 [label="NEG\n[3]\n@69", shape=box, fillcolor="#cce5ff"];
+  dup68 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  n42 -> dup68;
+  dup68 -> n69 [label="dp1@69"];
+  era89 [label="ERA\n@89",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  n69 -> era89 [label="p"];
+  n84 [label="ADD\n[3]\n@84", shape=box, fillcolor="#cce5ff"];
+  dup59 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  dup50 -> dup59 [label="dp0@59"];
+  dup59 -> n84 [label="a (dp0@84)"];
+  dup77 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  dup68 -> dup77 [label="dp0@77"];
+  dup77 -> n84 [label="b (dp0@85)"];
+  n86 [label="ADD\n[3]\n@86", shape=box, fillcolor="#cce5ff"];
+  dup59 -> n86 [label="a (dp1@86)"];
+  dup77 -> n86 [label="b (dp1@87)"];
+}

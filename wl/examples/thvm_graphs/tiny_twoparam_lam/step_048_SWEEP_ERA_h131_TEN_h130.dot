@@ -1,0 +1,16 @@
+digraph G {
+  // PREV_INTERACTION: SWEEP_ERA_h129_TEN_h128
+  // NEXT_INTERACTION: SWEEP_ERA_h131_TEN_h130
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  ctr47 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n114 [label="FUSE", shape=box, fillcolor="#f0f0f0"];
+  n114 -> ctr47 [label="c0"];
+  n115 [label="FUSE", shape=box, fillcolor="#f0f0f0"];
+  n115 -> ctr47 [label="c1"];
+  era131 [label="ERA\n@131",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  t6 [label="t6\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t6 -> era131 [label="p",taillabel="@130",labelfontsize=7,fontcolor="#666666",color="#cc0000",penwidth=2.0,style=dashed];
+}

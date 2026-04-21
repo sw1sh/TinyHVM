@@ -4,8 +4,7 @@ digraph G {
   edge [fontsize=8, fontname="Helvetica"];
 
   n17 [label="DIV\n[3]\n@17", shape=box, fillcolor="#cce5ff"];
-  num17_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num17_0 -> n17 [label="a"];
+  n19 -> n17 [label="a"];
   n15 -> n17 [label="b"];
   n11 [label="SQRT\n[3]\n@11", shape=box, fillcolor="#cce5ff"];
   t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
@@ -13,6 +12,11 @@ digraph G {
   ctr6 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
   n11 -> ctr6 [label="c0"];
   n17 -> ctr6 [label="c1"];
+  n19 [label="EXPAND\n[3]\n@19", shape=box, fillcolor="#fff3cd"];
+  num19_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num19_0 -> n19 [label="in"];
+  t2 [label="t2\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n19 [label="shape",taillabel="@20",labelfontsize=7,fontcolor="#666666"];
   n13 [label="SQRT\n[3]\n@13", shape=box, fillcolor="#cce5ff"];
   t1 -> n13 [label="",taillabel="@13",labelfontsize=7,fontcolor="#666666"];
   n15 [label="MUL\n[3]\n@15", shape=box, fillcolor="#cce5ff"];

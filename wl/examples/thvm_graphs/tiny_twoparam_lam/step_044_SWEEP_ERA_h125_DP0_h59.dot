@@ -1,0 +1,49 @@
+digraph G {
+  // PREV_INTERACTION: SWEEP_ERA_h123_DP1_h58
+  // NEXT_INTERACTION: SWEEP_ERA_h125_DP0_h59
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  ctr47 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n114 [label="FUSE", shape=box, fillcolor="#f0f0f0"];
+  n114 -> ctr47 [label="c0"];
+  n115 [label="FUSE", shape=box, fillcolor="#f0f0f0"];
+  n115 -> ctr47 [label="c1"];
+  n41 [label="SUB\n[3]\n@41", shape=box, fillcolor="#cce5ff"];
+  n43 -> n41 [label="a"];
+  t3 [label="t3\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n41 [label="b",taillabel="@42",labelfontsize=7,fontcolor="#666666"];
+  n43 [label="ADD\n[3]\n@43", shape=box, fillcolor="#cce5ff"];
+  dup45 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup45_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup45 -> freedup45_1 [label="dp1@45",style=dotted,color="#999999"];
+  t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> dup45[label="",taillabel="@45",labelfontsize=7,fontcolor="#666666"];
+  dup45 -> n43 [label="a (dp0@43)"];
+  dup46 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup46_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup46 -> freedup46_1 [label="dp1@46",style=dotted,color="#999999"];
+  t2 [label="t2\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t2 -> dup46[label="",taillabel="@46",labelfontsize=7,fontcolor="#666666"];
+  dup46 -> n43 [label="b (dp0@44)"];
+  era125 [label="ERA\n@125",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  dup59 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup59_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup59 -> freedup59_1 [label="dp1@59",style=dotted,color="#999999"];
+  n41 -> dup59;
+  dup59 -> era125 [label="dp0@124",color="#cc0000",penwidth=2.0,style=dashed];
+  era127 [label="ERA\n@127",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  dup57 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup57_0 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup57 -> freedup57_0 [label="dp0@57",style=dotted,color="#999999"];
+  n41 -> dup57;
+  dup57 -> era127 [label="dp1@126"];
+  n53 [label="EXPAND\n[3]\n@53", shape=box, fillcolor="#fff3cd"];
+  t5 [label="t5\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t5 -> n53 [label="in",taillabel="@53",labelfontsize=7,fontcolor="#666666"];
+  t6 [label="t6\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t6 -> n53 [label="shape",taillabel="@54",labelfontsize=7,fontcolor="#666666"];
+  era129 [label="ERA\n@129",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  n53 -> era129 [label="p"];
+}

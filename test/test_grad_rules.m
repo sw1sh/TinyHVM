@@ -1329,6 +1329,33 @@ static int test_gradu_batched_reduce(void) {
     return report("gradu_batched_reduce", ok);
 }
 
+// UOP_GRAD2 through non-trivial lambda: y = (λv. v*v) a.  After beta,
+// body becomes a*a; GRAD2 should give 2a.  The lambda body DUPs v to
+// use it twice in MUL.
+static int test_gradu_lambda_square(void) {
+    setup_graph_dir("gradu_lambda_square");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term v;
+    Term lam = thvm_lam(ctx, &v, term_new(TAG_ERA, 0, 0));
+    Term v0, v1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), v, &v0, &v1);
+    heap_set(ctx, term_val(lam) + 1, thvm_op(ctx, UOP_MUL, v0, v1));
+    Term y = thvm_app(ctx, lam, a);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "APP", "LAM", "MUL"};
+    const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
+    int ok = topo_check("gradu_lambda_square", 0, pre, 5)
+          && topo_check("gradu_lambda_square", 1, post, 4);
+    return report("gradu_lambda_square", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1401,6 +1428,7 @@ int main(void) {
     fails += test_gradu_cross_entropy();
     fails += test_gradu_batched_reduce();
     fails += test_gradu_lambda();
+    fails += test_gradu_lambda_square();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

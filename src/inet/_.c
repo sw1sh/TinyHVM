@@ -94,6 +94,35 @@ void thvm_grad_pair(TinyHVM *ctx, u32 label, Term y,
     *out_bwd = term_new(TAG_GB, label, loc);
 }
 
+// Adapter for legacy bundle-style callers: returns a CTR#n_params where
+// each slot is the bwd of GRAD(y, targets[i]). Caller reads via
+// thvm_grad_bundle_get (CTR child access). y is DUP'd n_params-1 times so
+// each target's GRAD gets its own copy.
+Term thvm_grad_pair_bundle(TinyHVM *ctx, Term y, Term *targets, u32 n_params) {
+    if (n_params == 0) return thvm_ctr(ctx, NULL, 0);
+    Term *ys = (Term *)malloc((size_t)n_params * sizeof(Term));
+    ys[0] = y;
+    for (u32 i = 0; i + 1 < n_params; i++) {
+        Term a, b;
+        thvm_dup(ctx, thvm_fresh_label(ctx), ys[i], &a, &b);
+        ys[i] = a;
+        ys[i+1] = b;
+    }
+    Term *bwds = (Term *)malloc((size_t)n_params * sizeof(Term));
+    for (u32 i = 0; i < n_params; i++) {
+        Term fwd, bwd;
+        thvm_grad_pair(ctx, (u32)term_val(targets[i]), ys[i], &fwd, &bwd);
+        /* Forward port is unused by bundle callers — sink it to an ERA
+         * so the chain rule doesn't leak un-consumed fwd wires. */
+        thvm_spawn_detached_era(ctx, fwd);
+        bwds[i] = bwd;
+    }
+    Term bundle = thvm_ctr(ctx, bwds, (u8)n_params);
+    free(ys);
+    free(bwds);
+    return bundle;
+}
+
 // Allocate a fresh label (monotonic counter). Only call at search-space construction
 // time — interaction rules propagate existing labels, never create fresh ones.
 u32 thvm_fresh_label(TinyHVM *ctx) {

@@ -946,6 +946,30 @@ static int test_gradu_third_derivative(void) {
     return report("gradu_third_derivative", ok);
 }
 
+// UOP_GRAD2: y = exp(-t), dy/dt = -exp(-t).
+// EXP inner = NEG(t), so rule composes EXP' (mul by exp(neg(t))) and
+// NEG' (negate da).
+static int test_gradu_exp_neg(void) {
+    setup_graph_dir("gradu_exp_neg");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_op(ctx, UOP_EXP,
+                thvm_op(ctx, UOP_NEG, a, term_era()),
+                term_era());
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "EXP", "NEG"};
+    const char *post[] = {"CTR", "EXP", "NEG", "MUL", "EXPAND"};
+    int ok = topo_check("gradu_exp_neg", 0, pre, 4)
+          && topo_check("gradu_exp_neg", 1, post, 5);
+    return report("gradu_exp_neg", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1003,6 +1027,7 @@ int main(void) {
     fails += test_gradu_cubic();
     fails += test_gradu_shape_target_diff();
     fails += test_gradu_third_derivative();
+    fails += test_gradu_exp_neg();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

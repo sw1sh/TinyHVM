@@ -2082,15 +2082,21 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             {
                 Term _self = term_new(TAG_TOP, ext, val);
                 if (!TERM_HAS_PARENT_REF(_self) && !TERM_IS_DEF_ROOT(_self) && !REF_TARGETS_LOC(val)) {
-                    // GRAD / GRAD_FWD: outgoing port is bw (reverse-mode
-                    // gradient) / fw (forward-mode tangent).  Everything
-                    // else labels its free out "out".
-                    const char *out_lbl =
-                        (ext == UOP_GRAD)     ? "bw" :
-                        (ext == UOP_GRAD_FWD) ? "fw" : "out";
-                    EMIT_FREE_PORT(val, 1000u);
-                    fprintf(f, "  n%llu -> free%llu_%u [label=\"%s\"];\n",
-                            (unsigned long long)val, (unsigned long long)val, 1000u, out_lbl);
+                    if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) {
+                        // DUP-shaped pair: one body, two aux projections.
+                        // fw = forward value (VJP) / forward tangent (JVP).
+                        // bw = reverse gradient (VJP) / cotangent seed (JVP).
+                        EMIT_FREE_PORT(val, 1001u);
+                        EMIT_FREE_PORT(val, 1000u);
+                        fprintf(f, "  n%llu -> free%llu_%u [label=\"fw\"];\n",
+                                (unsigned long long)val, (unsigned long long)val, 1001u);
+                        fprintf(f, "  n%llu -> free%llu_%u [label=\"bw\"];\n",
+                                (unsigned long long)val, (unsigned long long)val, 1000u);
+                    } else {
+                        EMIT_FREE_PORT(val, 1000u);
+                        fprintf(f, "  n%llu -> free%llu_%u [label=\"out\"];\n",
+                                (unsigned long long)val, (unsigned long long)val, 1000u);
+                    }
                 }
             }
             nn++;

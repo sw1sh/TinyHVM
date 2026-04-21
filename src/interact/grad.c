@@ -18,12 +18,36 @@ if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
     if (term_is_sub(y))   y   = term_strip_sub(y);
     if (term_is_sub(tgt)) tgt = term_strip_sub(tgt);
 
-    // In forward mode every recursive GRAD stays in forward mode too.
-    // GRAD_REC reduces the sub-gradient *inline* so the ERA peepholes
-    // below (GRAD_ADD/MUL/etc.) see actual ERA terms, not unresolved
-    // GRAD TOPs that only collapse to ERA at the next reduction step.
-    #define GRAD_REC(_y, _t) thvm_reduce(ctx, \
-        (is_fwd ? thvm_grad_fwd(ctx, (_y), (_t)) : thvm_grad(ctx, (_y), (_t))))
+    // GRAD_REC: build a sub-gradient term.  Short-circuits at construction
+    // time for leaves (TEN and NUM) so the ERA peepholes below see actual
+    // ERA / TEN, not an unresolved GRAD TOP.  For composite operands, emit
+    // a fresh GRAD TOP and let the reducer fire it.
+    #define GRAD_REC(_y, _t) ({ \
+        Term __y = (_y), __t = (_t); \
+        Term __r; \
+        u8 __yt = term_tag(__y); \
+        if (__yt == TAG_NUM) __r = term_era(); \
+        else if (__yt == TAG_TEN && term_tag(__t) == TAG_TEN) { \
+            u32 __yi = (u32)term_val(__y), __ti = (u32)term_val(__t); \
+            if (__yi != __ti) __r = term_era(); \
+            else if (is_fwd) { \
+                Shape __s = (__yi < ctx->tensor_count) \
+                    ? ctx->tensors[__yi].view.shape : SHAPE(1); \
+                if (__s.rank > 0) { \
+                    u32 __n = 1; for (u32 __k = 0; __k < __s.rank; __k++) __n *= __s.dims[__k]; \
+                    f32 *__b = (f32*)malloc(__n * sizeof(f32)); \
+                    for (u32 __k = 0; __k < __n; __k++) __b[__k] = 1.0f; \
+                    __r = thvm_tensor(ctx, __b, __s); \
+                    free(__b); \
+                } else __r = GRAD_SCALAR_TEN(1.0f, __s); \
+            } else { \
+                Shape __s = (__ti < ctx->tensor_count) \
+                    ? ctx->tensors[__ti].view.shape : SHAPE(1); \
+                __r = GRAD_SCALAR_TEN(1.0f, __s); \
+            } \
+        } \
+        else __r = is_fwd ? thvm_grad_fwd(ctx, __y, __t) : thvm_grad(ctx, __y, __t); \
+        __r; })
 
     // Helper: build a scalar-valued tensor of tsh shape via
     // rank-matched ones-shape + EXPAND.  Handles the recurring

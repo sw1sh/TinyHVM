@@ -173,16 +173,26 @@ if (uop == UOP_GRAD2) {
         }
         // RESHAPE/PERMUTE: movement ops. dA = inverse_view(da).
         // Shapes/perm taken from the second operand TEN.
+        // RESHAPE / PERMUTE are 1:1 data maps — y[*] corresponds bijectively
+        // to a[*]. sum over y of dy/d_target = sum over a of da/d_target =
+        // GRAD2(a, target) unchanged.  Guard: only apply a wrap when the
+        // grad's shape still matches a_shape (identity target case).
         if (yuop == UOP_RESHAPE || yuop == UOP_PERMUTE) {
             Term a     = heap_read(ctx, yloc + 0);
             Term shape = heap_read(ctx, yloc + 1);
             Shape a_shape = SHAPE(1);
             GRAD2_TERM_SHAPE(a, a_shape);
+            u32 ttid = (u32)term_val(tgt);
+            Shape tsh = (ttid < ctx->tensor_count)
+                ? ctx->tensors[ttid].view.shape : SHAPE(1);
+            u32 a_numel = 1, t_numel = 1;
+            for (u32 i = 0; i < a_shape.rank; i++) a_numel *= a_shape.dims[i];
+            for (u32 i = 0; i < tsh.rank; i++) t_numel *= tsh.dims[i];
             Term da = thvm_grad_u(ctx, a, tgt);
             Term out;
-            if (yuop == UOP_RESHAPE && a_shape.rank != 0) {
+            if (a_numel == t_numel && yuop == UOP_RESHAPE && a_shape.rank != 0) {
                 out = thvm_reshape(ctx, da, a_shape);
-            } else if (yuop == UOP_PERMUTE &&
+            } else if (a_numel == t_numel && yuop == UOP_PERMUTE &&
                        term_tag(shape) == TAG_TEN && a_shape.rank > 0) {
                 u32 pid = (u32)term_val(shape);
                 u32 nd = a_shape.rank;
@@ -190,7 +200,7 @@ if (uop == UOP_GRAD2) {
                 u32 inv[MAX_DIM]; for (u32 j = 0; j < nd; j++) inv[pf[j]] = j;
                 out = thvm_permute(ctx, da, inv, nd);
             } else {
-                out = da;
+                out = da;  // pass-through when target shape differs from a's
             }
             ctx->itrs++; return out;
         }

@@ -2573,7 +2573,7 @@ int main(void) {
     fails += test_e2e_adam();
     fails += test_e2e_maxpool_like();
     fails += test_e2e_adam_linear_fit();
-    // fails += test_e2e_mm_bwd();  // neither thvm_op nor thvm_op_raw MM path materializes
+    // fails += test_e2e_mm_bwd();  // MM composite bwd: RESHAPE guard avoids assert but result TOP doesn't materialize
 
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);

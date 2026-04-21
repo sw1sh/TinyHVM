@@ -1333,6 +1333,19 @@ inet_step:
                         Term out = thvm_grad_u(ctx, dst, tgt);
                         ctx->itrs++; RETURN_REDUCED(out);
                     }
+                    // WHERE(cond, a, b): dy/dt = where(cond, da, db).
+                    // cond is constant w.r.t. t; gradient distributes linearly.
+                    if (yuop == UOP_WHERE) {
+                        Term c = heap_read(ctx, yloc + 0);
+                        Term a = heap_read(ctx, yloc + 1);
+                        Term b = heap_read(ctx, yloc + 2);
+                        Term t0, t1;
+                        thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &t0, &t1);
+                        Term da = thvm_grad_u(ctx, a, t0);
+                        Term db = thvm_grad_u(ctx, b, t1);
+                        Term out = thvm_where(ctx, c, da, db);
+                        ctx->itrs++; RETURN_REDUCED(out);
+                    }
                     // CMP: non-differentiable. Zero contribution, shape-matched.
                     if (yuop == UOP_CMP) {
                         u32 ttid = (u32)term_val(tgt);

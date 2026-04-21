@@ -170,6 +170,58 @@ static int test_expand(void) {
     return report("expand", ok);
 }
 
+static int test_rmax(void) {
+    setup_graph_dir("rmax");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 5, 3, 2};
+    Term a = thvm_tensor(ctx, ad, SHAPE(4));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_rmax_axes(ctx, a, (u32[]){0}, 1);
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "RMAX"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("rmax", 0, pre, 3)
+          && topo_check("rmax", 1, post, 1);
+    return report("rmax", ok);
+}
+
+static int test_shrink(void) {
+    setup_graph_dir("shrink");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(6));
+    thvm_set_requires_grad(ctx, a);
+    /* shrink[1:5] */
+    u32 pairs[2] = {1, 5};
+    Term y = thvm_shrink(ctx, a, pairs, 1);
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "SHRINK"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("shrink", 0, pre, 3)
+          && topo_check("shrink", 1, post, 1);
+    return report("shrink", ok);
+}
+
+static int test_pad(void) {
+    setup_graph_dir("pad");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4};
+    Term a = thvm_tensor(ctx, ad, SHAPE(4));
+    thvm_set_requires_grad(ctx, a);
+    /* pad(1, 1): add 1 element on each side */
+    u32 pairs[2] = {1, 1};
+    Term y = thvm_pad(ctx, a, pairs, 1);
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "PAD"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("pad", 0, pre, 3)
+          && topo_check("pad", 1, post, 1);
+    return report("pad", ok);
+}
+
 static int test_mm(void) {
     setup_graph_dir("mm");
     TinyHVM *ctx = thvm_init("cpu");
@@ -241,6 +293,9 @@ int main(void) {
     fails += test_expand();
     fails += test_permute();
     fails += test_mm();
+    fails += test_rmax();
+    fails += test_shrink();
+    fails += test_pad();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

@@ -84,27 +84,18 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term target) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc + 0, y);
     heap_set(ctx, loc + 1, target);
-    // Record target.shape on the GRAD TOP so downstream wrappers (ADD, NEG,…)
-    // can compute their output view and the scheduler can allocate a
-    // raw_output_tid.  GRAD's result shape = target.shape.
     const View *tv = term_view(ctx, target);
-    if (tv) {
-        View v = *tv;
-        st_set(loc, &v);
-    }
+    if (tv) { View v = *tv; st_set(loc, &v); }
     return term_new(TAG_TOP, UOP_GRAD, loc);
 }
 
-// Forward-mode JVP.  heap[loc+0] = y, heap[loc+1] = target.  Result shape = y.shape.
+// Forward-mode JVP.  heap[loc+0] = y, heap[loc+1] = target.
 Term thvm_grad_fwd(TinyHVM *ctx, Term y, Term target) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc + 0, y);
     heap_set(ctx, loc + 1, target);
     const View *yv = term_view(ctx, y);
-    if (yv) {
-        View v = *yv;
-        st_set(loc, &v);
-    }
+    if (yv) { View v = *yv; st_set(loc, &v); }
     return term_new(TAG_TOP, UOP_GRAD_FWD, loc);
 }
 

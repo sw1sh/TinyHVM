@@ -1025,6 +1025,29 @@ inet_step:
             u32 uop = term_ext(t);
             u64 loc = term_val(t);
 
+            // === UOP_GRAD2 (new UOP-shape gradient; TEN-leaf only for now)
+            if (uop == UOP_GRAD2) {
+                Term y   = heap_read(ctx, loc + 0);
+                Term tgt = heap_read(ctx, loc + 1);
+                if (term_is_sub(y))   y   = term_strip_sub(y);
+                if (term_is_sub(tgt)) tgt = term_strip_sub(tgt);
+                if (term_tag(y) == TAG_TEN && term_tag(tgt) == TAG_TEN) {
+                    u32 ytid = (u32)term_val(y);
+                    u32 ttid = (u32)term_val(tgt);
+                    Shape tsh = (ttid < ctx->tensor_count)
+                        ? ctx->tensors[ttid].view.shape : SHAPE(1);
+                    Term scalar = (ytid == ttid) ? term_num_f32(1.0f)
+                                                 : term_num_f32(0.0f);
+                    Term out = (tsh.rank > 0 && !(tsh.rank == 1 && tsh.dims[0] == 1))
+                        ? thvm_expand(ctx, scalar, tsh) : scalar;
+                    ctx->itrs++;
+                    RETURN_REDUCED(out);
+                }
+                // y not yet WNF or not TEN-leaf: leave alone; trampoline will
+                // retry once y reduces further.  TOP dispatch for UOP_GRAD2
+                // lands in follow-up ticks.
+            }
+
             // === UOP_GRAD ===
 #include "grad.c"
 

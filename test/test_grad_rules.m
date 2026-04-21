@@ -525,6 +525,28 @@ static int test_sum_multi_axis(void) {
     return report("sum_multi_axis", ok);
 }
 
+// UOP_GRAD2 pivot: identity via new single-UOP shape.
+// y = t1, target = t1.  thvm_grad_u(t1, t1) should reduce to
+// EXPAND(1, t1.shape).
+static int test_gradu_identity(void) {
+    setup_graph_dir("gradu_identity");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term a0, a1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+    Term root = thvm_ctr(ctx,
+        (Term[]){ a0, thvm_grad_u(ctx, a1, a) }, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2"};
+    const char *post[] = {"CTR", "EXPAND"};
+    int ok = topo_check("gradu_identity", 0, pre, 2)
+          && topo_check("gradu_identity", 1, post, 2);
+    return report("gradu_identity", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -557,6 +579,9 @@ int main(void) {
     fails += test_nested_unary();
     fails += test_identity();
     fails += test_sum_multi_axis();
+    // test_gradu_identity() disabled — UOP_GRAD2 rule not yet plumbed into
+    // the trampoline's TOP enter-paths (src/interact/_.c:454, 464, 845).
+    // Re-enable once trampoline gating lands.
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

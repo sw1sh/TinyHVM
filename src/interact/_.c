@@ -71,7 +71,7 @@ static u32 thvm_uop_storage_arity(u32 ext) {
     if (ext == UOP_EXEC) return 3;   // [NUM(kid), deps, NUM(flags)]
     if (ext == UOP_FUSE) return 1;
     if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
-    if (ext == UOP_GRAD) return 2;
+    if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) return 2;
     if (ext == UOP_LOG_PRINT || ext == UOP_DETACH) return 1;
     if (!is_binary(ext) && is_elementwise(ext)) return 1;
     return 2;
@@ -451,7 +451,7 @@ static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 de
                                    uop == UOP_ASSIGN || uop == UOP_DETACH ||
                                    uop == UOP_FUSE ||
                                    uop == UOP_IFZ || uop == UOP_WHERE ||
-                                   uop == UOP_GRAD || uop == UOP_GRAD ||
+                                   uop == UOP_GRAD || uop == UOP_GRAD_FWD ||
                                    uop == UOP_LOG_PRINT ||
                                    uop == UOP_TODEVICE);
                 if (maybe_force) {

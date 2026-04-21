@@ -1,15 +1,26 @@
-// src/interact/grad2.c - UOP_GRAD interaction rule (new DUP-shape gradient).
+// src/interact/grad.c - UOP_GRAD (VJP) / UOP_GRAD_FWD (JVP) interaction rule.
 // Included inline from src/interact/_.c under case TAG_TOP.
 //
-// Convention: GRAD(y, target) reduces to a tensor of target.shape holding
-// d(y)/d(target) summed over y indices (forward-mode JVP with ones seed).
-// Helper macros GRAD_SCALAR_TEN / GRAD_ONES_OF / GRAD_TERM_SHAPE live in _.c.
+// Reverse mode (UOP_GRAD):  GRAD(y, target) → tensor of target.shape
+//     = ∂(Σ y)/∂target  (VJP with implicit ones cotangent on y).
+// Forward mode (UOP_GRAD_FWD):  GRAD_FWD(y, target) → tensor of y.shape
+//     = (∂y/∂target) · ones(target.shape)  (JVP with implicit ones seed).
+//
+// The two modes share all elementwise/diagonal-Jacobian rules (ADD, SUB, NEG,
+// MUL, DIV, EXP, LOG, SQRT, RELU, MAX, CMP, WHERE).  They branch on polarity
+// (`is_fwd`) for leaf shape and the non-diagonal ops: MM, SUM, EXPAND,
+// RESHAPE, PERMUTE, SHRINK, PAD.
 
-if (uop == UOP_GRAD) {
+if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
+    const int is_fwd = (uop == UOP_GRAD_FWD);
     Term y   = heap_read(ctx, loc + 0);
     Term tgt = heap_read(ctx, loc + 1);
     if (term_is_sub(y))   y   = term_strip_sub(y);
     if (term_is_sub(tgt)) tgt = term_strip_sub(tgt);
+
+    // In forward mode every recursive GRAD stays in forward mode too.
+    #define GRAD_REC(_y, _t) (is_fwd ? thvm_grad_fwd(ctx, (_y), (_t)) \
+                                      : thvm_grad(ctx, (_y), (_t)))
 
     // Helper: build a scalar-valued tensor of tsh shape via
     // rank-matched ones-shape + EXPAND.  Handles the recurring
@@ -47,20 +58,43 @@ if (uop == UOP_GRAD) {
         Term _t = thvm_tensor(ctx, &_v, _os);                \
         ((_shape).rank == 0) ? _t : thvm_expand(ctx, _t, (_shape)); \
     })
-    // NUM constant: d(const)/dt = 0 of target-shape.
+    // Leaf output shape: VJP returns target.shape, JVP returns y.shape.
+    // Value: 1 if y-leaf matches target (then y.shape == target.shape), else 0.
+    // NUM constant: always 0 of output shape.
     if (term_tag(y) == TAG_NUM && term_tag(tgt) == TAG_TEN) {
-        u32 ttid = (u32)term_val(tgt);
-        Shape tsh = (ttid < ctx->tensor_count)
-            ? ctx->tensors[ttid].view.shape : SHAPE(1);
-        Term out = GRAD_SCALAR_TEN(0.0f, tsh);
+        Shape osh = SHAPE(1);
+        if (is_fwd) {
+            // y is NUM scalar; result shape = [1].
+            osh = SHAPE(1);
+        } else {
+            u32 ttid = (u32)term_val(tgt);
+            if (ttid < ctx->tensor_count) osh = ctx->tensors[ttid].view.shape;
+        }
+        Term out = GRAD_SCALAR_TEN(0.0f, osh);
         ctx->itrs++; return out;
     }
     if (term_tag(y) == TAG_TEN && term_tag(tgt) == TAG_TEN) {
         u32 ytid = (u32)term_val(y);
         u32 ttid = (u32)term_val(tgt);
-        Shape tsh = (ttid < ctx->tensor_count)
-            ? ctx->tensors[ttid].view.shape : SHAPE(1);
-        Term out = GRAD_SCALAR_TEN(ytid == ttid ? 1.0f : 0.0f, tsh);
+        Shape osh = SHAPE(1);
+        if (is_fwd) {
+            if (ytid < ctx->tensor_count) osh = ctx->tensors[ytid].view.shape;
+        } else {
+            if (ttid < ctx->tensor_count) osh = ctx->tensors[ttid].view.shape;
+        }
+        // Forward mode feeds this tangent directly into MM/etc., so emit a
+        // dense materialized tensor instead of a stride-0 EXPAND view (which
+        // can lose its broadcast semantics across the MM decomposition).
+        if (is_fwd && osh.rank > 0) {
+            u32 n = 1; for (u32 i = 0; i < osh.rank; i++) n *= osh.dims[i];
+            f32 val = (ytid == ttid) ? 1.0f : 0.0f;
+            f32 *buf = (f32 *)malloc(n * sizeof(f32));
+            for (u32 i = 0; i < n; i++) buf[i] = val;
+            Term out = thvm_tensor(ctx, buf, osh);
+            free(buf);
+            ctx->itrs++; return out;
+        }
+        Term out = GRAD_SCALAR_TEN(ytid == ttid ? 1.0f : 0.0f, osh);
         ctx->itrs++;
         return out;
     }
@@ -74,8 +108,8 @@ if (uop == UOP_GRAD) {
             Term b = heap_read(ctx, yloc + 1);
             Term tgt0, tgt1;
             thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &tgt0, &tgt1);
-            Term da = thvm_grad(ctx, a, tgt0);
-            Term db = thvm_grad(ctx, b, tgt1);
+            Term da = GRAD_REC( a, tgt0);
+            Term db = GRAD_REC( b, tgt1);
             Term out = thvm_op_raw(ctx, yuop, da, db);
             ctx->itrs++;
             return out;
@@ -83,7 +117,7 @@ if (uop == UOP_GRAD) {
         // NEG: d(-a)/dt = -(da).
         if (yuop == UOP_NEG) {
             Term a = heap_read(ctx, yloc + 0);
-            Term da = thvm_grad(ctx, a, tgt);
+            Term da = GRAD_REC( a, tgt);
             Term out = thvm_op_raw(ctx, UOP_NEG, da, term_era());
             ctx->itrs++; return out;
         }
@@ -92,7 +126,7 @@ if (uop == UOP_GRAD) {
             Term a = heap_read(ctx, yloc + 0);
             Term a0, a1;
             thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-            Term da = thvm_grad(ctx, a0, tgt);
+            Term da = GRAD_REC( a0, tgt);
             Term exp_a = thvm_op_raw(ctx, UOP_EXP, a1, term_era());
             Term out = thvm_op_raw(ctx, UOP_MUL, da, exp_a);
             ctx->itrs++; return out;
@@ -102,7 +136,7 @@ if (uop == UOP_GRAD) {
             Term a = heap_read(ctx, yloc + 0);
             Term a0, a1;
             thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-            Term da = thvm_grad(ctx, a0, tgt);
+            Term da = GRAD_REC( a0, tgt);
             Term out = thvm_op_raw(ctx, UOP_DIV, da, a1);
             ctx->itrs++; return out;
         }
@@ -111,7 +145,7 @@ if (uop == UOP_GRAD) {
             Term a = heap_read(ctx, yloc + 0);
             Term a0, a1;
             thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-            Term da = thvm_grad(ctx, a0, tgt);
+            Term da = GRAD_REC( a0, tgt);
             Term sq = thvm_op_raw(ctx, UOP_SQRT, a1, term_era());
             Term two = term_num_f32(2.0f);
             Term den = thvm_op_raw(ctx, UOP_MUL, two, sq);
@@ -123,7 +157,7 @@ if (uop == UOP_GRAD) {
             Term a = heap_read(ctx, yloc + 0);
             Term a0, a1;
             thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-            Term da = thvm_grad(ctx, a0, tgt);
+            Term da = GRAD_REC( a0, tgt);
             Term zero = term_num_f32(0.0f);
             Term mask = thvm_op_raw(ctx, UOP_CMP, a1, zero);
             Term out = thvm_op_raw(ctx, UOP_MUL, da, mask);
@@ -142,8 +176,8 @@ if (uop == UOP_GRAD) {
             thvm_dup(ctx, thvm_fresh_label(ctx), b1, &b_lo, &b2);
             thvm_dup(ctx, thvm_fresh_label(ctx), b_lo, &b1, &b3);
             thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &t0, &t1);
-            Term da = thvm_grad(ctx, a0, t0);
-            Term db = thvm_grad(ctx, b0, t1);
+            Term da = GRAD_REC( a0, t0);
+            Term db = GRAD_REC( b0, t1);
             Term l  = thvm_op_raw(ctx, UOP_MUL, da, b1);
             Term r  = thvm_op_raw(ctx, UOP_MUL, a1, db);
             Term num = thvm_op_raw(ctx, UOP_SUB, l, r);
@@ -159,8 +193,8 @@ if (uop == UOP_GRAD) {
             thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
             thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
             thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &t0, &t1);
-            Term da = thvm_grad(ctx, a0, t0);
-            Term db = thvm_grad(ctx, b0, t1);
+            Term da = GRAD_REC( a0, t0);
+            Term db = GRAD_REC( b0, t1);
             Term mask_a = thvm_op_raw(ctx, UOP_CMP, a1, b1);
             Term m0, m1;
             thvm_dup(ctx, thvm_fresh_label(ctx), mask_a, &m0, &m1);
@@ -182,14 +216,31 @@ if (uop == UOP_GRAD) {
             Term shape = heap_read(ctx, yloc + 1);
             Shape a_shape = SHAPE(1);
             GRAD_TERM_SHAPE(a, a_shape);
+            Term da = GRAD_REC( a, tgt);
+            Term out;
+            if (is_fwd) {
+                // JVP: apply the forward movement op to the tangent.
+                Shape y_shape = SHAPE(1);
+                const View *yv = st_get(yloc); if (yv) y_shape = yv->shape;
+                if (yuop == UOP_RESHAPE && y_shape.rank > 0) {
+                    out = thvm_reshape(ctx, da, y_shape);
+                } else if (yuop == UOP_PERMUTE &&
+                           term_tag(shape) == TAG_TEN && a_shape.rank > 0) {
+                    u32 pid = (u32)term_val(shape);
+                    u32 nd = a_shape.rank;
+                    u32 pf[MAX_DIM]; tensor_meta_read_u32(ctx, pid, pf, MAX_DIM);
+                    out = thvm_permute(ctx, da, pf, nd);
+                } else {
+                    out = da;
+                }
+                ctx->itrs++; return out;
+            }
             u32 ttid = (u32)term_val(tgt);
             Shape tsh = (ttid < ctx->tensor_count)
                 ? ctx->tensors[ttid].view.shape : SHAPE(1);
             u32 a_numel = 1, t_numel = 1;
             for (u32 i = 0; i < a_shape.rank; i++) a_numel *= a_shape.dims[i];
             for (u32 i = 0; i < tsh.rank; i++) t_numel *= tsh.dims[i];
-            Term da = thvm_grad(ctx, a, tgt);
-            Term out;
             if (a_numel == t_numel && yuop == UOP_RESHAPE && a_shape.rank != 0) {
                 out = thvm_reshape(ctx, da, a_shape);
             } else if (a_numel == t_numel && yuop == UOP_PERMUTE &&
@@ -204,15 +255,28 @@ if (uop == UOP_GRAD) {
             }
             ctx->itrs++; return out;
         }
-        // SUM: dA = EXPAND(da, input_shape).
+        // SUM.  VJP: expand da to a_shape (broadcast cotangent back).
+        //         JVP: apply the same SUM axes to the tangent.
         if (yuop == UOP_SUM) {
             Term a    = heap_read(ctx, yloc + 0);
-            (void)heap_read(ctx, yloc + 1);
+            Term axes = heap_read(ctx, yloc + 1);
             Shape a_shape = SHAPE(1);
             GRAD_TERM_SHAPE(a, a_shape);
-            Term da = thvm_grad(ctx, a, tgt);
-            Term out = (a_shape.rank != 0)
-                ? thvm_expand(ctx, da, a_shape) : da;
+            Term da = GRAD_REC( a, tgt);
+            Term out;
+            if (is_fwd) {
+                out = thvm_op_raw(ctx, UOP_SUM, da, axes);
+            } else {
+                out = (a_shape.rank != 0) ? thvm_expand(ctx, da, a_shape) : da;
+            }
+            ctx->itrs++; return out;
+        }
+        // SHRINK/PAD: JVP applies the same op to the tangent.
+        if ((yuop == UOP_SHRINK || yuop == UOP_PAD) && is_fwd) {
+            Term a     = heap_read(ctx, yloc + 0);
+            Term shape = heap_read(ctx, yloc + 1);
+            Term da    = GRAD_REC(a, tgt);
+            Term out   = thvm_op_raw(ctx, yuop, da, shape);
             ctx->itrs++; return out;
         }
         // SHRINK: dA = pad(da, complementary pairs of shrink pairs).
@@ -243,7 +307,7 @@ if (uop == UOP_GRAD) {
                 }
                 out = thvm_pad(ctx, y_ones, pp, nd);
             } else {
-                out = thvm_grad(ctx, a, tgt);
+                out = GRAD_REC( a, tgt);
             }
             ctx->itrs++; return out;
         }
@@ -269,7 +333,7 @@ if (uop == UOP_GRAD) {
                 }
                 out = thvm_shrink(ctx, y_ones, sp, nd);
             } else {
-                out = thvm_grad(ctx, a, tgt);
+                out = GRAD_REC( a, tgt);
             }
             ctx->itrs++; return out;
         }
@@ -283,6 +347,12 @@ if (uop == UOP_GRAD) {
             Shape y_shape = SHAPE(1);
             const View *yv = st_get(yloc);
             if (yv) y_shape = yv->shape;
+            if (is_fwd) {
+                // JVP: expand the tangent forward to y.shape.
+                Term da = GRAD_REC(a, tgt);
+                Term out = (y_shape.rank != 0) ? thvm_expand(ctx, da, y_shape) : da;
+                ctx->itrs++; return out;
+            }
             u32 ttid = (u32)term_val(tgt);
             Shape tsh = (ttid < ctx->tensor_count)
                 ? ctx->tensors[ttid].view.shape : SHAPE(1);
@@ -308,7 +378,7 @@ if (uop == UOP_GRAD) {
             thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
             Term a1b;
             thvm_dup(ctx, thvm_fresh_label(ctx), a1, &a1b, &a2);
-            Term da = thvm_grad(ctx, a0, tgt);
+            Term da = GRAD_REC( a0, tgt);
             Term rm = thvm_op_raw(ctx, UOP_RMAX, a1b, axes);
             Term rm_bc = (a_shape.rank != 0)
                 ? thvm_expand(ctx, rm, a_shape) : rm;
@@ -330,6 +400,22 @@ if (uop == UOP_GRAD) {
         if (yuop == UOP_MM) {
             Term a = heap_read(ctx, yloc + 0);
             Term b = heap_read(ctx, yloc + 1);
+            // JVP: Leibniz is exactly right — JVP(a@b) = JVP(a)@b + a@JVP(b).
+            // Tangent of each operand has the operand's shape, so the MMs
+            // compose shape-wise into y.shape.
+            if (is_fwd) {
+                // JVP(a@b) = JVP(a)@b + a@JVP(b).  Leibniz composes naturally.
+                Term a0, a1, b0, b1, t0, t1;
+                thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
+                thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &t0, &t1);
+                Term da = GRAD_REC(a0, t0);
+                Term db = GRAD_REC(b0, t1);
+                Term l  = thvm_op(ctx, UOP_MM, da, b1);
+                Term r  = thvm_op(ctx, UOP_MM, a1, db);
+                Term out = thvm_op_raw(ctx, UOP_ADD, l, r);
+                ctx->itrs++; return out;
+            }
             // Resolve TEN id through DP/VAR chain.
             #define MM_TID(_tm) ({ \
                 Term _t = (_tm); u32 _id = ~0u; \
@@ -381,7 +467,7 @@ if (uop == UOP_GRAD) {
         // ASSIGN: forward-only. Gradient flows through dst only.
         if (yuop == UOP_ASSIGN) {
             Term dst = heap_read(ctx, yloc + 0);
-            Term out = thvm_grad(ctx, dst, tgt);
+            Term out = GRAD_REC( dst, tgt);
             ctx->itrs++; return out;
         }
         // WHERE(cond, a, b): dy/dt = where(cond, da, db).
@@ -392,8 +478,8 @@ if (uop == UOP_GRAD) {
             Term b = heap_read(ctx, yloc + 2);
             Term t0, t1;
             thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &t0, &t1);
-            Term da = thvm_grad(ctx, a, t0);
-            Term db = thvm_grad(ctx, b, t1);
+            Term da = GRAD_REC( a, t0);
+            Term db = GRAD_REC( b, t1);
             Term out = thvm_where(ctx, c, da, db);
             ctx->itrs++; return out;
         }
@@ -415,8 +501,8 @@ if (uop == UOP_GRAD) {
             thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
             thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
             thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &t0, &t1);
-            Term da = thvm_grad(ctx, a0, t0);
-            Term db = thvm_grad(ctx, b0, t1);
+            Term da = GRAD_REC( a0, t0);
+            Term db = GRAD_REC( b0, t1);
             Term l = thvm_op_raw(ctx, UOP_MUL, da, b1);
             Term r = thvm_op_raw(ctx, UOP_MUL, a1, db);
             Term out = thvm_op_raw(ctx, UOP_ADD, l, r);

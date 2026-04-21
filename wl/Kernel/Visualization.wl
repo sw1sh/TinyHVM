@@ -20,6 +20,9 @@ ClearAll[
     dotNodeId,
     dotShapeName,
     dotAttrsString,
+    edgeLabelLines,
+    edgeLabelColor,
+    displayWalkData,
     dotNodeAttrs,
     dotEdgeAttrs,
     walkDOTString,
@@ -101,8 +104,8 @@ dotInferShape[val_Integer] := Block[{
     If[ListQ[dims], dims, None]
 ]
 
-(* Multi-line label for a graph node, matching dump.c's 
--separated fields.
+(* Multi-line label for a graph node, using the same newline-separated fields
+   across the WL graph and DOT exporters.
    Optional `nodeRec` gives the captured-at-walk derived fields
    (KernelOpChain, Shape) so trace replays don't read mutated heap. *)
 dotLabelLines[
@@ -195,7 +198,7 @@ dotLabelLines[
         ]
 ]
 
-(* Fill color for a node; dump.c palette with dark-mode variants. *)
+(* Fill color for a node in the shared WL/DOT display path. *)
 dotFill[tag_String, uop_String] := Which[
     tag === "Top",
         Which[
@@ -353,6 +356,59 @@ dotAttrsString[attrs_Association] := StringRiffle[
     ", "
 ]
 
+edgeLabelLines[edge_Association, nodes_Association] := Block[{
+    slot = Lookup[edge, "FromSlot", 0],
+    srcTag = Lookup[Lookup[nodes, edge["From"], <||>], "Tag", None]
+},
+    DeleteCases[
+        {
+            edge["Port"],
+            If[slot > 0 && srcTag === "Ten", "@" <> ToString[slot], Nothing]
+        },
+        Nothing
+    ]
+]
+
+edgeLabelColor[edge_Association] := Switch[
+    Lookup[edge, "Style", ""],
+    "KernelSemantic", "#006600",
+    "RefDef", "#777777",
+    _, "#222222"
+]
+
+displayWalkData[walk_Association, termId_: None] := Block[{
+    nodes = Association[walk["Nodes"]],
+    edges = walk["Edges"],
+    rootKey = walk["Root"],
+    freeKey = "free_out"
+},
+    If[StringQ[rootKey] && KeyExistsQ[nodes, rootKey],
+        nodes[freeKey] = <|
+            "Tag" -> "Free",
+            "TagCode" -> -1,
+            "Ext" -> 0,
+            "Val" -> 0,
+            "Loc" -> 0,
+            "Key" -> freeKey,
+            "DisplayLoc" -> 0
+        |>;
+        AppendTo[
+            edges,
+            <|"From" -> rootKey, "To" -> freeKey, "Port" -> "out", "FromSlot" -> 0|>
+        ]
+    ];
+    <|
+        "Nodes" -> nodes,
+        "Edges" -> edges,
+        "Root" -> rootKey,
+        "Keys" -> Keys[nodes],
+        "ActiveSlot" -> activeHighlightSlot[
+            <|"Nodes" -> nodes, "Edges" -> edges, "Root" -> rootKey|>,
+            termId
+        ]
+    |>
+]
+
 dotNodeAttrs[node_Association] := Block[{
     tag = node["Tag"],
     uop = Lookup[node, "UOp", ""],
@@ -406,25 +462,11 @@ dotNodeAttrs[node_Association] := Block[{
 
 dotEdgeAttrs[edge_Association, nodes_Association, activeSlot_Integer] := Block[{
     slot = Lookup[edge, "FromSlot", 0],
-    srcTag = Lookup[Lookup[nodes, edge["From"], <||>], "Tag", None],
     style = Lookup[edge, "Style", ""],
-    labelLines,
-    labelColor,
+    labelLines = edgeLabelLines[edge, nodes],
+    labelColor = edgeLabelColor[edge],
     attrs
 },
-    labelLines = DeleteCases[
-        {
-            edge["Port"],
-            If[slot > 0 && srcTag === "Ten", "@" <> ToString[slot], Nothing]
-        },
-        Nothing
-    ];
-    labelColor = Switch[
-        style,
-        "KernelSemantic", "#006600",
-        "RefDef", "#777777",
-        _, "#222222"
-    ];
     attrs = Switch[
         style,
         "KernelSemantic",
@@ -466,31 +508,14 @@ dotEdgeAttrs[edge_Association, nodes_Association, activeSlot_Integer] := Block[{
 ]
 
 walkDOTString[walk_Association, termId_: None] := Block[{
-    nodes = Association[walk["Nodes"]],
-    edges = walk["Edges"],
-    rootKey = walk["Root"],
-    freeKey = "free_out",
-    activeSlot,
+    data = displayWalkData[walk, termId],
+    nodes,
+    edges,
     nodeLines,
     edgeLines
 },
-    If[StringQ[rootKey] && KeyExistsQ[nodes, rootKey],
-        nodes[freeKey] = <|
-            "Tag" -> "Free",
-            "TagCode" -> -1,
-            "Ext" -> 0,
-            "Val" -> 0,
-            "Loc" -> 0,
-            "Key" -> freeKey,
-            "DisplayLoc" -> 0
-        |>;
-        AppendTo[
-            edges,
-            <|"From" -> rootKey, "To" -> freeKey, "Port" -> "out", "FromSlot" -> 0|>
-        ]
-    ];
-
-    activeSlot = activeHighlightSlot[<|"Nodes" -> nodes, "Edges" -> edges, "Root" -> rootKey|>, termId];
+    nodes = data["Nodes"];
+    edges = data["Edges"];
 
     nodeLines = KeyValueMap[
         "    " <> dotNodeId[#1] <> " [" <> dotAttrsString[dotNodeAttrs[#2]] <> "];" &,
@@ -499,7 +524,7 @@ walkDOTString[walk_Association, termId_: None] := Block[{
     edgeLines = Map[
         Function[edge,
             "    " <> dotNodeId[edge["From"]] <> " -> " <> dotNodeId[edge["To"]] <>
-                " [" <> dotAttrsString[dotEdgeAttrs[edge, nodes, activeSlot]] <> "];"
+                " [" <> dotAttrsString[dotEdgeAttrs[edge, nodes, data["ActiveSlot"]]] <> "];"
         ],
         edges
     ];
@@ -622,7 +647,7 @@ TINetGraph[
     walkIn_ ? AssociationQ /; KeyExistsQ[walkIn, "Nodes"],
     opts___?OptionQ
 ] := Block[{
-    walk = walkIn,
+    data,
     nodes,
     edges,
     keys,
@@ -633,9 +658,6 @@ TINetGraph[
     vsf,
     gEdges,
     eLabels,
-    nextInfo,
-    activeSlot = -1,
-    activeKey = None,
     hlColor,
     edgePairs,
     baseEdgeStyles,
@@ -644,70 +666,10 @@ TINetGraph[
     termIdForHl = None
 },
     termIdForHl = "TermId" /. passedOpts /. "TermId" -> None;
-    nodes = walk["Nodes"];
-    edges = walk["Edges"];
-
-    (* dump.c "out" free-slot above the root term. *)
-    Block[{rootKey = walk["Root"], freeKey = "free_out"},
-        If[StringQ[rootKey] && KeyExistsQ[nodes, rootKey],
-            nodes[freeKey] = <|
-                "Tag" -> "Free",
-                "TagCode" -> -1,
-                "Ext" -> 0,
-                "Val" -> 0,
-                "Loc" -> 0,
-                "Key" -> freeKey,
-                "DisplayLoc" -> 0
-            |>;
-            AppendTo[
-                edges,
-                <|"From" -> rootKey, "To" -> freeKey, "Port" -> "out", "FromSlot" -> 0|>
-            ]
-        ]
-    ];
-
-    keys = Keys[nodes];
-
-    (* Find next active pair. nextInfo = {found, sourceSlot, tag, ext}.
-       sourceSlot==0 means the root term itself is the active source; the
-       highlighted edge is then the one feeding the root's first arg. *)
-    nextInfo = If[
-        termIdForHl === None,
-        {0, -1, -1, -1},
-        Quiet @ Check[thvmNextInteractionFn[termIdForHl], {0, -1, -1, -1}]
-    ];
-    If[ListQ[nextInfo] && Length[nextInfo] >= 4 && nextInfo[[1]] == 1,
-        activeSlot = nextInfo[[2]];
-        Block[{
-            slot = nextInfo[[2]],
-            activeTag = Lookup[$tagName, nextInfo[[3]], "?"],
-            activeExt = nextInfo[[4]],
-            activeUOp = Lookup[$uopName, nextInfo[[4]], "?"]
-        },
-            Do[
-                With[{n = nodes[k]},
-                    If[
-                        (slot > 0 && (n["Loc"] == slot || Lookup[n, "DisplayLoc", -2] == slot)) ||
-                        (
-                            slot <= 0 &&
-                            n["Tag"] === activeTag &&
-                            If[
-                                activeTag === "Top",
-                                Lookup[n, "UOp", Lookup[$uopName, n["Ext"], "?"]] === activeUOp,
-                                n["Ext"] == activeExt
-                            ]
-                        ),
-                        activeKey = k;
-                        Break[]
-                    ]
-                ],
-                {k, keys}
-            ]
-        ];
-        If[activeSlot <= 0 && activeKey =!= None,
-            activeSlot = nodes[activeKey]["Val"]
-        ]
-    ];
+    data = displayWalkData[walkIn, termIdForHl];
+    nodes = data["Nodes"];
+    edges = data["Edges"];
+    keys = data["Keys"];
     hlColor = RGBColor[0.85, 0.10, 0.10];
 
     textColor = GrayLevel[0.05];
@@ -756,39 +718,31 @@ TINetGraph[
             Block[{
                 e = pair[[1]],
                 edge = pair[[2]],
-                from,
-                port,
-                slot,
-                srcTag,
                 labelColor
             },
-                from = e[[1]];
-                port = First[Last[e]];
-                slot = Last[Last[e]];
-                srcTag = Lookup[Lookup[nodes, from, <||>], "Tag", None];
                 labelColor = Switch[
-                    Lookup[edge, "Style", ""],
-                    "KernelSemantic", RGBColor["#006600"],
-                    "RefDef", GrayLevel[0.45],
+                    edgeLabelColor[edge],
+                    "#006600", RGBColor["#006600"],
+                    "#777777", GrayLevel[0.45],
                     _, StandardGray
                 ];
                 e -> Placed[
                     Column[
                         DeleteCases[
-                            {
-                                Style[port, 10, FontFamily -> "Helvetica", FontColor -> labelColor],
+                            MapIndexed[
                                 If[
-                                    slot > 0 && srcTag === "Ten",
+                                    #2[[1]] == 1,
+                                    Style[#, 10, FontFamily -> "Helvetica", FontColor -> labelColor],
                                     Style[
-                                        "@" <> ToString[slot],
+                                        #,
                                         7,
                                         FontFamily -> "Helvetica",
                                         FontSlant -> Italic,
                                         FontColor -> GrayLevel[0.45]
-                                    ],
-                                    Nothing
-                                ]
-                            },
+                                    ]
+                                ] &,
+                                edgeLabelLines[edge, nodes]
+                            ],
                             Nothing
                         ],
                         Alignment -> Center,
@@ -829,11 +783,11 @@ TINetGraph[
         edgePairs
     ];
     eStyleRules = If[
-        activeSlot < 0,
+        data["ActiveSlot"] < 0,
         {},
         Cases[
             gEdges,
-            e : DirectedEdge[_, _, _ -> activeSlot] :>
+            e : DirectedEdge[_, _, _ -> data["ActiveSlot"]] :>
                 (e -> Directive[hlColor, AbsoluteThickness[2.4], Arrowheads[0.035]])
         ]
     ];

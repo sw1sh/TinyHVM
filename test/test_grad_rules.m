@@ -2672,6 +2672,78 @@ static int test_e2e_disconnected_target(void) {
     return report("e2e_disconnected_target", ok);
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Forward-mode (JVP) examples — showcase the shape-difference vs VJP.
+//
+// GRAD    (VJP):  result has target.shape, reduces y  ← seed ones(y.shape)
+// GRAD_FWD (JVP): result has y.shape,      propagates forward ← seed ones(target.shape)
+//
+// Same rule file, one polarity bit. Diagonal Jacobian ops (ADD, MUL, …)
+// use the same rewrite in both modes; non-diagonal ops (MM, SUM, EXPAND,
+// RESHAPE, PERMUTE, SHRINK, PAD) branch on polarity.
+// ──────────────────────────────────────────────────────────────────────
+
+// Diagonal case — shapes match, values agree.
+// y = x*x, x=[1,2,3], target=x.   dy/dx = 2x = [2,4,6].
+// VJP: shape [3] = target.shape.   JVP: shape [3] = y.shape.   Both [2,4,6].
+static int test_e2e_jvp_elementwise(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
+    Term xa0, xa1; thvm_dup(ctx, thvm_fresh_label(ctx), xa, &xa0, &xa1);
+    Term y = thvm_op(ctx, UOP_MUL, xa0, xa1);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_fwd(ctx, y, xt)));
+    f32 expect[] = {2,4,6};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) if (h[i] != expect[i]) {
+        fprintf(stderr, "  jvp_ew h[%d]=%g want %g\n", i, h[i], expect[i]); ok=0;
+    }
+    thvm_free(ctx);
+    return report("e2e_jvp_elementwise", ok);
+}
+
+// Non-diagonal: SUM — shapes diverge.
+// y = sum(x*x), x=[1,2,3].
+// VJP:  shape [3] (target.shape), value 2x = [2,4,6].
+// JVP:  shape [1] (y.shape=scalar), value sum(2x · 1) = 12.
+static int test_e2e_jvp_sum_of_square(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
+    Term xa0, xa1; thvm_dup(ctx, thvm_fresh_label(ctx), xa, &xa0, &xa1);
+    Term sq = thvm_op(ctx, UOP_MUL, xa0, xa1);
+    Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_fwd(ctx, y, xt)));
+    int ok = (h != NULL) && (h[0] > 11.9f && h[0] < 12.1f);
+    if (!ok) fprintf(stderr, "  jvp_sum h=%g want 12\n", h ? h[0] : 0);
+    thvm_free(ctx);
+    return report("e2e_jvp_sum_of_square", ok);
+}
+
+// Non-diagonal: MM — shapes diverge most dramatically.
+// y = x @ w where x=[2,3], w=[3,2] all ones.   y.shape = [2,2].
+// VJP:  grad(y, x) shape [2,3] = x.shape.
+// JVP:  grad_fwd(y, x) shape [2,2] = y.shape.
+//       = JVP(x,x)@w + x@JVP(w,x) = I(shape x)@w + 0 = ones(2,3)@ones(3,2) = 3·ones(2,2).
+static int test_e2e_jvp_mm(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3,4,5,6}, wd[] = {1,1,1,1,1,1};
+    Term x = thvm_tensor(ctx, xd, SHAPE(2,3));
+    Term w = thvm_tensor(ctx, wd, SHAPE(3,2));
+    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
+    Term y = thvm_op_raw(ctx, UOP_MM, xa, w);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_fwd(ctx, y, xt)));
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 4; i++) {
+        f32 d = h[i] - 3.0f; if (d<0) d=-d;
+        if (d > 1e-3f) { fprintf(stderr,"  jvp_mm h[%d]=%g want 3\n", i, h[i]); ok=0; }
+    }
+    thvm_free(ctx);
+    return report("e2e_jvp_mm", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -2801,6 +2873,9 @@ int main(void) {
     // fails += test_e2e_view_chain_grad();  // BLOCKED: inner RESHAPE/PERMUTE rules wrap grad in operand-shape, SUM.expand then shape-mismatches; same shape-bookkeeping issue as conv_like
     fails += test_e2e_div_chain();
     fails += test_e2e_disconnected_target();
+    fails += test_e2e_jvp_elementwise();
+    fails += test_e2e_jvp_sum_of_square();
+    fails += test_e2e_jvp_mm();
 
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);

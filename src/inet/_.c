@@ -95,6 +95,19 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term target) {
     return term_new(TAG_TOP, UOP_GRAD, loc);
 }
 
+// Forward-mode JVP.  heap[loc+0] = y, heap[loc+1] = target.  Result shape = y.shape.
+Term thvm_grad_fwd(TinyHVM *ctx, Term y, Term target) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc + 0, y);
+    heap_set(ctx, loc + 1, target);
+    const View *yv = term_view(ctx, y);
+    if (yv) {
+        View v = *yv;
+        st_set(loc, &v);
+    }
+    return term_new(TAG_TOP, UOP_GRAD_FWD, loc);
+}
+
 // Multi-target bundle: returns CTR#n_params where each slot is GRAD(y, targets[i]).
 // y is DUP'd n_params-1 times so each target's GRAD gets its own copy.
 Term thvm_grad_bundle(TinyHVM *ctx, Term y, Term *targets, u32 n_params) {

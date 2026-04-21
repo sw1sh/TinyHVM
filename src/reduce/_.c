@@ -135,7 +135,7 @@ static inline int reduce_fuse_payload_ready(TinyHVM *ctx, Term t) {
 }
 
 static inline int reduce_top_direct_uop(u32 uop) {
-    return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_GRAD || uop == UOP_IFZ ||
+    return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_GRAD_FWD || uop == UOP_IFZ ||
            uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_CAST ||
            uop == UOP_DETACH ||
            uop == UOP_WHERE ||
@@ -634,7 +634,7 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
                 term_tag(whnf) == TAG_ERA ||
                 term_tag(whnf) == TAG_NUM ||
                 term_tag(whnf) == TAG_SUP ||
-                (term_tag(whnf) == TAG_TOP && (frame_uop == UOP_GRAD || frame_uop == UOP_GRAD)) ||
+                (term_tag(whnf) == TAG_TOP && (frame_uop == UOP_GRAD || frame_uop == UOP_GRAD_FWD)) ||
                 (term_tag(whnf) == TAG_VAR && frame_uop == UOP_DETACH) ||
                 (frame_uop == UOP_FUSE) ||
                 // UOP_KERNEL accepts most WNF payloads, but NOT DP0/DP1 —
@@ -651,7 +651,7 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
             heap_set(ctx, loc + 0, whnf);  // store arg0 result
 
             // GRAD/GRAD: target stays lazy. Fire once y is in WNF.
-            if (frame_uop == UOP_GRAD || frame_uop == UOP_GRAD) {
+            if (frame_uop == UOP_GRAD || frame_uop == UOP_GRAD_FWD) {
                 if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }

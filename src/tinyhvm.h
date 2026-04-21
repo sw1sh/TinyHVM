@@ -159,12 +159,17 @@ typedef u64 Term;
 #define UOP_EXEC      33   // executable kernel trigger: EXEC(NUM(kid), deps, NUM(flags))
                            // installed by global compiler passes; fires JIT/dispatch on reduce
 
-// UOP_GRAD: gradient node. heap[loc+0]=y, heap[loc+1]=target.
-// Reduces to a tensor of target.shape holding ∂(sum y)/∂target
-// (reverse-mode autodiff with implicit ones cotangent on y).
+// UOP_GRAD: reverse-mode gradient (VJP with implicit ones cotangent on y).
+// heap[loc+0]=y, heap[loc+1]=target.  Reduces to tensor of target.shape.
 #define UOP_GRAD      34
+// UOP_GRAD_FWD: forward-mode tangent (JVP with implicit ones seed on target).
+// heap[loc+0]=y, heap[loc+1]=target.  Reduces to tensor of y.shape.
+// Shares the rule body with UOP_GRAD; branches on polarity for MM/SUM/EXPAND/
+// RESHAPE/PERMUTE/SHRINK/PAD and the leaf shape.  Elementwise rules are
+// polarity-agnostic (diagonal Jacobian ⇒ same rewrite in both modes).
+#define UOP_GRAD_FWD  35
 
-#define UOP_COUNT     35
+#define UOP_COUNT     36
 
 // (LAYER_OP_POOL_GATHER and LAYER_OP_BATCHNORM removed — both are now
 // composed from standard UOps with standard backward rules.)
@@ -175,7 +180,7 @@ static const char *uop_names[] = {
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
     "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","KERNEL","ASSIGN","WHERE",
     "IFZ","LOG_PRINT","RESERVED28","TODEVICE","DETACH","FUSE","LEGACY32","EXEC",
-    "GRAD"
+    "GRAD","GRAD_FWD"
 };
 
 // ============================================================
@@ -1433,6 +1438,10 @@ f32      thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
 // Gradient.  Builds a UOP_GRAD(y, target) node that reduces to a tensor of
 // target.shape holding ∂(sum y)/∂target (reverse-mode, ones-seed cotangent).
 Term     thvm_grad(TinyHVM *ctx, Term y, Term target);
+// Forward-mode tangent (JVP).  Reduces to a tensor of y.shape holding
+// ∂y/∂target · ones(target.shape).  Same rule skeleton as thvm_grad with
+// a polarity bit; shape-propagation runs in the opposite direction.
+Term     thvm_grad_fwd(TinyHVM *ctx, Term y, Term target);
 u32      thvm_grad_bundle_count(TinyHVM *ctx, Term bundle);
 Term     thvm_grad_bundle_get(TinyHVM *ctx, Term bundle, u32 index);
 void     term_use_clear(void);

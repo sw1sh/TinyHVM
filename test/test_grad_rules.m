@@ -1668,6 +1668,40 @@ static int test_gradu_where_nested(void) {
     return report("gradu_where_nested", ok);
 }
 
+// UOP_GRAD2: polynomial y = a*x*x + b*x + c, target = a.  dy/da = x*x.
+// Exercises ADD+MUL-Leibniz through a 3-term polynomial.
+static int test_gradu_poly(void) {
+    setup_graph_dir("gradu_poly");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[]={1,1,1}, bd[]={2,2,2}, cd[]={3,3,3}, xd[]={1,2,3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term c = thvm_tensor(ctx, cd, SHAPE(3));
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term x0, x1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), x, &x0, &x1);
+    Term xsq = thvm_op(ctx, UOP_MUL, x0, x1);
+    Term xsq0, xsq1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), xsq, &xsq0, &xsq1);
+    (void)xsq1;
+    Term axsq = thvm_op(ctx, UOP_MUL, a, xsq0);
+    Term bx   = thvm_op(ctx, UOP_MUL, b, x);  // shadow: x is consumed, but re-usable TEN ref
+    Term y    = thvm_op(ctx, UOP_ADD,
+                   thvm_op(ctx, UOP_ADD, axsq, bx),
+                   c);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "ADD", "MUL"};
+    const char *post[] = {"CTR", "ADD", "MUL", "EXPAND"};
+    int ok = topo_check("gradu_poly", 0, pre, 4)
+          && topo_check("gradu_poly", 1, post, 4);
+    return report("gradu_poly", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1752,6 +1786,7 @@ int main(void) {
     fails += test_gradu_dot();
     fails += test_gradu_where_else();
     fails += test_gradu_where_nested();
+    fails += test_gradu_poly();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

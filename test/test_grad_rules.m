@@ -1702,10 +1702,12 @@ static int test_gradu_poly(void) {
     return report("gradu_poly", ok);
 }
 
-// E2E: verify EXPAND(NUM(1), [3]) materializes as [1,1,1].
+// E2E: verify EXPAND broadcast from [1] to [3].  Uses a shape-[1] TEN
+// input so it's a real broadcast.
 static int test_e2e_expand_scalar(void) {
     TinyHVM *ctx = thvm_init("cpu");
-    Term one = term_num_f32(1.0f);
+    f32 d[] = {1.0f};
+    Term one = thvm_tensor(ctx, d, SHAPE(1));
     Term y = thvm_expand(ctx, one, SHAPE(3));
     Term r = thvm_eval(ctx, y);
     f32 *h = thvm_to_host(ctx, r);

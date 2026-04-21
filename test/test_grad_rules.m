@@ -2037,6 +2037,64 @@ static int test_e2e_grad_sum(void) {
     return report("e2e_grad_sum", ok);
 }
 
+// d(cmp(a,b))/da = 0 (non-differentiable)
+static int test_e2e_grad_cmp(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3}, bd[] = {2,2,2};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_CMP, a, b);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {0,0,0};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) if (h[i] != expect[i]) { fprintf(stderr,"  grad_cmp h[%d]=%g\n",i,h[i]); ok=0; }
+    thvm_free(ctx);
+    return report("e2e_grad_cmp", ok);
+}
+
+// d(rmax(a))/da = mask where a==max.  a=[1,5,3,2] → [0,1,0,0].
+static int test_e2e_grad_rmax(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 5, 3, 2};
+    Term a = thvm_tensor(ctx, ad, SHAPE(4));
+    Term y = thvm_rmax_axes(ctx, a, (u32[]){0}, 1);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {0, 1, 0, 0};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 4; i++) if (h[i] != expect[i]) { fprintf(stderr,"  grad_rmax h[%d]=%g\n",i,h[i]); ok=0; }
+    thvm_free(ctx);
+    return report("e2e_grad_rmax", ok);
+}
+
+// d(reshape(a, [2,3]))/da = ones([6]).
+static int test_e2e_grad_reshape(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(6));
+    Term y = thvm_reshape(ctx, a, SHAPE(2, 3));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {1,1,1,1,1,1};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 6; i++) if (h[i] != expect[i]) { fprintf(stderr,"  grad_reshape h[%d]=%g\n",i,h[i]); ok=0; }
+    thvm_free(ctx);
+    return report("e2e_grad_reshape", ok);
+}
+
+// d(permute(a, [1,0]))/da = ones(a.shape).
+static int test_e2e_grad_permute(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(2, 3));
+    u32 perm[] = {1,0};
+    Term y = thvm_permute(ctx, a, perm, 2);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {1,1,1,1,1,1};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 6; i++) if (h[i] != expect[i]) { fprintf(stderr,"  grad_permute h[%d]=%g\n",i,h[i]); ok=0; }
+    thvm_free(ctx);
+    return report("e2e_grad_permute", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -2139,6 +2197,10 @@ int main(void) {
     fails += test_e2e_grad_div();
     fails += test_e2e_grad_max();
     fails += test_e2e_grad_sum();
+    fails += test_e2e_grad_cmp();
+    fails += test_e2e_grad_rmax();
+    fails += test_e2e_grad_reshape();
+    fails += test_e2e_grad_permute();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

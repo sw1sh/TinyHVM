@@ -1354,9 +1354,10 @@ inet_step:
                         u32 ttid = (u32)term_val(tgt);
                         Shape tsh = (ttid < ctx->tensor_count)
                             ? ctx->tensors[ttid].view.shape : SHAPE(1);
-                        Term zero = term_num_f32(0.0f);
+                        f32 zd = 0.0f;
+                        Term zten = thvm_tensor(ctx, &zd, SHAPE(1));
                         Term out = (tsh.rank > 0 && !(tsh.rank == 1 && tsh.dims[0] == 1))
-                            ? thvm_expand(ctx, zero, tsh) : zero;
+                            ? thvm_expand(ctx, zten, tsh) : zten;
                         ctx->itrs++; RETURN_REDUCED(out);
                     }
                     // MUL (Leibniz): d(a*b)/dt = da*b + a*db.

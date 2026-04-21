@@ -78,8 +78,9 @@ void thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1) {
 }
 
 // UOP_GRAD builder.  heap[loc+0] = y, heap[loc+1] = target.
-// Reduces to a tensor of target.shape holding ∂(sum y)/∂target
-// (reverse-mode autodiff with an implicit ones cotangent on y).
+// Following compute-op convention (see thvm_op_raw): no linear_use.
+// Callers who also want to reference y or target outside GRAD must
+// thvm_dup them explicitly beforehand.
 Term thvm_grad(TinyHVM *ctx, Term y, Term target) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc + 0, y);

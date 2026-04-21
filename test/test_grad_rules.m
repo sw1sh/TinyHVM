@@ -923,6 +923,29 @@ static int test_gradu_shape_target_diff(void) {
     return report("gradu_shape_target_diff", ok);
 }
 
+// UOP_GRAD2 third derivative: y = t*t, d^3y/dt^3 = 0.
+// Chain: GRAD2(GRAD2(GRAD2(t*t, t), t), t) — three nested GRAD2s.
+static int test_gradu_third_derivative(void) {
+    setup_graph_dir("gradu_third_derivative");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term a0, a1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+    Term y = thvm_op(ctx, UOP_MUL, a0, a1);
+    Term d1 = thvm_grad_u(ctx, y, a);
+    Term d2 = thvm_grad_u(ctx, d1, a);
+    Term d3 = thvm_grad_u(ctx, d2, a);
+    thvm_eval(ctx, d3);
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD2", "MUL"};
+    // After full sweep d^3(t^2)/dt^3 is a constant expression reducing
+    // through GRAD2 -> NUM-leaf rule; no residual GRAD2 should remain.
+    int ok = topo_check("gradu_third_derivative", 0, pre, 2);
+    return report("gradu_third_derivative", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -979,6 +1002,7 @@ int main(void) {
     fails += test_gradu_sub_rhs();
     fails += test_gradu_cubic();
     fails += test_gradu_shape_target_diff();
+    fails += test_gradu_third_derivative();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

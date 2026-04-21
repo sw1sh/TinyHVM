@@ -73,10 +73,12 @@ static int topo_check(const char *rule, int phase,
     return ok;
 }
 
+// mk() builds CTR{y_fwd, GRAD2(y_bwd, target)}.  y is DUP'd so both the
+// forward consumer (c0) and the GRAD2 sub-term see it.
 static Term mk(TinyHVM *ctx, Term y, Term target) {
-    Term fwd, bwd;
-    thvm_grad_pair_target(ctx, target, y, &fwd, &bwd);
-    return thvm_ctr(ctx, (Term[]){fwd, bwd}, 2);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    return thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, target)}, 2);
 }
 
 static int report(const char *name, int ok) {

@@ -3,17 +3,13 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  n24 [label="RESHAPE\n[1]\n@24", shape=box, fillcolor="#fff3cd"];
-  n22 -> n24 [label="in"];
-  t6 [label="t6\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t6 -> n24 [label="shape",taillabel="@25",labelfontsize=7,fontcolor="#666666"];
-  ctr6 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n16 [label="EXPAND\n[3]\n@16", shape=box, fillcolor="#fff3cd"];
+  num16_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num16_0 -> n16 [label="in"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n16 [label="shape",taillabel="@17",labelfontsize=7,fontcolor="#666666"];
+  ctr8 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
   t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
-  t1 -> ctr6 [label="c0"];
-  n24 -> ctr6 [label="c1"];
-  n22 [label="SUM\n@22", shape=box, fillcolor="#ffcccc"];
-  grad19 [label="GRAD\n@19", shape=invtriangle, fillcolor="#e8d0ff"];
-  grad19 -> n22 [label="bwd"];
-  t5 [label="t5\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t5 -> n22 [label="axes",taillabel="@23",labelfontsize=7,fontcolor="#666666"];
+  t1 -> ctr8 [label="c0"];
+  n16 -> ctr8 [label="c1"];
 }

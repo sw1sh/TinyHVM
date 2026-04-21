@@ -1880,6 +1880,10 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 else if (ext == UOP_DETACH) elbl = "in";
                 else if (is_binary(ext)) elbl = ai==0 ? "a" : "b";
                 int rev = 0;
+                // GRAD's gy is an OUTPUT port (gradient flows outward).
+                // Edge goes from GRAD node to whatever is in the gy slot
+                // (usually a free port / small circle).
+                if (ext == UOP_GRAD && ai == 1) rev = 1;
 
                 if (ctag == TAG_DP0 || ctag == TAG_DP1) {
                     // Always show full DUP triangle with both ports
@@ -1934,10 +1938,17 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                         }
                     } else {
                         EMIT_FREE_PORT(val, ai);
-                        if (edge_hl) fprintf(f, "  free%llu_%u -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n",
-                                             (unsigned long long)val, ai, (unsigned long long)val, elbl);
-                        else         fprintf(f, "  free%llu_%u -> n%llu [label=\"%s\"];\n",
-                                             (unsigned long long)val, ai, (unsigned long long)val, elbl);
+                        if (rev) {
+                            if (edge_hl) fprintf(f, "  n%llu -> free%llu_%u [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n",
+                                                 (unsigned long long)val, (unsigned long long)val, ai, elbl);
+                            else         fprintf(f, "  n%llu -> free%llu_%u [label=\"%s\"];\n",
+                                                 (unsigned long long)val, (unsigned long long)val, ai, elbl);
+                        } else {
+                            if (edge_hl) fprintf(f, "  free%llu_%u -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n",
+                                                 (unsigned long long)val, ai, (unsigned long long)val, elbl);
+                            else         fprintf(f, "  free%llu_%u -> n%llu [label=\"%s\"];\n",
+                                                 (unsigned long long)val, ai, (unsigned long long)val, elbl);
+                        }
                     }
                 } else if (ctag == TAG_NUM) {
                     char num_label[32];

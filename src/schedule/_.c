@@ -2709,34 +2709,57 @@ static Term thvm_eval_internal(TinyHVM *ctx, Term t, int pre_reduce_phase) {
         if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
             heap_set(ctx, step_root_slot, term_era());
 
-        // Phase 2: wrap in UOP_FUSE and reduce. By default this produces the
+        // Phase 2: GC sweep — erase heap slots not reachable from the root.
+        // Interactive rules can leave orphaned fragments (e.g. backward
+        // scaffolding whose arm got dropped). Mark reachable slots from
+        // `traced` (and the step-root pointer), then erase everything else.
+        // This is a pure graph cleanup: no rule fires, no shape logic.
+        {
+            u8 *reach = (u8 *)calloc(ctx->heap_pos ? (size_t)ctx->heap_pos : 1, 1);
+            if (reach) {
+                step_mark_reachable_slots(ctx, traced, reach);
+                for (u64 h = 1; h < ctx->heap_pos; h++) {
+                    if (!reach[h] && term_tag(ctx->heap[h]) != TAG_ERA)
+                        heap_set(ctx, h, term_era());
+                }
+                free(reach);
+            }
+        }
+        traced = thvm_step_seed_root_grad(ctx, traced);
+        thvm_graph_dump_path(path, sizeof(path), "thvm_2_post_sweep.dot");
+        thvm_heap_dot_set_sched_kernels(0);
+        thvm_heap_dot_root(ctx, path, traced);
+        if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
+            heap_set(ctx, step_root_slot, term_era());
+
+        // Phase 3: wrap in UOP_FUSE and reduce. By default this produces the
         // post-local coarse graph only; THVM_EVAL_MIXED_DISPATCH=1 preserves
         // the legacy mixed path that also dispatches during this pass.
         traced = thvm_eval_fuse_fixed_point(ctx, traced, thvm_eval_mixed_dispatch_enabled());
         traced = thvm_step_seed_root_grad(ctx, traced);
-        thvm_graph_dump_path(path, sizeof(path), "thvm_2_post_dispatch.dot");
+        thvm_graph_dump_path(path, sizeof(path), "thvm_3_post_fuse.dot");
         thvm_heap_dot_set_sched_kernels(0);
         thvm_heap_dot_root(ctx, path, traced);
         if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
             heap_set(ctx, step_root_slot, term_era());
         step_root_slot = 0;
 
-        // Phase 2.5: run global compiler passes.
+        // Phase 4: run global compiler passes.
         traced = thvm_run_global_passes(ctx, traced);
         traced = thvm_step_seed_root_grad(ctx, traced);
-        thvm_graph_dump_path(path, sizeof(path), "thvm_3_post_passes.dot");
+        thvm_graph_dump_path(path, sizeof(path), "thvm_4_post_passes.dot");
         thvm_heap_dot_set_sched_kernels(0);
         thvm_heap_dot_root(ctx, path, traced);
         if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
             heap_set(ctx, step_root_slot, term_era());
         step_root_slot = 0;
 
-        // Phase 3: second reduce for exec triggers.
+        // Phase 5: second reduce for exec triggers.
         if (ctx->n_compiler_passes > 0) {
             traced = thvm_eval_exec_fixed_point(ctx, traced);
         }
         traced = thvm_step_seed_root_grad(ctx, traced);
-        thvm_graph_dump_path(path, sizeof(path), "thvm_4_post_exec.dot");
+        thvm_graph_dump_path(path, sizeof(path), "thvm_5_post_exec.dot");
         thvm_heap_dot_set_sched_kernels(0);
         thvm_heap_dot_root(ctx, path, traced);
         if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)

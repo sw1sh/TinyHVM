@@ -3,14 +3,15 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  n16 [label="EXPAND\n[4]\n@16", shape=box, fillcolor="#fff3cd",color="#1f78ff",penwidth=2.2];
-  t3 [label="t3\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t3 -> n16 [label="in",taillabel="@16",labelfontsize=7,fontcolor="#666666"];
-  t4 [label="t4\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t4 -> n16 [label="shape",taillabel="@17",labelfontsize=7,fontcolor="#666666"];
-  free16_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
-  n16 -> free16_1000 [label="out"];
-  era15 [label="ERA\n@15",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  num_root [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8,color="#1f78ff",penwidth=2.2];
+  era11 [label="ERA\n@11",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
   t2 [label="t2\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t2 -> era15 [label="p",taillabel="@14",labelfontsize=7,fontcolor="#666666"];
+  t2 -> era11 [label="p",taillabel="@10",labelfontsize=7,fontcolor="#666666"];
+  n12 [label="EXPAND\n[4]\n@12", shape=box, fillcolor="#fff3cd"];
+  t3 [label="t3\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n12 [label="in",taillabel="@12",labelfontsize=7,fontcolor="#666666"];
+  t4 [label="t4\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 -> n12 [label="shape",taillabel="@13",labelfontsize=7,fontcolor="#666666"];
+  era17 [label="ERA\n@17",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  n12 -> era17 [label="p"];
 }

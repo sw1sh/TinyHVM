@@ -59,7 +59,7 @@ static char *slurp(const char *path) {
 }
 
 // Topology assertion: every needle must be present in phase_N of rule's dir.
-// phase: 0 = pre-reduce, 1 = post-reduce (after Phase 1), 2 = post-dispatch.
+// 0 = pre-reduce, 1 = post-reduce, 2 = post-sweep (GC), 3 = post-fuse.
 static int topo_check(const char *rule, int phase,
                       const char **needles, int n_needles,
                       const char **forbid, int n_forbid) {
@@ -67,7 +67,8 @@ static int topo_check(const char *rule, int phase,
     const char *name[] = {
         "thvm_0_pre_reduce.dot",
         "thvm_1_post_reduce.dot",
-        "thvm_2_post_dispatch.dot",
+        "thvm_2_post_sweep.dot",
+        "thvm_3_post_fuse.dot",
     };
     snprintf(path, sizeof(path), "%s/%s/%s", GRAPH_ROOT, rule, name[phase]);
     char *buf = slurp(path);
@@ -100,7 +101,8 @@ static int topo_count(const char *rule, int phase, const char *needle) {
     const char *name[] = {
         "thvm_0_pre_reduce.dot",
         "thvm_1_post_reduce.dot",
-        "thvm_2_post_dispatch.dot",
+        "thvm_2_post_sweep.dot",
+        "thvm_3_post_fuse.dot",
     };
     snprintf(path, sizeof(path), "%s/%s/%s", GRAPH_ROOT, rule, name[phase]);
     char *buf = slurp(path);
@@ -113,10 +115,10 @@ static int topo_count(const char *rule, int phase, const char *needle) {
 }
 
 // Build a raw GRAD node: y + free-port gy, single-target KEEP mode so the
-// chain-rule tree stays in the graph (drop mode would collapse everything
-// to ERA the moment it matched the target TEN). The bundle itself is
-// invisible to the topology check; we only look at what's on the heap
-// after Phase-1 reduce.
+// chain-rule tree stays visible in the graph. No APP wrapper — the bundle
+// is a side-channel (thvm_grad_keep_bundle_set isn't called, so the
+// deposit path goes to heap[loc+index] instead of app_loc+1; we don't
+// read the bundle in this test anyway — only the graph structure).
 static Term mk_grad(TinyHVM *ctx, Term y, Term x) {
     thvm_grad_targets_clear(ctx);
     term_use_clear();
@@ -125,13 +127,10 @@ static Term mk_grad(TinyHVM *ctx, Term y, Term x) {
     heap_set(ctx, loc + 0, y);
     heap_set(ctx, loc + 1, term_era());         // free port on gy
     Term driver = term_new(TAG_TOP, UOP_GRAD, loc);
-    Term bundle = term_num_f32(0.0f);
-    Term keep_root = thvm_app(ctx, driver, bundle);
     thvm_grad_target_set(ctx, loc, thvm_any());
     thvm_grad_mode_set(ctx, loc, GRAD_MODE_KEEP);
     thvm_grad_targets_set_for_loc(ctx, loc, &x, NULL, 1);
-    thvm_grad_keep_app_loc_set(ctx, loc, term_val(keep_root));
-    return keep_root;
+    return driver;
 }
 
 static int report(const char *rule, int ok) {

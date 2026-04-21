@@ -3,22 +3,20 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  n23 [label="SQRT\n[3]\n@23", shape=box, fillcolor="#cce5ff"];
+  n11 [label="SQRT\n[3]\n@11", shape=box, fillcolor="#cce5ff"];
   t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
-  t1 -> n23 [label="",taillabel="@23",labelfontsize=7,fontcolor="#666666"];
-  n31 [label="DIV\n[3]\n@31", shape=box, fillcolor="#cce5ff"];
-  num31_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num31_0 -> n31 [label="a"];
-  n29 -> n31 [label="b"];
-  ctr21 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
-  n23 -> ctr21 [label="c0"];
-  n31 -> ctr21 [label="c1"];
-  n27 [label="EXPAND\n[3]\n@27", shape=box, fillcolor="#fff3cd"];
-  t4 [label="t4\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t4 -> n27 [label="in",taillabel="@27",labelfontsize=7,fontcolor="#666666"];
-  t5 [label="t5\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t5 -> n27 [label="shape",taillabel="@28",labelfontsize=7,fontcolor="#666666"];
-  n29 [label="MUL\n[3]\n@29", shape=box, fillcolor="#cce5ff"];
-  n27 -> n29 [label="a"];
-  n23 -> n29 [label="b"];
+  t1 -> n11 [label="",taillabel="@11",labelfontsize=7,fontcolor="#666666"];
+  n17 [label="DIV\n[3]\n@17", shape=box, fillcolor="#cce5ff"];
+  num17_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num17_0 -> n17 [label="a"];
+  n15 -> n17 [label="b"];
+  ctr6 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n11 -> ctr6 [label="c0"];
+  n17 -> ctr6 [label="c1"];
+  n13 [label="SQRT\n[3]\n@13", shape=box, fillcolor="#cce5ff"];
+  t1 -> n13 [label="",taillabel="@13",labelfontsize=7,fontcolor="#666666"];
+  n15 [label="MUL\n[3]\n@15", shape=box, fillcolor="#cce5ff"];
+  num15_0 [label="2",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num15_0 -> n15 [label="a"];
+  n13 -> n15 [label="b"];
 }

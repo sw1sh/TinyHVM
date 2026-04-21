@@ -2200,6 +2200,45 @@ static int test_e2e_softmax(void) {
     return report("e2e_softmax", ok);
 }
 
+// SGD loop (host-driven): minimize loss = 0.5 * w^2 starting w=[4.0].
+// Update rule: w <- w - 0.1 * grad(loss, w) = w - 0.1 * w = 0.9*w.
+// After 10 steps: w ≈ 4.0 * 0.9^10 ≈ 1.395.  Exercises GRAD2 under repeated eval.
+static int test_e2e_sgd_loop(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 wd[] = {4.0f};
+    Term w = thvm_tensor(ctx, wd, SHAPE(1));
+    f32 lr = 0.1f;
+    for (int step = 0; step < 10; step++) {
+        // w_dup for loss + target; loss = 0.5 * w * w
+        Term w0, w1;
+        thvm_dup(ctx, thvm_fresh_label(ctx), w, &w0, &w1);
+        Term w0a, w0b;
+        thvm_dup(ctx, thvm_fresh_label(ctx), w0, &w0a, &w0b);
+        Term wsq = thvm_op(ctx, UOP_MUL, w0a, w0b);
+        f32 halfv = 0.5f;
+        Term half = thvm_tensor(ctx, &halfv, SHAPE(1));
+        Term loss = thvm_op(ctx, UOP_MUL, half, wsq);
+        Term g = thvm_grad_u(ctx, loss, w1);
+        Term ge = thvm_eval(ctx, g);
+        f32 *gh = thvm_to_host(ctx, ge);
+        if (!gh) { thvm_free(ctx); return report("e2e_sgd_loop", 0); }
+        // w_new = w - lr*g
+        f32 new_w = wd[0] - lr * gh[0];
+        wd[0] = new_w;
+        // Re-seed w for next iter
+        thvm_free(ctx);
+        ctx = thvm_init("cpu");
+        w = thvm_tensor(ctx, wd, SHAPE(1));
+    }
+    f32 expect = 4.0f;
+    for (int i = 0; i < 10; i++) expect *= 0.9f;
+    f32 diff = wd[0] - expect; if (diff < 0) diff = -diff;
+    int ok = (diff < 1e-3f);
+    if (!ok) fprintf(stderr, "  sgd_loop: final w=%g expect=%g\n", wd[0], expect);
+    thvm_free(ctx);
+    return report("e2e_sgd_loop", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -2312,6 +2351,7 @@ int main(void) {
     fails += test_e2e_mse_grad();
     // fails += test_e2e_conv_like();  // MUL Leibniz shape-mismatch when operand is PAD'd
     fails += test_e2e_softmax();
+    fails += test_e2e_sgd_loop();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

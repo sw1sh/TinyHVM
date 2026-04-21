@@ -628,7 +628,7 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
                 term_tag(whnf) == TAG_ERA ||
                 term_tag(whnf) == TAG_NUM ||
                 term_tag(whnf) == TAG_SUP ||
-                (term_tag(whnf) == TAG_TOP && frame_uop == UOP_GRAD) ||
+                (term_tag(whnf) == TAG_TOP && (frame_uop == UOP_GRAD || frame_uop == UOP_GRAD2)) ||
                 (term_tag(whnf) == TAG_VAR && frame_uop == UOP_DETACH) ||
                 (frame_uop == UOP_FUSE) ||
                 // UOP_KERNEL accepts most WNF payloads, but NOT DP0/DP1 —
@@ -644,9 +644,8 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
             }
             heap_set(ctx, loc + 0, whnf);  // store arg0 result
 
-            // GRAD: gy stays lazy and target spec is kept outside heap.
-            // Fire immediately once y is in WNF.
-            if (frame_uop == UOP_GRAD) {
+            // GRAD/GRAD2: target stays lazy. Fire once y is in WNF.
+            if (frame_uop == UOP_GRAD || frame_uop == UOP_GRAD2) {
                 if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }

@@ -1044,9 +1044,25 @@ inet_step:
                     ctx->itrs++;
                     RETURN_REDUCED(out);
                 }
-                // y not yet WNF or not TEN-leaf: leave alone; trampoline will
-                // retry once y reduces further.  TOP dispatch for UOP_GRAD2
-                // lands in follow-up ticks.
+                // TOP chain-rule dispatch.  Recursively emits GRAD2 on sub-
+                // operands; target is DUP'd to keep linearity.
+                if (term_tag(y) == TAG_TOP && term_tag(tgt) == TAG_TEN) {
+                    u32 yuop = term_ext(y);
+                    u64 yloc = term_val(y);
+                    if (yuop == UOP_ADD || yuop == UOP_SUB) {
+                        Term a = heap_read(ctx, yloc + 0);
+                        Term b = heap_read(ctx, yloc + 1);
+                        Term tgt0, tgt1;
+                        thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &tgt0, &tgt1);
+                        Term da = thvm_grad_u(ctx, a, tgt0);
+                        Term db = thvm_grad_u(ctx, b, tgt1);
+                        Term out = thvm_op_raw(ctx, yuop, da, db);
+                        ctx->itrs++;
+                        RETURN_REDUCED(out);
+                    }
+                }
+                // y not yet WNF or pattern unhandled: leave alone; trampoline
+                // retries when y reduces further.
             }
 
             // === UOP_GRAD ===

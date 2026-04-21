@@ -1,147 +1,218 @@
 // wnf/_.c — HVM4-style eval/apply stack machine for IC reduction.
 //
-// Replacement for the predicate-based trampoline in src/schedule/_.c.
-// Plan: resources/plans/eval_apply_stack_machine.md.
+// See resources/plans/eval_apply_stack_machine.md.
 //
-// Stage 0 (this file): scaffold.  Entry point thvm_wnf(ctx, t).  Handles
-// atoms (TEN/NUM/ERA/LAM/SUP) directly.  Everything else falls back to
-// the old thvm_reduce for now — we migrate tags one-by-one in subsequent
-// stages.
+// Stage 1 scope: handle GRAD/GRAD_FWD as eval-apply frames so nested
+// GRAD fires inner-first mechanically.  For any tag the machine doesn't
+// yet support, fall back to the existing thvm_reduce.
 //
-// The machine's core loop:
+// Enter:  push continuation frame, descend into principal.  Atoms break
+//         out of enter into apply.
+// Apply:  pop frame; dispatch on (frame_tag × whnf_tag); rewrite.
 //
-//   enter:   push continuation frame, descend into principal.  Atoms
-//            break out of enter into apply.
-//   apply:   pop frame, dispatch on (frame_tag × whnf_tag) pair, rewrite.
-//
-// No readiness predicates.  By construction, when apply pops a frame,
-// the current whnf is actually WHNF — because enter drove it there.
+// Stack is global per-thread, allocated lazily, grows on overflow.
 
-// Per-context stack.  Allocated lazily on first wnf invocation.
 #define WNF_STACK_INIT_CAP 4096
 
 typedef struct {
     Term *buf;
     u32   cap;
     u32   pos;
-    u32   base;     // base offset for the current wnf invocation
 } WnfStack;
 
 static WnfStack g_wnf_stack = {0};
 
-static void wnf_stack_ensure(u32 need) {
+static void wnf_stack_push(Term t) {
     if (!g_wnf_stack.buf) {
         g_wnf_stack.buf = (Term *)malloc(sizeof(Term) * WNF_STACK_INIT_CAP);
         g_wnf_stack.cap = WNF_STACK_INIT_CAP;
         g_wnf_stack.pos = 0;
-        g_wnf_stack.base = 0;
     }
-    while (need > g_wnf_stack.cap) {
+    if (g_wnf_stack.pos + 1 >= g_wnf_stack.cap) {
         g_wnf_stack.cap *= 2;
         g_wnf_stack.buf = (Term *)realloc(g_wnf_stack.buf, sizeof(Term) * g_wnf_stack.cap);
     }
-}
-
-// Re-build a term from a partial descent when we bail out (budget, etc.).
-// Walks remaining stack frames and re-installs `cur` into each frame's
-// principal slot, producing the original (or updated) surface term.
-// Stage 0: stub — just returns cur.  Real rebuild comes with stage 3.
-static Term wnf_rebuild(TinyHVM *ctx, Term cur, u32 s_pos, u32 base) {
-    (void)ctx;
-    while (s_pos > base) {
-        Term frame = g_wnf_stack.buf[--s_pos];
-        (void)frame;
-        // TODO stage 3: per-tag rebuild (APP: reinstall fun slot; DP0/DP1:
-        // reinstall body slot; OP2: reinstall x slot; etc.).
-    }
-    return cur;
+    g_wnf_stack.buf[g_wnf_stack.pos++] = t;
 }
 
 // Forward decl of the fallback to the existing reducer.
-// Tags not yet migrated to the stack machine route through this.
 Term thvm_reduce(TinyHVM *ctx, Term t);
 
-// Tag classification.  A tag is "whnf-atom" if no rule fires on it as
-// a principal — it just sits.  These are the values that pop out of
-// enter directly into apply.
+// ──────────────────────────────────────────────────────────────────────
+// GRAD apply-phase dispatch.  Called when a GRAD frame is popped with
+// whnf being the reduced y.  Produces the rewritten term; caller sets
+// next = result and goto enter (if result needs further reduction) or
+// whnf = result (if already in WHNF).
+// ──────────────────────────────────────────────────────────────────────
+
+// Leaf rule: GRAD(TEN y, TEN target).  y.tid == target.tid → ones, else ERA.
+// Uses the same GRAD_SCALAR_TEN pattern as src/interact/grad.c.
+static Term wnf_grad_apply_ten(TinyHVM *ctx, Term frame, Term y_whnf, int is_fwd) {
+    u64 loc = term_val(frame);
+    if (loc == 0 || loc + 1 >= ctx->heap_pos) return term_era();
+    Term tgt = heap_read(ctx, loc + 1);
+    if (term_tag(tgt) != TAG_TEN) {
+        // Target not resolved — can't compute leaf here.  Fall back.
+        return thvm_reduce(ctx, term_new(TAG_TOP, is_fwd ? UOP_GRAD_FWD : UOP_GRAD, loc));
+    }
+    u32 ytid = (u32)term_val(y_whnf);
+    u32 ttid = (u32)term_val(tgt);
+    if (ytid != ttid) { ctx->itrs++; return term_era(); }
+    Shape osh = SHAPE(1);
+    if (ytid < ctx->tensor_count) osh = ctx->tensors[ytid].view.shape;
+    // Forward mode needs a dense materialized ones tensor (stride-0
+    // EXPAND views break MM decomposition).
+    if (is_fwd && osh.rank > 0) {
+        u32 n = 1; for (u32 i = 0; i < osh.rank; i++) n *= osh.dims[i];
+        f32 *buf = (f32 *)malloc(n * sizeof(f32));
+        for (u32 i = 0; i < n; i++) buf[i] = 1.0f;
+        Term out = thvm_tensor(ctx, buf, osh);
+        free(buf);
+        ctx->itrs++; return out;
+    }
+    // Reverse mode: rank-matched [1,1,..] scalar + EXPAND to target shape.
+    Shape one_shape = {.rank = osh.rank};
+    for (u32 i = 0; i < osh.rank; i++) one_shape.dims[i] = 1;
+    if (one_shape.rank == 0) { one_shape.rank = 1; one_shape.dims[0] = 1; }
+    f32 v = 1.0f;
+    Term scalar = thvm_tensor(ctx, &v, one_shape);
+    int is_scalar_shape = (osh.rank == 0) ||
+                          (osh.rank == 1 && osh.dims[0] == 1);
+    ctx->itrs++;
+    return is_scalar_shape ? scalar : thvm_expand(ctx, scalar, osh);
+}
+
+// Whnf constants at the frame dispatch level.
+static Term wnf_grad_apply_num_or_era(TinyHVM *ctx) {
+    ctx->itrs++;
+    return term_era();
+}
+
+// For compute TOPs as whnf, delegate to the existing grad rule in
+// src/interact/grad.c by constructing a GRAD(whnf, target) TOP and
+// running thvm_reduce.  Stage 1 transitional: gets the right rewrite
+// with existing rule bodies without re-implementing them in the wnf
+// machine.  Later stages will inline them.
+static Term wnf_grad_apply_compute_top(TinyHVM *ctx, Term frame, Term y_whnf, int is_fwd) {
+    u64 loc = term_val(frame);
+    if (loc == 0 || loc + 1 >= ctx->heap_pos) return term_era();
+    Term tgt = heap_read(ctx, loc + 1);
+    // Build fresh GRAD(y_whnf, tgt) and reduce via the existing rule.
+    u32 uop = is_fwd ? UOP_GRAD_FWD : UOP_GRAD;
+    u64 nl = heap_alloc(ctx, 2);
+    heap_set(ctx, nl + 0, y_whnf);
+    heap_set(ctx, nl + 1, tgt);
+    // Copy shape tracking if present.
+    const View *v = st_get(loc);
+    if (v) st_set(nl, v);
+    return thvm_reduce(ctx, term_new(TAG_TOP, uop, nl));
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Entry point: drive term to WHNF via enter/apply.
+// ──────────────────────────────────────────────────────────────────────
+
 static inline int wnf_is_atom(u8 tag) {
     return tag == TAG_TEN || tag == TAG_NUM || tag == TAG_ERA ||
            tag == TAG_LAM || tag == TAG_SUP || tag == TAG_ANY;
 }
 
-// Main entry.  Drives `term` to WHNF using the enter/apply machine.
-// Stage 0 behavior: for atoms, return immediately.  For anything that
-// would push a frame, fall back to thvm_reduce for now.
 Term thvm_wnf(TinyHVM *ctx, Term term) {
-    // Early exit: already WHNF.
-    u8 tag = term_tag(term);
-    if (wnf_is_atom(tag)) return term;
+    if (wnf_is_atom(term_tag(term))) return term;
 
-    // Stage 0: no frames pushed yet — delegate everything else.
-    //
-    // Stages 1+ will populate the enter/apply loop with per-tag
-    // descent/dispatch logic, eventually handling GRAD, APP/LAM/SUP/DUP,
-    // compute TOPs, etc.  The scaffold below shows the intended shape.
-    //
-    // Enter/apply skeleton (stub):
-    //
-    //   wnf_stack_ensure(128);
-    //   u32 base = g_wnf_stack.pos;
-    //   u32 s_pos = base;
-    //   Term next = term;
-    //   Term whnf;
-    //   enter:
-    //     switch (term_tag(next)) {
-    //       case TAG_APP: {
-    //         u64 loc = term_val(next);
-    //         g_wnf_stack.buf[s_pos++] = next;   // push continuation
-    //         next = heap_read(ctx, loc + 0);     // descend into fun
-    //         goto enter;
-    //       }
-    //       case TAG_TOP: {
-    //         u32 uop = term_ext(next);
-    //         if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
-    //             u64 loc = term_val(next);
-    //             g_wnf_stack.buf[s_pos++] = next;
-    //             next = heap_read(ctx, loc + 0); // descend into y
-    //             goto enter;
-    //         }
-    //         // Compute TOPs: IC-WHNF, dispatch handled elsewhere.
-    //         whnf = next; goto apply;
-    //       }
-    //       ...atoms... whnf = next; goto apply;
-    //     }
-    //   apply:
-    //     while (s_pos > base) {
-    //       Term frame = g_wnf_stack.buf[--s_pos];
-    //       switch (term_tag(frame)) {
-    //         case TAG_APP:
-    //           switch (term_tag(whnf)) {
-    //             case TAG_LAM: next = wnf_app_lam(ctx, frame, whnf); goto enter;
-    //             case TAG_SUP: whnf = wnf_app_sup(ctx, frame, whnf); continue;
-    //             ...
-    //           }
-    //         case TAG_TOP: { // GRAD frame
-    //           u32 uop = term_ext(frame);
-    //           if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
-    //             next = wnf_grad_apply(ctx, frame, whnf); goto enter;
-    //           }
-    //         }
-    //       }
-    //     }
-    //     return whnf;
-    //
-    // For now, route to old reducer.  Swap in real logic stage by stage.
-    return thvm_reduce(ctx, term);
+    u32 base = g_wnf_stack.pos;
+    Term next = term;
+    Term whnf;
+
+enter: {
+    u8 tag = term_tag(next);
+
+    // Atoms: transition to apply.
+    if (wnf_is_atom(tag)) { whnf = next; goto apply; }
+
+    // GRAD / GRAD_FWD: push as continuation frame, descend into y.
+    if (tag == TAG_TOP) {
+        u32 ext = term_ext(next);
+        if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) {
+            u64 loc = term_val(next);
+            if (loc == 0 || loc + 1 >= ctx->heap_pos) {
+                whnf = next; goto apply;
+            }
+            wnf_stack_push(next);
+            next = heap_read(ctx, loc + 0);
+            goto enter;
+        }
+        // Other TOPs: compute TOPs (ADD/MUL/...) are IC-WHNF, KERNEL/FUSE
+        // and ASSIGN need the old reducer.  Fall back.
+        whnf = thvm_reduce(ctx, next);
+        goto apply;
+    }
+
+    // Any other tag: fall back to the existing reducer.  We'll migrate
+    // more tags into explicit enter/apply cases in later stages.
+    whnf = thvm_reduce(ctx, next);
+    goto apply;
 }
 
-// Cleanup on context free.
+apply: {
+    while (g_wnf_stack.pos > base) {
+        Term frame = g_wnf_stack.buf[--g_wnf_stack.pos];
+        u8 ftag = term_tag(frame);
+        if (ftag != TAG_TOP) {
+            // Stage 1 only pushes TAG_TOP frames.  If something else
+            // slipped in, panic-degrade: unwind and return whnf.
+            break;
+        }
+        u32 fuop = term_ext(frame);
+        if (fuop == UOP_GRAD || fuop == UOP_GRAD_FWD) {
+            int is_fwd = (fuop == UOP_GRAD_FWD);
+            u8 wtag = term_tag(whnf);
+            if (wtag == TAG_TEN) {
+                whnf = wnf_grad_apply_ten(ctx, frame, whnf, is_fwd);
+                continue;
+            }
+            if (wtag == TAG_NUM || wtag == TAG_ERA) {
+                whnf = wnf_grad_apply_num_or_era(ctx);
+                continue;
+            }
+            if (wtag == TAG_TOP) {
+                u32 wext = term_ext(whnf);
+                if (wext == UOP_GRAD || wext == UOP_GRAD_FWD) {
+                    // Should not happen: by construction, inner GRAD was
+                    // driven to WHNF before this frame popped.  If it
+                    // still is a GRAD, we're stuck — return original.
+                    // Reinstall whnf into frame's y slot and return frame.
+                    u64 fl = term_val(frame);
+                    heap_set(ctx, fl + 0, whnf);
+                    whnf = frame;
+                    continue;
+                }
+                // Compute TOP as whnf: delegate to existing rule.
+                next = wnf_grad_apply_compute_top(ctx, frame, whnf, is_fwd);
+                // Result may need further reduction (if it's another GRAD
+                // chain).  Re-enter.
+                goto enter;
+            }
+            // Other whnf tags (DP/VAR stuck, etc.): reinstall and return.
+            u64 fl = term_val(frame);
+            heap_set(ctx, fl + 0, whnf);
+            whnf = frame;
+            continue;
+        }
+        // Non-GRAD frame: shouldn't happen in stage 1.  Reinstall.
+        break;
+    }
+    return whnf;
+}
+}
+
+// Cleanup on context free (call from thvm_free if desired).
 static void wnf_stack_reset(void) {
     if (g_wnf_stack.buf) {
         free(g_wnf_stack.buf);
         g_wnf_stack.buf = NULL;
         g_wnf_stack.cap = 0;
         g_wnf_stack.pos = 0;
-        g_wnf_stack.base = 0;
     }
+    (void)wnf_stack_reset;
 }

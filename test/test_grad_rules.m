@@ -1702,6 +1702,36 @@ static int test_gradu_poly(void) {
     return report("gradu_poly", ok);
 }
 
+// End-to-end numerical: y = sum(x*w), dy/dx = w.  Run full pipeline
+// (no STOP_AFTER_SWEEP) and read the gradient tensor back; check
+// against the known analytical answer.
+static int test_gradu_dot_e2e(void) {
+    setenv("THVM_GRAPH", "0", 1);
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1, 2, 3}, wd[] = {10, 20, 30};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term w = thvm_tensor(ctx, wd, SHAPE(3));
+    thvm_set_requires_grad(ctx, x);
+    Term prod = thvm_op(ctx, UOP_MUL, x, w);
+    Term y = thvm_sum_axes(ctx, prod, (u32[]){0}, 1);
+    Term grad = thvm_grad_u(ctx, y, x);
+    Term r = thvm_eval(ctx, grad);
+    f32 *h = thvm_to_host(ctx, r);
+    int ok = (h != NULL);
+    if (h) {
+        f32 expect[] = {10, 20, 30};
+        for (int i = 0; i < 3; i++) {
+            if (h[i] != expect[i]) {
+                fprintf(stderr, "  gradu_dot_e2e: h[%d]=%g expect=%g\n",
+                        i, h[i], expect[i]);
+                ok = 0;
+            }
+        }
+    }
+    thvm_free(ctx);
+    return report("gradu_dot_e2e", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1787,6 +1817,7 @@ int main(void) {
     fails += test_gradu_where_else();
     fails += test_gradu_where_nested();
     fails += test_gradu_poly();
+    fails += test_gradu_dot_e2e();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

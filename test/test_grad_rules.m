@@ -995,6 +995,30 @@ static int test_gradu_softplus(void) {
     return report("gradu_softplus", ok);
 }
 
+// UOP_GRAD2: y = sum(t*t), target = t.  Composes MUL-Leibniz then SUM.
+// bwd threads EXPAND over sum's inverse + Leibniz's 2t.
+static int test_gradu_sum_sq(void) {
+    setup_graph_dir("gradu_sum_sq");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4};
+    Term a = thvm_tensor(ctx, ad, SHAPE(4));
+    thvm_set_requires_grad(ctx, a);
+    Term a0, a1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+    Term sq = thvm_op(ctx, UOP_MUL, a0, a1);
+    Term y  = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "SUM", "MUL"};
+    const char *post[] = {"CTR", "SUM", "MUL", "EXPAND", "ADD"};
+    int ok = topo_check("gradu_sum_sq", 0, pre, 4)
+          && topo_check("gradu_sum_sq", 1, post, 5);
+    return report("gradu_sum_sq", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1054,6 +1078,7 @@ int main(void) {
     fails += test_gradu_third_derivative();
     fails += test_gradu_exp_neg();
     fails += test_gradu_softplus();
+    fails += test_gradu_sum_sq();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

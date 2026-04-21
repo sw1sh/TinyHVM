@@ -1,5 +1,14 @@
 # TinyHVM Heap & Trampoline: How Recursive Inet Training Works
 
+> **Status (2026-04-22):** This doc describes the **current**
+> predicate-based trampoline (`src/schedule/_.c`, `src/reduce/_.c`).
+> That reducer is scheduled for replacement with an HVM4-style
+> enter/apply stack machine living in `src/wnf/_.c` — see
+> [resources/plans/eval_apply_stack_machine.md](plans/eval_apply_stack_machine.md).
+> The predicate-driven design sketched below doesn't cleanly support
+> nested IC interactions (higher-order GRAD, GRAD⊳APP, nested WHERE);
+> that's the reason for the planned refactor.
+
 > **See also:** [docs/step_trampoline.md](../docs/step_trampoline.md) for the
 > step-graph tracer, walker, and WL `TStep`/`TStepTrace`/`TDotGraph` API
 > that build on top of the primitives documented here.

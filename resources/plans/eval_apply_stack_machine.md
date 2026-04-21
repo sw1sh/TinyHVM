@@ -1,5 +1,17 @@
 # Refactor: eval/apply stack machine for IC reduction
 
+**Implementation location:** `src/wnf/_.c` (new file, mirrors HVM4's
+`clang/wnf/_.c` organization).  Existing reducer (`src/schedule/_.c`,
+`src/reduce/_.c`) stays in place during migration and gets retired at
+stage 4.
+
+**Docs to update on completion:**
+- `resources/heap_and_trampoline.md` — currently describes a
+  two-phase ENTER/APPLY loop but only at a surface level; needs a full
+  rewrite to describe the HVM4-style stack machine.
+- New: `resources/wnf_stack_machine.md` — definitive reference for
+  the finished implementation.
+
 ## Why
 
 TinyHVM's current reducer (`src/schedule/_.c`) is predicate-driven: it

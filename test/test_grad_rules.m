@@ -267,11 +267,17 @@ static int test_bundle_multitarget(void) {
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term b = thvm_tensor(ctx, bd, SHAPE(3));
     Term y = thvm_op(ctx, UOP_MUL, a, b);
-    Term params[] = {a, b};
-    Term bundle = thvm_grad_pair_bundle(ctx, y, params, 2);
+    // Two independent gradients: GRAD2(y, a), GRAD2(y, b).  y is DUP'd so
+    // each GRAD2 sees its own copy.
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term bundle = thvm_ctr(ctx, (Term[]){
+        thvm_grad_u(ctx, y0, a),
+        thvm_grad_u(ctx, y1, b),
+    }, 2);
     thvm_eval(ctx, bundle);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD", "CTR", "MUL"};
+    const char *pre[]  = {"GRAD2", "CTR", "MUL"};
     const char *post[] = {"CTR"};
     int ok = topo_check("bundle_multitarget", 0, pre, 3)
           && topo_check("bundle_multitarget", 1, post, 1);

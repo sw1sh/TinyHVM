@@ -645,6 +645,63 @@ GRADU_BIN_TEST(div, "gradu_div", UOP_DIV, "DIV", "DIV")
 GRADU_BIN_TEST(max, "gradu_max", UOP_MAX, "MAX", "CMP")
 GRADU_BIN_TEST(cmp, "gradu_cmp", UOP_CMP, "CMP", "EXPAND")
 
+// UOP_GRAD2 view/reduce batch (RESHAPE, PERMUTE, SUM).
+static int test_gradu_reshape(void) {
+    setup_graph_dir("gradu_reshape");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(6));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_reshape(ctx, a, SHAPE(2, 3));
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "RESHAPE"};
+    const char *post[] = {"CTR", "RESHAPE", "EXPAND"};
+    int ok = topo_check("gradu_reshape", 0, pre, 3)
+          && topo_check("gradu_reshape", 1, post, 3);
+    return report("gradu_reshape", ok);
+}
+static int test_gradu_permute(void) {
+    setup_graph_dir("gradu_permute");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(2, 3));
+    thvm_set_requires_grad(ctx, a);
+    u32 perm[] = {1, 0};
+    Term y = thvm_permute(ctx, a, perm, 2);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "PERMUTE"};
+    const char *post[] = {"CTR", "PERMUTE", "EXPAND"};
+    int ok = topo_check("gradu_permute", 0, pre, 3)
+          && topo_check("gradu_permute", 1, post, 3);
+    return report("gradu_permute", ok);
+}
+static int test_gradu_sum(void) {
+    setup_graph_dir("gradu_sum");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4};
+    Term a = thvm_tensor(ctx, ad, SHAPE(4));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_sum_axes(ctx, a, (u32[]){0}, 1);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "SUM"};
+    const char *post[] = {"CTR", "SUM", "EXPAND"};
+    int ok = topo_check("gradu_sum", 0, pre, 3)
+          && topo_check("gradu_sum", 1, post, 3);
+    return report("gradu_sum", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -688,6 +745,9 @@ int main(void) {
     fails += test_gradu_div();
     fails += test_gradu_max();
     fails += test_gradu_cmp();
+    fails += test_gradu_reshape();
+    fails += test_gradu_permute();
+    fails += test_gradu_sum();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

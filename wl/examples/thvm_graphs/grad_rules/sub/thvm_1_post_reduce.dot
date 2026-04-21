@@ -1,0 +1,17 @@
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t3 [label="t3\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0",color="#1f78ff",penwidth=2.2];
+  n15 [label="NEG\n[1]\n@15", shape=box, fillcolor="#cce5ff"];
+  dup14 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup14_0 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup14 -> freedup14_0 [label="dp0@14",style=dotted,color="#999999"];
+  t3 -> dup14[label="",taillabel="@14",labelfontsize=7,fontcolor="#666666"];
+  dup14 -> n15 [label="dp1@15"];
+  era24 [label="ERA\n@24",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  n15 -> era24 [label="p"];
+  rootout_t3 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  t3 -> rootout_t3 [label="out"];
+}

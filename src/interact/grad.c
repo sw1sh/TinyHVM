@@ -140,9 +140,20 @@
                             has_keep_bundle,
                             thvm_grad_targets_count_at(ctx, loc));
                 }
-                if (grad_mode == GRAD_MODE_DROP) {
-                    GRAD_RETURN(GRAD_ERASE2(y_src, gy_src));
+                // Free-port gy (TAG_ERA, val=0) = Jacobian-mode seed "I am
+                // unit gradient of y's shape". Lift to a scalar-1.0 TEN that
+                // will be broadcast to y.shape in the per-rule formulas via
+                // the existing sum_to_shape / thvm_expand machinery. The
+                // heap cell is not updated — only the local gy binding is
+                // substituted, so step graphs still render the free port.
+                if (term_tag(gy) == TAG_ERA && term_val(gy) == 0) {
+                    gy = thvm_scalar_typed(ctx, 1.0f, DTYPE_F32);
                 }
+                // DROP mode used to short-circuit here with ERA2(y, gy) —
+                // but that hid the chain rule, which is the main thing the
+                // Phase-1 step graphs are supposed to show. Fall through so
+                // the same rule firings happen as in KEEP/SLOT modes; drop
+                // mode just doesn't deposit into a bundle.
                 GRAD_RESOLVE_ALIAS(y);
                 GRAD_RESOLVE_ALIAS(x);
                 if (getenv("THVM_LOOP_DIAG")) {

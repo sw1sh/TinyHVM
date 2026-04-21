@@ -1,0 +1,7 @@
+registered_passes=1
+mixed_dispatch=0
+input=TEN/t4
+pass[0].name=sched
+pass[0].before=TEN/t4
+pass[0].after=TEN/t4
+output=TEN/t4

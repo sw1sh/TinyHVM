@@ -1,0 +1,7 @@
+registered_passes=1
+mixed_dispatch=0
+input=TOP/KERNEL@69
+pass[0].name=sched
+pass[0].before=TOP/KERNEL@69
+pass[0].after=TOP/EXEC@72
+output=TOP/EXEC@72

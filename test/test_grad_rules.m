@@ -1144,6 +1144,32 @@ static int test_gradu_lambda(void) {
     return report("gradu_lambda", ok);
 }
 
+// UOP_GRAD2: conv-shaped composition — y = sum(pad(x,[1,1]) * w).
+// Exercises PAD + MUL-Leibniz + SUM in a realistic-ish shape.
+static int test_gradu_conv_like(void) {
+    setup_graph_dir("gradu_conv_like");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3,4};
+    f32 wd[] = {1,0,1,0,1,0};  // shape [6] to match padded x
+    Term x = thvm_tensor(ctx, xd, SHAPE(4));
+    Term w = thvm_tensor(ctx, wd, SHAPE(6));
+    thvm_set_requires_grad(ctx, x);
+    u32 pairs[2] = {1, 1};
+    Term px = thvm_pad(ctx, x, pairs, 1);
+    Term prod = thvm_op(ctx, UOP_MUL, px, w);
+    Term y = thvm_sum_axes(ctx, prod, (u32[]){0}, 1);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "SUM", "MUL", "PAD"};
+    const char *post[] = {"CTR", "SUM", "EXPAND", "MUL", "SHRINK"};
+    int ok = topo_check("gradu_conv_like", 0, pre, 5)
+          && topo_check("gradu_conv_like", 1, post, 5);
+    return report("gradu_conv_like", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1208,6 +1234,7 @@ int main(void) {
     fails += test_gradu_distributive();
     fails += test_gradu_assign_src();
     fails += test_gradu_mse();
+    fails += test_gradu_conv_like();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

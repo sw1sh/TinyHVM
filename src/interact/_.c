@@ -1291,23 +1291,26 @@ inet_step:
                         }
                         ctx->itrs++; RETURN_REDUCED(out);
                     }
-                    // EXPAND: dA = sum_to_shape(da, y_shape, a_shape).
+                    // EXPAND: dA for target = sum_to_shape(ones(y_shape), y_shape, target.shape).
+                    // Direct leaf emission matches the target-shape convention and
+                    // avoids the rank-change mismatch that the former recurse+sum
+                    // path hit when target shape differs from EXPAND's operand shape.
                     if (yuop == UOP_EXPAND) {
-                        Term a = heap_read(ctx, yloc + 0);
-                        Shape a_shape = SHAPE(1), y_shape = SHAPE(1);
-                        if (term_tag(a) == TAG_TEN) {
-                            u32 aid = (u32)term_val(a);
-                            if (aid < ctx->tensor_count)
-                                a_shape = ctx->tensors[aid].view.shape;
-                        } else if (term_tag(a) == TAG_TOP) {
-                            const View *av = st_get(term_val(a));
-                            if (av) a_shape = av->shape;
-                        }
+                        Shape y_shape = SHAPE(1);
                         const View *yv = st_get(yloc);
                         if (yv) y_shape = yv->shape;
-                        Term da = thvm_grad_u(ctx, a, tgt);
-                        Term out = (y_shape.rank != 0 && a_shape.rank != 0)
-                            ? sum_to_shape(ctx, da, y_shape, a_shape) : da;
+                        u32 ttid = (u32)term_val(tgt);
+                        Shape tsh = (ttid < ctx->tensor_count)
+                            ? ctx->tensors[ttid].view.shape : SHAPE(1);
+                        // Build rank-matched ones(y_shape).
+                        Shape one_sh = {.rank = y_shape.rank};
+                        for (u32 i = 0; i < y_shape.rank; i++) one_sh.dims[i] = 1;
+                        if (one_sh.rank == 0) { one_sh.rank = 1; one_sh.dims[0] = 1; }
+                        f32 one_v = 1.0f;
+                        Term one_ten = thvm_tensor(ctx, &one_v, one_sh);
+                        Term y_ones = (y_shape.rank != 0) ? thvm_expand(ctx, one_ten, y_shape) : one_ten;
+                        Term out = (y_shape.rank != 0 && tsh.rank != 0)
+                            ? sum_to_shape(ctx, y_ones, y_shape, tsh) : y_ones;
                         ctx->itrs++; RETURN_REDUCED(out);
                     }
                     // RMAX: dA = da * (a == expand(rmax(a))).  a used 3x.

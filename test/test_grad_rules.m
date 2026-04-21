@@ -2268,8 +2268,8 @@ int main(void) {
     fails += test_e2e_grad_permute();
     fails += test_e2e_grad_shrink();
     fails += test_e2e_grad_pad();
-    // fails += test_e2e_grad_expand();  // FIXME: hits view_reshape assert via sum_to_shape
-    // fails += test_e2e_mse_grad();     // disabled; previous test triggers abort
+    fails += test_e2e_grad_expand();
+    fails += test_e2e_mse_grad();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

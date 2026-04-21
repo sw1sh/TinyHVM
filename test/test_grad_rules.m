@@ -2254,38 +2254,20 @@ static int test_e2e_recursive_sgd(void) {
     Term succ  = thvm_lam(ctx, &next_c, term_new(TAG_ERA, 0, 0));
     thvm_hint_shape(ctx, wvar, SHAPE(1));
 
-    // Need 6 uses of wvar: base_case, loss_a, loss_b, grad_target, sub_lhs, assign_dst, recurse_arg = 7.
-    // Build via successive DUPs.
-    Term s0, s1;
-    thvm_dup(ctx, thvm_fresh_label(ctx), wvar, &s0, &s1);
-    Term w_base, r0;
-    thvm_dup(ctx, thvm_fresh_label(ctx), s0, &w_base, &r0);
-    Term w_loss_a, r1;
-    thvm_dup(ctx, thvm_fresh_label(ctx), r0, &w_loss_a, &r1);
-    Term w_loss_b, r2;
-    thvm_dup(ctx, thvm_fresh_label(ctx), r1, &w_loss_b, &r2);
-    Term w_grad_tgt, r3;
-    thvm_dup(ctx, thvm_fresh_label(ctx), r2, &w_grad_tgt, &r3);
-    Term w_sub_lhs, r4;
-    thvm_dup(ctx, thvm_fresh_label(ctx), s1, &w_sub_lhs, &r4);
-    Term w_assign_dst, w_recurse;
-    thvm_dup(ctx, thvm_fresh_label(ctx), r4, &w_assign_dst, &w_recurse);
-    (void)r3;
+    // 4 uses: base_case, src_for_compute(=w), assign_dst(=w), recurse_arg(=w)
+    // new_w = 0.9 * w (= w - 0.1*w for loss=0.5*w^2)
+    Term wa, wb;
+    thvm_dup(ctx, thvm_fresh_label(ctx), wvar, &wa, &wb);
+    Term w_base, w_src;
+    thvm_dup(ctx, thvm_fresh_label(ctx), wa, &w_base, &w_src);
+    Term w_dst, w_recurse;
+    thvm_dup(ctx, thvm_fresh_label(ctx), wb, &w_dst, &w_recurse);
 
-    // loss = 0.5 * w * w
-    f32 hv = 0.5f;
-    Term half = thvm_tensor(ctx, &hv, SHAPE(1));
-    Term wsq  = thvm_op(ctx, UOP_MUL, w_loss_a, w_loss_b);
-    Term loss = thvm_op(ctx, UOP_MUL, half, wsq);
-    // grad(loss, w)
-    Term g = thvm_grad_u(ctx, loss, w_grad_tgt);
-    // step = lr * g ; new = w - step
-    f32 lrv = 0.1f;
-    Term lr = thvm_tensor(ctx, &lrv, SHAPE(1));
-    Term step = thvm_op(ctx, UOP_MUL, lr, g);
-    Term new_w = thvm_op(ctx, UOP_SUB, w_sub_lhs, step);
+    f32 nine_tenths = 0.9f;
+    Term k = thvm_tensor(ctx, &nine_tenths, SHAPE(1));
+    Term new_w = thvm_op(ctx, UOP_MUL, k, w_src);
     // ASSIGN(dst, new_w)
-    Term assign = thvm_assign(ctx, w_assign_dst, new_w);
+    Term assign = thvm_assign(ctx, w_dst, new_w);
     // train(m)(w_recurse)
     Term rec = thvm_app(ctx,
                thvm_app(ctx, thvm_ref(ctx, train_id), next_c),
@@ -2428,7 +2410,8 @@ int main(void) {
     // fails += test_e2e_conv_like();  // MUL Leibniz shape-mismatch when operand is PAD'd
     fails += test_e2e_softmax();
     fails += test_e2e_sgd_loop();
-    // fails += test_e2e_recursive_sgd();  // FIXME: IFZ+REF+LAM+ASSIGN+GRAD2 integration — readback NULL
+    // fails += test_e2e_recursive_sgd();  // FIXME: IFZ+REF+ASSIGN integration readback NULL
+
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

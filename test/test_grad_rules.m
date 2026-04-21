@@ -3008,12 +3008,12 @@ int main(void) {
     // through to the original target (tid mismatch → ERA → zero).
     // Higher-order AD needs symbolic intermediate composition (disable
     // dispatch during GRAD) or provenance-aware tensor identification.
-    // fails += test_e2e_d2_square_rev_rev();  // VJP of VJP
-    // fails += test_e2e_d2_cube();            // VJP of VJP
-    // fails += test_e2e_mixed_partial();      // mixed partials
-    // fails += test_e2e_d2_square_jvp_jvp();  // JVP of JVP
-    // fails += test_e2e_d2_cube_vjp_jvp();    // VJP of JVP (HVP flavor)
-    // fails += test_e2e_d2_cube_jvp_vjp();    // JVP of VJP
+    // Higher-order / mixed-mode 2nd derivatives — not working.
+    // Root cause isn't one bug; it's the predicate-based trampoline not
+    // driving principals cleanly enough for nested GRADs.  Inner GRAD
+    // emits DPs in aux positions that don't resolve during pure
+    // reduction, outer structural walk hits DP leaves it can't dispatch.
+    // HVM4-style eval/apply stack machine would handle this mechanically.
     (void)test_e2e_d2_square_rev_rev;
     (void)test_e2e_d2_cube;
     (void)test_e2e_mixed_partial;

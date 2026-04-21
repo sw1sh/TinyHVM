@@ -699,8 +699,17 @@ static int step_term_is_whnf_atom(Term t) {
 
 static int step_grad_y_ready(Term t) {
     u8 tag = term_tag(t);
-    return tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM ||
-           tag == TAG_SUP || tag == TAG_TOP;
+    if (tag == TAG_TEN || tag == TAG_ERA || tag == TAG_NUM || tag == TAG_SUP)
+        return 1;
+    // A compute TOP is ready — GRAD rule walks it structurally.  But a
+    // nested GRAD/GRAD_FWD as y is *not* ready — let the trampoline
+    // fire the inner GRAD first so the outer walks the rewritten chain,
+    // not the unreduced GRAD TOP.
+    if (tag == TAG_TOP) {
+        u32 ext = term_ext(t);
+        return ext != UOP_GRAD && ext != UOP_GRAD_FWD;
+    }
+    return 0;
 }
 
 static int step_top_arg0_ready(Term t) {

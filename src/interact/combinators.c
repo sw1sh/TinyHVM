@@ -501,7 +501,7 @@ era_continue:
                 if (term_tag(v) == TAG_TEN)
                     tensor_incref(ctx, (u32)term_val(v));
                 ctx->itrs++;
-                RETURN_REDUCED(v);
+                return v;
             }
             Term val = cell; // body, WNF from trampoline
             /* Transparent projection for pure compute TOPs:
@@ -513,7 +513,7 @@ era_continue:
                 if (_vuop != UOP_DETACH && _vuop != UOP_ASSIGN &&
                     _vuop != UOP_KERNEL && _vuop != UOP_EXEC &&
                     _vuop != UOP_GRAD) {
-                    RETURN_REDUCED(val);
+                    return val;
                 }
             }
             /* HVM4 heap_subst_cop: write the SIBLING's clone into this
@@ -528,7 +528,7 @@ era_continue:
                 Term _mine    = dp_index == 0 ? _v0 : _v1; \
                 heap_set(ctx, dup_loc, term_set_sub(_sibling)); \
                 ctx->itrs++; \
-                RETURN_REDUCED(_mine); \
+                return _mine; \
             } while (0)
 
             // DUP ⊳ SUP
@@ -773,7 +773,7 @@ era_continue:
                 if (term_tag(v) == TAG_TEN)
                     tensor_incref(ctx, (u32)term_val(v));
                 ctx->itrs++;
-                RETURN_REDUCED(v);
+                return v;
             }
             /* Resolve y through DP / VAR so the rule's tag dispatch sees
              * the underlying TEN or compute TOP, not the projection. */
@@ -806,7 +806,7 @@ era_continue:
                 Term _mine    = is_bwd ? (_bwd) : (_fwd); \
                 heap_set(ctx, cell_loc, term_set_sub(_sibling)); \
                 ctx->itrs++; \
-                RETURN_REDUCED(_mine); \
+                return _mine; \
             } while (0)
 
             // GRAD ⊳ TEN(t):  fwd = t, bwd is a tensor of the appropriate

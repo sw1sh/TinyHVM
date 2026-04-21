@@ -27,9 +27,9 @@
                     Term s0 = term_new(TAG_DP0, lab, sdup);
                     Term s1 = term_new(TAG_DP1, lab, sdup);
                     ctx->itrs++;
-                    RETURN_REDUCED(thvm_sup(ctx, lab,
+                    return thvm_sup(ctx, lab,
                         thvm_assign(ctx, d0, s0),
-                        thvm_assign(ctx, d1, s1)));
+                        thvm_assign(ctx, d1, s1));
                 }
                 // Symmetric ASSIGN ⊳ SUP on src:
                 // ASSIGN(d, &L{s0,s1})
@@ -44,9 +44,9 @@
                     Term d0 = term_new(TAG_DP0, lab, ddup);
                     Term d1 = term_new(TAG_DP1, lab, ddup);
                     ctx->itrs++;
-                    RETURN_REDUCED(thvm_sup(ctx, lab,
+                    return thvm_sup(ctx, lab,
                         thvm_assign(ctx, d0, s0),
-                        thvm_assign(ctx, d1, s1)));
+                        thvm_assign(ctx, d1, s1));
                 }
                 // ASSIGN ⊳ ERA on src: the update expression reached ERA
                 // (e.g. an entire grad branch erased). ASSIGN returns its
@@ -57,7 +57,7 @@
                     heap_set(ctx, loc + 0, term_era());
                     heap_set(ctx, loc + 1, term_era());
                     ctx->itrs++;
-                    RETURN_REDUCED(dst_r);
+                    return dst_r;
                 }
                 if (term_tag(dst_r) != TAG_TEN || term_tag(src_t) != TAG_TEN)
                     return t;  // not ready — reducer will reduce args first
@@ -155,7 +155,7 @@
                                 (dst_host && dst_dtype == DTYPE_F32) ? dst_host[0] : 0.0f);
                     }
                     ctx->itrs++;
-                    RETURN_REDUCED(dst_r);
+                    return dst_r;
                 }
             }
 
@@ -177,7 +177,7 @@
                     if ((term_tag(left) == TAG_TOP && term_ext(left) == UOP_FUSE) ||
                         (term_tag(right) == TAG_TOP && term_ext(right) == UOP_FUSE))
                         return t;
-                    RETURN_REDUCED(thvm_seq(ctx, left, right));
+                    return thvm_seq(ctx, left, right);
                 }
                 if (!thvm_kernel_is_monolithic(ctx, t)) {
                     if (!thvm_kernel_local_child_ready(ctx, left) ||
@@ -189,7 +189,7 @@
                         fprintf(stderr, "KERNEL_SETTLE: op=%s tag=%u ext=%u val=%llu\n",
                                 uop_names[kernel_uop], term_tag(settled), term_ext(settled),
                                 (unsigned long long)term_val(settled));
-                    RETURN_REDUCED(settled);
+                    return settled;
                 }
                 // KERNEL stays a DAG node in phase-1 — only phase-2 (which sets
                 // dispatch_enabled) is allowed to lower (register) and dispatch it.
@@ -200,7 +200,7 @@
                 if (!thvm_kernel_register(ctx, t, &kid)) {
                     Term compute = term_era();
                     if (thvm_kernel_to_compute(ctx, t, &compute, 0))
-                        RETURN_REDUCED(compute);
+                        return compute;
                     return t;
                 }
                 u64 sig = (kid < sched_kernel_count) ? sched_kernels[kid].normalized_sig : 0;
@@ -229,7 +229,7 @@
                         if (getenv("THVM_SCHED_DIAG"))
                             fprintf(stderr, "KERNEL_CACHE_HIT kid=%u sig=0x%016llx\n",
                                     kid, (unsigned long long)sig);
-                        RETURN_REDUCED(kid_results[kid]);
+                        return kid_results[kid];
                     }
                     // Stale — invalidate and re-dispatch
                     if (getenv("THVM_SCHED_DIAG"))
@@ -271,7 +271,7 @@
                             }
                         }
                     }
-                    RETURN_REDUCED(result);
+                    return result;
                 }
             }
 
@@ -295,7 +295,7 @@
                 if (!ctx->dispatch_enabled) return t;
                 u32 kid = term_as_u32(kid_term);
                 if (kid >= sched_kernel_count) {
-                    RETURN_REDUCED(term_era());
+                    return term_era();
                 }
                 // Cache check (same as UOP_KERNEL)
                 if (term_tag(kid_results[kid]) != TAG_ERA) {
@@ -306,7 +306,7 @@
                             cache_valid = 0; break;
                         }
                     }
-                    if (cache_valid) RETURN_REDUCED(kid_results[kid]);
+                    if (cache_valid) return kid_results[kid];
                     kid_results[kid] = term_era();
                 }
                 {
@@ -330,7 +330,7 @@
                         }
                         kid_n_inputs[kid] = ni;
                     }
-                    RETURN_REDUCED(result);
+                    return result;
                 }
             }
 
@@ -352,14 +352,14 @@
 
                 // Atoms: pass through
                 if (ptag == TAG_TEN || ptag == TAG_ERA || ptag == TAG_NUM)
-                    RETURN_REDUCED(payload);
+                    return payload;
 
                 if (ptag == TAG_TOP) {
                     u32 puop = term_ext(payload);
 
                     // Already fused/meta — pass through
                     if (puop == UOP_KERNEL || puop == UOP_FUSE)
-                        RETURN_REDUCED(payload);
+                        return payload;
 
                     // ASSIGN: wrap src in FUSE (once), return ASSIGN.
                     // Pure interaction — no sub-reduce. Reducer handles the rest.
@@ -377,7 +377,7 @@
                             heap_set(ctx, fl, src);
                             heap_set(ctx, aloc + 1, term_new(TAG_TOP, UOP_FUSE, fl));
                         }
-                        RETURN_REDUCED(payload);
+                        return payload;
                     }
 
                     // Compute-like payloads become visible KERNEL carriers.
@@ -393,11 +393,11 @@
                                     uop_names[puop], term_tag(public_term), term_ext(public_term),
                                     (unsigned long long)term_val(public_term));
                         }
-                        RETURN_REDUCED(public_term);
+                        return public_term;
                     }
 
                     // Other TAG_TOP: pass through
-                    RETURN_REDUCED(payload);
+                    return payload;
                 }
 
                 // SEQ: pass through. Do NOT absorb into a parallel
@@ -406,7 +406,7 @@
                 // considered). The reducer's TAG_SEQ handler fires a
                 // first, discards, then returns b, and FUSE can wrap b
                 // later on the next root pass.
-                if (ptag == TAG_SEQ) RETURN_REDUCED(payload);
+                if (ptag == TAG_SEQ) return payload;
 
                 // CTR: distribute
                 if (ptag == TAG_CTR) {
@@ -419,7 +419,7 @@
                             heap_set(ctx, cloc + i, term_new(TAG_TOP, UOP_FUSE, fl));
                         }
                     }
-                    RETURN_REDUCED(payload);
+                    return payload;
                 }
 
                 // DP: should have been resolved by reducer before reaching FUSE.
@@ -429,7 +429,7 @@
                 }
 
                 // Default: pass through
-                RETURN_REDUCED(payload);
+                return payload;
             }
 
             if (uop == UOP_TODEVICE) {
@@ -447,7 +447,7 @@
                     Backend *dst_be = ctx->backends[dev_idx];
                     if (!dst_be || ms->backend == dst_be) {
                         ctx->itrs++;
-                        RETURN_REDUCED(src_t); // no-op: same device or invalid
+                        return src_t; // no-op: same device or invalid
                     }
                     // Read to host, allocate on target device
                     void *host = thvm_to_host_raw(ctx, src_t, NULL, NULL);
@@ -459,15 +459,15 @@
                     dst_be->buf_write(mn->buf_id, host, (u64)mn->view.numel * dtype_size(mn->dtype));
                     mn->requires_grad = ms->requires_grad;
                     ctx->itrs++;
-                    RETURN_REDUCED(term_ten(new_id, mn->dtype));
+                    return term_ten(new_id, mn->dtype);
                 }
-                RETURN_REDUCED(term_era());
+                return term_era();
             }
 
             if (uop == UOP_DETACH) {
                 Term memo = heap_read(ctx, loc + 1);
                 if (term_tag(memo) == TAG_TEN) {
-                    RETURN_REDUCED(memo);
+                    return memo;
                 }
                 Term src = heap_read(ctx, loc); // WNF from trampoline when possible
                 Term src_expr = src;
@@ -604,7 +604,7 @@
                 }
                 if (term_tag(src) == TAG_ERA) {
                     ctx->itrs++;
-                    RETURN_REDUCED(term_era());
+                    return term_era();
                 }
                 u32 src_dtype = DTYPE_F32;
                 Shape src_shape = SHAPE(1);
@@ -629,7 +629,7 @@
 
                 thvm_spawn_detached_era(ctx, src_expr);
                 ctx->itrs++;
-                RETURN_REDUCED(term_ten(new_id, md->dtype));
+                return term_ten(new_id, md->dtype);
             }
 
             if (uop == UOP_WHERE) {
@@ -639,7 +639,7 @@
                 Term then_t = heap_read(ctx, loc + 1); // WNF from trampoline
                 Term else_t = heap_read(ctx, loc + 2); // WNF from trampoline (TAG_TOP2)
                 if (term_tag(cond_t) != TAG_TEN || term_tag(then_t) != TAG_TEN ||
-                    term_tag(else_t) != TAG_TEN) RETURN_REDUCED(term_era());
+                    term_tag(else_t) != TAG_TEN) return term_era();
                 u32 c_id = (u32)term_val(cond_t);
                 u32 a_wid = (u32)term_val(then_t);
                 u32 b_wid = (u32)term_val(else_t);
@@ -652,7 +652,7 @@
                 void *cp = thvm_to_host_raw(ctx, cond_t, &cond_dtype, NULL);
                 void *ap = thvm_to_host_raw(ctx, then_t, &then_dtype, NULL);
                 void *bp = thvm_to_host_raw(ctx, else_t, &else_dtype, NULL);
-                if (!cp || !ap || !bp) RETURN_REDUCED(term_era());
+                if (!cp || !ap || !bp) return term_era();
                 u32 dst_wid = tensor_create(ctx, ma_w->view.shape, ma_w->dtype);
                 u64 nbytes = (u64)n * dtype_size(ma_w->dtype);
                 void *rp = malloc((size_t)nbytes);
@@ -665,7 +665,7 @@
                 ctx->tensors[dst_wid].backend->buf_write(ctx->tensors[dst_wid].buf_id, rp, nbytes);
                 free(rp);
                 ctx->itrs++;
-                RETURN_REDUCED(term_ten(dst_wid, ma_w->dtype));
+                return term_ten(dst_wid, ma_w->dtype);
             }
 
             // UOP_IFZ(counter, zero_case, succ_lam)
@@ -686,9 +686,9 @@
                         thvm_spawn_detached_era(ctx, succ_lam);
                     }
                     ctx->itrs++;
-                    RETURN_REDUCED(term_val(ctr) != 0 ? ctr : term_era());
+                    return term_val(ctr != 0 ? ctr : term_era());
                 }
-                if (term_tag(ctr) != TAG_TEN) RETURN_REDUCED(term_era());
+                if (term_tag(ctr) != TAG_TEN) return term_era();
                 u32 ctr_dtype = ctx->tensors[(u32)term_val(ctr)].dtype;
                 void *val = thvm_to_host_raw(ctx, ctr, &ctr_dtype, NULL);
                 f32 ctr_val = val ? dtype_load_as_f32(val, ctr_dtype, 0) : 0.0f;
@@ -738,7 +738,7 @@
                 } else if (term_tag(t) == TAG_NUM) {
                     printf("  loss: %.6f\n", term_as_f32(t));
                 }
-                RETURN_REDUCED(term_era());
+                return term_era();
             }
 
             // === Fusion handled by rewrite rules (rewrite/_.c) ===
@@ -798,14 +798,14 @@
                         if (a_is_active_era && b_is_active_era)
                             thvm_spawn_detached_era(ctx, b_term);
                         ctx->itrs++;
-                        if (a_is_active_era) RETURN_REDUCED(a_term);
-                        if (b_is_active_era) RETURN_REDUCED(b_term);
-                        RETURN_REDUCED(term_era());
+                        if (a_is_active_era) return a_term;
+                        if (b_is_active_era) return b_term;
+                        return term_era();
                     }
                     if (a_is_active_era || b_is_active_era)
                         thvm_spawn_detached_era(ctx, era_term);
                     ctx->itrs++;
-                    RETURN_REDUCED(other);
+                    return other;
                 }
                 if (has_aux && !(a_has_era && b_has_era))
                     thvm_spawn_detached_era(ctx, other);
@@ -816,11 +816,11 @@
                 if (a_has_era && b_has_era) {
                     if (a_is_active_era && b_is_active_era)
                         thvm_spawn_detached_era(ctx, b_term);
-                    if (a_is_active_era) RETURN_REDUCED(a_term);
-                    if (b_is_active_era) RETURN_REDUCED(b_term);
-                    RETURN_REDUCED(term_era());
+                    if (a_is_active_era) return a_term;
+                    if (b_is_active_era) return b_term;
+                    return term_era();
                 }
-                RETURN_REDUCED(era_term);
+                return era_term;
             }
 
             // ADD with a literal zero branch is algebraically transparent.
@@ -833,8 +833,8 @@
                     heap_set(ctx, loc + 0, term_era());
                     heap_set(ctx, loc + 1, term_era());
                     ctx->itrs++;
-                    if (a_zero && b_zero) RETURN_REDUCED(a);
-                    RETURN_REDUCED(a_zero ? b : a);
+                    if (a_zero && b_zero) return a;
+                    return a_zero ? b : a;
                 }
             }
 
@@ -854,9 +854,9 @@
                     b1 = term_new(TAG_DP1, lab, dup_loc);
                 }
                 ctx->itrs++;
-                RETURN_REDUCED(thvm_sup(ctx, lab,
+                return thvm_sup(ctx, lab,
                     thvm_op_raw(ctx, uop, a0, b0),
-                    thvm_op_raw(ctx, uop, a1, b1)));
+                    thvm_op_raw(ctx, uop, a1, b1));
             }
             if (term_tag(b) == TAG_SUP && has_aux) {
                 u32 lab = term_ext(b);
@@ -865,9 +865,9 @@
                 Term b1 = heap_read(ctx, sup_loc + 1);
                 // a is already reduced (TEN/NUM/ERA) — atoms copy freely
                 ctx->itrs++;
-                RETURN_REDUCED(thvm_sup(ctx, lab,
+                return thvm_sup(ctx, lab,
                     thvm_op_raw(ctx, uop, a, b0),
-                    thvm_op_raw(ctx, uop, a, b1)));
+                    thvm_op_raw(ctx, uop, a, b1));
             }
 
             // TAG_NUM fast path: inline scalar compute without tensors/buffers.
@@ -889,7 +889,7 @@
                     default: goto num_skip;
                 }
                 ctx->itrs++;
-                RETURN_REDUCED(term_num_f32(vr));
+                return term_num_f32(vr);
             }
             num_skip:
 
@@ -907,15 +907,15 @@
                 if (!ctx->dispatch_enabled) return t;
                 u32 arg_dtype = DTYPE_U32;
                 void *dtype_raw = thvm_to_host_raw(ctx, b, &arg_dtype, NULL);
-                if (!dtype_raw) RETURN_REDUCED(term_era());
+                if (!dtype_raw) return term_era();
                 u32 dst_dtype = dtype_load_as_u32(dtype_raw, arg_dtype, 0);
-                if (dst_dtype >= DTYPE_COUNT) RETURN_REDUCED(term_era());
+                if (dst_dtype >= DTYPE_COUNT) return term_era();
                 if (dst_dtype == ma->dtype) {
                     ctx->itrs++;
-                    RETURN_REDUCED(a);
+                    return a;
                 }
                 void *src_raw = thvm_to_host_raw(ctx, a, NULL, NULL);
-                if (!src_raw) RETURN_REDUCED(term_era());
+                if (!src_raw) return term_era();
                 u32 n = ma->view.numel;
                 u32 dst_id = tensor_create(ctx, ma->view.shape, dst_dtype);
                 TensorMeta *md = &ctx->tensors[dst_id];
@@ -934,7 +934,7 @@
                 md->src_ids[0] = a_id;
                 md->src_ids[1] = (u32)term_val(b);
                 ctx->itrs++;
-                RETURN_REDUCED(term_ten(dst_id, dst_dtype));
+                return term_ten(dst_id, dst_dtype);
             }
 
             if (!is_movement) goto skip_movement;
@@ -1040,7 +1040,7 @@
                 if (a_id) ctx->tensors[a_id].defer_consumers++;
                 if (b_id && is_binary) ctx->tensors[b_id].defer_consumers++;
                 ctx->itrs++;
-                RETURN_REDUCED(term_ten(dst_id, ma->dtype));
+                return term_ten(dst_id, ma->dtype);
             }
 
             // Movement ops: create view, share buffer, no compute
@@ -1218,7 +1218,7 @@
                     if (ma->requires_grad) md->requires_grad = 1;
                 }
                 ctx->itrs++;
-                RETURN_REDUCED(term_ten(dst_id, ma->dtype));
+                return term_ten(dst_id, ma->dtype);
             }
             skip_movement:;
 

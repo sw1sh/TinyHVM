@@ -1008,11 +1008,7 @@ static Term thvm_interact(TinyHVM *ctx, Term t) {
     // unless THVM_STEP_GRAPH is set.
     thvm_step_graph_on_pre_interaction(ctx, t);
 
-    // Return result directly — the trampoline handles TAG_TOP results
-    // via `next = r; goto enter;` (no need to force-reduce here).
-    // Return directly — trampoline handles TAG_TOP via goto enter
-    #define RETURN_REDUCED(result) do { return (result); } while(0)
-    // One interact() call performs exactly one local rewrite.
+    // Rules use plain `return expr;` to emit the single local rewrite.
     // Continued reduction is the reducer trampoline's job.
     #define INET_RECURSE() do { return t; } while (0)
     // No GRAD_STEP — all GRAD sub-terms are placed on heap iteratively

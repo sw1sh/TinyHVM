@@ -114,11 +114,12 @@ static int topo_count(const char *rule, int phase, const char *needle) {
     return count;
 }
 
-// Build a raw GRAD node: y + free-port gy, single-target KEEP mode so the
-// chain-rule tree stays visible in the graph. No APP wrapper — the bundle
-// is a side-channel (thvm_grad_keep_bundle_set isn't called, so the
-// deposit path goes to heap[loc+index] instead of app_loc+1; we don't
-// read the bundle in this test anyway — only the graph structure).
+// Build a raw GRAD node: y on principal port, free-port gy.
+// Single-target DROP mode with x as the literal target (not ANY+table).
+// No bundle side-channel, no APP wrapper — the matcher returns gy on
+// target match and ERAs/NUM(0) on mismatch, so the gradient comes back
+// as the root result directly (e.g. NUM(1) for d(t1+t2)/dt1 once the
+// chain rule + combine zero-simplification finish).
 static Term mk_grad(TinyHVM *ctx, Term y, Term x) {
     thvm_grad_targets_clear(ctx);
     term_use_clear();
@@ -126,11 +127,9 @@ static Term mk_grad(TinyHVM *ctx, Term y, Term x) {
     y = linear_use(ctx, y, loc);
     heap_set(ctx, loc + 0, y);
     heap_set(ctx, loc + 1, term_era());         // free port on gy
-    Term driver = term_new(TAG_TOP, UOP_GRAD, loc);
-    thvm_grad_target_set(ctx, loc, thvm_any());
-    thvm_grad_mode_set(ctx, loc, GRAD_MODE_KEEP);
-    thvm_grad_targets_set_for_loc(ctx, loc, &x, NULL, 1);
-    return driver;
+    thvm_grad_target_set(ctx, loc, x);
+    thvm_grad_mode_set(ctx, loc, GRAD_MODE_DROP);
+    return term_new(TAG_TOP, UOP_GRAD, loc);
 }
 
 static int report(const char *rule, int ok) {

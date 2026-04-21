@@ -3,7 +3,11 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  num_root [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8,color="#1f78ff",penwidth=2.2];
+  n15 [label="DIV\n[3]\n@15", shape=box, fillcolor="#cce5ff",color="#1f78ff",penwidth=2.2];
+  n13 -> n15 [label="a"];
+  n11 -> n15 [label="b"];
+  free15_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n15 -> free15_1000 [label="out"];
   n9 [label="EXPAND\n[3]\n@9", shape=box, fillcolor="#fff3cd"];
   t3 [label="t3\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t3 -> n9 [label="in",taillabel="@9",labelfontsize=7,fontcolor="#666666"];
@@ -20,9 +24,4 @@ digraph G {
   n11 [label="MUL\n[3]\n@11", shape=box, fillcolor="#cce5ff"];
   n9 -> n11 [label="a"];
   n7 -> n11 [label="b"];
-  n15 [label="DIV\n[3]\n@15", shape=box, fillcolor="#cce5ff"];
-  n13 -> n15 [label="a"];
-  n11 -> n15 [label="b"];
-  era20 [label="ERA\n@20",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  n15 -> era20 [label="p"];
 }

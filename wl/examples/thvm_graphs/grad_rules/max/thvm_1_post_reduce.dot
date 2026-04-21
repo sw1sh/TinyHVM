@@ -3,7 +3,11 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  num_root [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8,color="#1f78ff",penwidth=2.2];
+  n18 [label="MUL\n[3]\n@18", shape=box, fillcolor="#cce5ff",color="#1f78ff",penwidth=2.2];
+  n16 -> n18 [label="a"];
+  n10 -> n18 [label="b"];
+  free18_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n18 -> free18_1000 [label="out"];
   n10 [label="CMP\n[3]\n@10", shape=box, fillcolor="#cce5ff"];
   t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
   t1 -> n10 [label="a",taillabel="@10",labelfontsize=7,fontcolor="#666666"];
@@ -16,9 +20,4 @@ digraph G {
   t6 -> n16 [label="shape",taillabel="@17",labelfontsize=7,fontcolor="#666666"];
   era21 [label="ERA\n@21",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
   t2 -> era21 [label="p",taillabel="@20",labelfontsize=7,fontcolor="#666666"];
-  n18 [label="MUL\n[3]\n@18", shape=box, fillcolor="#cce5ff"];
-  n16 -> n18 [label="a"];
-  n10 -> n18 [label="b"];
-  era25 [label="ERA\n@25",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  n18 -> era25 [label="p"];
 }

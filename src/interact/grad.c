@@ -103,12 +103,26 @@
                         } \
                         _gr_keep; \
                     })
+                    // GRAD_COMBINE: combine two branch gradients.
+                    // Always zero-aware: if one branch is NUM(0) / ERA, the
+                    // other branch passes through unchanged. Without this, a
+                    // binary rule where only one operand is a target (or
+                    // neither is a target) produces an ADD(gy, 0) TOP node
+                    // that clutters the graph with a spurious ADD.
                     #define GRAD_COMBINE(a_, b_) ({ \
                         Term _ga_comb = (a_); \
                         Term _gb_comb = (b_); \
-                        (grad_mode == GRAD_MODE_SLOT) ? GRAD_SLOT_SEQ2(_ga_comb, _gb_comb) : \
-                        (grad_mode == GRAD_MODE_KEEP) ? GRAD_KEEP_SEQ2(_ga_comb, _gb_comb) : \
-                                                       thvm_op_raw(ctx, UOP_ADD, _ga_comb, _gb_comb); \
+                        Term _gr_comb; \
+                        int _ga_z = (term_tag(_ga_comb) == TAG_ERA && term_val(_ga_comb) == 0) || \
+                                    (term_tag(_ga_comb) == TAG_NUM && term_val(_ga_comb) == 0); \
+                        int _gb_z = (term_tag(_gb_comb) == TAG_ERA && term_val(_gb_comb) == 0) || \
+                                    (term_tag(_gb_comb) == TAG_NUM && term_val(_gb_comb) == 0); \
+                        if (_ga_z) _gr_comb = _gb_comb; \
+                        else if (_gb_z) _gr_comb = _ga_comb; \
+                        else if (grad_mode == GRAD_MODE_SLOT) _gr_comb = GRAD_SLOT_SEQ2(_ga_comb, _gb_comb); \
+                        else if (grad_mode == GRAD_MODE_KEEP) _gr_comb = GRAD_KEEP_SEQ2(_ga_comb, _gb_comb); \
+                        else _gr_comb = thvm_op_raw(ctx, UOP_ADD, _ga_comb, _gb_comb); \
+                        _gr_comb; \
                     })
                     #define GRAD_SLOT_ACCUM(slot_term_, gy_term_) ({ \
                         Term _slot_src = (slot_term_); \
@@ -141,11 +155,11 @@
                             thvm_grad_targets_count_at(ctx, loc));
                 }
                 // Free-port gy (TAG_ERA, val=0) = Jacobian-mode seed "I am
-                // unit gradient of y's shape". Lift to a scalar-1.0 TEN that
-                // will be broadcast to y.shape in the per-rule formulas via
-                // the existing sum_to_shape / thvm_expand machinery. The
-                // heap cell is not updated — only the local gy binding is
-                // substituted, so step graphs still render the free port.
+                // unit gradient of y's shape". Lift locally to a scalar TEN(1.0)
+                // so the per-rule formulas (sum_to_shape, thvm_expand) have a
+                // concrete shape-aware operand to work with. The heap cell stays
+                // a free port so step graphs still render the gy port as an
+                // outward arrow to a small circle.
                 if (term_tag(gy) == TAG_ERA && term_val(gy) == 0) {
                     gy = thvm_scalar_typed(ctx, 1.0f, DTYPE_F32);
                 }
@@ -175,8 +189,11 @@
                     fprintf(stderr, "  GRAD_RESOLVE[%d]: y_tag=%u y_ext=%u y_val=%llu gy_tag=%u\n", _yc, term_tag(y), term_ext(y), term_val(y), term_tag(gy));
                 }
 
+                // GRAD⊳TEN target match: y is the target leaf, so dy/dx = 1.
+                // Return gy (the accumulated gradient at this path); any
+                // previous short-circuit that erased gy here was hiding the
+                // chain rule's result at the root.
                 if (term_tag(x) != TAG_ANY && x == y) {
-                    if (grad_mode == GRAD_MODE_DROP) GRAD_DROP(gy);
                     GRAD_RETURN(gy);
                 }
 

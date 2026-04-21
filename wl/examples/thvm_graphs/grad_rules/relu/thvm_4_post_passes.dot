@@ -3,5 +3,11 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  num_root [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8,color="#1f78ff",penwidth=2.2];
+  n68 [label="EXEC\n#0\n@68", shape=box, fillcolor="#ccccff",color="#1f78ff",penwidth=2.2];
+  num68_0 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num68_0 -> n68 [label=""];
+  free68_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  free68_1 -> n68 [label=""];
+  free68_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n68 -> free68_1000 [label="out"];
 }

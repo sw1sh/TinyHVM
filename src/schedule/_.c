@@ -2697,8 +2697,13 @@ static Term thvm_eval_internal(TinyHVM *ctx, Term t, int pre_reduce_phase) {
         if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
             heap_set(ctx, step_root_slot, term_era());
 
-        // Phase 1: pure IC reduction — combinators fire, compute ops are WNF.
+        // Phase 1: pure IC reduction. thvm_reduce reduces the root to WHNF
+        // (stops at a compute TOP), which leaves sub-GRADs and other direct
+        // uops unfired on the heap. Follow up with reduce_net_quiesce so
+        // every interaction rule fires to completion — that's what shows the
+        // full chain-rule unfolding in the phase-1 dump.
         traced = thvm_reduce(ctx, traced);
+        traced = reduce_net_quiesce(ctx, traced);
         if (getenv("THVM_SCHED_DIAG"))
             fprintf(stderr, "PHASE1_RESULT: tag=%u ext=%u val=%llu\n",
                     term_tag(traced), term_ext(traced), (unsigned long long)term_val(traced));

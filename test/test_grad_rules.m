@@ -1356,6 +1356,34 @@ static int test_gradu_lambda_square(void) {
     return report("gradu_lambda_square", ok);
 }
 
+// UOP_GRAD2: absolute value via |x| = relu(x) + relu(-x).
+// dy/dx = 2*(x>0) - 1 = sign(x).  Tests parallel RELU branches sharing
+// a common target via DUP.
+static int test_gradu_abs(void) {
+    setup_graph_dir("gradu_abs");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {-2, -1, 0, 1, 2};
+    Term x = thvm_tensor(ctx, xd, SHAPE(5));
+    thvm_set_requires_grad(ctx, x);
+    Term x0, x1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), x, &x0, &x1);
+    Term r_pos = thvm_op(ctx, UOP_RELU, x0, term_era());
+    Term r_neg = thvm_op(ctx, UOP_RELU,
+                    thvm_op(ctx, UOP_NEG, x1, term_era()),
+                    term_era());
+    Term y = thvm_op(ctx, UOP_ADD, r_pos, r_neg);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "ADD", "RELU", "NEG"};
+    const char *post[] = {"CTR", "ADD", "MUL", "CMP", "NEG", "EXPAND"};
+    int ok = topo_check("gradu_abs", 0, pre, 5)
+          && topo_check("gradu_abs", 1, post, 6);
+    return report("gradu_abs", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1429,6 +1457,7 @@ int main(void) {
     fails += test_gradu_batched_reduce();
     fails += test_gradu_lambda();
     fails += test_gradu_lambda_square();
+    fails += test_gradu_abs();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

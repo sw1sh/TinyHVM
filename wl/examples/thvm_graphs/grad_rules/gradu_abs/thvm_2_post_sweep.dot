@@ -1,0 +1,48 @@
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n18 [label="ADD\n[5]\n@18", shape=box, fillcolor="#cce5ff"];
+  n20 -> n18 [label="a"];
+  n22 -> n18 [label="b"];
+  n32 [label="ADD\n[5]\n@32", shape=box, fillcolor="#cce5ff"];
+  n39 -> n32 [label="a"];
+  n46 -> n32 [label="b"];
+  n20 [label="RELU\n[5]\n@20", shape=box, fillcolor="#cce5ff"];
+  t1 [label="t1\n[5]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> n20 [label="",taillabel="@20",labelfontsize=7,fontcolor="#666666"];
+  n22 [label="RELU\n[5]\n@22", shape=box, fillcolor="#cce5ff"];
+  n23 -> n22 [label=""];
+  n23 [label="NEG\n[5]\n@23", shape=box, fillcolor="#cce5ff"];
+  t1 -> n23 [label="",taillabel="@23",labelfontsize=7,fontcolor="#666666"];
+  ctr15 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n18 -> ctr15 [label="c0"];
+  n32 -> ctr15 [label="c1"];
+  n39 [label="MUL\n[5]\n@39", shape=box, fillcolor="#cce5ff"];
+  n48 -> n39 [label="a"];
+  n37 -> n39 [label="b"];
+  n46 [label="MUL\n[5]\n@46", shape=box, fillcolor="#cce5ff"];
+  n52 -> n46 [label="a"];
+  n44 -> n46 [label="b"];
+  n48 [label="EXPAND\n[5]\n@48", shape=box, fillcolor="#fff3cd"];
+  num48_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num48_0 -> n48 [label="in"];
+  t2 [label="t2\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n48 [label="shape",taillabel="@49",labelfontsize=7,fontcolor="#666666"];
+  n37 [label="CMP\n[5]\n@37", shape=box, fillcolor="#cce5ff"];
+  t1 -> n37 [label="a",taillabel="@37",labelfontsize=7,fontcolor="#666666"];
+  num37_1 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num37_1 -> n37 [label="b"];
+  n52 [label="NEG\n[5]\n@52", shape=box, fillcolor="#cce5ff"];
+  n54 -> n52 [label=""];
+  n44 [label="CMP\n[5]\n@44", shape=box, fillcolor="#cce5ff"];
+  n23 -> n44 [label="a"];
+  num44_1 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num44_1 -> n44 [label="b"];
+  n54 [label="EXPAND\n[5]\n@54", shape=box, fillcolor="#fff3cd"];
+  num54_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num54_0 -> n54 [label="in"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n54 [label="shape",taillabel="@55",labelfontsize=7,fontcolor="#666666"];
+}

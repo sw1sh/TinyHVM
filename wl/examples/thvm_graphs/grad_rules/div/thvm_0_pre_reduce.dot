@@ -3,15 +3,17 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  n7 [label="DIV\n[3]\n@7", shape=box, fillcolor="#cce5ff"];
+  n9 [label="GRAD\nd/d(t1)\n@9", shape=box, fillcolor="#e8d0ff"];
+  n11 -> n9 [label="y"];
+  free9_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n9 -> free9_1 [label="gy"];
+  n11 [label="DIV\n[3]\n@11", shape=box, fillcolor="#cce5ff"];
   t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
-  t1 -> n7 [label="a",taillabel="@7",labelfontsize=7,fontcolor="#666666"];
+  t1 -> n11 [label="a",taillabel="@11",labelfontsize=7,fontcolor="#666666"];
   t2 [label="t2\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t2 -> n7 [label="b",taillabel="@8",labelfontsize=7,fontcolor="#666666"];
-  n5 [label="GRAD\nd/d(t1)\n@5", shape=box, fillcolor="#e8d0ff",color="#1f78ff",penwidth=2.2];
-  n7 -> n5 [label="y"];
-  free5_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
-  n5 -> free5_1 [label="gy"];
-  free5_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
-  n5 -> free5_1000 [label="out"];
+  t2 -> n11 [label="b",taillabel="@12",labelfontsize=7,fontcolor="#666666"];
+  ctr7 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n9 -> ctr7 [label="c0"];
+  free7_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  free7_1 -> ctr7 [label="c1"];
 }

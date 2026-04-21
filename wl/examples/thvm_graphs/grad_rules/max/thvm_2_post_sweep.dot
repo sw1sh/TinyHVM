@@ -3,19 +3,17 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  n18 [label="MUL\n[3]\n@18", shape=box, fillcolor="#cce5ff",color="#1f78ff",penwidth=2.2];
-  n16 -> n18 [label="a"];
-  n10 -> n18 [label="b"];
-  free18_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
-  n18 -> free18_1000 [label="out"];
-  n16 [label="EXPAND\n[3]\n@16", shape=box, fillcolor="#fff3cd"];
-  t3 [label="t3\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t3 -> n16 [label="in",taillabel="@16",labelfontsize=7,fontcolor="#666666"];
-  t6 [label="t6\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t6 -> n16 [label="shape",taillabel="@17",labelfontsize=7,fontcolor="#666666"];
-  n10 [label="CMP\n[3]\n@10", shape=box, fillcolor="#cce5ff"];
+  n20 [label="MUL\n[3]\n@20", shape=box, fillcolor="#cce5ff"];
+  num20_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num20_0 -> n20 [label="a"];
+  n14 -> n20 [label="b"];
+  ctr7 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n20 -> ctr7 [label="c0"];
+  free7_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  free7_1 -> ctr7 [label="c1"];
+  n14 [label="CMP\n[3]\n@14", shape=box, fillcolor="#cce5ff"];
   t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
-  t1 -> n10 [label="a",taillabel="@10",labelfontsize=7,fontcolor="#666666"];
+  t1 -> n14 [label="a",taillabel="@14",labelfontsize=7,fontcolor="#666666"];
   t2 [label="t2\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t2 -> n10 [label="b",taillabel="@11",labelfontsize=7,fontcolor="#666666"];
+  t2 -> n14 [label="b",taillabel="@15",labelfontsize=7,fontcolor="#666666"];
 }

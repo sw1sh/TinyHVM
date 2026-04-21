@@ -3,5 +3,9 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  num_root [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8,color="#1f78ff",penwidth=2.2];
+  ctr7 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  num_ctr7_7 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num_ctr7_7 -> ctr7 [label="c0"];
+  free7_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  free7_1 -> ctr7 [label="c1"];
 }

@@ -35,13 +35,15 @@ static void setup_graph_dir(const char *rule) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", dir, dir);
     int r = system(cmd); (void)r;
-    // THVM_STEP_GRAPH=1 runs the per-interaction tracer (and early-returns
-    // before the coarse/phase dumps run). For topology checks we want the
-    // phase dumps (thvm_0_pre_reduce..thvm_4_post_exec), which only the
-    // THVM_GRAPH path emits.
+    // Phase dumps (thvm_0_pre_reduce..thvm_2_post_sweep) via THVM_GRAPH.
+    // STOP_AFTER_SWEEP skips fuse / passes / exec — we only care about
+    // Phase 1 + sweep topology, not codegen. Per-step dumps (THVM_STEP_GRAPH)
+    // would run the full pipeline internally and choke on NUM-seeded ops,
+    // so they're disabled here.
     unsetenv("THVM_STEP_GRAPH");
     setenv("THVM_GRAPH", "1", 1);
     setenv("THVM_GRAPH_DIR", dir, 1);
+    setenv("THVM_GRAPH_STOP_AFTER_SWEEP", "1", 1);
 }
 
 static char *slurp(const char *path) {
@@ -114,22 +116,26 @@ static int topo_count(const char *rule, int phase, const char *needle) {
     return count;
 }
 
-// Build a raw GRAD node: y on principal port, free-port gy.
-// Single-target DROP mode with x as the literal target (not ANY+table).
-// No bundle side-channel, no APP wrapper — the matcher returns gy on
-// target match and ERAs/NUM(0) on mismatch, so the gradient comes back
-// as the root result directly (e.g. NUM(1) for d(t1+t2)/dt1 once the
-// chain rule + combine zero-simplification finish).
+// Build a raw GRAD node and wrap it in a CTR so nothing is orphaned.
+//
+//     CTR#2 { slot0 = GRAD(y, gy=free), slot1 = free }
+//
+// slot0 holds the chain-rule result once the GRAD fires.
+// slot1 is a dangling free-port consumer so the gy output (which the
+// GRAD rule emits an ERA on for the non-target arm) has a visible
+// external sink — keeps the ERA ⊳ ⋯ interaction visible in per-step
+// graphs instead of dropping it as "orphan root".
 static Term mk_grad(TinyHVM *ctx, Term y, Term x) {
     thvm_grad_targets_clear(ctx);
     term_use_clear();
     u64 loc = heap_alloc(ctx, 2);
     y = linear_use(ctx, y, loc);
     heap_set(ctx, loc + 0, y);
-    heap_set(ctx, loc + 1, term_era());         // free port on gy
+    heap_set(ctx, loc + 1, term_era());
     thvm_grad_target_set(ctx, loc, x);
     thvm_grad_mode_set(ctx, loc, GRAD_MODE_DROP);
-    return term_new(TAG_TOP, UOP_GRAD, loc);
+    Term grad_top = term_new(TAG_TOP, UOP_GRAD, loc);
+    return thvm_ctr(ctx, (Term[]){grad_top, term_era()}, 2);
 }
 
 static int report(const char *rule, int ok) {

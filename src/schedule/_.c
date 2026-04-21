@@ -2655,30 +2655,18 @@ static Term thvm_eval_internal(TinyHVM *ctx, Term t, int pre_reduce_phase) {
         // #endregion
         traced = thvm_trace_step_graph_session(ctx, traced);
         thvm_step_graph_restore_tensors(ctx, snaps, snap_count);
-        // Keep step-graph tracing path semantically aligned with normal eval:
-        // after emitting graphs, run the standard pipeline (without tracing)
-        // to settle any residual administrative structure.
-        u8 saved_settled_replay = ctx->step_graph_settled_replay;
-        ctx->step_graph_settled_replay = 1;
-        Term settled = thvm_eval(ctx, t);
-        ctx->step_graph_settled_replay = saved_settled_replay;
-        // #region agent log
-        do {
-            static u32 step_trace_settled_dbg_count = 0;
-            if (step_trace_settled_dbg_count >= 8) break;
-            step_trace_settled_dbg_count++;
-            char _dbg[256];
-            snprintf(_dbg, sizeof(_dbg),
-                     "{\"returned_tag\":%u,\"returned_ext\":%u,\"returned_val\":%llu,"
-                     "\"traced_tag\":%u,\"traced_ext\":%u,\"traced_val\":%llu}",
-                     (u32)term_tag(settled), (u32)term_ext(settled), (unsigned long long)term_val(settled),
-                     (u32)term_tag(traced), (u32)term_ext(traced), (unsigned long long)term_val(traced));
-            thvm_agent_debug_log("pre-fix", "H2", "src/schedule/_.c:1557",
-                                 "step_graph_settled_result", _dbg);
-        } while (0);
-        // #endregion
-        ctx->eval_depth--;
-        return settled;
+        // Don't early-return here: if THVM_GRAPH is also set, fall through
+        // to the coarse-graph block so per-step and phase dumps are emitted
+        // in the same run. The coarse block clones t on entry, so the step
+        // trace mutations don't bleed into the phase dumps.
+        if (!run_coarse_graph) {
+            u8 saved_settled_replay = ctx->step_graph_settled_replay;
+            ctx->step_graph_settled_replay = 1;
+            Term settled = thvm_eval(ctx, t);
+            ctx->step_graph_settled_replay = saved_settled_replay;
+            ctx->eval_depth--;
+            return settled;
+        }
     }
 
     if (run_coarse_graph) {
@@ -2736,6 +2724,18 @@ static Term thvm_eval_internal(TinyHVM *ctx, Term t, int pre_reduce_phase) {
         thvm_heap_dot_root(ctx, path, traced);
         if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
             heap_set(ctx, step_root_slot, term_era());
+
+        // Bail out after Phase 2 when the caller only wants topology dumps
+        // through the post-sweep phase (e.g. GRAD rule tests). Skips fuse,
+        // global passes, and exec — none of which matter for structural
+        // correctness of the chain rule, and which choke on NUM operands
+        // that the rest of the pipeline expects to be TEN.
+        if (getenv("THVM_GRAPH_STOP_AFTER_SWEEP")) {
+            thvm_step_graph_restore_tensors(ctx, snaps, snap_count);
+            sched_planner_release_detached_slots();
+            ctx->eval_depth--;
+            return traced;
+        }
 
         // Phase 3: wrap in UOP_FUSE and reduce. By default this produces the
         // post-local coarse graph only; THVM_EVAL_MIXED_DISPATCH=1 preserves

@@ -170,7 +170,11 @@ typedef u64 Term;
 #define UOP_EXEC      33   // executable kernel trigger: EXEC(NUM(kid), deps, NUM(flags))
                            // installed by global compiler passes; fires JIT/dispatch on reduce
 
-#define UOP_COUNT     34
+// UOP_GRAD2: clean UOP-shape gradient.  heap[loc+0]=y, heap[loc+1]=target.
+// Shape = target.shape.  Parallel to legacy UOP_GRAD during migration.
+#define UOP_GRAD2     34
+
+#define UOP_COUNT     35
 
 // (LAYER_OP_POOL_GATHER and LAYER_OP_BATCHNORM removed — both are now
 // composed from standard UOps with standard backward rules.)
@@ -180,7 +184,8 @@ static const char *uop_names[] = {
     "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
     "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","KERNEL","ASSIGN","WHERE",
-    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","LEGACY32","EXEC"
+    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","LEGACY32","EXEC",
+    "GRAD2"
 };
 
 // ============================================================

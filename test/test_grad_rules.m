@@ -570,6 +570,28 @@ static int test_gradu_add(void) {
     return report("gradu_add", ok);
 }
 
+// UOP_GRAD2 MUL (Leibniz): GRAD2(a*b, t) -> a'*b + a*b'.
+static int test_gradu_mul(void) {
+    setup_graph_dir("gradu_mul");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3}, bd[] = {4, 5, 6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_op(ctx, UOP_MUL, a, b);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx,
+        (Term[]){ y0, thvm_grad_u(ctx, y1, a) }, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "MUL"};
+    const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
+    int ok = topo_check("gradu_mul", 0, pre, 3)
+          && topo_check("gradu_mul", 1, post, 4);
+    return report("gradu_mul", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -604,6 +626,7 @@ int main(void) {
     fails += test_sum_multi_axis();
     fails += test_gradu_identity();
     fails += test_gradu_add();
+    fails += test_gradu_mul();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

@@ -1060,6 +1060,24 @@ inet_step:
                         ctx->itrs++;
                         RETURN_REDUCED(out);
                     }
+                    // MUL (Leibniz): d(a*b)/dt = da*b + a*db.
+                    // a and b each appear twice (fwd + bwd cross-term),
+                    // target appears twice (one per recursive GRAD2). DUPs.
+                    if (yuop == UOP_MUL) {
+                        Term a = heap_read(ctx, yloc + 0);
+                        Term b = heap_read(ctx, yloc + 1);
+                        Term a0, a1, b0, b1, t0, t1;
+                        thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                        thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
+                        thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &t0, &t1);
+                        Term da = thvm_grad_u(ctx, a0, t0);
+                        Term db = thvm_grad_u(ctx, b0, t1);
+                        Term l = thvm_op_raw(ctx, UOP_MUL, da, b1);
+                        Term r = thvm_op_raw(ctx, UOP_MUL, a1, db);
+                        Term out = thvm_op_raw(ctx, UOP_ADD, l, r);
+                        ctx->itrs++;
+                        RETURN_REDUCED(out);
+                    }
                 }
                 // y not yet WNF or pattern unhandled: leave alone; trampoline
                 // retries when y reduces further.

@@ -1,0 +1,29 @@
+digraph G {
+  // PREV_INTERACTION: 
+  // NEXT_INTERACTION: GRAD_h11_SUM_h13
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n11 [label="GRAD\nd/d(t1)\n@11", shape=box, fillcolor="#e8d0ff"];
+  n13 -> n11 [label="y",color="#cc0000",penwidth=2.0];
+  t4 [label="t4\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 -> n11 [label="gy",taillabel="@12",labelfontsize=7,fontcolor="#666666"];
+  n13 [label="SUM\n[1,1]\n@13", shape=box, fillcolor="#ffcccc"];
+  n15 -> n13 [label="in"];
+  t3 [label="t3\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n13 [label="axes",taillabel="@14",labelfontsize=7,fontcolor="#666666"];
+  n15 [label="RESHAPE\n[2,3]\n@15", shape=box, fillcolor="#fff3cd"];
+  t1 [label="t1\n[6]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> n15 [label="in",taillabel="@15",labelfontsize=7,fontcolor="#666666"];
+  t2 [label="t2\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n15 [label="shape",taillabel="@16",labelfontsize=7,fontcolor="#666666"];
+  n9 [label="APP\n#0@9", shape=invtriangle, fillcolor="#f3f3f3"];
+  n11 -> n9 [label="fun"];
+  num_app9_1 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num_app9_1 -> n9 [label="arg"];
+  n17 [label="FUSE\n@17", shape=box, fillcolor="#f0f0f0",color="#1f78ff",penwidth=2.2];
+  n9 -> n17 [label="in"];
+  free17_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n17 -> free17_1000 [label="out"];
+}

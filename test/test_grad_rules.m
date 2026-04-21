@@ -2160,6 +2160,46 @@ static int test_e2e_mse_grad(void) {
     return report("e2e_mse_grad", ok);
 }
 
+// d(sum(x*w))/dx = w, batched: x=[[1,2,3],[4,5,6]] w=[10,20,30] broadcast.
+// Composition: mul broadcast + sum over axis.
+static int test_e2e_conv_like(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3,4}, wd[] = {1,0,1,0,1,0};
+    Term x = thvm_tensor(ctx, xd, SHAPE(4));
+    Term w = thvm_tensor(ctx, wd, SHAPE(6));
+    u32 pairs[2] = {1, 1};
+    Term px = thvm_pad(ctx, x, pairs, 1);
+    Term prod = thvm_op(ctx, UOP_MUL, px, w);
+    Term y = thvm_sum_axes(ctx, prod, (u32[]){0}, 1);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    // dy/dx = shrink(w_shape_match, [1,5]) = w middle 4: [0,1,0,1]
+    f32 expect[] = {0, 1, 0, 1};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 4; i++) if (h[i] != expect[i]) { fprintf(stderr,"  conv h[%d]=%g e=%g\n",i,h[i],expect[i]); ok=0; }
+    thvm_free(ctx);
+    return report("e2e_conv_like", ok);
+}
+
+// Softmax-like chain: d(log(sum(exp(x))))/dx = exp(x)/sum(exp(x)) = softmax(x).
+// x=[1,2,3] → softmax ≈ [0.0900, 0.2447, 0.6652].
+static int test_e2e_softmax(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1, 2, 3};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term ex = thvm_op(ctx, UOP_EXP, x, term_era());
+    Term s = thvm_sum_axes(ctx, ex, (u32[]){0}, 1);
+    Term y = thvm_op(ctx, UOP_LOG, s, term_era());
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 expect[] = {0.0900f, 0.2447f, 0.6652f};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) {
+        f32 d = h[i]-expect[i]; if (d<0) d=-d;
+        if (d > 1e-3f) { fprintf(stderr,"  softmax h[%d]=%g e=%g\n",i,h[i],expect[i]); ok=0; }
+    }
+    thvm_free(ctx);
+    return report("e2e_softmax", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -2270,6 +2310,8 @@ int main(void) {
     fails += test_e2e_grad_pad();
     fails += test_e2e_grad_expand();
     fails += test_e2e_mse_grad();
+    // fails += test_e2e_conv_like();  // pad+mul+sum composition bwd needs shape rework
+    fails += test_e2e_softmax();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

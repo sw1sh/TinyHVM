@@ -1019,6 +1019,33 @@ static int test_gradu_sum_sq(void) {
     return report("gradu_sum_sq", ok);
 }
 
+// UOP_GRAD2: target passed through a user DUP before GRAD2. Tests that
+// the rule resolves tgt through a DP0/DP1 wrapping to the underlying
+// TEN (via the trampoline's arg-reduce on tgt).
+static int test_gradu_target_via_dup(void) {
+    setup_graph_dir("gradu_target_via_dup");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3}, bd[] = {4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_op(ctx, UOP_ADD, a, b);
+    Term a_dup0, a_dup1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a_dup0, &a_dup1);
+    // Use a_dup0 in forward (to keep it live); pass a_dup1 as GRAD2 target.
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a_dup1)}, 2);
+    thvm_spawn_detached_era(ctx, a_dup0);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "ADD"};
+    const char *post[] = {"CTR", "ADD", "EXPAND"};
+    int ok = topo_check("gradu_target_via_dup", 0, pre, 3)
+          && topo_check("gradu_target_via_dup", 1, post, 3);
+    return report("gradu_target_via_dup", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1079,6 +1106,7 @@ int main(void) {
     fails += test_gradu_exp_neg();
     fails += test_gradu_softplus();
     fails += test_gradu_sum_sq();
+    fails += test_gradu_target_via_dup();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

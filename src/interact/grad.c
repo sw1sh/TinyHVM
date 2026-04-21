@@ -140,14 +140,8 @@
                             has_keep_bundle,
                             thvm_grad_targets_count_at(ctx, loc));
                 }
-                // Free-port gy (TAG_ERA, val=0) means "unit upstream gradient".
-                // The chain rule needs a concrete seed to multiply through, so
-                // lift the free port to NUM(1.0) locally. The heap cell stays a
-                // free port for visualization; only this rule's local `gy`
-                // binding is substituted.
-                if (term_tag(gy) == TAG_ERA && term_val(gy) == 0) {
-                    gy = term_num_f32(1.0f);
-                    gy_src = gy;
+                if (grad_mode == GRAD_MODE_DROP) {
+                    GRAD_RETURN(GRAD_ERASE2(y_src, gy_src));
                 }
                 GRAD_RESOLVE_ALIAS(y);
                 GRAD_RESOLVE_ALIAS(x);

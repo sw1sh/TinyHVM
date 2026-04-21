@@ -2639,7 +2639,7 @@ int main(void) {
     fails += test_e2e_maxpool_like();
     fails += test_e2e_adam_linear_fit();
     fails += test_e2e_mm_bwd();
-    // fails += test_e2e_scalar_mul_grad();  // EXPAND rule over-counts when target doesn't flow; leave for design rework
+    fails += test_e2e_scalar_mul_grad();
     fails += test_e2e_mlp_scalar_loss();
     fails += test_e2e_sigmoid_grad();
 

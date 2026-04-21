@@ -273,17 +273,26 @@ if (uop == UOP_GRAD2) {
             }
             ctx->itrs++; return out;
         }
-        // EXPAND: emit ones(y_shape) sum-reduced to target.shape.  Works when
-        // target flows through the operand.  For cases where target tid doesn't
-        // match expand's direct TEN, this over-counts but prior design was also
-        // compromised for non-trivial chains; keeping simple rule.
+        // EXPAND: y = expand(a, y_shape). Under the ones-seed contract,
+        //   d(sum y)/dt = sum_to_shape(ones(y_shape), tgt.shape)  when
+        // target flows through the operand. If the operand is a leaf TEN
+        // whose id doesn't match the target (projection-stripped), the
+        // expand contributes nothing — emit zeros(tgt.shape).
         if (yuop == UOP_EXPAND) {
+            Term a = heap_read(ctx, yloc + 0);
             Shape y_shape = SHAPE(1);
             const View *yv = st_get(yloc);
             if (yv) y_shape = yv->shape;
             u32 ttid = (u32)term_val(tgt);
             Shape tsh = (ttid < ctx->tensor_count)
                 ? ctx->tensors[ttid].view.shape : SHAPE(1);
+            // Leaf-mismatch short-circuit.
+            if (term_tag(a) == TAG_TEN && term_tag(tgt) == TAG_TEN) {
+                u32 a_tid = (u32)term_val(a);
+                if (a_tid != ttid) {
+                    ctx->itrs++; return GRAD2_SCALAR_TEN(0.0f, tsh);
+                }
+            }
             Term y_ones = GRAD2_ONES_OF(y_shape);
             Term out = (y_shape.rank != 0 && tsh.rank != 0)
                 ? sum_to_shape(ctx, y_ones, y_shape, tsh) : y_ones;

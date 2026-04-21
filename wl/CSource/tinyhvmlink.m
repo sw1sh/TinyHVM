@@ -1033,16 +1033,16 @@ EXTERN_C DLLEXPORT int thvmGradMulti(
     MTensor slot_mt  = MArgument_getMTensor(args[3]);
 
     mint *param_ids = libData->MTensor_getIntegerData(param_mt);
-    mint *slot_ids  = libData->MTensor_getIntegerData(slot_mt);
     mint n = libData->MTensor_getFlattenedLength(param_mt);
 
-    Term params[64], slots[64];
+    (void)slot_mt;
+
+    Term params[64];
     for (mint i = 0; i < n && i < 64; i++) {
         params[i] = get_term(param_ids[i]);
-        slots[i]  = get_term(slot_ids[i]);
     }
 
-    Term result = thvm_grad_multi(g_ctx, get_term(loss_id), params, slots, (u32)n);
+    Term result = thvm_grad_bundle(g_ctx, get_term(loss_id), params, (u32)n);
     set_term(out_id, result);
 
     return LIBRARY_NO_ERROR;
@@ -1482,6 +1482,41 @@ EXTERN_C DLLEXPORT int thvmHeapGraph(
     return LIBRARY_NO_ERROR;
 }
 
+// thvmHeapDOT(termId) → UTF8String
+EXTERN_C DLLEXPORT int thvmHeapDOT(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    mint term_id = MArgument_getInteger(args[0]);
+    Term root = get_term(term_id);
+    char *dot = thvm_heap_dot_string(g_ctx, root);
+
+    if (!dot) return LIBRARY_FUNCTION_ERROR;
+
+    MArgument_setUTF8String(res, dot);
+    return LIBRARY_NO_ERROR;
+}
+
+// thvmHeapDOTRaw(tag, ext, val) → UTF8String
+EXTERN_C DLLEXPORT int thvmHeapDOTRaw(
+    WolframLibraryData libData, mint argc, MArgument *args, MArgument res)
+{
+    (void)libData; (void)argc;
+    if (!g_ctx) return LIBRARY_FUNCTION_ERROR;
+
+    u8 tag = (u8)MArgument_getInteger(args[0]);
+    u32 ext = (u32)MArgument_getInteger(args[1]);
+    u64 val = (u64)MArgument_getInteger(args[2]);
+    char *dot = thvm_heap_dot_string(g_ctx, term_new(tag, ext, val));
+
+    if (!dot) return LIBRARY_FUNCTION_ERROR;
+
+    MArgument_setUTF8String(res, dot);
+    return LIBRARY_NO_ERROR;
+}
+
 // ── Interaction tracing & step reduction ──────────────────────────────────────
 
 // thvmTraceEnable(enabled) → Void
@@ -1780,7 +1815,8 @@ EXTERN_C DLLEXPORT int thvmNextInteraction(
 
     u64 source_slot = 0;
     Term before = 0;
-    int found = thvm_step_find_next_actual(g_ctx, root, &source_slot, &before);
+    u8 kind = 0;
+    int found = thvm_step_find_next_actual(g_ctx, root, &source_slot, &before, &kind);
 
     mint dims[1] = {4};
     MTensor out;

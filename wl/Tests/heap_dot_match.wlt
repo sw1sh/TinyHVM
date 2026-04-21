@@ -74,4 +74,28 @@ VerificationTest[
     TestID -> "term-entrypoint-matches-pure-wl-walk-entrypoint"
 ]
 
+VerificationTest[
+    Block[{ok, term, walk},
+        ok = TInit["cpu"];
+        If[! TrueQ[ok], Return[False]];
+        term = TNum[7];
+        walk = TinyHVM`Private`heapWalk[TinyHVM`Private`rootTermOf[term]];
+        TinyHVM`Private`dumpCDOTString[term] == TINetGraphDOT[walk]
+    ],
+    True,
+    TestID -> "dump-c-dot-matches-pure-wl-dot-for-num-root"
+]
+
+VerificationTest[
+    Block[{ok, tensor, walk},
+        ok = TInit["cpu"];
+        If[! TrueQ[ok], Return[False]];
+        tensor = TCreate[{1.0}, {1}];
+        walk = TinyHVM`Private`heapWalk[TinyHVM`Private`rootTermOf[tensor]];
+        TinyHVM`Private`dumpCDOTString[tensor] == TINetGraphDOT[walk]
+    ],
+    True,
+    TestID -> "dump-c-dot-matches-pure-wl-dot-for-tensor-root"
+]
+
 Quiet[TFree[]];

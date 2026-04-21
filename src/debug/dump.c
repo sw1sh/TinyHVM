@@ -3,6 +3,9 @@
 // Visualize: dot -Tpng graph.dot -o graph.png
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 // Step-graph overlay: highlight one predicted next interaction edge.
 static int heap_dot_hl_on = 0;
@@ -2952,6 +2955,80 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
     #undef NODE_MARK
     #undef DP_SLOT_MARK
     #undef DP_SLOT_SEEN
+}
+
+char *thvm_heap_dot_string(TinyHVM *ctx, Term root) {
+    char template[] = "/tmp/thvm_heap_dot_XXXXXX.dot";
+    int fd = mkstemps(template, 4);
+    char *buf = NULL;
+    FILE *f = NULL;
+    long len = 0;
+    int old_hl_on = heap_dot_hl_on;
+    u64 old_hl_slot = heap_dot_hl_slot;
+    Term old_hl_term = heap_dot_hl_term;
+    int old_hl_hit = heap_dot_hl_hit;
+    int old_root_only = heap_dot_root_only;
+    int old_sched_kernels = heap_dot_include_sched_kernels;
+    char old_prev_name[sizeof(heap_dot_prev_name)];
+    char old_next_name[sizeof(heap_dot_next_name)];
+
+    if (fd < 0)
+        return NULL;
+
+    close(fd);
+
+    memcpy(old_prev_name, heap_dot_prev_name, sizeof(heap_dot_prev_name));
+    memcpy(old_next_name, heap_dot_next_name, sizeof(heap_dot_next_name));
+
+    thvm_heap_dot_set_highlight(0, 0);
+    thvm_heap_dot_set_step_meta("", "");
+    thvm_heap_dot_set_sched_kernels(0);
+    heap_dot_root_only = 1;
+
+    thvm_heap_dot_root(ctx, template, root);
+
+    f = fopen(template, "rb");
+    if (!f)
+        goto cleanup;
+
+    if (fseek(f, 0, SEEK_END) != 0)
+        goto cleanup;
+
+    len = ftell(f);
+    if (len < 0)
+        goto cleanup;
+
+    if (fseek(f, 0, SEEK_SET) != 0)
+        goto cleanup;
+
+    buf = (char *)malloc((size_t)len + 1);
+    if (!buf)
+        goto cleanup;
+
+    if (fread(buf, 1, (size_t)len, f) != (size_t)len) {
+        free(buf);
+        buf = NULL;
+        goto cleanup;
+    }
+
+    buf[len] = '\0';
+
+cleanup:
+    if (f)
+        fclose(f);
+
+    unlink(template);
+
+    heap_dot_hl_on = old_hl_on;
+    heap_dot_hl_slot = old_hl_slot;
+    heap_dot_hl_term = old_hl_term;
+    heap_dot_hl_hit = old_hl_hit;
+    heap_dot_root_only = old_root_only;
+    heap_dot_include_sched_kernels = old_sched_kernels;
+    memcpy(heap_dot_prev_name, old_prev_name, sizeof(heap_dot_prev_name));
+    memcpy(heap_dot_next_name, old_next_name, sizeof(heap_dot_next_name));
+
+    return buf;
 }
 
 static void thvm_dump_json(TinyHVM *ctx, const char *path) {

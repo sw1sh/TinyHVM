@@ -35,6 +35,18 @@ static void setup_graph_dir(const char *rule) {
     setenv("THVM_GRAPH_STOP_AFTER_SWEEP", "1", 1);
 }
 
+// Same as setup_graph_dir but ALSO enables per-interaction step dumps.
+static void setup_step_graph_dir(const char *rule) {
+    setup_graph_dir(rule);
+    char sdir[256];
+    snprintf(sdir, sizeof(sdir), "%s/%s/steps", GRAPH_ROOT, rule);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", sdir);
+    int r = system(cmd); (void)r;
+    setenv("THVM_STEP_GRAPH", "1", 1);
+    setenv("THVM_STEP_GRAPH_DIR", sdir, 1);
+}
+
 static char *slurp(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
@@ -2707,7 +2719,7 @@ static int test_e2e_jvp_elementwise(void) {
 // VJP counterpart to JVP(sum(x*x)) — same forward, reverse gradient.
 // Emits graph under graphs/grad_rules/vjp_sum_of_square/ for side-by-side viz.
 static int test_e2e_vjp_sum_of_square(void) {
-    setup_graph_dir("vjp_sum_of_square");
+    setup_step_graph_dir("vjp_sum_of_square");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1,2,3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
@@ -2730,7 +2742,7 @@ static int test_e2e_vjp_sum_of_square(void) {
 // VJP:  shape [3] (target.shape), value 2x = [2,4,6].
 // JVP:  shape [1] (y.shape=scalar), value sum(2x · 1) = 12.
 static int test_e2e_jvp_sum_of_square(void) {
-    setup_graph_dir("jvp_sum_of_square");
+    setup_step_graph_dir("jvp_sum_of_square");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1,2,3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));

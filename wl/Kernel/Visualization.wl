@@ -23,6 +23,10 @@ ClearAll[
     edgeLabelLines,
     edgeLabelColor,
     displayWalkData,
+    dumpNumText,
+    rootTensorDOTString,
+    rootNumDOTString,
+    exactRootDOTString,
     dotNodeAttrs,
     dotEdgeAttrs,
     walkDOTString,
@@ -55,6 +59,84 @@ numText[ext_Integer, val_Integer] := If[
         ToString[val]
     ],
     ToString[val]
+]
+
+dumpNumText[val_Integer] := Block[{x, ax},
+    x = Quiet @ Check[
+        First @ ImportByteArray[
+            ByteArray[Reverse[IntegerDigits[BitAnd[val, 16^^FFFFFFFF], 256, 4]]],
+            "Real32"
+        ],
+        val
+    ];
+    If[! NumericQ[x], Return[ToString[val]]];
+    ax = Abs[N[x]];
+    If[
+        x == 0,
+        "0",
+        If[
+            ax >= 10^4 || ax < 10^-4,
+            ToString[
+                ScientificForm[
+                    x,
+                    4,
+                    NumberFormat -> (Row[{#1, "e", #3}] &)
+                ],
+                OutputForm
+            ],
+            ToString[
+                NumberForm[x, 4, ExponentFunction -> (Null &)],
+                OutputForm
+            ]
+        ]
+    ]
+]
+
+rootTensorDOTString[node_Association] := Block[{tid, dims, dev, dimText},
+    tid = node["Val"];
+    dims = Quiet[TDimensions[TTensor[tid]]];
+    dev = Quiet[TTensor[tid]["Device"]];
+    dimText = If[ListQ[dims], StringRiffle[ToString /@ dims, "\[Cross]"], ""];
+    StringRiffle[
+        {
+            "digraph G {",
+            "  rankdir=BT;",
+            "  node [fontname=\"Helvetica\", fontsize=10, style=filled, shape=box, margin=\"0.1,0.05\"];",
+            "  edge [fontsize=8, fontname=\"Helvetica\"];",
+            "",
+            "  t" <> ToString[tid] <> " [label=\"t" <> ToString[tid] <> "\\n[" <> dimText <> "]\\nf32 " <> ToString[dev] <> "\",shape=box,fillcolor=\"#e0e0e0\",color=\"#1f78ff\",penwidth=2.2];",
+            "  rootout_t" <> ToString[tid] <> " [label=\"\",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor=\"#ffffff\",color=\"#888888\",fontsize=1];",
+            "  t" <> ToString[tid] <> " -> rootout_t" <> ToString[tid] <> " [label=\"out\"];",
+            "}"
+        },
+        "\n"
+    ] <> "\n"
+]
+
+rootNumDOTString[node_Association] := StringRiffle[
+    {
+        "digraph G {",
+        "  rankdir=BT;",
+        "  node [fontname=\"Helvetica\", fontsize=10, style=filled, shape=box, margin=\"0.1,0.05\"];",
+        "  edge [fontsize=8, fontname=\"Helvetica\"];",
+        "",
+        "  num_root [label=\"" <> dumpNumText[node["Val"]] <> "\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8,color=\"#1f78ff\",penwidth=2.2];",
+        "}"
+    },
+    "\n"
+] <> "\n"
+
+exactRootDOTString[walk_Association, termId_: None] := Block[{data, root},
+    data = displayWalkData[walk, termId];
+    root = Lookup[data["Nodes"], data["Root"], Missing["NotFound"]];
+    If[! AssociationQ[root], Return[None]];
+    If[Length[data["Nodes"]] =!= 2 || Length[data["Edges"]] =!= 1, Return[None]];
+    Switch[
+        root["Tag"],
+        "Ten", rootTensorDOTString[root],
+        "Num", rootNumDOTString[root],
+        _, None
+    ]
 ]
 
 (* Pull chain from cached KernelEntry's FusedOp[] via thvmKernelOpChainFn. *)
@@ -508,12 +590,14 @@ dotEdgeAttrs[edge_Association, nodes_Association, activeSlot_Integer] := Block[{
 ]
 
 walkDOTString[walk_Association, termId_: None] := Block[{
+    exact = exactRootDOTString[walk, termId],
     data = displayWalkData[walk, termId],
     nodes,
     edges,
     nodeLines,
     edgeLines
 },
+    If[StringQ[exact], Return[exact]];
     nodes = data["Nodes"];
     edges = data["Edges"];
 
@@ -575,6 +659,18 @@ withDOTImport[dot_String, opts___?OptionQ] := Block[{
         Quiet @ Check[DeleteFile[path], Null]
     ];
     result
+]
+
+dumpCDOTString[t_TTensor] := dumpCDOTString[ToTTerm[t]]
+
+dumpCDOTString[t_TTerm] := Block[{root},
+    loadLibrary[];
+    root = rootTermOf[t];
+    thvmHeapDOTRawFn[
+        Lookup[$tagCode, root["Tag"], 0],
+        root["Ext"],
+        root["Val"]
+    ]
 ]
 
 TINetGraphDOT[t_TTensor, opts___?OptionQ] := TINetGraphDOT[ToTTerm[t], opts]

@@ -407,6 +407,8 @@ thvmViewInfoFn = None;
 thvmTensorDeviceFn = None;
 thvmToDeviceFn = None;
 thvmHeapGraphFn = None;
+thvmHeapDOTFn = None;
+thvmHeapDOTRawFn = None;
 thvmTraceEnableFn = None;
 thvmTraceClearFn = None;
 thvmTraceDataFn = None;
@@ -582,6 +584,10 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
     (* Heap graph visualization *)
     thvmHeapGraphFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapGraph",
         {Integer}, LibraryDataType[NumericArray]];
+    thvmHeapDOTFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapDOT",
+        {Integer}, "UTF8String"];
+    thvmHeapDOTRawFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmHeapDOTRaw",
+        {Integer, Integer, Integer}, "UTF8String"];
 
     (* Interaction tracing & step reduction *)
     thvmTraceEnableFn = LibraryFunctionLoad[$TinyHVMLibrary, "thvmTraceEnable",

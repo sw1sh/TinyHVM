@@ -1827,8 +1827,22 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 snprintf(label,sizeof(label),"EXEC\\n#%u\\n@%llu",
                          kid, (unsigned long long)val);
                 color = "#ccccff";  // light blue for exec triggers
-            } else if (ext == UOP_GRAD) {
-                snprintf(label, sizeof(label), "GRAD\\n@%llu", (unsigned long long)val);
+            } else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) {
+                // Render GRAD as a DUP-shaped pair: principal y (in), two
+                // aux projections fw/bw.  Target is metadata, shown in the
+                // label, not as an operand edge.
+                const char *mode = (ext == UOP_GRAD_FWD) ? "JVP" : "GRAD";
+                char tgt_desc[64] = "?";
+                if (val + 1 < ctx->heap_pos) {
+                    Term tgt = heap_read(ctx, val + 1);
+                    if (term_tag(tgt) == TAG_TEN)
+                        snprintf(tgt_desc, sizeof(tgt_desc), "t%u", (u32)term_val(tgt));
+                    else if (term_tag(tgt) == TAG_DP0 || term_tag(tgt) == TAG_DP1)
+                        snprintf(tgt_desc, sizeof(tgt_desc), "dp@%llu",
+                                 (unsigned long long)term_val(tgt));
+                }
+                snprintf(label, sizeof(label), "%s\\nd/d(%s)\\n@%llu",
+                         mode, tgt_desc, (unsigned long long)val);
                 color = "#e8d0ff"; nshape = "box";
             } else {
                 if (ext == UOP_FUSE) {
@@ -1861,7 +1875,11 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                         ? dot_kernel_entry_for_term(ctx, t, &ke_tmp, &dot_ke, &dot_kid)
                         : 0;
             u32 arity = 2;
-            if (ext == UOP_GRAD) arity = 2;
+            // GRAD / GRAD_FWD: only render the y operand (slot 0).  The
+            // target (slot 1) is metadata, already shown in the node label
+            // as d/d(tN).  The GRAD's own outgoing edge carries fw/bw
+            // semantics and is drawn by EMIT_FREE_OUT below.
+            if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) arity = 1;
             else if (ext == UOP_WHERE || ext == UOP_IFZ) arity = 3;
             else if (ext == UOP_KERNEL) arity = monolithic_kernel ? 0 : 2;
             else if (ext == UOP_EXEC) arity = 2;  // kid + deps (flags hidden)
@@ -1892,14 +1910,10 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 else if (ext == UOP_FUSE) elbl = "in";
                 else if (ext >= UOP_RESHAPE && ext <= UOP_PAD) elbl = ai==0 ? "in" : "shape";
                 else if (ext == UOP_SUM || ext == UOP_RMAX) elbl = ai==0 ? "in" : "axes";
-                else if (ext == UOP_GRAD) elbl = ai==0 ? "y" : "gy";
+                else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) elbl = "y";
                 else if (ext == UOP_DETACH) elbl = "in";
                 else if (is_binary(ext)) elbl = ai==0 ? "a" : "b";
                 int rev = 0;
-                // GRAD's gy is an OUTPUT port (gradient flows outward).
-                // Edge goes from GRAD node to whatever is in the gy slot
-                // (usually a free port / small circle).
-                if (ext == UOP_GRAD && ai == 1) rev = 1;
 
                 if (ctag == TAG_DP0 || ctag == TAG_DP1) {
                     // Always show full DUP triangle with both ports
@@ -2068,9 +2082,15 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             {
                 Term _self = term_new(TAG_TOP, ext, val);
                 if (!TERM_HAS_PARENT_REF(_self) && !TERM_IS_DEF_ROOT(_self) && !REF_TARGETS_LOC(val)) {
+                    // GRAD / GRAD_FWD: outgoing port is bw (reverse-mode
+                    // gradient) / fw (forward-mode tangent).  Everything
+                    // else labels its free out "out".
+                    const char *out_lbl =
+                        (ext == UOP_GRAD)     ? "bw" :
+                        (ext == UOP_GRAD_FWD) ? "fw" : "out";
                     EMIT_FREE_PORT(val, 1000u);
-                    fprintf(f, "  n%llu -> free%llu_%u [label=\"out\"];\n",
-                            (unsigned long long)val, (unsigned long long)val, 1000u);
+                    fprintf(f, "  n%llu -> free%llu_%u [label=\"%s\"];\n",
+                            (unsigned long long)val, (unsigned long long)val, 1000u, out_lbl);
                 }
             }
             nn++;

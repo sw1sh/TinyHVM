@@ -915,8 +915,6 @@ static u32 dot_term_arity(TinyHVM *ctx, Term t) {
             return ext;
         case TAG_DP0:
         case TAG_DP1:
-        case TAG_GF:
-        case TAG_GB:
         case TAG_UDP:
         case TAG_ERA:
         case TAG_VAR:

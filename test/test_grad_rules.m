@@ -2443,7 +2443,7 @@ static int test_e2e_mm_bwd(void) {
     f32 xd[] = {1,2,3,4,5,6}, wd[] = {1,1,1,1,1,1};
     Term x = thvm_tensor(ctx, xd, SHAPE(2, 3));
     Term w = thvm_tensor(ctx, wd, SHAPE(3, 2));
-    Term y = thvm_op(ctx, UOP_MM, x, w);
+    Term y = thvm_op_raw(ctx, UOP_MM, x, w);
     f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
     f32 expect[] = {2,2,2,2,2,2};
     int ok = (g != NULL);
@@ -2495,6 +2495,29 @@ static int test_e2e_mlp_scalar_loss(void) {
     }
     thvm_free(ctx);
     return report("e2e_mlp_scalar_loss", ok);
+}
+
+// Sigmoid via 1/(1+exp(-x)).  d/dx sigmoid(x) = sigmoid(x)*(1-sigmoid(x)).
+// For x=0: sigmoid=0.5, grad=0.25.  x=[0] check grad[0]≈0.25.
+static int test_e2e_sigmoid_grad(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[]={0.0f}, oned[]={1.0f};
+    Term x = thvm_tensor(ctx, xd, SHAPE(1));
+    Term one = thvm_tensor(ctx, oned, SHAPE(1));
+    Term neg_x = thvm_op(ctx, UOP_NEG, x, term_era());
+    Term e = thvm_op(ctx, UOP_EXP, neg_x, term_era());
+    Term den = thvm_op(ctx, UOP_ADD, one, e);
+    Term one2 = thvm_tensor(ctx, oned, SHAPE(1));
+    Term y = thvm_op(ctx, UOP_DIV, one2, den);
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 expect = 0.25f;
+    int ok = (g != NULL);
+    if (g) {
+        f32 d = g[0]-expect; if (d<0) d=-d;
+        if (d > 1e-3f) { fprintf(stderr,"  sigmoid g=%g e=%g\n", g[0], expect); ok=0; }
+    }
+    thvm_free(ctx);
+    return report("e2e_sigmoid_grad", ok);
 }
 
 int main(void) {
@@ -2615,9 +2638,10 @@ int main(void) {
     fails += test_e2e_adam();
     fails += test_e2e_maxpool_like();
     fails += test_e2e_adam_linear_fit();
-    // fails += test_e2e_mm_bwd();  // MUL-Leibniz shape mismatch when one operand is EXPAND-broadcast; needs shape reconciliation
+    fails += test_e2e_mm_bwd();
     // fails += test_e2e_scalar_mul_grad();  // EXPAND rule over-counts when target doesn't flow; leave for design rework
     fails += test_e2e_mlp_scalar_loss();
+    fails += test_e2e_sigmoid_grad();
 
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);

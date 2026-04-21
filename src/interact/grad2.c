@@ -310,20 +310,64 @@ if (uop == UOP_GRAD2) {
             Term out = thvm_op_raw(ctx, UOP_MUL, da, mask);
             ctx->itrs++; return out;
         }
-        // MM: d(a@b)/dt = da@b + a@db.  Leibniz-style in MM.
+        // MM reverse-mode (scalar-loss, ones seed on y):
+        //   y = a @ b   (y.shape = [M,N], a.shape = [M,K], b.shape = [K,N])
+        //   gy = ones(y.shape)
+        //   grad_a = gy @ b^T   shape [M,K] = a.shape
+        //   grad_b = a^T @ gy   shape [K,N] = b.shape
+        // GRAD2 contract requires result of target.shape. For a leaf target
+        // matching operand a (TEN-id equal after projection strip), emit
+        // grad_a; for leaf matching b, emit grad_b; else zeros(target).
         if (yuop == UOP_MM) {
             Term a = heap_read(ctx, yloc + 0);
             Term b = heap_read(ctx, yloc + 1);
-            Term a0, a1, b0, b1, t0, t1;
-            thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-            thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
-            thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &t0, &t1);
-            Term da = thvm_grad_u(ctx, a0, t0);
-            Term db = thvm_grad_u(ctx, b0, t1);
-            Term l  = thvm_op_raw(ctx, UOP_MM, da, b1);
-            Term r  = thvm_op_raw(ctx, UOP_MM, a1, db);
-            Term out = thvm_op_raw(ctx, UOP_ADD, l, r);
-            ctx->itrs++; return out;
+            // Resolve TEN id through DP/VAR chain.
+            #define MM_TID(_tm) ({ \
+                Term _t = (_tm); u32 _id = ~0u; \
+                for (int _i = 0; _i < 32; _i++) { \
+                    u8 _tg = term_tag(_t); \
+                    if (_tg == TAG_TEN) { _id = (u32)term_val(_t); break; } \
+                    if (_tg == TAG_DP0 || _tg == TAG_DP1) { \
+                        u64 _l = term_val(_t); \
+                        if (_l == 0 || _l >= ctx->heap_pos) break; \
+                        Term _n = heap_read(ctx, _l); \
+                        if (term_is_sub(_n)) _n = term_strip_sub(_n); \
+                        if (_n == _t) break; _t = _n; continue; \
+                    } \
+                    if (_tg == TAG_VAR) { \
+                        u64 _l = term_val(_t); \
+                        if (_l == 0 || _l >= ctx->heap_pos) break; \
+                        Term _s = heap_read(ctx, _l); \
+                        if (term_is_sub(_s)) break; \
+                        if (_s == _t) break; _t = _s; continue; \
+                    } \
+                    break; \
+                } _id; \
+            })
+            u32 a_tid = MM_TID(a), b_tid = MM_TID(b), t_tid = MM_TID(tgt);
+            Shape ysh = SHAPE(1);
+            const View *yv = st_get(yloc); if (yv) ysh = yv->shape;
+            if (ysh.rank != 2) {
+                Shape tsh = SHAPE(1); GRAD2_TERM_SHAPE(tgt, tsh);
+                ctx->itrs++; return GRAD2_SCALAR_TEN(0.0f, tsh);
+            }
+            if (t_tid != ~0u && t_tid == a_tid) {
+                Term gy = GRAD2_ONES_OF(ysh);
+                u32 ax[2] = {1,0};
+                Term bT = thvm_permute(ctx, b, ax, 2);
+                Term out = thvm_op(ctx, UOP_MM, gy, bT);
+                ctx->itrs++; return out;
+            }
+            if (t_tid != ~0u && t_tid == b_tid) {
+                Term gy = GRAD2_ONES_OF(ysh);
+                u32 ax[2] = {1,0};
+                Term aT = thvm_permute(ctx, a, ax, 2);
+                Term out = thvm_op(ctx, UOP_MM, aT, gy);
+                ctx->itrs++; return out;
+            }
+            Shape tsh = SHAPE(1); GRAD2_TERM_SHAPE(tgt, tsh);
+            ctx->itrs++; return GRAD2_SCALAR_TEN(0.0f, tsh);
+            #undef MM_TID
         }
         // ASSIGN: forward-only. Gradient flows through dst only.
         if (yuop == UOP_ASSIGN) {

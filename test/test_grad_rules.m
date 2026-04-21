@@ -1569,6 +1569,32 @@ static int test_gradu_ifz_succ(void) {
     return report("gradu_ifz_succ", ok);
 }
 
+// UOP_GRAD2: WHERE(cond=all-1, a, b).  KNOWN GAP: WHERE materializes to
+// a FRESH TEN (not reusing a's id) before GRAD2 fires, so the leaf rule
+// sees ytid != target_tid and emits zeros instead of 1.  The "dy/da=1 if
+// cond" semantics needs either a WHERE-specific UOP_GRAD2 rule or a
+// lazier WHERE.  Test currently only asserts pre-phase topology.
+static int test_gradu_where(void) {
+    setup_graph_dir("gradu_where");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3}, bd[] = {7, 8, 9}, condd[] = {1, 1, 1};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term cond = thvm_tensor(ctx, condd, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_where(ctx, cond, a, b);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    // Pre must contain GRAD2+WHERE; post we don't yet know — if no WHERE
+    // rule exists, GRAD2 stays in the graph.  Just check pre.
+    const char *pre[]  = {"CTR", "GRAD2", "WHERE"};
+    int ok = topo_check("gradu_where", 0, pre, 3);
+    return report("gradu_where", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1649,6 +1675,7 @@ int main(void) {
     fails += test_gradu_curried();
     fails += test_gradu_ifz();
     fails += test_gradu_ifz_succ();
+    fails += test_gradu_where();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

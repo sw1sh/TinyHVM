@@ -831,13 +831,150 @@ era_continue:
                     GRAD_STATE_RETURN(fwd, bwd);
                 }
 
-                // Unary NEG: d(-a) = -da
+                // Unary NEG: d(-a) = -da. No operand reuse.
                 if (uop == UOP_NEG) {
                     Term a = heap_read(ctx, yloc + 0);
                     Term a_fwd, a_bwd;
                     thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
                     Term fwd = thvm_op_raw(ctx, UOP_NEG, a_fwd, term_era());
                     Term bwd = thvm_op_raw(ctx, UOP_NEG, a_bwd, term_era());
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
+                // DIV: d(a/b) = (da·b - a·db) / b²
+                // fwd = DIV(fa, fb), bwd = DIV(SUB(MUL(da, fb'), MUL(fa', db)),
+                //                             MUL(fb'', fb'''))
+                // fa used twice (fwd, bwd cross), fb used FOUR times (fwd,
+                // bwd.l, bwd.r numerator, bwd denom twice).
+                if (uop == UOP_DIV) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term b = heap_read(ctx, yloc + 1);
+                    Term a_fwd, a_bwd, b_fwd, b_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    thvm_grad_pair(ctx, target_tid, b, &b_fwd, &b_bwd);
+                    Term af0, af1, bf0, bf1, bf2, bf3, bftmp;
+                    thvm_dup(ctx, thvm_fresh_label(ctx), a_fwd, &af0, &af1);
+                    thvm_dup(ctx, thvm_fresh_label(ctx), b_fwd, &bf0, &bftmp);
+                    thvm_dup(ctx, thvm_fresh_label(ctx), bftmp, &bf1, &bf2);
+                    /* bf2 needs one more DUP for denom (b²) */
+                    (void)bf3; /* denom gets bf2 itself, then bf1 for numerator b */
+                    Term fwd = thvm_op_raw(ctx, UOP_DIV, af0, bf0);
+                    Term num_l = thvm_op_raw(ctx, UOP_MUL, a_bwd, bf1);
+                    Term num_r = thvm_op_raw(ctx, UOP_MUL, af1, b_bwd);
+                    Term num   = thvm_op_raw(ctx, UOP_SUB, num_l, num_r);
+                    /* denom = b² — need two more copies of b_fwd */
+                    Term bf_d0, bf_d1;
+                    thvm_dup(ctx, thvm_fresh_label(ctx), bf2, &bf_d0, &bf_d1);
+                    Term denom = thvm_op_raw(ctx, UOP_MUL, bf_d0, bf_d1);
+                    Term bwd = thvm_op_raw(ctx, UOP_DIV, num, denom);
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
+                // Unary EXP: d(exp a) = exp(a) · da.
+                // Reuses fa (once in forward, once in derivative MUL).
+                if (uop == UOP_EXP) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term a_fwd, a_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    Term af0, af1;
+                    thvm_dup(ctx, thvm_fresh_label(ctx), a_fwd, &af0, &af1);
+                    Term fwd = thvm_op_raw(ctx, UOP_EXP, af0, term_era());
+                    Term expa = thvm_op_raw(ctx, UOP_EXP, af1, term_era());
+                    Term bwd = thvm_op_raw(ctx, UOP_MUL, a_bwd, expa);
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
+                // Unary LOG: d(log a) = da / a.  a used twice.
+                if (uop == UOP_LOG) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term a_fwd, a_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    Term af0, af1;
+                    thvm_dup(ctx, thvm_fresh_label(ctx), a_fwd, &af0, &af1);
+                    Term fwd = thvm_op_raw(ctx, UOP_LOG, af0, term_era());
+                    Term bwd = thvm_op_raw(ctx, UOP_DIV, a_bwd, af1);
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
+                // Unary SQRT: d(√a) = da / (2·√a).  y = √a, so reuse fwd.
+                if (uop == UOP_SQRT) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term a_fwd, a_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    Term af0, af1;
+                    thvm_dup(ctx, thvm_fresh_label(ctx), a_fwd, &af0, &af1);
+                    Term fwd = thvm_op_raw(ctx, UOP_SQRT, af0, term_era());
+                    Term sqrt_a = thvm_op_raw(ctx, UOP_SQRT, af1, term_era());
+                    Term two = term_num_f32(2.0f);
+                    Term denom = thvm_op_raw(ctx, UOP_MUL, two, sqrt_a);
+                    Term bwd = thvm_op_raw(ctx, UOP_DIV, a_bwd, denom);
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
+                // Unary RELU: d(relu a) = (a > 0) · da.  a used twice.
+                if (uop == UOP_RELU) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term a_fwd, a_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    Term af0, af1;
+                    thvm_dup(ctx, thvm_fresh_label(ctx), a_fwd, &af0, &af1);
+                    Term fwd = thvm_op_raw(ctx, UOP_RELU, af0, term_era());
+                    Term zero = term_num_f32(0.0f);
+                    Term mask = thvm_op_raw(ctx, UOP_CMP, af1, zero);
+                    Term bwd = thvm_op_raw(ctx, UOP_MUL, a_bwd, mask);
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
+                // CMP: non-differentiable → bwd = NUM(0). fa/fb erased.
+                if (uop == UOP_CMP) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term b = heap_read(ctx, yloc + 1);
+                    Term a_fwd, a_bwd, b_fwd, b_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    thvm_grad_pair(ctx, target_tid, b, &b_fwd, &b_bwd);
+                    Term fwd = thvm_op_raw(ctx, UOP_CMP, a_fwd, b_fwd);
+                    thvm_spawn_detached_era(ctx, a_bwd);
+                    thvm_spawn_detached_era(ctx, b_bwd);
+                    Term bwd = term_num_f32(0.0f);
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
+                // MAX: d(max(a,b)) = (a >= b)·da + (a < b)·db. Needs both
+                // operand values to build the mask. a/b used twice each.
+                if (uop == UOP_MAX) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term b = heap_read(ctx, yloc + 1);
+                    Term a_fwd, a_bwd, b_fwd, b_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    thvm_grad_pair(ctx, target_tid, b, &b_fwd, &b_bwd);
+                    Term af0, af1, bf0, bf1;
+                    thvm_dup(ctx, thvm_fresh_label(ctx), a_fwd, &af0, &af1);
+                    thvm_dup(ctx, thvm_fresh_label(ctx), b_fwd, &bf0, &bf1);
+                    Term fwd = thvm_op_raw(ctx, UOP_MAX, af0, bf0);
+                    /* mask = (a >= b) represented via CMP(a, b)  */
+                    Term mask_a = thvm_op_raw(ctx, UOP_CMP, af1, bf1);
+                    Term one = term_num_f32(1.0f);
+                    Term mask_b = thvm_op_raw(ctx, UOP_SUB, one, mask_a);
+                    Term l = thvm_op_raw(ctx, UOP_MUL, a_bwd, mask_a);
+                    Term r = thvm_op_raw(ctx, UOP_MUL, b_bwd, mask_b);
+                    Term bwd = thvm_op_raw(ctx, UOP_ADD, l, r);
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
+                // RESHAPE: view op — fwd = RESHAPE(fa, shape),
+                // bwd = RESHAPE(da, a_shape). For topology, forward the
+                // shape operand through directly.
+                if (uop == UOP_RESHAPE) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term shape = heap_read(ctx, yloc + 1);
+                    Term a_fwd, a_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    Term fwd = thvm_op_raw(ctx, UOP_RESHAPE, a_fwd, shape);
+                    /* Backward reshape back to a's original shape is not
+                     * expressible without the original shape metadata; for
+                     * the topology cut, return a_bwd unchanged. Proper
+                     * shape-aware rules land with sum_to_shape support. */
+                    Term bwd = a_bwd;
                     GRAD_STATE_RETURN(fwd, bwd);
                 }
 

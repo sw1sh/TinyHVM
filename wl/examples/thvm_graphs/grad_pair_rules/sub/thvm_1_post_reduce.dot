@@ -1,0 +1,19 @@
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n13 [label="SUB\n[1]\n@13", shape=box, fillcolor="#cce5ff"];
+  num13_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num13_0 -> n13 [label="a"];
+  num13_1 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num13_1 -> n13 [label="b"];
+  n11 [label="SUB\n[3]\n@11", shape=box, fillcolor="#cce5ff"];
+  t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> n11 [label="a",taillabel="@11",labelfontsize=7,fontcolor="#666666"];
+  t2 [label="t2\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n11 [label="b",taillabel="@12",labelfontsize=7,fontcolor="#666666"];
+  ctr6 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n11 -> ctr6 [label="c0"];
+  n13 -> ctr6 [label="c1"];
+}

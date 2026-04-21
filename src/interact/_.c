@@ -1032,21 +1032,26 @@ inet_step:
                 Term tgt = heap_read(ctx, loc + 1);
                 if (term_is_sub(y))   y   = term_strip_sub(y);
                 if (term_is_sub(tgt)) tgt = term_strip_sub(tgt);
+
+                // Helper: build a scalar-valued tensor of tsh shape via
+                // rank-matched ones-shape + EXPAND.  Handles the recurring
+                // pattern across all leaf/CMP emissions.
+                #define GRAD2_SCALAR_TEN(_val, _tsh) ({                 \
+                    Shape _one = {.rank = (_tsh).rank};                 \
+                    for (u32 _i = 0; _i < (_tsh).rank; _i++) _one.dims[_i] = 1; \
+                    if (_one.rank == 0) { _one.rank = 1; _one.dims[0] = 1; } \
+                    f32 _v = (_val);                                    \
+                    Term _t = thvm_tensor(ctx, &_v, _one);              \
+                    int _scalar = ((_tsh).rank == 0) ||                 \
+                                  ((_tsh).rank == 1 && (_tsh).dims[0] == 1); \
+                    _scalar ? _t : thvm_expand(ctx, _t, (_tsh));        \
+                })
                 // NUM constant: d(const)/dt = 0 of target-shape.
                 if (term_tag(y) == TAG_NUM && term_tag(tgt) == TAG_TEN) {
                     u32 ttid = (u32)term_val(tgt);
                     Shape tsh = (ttid < ctx->tensor_count)
                         ? ctx->tensors[ttid].view.shape : SHAPE(1);
-                    // Wrap scalar in a rank-matching ones-like TEN so EXPAND's
-                    // rank check (src rank == dst rank) passes for multi-dim
-                    // target shapes.  dims are all 1, numel=1 backing.
-                    Shape ones_shape = {.rank = tsh.rank};
-                    for (u32 i = 0; i < tsh.rank; i++) ones_shape.dims[i] = 1;
-                    if (ones_shape.rank == 0) { ones_shape.rank = 1; ones_shape.dims[0] = 1; }
-                    f32 zd = 0.0f;
-                    Term zten = thvm_tensor(ctx, &zd, ones_shape);
-                    int is_scalar = (tsh.rank == 0) || (tsh.rank == 1 && tsh.dims[0] == 1);
-                    Term out = is_scalar ? zten : thvm_expand(ctx, zten, tsh);
+                    Term out = GRAD2_SCALAR_TEN(0.0f, tsh);
                     ctx->itrs++; RETURN_REDUCED(out);
                 }
                 if (term_tag(y) == TAG_TEN && term_tag(tgt) == TAG_TEN) {
@@ -1054,13 +1059,7 @@ inet_step:
                     u32 ttid = (u32)term_val(tgt);
                     Shape tsh = (ttid < ctx->tensor_count)
                         ? ctx->tensors[ttid].view.shape : SHAPE(1);
-                    Shape ones_shape = {.rank = tsh.rank};
-                    for (u32 i = 0; i < tsh.rank; i++) ones_shape.dims[i] = 1;
-                    if (ones_shape.rank == 0) { ones_shape.rank = 1; ones_shape.dims[0] = 1; }
-                    f32 sd = (ytid == ttid) ? 1.0f : 0.0f;
-                    Term sten = thvm_tensor(ctx, &sd, ones_shape);
-                    int is_scalar = (tsh.rank == 0) || (tsh.rank == 1 && tsh.dims[0] == 1);
-                    Term out = is_scalar ? sten : thvm_expand(ctx, sten, tsh);
+                    Term out = GRAD2_SCALAR_TEN(ytid == ttid ? 1.0f : 0.0f, tsh);
                     ctx->itrs++;
                     RETURN_REDUCED(out);
                 }
@@ -1389,13 +1388,7 @@ inet_step:
                         u32 ttid = (u32)term_val(tgt);
                         Shape tsh = (ttid < ctx->tensor_count)
                             ? ctx->tensors[ttid].view.shape : SHAPE(1);
-                        Shape ones_shape = {.rank = tsh.rank};
-                        for (u32 i = 0; i < tsh.rank; i++) ones_shape.dims[i] = 1;
-                        if (ones_shape.rank == 0) { ones_shape.rank = 1; ones_shape.dims[0] = 1; }
-                        f32 zd = 0.0f;
-                        Term zten = thvm_tensor(ctx, &zd, ones_shape);
-                        int is_scalar = (tsh.rank == 0) || (tsh.rank == 1 && tsh.dims[0] == 1);
-                        Term out = is_scalar ? zten : thvm_expand(ctx, zten, tsh);
+                        Term out = GRAD2_SCALAR_TEN(0.0f, tsh);
                         ctx->itrs++; RETURN_REDUCED(out);
                     }
                     // MUL (Leibniz): d(a*b)/dt = da*b + a*db.

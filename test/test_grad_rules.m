@@ -292,17 +292,15 @@ static int test_second_derivative(void) {
     thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
     Term y = thvm_op(ctx, UOP_MUL, a0, a1);
 
-    Term fwd1, bwd1;
-    thvm_grad_pair_target(ctx, a, y, &fwd1, &bwd1);
-    thvm_spawn_detached_era(ctx, fwd1);
-
-    Term fwd2, bwd2;
-    thvm_grad_pair_target(ctx, a, bwd1, &fwd2, &bwd2);
-
-    Term root = thvm_ctr(ctx, (Term[]){fwd2, bwd2}, 2);
+    // First derivative: GRAD2(y, a). Second derivative: GRAD2(first, a).
+    Term bwd1 = thvm_grad_u(ctx, y, a);
+    Term bwd1_0, bwd1_1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), bwd1, &bwd1_0, &bwd1_1);
+    Term bwd2 = thvm_grad_u(ctx, bwd1_1, a);
+    Term root = thvm_ctr(ctx, (Term[]){bwd1_0, bwd2}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD", "CTR", "MUL"};
+    const char *pre[]  = {"GRAD2", "CTR", "MUL"};
     const char *post[] = {"CTR"};
     int ok = topo_check("second_derivative", 0, pre, 3)
           && topo_check("second_derivative", 1, post, 1);

@@ -3,18 +3,21 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  n2 [label="MUL\n[3]\n@2", shape=box, fillcolor="#cce5ff"];
-  dup1 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  n19 [label="GRAD2\n[3]\n@19", shape=box, fillcolor="#f0f0f0"];
+  dup13 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  n14 -> dup13;
+  dup13 -> n19 [label="dp1@19"];
   t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
-  t1 -> dup1[label="",taillabel="@1",labelfontsize=7,fontcolor="#666666"];
-  dup1 -> n2 [label="a (dp0@2)"];
-  dup1 -> n2 [label="b (dp1@3)"];
-  era6 [label="ERA\n@6",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  grad4 [label="GRAD\n@4", shape=invtriangle, fillcolor="#e8d0ff"];
-  n2 -> grad4 [label="y",color="#cc0000",penwidth=2.0];
-  grad4 -> era6 [label="fwd"];
-  ctr10 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
-  grad7 [label="GRAD\n@7", shape=invtriangle, fillcolor="#e8d0ff"];
-  grad7 -> ctr10 [label="c0 (fwd)"];
-  grad7 -> ctr10 [label="c1 (bwd)"];
+  t1 -> n19 [label="",taillabel="@20",labelfontsize=7,fontcolor="#666666"];
+  n14 [label="GRAD2\n[3]\n@14", shape=box, fillcolor="#f0f0f0"];
+  n16 -> n14 [label=""];
+  t1 -> n14 [label="",taillabel="@15",labelfontsize=7,fontcolor="#666666"];
+  n16 [label="MUL\n[3]\n@16", shape=box, fillcolor="#cce5ff"];
+  dup18 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  t1 -> dup18[label="",taillabel="@18",labelfontsize=7,fontcolor="#666666"];
+  dup18 -> n16 [label="a (dp0@16)"];
+  dup18 -> n16 [label="b (dp1@17)"];
+  ctr11 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  dup13 -> ctr11 [label="c0 (dp0@11)"];
+  n19 -> ctr11 [label="c1"];
 }

@@ -1032,6 +1032,16 @@ inet_step:
                 Term tgt = heap_read(ctx, loc + 1);
                 if (term_is_sub(y))   y   = term_strip_sub(y);
                 if (term_is_sub(tgt)) tgt = term_strip_sub(tgt);
+                // NUM constant: d(const)/dt = 0 of target-shape.
+                if (term_tag(y) == TAG_NUM && term_tag(tgt) == TAG_TEN) {
+                    u32 ttid = (u32)term_val(tgt);
+                    Shape tsh = (ttid < ctx->tensor_count)
+                        ? ctx->tensors[ttid].view.shape : SHAPE(1);
+                    Term zero = term_num_f32(0.0f);
+                    Term out = (tsh.rank > 0 && !(tsh.rank == 1 && tsh.dims[0] == 1))
+                        ? thvm_expand(ctx, zero, tsh) : zero;
+                    ctx->itrs++; RETURN_REDUCED(out);
+                }
                 if (term_tag(y) == TAG_TEN && term_tag(tgt) == TAG_TEN) {
                     u32 ytid = (u32)term_val(y);
                     u32 ttid = (u32)term_val(tgt);

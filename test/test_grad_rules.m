@@ -248,18 +248,14 @@ static int test_chained_compute(void) {
     thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
     Term y = thvm_op(ctx, UOP_MUL, a0, a1);
 
-    Term fwd, g;
-    thvm_grad_pair_target(ctx, a, y, &fwd, &g);
-    thvm_spawn_detached_era(ctx, fwd);
-
-    /* DUP g so it can be used twice in MUL(g, g) */
+    Term g = thvm_grad_u(ctx, y, a);
     Term g0, g1;
     thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
     Term z = thvm_op(ctx, UOP_MUL, g0, g1);
 
     thvm_eval(ctx, z);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD", "MUL"};
+    const char *pre[]  = {"GRAD2", "MUL"};
     int ok = topo_check("chained_compute", 0, pre, 2);
     return report("chained", ok);
 }

@@ -507,6 +507,24 @@ static int test_identity(void) {
     return report("identity", ok);
 }
 
+// y = sum(t1, axes=[0,1]) reduces a 2D tensor to scalar.  Exercises
+// multi-axis SUM and the EXPAND(..., input.shape) inverse.
+static int test_sum_multi_axis(void) {
+    setup_graph_dir("sum_multi_axis");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(2, 3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_sum_axes(ctx, a, (u32[]){0, 1}, 2);
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "SUM"};
+    const char *post[] = {"CTR", "SUM", "EXPAND"};
+    int ok = topo_check("sum_multi_axis", 0, pre, 3)
+          && topo_check("sum_multi_axis", 1, post, 3);
+    return report("sum_multi_axis", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -538,6 +556,7 @@ int main(void) {
     fails += test_reshape_deep_target();
     fails += test_nested_unary();
     fails += test_identity();
+    fails += test_sum_multi_axis();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

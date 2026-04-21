@@ -1291,6 +1291,11 @@ void     jit_replay(void);
 // Reduction
 Term     thvm_reduce(TinyHVM *ctx, Term t);
 Term     thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps);
+// HVM4-style eval/apply stack machine (src/wnf/_.c).  Staged migration
+// replacement for the predicate-based reducer above.  Stage 0: atoms
+// return as-is, everything else delegates to thvm_reduce.  See
+// resources/plans/eval_apply_stack_machine.md.
+Term     thvm_wnf(TinyHVM *ctx, Term t);
 Term     thvm_eval(TinyHVM *ctx, Term t);
 void     thvm_sched_reset_runtime(void);
 

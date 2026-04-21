@@ -170,6 +170,9 @@ static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel)
 // ── grad/ — thvm_grad_bundle_get (CTR bundle accessor) ──────────────────────
 #include "grad/_.c"
 
+// ── wnf/ — HVM4-style eval/apply stack machine (stage 0 scaffold) ──────────
+#include "wnf/_.c"
+
 // ── parallel/ — work-stealing deque + per-thread state ──────────────────────
 #include "parallel/wsdeque.c"
 #include "parallel/workers.c"

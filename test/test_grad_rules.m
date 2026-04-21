@@ -449,6 +449,26 @@ static int test_nested_reuse(void) {
     return report("nested_reuse", ok);
 }
 
+// y = reshape(t1+t2, [2,3]), target = t2.  Exercises the RESHAPE
+// rule's composition when target is NOT the reshape's direct operand
+// but a sibling leaf of the ADD underneath.
+static int test_reshape_deep_target(void) {
+    setup_graph_dir("reshape_deep_target");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6}, bd[] = {6,5,4,3,2,1};
+    Term a = thvm_tensor(ctx, ad, SHAPE(6));
+    Term b = thvm_tensor(ctx, bd, SHAPE(6));
+    thvm_set_requires_grad(ctx, b);
+    Term y = thvm_reshape(ctx, thvm_op(ctx, UOP_ADD, a, b), SHAPE(2, 3));
+    thvm_eval(ctx, mk(ctx, y, b));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "RESHAPE", "ADD"};
+    const char *post[] = {"CTR", "RESHAPE", "ADD"};
+    int ok = topo_check("reshape_deep_target", 0, pre, 4)
+          && topo_check("reshape_deep_target", 1, post, 3);
+    return report("reshape_deep_target", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -477,6 +497,7 @@ int main(void) {
     fails += test_target_nomatch();
     fails += test_self_mul();
     fails += test_nested_reuse();
+    fails += test_reshape_deep_target();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

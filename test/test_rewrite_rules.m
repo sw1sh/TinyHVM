@@ -227,8 +227,8 @@ static int test_rule_grad_leaf_match(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
-    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
-    Term g = thvm_grad(ctx, xa, xt);
+    // TEN is atomic — pass it directly as both y and target; no DUP needed.
+    Term g = thvm_grad(ctx, x, x);
     Term reduced = thvm_eval(ctx, g);
     // Rule: GRAD(x, x) rewrites to EXPAND(TEN([1.0], shape=[1]), shape=[3]).
     // That's what GRAD_SCALAR_TEN emits for rank-1 non-scalar target.
@@ -276,9 +276,8 @@ static int test_rule_grad_add(void) {
     f32 ad[] = {1, 2, 3}, bd[] = {4, 5, 6};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term b = thvm_tensor(ctx, bd, SHAPE(3));
-    Term aa, at; thvm_dup(ctx, thvm_fresh_label(ctx), a, &aa, &at);
-    Term y = thvm_op(ctx, UOP_ADD, aa, b);
-    Term g = thvm_grad(ctx, y, at);
+    Term y = thvm_op(ctx, UOP_ADD, a, b);
+    Term g = thvm_grad(ctx, y, a);
     Term reduced = thvm_eval(ctx, g);
     f32 ones[] = {1, 1, 1};
     Term expected = thvm_tensor(ctx, ones, SHAPE(3));
@@ -297,10 +296,11 @@ static int test_rule_grad_mul_square(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
-    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
-    Term xa0, xa1; thvm_dup(ctx, thvm_fresh_label(ctx), xa, &xa0, &xa1);
-    Term y = thvm_op(ctx, UOP_MUL, xa0, xa1);
-    Term g = thvm_grad(ctx, y, xt);
+    // x appears twice in y (via MUL) and once as target — TEN is atomic,
+    // a single DUP for the two MUL uses is sufficient; target needs no DUP.
+    Term xa, xb; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xb);
+    Term y = thvm_op(ctx, UOP_MUL, xa, xb);
+    Term g = thvm_grad(ctx, y, x);
     Term reduced = thvm_eval(ctx, g);
     f32 twox[] = {2, 4, 6};
     Term expected = thvm_tensor(ctx, twox, SHAPE(3));
@@ -319,8 +319,7 @@ static int test_rule_grad_fwd_leaf_match(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
-    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
-    Term g = thvm_grad_fwd(ctx, xa, xt);
+    Term g = thvm_grad_fwd(ctx, x, x);
     Term reduced = thvm_eval(ctx, g);
     f32 ones[] = {1, 1, 1};
     Term expected = thvm_tensor(ctx, ones, SHAPE(3));
@@ -339,11 +338,10 @@ static int test_rule_grad_fwd_sum_of_square(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
-    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
-    Term xa0, xa1; thvm_dup(ctx, thvm_fresh_label(ctx), xa, &xa0, &xa1);
-    Term sq = thvm_op(ctx, UOP_MUL, xa0, xa1);
+    Term xa, xb; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xb);
+    Term sq = thvm_op(ctx, UOP_MUL, xa, xb);
     Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
-    Term g = thvm_grad_fwd(ctx, y, xt);
+    Term g = thvm_grad_fwd(ctx, y, x);
     Term reduced = thvm_eval(ctx, g);
     f32 s[] = {12};
     Term expected = thvm_tensor(ctx, s, SHAPE(1));
@@ -447,9 +445,8 @@ static int test_rule_grad_neg(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
-    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
-    Term y = thvm_op(ctx, UOP_NEG, xa, term_era());
-    Term g = thvm_grad(ctx, y, xt);
+    Term y = thvm_op(ctx, UOP_NEG, x, term_era());
+    Term g = thvm_grad(ctx, y, x);
     Term reduced = thvm_eval(ctx, g);
     f32 mones[] = {-1, -1, -1};
     Term expected = thvm_tensor(ctx, mones, SHAPE(3));

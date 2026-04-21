@@ -98,21 +98,90 @@ if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
         ctx->itrs++;
         return out;
     }
+    // Reachability: does any leaf TEN descended from `y` have id == ttid?
+    // Bounded DFS over TOP children (shape meta and reduction operands
+    // are skipped — reachability checks compute operands only).  DP/VAR
+    // chains are resolved one hop.  Used to prune dead branches in ADD,
+    // SUB, MUL, DIV, EXP, LOG etc. — no reason to emit zero-seeds or
+    // recurse into operands that don't contain the target.
+    #define GRAD_REACHES_TARGET(_y, _ttid) ({ \
+        u32 _tt = (_ttid); int _found = 0; \
+        /* stack: pairs of (term, depth) — iterative DFS */ \
+        Term _stk[64]; u32 _sp = 0; _stk[_sp++] = (_y); \
+        while (_sp > 0 && !_found) { \
+            Term _t = _stk[--_sp]; \
+            /* Resolve DP/VAR one hop */ \
+            for (int _it = 0; _it < 8; _it++) { \
+                u8 _tg = term_tag(_t); \
+                if (_tg == TAG_DP0 || _tg == TAG_DP1 || _tg == TAG_VAR) { \
+                    u64 _l = term_val(_t); \
+                    if (_l == 0 || _l >= ctx->heap_pos) break; \
+                    Term _n = heap_read(ctx, _l); \
+                    if (term_is_sub(_n)) _n = term_strip_sub(_n); \
+                    if (_n == _t) break; _t = _n; continue; \
+                } break; \
+            } \
+            u8 _tg = term_tag(_t); \
+            if (_tg == TAG_TEN) { \
+                if ((u32)term_val(_t) == _tt) { _found = 1; break; } \
+                continue; \
+            } \
+            if (_tg == TAG_TOP) { \
+                u32 _u = term_ext(_t); u64 _l = term_val(_t); \
+                /* Compute-op arities: unary=1, binary=2, ternary=3. */ \
+                u32 _ar = 2; \
+                if (_u == UOP_WHERE || _u == UOP_IFZ) _ar = 3; \
+                else if (_u == UOP_NEG || _u == UOP_EXP || _u == UOP_LOG || \
+                         _u == UOP_RELU || _u == UOP_SQRT || _u == UOP_CAST || \
+                         _u == UOP_DETACH) _ar = 1; \
+                /* For view ops and SUM/RMAX, only first operand is data; \
+                   second is shape/axes meta — skip it. */ \
+                u32 _data_ar = _ar; \
+                if (_u >= UOP_RESHAPE && _u <= UOP_PAD) _data_ar = 1; \
+                else if (_u == UOP_SUM || _u == UOP_RMAX) _data_ar = 1; \
+                for (u32 _i = 0; _i < _data_ar && _sp < 63; _i++) { \
+                    if (_l + _i < ctx->heap_pos) _stk[_sp++] = heap_read(ctx, _l + _i); \
+                } \
+            } \
+        } _found; \
+    })
+
     // TOP chain-rule dispatch.  Recursively emits GRAD on sub-
     // operands; target is DUP'd to keep linearity.
     if (term_tag(y) == TAG_TOP && term_tag(tgt) == TAG_TEN) {
         u32 yuop = term_ext(y);
         u64 yloc = term_val(y);
+        u32 ttid = (u32)term_val(tgt);
+        Shape tsh_guard = SHAPE(1);
+        if (ttid < ctx->tensor_count) tsh_guard = ctx->tensors[ttid].view.shape;
+        // Pre-flight reachability on the whole y: if target doesn't appear
+        // anywhere, the entire GRAD is zero (or identity for leaf-match
+        // already handled above).  Saves every rule the work of recursing
+        // into a dead subtree.
+        if (!GRAD_REACHES_TARGET(y, ttid)) {
+            ctx->itrs++;
+            if (is_fwd) {
+                Shape ysh_out = SHAPE(1);
+                const View *yv = st_get(yloc); if (yv) ysh_out = yv->shape;
+                return GRAD_SCALAR_TEN(0.0f, ysh_out);
+            }
+            return GRAD_SCALAR_TEN(0.0f, tsh_guard);
+        }
         if (yuop == UOP_ADD || yuop == UOP_SUB) {
             Term a = heap_read(ctx, yloc + 0);
             Term b = heap_read(ctx, yloc + 1);
-            Term tgt0, tgt1;
-            thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &tgt0, &tgt1);
-            Term da = GRAD_REC( a, tgt0);
-            Term db = GRAD_REC( b, tgt1);
-            Term out = thvm_op_raw(ctx, yuop, da, db);
+            int a_reaches = GRAD_REACHES_TARGET(a, ttid);
+            int b_reaches = GRAD_REACHES_TARGET(b, ttid);
+            Term da = a_reaches ? GRAD_REC(a, tgt) : (Term)0;
+            Term db = b_reaches ? GRAD_REC(b, tgt) : (Term)0;
             ctx->itrs++;
-            return out;
+            if (a_reaches && b_reaches) return thvm_op_raw(ctx, yuop, da, db);
+            if (a_reaches) return yuop == UOP_SUB ? da : da;  // a + 0 = a; a - 0 = a
+            if (b_reaches) return yuop == UOP_SUB
+                ? thvm_op_raw(ctx, UOP_NEG, db, term_era())  // 0 - b = -b
+                : db;                                         // 0 + b = b
+            // Unreachable — pre-flight caught this.  Keep a safe fallback.
+            return GRAD_SCALAR_TEN(0.0f, tsh_guard);
         }
         // NEG: d(-a)/dt = -(da).
         if (yuop == UOP_NEG) {

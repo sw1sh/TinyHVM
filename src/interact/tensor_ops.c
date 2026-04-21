@@ -985,7 +985,55 @@
                 TensorMeta *md = &ctx->tensors[dst_id];
                 memset(md, 0, sizeof(*md));
                 md->dtype = ma->dtype; md->refcount = 1; md->backend = ma->backend;
-                md->view = view_create(shape_of(out_shape, out_ndim));
+                // For movement ops on a TEN with a live buffer, preserve the
+                // stride/contiguity implied by view_{expand,reshape,...} and
+                // share the source buffer.  Otherwise the deferred tensor gets
+                // view_create (contiguous) which loses broadcast stride=0 etc.
+                if (is_movement && ma->buf_id) {
+                    View nv = ma->view;
+                    Shape ns = shape_of(out_shape, out_ndim);
+                    if (uop == UOP_EXPAND && ns.rank == ma->view.shape.rank) {
+                        nv = view_expand(ma->view, ns);
+                    } else if (uop == UOP_RESHAPE) {
+                        View rv = view_reshape(ma->view, ns);
+                        if (rv.numel != 0) nv = rv;
+                        else nv = view_create(ns);
+                    } else if (uop == UOP_PERMUTE && b_id) {
+                        u32 pf[MAX_DIM];
+                        tensor_meta_read_u32(ctx, b_id, pf, MAX_DIM);
+                        nv = view_permute(ma->view, pf);
+                    } else if (uop == UOP_SHRINK && b_id) {
+                        TensorMeta *bm = &ctx->tensors[b_id];
+                        u32 np = bm->view.numel / 2;
+                        u32 pairs[MAX_DIM * 2];
+                        tensor_meta_read_u32(ctx, b_id, pairs, MAX_DIM * 2);
+                        u32 starts[MAX_DIM], ends[MAX_DIM];
+                        for (u32 i = 0; i < np; i++) {
+                            starts[i] = pairs[i*2];
+                            ends[i]   = pairs[i*2+1];
+                        }
+                        nv = view_shrink(ma->view, starts, ends);
+                    } else if (uop == UOP_PAD && b_id) {
+                        TensorMeta *bm = &ctx->tensors[b_id];
+                        u32 np = bm->view.numel / 2;
+                        u32 pairs[MAX_DIM * 2];
+                        tensor_meta_read_u32(ctx, b_id, pairs, MAX_DIM * 2);
+                        u32 pre[MAX_DIM], post[MAX_DIM];
+                        for (u32 i = 0; i < np; i++) {
+                            pre[i]  = pairs[i*2];
+                            post[i] = pairs[i*2+1];
+                        }
+                        nv = view_pad(ma->view, pre, post);
+                    } else {
+                        nv = view_create(ns);
+                    }
+                    md->view = nv;
+                    md->buf_id = ma->buf_id;
+                    if (md->backend && md->backend->buf_incref)
+                        md->backend->buf_incref(md->buf_id);
+                } else {
+                    md->view = view_create(shape_of(out_shape, out_ndim));
+                }
                 md->creator_op = uop; md->src_ids[0] = a_id; md->src_ids[1] = b_id;
                 if (ma->requires_grad || (mb && mb->requires_grad)) md->requires_grad = 1;
                 // Track consumers (needed by tensor_materialize for side outputs)

@@ -311,6 +311,8 @@ void *thvm_to_host_raw(TinyHVM *ctx, Term t, u32 *out_dtype, Shape *out_shape) {
     if (out_dtype) *out_dtype = m->dtype;
     if (out_shape) *out_shape = m->view.shape;
 
+    if (getenv("THVM_RDIAG")) fprintf(stderr, "to_host tid=%u creator=%u buf=%u numel=%u contig=%u str0=%d\n",
+        id, m->creator_op, m->buf_id, m->view.numel, m->view.contiguous, m->view.shape.rank>0?m->view.strides[0]:0);
     if (m->view.contiguous) {
         // Contiguous: direct read
         if (!m->host_ptr) m->host_ptr = malloc((size_t)m->view.numel * elem_bytes);

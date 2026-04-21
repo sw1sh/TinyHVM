@@ -1060,6 +1060,55 @@ inet_step:
                         ctx->itrs++;
                         RETURN_REDUCED(out);
                     }
+                    // NEG: d(-a)/dt = -(da).
+                    if (yuop == UOP_NEG) {
+                        Term a = heap_read(ctx, yloc + 0);
+                        Term da = thvm_grad_u(ctx, a, tgt);
+                        Term out = thvm_op_raw(ctx, UOP_NEG, da, term_era());
+                        ctx->itrs++; RETURN_REDUCED(out);
+                    }
+                    // EXP: d(exp a)/dt = exp(a) * da.  a used twice.
+                    if (yuop == UOP_EXP) {
+                        Term a = heap_read(ctx, yloc + 0);
+                        Term a0, a1;
+                        thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                        Term da = thvm_grad_u(ctx, a0, tgt);
+                        Term exp_a = thvm_op_raw(ctx, UOP_EXP, a1, term_era());
+                        Term out = thvm_op_raw(ctx, UOP_MUL, da, exp_a);
+                        ctx->itrs++; RETURN_REDUCED(out);
+                    }
+                    // LOG: d(log a)/dt = (1/a) * da.  a used twice.
+                    if (yuop == UOP_LOG) {
+                        Term a = heap_read(ctx, yloc + 0);
+                        Term a0, a1;
+                        thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                        Term da = thvm_grad_u(ctx, a0, tgt);
+                        Term out = thvm_op_raw(ctx, UOP_DIV, da, a1);
+                        ctx->itrs++; RETURN_REDUCED(out);
+                    }
+                    // SQRT: d(sqrt a)/dt = da / (2*sqrt(a)).  a used twice.
+                    if (yuop == UOP_SQRT) {
+                        Term a = heap_read(ctx, yloc + 0);
+                        Term a0, a1;
+                        thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                        Term da = thvm_grad_u(ctx, a0, tgt);
+                        Term sq = thvm_op_raw(ctx, UOP_SQRT, a1, term_era());
+                        Term two = term_num_f32(2.0f);
+                        Term den = thvm_op_raw(ctx, UOP_MUL, two, sq);
+                        Term out = thvm_op_raw(ctx, UOP_DIV, da, den);
+                        ctx->itrs++; RETURN_REDUCED(out);
+                    }
+                    // RELU: d(relu a)/dt = (a>0) * da.  a used twice.
+                    if (yuop == UOP_RELU) {
+                        Term a = heap_read(ctx, yloc + 0);
+                        Term a0, a1;
+                        thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                        Term da = thvm_grad_u(ctx, a0, tgt);
+                        Term zero = term_num_f32(0.0f);
+                        Term mask = thvm_op_raw(ctx, UOP_CMP, a1, zero);
+                        Term out = thvm_op_raw(ctx, UOP_MUL, da, mask);
+                        ctx->itrs++; RETURN_REDUCED(out);
+                    }
                     // MUL (Leibniz): d(a*b)/dt = da*b + a*db.
                     // a and b each appear twice (fwd + bwd cross-term),
                     // target appears twice (one per recursive GRAD2). DUPs.

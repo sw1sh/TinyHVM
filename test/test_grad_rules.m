@@ -1270,6 +1270,39 @@ static int test_gradu_permute_sum(void) {
     return report("gradu_permute_sum", ok);
 }
 
+// UOP_GRAD2: cross-entropy loss (simplified).
+// CE(x, t) = log(sum(exp(x))) - sum(t * x).  grad w.r.t. x = softmax(x) - t.
+// Exercises LOG + SUM + EXP + MUL + SUB all composed.
+static int test_gradu_cross_entropy(void) {
+    setup_graph_dir("gradu_cross_entropy");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1, 2, 3, 4}, td[] = {0, 0, 1, 0};
+    Term x = thvm_tensor(ctx, xd, SHAPE(4));
+    Term t = thvm_tensor(ctx, td, SHAPE(4));
+    thvm_set_requires_grad(ctx, x);
+    Term x0, x1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), x, &x0, &x1);
+    // log(sum(exp(x0)))
+    Term ex = thvm_op(ctx, UOP_EXP, x0, term_era());
+    Term se = thvm_sum_axes(ctx, ex, (u32[]){0}, 1);
+    Term lse = thvm_op(ctx, UOP_LOG, se, term_era());
+    // sum(t * x1) — scalar
+    Term tx = thvm_op(ctx, UOP_MUL, t, x1);
+    Term stx = thvm_sum_axes(ctx, tx, (u32[]){0}, 1);
+    // CE = lse - stx (both scalar)
+    Term y = thvm_op(ctx, UOP_SUB, lse, stx);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "SUB", "LOG", "SUM", "EXP", "MUL"};
+    const char *post[] = {"CTR", "SUB", "DIV", "SUM", "EXP", "MUL", "EXPAND"};
+    int ok = topo_check("gradu_cross_entropy", 0, pre, 7)
+          && topo_check("gradu_cross_entropy", 1, post, 7);
+    return report("gradu_cross_entropy", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1339,6 +1372,7 @@ int main(void) {
     fails += test_gradu_logsumexp();
     fails += test_gradu_l2_normalize();
     fails += test_gradu_permute_sum();
+    fails += test_gradu_cross_entropy();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

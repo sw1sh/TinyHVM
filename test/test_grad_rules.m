@@ -619,6 +619,32 @@ GRADU_UNARY_TEST(log,  "gradu_log",  UOP_LOG,  "LOG",  "DIV")
 GRADU_UNARY_TEST(sqrt, "gradu_sqrt", UOP_SQRT, "SQRT", "DIV")
 GRADU_UNARY_TEST(relu, "gradu_relu", UOP_RELU, "RELU", "CMP")
 
+// UOP_GRAD2 binary batch (DIV/MAX/CMP).
+#define GRADU_BIN_TEST(TNAME, DIR, UOP, PRE, POST_NEEDLE)              \
+static int test_gradu_##TNAME(void) {                                  \
+    setup_graph_dir(DIR);                                              \
+    TinyHVM *ctx = thvm_init("cpu");                                   \
+    f32 ad[] = {4, 5, 6}, bd[] = {1, 2, 3};                             \
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));                           \
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));                           \
+    thvm_set_requires_grad(ctx, a);                                    \
+    Term y = thvm_op(ctx, UOP, a, b);                                  \
+    Term y0, y1;                                                       \
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);                 \
+    Term root = thvm_ctr(ctx,                                          \
+        (Term[]){ y0, thvm_grad_u(ctx, y1, a) }, 2);                   \
+    thvm_eval(ctx, root);                                              \
+    thvm_free(ctx);                                                    \
+    const char *pre[]  = {"CTR", "GRAD2", PRE};                        \
+    const char *post[] = {"CTR", POST_NEEDLE};                         \
+    int ok = topo_check(DIR, 0, pre, 3)                                \
+          && topo_check(DIR, 1, post, 2);                              \
+    return report(DIR, ok);                                            \
+}
+GRADU_BIN_TEST(div, "gradu_div", UOP_DIV, "DIV", "DIV")
+GRADU_BIN_TEST(max, "gradu_max", UOP_MAX, "MAX", "CMP")
+GRADU_BIN_TEST(cmp, "gradu_cmp", UOP_CMP, "CMP", "EXPAND")
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -659,6 +685,9 @@ int main(void) {
     fails += test_gradu_log();
     fails += test_gradu_sqrt();
     fails += test_gradu_relu();
+    fails += test_gradu_div();
+    fails += test_gradu_max();
+    fails += test_gradu_cmp();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

@@ -1832,6 +1832,70 @@ static int test_gradu_dot_e2e(void) {
     return report("gradu_dot_e2e", ok);
 }
 
+static int check_e2e(const char *name, f32 *h, f32 *expect, int n) {
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < n; i++)
+        if (h[i] != expect[i]) {
+            fprintf(stderr, "  %s: h[%d]=%g exp=%g\n", name, i, h[i], expect[i]);
+            ok = 0;
+        }
+    return ok;
+}
+
+// d(a+b)/da = 1 → [1,1,1]
+static int test_e2e_grad_add(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3}, bd[] = {4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_ADD, a, b);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {1,1,1};
+    int ok = check_e2e("grad_add", h, expect, 3);
+    thvm_free(ctx);
+    return report("e2e_grad_add", ok);
+}
+
+// d(a-b)/db = -1
+static int test_e2e_grad_sub_rhs(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {4,5,6}, bd[] = {1,2,3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_SUB, a, b);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, b)));
+    f32 expect[] = {-1,-1,-1};
+    int ok = check_e2e("grad_sub_rhs", h, expect, 3);
+    thvm_free(ctx);
+    return report("e2e_grad_sub_rhs", ok);
+}
+
+// d(-a)/da = -1
+static int test_e2e_grad_neg(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_NEG, a, term_era());
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {-1,-1,-1};
+    int ok = check_e2e("grad_neg", h, expect, 3);
+    thvm_free(ctx);
+    return report("e2e_grad_neg", ok);
+}
+
+// d(relu(a))/da on a=[-1,1,2] → [0,1,1]
+static int test_e2e_grad_relu(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {-1,1,2};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_RELU, a, term_era());
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {0,1,1};
+    int ok = check_e2e("grad_relu", h, expect, 3);
+    thvm_free(ctx);
+    return report("e2e_grad_relu", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1922,6 +1986,10 @@ int main(void) {
     fails += test_e2e_mul_broadcast();
     fails += test_gradu_mul_e2e();
     fails += test_gradu_dot_e2e();
+    fails += test_e2e_grad_add();
+    fails += test_e2e_grad_sub_rhs();
+    fails += test_e2e_grad_neg();
+    fails += test_e2e_grad_relu();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

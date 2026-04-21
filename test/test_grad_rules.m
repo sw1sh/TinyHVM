@@ -1196,6 +1196,29 @@ static int test_gradu_mlp_like(void) {
     return report("gradu_mlp_like", ok);
 }
 
+// UOP_GRAD2: log-sum-exp. y = log(sum(exp(x))). dy/dx = softmax(x).
+// Composes LOG + SUM + EXP through nested GRAD2.
+static int test_gradu_logsumexp(void) {
+    setup_graph_dir("gradu_logsumexp");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1, 2, 3, 4};
+    Term x = thvm_tensor(ctx, xd, SHAPE(4));
+    thvm_set_requires_grad(ctx, x);
+    Term ex = thvm_op(ctx, UOP_EXP, x, term_era());
+    Term s  = thvm_sum_axes(ctx, ex, (u32[]){0}, 1);
+    Term y  = thvm_op(ctx, UOP_LOG, s, term_era());
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "LOG", "SUM", "EXP"};
+    const char *post[] = {"CTR", "DIV", "SUM", "EXP", "MUL", "EXPAND"};
+    int ok = topo_check("gradu_logsumexp", 0, pre, 5)
+          && topo_check("gradu_logsumexp", 1, post, 6);
+    return report("gradu_logsumexp", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1262,6 +1285,7 @@ int main(void) {
     fails += test_gradu_mse();
     fails += test_gradu_conv_like();
     fails += test_gradu_mlp_like();
+    fails += test_gradu_logsumexp();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

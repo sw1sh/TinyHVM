@@ -53,6 +53,12 @@ enum {
                            // flags: is_fwd | (uop << 1)  where uop ∈ {RESHAPE,PERMUTE}
     // SHRINK/PAD fwd post: apply same view to tangent.
     WNF_F_GRAD_SHRINKPAD_FWD_POST, // t0=shape_meta; flags: (uop << 1)
+    // MAX Leibniz: d(max(a,b))/dt = (a>=b)*da + (a<b)*db.
+    WNF_F_GRAD_MAX_PHASE1, // t0=a, t1=b, t2=tgt — need da
+    WNF_F_GRAD_MAX_PHASE2, // t0=a, t1=b, t2=da — need db
+    // WHERE: gradient distributes through both branches, masked by cond.
+    WNF_F_GRAD_WHERE_PHASE1, // t0=cond, t1=a, t2=b, t3=tgt — need da
+    WNF_F_GRAD_WHERE_PHASE2, // t0=cond, t1=b, t2=da, t3=tgt — need db
 };
 
 typedef struct {
@@ -484,6 +490,44 @@ apply: {
                     continue;
                 }
 
+                // MAX Leibniz: d(max(a,b))/dt = (a>=b)*da + (a<b)*db.
+                if (wuop == UOP_MAX) {
+                    Term a = heap_read(ctx, wloc + 0);
+                    Term b = heap_read(ctx, wloc + 1);
+                    WnfFrame ph1 = {
+                        .kind = WNF_F_GRAD_MAX_PHASE1, .flags = (u8)is_fwd,
+                        .t0 = a, .t1 = b, .t2 = tgt, .t3 = 0
+                    };
+                    wnf_stack_push(ph1);
+                    WnfFrame inner = {
+                        .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                        .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(inner);
+                    next = a;
+                    goto enter;
+                }
+
+                // WHERE(cond, a, b): grad distributes linearly through a,b.
+                // Fires as two-phase; cond is treated as constant w.r.t. target.
+                if (wuop == UOP_WHERE) {
+                    Term cond = heap_read(ctx, wloc + 0);
+                    Term a = heap_read(ctx, wloc + 1);
+                    Term b = heap_read(ctx, wloc + 2);
+                    WnfFrame ph1 = {
+                        .kind = WNF_F_GRAD_WHERE_PHASE1, .flags = (u8)is_fwd,
+                        .t0 = cond, .t1 = a, .t2 = b, .t3 = tgt
+                    };
+                    wnf_stack_push(ph1);
+                    WnfFrame inner = {
+                        .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                        .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(inner);
+                    next = a;
+                    goto enter;
+                }
+
                 // SUM: fwd → SUM(da, axes); rev → EXPAND(da, a_shape).
                 if (wuop == UOP_SUM) {
                     Term a = heap_read(ctx, wloc + 0);
@@ -719,6 +763,69 @@ apply: {
             u32 uop = f.flags >> 1;
             Term shape = f.t0;
             whnf = thvm_op_raw(ctx, uop, whnf, shape);
+            ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_GRAD_MAX_PHASE1: {
+            // whnf = da.  Descend into b for db.
+            Term a = f.t0, b = f.t1, tgt = f.t2;
+            int is_fwd = f.flags & 1;
+            WnfFrame ph2 = {
+                .kind = WNF_F_GRAD_MAX_PHASE2, .flags = (u8)is_fwd,
+                .t0 = a, .t1 = b, .t2 = whnf, .t3 = 0
+            };
+            wnf_stack_push(ph2);
+            WnfFrame inner = {
+                .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+            };
+            wnf_stack_push(inner);
+            next = b;
+            goto enter;
+        }
+
+        case WNF_F_GRAD_MAX_PHASE2: {
+            // whnf = db.  Assemble masked ADD.
+            Term a = f.t0, b = f.t1, da = f.t2;
+            Term db = whnf;
+            if (wnf_is_era(da) && wnf_is_era(db)) { whnf = term_era(); ctx->itrs++; continue; }
+            Term mask_a = thvm_op_raw(ctx, UOP_CMP, a, b);
+            Term one = term_num_f32(1.0f);
+            Term mask_b = thvm_op_raw(ctx, UOP_SUB, one, mask_a);
+            Term l = wnf_mk_mul(ctx, da, mask_a);
+            Term r = wnf_mk_mul(ctx, db, mask_b);
+            whnf = wnf_mk_add(ctx, l, r);
+            ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_GRAD_WHERE_PHASE1: {
+            // whnf = da.  Descend into b for db.
+            Term cond = f.t0, b = f.t2, tgt = f.t3;
+            int is_fwd = f.flags & 1;
+            WnfFrame ph2 = {
+                .kind = WNF_F_GRAD_WHERE_PHASE2, .flags = (u8)is_fwd,
+                .t0 = cond, .t1 = b, .t2 = whnf, .t3 = 0
+            };
+            wnf_stack_push(ph2);
+            WnfFrame inner = {
+                .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+            };
+            wnf_stack_push(inner);
+            next = b;
+            goto enter;
+        }
+
+        case WNF_F_GRAD_WHERE_PHASE2: {
+            // whnf = db.  out = WHERE(cond, da, db).
+            Term cond = f.t0, da = f.t2;
+            Term db = whnf;
+            if (wnf_is_era(da) && wnf_is_era(db)) { whnf = term_era(); ctx->itrs++; continue; }
+            if (wnf_is_era(da)) da = thvm_expand(ctx, term_num_f32(0.0f), SHAPE(1));
+            if (wnf_is_era(db)) db = thvm_expand(ctx, term_num_f32(0.0f), SHAPE(1));
+            whnf = thvm_where(ctx, cond, da, db);
             ctx->itrs++;
             continue;
         }

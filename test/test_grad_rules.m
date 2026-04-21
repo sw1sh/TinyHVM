@@ -1506,6 +1506,32 @@ static int test_gradu_curried(void) {
     return report("gradu_curried", ok);
 }
 
+// UOP_GRAD2: IFZ with target in zero-case branch.
+// y = IFZ(0, a, succ_lam).  counter=0 so y reduces to a; grad w.r.t. a = 1.
+static int test_gradu_ifz(void) {
+    setup_graph_dir("gradu_ifz");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    // succ_lam is unused (counter=0 hits zero-case); use identity λv.v
+    Term v;
+    Term succ = thvm_lam(ctx, &v, term_new(TAG_ERA, 0, 0));
+    heap_set(ctx, term_val(succ) + 1, v);
+    Term counter = thvm_scalar(ctx, 0.0f);
+    Term y = thvm_ifz(ctx, counter, a, succ);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "IFZ"};
+    const char *post[] = {"CTR", "EXPAND"};
+    int ok = topo_check("gradu_ifz", 0, pre, 3)
+          && topo_check("gradu_ifz", 1, post, 2);
+    return report("gradu_ifz", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1584,6 +1610,7 @@ int main(void) {
     fails += test_gradu_app_compute_arg();
     fails += test_gradu_nested_app();
     fails += test_gradu_curried();
+    fails += test_gradu_ifz();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

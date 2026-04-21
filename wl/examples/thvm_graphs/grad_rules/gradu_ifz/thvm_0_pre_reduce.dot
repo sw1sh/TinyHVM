@@ -1,0 +1,22 @@
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n19 [label="GRAD2\n[1]\n@19", shape=box, fillcolor="#f0f0f0"];
+  dup13 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  n14 -> dup13;
+  dup13 -> n19 [label="dp1@19"];
+  t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> n19 [label="",taillabel="@20",labelfontsize=7,fontcolor="#666666"];
+  n14 [label="IFZ\n@14", shape=box, fillcolor="#f0f0f0"];
+  t2 [label="t2\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n14 [label="cond",taillabel="@14",labelfontsize=7,fontcolor="#666666"];
+  t1 -> n14 [label="then",taillabel="@15",labelfontsize=7,fontcolor="#666666"];
+  n17 -> n14 [label="else"];
+  n17 [label="LAM\n#0@17", shape=triangle, fillcolor="#f2e8ff"];
+  n17 -> n17 [label="body"];
+  ctr11 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  dup13 -> ctr11 [label="c0 (dp0@11)"];
+  n19 -> ctr11 [label="c1"];
+}

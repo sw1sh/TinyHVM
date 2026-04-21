@@ -3,7 +3,7 @@
 // Each sub-test builds:
 //     (fwd, bwd) = GRAD(<uop>(t1, t2))    target = t1
 //     root       = CTR { fwd, bwd }
-// then dumps thvm_N_*.dot under wl/examples/thvm_graphs/grad_pair_rules/<uop>/.
+// then dumps thvm_N_*.dot under graphs/grad_pair_rules/<uop>/.
 //
 // No numeric checks — just confirms each rule produces a graph and doesn't
 // hang.  Look at the phase-1 / phase-2 .dot files to verify the chain
@@ -17,7 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define ROOT "wl/examples/thvm_graphs/grad_pair_rules"
+#define ROOT "graphs/grad_pair_rules"
 
 static void setup(const char *name) {
     char cmd[512];

@@ -6,7 +6,7 @@
 //          (fwd, bwd) = thvm_grad_pair(ctx, target_tid, y)
 //          root       = CTR#2 { fwd, bwd }
 //   3. THVM_GRAPH + THVM_GRAPH_STOP_AFTER_SWEEP → emits thvm_0..thvm_2
-//      phase dumps under wl/examples/thvm_graphs/grad_rules/<rule>/.
+//      phase dumps under graphs/grad_rules/<rule>/.
 //   4. Parses thvm_1_post_reduce.dot and asserts expected chain-rule
 //      tokens (CTR, forward uop, backward formula uops).
 //
@@ -23,7 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define GRAPH_ROOT "wl/examples/thvm_graphs/grad_rules"
+#define GRAPH_ROOT "graphs/grad_rules"
 
 static void setup_graph_dir(const char *rule) {
     char dir[256];

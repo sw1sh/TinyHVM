@@ -21,9 +21,9 @@
 #include <stdlib.h>
 
 int main(void) {
-    system("rm -rf wl/examples/thvm_graphs/grad_pair && mkdir -p wl/examples/thvm_graphs/grad_pair");
+    system("rm -rf graphs/grad_pair && mkdir -p graphs/grad_pair");
     setenv("THVM_GRAPH", "1", 1);
-    setenv("THVM_GRAPH_DIR", "wl/examples/thvm_graphs/grad_pair", 1);
+    setenv("THVM_GRAPH_DIR", "graphs/grad_pair", 1);
     setenv("THVM_GRAPH_STOP_AFTER_SWEEP", "1", 1);
 
     TinyHVM *ctx = thvm_init("cpu");

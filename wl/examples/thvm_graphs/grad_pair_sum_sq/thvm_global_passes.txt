@@ -1,7 +1,0 @@
-registered_passes=1
-mixed_dispatch=0
-input=ERA@0
-pass[0].name=sched
-pass[0].before=ERA@0
-pass[0].after=ERA@0
-output=ERA@0

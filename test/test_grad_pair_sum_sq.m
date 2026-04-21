@@ -11,9 +11,9 @@
 #include <stdlib.h>
 
 int main(void) {
-    system("rm -rf wl/examples/thvm_graphs/grad_pair_sum_sq && mkdir -p wl/examples/thvm_graphs/grad_pair_sum_sq");
+    system("rm -rf graphs/grad_pair_sum_sq && mkdir -p graphs/grad_pair_sum_sq");
     setenv("THVM_GRAPH", "1", 1);
-    setenv("THVM_GRAPH_DIR", "wl/examples/thvm_graphs/grad_pair_sum_sq", 1);
+    setenv("THVM_GRAPH_DIR", "graphs/grad_pair_sum_sq", 1);
     /* DON'T set STOP_AFTER_SWEEP — we need codegen to materialize TOPs. */
 
     TinyHVM *ctx = thvm_init("cpu");

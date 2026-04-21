@@ -317,16 +317,18 @@ static int test_second_derivative(void) {
 static int test_target_nomatch(void) {
     setup_graph_dir("target_nomatch");
     TinyHVM *ctx = thvm_init("cpu");
-    f32 ad[] = {1,2,3}, bd[] = {4,5,6};
+    f32 ad[] = {1,2,3}, bd[] = {4,5,6}, cd[] = {7,8,9};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    // target c is not referenced by y — every leaf comparison returns 0.
+    Term c = thvm_tensor(ctx, cd, SHAPE(3));
     Term y = thvm_op(ctx, UOP_ADD, a, b);
-    Term fwd, bwd;
-    thvm_grad_pair(ctx, ~0u, y, &fwd, &bwd);
-    Term root = thvm_ctr(ctx, (Term[]){fwd, bwd}, 2);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, c)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD", "CTR", "ADD"};
+    const char *pre[]  = {"GRAD2", "CTR", "ADD"};
     const char *post[] = {"CTR"};
     int ok = topo_check("target_nomatch", 0, pre, 3)
           && topo_check("target_nomatch", 1, post, 1);

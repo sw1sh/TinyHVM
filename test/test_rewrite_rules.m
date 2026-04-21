@@ -254,12 +254,10 @@ static int test_rule_grad_leaf_nomatch(void) {
     Term b = thvm_tensor(ctx, bd, SHAPE(3));
     Term g = thvm_grad(ctx, a, b);
     Term reduced = thvm_eval(ctx, g);
-    // Rule: GRAD(a, b) non-match rewrites to EXPAND(TEN([0.0]), shape=[3]).
-    f32 zero = 0.0f;
-    Term scalar_zero = thvm_tensor(ctx, &zero, SHAPE(1));
-    Term expected = thvm_expand(ctx, scalar_zero, SHAPE(3));
-    int ok = term_eq(ctx, reduced, expected, 16);
-    if (!ok) { dbg_term(ctx, "reduced", reduced); dbg_term(ctx, "expected", expected); }
+    // Rule: GRAD leaf non-match reduces to ERA (dead gradient branch).
+    // ERA propagates through adjacent ops via GRAD_ADD/SUB/MUL peepholes.
+    int ok = (term_tag(reduced) == TAG_ERA);
+    if (!ok) dbg_term(ctx, "reduced (expected ERA)", reduced);
     thvm_free(ctx);
     return report("grad_leaf_nomatch", ok);
 }

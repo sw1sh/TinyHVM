@@ -19,8 +19,11 @@ if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
     if (term_is_sub(tgt)) tgt = term_strip_sub(tgt);
 
     // In forward mode every recursive GRAD stays in forward mode too.
-    #define GRAD_REC(_y, _t) (is_fwd ? thvm_grad_fwd(ctx, (_y), (_t)) \
-                                      : thvm_grad(ctx, (_y), (_t)))
+    // GRAD_REC reduces the sub-gradient *inline* so the ERA peepholes
+    // below (GRAD_ADD/MUL/etc.) see actual ERA terms, not unresolved
+    // GRAD TOPs that only collapse to ERA at the next reduction step.
+    #define GRAD_REC(_y, _t) thvm_reduce(ctx, \
+        (is_fwd ? thvm_grad_fwd(ctx, (_y), (_t)) : thvm_grad(ctx, (_y), (_t))))
 
     // Helper: build a scalar-valued tensor of tsh shape via
     // rank-matched ones-shape + EXPAND.  Handles the recurring
@@ -61,218 +64,156 @@ if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
     // Leaf output shape: VJP returns target.shape, JVP returns y.shape.
     // Value: 1 if y-leaf matches target (then y.shape == target.shape), else 0.
     // NUM constant: always 0 of output shape.
+    // NUM constant: d(const)/dt = 0 ⇒ dead branch ⇒ ERA.
     if (term_tag(y) == TAG_NUM && term_tag(tgt) == TAG_TEN) {
-        Shape osh = SHAPE(1);
-        if (is_fwd) {
-            // y is NUM scalar; result shape = [1].
-            osh = SHAPE(1);
-        } else {
-            u32 ttid = (u32)term_val(tgt);
-            if (ttid < ctx->tensor_count) osh = ctx->tensors[ttid].view.shape;
-        }
-        Term out = GRAD_SCALAR_TEN(0.0f, osh);
-        ctx->itrs++; return out;
+        ctx->itrs++;
+        return term_era();
     }
+    // TEN leaf:
+    //   y == target (identity) → ones(y.shape) — the cotangent seed
+    //   y != target (dead branch) → ERA
+    // ERA bubbles up via GRAD_ADD/SUB/MUL/DIV/NEG peepholes below,
+    // collapsing the gradient of any subtree that doesn't reach target.
     if (term_tag(y) == TAG_TEN && term_tag(tgt) == TAG_TEN) {
         u32 ytid = (u32)term_val(y);
         u32 ttid = (u32)term_val(tgt);
+        if (ytid != ttid) { ctx->itrs++; return term_era(); }
         Shape osh = SHAPE(1);
-        if (is_fwd) {
-            if (ytid < ctx->tensor_count) osh = ctx->tensors[ytid].view.shape;
-        } else {
-            if (ttid < ctx->tensor_count) osh = ctx->tensors[ttid].view.shape;
-        }
-        // Forward mode feeds this tangent directly into MM/etc., so emit a
-        // dense materialized tensor instead of a stride-0 EXPAND view (which
-        // can lose its broadcast semantics across the MM decomposition).
+        if (ytid < ctx->tensor_count) osh = ctx->tensors[ytid].view.shape;
         if (is_fwd && osh.rank > 0) {
             u32 n = 1; for (u32 i = 0; i < osh.rank; i++) n *= osh.dims[i];
-            f32 val = (ytid == ttid) ? 1.0f : 0.0f;
             f32 *buf = (f32 *)malloc(n * sizeof(f32));
-            for (u32 i = 0; i < n; i++) buf[i] = val;
+            for (u32 i = 0; i < n; i++) buf[i] = 1.0f;
             Term out = thvm_tensor(ctx, buf, osh);
             free(buf);
             ctx->itrs++; return out;
         }
-        Term out = GRAD_SCALAR_TEN(ytid == ttid ? 1.0f : 0.0f, osh);
+        Term out = GRAD_SCALAR_TEN(1.0f, osh);
         ctx->itrs++;
         return out;
     }
-    // Reachability: does any leaf TEN descended from `y` have id == ttid?
-    // Bounded DFS over TOP children (shape meta and reduction operands
-    // are skipped — reachability checks compute operands only).  DP/VAR
-    // chains are resolved one hop.  Used to prune dead branches in ADD,
-    // SUB, MUL, DIV, EXP, LOG etc. — no reason to emit zero-seeds or
-    // recurse into operands that don't contain the target.
-    #define GRAD_REACHES_TARGET(_y, _ttid) ({ \
-        u32 _tt = (_ttid); int _found = 0; \
-        /* stack: pairs of (term, depth) — iterative DFS */ \
-        Term _stk[64]; u32 _sp = 0; _stk[_sp++] = (_y); \
-        while (_sp > 0 && !_found) { \
-            Term _t = _stk[--_sp]; \
-            /* Resolve DP/VAR one hop */ \
-            for (int _it = 0; _it < 8; _it++) { \
-                u8 _tg = term_tag(_t); \
-                if (_tg == TAG_DP0 || _tg == TAG_DP1 || _tg == TAG_VAR) { \
-                    u64 _l = term_val(_t); \
-                    if (_l == 0 || _l >= ctx->heap_pos) break; \
-                    Term _n = heap_read(ctx, _l); \
-                    if (term_is_sub(_n)) _n = term_strip_sub(_n); \
-                    if (_n == _t) break; _t = _n; continue; \
-                } break; \
-            } \
-            u8 _tg = term_tag(_t); \
-            if (_tg == TAG_TEN) { \
-                if ((u32)term_val(_t) == _tt) { _found = 1; break; } \
-                continue; \
-            } \
-            if (_tg == TAG_TOP) { \
-                u32 _u = term_ext(_t); u64 _l = term_val(_t); \
-                /* Compute-op arities: unary=1, binary=2, ternary=3. */ \
-                u32 _ar = 2; \
-                if (_u == UOP_WHERE || _u == UOP_IFZ) _ar = 3; \
-                else if (_u == UOP_NEG || _u == UOP_EXP || _u == UOP_LOG || \
-                         _u == UOP_RELU || _u == UOP_SQRT || _u == UOP_CAST || \
-                         _u == UOP_DETACH) _ar = 1; \
-                /* For view ops and SUM/RMAX, only first operand is data; \
-                   second is shape/axes meta — skip it. */ \
-                u32 _data_ar = _ar; \
-                if (_u >= UOP_RESHAPE && _u <= UOP_PAD) _data_ar = 1; \
-                else if (_u == UOP_SUM || _u == UOP_RMAX) _data_ar = 1; \
-                for (u32 _i = 0; _i < _data_ar && _sp < 63; _i++) { \
-                    if (_l + _i < ctx->heap_pos) _stk[_sp++] = heap_read(ctx, _l + _i); \
-                } \
-            } \
-        } _found; \
-    })
+    // ERA-aware emission helpers.  GRAD leaf-nomatch emits ERA (dead
+    // gradient branch), and the binary/unary rules collapse ERA via the
+    // standard interaction-calculus peepholes:
+    //   ADD(x, ERA) → x ;  ADD(ERA, x) → x
+    //   SUB(x, ERA) → x ;  SUB(ERA, x) → NEG(x)
+    //   MUL(x, ERA) → ERA;  MUL(ERA, x) → ERA
+    //   DIV(ERA, x) → ERA;  DIV(x, ERA) → ERA   (b≠0 guard in forward)
+    //   NEG(ERA)    → ERA
+    // Dead subtrees then bubble out via these rules naturally — no
+    // DFS reachability walk needed.
+    #define GRAD_IS_ERA(_t) (term_tag(_t) == TAG_ERA)
+    #define GRAD_ADD(_a, _b) \
+        (GRAD_IS_ERA(_a) ? (_b) : GRAD_IS_ERA(_b) ? (_a) : thvm_op_raw(ctx, UOP_ADD, (_a), (_b)))
+    #define GRAD_SUB(_a, _b) \
+        (GRAD_IS_ERA(_a) ? thvm_op_raw(ctx, UOP_NEG, (_b), term_era()) : \
+         GRAD_IS_ERA(_b) ? (_a) : thvm_op_raw(ctx, UOP_SUB, (_a), (_b)))
+    #define GRAD_MUL(_a, _b) \
+        (GRAD_IS_ERA(_a) || GRAD_IS_ERA(_b) ? term_era() : thvm_op_raw(ctx, UOP_MUL, (_a), (_b)))
+    #define GRAD_DIV(_a, _b) \
+        (GRAD_IS_ERA(_a) ? term_era() : thvm_op_raw(ctx, UOP_DIV, (_a), (_b)))
+    #define GRAD_NEG(_a) \
+        (GRAD_IS_ERA(_a) ? term_era() : thvm_op_raw(ctx, UOP_NEG, (_a), term_era()))
 
-    // TOP chain-rule dispatch.  Recursively emits GRAD on sub-
-    // operands; target is DUP'd to keep linearity.
+    // TOP chain-rule dispatch.  Recursively emits GRAD on sub-operands.
     if (term_tag(y) == TAG_TOP && term_tag(tgt) == TAG_TEN) {
         u32 yuop = term_ext(y);
         u64 yloc = term_val(y);
         u32 ttid = (u32)term_val(tgt);
         Shape tsh_guard = SHAPE(1);
         if (ttid < ctx->tensor_count) tsh_guard = ctx->tensors[ttid].view.shape;
-        // Pre-flight reachability on the whole y: if target doesn't appear
-        // anywhere, the entire GRAD is zero (or identity for leaf-match
-        // already handled above).  Saves every rule the work of recursing
-        // into a dead subtree.
-        if (!GRAD_REACHES_TARGET(y, ttid)) {
-            ctx->itrs++;
-            if (is_fwd) {
-                Shape ysh_out = SHAPE(1);
-                const View *yv = st_get(yloc); if (yv) ysh_out = yv->shape;
-                return GRAD_SCALAR_TEN(0.0f, ysh_out);
-            }
-            return GRAD_SCALAR_TEN(0.0f, tsh_guard);
-        }
+        (void)tsh_guard;
         if (yuop == UOP_ADD || yuop == UOP_SUB) {
             Term a = heap_read(ctx, yloc + 0);
             Term b = heap_read(ctx, yloc + 1);
-            int a_reaches = GRAD_REACHES_TARGET(a, ttid);
-            int b_reaches = GRAD_REACHES_TARGET(b, ttid);
-            Term da = a_reaches ? GRAD_REC(a, tgt) : (Term)0;
-            Term db = b_reaches ? GRAD_REC(b, tgt) : (Term)0;
+            Term da = GRAD_REC(a, tgt);
+            Term db = GRAD_REC(b, tgt);
             ctx->itrs++;
-            if (a_reaches && b_reaches) return thvm_op_raw(ctx, yuop, da, db);
-            if (a_reaches) return yuop == UOP_SUB ? da : da;  // a + 0 = a; a - 0 = a
-            if (b_reaches) return yuop == UOP_SUB
-                ? thvm_op_raw(ctx, UOP_NEG, db, term_era())  // 0 - b = -b
-                : db;                                         // 0 + b = b
-            // Unreachable — pre-flight caught this.  Keep a safe fallback.
-            return GRAD_SCALAR_TEN(0.0f, tsh_guard);
+            return (yuop == UOP_ADD) ? GRAD_ADD(da, db) : GRAD_SUB(da, db);
         }
         // NEG: d(-a)/dt = -(da).
         if (yuop == UOP_NEG) {
             Term a = heap_read(ctx, yloc + 0);
             Term da = GRAD_REC( a, tgt);
-            Term out = thvm_op_raw(ctx, UOP_NEG, da, term_era());
+            Term out = GRAD_NEG(da);
             ctx->itrs++; return out;
         }
-        // EXP: d(exp a)/dt = exp(a) * da.  a used twice.
+        // EXP: d(exp a)/dt = exp(a) * da.  a used 2x.
         if (yuop == UOP_EXP) {
             Term a = heap_read(ctx, yloc + 0);
-            Term a0, a1;
-            thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-            Term da = GRAD_REC( a0, tgt);
+            Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+            Term da = GRAD_REC(a0, tgt);
+            if (GRAD_IS_ERA(da)) { ctx->itrs++; return term_era(); }
             Term exp_a = thvm_op_raw(ctx, UOP_EXP, a1, term_era());
-            Term out = thvm_op_raw(ctx, UOP_MUL, da, exp_a);
-            ctx->itrs++; return out;
+            ctx->itrs++; return GRAD_MUL(da, exp_a);
         }
-        // LOG: d(log a)/dt = (1/a) * da.  a used twice.
+        // LOG: d(log a)/dt = da / a.  a used 2x.
         if (yuop == UOP_LOG) {
             Term a = heap_read(ctx, yloc + 0);
-            Term a0, a1;
-            thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-            Term da = GRAD_REC( a0, tgt);
-            Term out = thvm_op_raw(ctx, UOP_DIV, da, a1);
-            ctx->itrs++; return out;
+            Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+            Term da = GRAD_REC(a0, tgt);
+            if (GRAD_IS_ERA(da)) { ctx->itrs++; return term_era(); }
+            ctx->itrs++; return GRAD_DIV(da, a1);
         }
-        // SQRT: d(sqrt a)/dt = da / (2*sqrt(a)).  a used twice.
+        // SQRT: d(sqrt a)/dt = da / (2*sqrt(a)).  a used 2x.
         if (yuop == UOP_SQRT) {
             Term a = heap_read(ctx, yloc + 0);
-            Term a0, a1;
-            thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-            Term da = GRAD_REC( a0, tgt);
+            Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+            Term da = GRAD_REC(a0, tgt);
+            if (GRAD_IS_ERA(da)) { ctx->itrs++; return term_era(); }
             Term sq = thvm_op_raw(ctx, UOP_SQRT, a1, term_era());
             Term two = term_num_f32(2.0f);
             Term den = thvm_op_raw(ctx, UOP_MUL, two, sq);
-            Term out = thvm_op_raw(ctx, UOP_DIV, da, den);
-            ctx->itrs++; return out;
+            ctx->itrs++; return GRAD_DIV(da, den);
         }
-        // RELU: d(relu a)/dt = (a>0) * da.  a used twice.
+        // RELU: d(relu a)/dt = (a>0) * da.  a used 2x.
         if (yuop == UOP_RELU) {
             Term a = heap_read(ctx, yloc + 0);
-            Term a0, a1;
-            thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-            Term da = GRAD_REC( a0, tgt);
+            Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+            Term da = GRAD_REC(a0, tgt);
+            if (GRAD_IS_ERA(da)) { ctx->itrs++; return term_era(); }
             Term zero = term_num_f32(0.0f);
             Term mask = thvm_op_raw(ctx, UOP_CMP, a1, zero);
-            Term out = thvm_op_raw(ctx, UOP_MUL, da, mask);
-            ctx->itrs++; return out;
+            ctx->itrs++; return GRAD_MUL(da, mask);
         }
-        // DIV (quotient): d(a/b)/dt = (da*b - a*db) / b².
-        // a used 2x, b used 4x (fwd, 2 cross-terms, denom b²),
-        // target used 2x.
+        // DIV: d(a/b)/dt = (da*b - a*db) / b².  a used 2x, b used 4x.
         if (yuop == UOP_DIV) {
             Term a = heap_read(ctx, yloc + 0);
             Term b = heap_read(ctx, yloc + 1);
-            Term a0, a1, b0, b1, b2, b3, t0, t1;
+            Term a0, a1, b0, b1, b2, b3;
             thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-            thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
-            Term b_lo;
-            thvm_dup(ctx, thvm_fresh_label(ctx), b1, &b_lo, &b2);
-            thvm_dup(ctx, thvm_fresh_label(ctx), b_lo, &b1, &b3);
-            thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &t0, &t1);
-            Term da = GRAD_REC( a0, t0);
-            Term db = GRAD_REC( b0, t1);
-            Term l  = thvm_op_raw(ctx, UOP_MUL, da, b1);
-            Term r  = thvm_op_raw(ctx, UOP_MUL, a1, db);
-            Term num = thvm_op_raw(ctx, UOP_SUB, l, r);
+            {
+                Term b_lo, b_hi;
+                thvm_dup(ctx, thvm_fresh_label(ctx), b, &b_lo, &b_hi);
+                thvm_dup(ctx, thvm_fresh_label(ctx), b_lo, &b0, &b1);
+                thvm_dup(ctx, thvm_fresh_label(ctx), b_hi, &b2, &b3);
+            }
+            Term da = GRAD_REC(a0, tgt);
+            Term db = GRAD_REC(b0, tgt);
+            if (GRAD_IS_ERA(da) && GRAD_IS_ERA(db)) { ctx->itrs++; return term_era(); }
+            Term l = GRAD_MUL(da, b1);
+            Term r = GRAD_MUL(a1, db);
+            Term num = GRAD_SUB(l, r);
             Term den = thvm_op_raw(ctx, UOP_MUL, b2, b3);
-            Term out = thvm_op_raw(ctx, UOP_DIV, num, den);
-            ctx->itrs++; return out;
+            ctx->itrs++; return GRAD_DIV(num, den);
         }
         // MAX: d(max(a,b))/dt = (a>=b)*da + (a<b)*db.
         if (yuop == UOP_MAX) {
             Term a = heap_read(ctx, yloc + 0);
             Term b = heap_read(ctx, yloc + 1);
-            Term a0, a1, b0, b1, t0, t1;
+            Term a0, a1, b0, b1;
             thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
             thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
-            thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &t0, &t1);
-            Term da = GRAD_REC( a0, t0);
-            Term db = GRAD_REC( b0, t1);
+            Term da = GRAD_REC(a0, tgt);
+            Term db = GRAD_REC(b0, tgt);
+            if (GRAD_IS_ERA(da) && GRAD_IS_ERA(db)) { ctx->itrs++; return term_era(); }
             Term mask_a = thvm_op_raw(ctx, UOP_CMP, a1, b1);
-            Term m0, m1;
-            thvm_dup(ctx, thvm_fresh_label(ctx), mask_a, &m0, &m1);
+            Term m0, m1; thvm_dup(ctx, thvm_fresh_label(ctx), mask_a, &m0, &m1);
             Term one = term_num_f32(1.0f);
             Term mask_b = thvm_op_raw(ctx, UOP_SUB, one, m1);
-            Term l = thvm_op_raw(ctx, UOP_MUL, da, m0);
-            Term r = thvm_op_raw(ctx, UOP_MUL, db, mask_b);
-            Term out = thvm_op_raw(ctx, UOP_ADD, l, r);
-            ctx->itrs++; return out;
+            Term l = GRAD_MUL(da, m0);
+            Term r = GRAD_MUL(db, mask_b);
+            ctx->itrs++; return GRAD_ADD(l, r);
         }
         // RESHAPE/PERMUTE: movement ops. dA = inverse_view(da).
         // Shapes/perm taken from the second operand TEN.
@@ -553,30 +494,23 @@ if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
             ctx->itrs++; return out;
         }
         // CMP: non-differentiable. Zero contribution, shape-matched.
-        if (yuop == UOP_CMP) {
-            u32 ttid = (u32)term_val(tgt);
-            Shape tsh = (ttid < ctx->tensor_count)
-                ? ctx->tensors[ttid].view.shape : SHAPE(1);
-            Term out = GRAD_SCALAR_TEN(0.0f, tsh);
-            ctx->itrs++; return out;
-        }
-        // MUL (Leibniz): d(a*b)/dt = da*b + a*db.
-        // a and b each appear twice (fwd + bwd cross-term),
-        // target appears twice (one per recursive GRAD). DUPs.
+        // CMP: non-differentiable ⇒ zero gradient ⇒ ERA.
+        if (yuop == UOP_CMP) { ctx->itrs++; return term_era(); }
+        // MUL (Leibniz): d(a*b)/dt = b*da + a*db.
+        // a, b each appear twice (as operand of GRAD recursion AND as
+        // multiplier in the Leibniz cross-term), so DUP both.
         if (yuop == UOP_MUL) {
             Term a = heap_read(ctx, yloc + 0);
             Term b = heap_read(ctx, yloc + 1);
-            Term a0, a1, b0, b1, t0, t1;
+            Term a0, a1, b0, b1;
             thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
             thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
-            thvm_dup(ctx, thvm_fresh_label(ctx), tgt, &t0, &t1);
-            Term da = GRAD_REC( a0, t0);
-            Term db = GRAD_REC( b0, t1);
-            Term l = thvm_op_raw(ctx, UOP_MUL, da, b1);
-            Term r = thvm_op_raw(ctx, UOP_MUL, a1, db);
-            Term out = thvm_op_raw(ctx, UOP_ADD, l, r);
-            ctx->itrs++;
-            return out;
+            Term da = GRAD_REC(a0, tgt);
+            Term db = GRAD_REC(b0, tgt);
+            if (GRAD_IS_ERA(da) && GRAD_IS_ERA(db)) { ctx->itrs++; return term_era(); }
+            Term l = GRAD_MUL(da, b1);
+            Term r = GRAD_MUL(a1, db);
+            ctx->itrs++; return GRAD_ADD(l, r);
         }
     }
     // y not yet WNF or pattern unhandled: leave alone; trampoline

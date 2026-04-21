@@ -101,6 +101,14 @@ Term thvm_grad_u(TinyHVM *ctx, Term y, Term target) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc + 0, y);
     heap_set(ctx, loc + 1, target);
+    // Record shape on the GRAD2 TOP so downstream ops (ADD/NEG/etc.)
+    // that wrap it can compute their output view and the scheduler can
+    // allocate a raw_output_tid.  GRAD2's result shape = target.shape.
+    const View *tv = term_view(ctx, target);
+    if (tv) {
+        View v = *tv;
+        st_set(loc, &v);
+    }
     return term_new(TAG_TOP, UOP_GRAD2, loc);
 }
 

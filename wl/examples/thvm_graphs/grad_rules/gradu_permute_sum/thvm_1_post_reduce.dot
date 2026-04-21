@@ -19,7 +19,7 @@ digraph G {
   ctr10 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
   n13 -> ctr10 [label="c0"];
   n22 -> ctr10 [label="c1"];
-  n26 [label="PERMUTE\n[2,3]\n@26", shape=box, fillcolor="#fff3cd"];
+  n26 [label="PERMUTE\n[3,2]\n@26", shape=box, fillcolor="#fff3cd"];
   n28 -> n26 [label="in"];
   t5 [label="t5\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t5 -> n26 [label="shape",taillabel="@27",labelfontsize=7,fontcolor="#666666"];

@@ -3,7 +3,7 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  n13 [label="GRAD2\n[1,1]\n@13", shape=box, fillcolor="#f0f0f0"];
+  n13 [label="GRAD2\n[2,3]\n@13", shape=box, fillcolor="#f0f0f0"];
   dup10 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
   n11 -> dup10;
   dup10 -> n13 [label="dp1@13"];

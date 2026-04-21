@@ -5,7 +5,7 @@ digraph G {
 
   era5 [label="ERA\n@5",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
   n1 -> era5 [label="p"];
-  n27 [label="GRAD2\n[1]\n@27", shape=box, fillcolor="#f0f0f0"];
+  n27 [label="GRAD2\n[3]\n@27", shape=box, fillcolor="#f0f0f0"];
   dup18 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
   n19 -> dup18;
   dup18 -> n27 [label="dp1@27"];

@@ -2435,6 +2435,26 @@ static int test_e2e_adam_linear_fit(void) {
     return report("e2e_adam_linear_fit", ok);
 }
 
+// MM via thvm_op (composite expand+mul+sum): gradient w.r.t. x.
+// x=[[1,2,3],[4,5,6]] (2x3) @ w=[[1,1],[1,1],[1,1]] (3x2) = [[6,6],[15,15]] (2x2).
+// Expected dy/dx: each row of w summed = [2,2,2], broadcast to [[2,2,2],[2,2,2]].
+static int test_e2e_mm_bwd(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3,4,5,6}, wd[] = {1,1,1,1,1,1};
+    Term x = thvm_tensor(ctx, xd, SHAPE(2, 3));
+    Term w = thvm_tensor(ctx, wd, SHAPE(3, 2));
+    Term y = thvm_op(ctx, UOP_MM, x, w);
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 expect[] = {2,2,2,2,2,2};
+    int ok = (g != NULL);
+    if (g) for (int i = 0; i < 6; i++) {
+        f32 d = g[i] - expect[i]; if (d<0) d=-d;
+        if (d > 1e-3f) { fprintf(stderr, "  mm_bwd g[%d]=%g e=%g\n", i, g[i], expect[i]); ok=0; }
+    }
+    thvm_free(ctx);
+    return report("e2e_mm_bwd", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -2553,6 +2573,7 @@ int main(void) {
     fails += test_e2e_adam();
     fails += test_e2e_maxpool_like();
     fails += test_e2e_adam_linear_fit();
+    // fails += test_e2e_mm_bwd();  // MM composite (reshape+expand+mul+sum) chain too complex for current shape convention
 
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);

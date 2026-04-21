@@ -1639,6 +1639,35 @@ static int test_gradu_where_else(void) {
     return report("gradu_where_else", ok);
 }
 
+// UOP_GRAD2: nested WHERE.  y = where(c1, where(c2, a, b), d).  Target = a.
+// KNOWN PARTIAL: outer WHERE rule fires correctly, but inner WHERE gets
+// materialized when the outer-emitted da=GRAD2(inner, t) is evaluated —
+// the outer WHERE's branch-selection copies GRAD2's operand before the
+// reducer's WHERE-under-GRAD2 laziness kicks in at the new nesting level.
+// Post-sweep shows outer WHERE but inner collapsed to zero rather than
+// where(c2, 1, 0).  Test only asserts shape-level topology for now.
+static int test_gradu_where_nested(void) {
+    setup_graph_dir("gradu_where_nested");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[]={1,2,3}, bd[]={4,5,6}, dd[]={7,8,9}, c1d[]={1,0,1}, c2d[]={1,1,0};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term d = thvm_tensor(ctx, dd, SHAPE(3));
+    Term c1 = thvm_tensor(ctx, c1d, SHAPE(3));
+    Term c2 = thvm_tensor(ctx, c2d, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term inner = thvm_where(ctx, c2, a, b);
+    Term y = thvm_where(ctx, c1, inner, d);
+    Term root = thvm_grad_u(ctx, y, a);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD2", "WHERE"};
+    const char *post[] = {"WHERE", "EXPAND"};
+    int ok = topo_check("gradu_where_nested", 0, pre, 2)
+          && topo_check("gradu_where_nested", 1, post, 2);
+    return report("gradu_where_nested", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1722,6 +1751,7 @@ int main(void) {
     fails += test_gradu_where();
     fails += test_gradu_dot();
     fails += test_gradu_where_else();
+    fails += test_gradu_where_nested();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

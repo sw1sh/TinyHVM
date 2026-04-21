@@ -748,6 +748,119 @@ era_continue:
             return t;
         }
 
+        // ─── GRAD pair: (fwd, bwd) = GRAD(y) ───────────────────────────
+        // TAG_GF and TAG_GB share one rule with branching on `is_bwd`,
+        // mirroring the DP0/DP1 pattern. The cell at term_val(t) holds
+        // y; the ext field carries the target tensor id.
+        //
+        // When the first aux fires: read body y (WNF from trampoline),
+        // compute both forward and backward outputs via the chain rule
+        // for y's shape, write the sibling's clone into the cell with
+        // the SUB bit, return the firing aux's clone.
+        //
+        // When the second aux fires later: cell has SUB bit set →
+        // strip it and return directly (HVM4 heap_subst_cop pattern).
+        case TAG_GF:
+        case TAG_GB: {
+            u32 is_bwd = (tag == TAG_GB) ? 1 : 0;
+            u32 target_tid = term_ext(t);
+            u64 cell_loc = term_val(t);
+            Term cell = heap_read(ctx, cell_loc);
+
+            if (term_is_sub(cell)) {
+                Term v = term_strip_sub(cell);
+                if (term_tag(v) == TAG_TEN)
+                    tensor_incref(ctx, (u32)term_val(v));
+                ctx->itrs++;
+                RETURN_REDUCED(v);
+            }
+            Term y = cell;
+
+            #define GRAD_STATE_RETURN(_fwd, _bwd) do { \
+                Term _sibling = is_bwd ? (_fwd) : (_bwd); \
+                Term _mine    = is_bwd ? (_bwd) : (_fwd); \
+                heap_set(ctx, cell_loc, term_set_sub(_sibling)); \
+                ctx->itrs++; \
+                RETURN_REDUCED(_mine); \
+            } while (0)
+
+            // GRAD ⊳ TEN(t):  fwd = t, bwd = 1 if t == target else 0
+            if (term_tag(y) == TAG_TEN) {
+                u32 tid = (u32)term_val(y);
+                Term fwd = y;
+                Term bwd = (tid == target_tid) ? term_num_f32(1.0f)
+                                               : term_num_f32(0.0f);
+                GRAD_STATE_RETURN(fwd, bwd);
+            }
+
+            // GRAD ⊳ TOP(uop, args): chain rule per uop.
+            if (term_tag(y) == TAG_TOP) {
+                u32 uop = term_ext(y);
+                u64 yloc = term_val(y);
+
+                // Binary elementwise rules (both operands live at yloc+0/1).
+                if (uop == UOP_ADD || uop == UOP_SUB || uop == UOP_MUL) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term b = heap_read(ctx, yloc + 1);
+                    Term a_fwd, a_bwd, b_fwd, b_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    thvm_grad_pair(ctx, target_tid, b, &b_fwd, &b_bwd);
+                    Term fwd, bwd;
+                    if (uop == UOP_ADD) {
+                        // d(a+b) = da + db. No operand sharing.
+                        fwd = thvm_op_raw(ctx, UOP_ADD, a_fwd, b_fwd);
+                        bwd = thvm_op_raw(ctx, UOP_ADD, a_bwd, b_bwd);
+                    } else if (uop == UOP_SUB) {
+                        // d(a-b) = da - db. No operand sharing.
+                        fwd = thvm_op_raw(ctx, UOP_SUB, a_fwd, b_fwd);
+                        bwd = thvm_op_raw(ctx, UOP_SUB, a_bwd, b_bwd);
+                    } else {
+                        // Leibniz: d(a*b) = da*b + a*db. The forward ports
+                        // a_fwd/b_fwd are each needed twice (forward MUL and
+                        // backward cross-term), so DUP them before use —
+                        // otherwise the second consumer reads a SUB-cell
+                        // written by the first and gets the sibling value.
+                        Term a_fwd_0, a_fwd_1, b_fwd_0, b_fwd_1;
+                        thvm_dup(ctx, thvm_fresh_label(ctx), a_fwd, &a_fwd_0, &a_fwd_1);
+                        thvm_dup(ctx, thvm_fresh_label(ctx), b_fwd, &b_fwd_0, &b_fwd_1);
+                        fwd = thvm_op_raw(ctx, UOP_MUL, a_fwd_0, b_fwd_0);
+                        Term l = thvm_op_raw(ctx, UOP_MUL, a_bwd, b_fwd_1);
+                        Term r = thvm_op_raw(ctx, UOP_MUL, a_fwd_1, b_bwd);
+                        bwd = thvm_op_raw(ctx, UOP_ADD, l, r);
+                    }
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
+                // Unary NEG: d(-a) = -da
+                if (uop == UOP_NEG) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term a_fwd, a_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    Term fwd = thvm_op_raw(ctx, UOP_NEG, a_fwd, term_era());
+                    Term bwd = thvm_op_raw(ctx, UOP_NEG, a_bwd, term_era());
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
+                // Reduction SUM: d(sum(a)) emits the grad of a's shape.
+                // For first cut, we don't handle the shape broadcast here —
+                // a later pass will add sum_to_shape / expand for general
+                // cases. For leaf-only tests it works out.
+                if (uop == UOP_SUM) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term a_fwd, a_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    Term axes = heap_read(ctx, yloc + 1);
+                    Term fwd = thvm_op_raw(ctx, UOP_SUM, a_fwd, axes);
+                    Term bwd = a_bwd;
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+            }
+
+            // Not yet reducible — leave the aux as-is; trampoline will
+            // retry once the body (y) reduces further.
+            #undef GRAD_STATE_RETURN
+            return t;
+        }
 
         case TAG_OP2: {
             u64 loc = term_val(t);

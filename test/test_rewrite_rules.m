@@ -294,10 +294,8 @@ static int test_rule_grad_mul_square(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
-    // x appears twice in y (via MUL) and once as target — TEN is atomic,
-    // a single DUP for the two MUL uses is sufficient; target needs no DUP.
-    Term xa, xb; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xb);
-    Term y = thvm_op(ctx, UOP_MUL, xa, xb);
+    // No explicit DUP — compute-op convention shares references directly.
+    Term y = thvm_op(ctx, UOP_MUL, x, x);
     Term g = thvm_grad(ctx, y, x);
     Term reduced = thvm_eval(ctx, g);
     f32 twox[] = {2, 4, 6};
@@ -336,8 +334,7 @@ static int test_rule_grad_fwd_sum_of_square(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
-    Term xa, xb; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xb);
-    Term sq = thvm_op(ctx, UOP_MUL, xa, xb);
+    Term sq = thvm_op(ctx, UOP_MUL, x, x);
     Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
     Term g = thvm_grad_fwd(ctx, y, x);
     Term reduced = thvm_eval(ctx, g);

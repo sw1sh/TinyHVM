@@ -29,19 +29,21 @@
 
 #define GRAPH_ROOT "wl/examples/thvm_graphs/grad_rules"
 
-static void setup_graph_dir(const char *rule) {
+// with_step=1 enables per-interaction step_NNN_*.dot dumps.
+// Phase dumps (thvm_N_*.dot) are always on under STOP_AFTER_SWEEP.
+// Some rules (NEG/EXP/LOG/SQRT/RELU/SUM/RESHAPE/EXPAND/CMP) crash the
+// step-trace path because FUSE⊳<unary> with a NUM operand enters codegen
+// that expects a TEN. Phase dumps still cover them.
+static void setup_graph_dir(const char *rule, int with_step) {
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", GRAPH_ROOT, rule);
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", dir, dir);
     int r = system(cmd); (void)r;
-    // Phase dumps (thvm_0_pre_reduce..thvm_2_post_sweep) via THVM_GRAPH.
-    // STOP_AFTER_SWEEP skips fuse / passes / exec — we only care about
-    // Phase 1 + sweep topology, not codegen. Per-step dumps (THVM_STEP_GRAPH)
-    // would run the full pipeline internally and choke on NUM-seeded ops,
-    // so they're disabled here.
-    unsetenv("THVM_STEP_GRAPH");
+    if (with_step) setenv("THVM_STEP_GRAPH", "1", 1);
+    else           unsetenv("THVM_STEP_GRAPH");
     setenv("THVM_GRAPH", "1", 1);
+    setenv("THVM_STEP_GRAPH_DIR", dir, 1);
     setenv("THVM_GRAPH_DIR", dir, 1);
     setenv("THVM_GRAPH_STOP_AFTER_SWEEP", "1", 1);
 }
@@ -116,26 +118,36 @@ static int topo_count(const char *rule, int phase, const char *needle) {
     return count;
 }
 
-// Build a raw GRAD node and wrap it in a CTR so nothing is orphaned.
+// Build a CTR#2 { forward, backward } around the GRAD:
 //
-//     CTR#2 { slot0 = GRAD(y, gy=free), slot1 = free }
+//                ↗  (CTR's own outgoing free port)
+//                |
+//              CTR#2
+//              /    \
+//         fwd       bwd
+//          |         |
+//         DP0      GRAD(y=DP1, gy↗)
+//           \      /
+//            DUP_k
+//              |
+//              y = forward expr
 //
-// slot0 holds the chain-rule result once the GRAD fires.
-// slot1 is a dangling free-port consumer so the gy output (which the
-// GRAD rule emits an ERA on for the non-target arm) has a visible
-// external sink — keeps the ERA ⊳ ⋯ interaction visible in per-step
-// graphs instead of dropping it as "orphan root".
+// The forward is DUP'd so one copy feeds the CTR's `forward` slot
+// (visible in the graph, never consumed) and the other feeds GRAD's
+// principal port. Result: nothing is orphaned; CTR holds both halves
+// of the Jacobian pair AND presents its own outgoing free port.
 static Term mk_grad(TinyHVM *ctx, Term y, Term x) {
     thvm_grad_targets_clear(ctx);
     term_use_clear();
+    Term y_fwd, y_grad;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y_fwd, &y_grad);
     u64 loc = heap_alloc(ctx, 2);
-    y = linear_use(ctx, y, loc);
-    heap_set(ctx, loc + 0, y);
-    heap_set(ctx, loc + 1, term_era());
+    heap_set(ctx, loc + 0, y_grad);
+    heap_set(ctx, loc + 1, term_era());         // gy free port
     thvm_grad_target_set(ctx, loc, x);
     thvm_grad_mode_set(ctx, loc, GRAD_MODE_DROP);
     Term grad_top = term_new(TAG_TOP, UOP_GRAD, loc);
-    return thvm_ctr(ctx, (Term[]){grad_top, term_era()}, 2);
+    return thvm_ctr(ctx, (Term[]){y_fwd, grad_top}, 2);
 }
 
 static int report(const char *rule, int ok) {
@@ -156,7 +168,7 @@ static int report(const char *rule, int ok) {
 // ────────────────────────────────────────────────────────────────────
 
 static int test_add(void) {
-    setup_graph_dir("add");
+    setup_graph_dir("add", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3}, bd[] = {4, 5, 6};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -165,16 +177,18 @@ static int test_add(void) {
     Term y = thvm_op(ctx, UOP_ADD, a, b);
     thvm_eval(ctx, mk_grad(ctx, y, a));
     thvm_free(ctx);
-    // Pre-reduce: the forward ADD and the GRAD with free-port gy must exist.
-    const char *pre_need[]    = {"GRAD\\nd/d(t1)", "ADD", "free"};
-    const char *post_forbid[] = {"UOP_ADD\\n", "\"ADD\\n"};  // forward ADD consumed
-    int ok = topo_check("add", 0, pre_need, 3, NULL, 0)
-          && topo_check("add", 1, NULL, 0, post_forbid, 2);
+    // Pre-reduce: forward ADD, GRAD, free-port gy, CTR wrap.
+    // Post-reduce: chain rule unfolded; forward ADD survives via CTR's
+    // first slot (we DUP'd y on construction), gradient is NUM(1).
+    const char *pre_need[]  = {"GRAD\\nd/d(t1)", "ADD", "free", "CTR"};
+    const char *post_need[] = {"CTR", "ADD", "\"1\""};
+    int ok = topo_check("add", 0, pre_need, 4, NULL, 0)
+          && topo_check("add", 1, post_need, 3, NULL, 0);
     return report("ADD", ok);
 }
 
 static int test_sub(void) {
-    setup_graph_dir("sub");
+    setup_graph_dir("sub", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3}, bd[] = {4, 5, 6};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -189,7 +203,7 @@ static int test_sub(void) {
 }
 
 static int test_mul(void) {
-    setup_graph_dir("mul");
+    setup_graph_dir("mul", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3}, bd[] = {4, 5, 6};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -209,7 +223,7 @@ static int test_mul(void) {
 }
 
 static int test_div(void) {
-    setup_graph_dir("div");
+    setup_graph_dir("div", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {2, 4, 6}, bd[] = {1, 2, 3};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -224,7 +238,7 @@ static int test_div(void) {
 }
 
 static int test_max(void) {
-    setup_graph_dir("max");
+    setup_graph_dir("max", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 5, 3}, bd[] = {4, 2, 6};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -242,7 +256,7 @@ static int test_max(void) {
 }
 
 static int test_neg(void) {
-    setup_graph_dir("neg");
+    setup_graph_dir("neg", 0);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -259,7 +273,7 @@ static int test_neg(void) {
 }
 
 static int test_exp(void) {
-    setup_graph_dir("exp");
+    setup_graph_dir("exp", 0);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {0, 1, 2};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -273,7 +287,7 @@ static int test_exp(void) {
 }
 
 static int test_log(void) {
-    setup_graph_dir("log");
+    setup_graph_dir("log", 0);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 4};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -290,7 +304,7 @@ static int test_log(void) {
 }
 
 static int test_sqrt(void) {
-    setup_graph_dir("sqrt");
+    setup_graph_dir("sqrt", 0);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 4, 9};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -306,7 +320,7 @@ static int test_sqrt(void) {
 }
 
 static int test_relu(void) {
-    setup_graph_dir("relu");
+    setup_graph_dir("relu", 0);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {-1, 0, 1, 2};
     Term a = thvm_tensor(ctx, ad, SHAPE(4));
@@ -322,7 +336,7 @@ static int test_relu(void) {
 }
 
 static int test_sum(void) {
-    setup_graph_dir("sum");
+    setup_graph_dir("sum", 0);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3, 4};
     Term a = thvm_tensor(ctx, ad, SHAPE(4));
@@ -338,7 +352,7 @@ static int test_sum(void) {
 }
 
 static int test_reshape(void) {
-    setup_graph_dir("reshape");
+    setup_graph_dir("reshape", 0);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3, 4, 5, 6};
     Term a = thvm_tensor(ctx, ad, SHAPE(6));
@@ -354,7 +368,7 @@ static int test_reshape(void) {
 }
 
 static int test_expand(void) {
-    setup_graph_dir("expand");
+    setup_graph_dir("expand", 0);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -370,7 +384,7 @@ static int test_expand(void) {
 }
 
 static int test_cmp(void) {
-    setup_graph_dir("cmp");
+    setup_graph_dir("cmp", 0);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3}, bd[] = {2, 2, 2};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));

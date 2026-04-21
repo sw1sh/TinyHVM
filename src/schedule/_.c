@@ -1616,7 +1616,12 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // tensor produced by phase-2.
     thvm_step_graph_set_root(traced);
     thvm_step_graph_finalize(ctx);
-    traced = reduce_net_quiesce(ctx, traced);
+    // When the caller has asked to stop after the sweep phase (e.g. GRAD
+    // rule topology tests), skip the post-loop quiesce — it drives the
+    // graph into compute territory that chokes on NUM operands.
+    if (!getenv("THVM_GRAPH_STOP_AFTER_SWEEP")) {
+        traced = reduce_net_quiesce(ctx, traced);
+    }
     step_root_slot = 0;
     sched_planner_release_detached_slots();
     return traced;

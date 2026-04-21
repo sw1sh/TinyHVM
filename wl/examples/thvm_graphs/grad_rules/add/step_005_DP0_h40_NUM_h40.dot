@@ -1,0 +1,30 @@
+digraph G {
+  // PREV_INTERACTION: GRAD_h13_ADD_h11
+  // NEXT_INTERACTION: DP0_h40_NUM_h40
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n21 [label="KERNEL\nADD\nkid=0 cpu\n[3]\n@21", shape=box, fillcolor="#ccffcc"];
+  t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> n21 [style=dashed,color="#009900",fontcolor="#006600",label="ADD:a"];
+  t2 [label="t2\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n21 [style=dashed,color="#009900",fontcolor="#006600",label="ADD:b"];
+  n18 [label="FUSE\n@18", shape=box, fillcolor="#f0f0f0"];
+  n45 -> n18 [label="in"];
+  ctr8 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n21 -> ctr8 [label="c0"];
+  n18 -> ctr8 [label="c1"];
+  n45 [label="ADD\n[3]\n@45", shape=box, fillcolor="#cce5ff"];
+  n41 -> n45 [label="a"];
+  n43 -> n45 [label="b"];
+  n41 [label="GRAD\nd/d(t1)\n@41", shape=box, fillcolor="#e8d0ff"];
+  t1 -> n41 [label="y",taillabel="@41",labelfontsize=7,fontcolor="#666666"];
+  dup40 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1,penwidth=2.0];
+  num_d40 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num_d40 -> dup40 [color="#cc0000",penwidth=2.0];
+  dup40 -> n41 [label="gy (dp0@42)"];
+  n43 [label="GRAD\nd/d(t1)\n@43", shape=box, fillcolor="#e8d0ff"];
+  t2 -> n43 [label="y",taillabel="@43",labelfontsize=7,fontcolor="#666666"];
+  dup40 -> n43 [label="gy (dp1@44)"];
+}

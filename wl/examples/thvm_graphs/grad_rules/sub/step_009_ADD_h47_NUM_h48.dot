@@ -1,0 +1,28 @@
+digraph G {
+  // PREV_INTERACTION: GRAD_h45_TEN_h45
+  // NEXT_INTERACTION: ADD_h47_NUM_h48
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n21 [label="KERNEL\nSUB\nkid=0 cpu\n[3]\n@21", shape=box, fillcolor="#ccffcc"];
+  t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> n21 [style=dashed,color="#009900",fontcolor="#006600",label="SUB:a"];
+  t2 [label="t2\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n21 [style=dashed,color="#009900",fontcolor="#006600",label="SUB:b"];
+  n18 [label="FUSE\n@18", shape=box, fillcolor="#f0f0f0"];
+  n47 -> n18 [label="in"];
+  ctr8 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n21 -> ctr8 [label="c0"];
+  n18 -> ctr8 [label="c1"];
+  n47 [label="ADD\n[1]\n@47", shape=box, fillcolor="#cce5ff"];
+  num47_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num47_0 -> n47 [label="a"];
+  num47_1 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num47_1 -> n47 [label="b",color="#cc0000",penwidth=2.0];
+  n41 [label="NEG\n[1]\n@41", shape=box, fillcolor="#cce5ff"];
+  num41_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num41_0 -> n41 [label=""];
+  era82 [label="ERA\n@82",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  n41 -> era82 [label="p"];
+}

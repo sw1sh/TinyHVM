@@ -775,7 +775,31 @@ era_continue:
                 ctx->itrs++;
                 RETURN_REDUCED(v);
             }
+            /* Resolve y through DP / VAR so the rule's tag dispatch sees
+             * the underlying TEN or compute TOP, not the projection. */
             Term y = cell;
+            for (int _i = 0; _i < 32; _i++) {
+                u8 yt = term_tag(y);
+                if (yt == TAG_DP0 || yt == TAG_DP1) {
+                    u64 l = term_val(y);
+                    if (l == 0 || l >= ctx->heap_pos) break;
+                    Term nxt = heap_read(ctx, l);
+                    if (term_is_sub(nxt)) nxt = term_strip_sub(nxt);
+                    if (nxt == y) break;
+                    y = nxt;
+                    continue;
+                }
+                if (yt == TAG_VAR) {
+                    u64 l = term_val(y);
+                    if (l == 0 || l >= ctx->heap_pos) break;
+                    Term sub = heap_read(ctx, l);
+                    if (term_is_sub(sub)) break;
+                    if (sub == y) break;
+                    y = sub;
+                    continue;
+                }
+                break;
+            }
 
             #define GRAD_STATE_RETURN(_fwd, _bwd) do { \
                 Term _sibling = is_bwd ? (_fwd) : (_bwd); \

@@ -1170,6 +1170,32 @@ static int test_gradu_conv_like(void) {
     return report("gradu_conv_like", ok);
 }
 
+// UOP_GRAD2: MLP-like elementwise — y = relu(x*W1 + b1) * W2, grad w.r.t. W1.
+// Covers RELU-mask, ADD, MUL-Leibniz all chained.
+static int test_gradu_mlp_like(void) {
+    setup_graph_dir("gradu_mlp_like");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3}, w1d[] = {0.1f, 0.2f, 0.3f}, b1d[] = {0,0,0}, w2d[] = {1,1,1};
+    Term x  = thvm_tensor(ctx, xd,  SHAPE(3));
+    Term W1 = thvm_tensor(ctx, w1d, SHAPE(3));
+    Term b1 = thvm_tensor(ctx, b1d, SHAPE(3));
+    Term W2 = thvm_tensor(ctx, w2d, SHAPE(3));
+    thvm_set_requires_grad(ctx, W1);
+    Term z  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MUL, x, W1), b1);
+    Term h  = thvm_op(ctx, UOP_RELU, z, term_era());
+    Term y  = thvm_op(ctx, UOP_MUL, h, W2);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, W1)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "MUL", "RELU", "ADD"};
+    const char *post[] = {"CTR", "MUL", "RELU", "CMP", "ADD"};
+    int ok = topo_check("gradu_mlp_like", 0, pre, 5)
+          && topo_check("gradu_mlp_like", 1, post, 5);
+    return report("gradu_mlp_like", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1235,6 +1261,7 @@ int main(void) {
     fails += test_gradu_assign_src();
     fails += test_gradu_mse();
     fails += test_gradu_conv_like();
+    fails += test_gradu_mlp_like();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

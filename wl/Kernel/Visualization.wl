@@ -36,15 +36,16 @@ ClearAll[
 $visualizationSourceDirectory = DirectoryName[$InputFileName];
 
 ensureDOTImporterLoaded[] := Block[{},
-    Block[{$Context = "Global`", $ContextPath = {"System`", "Global`"}},
-        If[DownValues[ImportDOT] === {},
-            Quiet @ Check[
-                Get @ FileNameJoin[{$visualizationSourceDirectory, "ImportCallGraphDOT.wl"}],
-                $Failed
-            ]
+    If[
+        ! NameQ["TinyHVM`ImportCallGraphDOT`ImportDOTString"],
+        Quiet @ Check[
+            Get @ FileNameJoin[{$visualizationSourceDirectory, "ImportCallGraphDOT.wl"}],
+            $Failed
         ]
     ]
 ]
+
+ensureDOTImporterLoaded[];
 
 (* NUM carries ext=0 for u32, ext=1 for f32. Render the raw value accordingly. *)
 numText[ext_Integer, val_Integer] := If[
@@ -630,12 +631,6 @@ walkDOTString[walk_Association, termId_: None] := Block[{
 ]
 
 withDOTImport[dot_String, opts___?OptionQ] := Block[{
-    path = FileNameJoin[
-        {
-            $TemporaryDirectory,
-            "thvm-graph-" <> IntegerString[Hash[{AbsoluteTime[], RandomInteger[10^9]}], 16] <> ".dot"
-        }
-    ],
     passedOpts = Flatten[{opts}],
     method,
     importOpts,
@@ -650,14 +645,7 @@ withDOTImport[dot_String, opts___?OptionQ] := Block[{
         ],
         Method -> method
     ];
-    Internal`WithLocalSettings[
-        Export[path, dot, "String"],
-        Block[{$Context = "Global`", $ContextPath = {"System`", "Global`"}},
-            ensureDOTImporterLoaded[];
-            result = Global`ImportDOT[path, Sequence @@ importOpts]
-        ],
-        Quiet @ Check[DeleteFile[path], Null]
-    ];
+    result = TinyHVM`ImportCallGraphDOT`ImportDOTString[dot, Sequence @@ importOpts];
     result
 ]
 
@@ -700,7 +688,7 @@ TINetGraphDOT[
     walkDOTString[walk, termIdForHighlight]
 ]
 
-Options[TINetGraphImport] = Options[ImportDOT];
+Options[TINetGraphImport] = Options[TinyHVM`ImportCallGraphDOT`ImportDOTString];
 
 TINetGraphImport[t_TTensor, opts___?OptionQ] := TINetGraphImport[ToTTerm[t], opts]
 

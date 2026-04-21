@@ -1,4 +1,11 @@
-(* ImportDOT imports a Graphviz .dot digraph as a Wolfram Language Graph or Graphics. *)
+(* ImportDOTString imports a Graphviz DOT digraph string as a Wolfram Language Graph or Graphics. *)
+
+BeginPackage["TinyHVM`ImportCallGraphDOT`"];
+
+ImportDOTString::usage =
+    "ImportDOTString[dot, opts] imports a Graphviz DOT digraph string as a Wolfram Language Graph or Graphics.";
+
+Begin["`Private`"];
 
 (* Compared with `dot -Tpng`:
    - `"UseGraphvizLayout" -> True` (default) uses `dot -Tplain` to recover node centers and
@@ -11,8 +18,8 @@
      layout fallback. *)
 
 ClearAll[
-    ImportDOT,
-    ImportCallGraphDOT,
+    ImportDOTString,
+    importDOTFile,
     findDotAuto,
     rankDirOrientation,
     parseAttrs,
@@ -298,7 +305,7 @@ chooseFreeLabelPoint[cands_List, wh : {_, _}, forbidden_List] := Block[{
 
 (* Public options *)
 
-Options[ImportDOT] = Join[
+Options[ImportDOTString] = Join[
     {
         Method -> Automatic,
         DotExecutable -> Automatic,
@@ -310,14 +317,12 @@ Options[ImportDOT] = Join[
     Options[Graph]
 ];
 
-ImportCallGraphDOT = ImportDOT;
-
-ImportDOT::dotfail =
+ImportDOTString::dotfail =
     "Graphviz rasterization failed on `1`: `2`.";
-ImportDOT::impfail =
+ImportDOTString::impfail =
     "Built-in Import failed; using the bundled DOT parser.";
-ImportDOT::badmeth = "Unknown Method `1`.";
-ImportDOT::gvplain =
+ImportDOTString::badmeth = "Unknown Method `1`.";
+ImportDOTString::gvplain =
     "Could not use dot -Tplain for layout; using WL layered layout.";
 
 dropImportDOTMethodOpts[opts_List] := Block[{
@@ -352,7 +357,7 @@ findDotAuto[] := Block[{
     If[AssociationQ[p2] && p2["ExitCode"] === 0, "dot", $Failed]
 ]
 
-resolveDotExecutable[opts : OptionsPattern[ImportDOT]] := Block[{
+resolveDotExecutable[opts : OptionsPattern[ImportDOTString]] := Block[{
     dot = OptionValue[DotExecutable]
 },
     Which[
@@ -402,7 +407,7 @@ parsePlainNodeLine[line_String] := Block[{
 (* Returns <| "graphSize" -> {gw,gh}, "coords" -> <| name -> {xw,yw}, ... |>,
    "sizes" -> <| name -> {wp, hp} in points (matches coords) |> |>,
    WL-style coords (y up, inches * 72). Graphviz plain is y-up — no y flip. *)
-graphvizPlainNodeXY[path_String, opts : OptionsPattern[ImportDOT]] := Block[{
+graphvizPlainNodeXY[path_String, opts : OptionsPattern[ImportDOTString]] := Block[{
     dot, proc, text, lines,
     gw, gh, gr, scale,
     posAssoc, sizeAssoc, shapeAssoc
@@ -544,7 +549,7 @@ resolvePlotLabel[path_String, label_] :=
         True, label
     ]
 
-importGraphvizPNG[path_String, opts : OptionsPattern[ImportDOT]] := Block[{
+importGraphvizPNG[path_String, opts : OptionsPattern[ImportDOTString]] := Block[{
     dot, dpi, proc, img,
     w0, cap, rs, title
 },
@@ -612,7 +617,7 @@ jsonBezierSegs[pts_List] := Block[{
     ]
 ]
 
-importGraphvizGraphics[path_String, opts : OptionsPattern[ImportDOT]] := Block[{
+importGraphvizGraphics[path_String, opts : OptionsPattern[ImportDOTString]] := Block[{
     dot, proc, data, bb,
     x0, y0, x1, y1,
     toColor, styleDash, drawOpsPrims,
@@ -1036,7 +1041,7 @@ resolveLayoutData[
     orient_,
     getLabel_,
     dotFs_,
-    opts : OptionsPattern[ImportDOT]
+    opts : OptionsPattern[ImportDOTString]
 ] := Block[{
     gv, layoutScale
 },
@@ -1284,7 +1289,7 @@ buildGraphvizJsonData[
     path_String,
     eStyleAssoc_Association,
     toColor_,
-    opts : OptionsPattern[ImportDOT]
+    opts : OptionsPattern[ImportDOTString]
 ] := Block[{
     dot, proc, data, objs, idToName,
     nodeTexts, edgePrims, tail, head, pts
@@ -1615,7 +1620,7 @@ edgeRenderData[
     |>
 ]
 
-importWolframGraph[path_String, opts : OptionsPattern[ImportDOT]] := Block[{
+importWolframGraph[path_String, opts : OptionsPattern[ImportDOTString]] := Block[{
     raw, parsed, nodes, edges, nodeAttrs,
     vNames, edgeObjs,
     orient, edgeShapeChoice, layoutEdge,
@@ -1646,7 +1651,7 @@ importWolframGraph[path_String, opts : OptionsPattern[ImportDOT]] := Block[{
 
     If[
         TrueQ[OptionValue["UseGraphvizLayout"]] && ! displayData["hasPlainCoords"],
-        Message[ImportDOT::gvplain]
+        Message[ImportDOTString::gvplain]
     ];
 
     getVertexFontSize = dotFs[#, displayData["vtxFS"]] &;
@@ -1780,14 +1785,14 @@ importWolframGraph[path_String, opts : OptionsPattern[ImportDOT]] := Block[{
     ]
     ]
 
-importGraphBuiltIn[path_String, opts : OptionsPattern[ImportDOT]] := Block[{
+importGraphBuiltIn[path_String, opts : OptionsPattern[ImportDOTString]] := Block[{
     pass
 },
     pass = FilterRules[dropImportDOTMethodOpts @ Flatten[{opts}], Options[Graph]];
     Quiet @ Check[Import[path, "DOT", Sequence @@ pass], $Failed]
 ]
 
-ImportDOT[file_String, opts : OptionsPattern[]] := Block[{
+importDOTFile[file_String, opts : OptionsPattern[ImportDOTString]] := Block[{
     path,
     method,
     png,
@@ -1796,13 +1801,13 @@ ImportDOT[file_String, opts : OptionsPattern[]] := Block[{
     path = Quiet @ Check[AbsoluteFileName[file], file];
     If[! FileExistsQ[path], Return[$Failed]];
 
-    method = OptionValue[ImportDOT, {opts}, Method];
+    method = OptionValue[ImportDOTString, {opts}, Method];
 
     If[
         method === "Graphviz" || method === "GraphvizRaster" || method === "DotPNG",
         png = importGraphvizPNG[path, opts];
         If[MatchQ[png, _Framed], Return[png]];
-        Message[ImportDOT::dotfail, path, "dot or PNG import"];
+        Message[ImportDOTString::dotfail, path, "dot or PNG import"];
         Return[$Failed]
     ];
 
@@ -1818,11 +1823,32 @@ ImportDOT[file_String, opts : OptionsPattern[]] := Block[{
             If[
                 GraphQ[g0],
                 g0,
-                Message[ImportDOT::impfail];
+                Message[ImportDOTString::impfail];
                 importWolframGraph[path, opts]
             ],
         True,
-            Message[ImportDOT::badmeth, method];
+            Message[ImportDOTString::badmeth, method];
             $Failed
     ]
 ]
+
+ImportDOTString[dot_String, opts : OptionsPattern[]] := Block[{
+    path = FileNameJoin[
+        {
+            $TemporaryDirectory,
+            "thvm-import-dot-" <> IntegerString[Hash[{AbsoluteTime[], RandomInteger[10^9]}], 16] <> ".dot"
+        }
+    ],
+    result = $Failed
+},
+    Internal`WithLocalSettings[
+        Export[path, dot, "String"],
+        result = importDOTFile[path, opts],
+        Quiet @ Check[DeleteFile[path], Null]
+    ];
+    result
+]
+
+End[];
+
+EndPackage[];

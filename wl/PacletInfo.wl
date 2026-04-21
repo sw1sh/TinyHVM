@@ -7,7 +7,10 @@ PacletObject[<|
         {
             "Kernel",
             "Root" -> "Kernel",
-            "Context" -> "TinyHVM`"
+            "Context" -> {
+                "TinyHVM`",
+                "TinyHVM`ImportCallGraphDOT`"
+            }
         },
         {
             "LibraryLink"

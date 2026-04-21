@@ -83,6 +83,13 @@ static int topo_check(const char *rule, int phase,
     return ok;
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// NOTE: dot-parser connectivity was replaced by term-equality rewrite
+// tests in test/test_rewrite_rules.m (one test per interaction rule,
+// building expected post-reduce term by hand and asserting structural
+// equality).  Keeping a stub here for backward ref.
+// ──────────────────────────────────────────────────────────────────────
+
 // mk() builds CTR{y_fwd, GRAD(y_bwd, target)}.  y is DUP'd so both the
 // forward consumer (c0) and the GRAD sub-term see it.
 static Term mk(TinyHVM *ctx, Term y, Term target) {

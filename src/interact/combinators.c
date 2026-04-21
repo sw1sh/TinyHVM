@@ -994,7 +994,16 @@ era_continue:
                     Term fwd = thvm_op_raw(ctx, UOP_CMP, a_fwd, b_fwd);
                     thvm_spawn_detached_era(ctx, a_bwd);
                     thvm_spawn_detached_era(ctx, b_bwd);
-                    Term bwd = term_num_f32(0.0f);
+                    // CMP is non-differentiable: zero contribution, but
+                    // shape-matched to the target leaf so chain composition
+                    // stays consistent with the rest of the rules.
+                    Shape tsh = (target_tid < ctx->tensor_count)
+                        ? ctx->tensors[target_tid].view.shape
+                        : SHAPE(1);
+                    Term zero = term_num_f32(0.0f);
+                    Term bwd = (tsh.rank > 0 && !(tsh.rank == 1 && tsh.dims[0] == 1))
+                        ? thvm_expand(ctx, zero, tsh)
+                        : zero;
                     GRAD_STATE_RETURN(fwd, bwd);
                 }
 

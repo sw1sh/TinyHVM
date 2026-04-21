@@ -1477,6 +1477,35 @@ static int test_gradu_nested_app(void) {
     return report("gradu_nested_app", ok);
 }
 
+// UOP_GRAD2: curried lambda.  y = ((λx.λw.x*w) a) b.  Two betas; target=a.
+// dy/da = b.  Tests curried two-arg application under GRAD2.
+static int test_gradu_curried(void) {
+    setup_graph_dir("gradu_curried");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3}, bd[] = {4, 5, 6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    // inner λw. xv * w   (xv from outer)
+    Term xv, wv;
+    Term lam_w = thvm_lam(ctx, &wv, term_new(TAG_ERA, 0, 0));
+    // outer λx. lam_w (parameterized by x)
+    Term lam_x = thvm_lam(ctx, &xv, lam_w);
+    heap_set(ctx, term_val(lam_w) + 1, thvm_op(ctx, UOP_MUL, xv, wv));
+    // apply: ((lam_x a) b)
+    Term y = thvm_app(ctx, thvm_app(ctx, lam_x, a), b);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "APP", "LAM"};
+    const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
+    int ok = topo_check("gradu_curried", 0, pre, 4)
+          && topo_check("gradu_curried", 1, post, 4);
+    return report("gradu_curried", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1554,6 +1583,7 @@ int main(void) {
     fails += test_gradu_mixed_partial();
     fails += test_gradu_app_compute_arg();
     fails += test_gradu_nested_app();
+    fails += test_gradu_curried();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

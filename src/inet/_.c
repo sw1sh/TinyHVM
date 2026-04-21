@@ -94,6 +94,16 @@ void thvm_grad_pair(TinyHVM *ctx, u32 label, Term y,
     *out_bwd = term_new(TAG_GB, label, loc);
 }
 
+// UOP_GRAD2 builder: single-UOP gradient, no label/side-table.
+// heap[loc+0] = y, heap[loc+1] = target.  Reduces via chain rule to a
+// tensor of target.shape.  Parallel to thvm_grad_pair during migration.
+Term thvm_grad_u(TinyHVM *ctx, Term y, Term target) {
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc + 0, y);
+    heap_set(ctx, loc + 1, target);
+    return term_new(TAG_TOP, UOP_GRAD2, loc);
+}
+
 // Safer target-typed wrapper. Extracts the tensor id from a TAG_TEN
 // target (walking DP/VAR chains first), or uses the ~0u no-match
 // sentinel when the target isn't a tensor. Using this instead of the

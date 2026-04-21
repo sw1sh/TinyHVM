@@ -1353,6 +1353,7 @@ Term     thvm_ref(TinyHVM *ctx, u32 name);                   // TAG_REF(name)
 Term     thvm_book_from_dynamic(TinyHVM *ctx, Term body);    // internal: freeze dynamic term into static/book heap
 Term     thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b);   // TAG_SUP with label
 void     thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1); // DUP with label
+Term     thvm_grad_u(TinyHVM *ctx, Term y, Term target); // UOP_GRAD2(y, target) — new pivot shape
 void     thvm_grad_pair(TinyHVM *ctx, u32 label, Term y, Term *out_fwd, Term *out_bwd); // (x, dx) = GRAD(y); raw u32 label
 void     thvm_grad_pair_target(TinyHVM *ctx, Term target, Term y, Term *out_fwd, Term *out_bwd); // safer; takes Term target
 Term     thvm_grad_pair_bundle(TinyHVM *ctx, Term y, Term *targets, u32 n_params); // CTR of per-target bwd

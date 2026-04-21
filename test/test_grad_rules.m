@@ -1384,6 +1384,35 @@ static int test_gradu_abs(void) {
     return report("gradu_abs", ok);
 }
 
+// UOP_GRAD2: mixed higher-order. d²(x*y)/dxdy = 1.
+// Inner: d(x*y)/dx = y (Leibniz w/ target=x).
+// Outer: d(y)/dy = 1 (leaf identity).
+static int test_gradu_mixed_partial(void) {
+    setup_graph_dir("gradu_mixed_partial");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1, 2, 3}, yd[] = {4, 5, 6};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term y = thvm_tensor(ctx, yd, SHAPE(3));
+    thvm_set_requires_grad(ctx, x);
+    thvm_set_requires_grad(ctx, y);
+    Term prod = thvm_op(ctx, UOP_MUL, x, y);
+    // Inner d/dx
+    Term inner = thvm_grad_u(ctx, prod, x);
+    // Outer d/dy — DUP the inner first since the root will consume it
+    Term inner0, inner1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), inner, &inner0, &inner1);
+    (void)inner0;  // not used directly; outer wants inner1
+    Term outer = thvm_grad_u(ctx, inner1, y);
+    Term root = thvm_ctr(ctx, (Term[]){inner0, outer}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "MUL"};
+    const char *post[] = {"CTR", "EXPAND"};
+    int ok = topo_check("gradu_mixed_partial", 0, pre, 3)
+          && topo_check("gradu_mixed_partial", 1, post, 2);
+    return report("gradu_mixed_partial", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1458,6 +1487,7 @@ int main(void) {
     fails += test_gradu_lambda();
     fails += test_gradu_lambda_square();
     fails += test_gradu_abs();
+    fails += test_gradu_mixed_partial();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

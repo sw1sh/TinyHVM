@@ -1968,6 +1968,75 @@ static int test_e2e_grad_sqrt(void) {
     return report("e2e_grad_sqrt", ok);
 }
 
+// d(log(a))/da = 1/a.  a=[1,2,4] → [1, 0.5, 0.25].
+static int test_e2e_grad_log(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 4};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_LOG, a, term_era());
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {1.0f, 0.5f, 0.25f};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) {
+        f32 d = h[i]-expect[i]; if (d<0) d=-d;
+        if (d > 1e-3f) { fprintf(stderr,"  grad_log h[%d]=%g e=%g\n",i,h[i],expect[i]); ok=0; }
+    }
+    thvm_free(ctx);
+    return report("e2e_grad_log", ok);
+}
+
+// d(a/b)/da = 1/b.  b=[2,4,8] → [0.5, 0.25, 0.125].
+static int test_e2e_grad_div(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 1, 1}, bd[] = {2, 4, 8};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_DIV, a, b);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {0.5f, 0.25f, 0.125f};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) {
+        f32 d = h[i]-expect[i]; if (d<0) d=-d;
+        if (d > 1e-3f) { fprintf(stderr,"  grad_div h[%d]=%g e=%g\n",i,h[i],expect[i]); ok=0; }
+    }
+    thvm_free(ctx);
+    return report("e2e_grad_div", ok);
+}
+
+// d(max(a,b))/da = (a>=b).  a=[1,3,2], b=[2,1,2] → [0,1,?] — tie at idx 2
+// CMP is a>b so for ties mask goes to b.  Just check idx 0,1.
+static int test_e2e_grad_max(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 3, 5}, bd[] = {2, 1, 4};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_MAX, a, b);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {0, 1, 1};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) {
+        if (h[i] != expect[i]) { fprintf(stderr,"  grad_max h[%d]=%g e=%g\n",i,h[i],expect[i]); ok=0; }
+    }
+    thvm_free(ctx);
+    return report("e2e_grad_max", ok);
+}
+
+// d(sum(x))/dx = 1 of shape x.
+static int test_e2e_grad_sum(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3, 4};
+    Term a = thvm_tensor(ctx, ad, SHAPE(4));
+    Term y = thvm_sum_axes(ctx, a, (u32[]){0}, 1);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {1, 1, 1, 1};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 4; i++) {
+        if (h[i] != expect[i]) { fprintf(stderr,"  grad_sum h[%d]=%g e=%g\n",i,h[i],expect[i]); ok=0; }
+    }
+    thvm_free(ctx);
+    return report("e2e_grad_sum", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -2066,6 +2135,10 @@ int main(void) {
     fails += test_e2e_neg_of_expand();
     fails += test_e2e_grad_exp();
     fails += test_e2e_grad_sqrt();
+    fails += test_e2e_grad_log();
+    fails += test_e2e_grad_div();
+    fails += test_e2e_grad_max();
+    fails += test_e2e_grad_sum();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

@@ -1303,6 +1303,30 @@ static int test_gradu_cross_entropy(void) {
     return report("gradu_cross_entropy", ok);
 }
 
+// UOP_GRAD2: batched reduce.  x shape [2,3], y = sum(x*x, axes=[1]).
+// Per-batch sum of squares; grad w.r.t. x keeps [2,3] shape.
+static int test_gradu_batched_reduce(void) {
+    setup_graph_dir("gradu_batched_reduce");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3,4,5,6};
+    Term x = thvm_tensor(ctx, xd, SHAPE(2, 3));
+    thvm_set_requires_grad(ctx, x);
+    Term x0, x1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), x, &x0, &x1);
+    Term sq = thvm_op(ctx, UOP_MUL, x0, x1);
+    Term y  = thvm_sum_axes(ctx, sq, (u32[]){1}, 1);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "SUM", "MUL"};
+    const char *post[] = {"CTR", "SUM", "EXPAND", "MUL", "ADD"};
+    int ok = topo_check("gradu_batched_reduce", 0, pre, 4)
+          && topo_check("gradu_batched_reduce", 1, post, 5);
+    return report("gradu_batched_reduce", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1373,6 +1397,7 @@ int main(void) {
     fails += test_gradu_l2_normalize();
     fails += test_gradu_permute_sum();
     fails += test_gradu_cross_entropy();
+    fails += test_gradu_batched_reduce();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

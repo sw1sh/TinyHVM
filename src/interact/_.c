@@ -1048,6 +1048,19 @@ inet_step:
                 })
                 // Emit ones tensor of the given shape (rank-matched ones-shape TEN
                 // then EXPAND).  Used by view-op direct-emit bwd.
+                // Read a term's shape (from TEN meta or TOP shape-table).
+                // Stores into _out (Shape lvalue); leaves it as SHAPE(1) if none.
+                #define GRAD2_TERM_SHAPE(_term, _out) do {               \
+                    Term _tm = (_term);                                  \
+                    if (term_tag(_tm) == TAG_TEN) {                      \
+                        u32 _id = (u32)term_val(_tm);                    \
+                        if (_id < ctx->tensor_count)                     \
+                            (_out) = ctx->tensors[_id].view.shape;       \
+                    } else if (term_tag(_tm) == TAG_TOP) {               \
+                        const View *_av = st_get(term_val(_tm));         \
+                        if (_av) (_out) = _av->shape;                    \
+                    }                                                    \
+                } while (0)
                 #define GRAD2_ONES_OF(_shape) ({                         \
                     Shape _os = {.rank = (_shape).rank};                 \
                     for (u32 _i = 0; _i < (_shape).rank; _i++) _os.dims[_i] = 1; \
@@ -1186,14 +1199,7 @@ inet_step:
                         Term a     = heap_read(ctx, yloc + 0);
                         Term shape = heap_read(ctx, yloc + 1);
                         Shape a_shape = SHAPE(1);
-                        if (term_tag(a) == TAG_TEN) {
-                            u32 aid = (u32)term_val(a);
-                            if (aid < ctx->tensor_count)
-                                a_shape = ctx->tensors[aid].view.shape;
-                        } else if (term_tag(a) == TAG_TOP) {
-                            const View *av = st_get(term_val(a));
-                            if (av) a_shape = av->shape;
-                        }
+                        GRAD2_TERM_SHAPE(a, a_shape);
                         Term da = thvm_grad_u(ctx, a, tgt);
                         Term out;
                         if (yuop == UOP_RESHAPE && a_shape.rank != 0) {
@@ -1215,14 +1221,7 @@ inet_step:
                         Term a    = heap_read(ctx, yloc + 0);
                         (void)heap_read(ctx, yloc + 1);
                         Shape a_shape = SHAPE(1);
-                        if (term_tag(a) == TAG_TEN) {
-                            u32 aid = (u32)term_val(a);
-                            if (aid < ctx->tensor_count)
-                                a_shape = ctx->tensors[aid].view.shape;
-                        } else if (term_tag(a) == TAG_TOP) {
-                            const View *av = st_get(term_val(a));
-                            if (av) a_shape = av->shape;
-                        }
+                        GRAD2_TERM_SHAPE(a, a_shape);
                         Term da = thvm_grad_u(ctx, a, tgt);
                         Term out = (a_shape.rank != 0)
                             ? thvm_expand(ctx, da, a_shape) : da;
@@ -1233,14 +1232,7 @@ inet_step:
                         Term a     = heap_read(ctx, yloc + 0);
                         Term shape = heap_read(ctx, yloc + 1);
                         Shape a_shape = SHAPE(1);
-                        if (term_tag(a) == TAG_TEN) {
-                            u32 aid = (u32)term_val(a);
-                            if (aid < ctx->tensor_count)
-                                a_shape = ctx->tensors[aid].view.shape;
-                        } else if (term_tag(a) == TAG_TOP) {
-                            const View *av = st_get(term_val(a));
-                            if (av) a_shape = av->shape;
-                        }
+                        GRAD2_TERM_SHAPE(a, a_shape);
                         // SHRINK shape-preserving bwd.  For target == a (leaf
                         // identity), emit PAD(ones(y_shape), pad_pairs) directly
                         // so the output has target.shape with mask (=1 in kept
@@ -1272,14 +1264,7 @@ inet_step:
                         Term a     = heap_read(ctx, yloc + 0);
                         Term shape = heap_read(ctx, yloc + 1);
                         Shape a_shape = SHAPE(1);
-                        if (term_tag(a) == TAG_TEN) {
-                            u32 aid = (u32)term_val(a);
-                            if (aid < ctx->tensor_count)
-                                a_shape = ctx->tensors[aid].view.shape;
-                        } else if (term_tag(a) == TAG_TOP) {
-                            const View *av = st_get(term_val(a));
-                            if (av) a_shape = av->shape;
-                        }
+                        GRAD2_TERM_SHAPE(a, a_shape);
                         Shape y_shape = SHAPE(1);
                         const View *yv = st_get(yloc);
                         if (yv) y_shape = yv->shape;
@@ -1321,14 +1306,7 @@ inet_step:
                         Term a    = heap_read(ctx, yloc + 0);
                         Term axes = heap_read(ctx, yloc + 1);
                         Shape a_shape = SHAPE(1);
-                        if (term_tag(a) == TAG_TEN) {
-                            u32 aid = (u32)term_val(a);
-                            if (aid < ctx->tensor_count)
-                                a_shape = ctx->tensors[aid].view.shape;
-                        } else if (term_tag(a) == TAG_TOP) {
-                            const View *av = st_get(term_val(a));
-                            if (av) a_shape = av->shape;
-                        }
+                        GRAD2_TERM_SHAPE(a, a_shape);
                         Term a0, a1, a2;
                         thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
                         Term a1b;

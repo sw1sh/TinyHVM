@@ -1445,6 +1445,38 @@ static int test_gradu_app_compute_arg(void) {
     return report("gradu_app_compute_arg", ok);
 }
 
+// UOP_GRAD2: nested APPs.  y = (λv. v) ((λu. u*u) a).  Two betas then
+// GRAD2(a*a, a) = 2a.  Verifies chain rule across multiple lambda layers.
+static int test_gradu_nested_app(void) {
+    setup_graph_dir("gradu_nested_app");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    // Inner λu. u*u
+    Term u;
+    Term lam_inner = thvm_lam(ctx, &u, term_new(TAG_ERA, 0, 0));
+    Term u0, u1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), u, &u0, &u1);
+    heap_set(ctx, term_val(lam_inner) + 1, thvm_op(ctx, UOP_MUL, u0, u1));
+    // Outer λv. v (identity)
+    Term v;
+    Term lam_outer = thvm_lam(ctx, &v, term_new(TAG_ERA, 0, 0));
+    heap_set(ctx, term_val(lam_outer) + 1, v);
+    // y = outer (inner a)
+    Term y = thvm_app(ctx, lam_outer, thvm_app(ctx, lam_inner, a));
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "APP", "LAM", "MUL"};
+    const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
+    int ok = topo_check("gradu_nested_app", 0, pre, 5)
+          && topo_check("gradu_nested_app", 1, post, 4);
+    return report("gradu_nested_app", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1521,6 +1553,7 @@ int main(void) {
     fails += test_gradu_abs();
     fails += test_gradu_mixed_partial();
     fails += test_gradu_app_compute_arg();
+    fails += test_gradu_nested_app();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

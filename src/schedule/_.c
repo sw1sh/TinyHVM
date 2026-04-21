@@ -1588,9 +1588,18 @@ static Term thvm_step_session_init(TinyHVM *ctx, Term root,
                                    u8 **reach_out, size_t *reach_cap_out) {
     step_root_slot = 0;
     Term cloned = term_clone(ctx, root);
-    u64 fuse_loc = heap_alloc(ctx, 1);
-    heap_set(ctx, fuse_loc, cloned);
-    Term traced = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
+    Term traced;
+    // Skip the UOP_FUSE wrap when the caller only wants Phase 1+2 topology
+    // (GRAD rule tests). FUSE injects a redex that drives the reducer into
+    // local fusion + dispatch, which chokes on NUM operands in unary
+    // backward formulas. Without it the step trace is pure IC reduction.
+    if (getenv("THVM_GRAPH_STOP_AFTER_SWEEP")) {
+        traced = cloned;
+    } else {
+        u64 fuse_loc = heap_alloc(ctx, 1);
+        heap_set(ctx, fuse_loc, cloned);
+        traced = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
+    }
     traced = thvm_step_seed_root_grad(ctx, traced);
     *reach_cap_out = (size_t)ctx->heap_pos;
     *reach_out = (u8 *)calloc(*reach_cap_out ? *reach_cap_out : 1, 1);

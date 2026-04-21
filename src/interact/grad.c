@@ -15,12 +15,19 @@
 	                Term gy_src = heap_read(ctx, loc + 1);
 	                Term y  = y_src;
 	                Term gy = gy_src;
-	                // Restore flags, return directly — trampoline reduces TAG_TOP results
+	                // GRAD emits CTR{forward, backward} — two output ports on
+	                // the node itself, so callers don't need to DUP the forward
+	                // externally. Drop mode returns the CTR; KEEP/SLOT deposit
+	                // into their bundle and return just the backward handle
+	                // (bundle semantics expect a scalar return).
 	                #define GRAD_RETURN(r) do { \
                         Term _gr = (r); \
                         if (thvm_grad_mode_get(ctx, loc) == GRAD_MODE_KEEP && \
                             term_tag(_gr) == TAG_ERA && term_val(_gr) == 0) { \
                             _gr = term_num_f32(0.0f); \
+                        } \
+                        if (thvm_grad_mode_get(ctx, loc) == GRAD_MODE_PAIR) { \
+                            _gr = thvm_ctr(ctx, (Term[]){y_src, _gr}, 2); \
                         } \
 	                    heap_set(ctx, loc, term_era()); \
 	                    heap_set(ctx, loc + 1, term_era()); \
@@ -429,6 +436,10 @@
 	                    #define GRAD2_H(y_,gy_,x_) ({ \
 	                        u64 _l = heap_alloc(ctx, 2); \
 	                        heap_set(ctx, _l, y_); heap_set(ctx, _l+1, gy_); thvm_grad_targets_share(ctx, _l, loc); thvm_grad_target_set(ctx, _l, x_); \
+	                        /* Sub-GRADs return just the backward scalar, not */ \
+	                        /* a CTR pair. CTR wrap is a top-level-only thing. */ \
+	                        if (thvm_grad_mode_get(ctx, _l) == GRAD_MODE_PAIR) \
+	                            thvm_grad_mode_set(ctx, _l, GRAD_MODE_DROP); \
 	                        { const View *_gv = NULL; Term _gt = (gy_); \
 	                          GRAD_RESOLVE_ALIAS(_gt); \
 	                          if (term_tag(_gt)==TAG_TEN && (u32)term_val(_gt)<ctx->tensor_count) _gv=&ctx->tensors[(u32)term_val(_gt)].view; \

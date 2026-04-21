@@ -711,6 +711,7 @@ typedef enum {
     GRAD_MODE_DROP = 0,
     GRAD_MODE_KEEP = 1,
     GRAD_MODE_SLOT = 2,
+    GRAD_MODE_PAIR = 3,   // emit CTR{forward, backward} on firing (top-level only)
 } GradMode;
 
 typedef struct {

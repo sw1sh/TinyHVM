@@ -118,36 +118,20 @@ static int topo_count(const char *rule, int phase, const char *needle) {
     return count;
 }
 
-// Build a CTR#2 { forward, backward } around the GRAD:
-//
-//                ↗  (CTR's own outgoing free port)
-//                |
-//              CTR#2
-//              /    \
-//         fwd       bwd
-//          |         |
-//         DP0      GRAD(y=DP1, gy↗)
-//           \      /
-//            DUP_k
-//              |
-//              y = forward expr
-//
-// The forward is DUP'd so one copy feeds the CTR's `forward` slot
-// (visible in the graph, never consumed) and the other feeds GRAD's
-// principal port. Result: nothing is orphaned; CTR holds both halves
-// of the Jacobian pair AND presents its own outgoing free port.
+// Build GRAD(y, gy=free) — no DUP, no external CTR wrap.
+// GRAD's firing rule is responsible for emitting CTR{forward, backward}
+// as its return value, so the forward value and the chain-rule gradient
+// come out of the same node without any caller-side duplication.
 static Term mk_grad(TinyHVM *ctx, Term y, Term x) {
     thvm_grad_targets_clear(ctx);
     term_use_clear();
-    Term y_fwd, y_grad;
-    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y_fwd, &y_grad);
     u64 loc = heap_alloc(ctx, 2);
-    heap_set(ctx, loc + 0, y_grad);
+    y = linear_use(ctx, y, loc);
+    heap_set(ctx, loc + 0, y);
     heap_set(ctx, loc + 1, term_era());         // gy free port
     thvm_grad_target_set(ctx, loc, x);
-    thvm_grad_mode_set(ctx, loc, GRAD_MODE_DROP);
-    Term grad_top = term_new(TAG_TOP, UOP_GRAD, loc);
-    return thvm_ctr(ctx, (Term[]){y_fwd, grad_top}, 2);
+    thvm_grad_mode_set(ctx, loc, GRAD_MODE_PAIR);
+    return term_new(TAG_TOP, UOP_GRAD, loc);
 }
 
 static int report(const char *rule, int ok) {
@@ -177,13 +161,16 @@ static int test_add(void) {
     Term y = thvm_op(ctx, UOP_ADD, a, b);
     thvm_eval(ctx, mk_grad(ctx, y, a));
     thvm_free(ctx);
-    // Pre-reduce: forward ADD, GRAD, free-port gy, CTR wrap.
-    // Post-reduce: chain rule unfolded; forward ADD survives via CTR's
-    // first slot (we DUP'd y on construction), gradient is NUM(1).
-    const char *pre_need[]  = {"GRAD\\nd/d(t1)", "ADD", "free", "CTR"};
-    const char *post_need[] = {"CTR", "ADD", "\"1\""};
-    int ok = topo_check("add", 0, pre_need, 4, NULL, 0)
-          && topo_check("add", 1, post_need, 3, NULL, 0);
+    // Pre-reduce: forward ADD, GRAD (with 3 free-ish ports: y, gy, out).
+    // Post-reduce: GRAD rule returns CTR{forward, backward}; chain rule
+    // unfolded; backward contains NUM(1) (for t1 arm) and NUM(0) (t2 arm).
+    const char *pre_need[]  = {"GRAD\\nd/d(t1)", "ADD", "free"};
+    // Post-reduce: root CTR with forward ADD (unreduced) at c0 and
+    // backward NUM(1) at c1 (intermediate ADD(NUM(1),NUM(0)) collapses
+    // via ERA on the t2-arm NUM).
+    const char *post_need[] = {"CTR", "\"1\""};
+    int ok = topo_check("add", 0, pre_need, 3, NULL, 0)
+          && topo_check("add", 1, post_need, 2, NULL, 0);
     return report("ADD", ok);
 }
 
@@ -213,12 +200,11 @@ static int test_mul(void) {
     thvm_eval(ctx, mk_grad(ctx, y, a));
     thvm_free(ctx);
     const char *pre_need[]  = {"GRAD\\nd/d(t1)", "MUL", "free"};
-    // Backward of MUL for single-target a: deposit is MUL(gy_broadcast, b).
-    // Phase-1 post should still contain a MUL (the backward product) and
-    // reference b (t2). The b-arm sub-GRAD returns 0 and collapses.
-    const char *post_need[] = {"\"MUL\\n", "t2"};
+    // Post-reduce: CTR{forward MUL, backward MUL(NUM(1), b)} — Leibniz.
+    // Root is a CTR with two MUL children; the backward MUL references b.
+    const char *post_need[] = {"CTR", "MUL", "t2"};
     int ok = topo_check("mul", 0, pre_need, 3, NULL, 0)
-          && topo_check("mul", 1, post_need, 2, NULL, 0);
+          && topo_check("mul", 1, post_need, 3, NULL, 0);
     return report("MUL", ok);
 }
 
@@ -256,7 +242,7 @@ static int test_max(void) {
 }
 
 static int test_neg(void) {
-    setup_graph_dir("neg", 0);
+    setup_graph_dir("neg", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -273,7 +259,7 @@ static int test_neg(void) {
 }
 
 static int test_exp(void) {
-    setup_graph_dir("exp", 0);
+    setup_graph_dir("exp", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {0, 1, 2};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -287,7 +273,7 @@ static int test_exp(void) {
 }
 
 static int test_log(void) {
-    setup_graph_dir("log", 0);
+    setup_graph_dir("log", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 4};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -304,7 +290,7 @@ static int test_log(void) {
 }
 
 static int test_sqrt(void) {
-    setup_graph_dir("sqrt", 0);
+    setup_graph_dir("sqrt", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 4, 9};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -320,7 +306,7 @@ static int test_sqrt(void) {
 }
 
 static int test_relu(void) {
-    setup_graph_dir("relu", 0);
+    setup_graph_dir("relu", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {-1, 0, 1, 2};
     Term a = thvm_tensor(ctx, ad, SHAPE(4));
@@ -336,7 +322,7 @@ static int test_relu(void) {
 }
 
 static int test_sum(void) {
-    setup_graph_dir("sum", 0);
+    setup_graph_dir("sum", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3, 4};
     Term a = thvm_tensor(ctx, ad, SHAPE(4));
@@ -352,7 +338,7 @@ static int test_sum(void) {
 }
 
 static int test_reshape(void) {
-    setup_graph_dir("reshape", 0);
+    setup_graph_dir("reshape", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3, 4, 5, 6};
     Term a = thvm_tensor(ctx, ad, SHAPE(6));
@@ -368,7 +354,7 @@ static int test_reshape(void) {
 }
 
 static int test_expand(void) {
-    setup_graph_dir("expand", 0);
+    setup_graph_dir("expand", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -384,7 +370,7 @@ static int test_expand(void) {
 }
 
 static int test_cmp(void) {
-    setup_graph_dir("cmp", 0);
+    setup_graph_dir("cmp", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3}, bd[] = {2, 2, 2};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));

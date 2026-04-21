@@ -1583,15 +1583,16 @@ static int test_gradu_where(void) {
     Term cond = thvm_tensor(ctx, condd, SHAPE(3));
     thvm_set_requires_grad(ctx, a);
     Term y = thvm_where(ctx, cond, a, b);
-    Term y0, y1;
-    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    // No DUP on y — let GRAD2 pattern-match the raw WHERE TOP directly.
+    Term root = thvm_grad_u(ctx, y, a);
     thvm_eval(ctx, root);
     thvm_free(ctx);
     // Pre must contain GRAD2+WHERE; post we don't yet know — if no WHERE
     // rule exists, GRAD2 stays in the graph.  Just check pre.
-    const char *pre[]  = {"CTR", "GRAD2", "WHERE"};
-    int ok = topo_check("gradu_where", 0, pre, 3);
+    const char *pre[]  = {"GRAD2", "WHERE"};
+    const char *post[] = {"WHERE", "EXPAND"};
+    int ok = topo_check("gradu_where", 0, pre, 2)
+          && topo_check("gradu_where", 1, post, 2);
     return report("gradu_where", ok);
 }
 

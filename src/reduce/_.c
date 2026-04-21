@@ -546,6 +546,14 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
             next = r;
             goto enter;
         }
+        // Keep WHERE lazy under GRAD2 parent frame so the GRAD2 rule
+        // can pattern-match on the WHERE TOP (otherwise eager WHERE
+        // reduction picks a branch and materializes a fresh TEN,
+        // losing target-identity for the leaf rule).
+        if (_uop == UOP_WHERE && sp > 0 && term_tag(stk[sp-1]) == TAG_TOP
+            && term_ext(stk[sp-1]) == UOP_GRAD2) {
+            whnf = next; goto apply;
+        }
         if (!reduce_top_direct_uop_ctx(ctx, _uop)) {
             whnf = next; goto apply;
         }

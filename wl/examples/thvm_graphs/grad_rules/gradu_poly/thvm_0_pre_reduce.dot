@@ -3,13 +3,12 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  n6 [label="EXPAND\n[3]\n@6", shape=box, fillcolor="#fff3cd"];
-  t1 [label="t1\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t1 -> n6 [label="in",taillabel="@6",labelfontsize=7,fontcolor="#666666"];
-  t2 [label="t2\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t2 -> n6 [label="shape",taillabel="@7",labelfontsize=7,fontcolor="#666666"];
-  n5 [label="NEG\n[3]\n@5", shape=box, fillcolor="#cce5ff",color="#1f78ff",penwidth=2.2];
-  n6 -> n5 [label=""];
+  n7 [label="SQRT\n[3]\n@7", shape=box, fillcolor="#cce5ff"];
+  t1 [label="t1\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t1 -> n7 [label="",taillabel="@7",labelfontsize=7,fontcolor="#666666"];
+  n5 [label="GRAD2\n[3]\n@5", shape=box, fillcolor="#f0f0f0",color="#1f78ff",penwidth=2.2];
+  n7 -> n5 [label=""];
+  t1 -> n5 [label="",taillabel="@6",labelfontsize=7,fontcolor="#666666"];
   free5_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
   n5 -> free5_1000 [label="out"];
 }

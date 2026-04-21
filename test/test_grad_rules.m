@@ -1910,6 +1910,48 @@ static int test_e2e_grad_relu(void) {
     return report("e2e_grad_relu", ok);
 }
 
+// d(exp(a))/da = exp(a).  a=[0,1,2] → [1, e, e^2].
+static int test_e2e_grad_exp(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {0, 1, 2};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_EXP, a, term_era());
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {1.0f, 2.718281828f, 7.389056099f};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) {
+        f32 diff = h[i] - expect[i];
+        if (diff < 0) diff = -diff;
+        if (diff > 1e-3f) {
+            fprintf(stderr, "  grad_exp: h[%d]=%g exp=%g\n", i, h[i], expect[i]);
+            ok = 0;
+        }
+    }
+    thvm_free(ctx);
+    return report("e2e_grad_exp", ok);
+}
+
+// d(sqrt(a))/da = 1/(2*sqrt(a)).  a=[1,4,9] → [0.5, 0.25, 1/6].
+static int test_e2e_grad_sqrt(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 4, 9};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_SQRT, a, term_era());
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 expect[] = {0.5f, 0.25f, 1.0f/6.0f};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) {
+        f32 diff = h[i] - expect[i];
+        if (diff < 0) diff = -diff;
+        if (diff > 1e-3f) {
+            fprintf(stderr, "  grad_sqrt: h[%d]=%g exp=%g\n", i, h[i], expect[i]);
+            ok = 0;
+        }
+    }
+    thvm_free(ctx);
+    return report("e2e_grad_sqrt", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -2005,6 +2047,8 @@ int main(void) {
     fails += test_e2e_grad_neg();
     fails += test_e2e_grad_relu();
     fails += test_e2e_neg_of_expand();
+    fails += test_e2e_grad_exp();
+    fails += test_e2e_grad_sqrt();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

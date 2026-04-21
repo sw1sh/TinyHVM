@@ -1219,6 +1219,34 @@ static int test_gradu_logsumexp(void) {
     return report("gradu_logsumexp", ok);
 }
 
+// UOP_GRAD2: L2-normalization-like. y = x / sqrt(sum(x*x)).  Covers
+// DIV-quotient + SQRT-chain + SUM + MUL-Leibniz all composed.
+static int test_gradu_l2_normalize(void) {
+    setup_graph_dir("gradu_l2_normalize");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1, 2, 3};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    thvm_set_requires_grad(ctx, x);
+    Term x0, x1, x2;
+    thvm_dup(ctx, thvm_fresh_label(ctx), x, &x0, &x1);
+    thvm_dup(ctx, thvm_fresh_label(ctx), x1, &x1, &x2);
+    Term sq = thvm_op(ctx, UOP_MUL, x1, x2);
+    Term s  = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
+    Term r  = thvm_op(ctx, UOP_SQRT, s, term_era());
+    Term r_bc = thvm_expand(ctx, r, SHAPE(3));
+    Term y  = thvm_op(ctx, UOP_DIV, x0, r_bc);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "DIV", "EXPAND", "SQRT", "SUM", "MUL"};
+    const char *post[] = {"CTR", "DIV", "SQRT", "SUM", "MUL", "EXPAND"};
+    int ok = topo_check("gradu_l2_normalize", 0, pre, 7)
+          && topo_check("gradu_l2_normalize", 1, post, 6);
+    return report("gradu_l2_normalize", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1286,6 +1314,7 @@ int main(void) {
     fails += test_gradu_conv_like();
     fails += test_gradu_mlp_like();
     fails += test_gradu_logsumexp();
+    fails += test_gradu_l2_normalize();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

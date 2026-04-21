@@ -164,11 +164,17 @@ static u32 thvm_grad_seed_dtype_hint(TinyHVM *ctx, Term t) {
 
 static Term thvm_grad_seed_like(TinyHVM *ctx, Term loss) {
     u32 dtype = thvm_grad_seed_dtype_hint(ctx, loss);
-    // Backward seeds should be scalar tensors, not TAG_NUM literals. Keep the
-    // seed at the loss float dtype when we know it; integer losses still fall
-    // back to f32 until compute kernels become genuinely typed.
     if (dtype != DTYPE_F32 && dtype != DTYPE_F16) dtype = DTYPE_F32;
     return thvm_scalar_typed(ctx, 1.0f, dtype);
+}
+
+// Drop-mode GRAD does not walk backward (gy is erased immediately on
+// firing), so the seed can be a plain NUM(1.0) without needing to feed
+// downstream `expand`/`sum_to_shape` or other shape-aware compute. Using a
+// NUM literal avoids allocating a scalar tensor whose only purpose is to
+// be immediately discarded.
+static Term thvm_grad_seed_drop(void) {
+    return term_num_f32(1.0f);
 }
 
 static GradTargetSet *grad_targets_get(TinyHVM *ctx, int create) {
@@ -890,7 +896,7 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
     // Single-target mode: no global target table.
     thvm_grad_targets_clear(ctx);
     term_use_clear();
-    Term seed = thvm_grad_seed_like(ctx, y);
+    Term seed = thvm_grad_seed_drop();
     u64 loc = heap_alloc(ctx, 2);
     y = linear_use(ctx, y, loc);
     heap_set(ctx, loc, y);
@@ -906,7 +912,7 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term x) {
 Term thvm_grad_multi(TinyHVM *ctx, Term loss, Term *params, Term *grad_slots, u32 n_params) {
     thvm_grad_targets_clear(ctx);
     term_use_clear();
-    Term seed = thvm_grad_seed_like(ctx, loss);
+    Term seed = grad_slots ? thvm_grad_seed_like(ctx, loss) : thvm_grad_seed_drop();
     u64 loc = heap_alloc(ctx, 2);
     loss = linear_use(ctx, loss, loc);
     heap_set(ctx, loc, loss);

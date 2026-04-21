@@ -1128,9 +1128,11 @@ static int test_gradu_lambda(void) {
     f32 ad[] = {1, 2, 3};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     thvm_set_requires_grad(ctx, a);
-    // λv.v (identity lambda). y = (λv.v) a should beta-reduce to a.
+    // λv.v (identity lambda): create LAM with ERA placeholder body,
+    // then patch body = vbind at loc+1.
     Term vbind;
-    Term lam = thvm_lam(ctx, &vbind, vbind);
+    Term lam = thvm_lam(ctx, &vbind, term_new(TAG_ERA, 0, 0));
+    heap_set(ctx, term_val(lam) + 1, vbind);
     Term y = thvm_app(ctx, lam, a);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
@@ -1398,6 +1400,7 @@ int main(void) {
     fails += test_gradu_permute_sum();
     fails += test_gradu_cross_entropy();
     fails += test_gradu_batched_reduce();
+    fails += test_gradu_lambda();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

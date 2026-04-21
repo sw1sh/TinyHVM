@@ -1444,6 +1444,11 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     fprintf(f, "  ref%llu -> era%llu [label=\"p\"%s];\n", (unsigned long long)_ev, (unsigned long long)(epos), EDGE_HL_LABEL_TERM(epos, _et)); \
                 } else if (_st == TAG_VAR) { \
                     EMIT_VAR_OR_RESOLVED_TO_TARGET(_src, term_val(_src), "era", (epos), "p", DOT_HL_MATCH_TERM(epos, _et), ""); \
+                } else if (_st == TAG_GF || _st == TAG_GB) { \
+                    EMIT_GRAD_CELL(term_val(_src)); \
+                    const char *_gport = (_st == TAG_GF) ? "fwd" : "bwd"; \
+                    fprintf(f, "  grad%llu -> era%llu [label=\"%s\"%s];\n", \
+                            (unsigned long long)term_val(_src), (unsigned long long)(epos), _gport, EDGE_HL_LABEL_TERM(epos, _et)); \
                 } else if (dot_visible_heap_loc_tag(_st)) { \
                     fprintf(f, "  n%llu -> era%llu [label=\"p\"%s];\n", (unsigned long long)term_val(_src), (unsigned long long)(epos), EDGE_HL_LABEL_TERM(epos, _et)); \
                 } else if (_st == TAG_NUM) { \

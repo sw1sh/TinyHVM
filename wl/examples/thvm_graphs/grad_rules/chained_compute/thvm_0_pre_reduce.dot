@@ -10,12 +10,11 @@ digraph G {
   dup1 -> n2 [label="a (dp0@2)"];
   dup1 -> n2 [label="b (dp1@3)"];
   era6 [label="ERA\n@6",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  h5 [label="h5\ntag=27", shape=box, fillcolor="#dddddd", fontsize=8];
-  h5 -> era6 [label="p"];
-  n10 [label="MUL\n@10", shape=box, fillcolor="#cce5ff",color="#1f78ff",penwidth=2.2];
-  dup12 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
   grad4 [label="GRAD\n@4", shape=invtriangle, fillcolor="#e8d0ff"];
   n2 -> grad4 [label="y",color="#cc0000",penwidth=2.0];
+  grad4 -> era6 [label="fwd"];
+  n10 [label="MUL\n@10", shape=box, fillcolor="#cce5ff",color="#1f78ff",penwidth=2.2];
+  dup12 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
   grad4 -> dup12 [label="bwd"];
   dup12 -> n10 [label="a (dp0@10)"];
   dup12 -> n10 [label="b (dp1@11)"];

@@ -13,9 +13,9 @@ digraph G {
   num_ctr6_7 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
   num_ctr6_7 -> ctr6 [label="c1"];
   era14 [label="ERA\n@14",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  h13 [label="h13\ntag=28", shape=box, fillcolor="#dddddd", fontsize=8];
-  h13 -> era14 [label="p"];
+  grad9 [label="GRAD\n@9", shape=invtriangle, fillcolor="#e8d0ff"];
+  grad9 -> era14 [label="bwd"];
   era16 [label="ERA\n@16",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  h15 [label="h15\ntag=28", shape=box, fillcolor="#dddddd", fontsize=8];
-  h15 -> era16 [label="p"];
+  grad10 [label="GRAD\n@10", shape=invtriangle, fillcolor="#e8d0ff"];
+  grad10 -> era16 [label="bwd"];
 }

@@ -19,8 +19,9 @@ digraph G {
   free19_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
   n19 -> free19_1000 [label="out"];
   era6 [label="ERA\n@6",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  h5 [label="h5\ntag=27", shape=box, fillcolor="#dddddd", fontsize=8];
-  h5 -> era6 [label="p"];
+  grad4 [label="GRAD\n@4", shape=invtriangle, fillcolor="#e8d0ff"];
+  n19 -> grad4 [label="y",color="#cc0000",penwidth=2.0];
+  grad4 -> era6 [label="fwd"];
   n31 [label="MUL\n[3]\n@31", shape=box, fillcolor="#cce5ff"];
   dup29 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
   freedup29_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
@@ -35,8 +36,9 @@ digraph G {
   free31_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
   n31 -> free31_1000 [label="out"];
   era9 [label="ERA\n@9",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  h8 [label="h8\ntag=27", shape=box, fillcolor="#dddddd", fontsize=8];
-  h8 -> era9 [label="p"];
+  grad7 [label="GRAD\n@7", shape=invtriangle, fillcolor="#e8d0ff"];
+  n31 -> grad7 [label="y",color="#cc0000",penwidth=2.0];
+  grad7 -> era9 [label="fwd"];
   n25 [label="ADD\n[3]\n@25", shape=box, fillcolor="#cce5ff"];
   n21 -> n25 [label="a"];
   n23 -> n25 [label="b"];

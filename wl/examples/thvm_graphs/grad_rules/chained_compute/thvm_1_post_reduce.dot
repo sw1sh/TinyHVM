@@ -18,8 +18,9 @@ digraph G {
   free18_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
   n18 -> free18_1000 [label="out"];
   era6 [label="ERA\n@6",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  h5 [label="h5\ntag=27", shape=box, fillcolor="#dddddd", fontsize=8];
-  h5 -> era6 [label="p"];
+  grad4 [label="GRAD\n@4", shape=invtriangle, fillcolor="#e8d0ff"];
+  n18 -> grad4 [label="y",color="#cc0000",penwidth=2.0];
+  grad4 -> era6 [label="fwd"];
   n24 [label="ADD\n[3]\n@24", shape=box, fillcolor="#cce5ff"];
   n20 -> n24 [label="a"];
   n22 -> n24 [label="b"];

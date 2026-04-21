@@ -10,8 +10,9 @@ digraph G {
   dup1 -> n2 [label="a (dp0@2)"];
   dup1 -> n2 [label="b (dp1@3)"];
   era6 [label="ERA\n@6",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  h5 [label="h5\ntag=27", shape=box, fillcolor="#dddddd", fontsize=8];
-  h5 -> era6 [label="p"];
+  grad4 [label="GRAD\n@4", shape=invtriangle, fillcolor="#e8d0ff"];
+  n2 -> grad4 [label="y",color="#cc0000",penwidth=2.0];
+  grad4 -> era6 [label="fwd"];
   ctr10 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
   grad7 [label="GRAD\n@7", shape=invtriangle, fillcolor="#e8d0ff"];
   grad7 -> ctr10 [label="c0 (fwd)"];

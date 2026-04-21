@@ -490,6 +490,23 @@ static int test_nested_unary(void) {
     return report("nested_unary", ok);
 }
 
+// y = target (GRAD of a tensor w.r.t. itself).  fwd = t1, bwd =
+// EXPAND(1, t1.shape) — the identity gradient from the leaf rule.
+static int test_identity(void) {
+    setup_graph_dir("identity");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    thvm_eval(ctx, mk(ctx, a, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR"};
+    const char *post[] = {"CTR", "EXPAND"};
+    int ok = topo_check("identity", 0, pre, 2)
+          && topo_check("identity", 1, post, 2);
+    return report("identity", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -520,6 +537,7 @@ int main(void) {
     fails += test_nested_reuse();
     fails += test_reshape_deep_target();
     fails += test_nested_unary();
+    fails += test_identity();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

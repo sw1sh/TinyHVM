@@ -1618,6 +1618,27 @@ static int test_gradu_dot(void) {
     return report("gradu_dot", ok);
 }
 
+// UOP_GRAD2: WHERE with mixed cond, target = b (else branch).
+// d(where(c, a, b))/db = where(c, 0, 1).
+static int test_gradu_where_else(void) {
+    setup_graph_dir("gradu_where_else");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3}, bd[] = {7, 8, 9}, condd[] = {0, 1, 0};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term cond = thvm_tensor(ctx, condd, SHAPE(3));
+    thvm_set_requires_grad(ctx, b);
+    Term y = thvm_where(ctx, cond, a, b);
+    Term root = thvm_grad_u(ctx, y, b);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD2", "WHERE"};
+    const char *post[] = {"WHERE", "EXPAND"};
+    int ok = topo_check("gradu_where_else", 0, pre, 2)
+          && topo_check("gradu_where_else", 1, post, 2);
+    return report("gradu_where_else", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1700,6 +1721,7 @@ int main(void) {
     fails += test_gradu_ifz_succ();
     fails += test_gradu_where();
     fails += test_gradu_dot();
+    fails += test_gradu_where_else();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

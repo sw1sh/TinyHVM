@@ -928,7 +928,11 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
 }
 
 // thvm_reduce is the fixed point of thvm_reduce_steps — unbounded budget.
-Term thvm_reduce(TinyHVM *ctx, Term t) {
+// Legacy predicate-based reducer.  The public entry `thvm_reduce` now
+// lives in src/wnf/_.c (HVM4-style eval/apply stack machine); this
+// function is a transitional fallback for tag cases the stack machine
+// hasn't migrated yet.
+Term thvm_reduce_fallback(TinyHVM *ctx, Term t) {
     return thvm_reduce_steps(ctx, t, 0);
 }
 

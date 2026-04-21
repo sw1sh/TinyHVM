@@ -1288,14 +1288,14 @@ void     jit_flush(void);
 void     jit_replay(void);
 #endif
 
-// Reduction
+// Reduction — HVM4-style eval/apply stack machine (src/wnf/_.c).
+// thvm_reduce is the public entry.  thvm_reduce_fallback is the
+// transitional legacy reducer (src/reduce/_.c), called by the stack
+// machine for tag cases not yet migrated.  thvm_reduce_steps is the
+// legacy step-bounded worker.
 Term     thvm_reduce(TinyHVM *ctx, Term t);
+Term     thvm_reduce_fallback(TinyHVM *ctx, Term t);
 Term     thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps);
-// HVM4-style eval/apply stack machine (src/wnf/_.c).  Staged migration
-// replacement for the predicate-based reducer above.  Stage 0: atoms
-// return as-is, everything else delegates to thvm_reduce.  See
-// resources/plans/eval_apply_stack_machine.md.
-Term     thvm_wnf(TinyHVM *ctx, Term t);
 Term     thvm_eval(TinyHVM *ctx, Term t);
 void     thvm_sched_reset_runtime(void);
 

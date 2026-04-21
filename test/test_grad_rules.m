@@ -2609,7 +2609,7 @@ static int test_e2e_d2_square_rev_rev(void) {
     Term g1 = thvm_grad(ctx, y, x);                        // 2x
     Term g2 = thvm_grad(ctx, g1, x);                       // d/dx(2x) = 2
     // Use wnf stack machine for higher-order composition.
-    f32 *h  = thvm_to_host(ctx, thvm_eval(ctx, thvm_wnf(ctx, g2)));
+    f32 *h  = thvm_to_host(ctx, thvm_eval(ctx, g2));
     int ok = h && h[0] > 1.9f && h[0] < 2.1f;
     if (!ok) fprintf(stderr, "  d2_rev_rev h=%g (want 2)\n", h ? h[0] : 0);
     thvm_free(ctx);
@@ -2625,7 +2625,7 @@ static int test_e2e_d2_cube(void) {
     Term x3 = thvm_op(ctx, UOP_MUL, x2, x);
     Term g1 = thvm_grad(ctx, x3, x);
     Term g2 = thvm_grad(ctx, g1, x);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_wnf(ctx, g2)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, g2));
     int ok = h && h[0] > 11.9f && h[0] < 12.1f;
     if (!ok) fprintf(stderr, "  d2_cube h=%g (want 12)\n", h ? h[0] : 0);
     thvm_free(ctx);
@@ -2642,7 +2642,7 @@ static int test_e2e_mixed_partial(void) {
     Term f  = thvm_op(ctx, UOP_MUL, x2, y);                // x²y
     Term dfdx = thvm_grad(ctx, f, x);                      // 2xy
     Term d2  = thvm_grad(ctx, dfdx, y);                    // 2x
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_wnf(ctx, d2)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, d2));
     int ok = h && h[0] > 5.9f && h[0] < 6.1f;
     if (!ok) fprintf(stderr, "  mixed_partial h=%g (want 6)\n", h ? h[0] : 0);
     thvm_free(ctx);
@@ -2657,7 +2657,7 @@ static int test_e2e_d2_square_jvp_jvp(void) {
     Term y  = thvm_op(ctx, UOP_MUL, x, x);
     Term t1 = thvm_grad_fwd(ctx, y, x);                    // 2x
     Term t2 = thvm_grad_fwd(ctx, t1, x);                   // 2
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_wnf(ctx, t2)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, t2));
     int ok = h && h[0] > 1.9f && h[0] < 2.1f;
     if (!ok) fprintf(stderr, "  d2_jvp_jvp h=%g (want 2)\n", h ? h[0] : 0);
     thvm_free(ctx);
@@ -2673,7 +2673,7 @@ static int test_e2e_d2_cube_vjp_jvp(void) {
     Term x3 = thvm_op(ctx, UOP_MUL, x2, x);
     Term jvp1 = thvm_grad_fwd(ctx, x3, x);                 // 3x²
     Term vjp2 = thvm_grad(ctx, jvp1, x);                   // 6x
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_wnf(ctx, vjp2)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, vjp2));
     int ok = h && h[0] > 11.9f && h[0] < 12.1f;
     if (!ok) fprintf(stderr, "  d2_vjp_jvp h=%g (want 12)\n", h ? h[0] : 0);
     thvm_free(ctx);
@@ -2689,7 +2689,7 @@ static int test_e2e_d2_cube_jvp_vjp(void) {
     Term x3 = thvm_op(ctx, UOP_MUL, x2, x);
     Term vjp1 = thvm_grad(ctx, x3, x);                     // 3x²
     Term jvp2 = thvm_grad_fwd(ctx, vjp1, x);               // 6x
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_wnf(ctx, jvp2)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, jvp2));
     int ok = h && h[0] > 11.9f && h[0] < 12.1f;
     if (!ok) fprintf(stderr, "  d2_jvp_vjp h=%g (want 12)\n", h ? h[0] : 0);
     thvm_free(ctx);

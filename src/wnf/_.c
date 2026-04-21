@@ -19,7 +19,7 @@
 //   - GRAD × TAG_TOP UOP_ADD/UOP_SUB (Leibniz-phase frames)
 //   - GRAD × TAG_TOP UOP_NEG (single-phase frame)
 //   - GRAD × TAG_TOP UOP_MUL (Leibniz with forward-value cross-term)
-// Other uops: fall back to existing grad.c rule via thvm_reduce.
+// Other uops: fall back to existing grad.c rule via thvm_reduce_fallback.
 
 // ──────────────────────────────────────────────────────────────────────
 // Frame kinds.  Stored on wnf stack.  Not heap terms.
@@ -71,7 +71,7 @@ static void wnf_stack_push(WnfFrame f) {
     g_wnf_stack_buf[g_wnf_stack_pos++] = f;
 }
 
-Term thvm_reduce(TinyHVM *ctx, Term t);
+Term thvm_reduce_fallback(TinyHVM *ctx, Term t);
 
 // ──────────────────────────────────────────────────────────────────────
 // Leaf-rule helpers.
@@ -84,7 +84,7 @@ static Term wnf_grad_ten_leaf(TinyHVM *ctx, Term tgt, Term y_whnf, int is_fwd) {
         heap_set(ctx, loc + 0, y_whnf);
         heap_set(ctx, loc + 1, tgt);
         u32 uop = is_fwd ? UOP_GRAD_FWD : UOP_GRAD;
-        return thvm_reduce(ctx, term_new(TAG_TOP, uop, loc));
+        return thvm_reduce_fallback(ctx, term_new(TAG_TOP, uop, loc));
     }
     u32 ytid = (u32)term_val(y_whnf);
     u32 ttid = (u32)term_val(tgt);
@@ -118,7 +118,7 @@ static Term wnf_grad_apply_top_fallback(TinyHVM *ctx, Term tgt, Term y_whnf, int
     heap_set(ctx, loc + 1, tgt);
     u32 uop = is_fwd ? UOP_GRAD_FWD : UOP_GRAD;
     Term t = term_new(TAG_TOP, uop, loc);
-    return thvm_reduce(ctx, t);
+    return thvm_reduce_fallback(ctx, t);
 }
 
 // ERA peephole helpers (ADD(x, ERA) → x, MUL(x, ERA) → ERA, etc.)
@@ -153,7 +153,7 @@ static inline int wnf_is_atom(u8 tag) {
            tag == TAG_LAM || tag == TAG_SUP || tag == TAG_ANY;
 }
 
-Term thvm_wnf(TinyHVM *ctx, Term term) {
+Term thvm_reduce(TinyHVM *ctx, Term term) {
     if (wnf_is_atom(term_tag(term))) return term;
 
     u32 base = g_wnf_stack_pos;
@@ -185,9 +185,9 @@ enter: {
         // Non-GRAD TOPs (ADD/MUL/KERNEL/ASSIGN/etc.): compute TOPs are
         // treated as WHNF from IC's perspective; dispatch logic lives
         // in enclosing GRAD frames (if any) via apply-phase dispatch.
-        // For root-level non-GRAD, fall back to thvm_reduce.
+        // For root-level non-GRAD, fall back to thvm_reduce_fallback.
         if (g_wnf_stack_pos == base) {
-            whnf = thvm_reduce(ctx, next);
+            whnf = thvm_reduce_fallback(ctx, next);
             goto apply;
         }
         whnf = next;
@@ -195,7 +195,7 @@ enter: {
     }
 
     // Other tags: fall back.
-    whnf = thvm_reduce(ctx, next);
+    whnf = thvm_reduce_fallback(ctx, next);
     goto apply;
 }
 

@@ -1023,8 +1023,59 @@ era_continue:
                             bwd = thvm_reshape(ctx, a_bwd, a_shape);
                         else
                             bwd = a_bwd;
+                    } else if (uop == UOP_PERMUTE) {
+                        // dA = permute(da, inverse_perm).
+                        // Second operand `shape` is a TEN holding the
+                        // permutation. Read its data, invert.
+                        if (term_tag(shape) == TAG_TEN && a_shape.rank > 0) {
+                            u32 pid = (u32)term_val(shape);
+                            u32 nd = a_shape.rank;
+                            u32 pf[MAX_DIM];
+                            tensor_meta_read_u32(ctx, pid, pf, MAX_DIM);
+                            u32 inv[MAX_DIM];
+                            for (u32 j = 0; j < nd; j++) inv[pf[j]] = j;
+                            bwd = thvm_permute(ctx, a_bwd, inv, nd);
+                        } else {
+                            bwd = a_bwd;
+                        }
+                    } else if (uop == UOP_SHRINK) {
+                        // dA = pad(da, complementary_pairs).
+                        // SHRINK's `shape` TEN holds [start_0, end_0,
+                        // start_1, end_1, ...]. Pad pairs are
+                        // (start_i, a_shape.dims[i] - end_i).
+                        if (term_tag(shape) == TAG_TEN && a_shape.rank > 0) {
+                            u32 sid = (u32)term_val(shape);
+                            u32 nd = a_shape.rank;
+                            u32 sf[MAX_DIM * 2];
+                            tensor_meta_read_u32(ctx, sid, sf, MAX_DIM * 2);
+                            u32 pp[MAX_DIM * 2];
+                            for (u32 j = 0; j < nd; j++) {
+                                pp[j*2]   = sf[j*2];
+                                pp[j*2+1] = a_shape.dims[j] - sf[j*2+1];
+                            }
+                            bwd = thvm_pad(ctx, a_bwd, pp, nd);
+                        } else {
+                            bwd = a_bwd;
+                        }
+                    } else if (uop == UOP_PAD) {
+                        // dA = shrink(da, complementary_pairs).
+                        // PAD's `shape` TEN holds pad pairs; shrink start
+                        // is pad_start, shrink end is pad_start + a_size.
+                        if (term_tag(shape) == TAG_TEN && a_shape.rank > 0) {
+                            u32 pid = (u32)term_val(shape);
+                            u32 nd = a_shape.rank;
+                            u32 pf[MAX_DIM * 2];
+                            tensor_meta_read_u32(ctx, pid, pf, MAX_DIM * 2);
+                            u32 sp[MAX_DIM * 2];
+                            for (u32 j = 0; j < nd; j++) {
+                                sp[j*2]   = pf[j*2];
+                                sp[j*2+1] = pf[j*2] + a_shape.dims[j];
+                            }
+                            bwd = thvm_shrink(ctx, a_bwd, sp, nd);
+                        } else {
+                            bwd = a_bwd;
+                        }
                     } else {
-                        // SHRINK/PAD/PERMUTE: pass through (topology-only).
                         bwd = a_bwd;
                     }
                     GRAD_STATE_RETURN(fwd, bwd);

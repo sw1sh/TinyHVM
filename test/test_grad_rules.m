@@ -227,6 +227,27 @@ static int test_pad(void) {
 // Second derivative:  d²/da²(a·a) = d/da(2a) = 2
 // First pair produces bwd1 = Leibniz; wrap bwd1 in a second pair to
 // capture the derivative of the derivative.
+// Multi-target bundle: gradient wrt TWO parameters at once.
+//   bundle = grad_pair_bundle(MUL(a, b), [a, b])
+// Expected bundle[0] = ∂(a·b)/∂a = b, bundle[1] = ∂(a·b)/∂b = a.
+static int test_bundle_multitarget(void) {
+    setup_graph_dir("bundle_multitarget");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3}, bd[] = {4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_MUL, a, b);
+    Term params[] = {a, b};
+    Term bundle = thvm_grad_pair_bundle(ctx, y, params, 2);
+    thvm_eval(ctx, bundle);
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "MUL"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("bundle_multitarget", 0, pre, 3)
+          && topo_check("bundle_multitarget", 1, post, 1);
+    return report("bundle2", ok);
+}
+
 static int test_second_derivative(void) {
     setup_graph_dir("second_derivative");
     TinyHVM *ctx = thvm_init("cpu");
@@ -376,6 +397,7 @@ int main(void) {
     fails += test_shrink();
     fails += test_pad();
     fails += test_assign();
+    fails += test_bundle_multitarget();
     fails += test_second_derivative();
     fails += test_target_nomatch();
     printf("\ntotal failures: %d\n", fails);

@@ -1,0 +1,16 @@
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n1 [label="LOG\n[3]\n@1", shape=box, fillcolor="#cce5ff"];
+  t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> n1 [label="",taillabel="@1",labelfontsize=7,fontcolor="#666666"];
+  n3 [label="EXP\n[3]\n@3", shape=box, fillcolor="#cce5ff"];
+  n1 -> n3 [label=""];
+  ctr8 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  grad5 [label="GRAD\n@5", shape=invtriangle, fillcolor="#e8d0ff"];
+  n3 -> grad5 [label="y",color="#cc0000",penwidth=2.0];
+  grad5 -> ctr8 [label="c0 (fwd)"];
+  grad5 -> ctr8 [label="c1 (bwd)"];
+}

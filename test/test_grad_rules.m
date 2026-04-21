@@ -469,6 +469,27 @@ static int test_reshape_deep_target(void) {
     return report("reshape_deep_target", ok);
 }
 
+// Nested unary: y = exp(log(t1)), target = t1.  d/dt1 via chain =
+// exp(log(t1)) * (1/t1) (symbolically = 1).  Exercises two unary
+// rules composing through the leaf.
+static int test_nested_unary(void) {
+    setup_graph_dir("nested_unary");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_op(ctx, UOP_EXP,
+                thvm_op(ctx, UOP_LOG, a, term_era()),
+                term_era());
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "EXP", "LOG"};
+    const char *post[] = {"CTR", "EXP", "LOG", "MUL", "DIV"};
+    int ok = topo_check("nested_unary", 0, pre, 4)
+          && topo_check("nested_unary", 1, post, 5);
+    return report("nested_unary", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -498,6 +519,7 @@ int main(void) {
     fails += test_self_mul();
     fails += test_nested_reuse();
     fails += test_reshape_deep_target();
+    fails += test_nested_unary();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

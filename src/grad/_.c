@@ -168,13 +168,13 @@ static Term thvm_grad_seed_like(TinyHVM *ctx, Term loss) {
     return thvm_scalar_typed(ctx, 1.0f, dtype);
 }
 
-// Drop-mode GRAD does not walk backward (gy is erased immediately on
-// firing), so the seed can be a plain NUM(1.0) without needing to feed
-// downstream `expand`/`sum_to_shape` or other shape-aware compute. Using a
-// NUM literal avoids allocating a scalar tensor whose only purpose is to
-// be immediately discarded.
+// Drop-mode GRAD: the gy aux port is free — no backward consumer, no
+// scalar-tensor seed. Visually renders as a small white circle in the step
+// graph (TAG_ERA with val=0 is the free-port sentinel). At rule-firing
+// time, the rule substitutes NUM(1.0) locally so the chain rule has a
+// seed to multiply through.
 static Term thvm_grad_seed_drop(void) {
-    return term_num_f32(1.0f);
+    return term_era();
 }
 
 static GradTargetSet *grad_targets_get(TinyHVM *ctx, int create) {

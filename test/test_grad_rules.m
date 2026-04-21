@@ -1532,6 +1532,43 @@ static int test_gradu_ifz(void) {
     return report("gradu_ifz", ok);
 }
 
+// UOP_GRAD2: IFZ hits succ branch.  y = IFZ(1, a, λ_. a*a).
+// counter=1 → evaluates succ_lam(0) → a*a → GRAD2 → 2a.
+static int test_gradu_ifz_succ(void) {
+    setup_graph_dir("gradu_ifz_succ");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    // succ_lam: λc. a*a  (ignores c, uses a twice via DUP)
+    Term cvar;
+    Term succ = thvm_lam(ctx, &cvar, term_new(TAG_ERA, 0, 0));
+    Term a0, a1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+    // Sink cvar since we don't use it; ERA the var.
+    thvm_spawn_detached_era(ctx, cvar);
+    heap_set(ctx, term_val(succ) + 1, thvm_op(ctx, UOP_MUL, a0, a1));
+    // Target for GRAD2: need a separate handle — use a' = dup of a
+    // before we pass a into succ_lam body.  But we already gave a away.
+    // Work around: target is the TEN tid, so we can recreate a fresh
+    // reference via thvm_tensor_from_id ... not exposed.  Use a via DUP.
+    // Simpler path: construct as y = IFZ(1, dummy, succ_lam), where
+    // succ_lam's body references a (captured by closure).
+    Term dummy = thvm_tensor(ctx, ad, SHAPE(3));
+    Term counter = thvm_scalar(ctx, 1.0f);
+    Term y = thvm_ifz(ctx, counter, dummy, succ);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "IFZ", "LAM", "MUL"};
+    const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
+    int ok = topo_check("gradu_ifz_succ", 0, pre, 5)
+          && topo_check("gradu_ifz_succ", 1, post, 4);
+    return report("gradu_ifz_succ", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1611,6 +1648,7 @@ int main(void) {
     fails += test_gradu_nested_app();
     fails += test_gradu_curried();
     fails += test_gradu_ifz();
+    fails += test_gradu_ifz_succ();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

@@ -1093,6 +1093,32 @@ static int test_gradu_assign_src(void) {
     return report("gradu_assign_src", ok);
 }
 
+// UOP_GRAD2 MSE loss: y = sum((x - c) * (x - c)), dy/dx = 2(x - c).
+// Exercises SUB + MUL-Leibniz + SUM composition end-to-end.
+static int test_gradu_mse(void) {
+    setup_graph_dir("gradu_mse");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3,4}, cd[] = {0,0,0,0};
+    Term x = thvm_tensor(ctx, xd, SHAPE(4));
+    Term c = thvm_tensor(ctx, cd, SHAPE(4));
+    thvm_set_requires_grad(ctx, x);
+    Term d = thvm_op(ctx, UOP_SUB, x, c);
+    Term d0, d1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), d, &d0, &d1);
+    Term sq = thvm_op(ctx, UOP_MUL, d0, d1);
+    Term y  = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "SUM", "MUL", "SUB"};
+    const char *post[] = {"CTR", "SUM", "EXPAND", "MUL", "SUB", "ADD"};
+    int ok = topo_check("gradu_mse", 0, pre, 5)
+          && topo_check("gradu_mse", 1, post, 6);
+    return report("gradu_mse", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1156,6 +1182,7 @@ int main(void) {
     fails += test_gradu_target_via_dup();
     fails += test_gradu_distributive();
     fails += test_gradu_assign_src();
+    fails += test_gradu_mse();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

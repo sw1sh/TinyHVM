@@ -59,6 +59,9 @@ enum {
     // WHERE: gradient distributes through both branches, masked by cond.
     WNF_F_GRAD_WHERE_PHASE1, // t0=cond, t1=a, t2=b, t3=tgt — need da
     WNF_F_GRAD_WHERE_PHASE2, // t0=cond, t1=b, t2=da, t3=tgt — need db
+    // MM forward-mode (JVP): Leibniz JVP(a)@b + a@JVP(b).
+    WNF_F_GRAD_MM_FWD_PHASE1, // t0=a, t1=b, t2=tgt — need da
+    WNF_F_GRAD_MM_FWD_PHASE2, // t0=l=MM(da,b), t1=a — need db
 };
 
 typedef struct {
@@ -490,6 +493,76 @@ apply: {
                     continue;
                 }
 
+                // MM: fwd is Leibniz (push both operands); rev is direct
+                // VJP emit (ones(y.shape) @ bᵀ for a-match, aᵀ @ ones for
+                // b-match; zeros otherwise).  No recursion in rev mode.
+                if (wuop == UOP_MM) {
+                    Term a = heap_read(ctx, wloc + 0);
+                    Term b = heap_read(ctx, wloc + 1);
+                    if (is_fwd) {
+                        WnfFrame ph1 = {
+                            .kind = WNF_F_GRAD_MM_FWD_PHASE1, .flags = 1,
+                            .t0 = a, .t1 = b, .t2 = tgt, .t3 = 0
+                        };
+                        wnf_stack_push(ph1);
+                        WnfFrame inner = {
+                            .kind = WNF_F_GRAD, .flags = 1,
+                            .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                        };
+                        wnf_stack_push(inner);
+                        next = a;
+                        goto enter;
+                    }
+                    // Reverse mode: leaf-match direct emit via tensor id check.
+                    u32 a_tid = (term_tag(a) == TAG_TEN) ? (u32)term_val(a) : ~0u;
+                    u32 b_tid = (term_tag(b) == TAG_TEN) ? (u32)term_val(b) : ~0u;
+                    u32 t_tid = (u32)term_val(tgt);
+                    Shape ysh = SHAPE(1);
+                    const View *yv = st_get(wloc); if (yv) ysh = yv->shape;
+                    Shape tsh = (t_tid < ctx->tensor_count)
+                        ? ctx->tensors[t_tid].view.shape : SHAPE(1);
+                    if (ysh.rank != 2) {
+                        // Non-2D MM — zeros.
+                        Shape one_shape = {.rank = tsh.rank};
+                        for (u32 i = 0; i < tsh.rank; i++) one_shape.dims[i] = 1;
+                        if (one_shape.rank == 0) { one_shape.rank = 1; one_shape.dims[0] = 1; }
+                        f32 z = 0.0f;
+                        Term scalar = thvm_tensor(ctx, &z, one_shape);
+                        int is_sc = (tsh.rank == 0) || (tsh.rank == 1 && tsh.dims[0] == 1);
+                        whnf = is_sc ? scalar : thvm_expand(ctx, scalar, tsh);
+                        ctx->itrs++;
+                        continue;
+                    }
+                    Shape one_ysh = {.rank = ysh.rank};
+                    for (u32 i = 0; i < ysh.rank; i++) one_ysh.dims[i] = 1;
+                    f32 v1 = 1.0f;
+                    Term ones_scalar = thvm_tensor(ctx, &v1, one_ysh);
+                    Term gy = thvm_expand(ctx, ones_scalar, ysh);
+                    u32 ax[2] = {1, 0};
+                    if (t_tid == a_tid && a_tid != ~0u) {
+                        Term bT = thvm_permute(ctx, b, ax, 2);
+                        whnf = thvm_op(ctx, UOP_MM, gy, bT);
+                        ctx->itrs++;
+                        continue;
+                    }
+                    if (t_tid == b_tid && b_tid != ~0u) {
+                        Term aT = thvm_permute(ctx, a, ax, 2);
+                        whnf = thvm_op(ctx, UOP_MM, aT, gy);
+                        ctx->itrs++;
+                        continue;
+                    }
+                    // Neither leaf matches → zeros of target shape.
+                    Shape one_shape = {.rank = tsh.rank};
+                    for (u32 i = 0; i < tsh.rank; i++) one_shape.dims[i] = 1;
+                    if (one_shape.rank == 0) { one_shape.rank = 1; one_shape.dims[0] = 1; }
+                    f32 z = 0.0f;
+                    Term scalar = thvm_tensor(ctx, &z, one_shape);
+                    int is_sc = (tsh.rank == 0) || (tsh.rank == 1 && tsh.dims[0] == 1);
+                    whnf = is_sc ? scalar : thvm_expand(ctx, scalar, tsh);
+                    ctx->itrs++;
+                    continue;
+                }
+
                 // MAX Leibniz: d(max(a,b))/dt = (a>=b)*da + (a<b)*db.
                 if (wuop == UOP_MAX) {
                     Term a = heap_read(ctx, wloc + 0);
@@ -763,6 +836,35 @@ apply: {
             u32 uop = f.flags >> 1;
             Term shape = f.t0;
             whnf = thvm_op_raw(ctx, uop, whnf, shape);
+            ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_GRAD_MM_FWD_PHASE1: {
+            // whnf = da.  Compute l = MM(da, b), descend into GRAD(b, tgt).
+            Term da = whnf;
+            Term a = f.t0, b = f.t1, tgt = f.t2;
+            Term l = wnf_is_era(da) ? term_era() : thvm_op(ctx, UOP_MM, da, b);
+            WnfFrame ph2 = {
+                .kind = WNF_F_GRAD_MM_FWD_PHASE2, .flags = 1,
+                .t0 = l, .t1 = a, .t2 = 0, .t3 = 0
+            };
+            wnf_stack_push(ph2);
+            WnfFrame inner = {
+                .kind = WNF_F_GRAD, .flags = 1,
+                .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+            };
+            wnf_stack_push(inner);
+            next = b;
+            goto enter;
+        }
+
+        case WNF_F_GRAD_MM_FWD_PHASE2: {
+            // whnf = db.  Assemble l + MM(a, db).
+            Term l = f.t0, a = f.t1;
+            Term db = whnf;
+            Term r = wnf_is_era(db) ? term_era() : thvm_op(ctx, UOP_MM, a, db);
+            whnf = wnf_mk_add(ctx, l, r);
             ctx->itrs++;
             continue;
         }

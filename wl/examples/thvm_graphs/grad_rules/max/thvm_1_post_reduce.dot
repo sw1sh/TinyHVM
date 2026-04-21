@@ -3,16 +3,21 @@ digraph G {
   node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
   edge [fontsize=8, fontname="Helvetica"];
 
-  ctr41 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
-  n26 [label="MAX", shape=box, fillcolor="#f0f0f0"];
-  n26 -> ctr41 [label="c0"];
-  n35 [label="MUL", shape=box, fillcolor="#f0f0f0"];
-  n35 -> ctr41 [label="c1"];
-  n29 [label="CMP\n[3]\n@29", shape=box, fillcolor="#cce5ff"];
+  n28 [label="MAX\n[3]\n@28", shape=box, fillcolor="#cce5ff"];
   t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
-  t1 -> n29 [label="a",taillabel="@29",labelfontsize=7,fontcolor="#666666"];
+  t1 -> n28 [label="a",taillabel="@28",labelfontsize=7,fontcolor="#666666"];
   t2 [label="t2\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t2 -> n29 [label="b",taillabel="@30",labelfontsize=7,fontcolor="#666666"];
-  era38 [label="ERA\n@38",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
-  t2 -> era38 [label="p",taillabel="@37",labelfontsize=7,fontcolor="#666666"];
+  t2 -> n28 [label="b",taillabel="@29",labelfontsize=7,fontcolor="#666666"];
+  n39 [label="MUL\n[3]\n@39", shape=box, fillcolor="#cce5ff"];
+  num39_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num39_0 -> n39 [label="a"];
+  n33 -> n39 [label="b"];
+  ctr26 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n28 -> ctr26 [label="c0"];
+  n39 -> ctr26 [label="c1"];
+  n33 [label="CMP\n[3]\n@33", shape=box, fillcolor="#cce5ff"];
+  t1 -> n33 [label="a",taillabel="@33",labelfontsize=7,fontcolor="#666666"];
+  t2 -> n33 [label="b",taillabel="@34",labelfontsize=7,fontcolor="#666666"];
+  era42 [label="ERA\n@42",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  t2 -> era42 [label="p",taillabel="@41",labelfontsize=7,fontcolor="#666666"];
 }

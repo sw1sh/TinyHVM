@@ -15,19 +15,16 @@
 	                Term gy_src = heap_read(ctx, loc + 1);
 	                Term y  = y_src;
 	                Term gy = gy_src;
-	                // GRAD emits CTR{forward, backward} — two output ports on
-	                // the node itself, so callers don't need to DUP the forward
-	                // externally. Drop mode returns the CTR; KEEP/SLOT deposit
-	                // into their bundle and return just the backward handle
-	                // (bundle semantics expect a scalar return).
+	                // GRAD returns just the backward scalar. The forward is
+	                // kept alive by external CTR wrapping done at construction
+	                // (CTR{ y, GRAD } shares y between CTR.c0 and GRAD.y; GRAD's
+	                // firing does not clear y's heap cells so the CTR.c0
+	                // reference stays valid).
 	                #define GRAD_RETURN(r) do { \
                         Term _gr = (r); \
                         if (thvm_grad_mode_get(ctx, loc) == GRAD_MODE_KEEP && \
                             term_tag(_gr) == TAG_ERA && term_val(_gr) == 0) { \
                             _gr = term_num_f32(0.0f); \
-                        } \
-                        if (thvm_grad_mode_get(ctx, loc) == GRAD_MODE_PAIR) { \
-                            _gr = thvm_ctr(ctx, (Term[]){y_src, _gr}, 2); \
                         } \
 	                    heap_set(ctx, loc, term_era()); \
 	                    heap_set(ctx, loc + 1, term_era()); \

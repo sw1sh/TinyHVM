@@ -118,20 +118,22 @@ static int topo_count(const char *rule, int phase, const char *needle) {
     return count;
 }
 
-// Build GRAD(y, gy=free) — no DUP, no external CTR wrap.
-// GRAD's firing rule is responsible for emitting CTR{forward, backward}
-// as its return value, so the forward value and the chain-rule gradient
-// come out of the same node without any caller-side duplication.
+// Build CTR#2 { forward = y, backward = GRAD(y, gy=free) } directly.
+// No DUP of y: CTR.c0 and GRAD's y-slot share the same Term handle.
+// The GRAD rule reads y's children (at heap[y_loc+0/1]) without clearing
+// them, so CTR.c0's forward reference stays valid. When GRAD fires, its
+// return replaces CTR.c1 with the scalar backward; CTR.c0 still points
+// at the original forward expression → final CTR{ forward_expr, backward }.
 static Term mk_grad(TinyHVM *ctx, Term y, Term x) {
     thvm_grad_targets_clear(ctx);
     term_use_clear();
     u64 loc = heap_alloc(ctx, 2);
-    y = linear_use(ctx, y, loc);
     heap_set(ctx, loc + 0, y);
     heap_set(ctx, loc + 1, term_era());         // gy free port
     thvm_grad_target_set(ctx, loc, x);
-    thvm_grad_mode_set(ctx, loc, GRAD_MODE_PAIR);
-    return term_new(TAG_TOP, UOP_GRAD, loc);
+    thvm_grad_mode_set(ctx, loc, GRAD_MODE_DROP);
+    Term grad_top = term_new(TAG_TOP, UOP_GRAD, loc);
+    return thvm_ctr(ctx, (Term[]){y, grad_top}, 2);
 }
 
 static int report(const char *rule, int ok) {

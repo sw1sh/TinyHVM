@@ -1,0 +1,31 @@
+digraph G {
+  // PREV_INTERACTION: DP0_h14_NUM_h14
+  // NEXT_INTERACTION: DP1_h14_NUM_h14
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n9 [label="ADD\n[3]\n@9", shape=box, fillcolor="#cce5ff"];
+  t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> n9 [label="a",taillabel="@9",labelfontsize=7,fontcolor="#666666"];
+  t2 [label="t2\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n9 [label="b",taillabel="@10",labelfontsize=7,fontcolor="#666666"];
+  n19 [label="ADD\n[3]\n@19", shape=box, fillcolor="#cce5ff"];
+  n15 -> n19 [label="a"];
+  n17 -> n19 [label="b"];
+  ctr7 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n9 -> ctr7 [label="c0"];
+  n19 -> ctr7 [label="c1"];
+  n15 [label="GRAD\nd/d(t1)\n@15", shape=box, fillcolor="#e8d0ff"];
+  t1 -> n15 [label="y",taillabel="@15",labelfontsize=7,fontcolor="#666666"];
+  num15_1 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num15_1 -> n15 [label="gy"];
+  n17 [label="GRAD\nd/d(t1)\n@17", shape=box, fillcolor="#e8d0ff"];
+  t2 -> n17 [label="y",taillabel="@17",labelfontsize=7,fontcolor="#666666"];
+  dup14 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1,penwidth=2.0];
+  freedup14_0 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup14 -> freedup14_0 [label="dp0@14",style=dotted,color="#999999"];
+  num_d14 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num_d14 -> dup14 [color="#cc0000",penwidth=2.0];
+  dup14 -> n17 [label="gy (dp1@18)"];
+}

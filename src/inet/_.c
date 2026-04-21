@@ -94,6 +94,41 @@ void thvm_grad_pair(TinyHVM *ctx, u32 label, Term y,
     *out_bwd = term_new(TAG_GB, label, loc);
 }
 
+// Safer target-typed wrapper. Extracts the tensor id from a TAG_TEN
+// target (walking DP/VAR chains first), or uses the ~0u no-match
+// sentinel when the target isn't a tensor. Using this instead of the
+// raw u32 variant avoids the heap-loc/tensor-id collision in the
+// 20-bit label field.
+void thvm_grad_pair_target(TinyHVM *ctx, Term target, Term y,
+                           Term *out_fwd, Term *out_bwd) {
+    u32 tid = ~0u;
+    Term t = target;
+    for (int i = 0; i < 32; i++) {
+        u8 tag = term_tag(t);
+        if (tag == TAG_TEN) { tid = (u32)term_val(t); break; }
+        if (tag == TAG_DP0 || tag == TAG_DP1) {
+            u64 l = term_val(t);
+            if (l == 0 || l >= ctx->heap_pos) break;
+            Term next = heap_read(ctx, l);
+            if (term_is_sub(next)) next = term_strip_sub(next);
+            if (next == t) break;
+            t = next;
+            continue;
+        }
+        if (tag == TAG_VAR) {
+            u64 l = term_val(t);
+            if (l == 0 || l >= ctx->heap_pos) break;
+            Term sub = heap_read(ctx, l);
+            if (term_is_sub(sub)) break;
+            if (sub == t) break;
+            t = sub;
+            continue;
+        }
+        break;
+    }
+    thvm_grad_pair(ctx, tid, y, out_fwd, out_bwd);
+}
+
 // Adapter for legacy bundle-style callers: returns a CTR#n_params where
 // each slot is the bwd of GRAD(y, targets[i]). Caller reads via
 // thvm_grad_bundle_get (CTR child access). y is DUP'd n_params-1 times so

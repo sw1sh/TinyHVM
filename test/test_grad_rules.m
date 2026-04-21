@@ -75,7 +75,7 @@ static int topo_check(const char *rule, int phase,
 
 static Term mk(TinyHVM *ctx, Term y, Term target) {
     Term fwd, bwd;
-    thvm_grad_pair(ctx, (u32)term_val(target), y, &fwd, &bwd);
+    thvm_grad_pair_target(ctx, target, y, &fwd, &bwd);
     return thvm_ctr(ctx, (Term[]){fwd, bwd}, 2);
 }
 
@@ -238,11 +238,11 @@ static int test_second_derivative(void) {
     Term y = thvm_op(ctx, UOP_MUL, a0, a1);
 
     Term fwd1, bwd1;
-    thvm_grad_pair(ctx, (u32)term_val(a), y, &fwd1, &bwd1);
+    thvm_grad_pair_target(ctx, a, y, &fwd1, &bwd1);
     thvm_spawn_detached_era(ctx, fwd1);
 
     Term fwd2, bwd2;
-    thvm_grad_pair(ctx, (u32)term_val(a), bwd1, &fwd2, &bwd2);
+    thvm_grad_pair_target(ctx, a, bwd1, &fwd2, &bwd2);
 
     Term root = thvm_ctr(ctx, (Term[]){fwd2, bwd2}, 2);
     thvm_eval(ctx, root);

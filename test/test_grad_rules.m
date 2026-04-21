@@ -1870,6 +1870,20 @@ static int test_e2e_grad_sub_rhs(void) {
     return report("e2e_grad_sub_rhs", ok);
 }
 
+// Baseline: NEG of an expanded shape-[1] TEN → readback
+static int test_e2e_neg_of_expand(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 od[] = {1.0f};
+    Term one = thvm_tensor(ctx, od, SHAPE(1));
+    Term e = thvm_expand(ctx, one, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_NEG, e, term_era());
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, y));
+    f32 expect[] = {-1,-1,-1};
+    int ok = check_e2e("neg_of_expand", h, expect, 3);
+    thvm_free(ctx);
+    return report("e2e_neg_of_expand", ok);
+}
+
 // d(-a)/da = -1
 static int test_e2e_grad_neg(void) {
     TinyHVM *ctx = thvm_init("cpu");
@@ -1990,6 +2004,7 @@ int main(void) {
     fails += test_e2e_grad_sub_rhs();
     fails += test_e2e_grad_neg();
     fails += test_e2e_grad_relu();
+    fails += test_e2e_neg_of_expand();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

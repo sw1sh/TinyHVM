@@ -970,6 +970,31 @@ static int test_gradu_exp_neg(void) {
     return report("gradu_exp_neg", ok);
 }
 
+// UOP_GRAD2: softplus derivative.  y = log(1 + exp(t)),
+// dy/dt = exp(t) / (1 + exp(t)) = sigmoid(t).
+// Composes: LOG, ADD, EXP via chain rule.
+static int test_gradu_softplus(void) {
+    setup_graph_dir("gradu_softplus");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term one = thvm_tensor(ctx, (f32[]){1, 1, 1}, SHAPE(3));
+    Term et = thvm_op(ctx, UOP_EXP, a, term_era());
+    Term in = thvm_op(ctx, UOP_ADD, one, et);
+    Term y  = thvm_op(ctx, UOP_LOG, in, term_era());
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "LOG", "ADD", "EXP"};
+    const char *post[] = {"CTR", "DIV", "ADD", "EXP", "EXPAND"};
+    int ok = topo_check("gradu_softplus", 0, pre, 5)
+          && topo_check("gradu_softplus", 1, post, 5);
+    return report("gradu_softplus", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1028,6 +1053,7 @@ int main(void) {
     fails += test_gradu_shape_target_diff();
     fails += test_gradu_third_derivative();
     fails += test_gradu_exp_neg();
+    fails += test_gradu_softplus();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

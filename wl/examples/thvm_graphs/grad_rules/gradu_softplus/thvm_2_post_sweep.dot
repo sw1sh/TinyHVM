@@ -1,0 +1,39 @@
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n15 [label="LOG\n[3]\n@15", shape=box, fillcolor="#cce5ff"];
+  n16 -> n15 [label=""];
+  n25 [label="DIV\n[3]\n@25", shape=box, fillcolor="#cce5ff"];
+  n32 -> n25 [label="a"];
+  n16 -> n25 [label="b"];
+  n16 [label="ADD\n[3]\n@16", shape=box, fillcolor="#cce5ff"];
+  t2 [label="t2\n[3]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n16 [label="a",taillabel="@16",labelfontsize=7,fontcolor="#666666"];
+  n18 -> n16 [label="b"];
+  n18 [label="EXP\n[3]\n@18", shape=box, fillcolor="#cce5ff"];
+  t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> n18 [label="",taillabel="@18",labelfontsize=7,fontcolor="#666666"];
+  ctr12 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
+  n15 -> ctr12 [label="c0"];
+  n25 -> ctr12 [label="c1"];
+  n32 [label="ADD\n[3]\n@32", shape=box, fillcolor="#cce5ff"];
+  n34 -> n32 [label="a"];
+  n41 -> n32 [label="b"];
+  n34 [label="EXPAND\n[3]\n@34", shape=box, fillcolor="#fff3cd"];
+  num34_0 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num34_0 -> n34 [label="in"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n34 [label="shape",taillabel="@35",labelfontsize=7,fontcolor="#666666"];
+  n41 [label="MUL\n[3]\n@41", shape=box, fillcolor="#cce5ff"];
+  n43 -> n41 [label="a"];
+  n39 -> n41 [label="b"];
+  n43 [label="EXPAND\n[3]\n@43", shape=box, fillcolor="#fff3cd"];
+  num43_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num43_0 -> n43 [label="in"];
+  t4 [label="t4\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 -> n43 [label="shape",taillabel="@44",labelfontsize=7,fontcolor="#666666"];
+  n39 [label="EXP\n[3]\n@39", shape=box, fillcolor="#cce5ff"];
+  t1 -> n39 [label="",taillabel="@39",labelfontsize=7,fontcolor="#666666"];
+}

@@ -222,6 +222,23 @@ static int test_pad(void) {
     return report("pad", ok);
 }
 
+static int test_assign(void) {
+    setup_graph_dir("assign");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3}, bd[] = {4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_assign(ctx, a, b);
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "ASSIGN"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("assign", 0, pre, 3)
+          && topo_check("assign", 1, post, 1);
+    return report("assign", ok);
+}
+
 static int test_mm(void) {
     setup_graph_dir("mm");
     TinyHVM *ctx = thvm_init("cpu");
@@ -296,6 +313,7 @@ int main(void) {
     fails += test_rmax();
     fails += test_shrink();
     fails += test_pad();
+    fails += test_assign();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

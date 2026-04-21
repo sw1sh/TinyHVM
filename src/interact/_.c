@@ -1037,12 +1037,16 @@ inet_step:
                     u32 ttid = (u32)term_val(tgt);
                     Shape tsh = (ttid < ctx->tensor_count)
                         ? ctx->tensors[ttid].view.shape : SHAPE(1);
-                    // Wrap scalar in a shape-[1] TEN so EXPAND has a live
-                    // buf_id to share (avoids lazy TOP that later defers).
+                    // Wrap scalar in a rank-matching ones-like TEN so EXPAND's
+                    // rank check (src rank == dst rank) passes for multi-dim
+                    // target shapes.  dims are all 1, numel=1 backing.
+                    Shape ones_shape = {.rank = tsh.rank};
+                    for (u32 i = 0; i < tsh.rank; i++) ones_shape.dims[i] = 1;
+                    if (ones_shape.rank == 0) { ones_shape.rank = 1; ones_shape.dims[0] = 1; }
                     f32 zd = 0.0f;
-                    Term zten = thvm_tensor(ctx, &zd, SHAPE(1));
-                    Term out = (tsh.rank > 0 && !(tsh.rank == 1 && tsh.dims[0] == 1))
-                        ? thvm_expand(ctx, zten, tsh) : zten;
+                    Term zten = thvm_tensor(ctx, &zd, ones_shape);
+                    int is_scalar = (tsh.rank == 0) || (tsh.rank == 1 && tsh.dims[0] == 1);
+                    Term out = is_scalar ? zten : thvm_expand(ctx, zten, tsh);
                     ctx->itrs++; RETURN_REDUCED(out);
                 }
                 if (term_tag(y) == TAG_TEN && term_tag(tgt) == TAG_TEN) {
@@ -1050,10 +1054,13 @@ inet_step:
                     u32 ttid = (u32)term_val(tgt);
                     Shape tsh = (ttid < ctx->tensor_count)
                         ? ctx->tensors[ttid].view.shape : SHAPE(1);
+                    Shape ones_shape = {.rank = tsh.rank};
+                    for (u32 i = 0; i < tsh.rank; i++) ones_shape.dims[i] = 1;
+                    if (ones_shape.rank == 0) { ones_shape.rank = 1; ones_shape.dims[0] = 1; }
                     f32 sd = (ytid == ttid) ? 1.0f : 0.0f;
-                    Term sten = thvm_tensor(ctx, &sd, SHAPE(1));
-                    Term out = (tsh.rank > 0 && !(tsh.rank == 1 && tsh.dims[0] == 1))
-                        ? thvm_expand(ctx, sten, tsh) : sten;
+                    Term sten = thvm_tensor(ctx, &sd, ones_shape);
+                    int is_scalar = (tsh.rank == 0) || (tsh.rank == 1 && tsh.dims[0] == 1);
+                    Term out = is_scalar ? sten : thvm_expand(ctx, sten, tsh);
                     ctx->itrs++;
                     RETURN_REDUCED(out);
                 }
@@ -1354,10 +1361,13 @@ inet_step:
                         u32 ttid = (u32)term_val(tgt);
                         Shape tsh = (ttid < ctx->tensor_count)
                             ? ctx->tensors[ttid].view.shape : SHAPE(1);
+                        Shape ones_shape = {.rank = tsh.rank};
+                        for (u32 i = 0; i < tsh.rank; i++) ones_shape.dims[i] = 1;
+                        if (ones_shape.rank == 0) { ones_shape.rank = 1; ones_shape.dims[0] = 1; }
                         f32 zd = 0.0f;
-                        Term zten = thvm_tensor(ctx, &zd, SHAPE(1));
-                        Term out = (tsh.rank > 0 && !(tsh.rank == 1 && tsh.dims[0] == 1))
-                            ? thvm_expand(ctx, zten, tsh) : zten;
+                        Term zten = thvm_tensor(ctx, &zd, ones_shape);
+                        int is_scalar = (tsh.rank == 0) || (tsh.rank == 1 && tsh.dims[0] == 1);
+                        Term out = is_scalar ? zten : thvm_expand(ctx, zten, tsh);
                         ctx->itrs++; RETURN_REDUCED(out);
                     }
                     // MUL (Leibniz): d(a*b)/dt = da*b + a*db.

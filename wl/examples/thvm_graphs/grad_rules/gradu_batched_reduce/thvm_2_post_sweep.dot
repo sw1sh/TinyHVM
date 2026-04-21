@@ -22,12 +22,12 @@ digraph G {
   n33 -> n37 [label="a"];
   n35 -> n37 [label="b"];
   n39 [label="EXPAND\n[2,3]\n@39", shape=box, fillcolor="#fff3cd"];
-  t4 [label="t4\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 [label="t4\n[1,1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t4 -> n39 [label="in",taillabel="@39",labelfontsize=7,fontcolor="#666666"];
   t5 [label="t5\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t5 -> n39 [label="shape",taillabel="@40",labelfontsize=7,fontcolor="#666666"];
   n41 [label="EXPAND\n[2,3]\n@41", shape=box, fillcolor="#fff3cd"];
-  t6 [label="t6\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t6 [label="t6\n[1,1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
   t6 -> n41 [label="in",taillabel="@41",labelfontsize=7,fontcolor="#666666"];
   t7 [label="t7\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t7 -> n41 [label="shape",taillabel="@42",labelfontsize=7,fontcolor="#666666"];

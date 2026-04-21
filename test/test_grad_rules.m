@@ -898,6 +898,31 @@ static int test_gradu_cubic(void) {
     return report("gradu_cubic", ok);
 }
 
+// UOP_GRAD2: target shape differs from y's operands.  Leaf emits
+// EXPAND(NUM(0), target.shape) even though y is unrelated shape — the
+// bwd tensor must match target.shape, not y's.
+static int test_gradu_shape_target_diff(void) {
+    setup_graph_dir("gradu_shape_target_diff");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3}, bd[] = {4,5,6};
+    f32 cd[] = {7, 8};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term c = thvm_tensor(ctx, cd, SHAPE(2));   // target, different shape
+    Term y = thvm_op(ctx, UOP_ADD, a, b);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, c)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "ADD"};
+    // bwd = ADD(EXPAND(0, [2]), EXPAND(0, [2])) = 0 of target's shape.
+    const char *post[] = {"CTR", "ADD", "EXPAND"};
+    int ok = topo_check("gradu_shape_target_diff", 0, pre, 3)
+          && topo_check("gradu_shape_target_diff", 1, post, 3);
+    return report("gradu_shape_target_diff", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -953,6 +978,7 @@ int main(void) {
     fails += test_gradu_deep_chain();
     fails += test_gradu_sub_rhs();
     fails += test_gradu_cubic();
+    fails += test_gradu_shape_target_diff();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

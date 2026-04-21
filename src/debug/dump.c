@@ -1362,6 +1362,12 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     fprintf(f, "  num_d%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", (unsigned long long)_cur, (double)_fv); \
                     fprintf(f, "  num_d%llu -> dup%llu%s;\n", (unsigned long long)_cur, (unsigned long long)_cur, _hl_principal ? " [color=\"#cc0000\",penwidth=2.0]" : ""); } \
                 else if (_stag == TAG_ANY) { EMIT_ANY_NODE(_cur); fprintf(f, "  any%llu -> dup%llu%s;\n", (unsigned long long)_cur, (unsigned long long)_cur, _hl_principal ? " [color=\"#cc0000\",penwidth=2.0]" : ""); } \
+                else if (_stag == TAG_GF || _stag == TAG_GB) { \
+                    EMIT_GRAD_CELL(term_val(_shared)); \
+                    const char *_gport = (_stag == TAG_GF) ? "fwd" : "bwd"; \
+                    fprintf(f, "  grad%llu -> dup%llu [label=\"%s\"];\n", \
+                            (unsigned long long)term_val(_shared), (unsigned long long)_cur, _gport); \
+                } \
                 else { EMIT_RAW_NODE(_cur, _shared); fprintf(f, "  h%llu -> dup%llu%s;\n", (unsigned long long)_cur, (unsigned long long)_cur, _hl_principal ? " [color=\"#cc0000\",penwidth=2.0]" : ""); } \
             } \
             break; \

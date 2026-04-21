@@ -37,18 +37,17 @@ digraph G {
   n51 -> n53 [label="b"];
   n35 [label="MUL\n[3]\n@35", shape=box, fillcolor="#cce5ff"];
   dup33 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
-  h33 [label="h33\ntag=27", shape=box, fillcolor="#dddddd", fontsize=8];
-  h33 -> dup33;
+  grad31 [label="GRAD\n@31", shape=invtriangle, fillcolor="#e8d0ff"];
+  grad31 -> dup33 [label="fwd"];
   dup33 -> n35 [label="a (dp0@35)"];
   t1 -> n35 [label="b",taillabel="@36",labelfontsize=7,fontcolor="#666666"];
   n47 [label="MUL\n[3]\n@47", shape=box, fillcolor="#cce5ff"];
   t1 -> n47 [label="a",taillabel="@47",labelfontsize=7,fontcolor="#666666"];
   dup46 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
-  h46 [label="h46\ntag=27", shape=box, fillcolor="#dddddd", fontsize=8];
-  h46 -> dup46;
+  grad44 [label="GRAD\n@44", shape=invtriangle, fillcolor="#e8d0ff"];
+  grad44 -> dup46 [label="fwd"];
   dup46 -> n47 [label="b (dp0@48)"];
   n37 [label="MUL\n[3]\n@37", shape=box, fillcolor="#cce5ff"];
-  grad31 [label="GRAD\n@31", shape=invtriangle, fillcolor="#e8d0ff"];
   grad31 -> n37 [label="bwd"];
   t1 -> n37 [label="b",taillabel="@38",labelfontsize=7,fontcolor="#666666"];
   n39 [label="MUL\n[1]\n@39", shape=box, fillcolor="#cce5ff"];
@@ -61,6 +60,5 @@ digraph G {
   dup46 -> n49 [label="b (dp1@50)"];
   n51 [label="MUL\n[3]\n@51", shape=box, fillcolor="#cce5ff"];
   t1 -> n51 [label="a",taillabel="@51",labelfontsize=7,fontcolor="#666666"];
-  grad44 [label="GRAD\n@44", shape=invtriangle, fillcolor="#e8d0ff"];
   grad44 -> n51 [label="bwd"];
 }

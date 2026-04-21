@@ -230,6 +230,38 @@ static int test_pad(void) {
 // Multi-target bundle: gradient wrt TWO parameters at once.
 //   bundle = grad_pair_bundle(MUL(a, b), [a, b])
 // Expected bundle[0] = ∂(a·b)/∂a = b, bundle[1] = ∂(a·b)/∂b = a.
+// Chained compute: GRAD output feeds a forward MUL.
+//     y        = MUL(a, a)               // forward
+//     (_, g)   = GRAD(y, a)               // g = 2a
+//     z        = MUL(g, g)                // z = 4a²
+// Produces a graph where TAG_GB auxes appear as operands of downstream
+// compute TOPs — checks that the renderer + arity lookups handle this.
+static int test_chained_compute(void) {
+    setup_graph_dir("chained_compute");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term a0, a1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+    Term y = thvm_op(ctx, UOP_MUL, a0, a1);
+
+    Term fwd, g;
+    thvm_grad_pair_target(ctx, a, y, &fwd, &g);
+    thvm_spawn_detached_era(ctx, fwd);
+
+    /* DUP g so it can be used twice in MUL(g, g) */
+    Term g0, g1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
+    Term z = thvm_op(ctx, UOP_MUL, g0, g1);
+
+    thvm_eval(ctx, z);
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "MUL"};
+    int ok = topo_check("chained_compute", 0, pre, 2);
+    return report("chained", ok);
+}
+
 static int test_bundle_multitarget(void) {
     setup_graph_dir("bundle_multitarget");
     TinyHVM *ctx = thvm_init("cpu");
@@ -398,6 +430,7 @@ int main(void) {
     fails += test_pad();
     fails += test_assign();
     fails += test_bundle_multitarget();
+    fails += test_chained_compute();
     fails += test_second_derivative();
     fails += test_target_nomatch();
     printf("\ntotal failures: %d\n", fails);

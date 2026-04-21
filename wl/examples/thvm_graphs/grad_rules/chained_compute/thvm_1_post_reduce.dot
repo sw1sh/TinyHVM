@@ -1,0 +1,39 @@
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  n18 [label="MUL\n[3]\n@18", shape=box, fillcolor="#cce5ff"];
+  dup16 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup16_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup16 -> freedup16_1 [label="dp1@16",style=dotted,color="#999999"];
+  t1 [label="t1\n[3]\nf32 cpu grad",shape=box,fillcolor="#ffe0e0"];
+  t1 -> dup16[label="",taillabel="@16",labelfontsize=7,fontcolor="#666666"];
+  dup16 -> n18 [label="a (dp0@18)"];
+  dup17 [label="", shape=circle, width=0.12, height=0.12, fixedsize=true, fillcolor="#d4b8e8", color="#8a63b7", fontsize=1];
+  freedup17_1 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  dup17 -> freedup17_1 [label="dp1@17",style=dotted,color="#999999"];
+  t1 -> dup17[label="",taillabel="@17",labelfontsize=7,fontcolor="#666666"];
+  dup17 -> n18 [label="b (dp0@19)"];
+  free18_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n18 -> free18_1000 [label="out"];
+  era6 [label="ERA\n@6",shape=circle,width=0.38,height=0.38,fixedsize=true,fillcolor="#ffb8b8",fontsize=7];
+  h5 [label="h5\ntag=27", shape=box, fillcolor="#dddddd", fontsize=8];
+  h5 -> era6 [label="p"];
+  n24 [label="ADD\n[3]\n@24", shape=box, fillcolor="#cce5ff"];
+  n20 -> n24 [label="a"];
+  n22 -> n24 [label="b"];
+  n10 [label="MUL\n[3]\n@10", shape=box, fillcolor="#cce5ff",color="#1f78ff",penwidth=2.2];
+  n24 -> n10 [label="a"];
+  n24 -> n10 [label="b"];
+  free10_1000 [label="",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor="#ffffff",color="#888888",fontsize=1];
+  n10 -> free10_1000 [label="out"];
+  n20 [label="MUL\n[3]\n@20", shape=box, fillcolor="#cce5ff"];
+  num20_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num20_0 -> n20 [label="a"];
+  t1 -> n20 [label="b",taillabel="@21",labelfontsize=7,fontcolor="#666666"];
+  n22 [label="MUL\n[3]\n@22", shape=box, fillcolor="#cce5ff"];
+  t1 -> n22 [label="a",taillabel="@22",labelfontsize=7,fontcolor="#666666"];
+  num22_1 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num22_1 -> n22 [label="b"];
+}

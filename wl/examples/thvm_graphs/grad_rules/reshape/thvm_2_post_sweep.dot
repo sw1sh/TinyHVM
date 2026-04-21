@@ -8,8 +8,12 @@ digraph G {
   t1 -> n10 [label="in",taillabel="@10",labelfontsize=7,fontcolor="#666666"];
   t2 [label="t2\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t2 -> n10 [label="shape",taillabel="@11",labelfontsize=7,fontcolor="#666666"];
+  n12 [label="RESHAPE\n[6]\n@12", shape=box, fillcolor="#fff3cd"];
+  num12_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
+  num12_0 -> n12 [label="in"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n12 [label="shape",taillabel="@13",labelfontsize=7,fontcolor="#666666"];
   ctr6 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];
   n10 -> ctr6 [label="c0"];
-  grad3 [label="GRAD\n@3", shape=invtriangle, fillcolor="#e8d0ff"];
-  grad3 -> ctr6 [label="c1 (bwd)"];
+  n12 -> ctr6 [label="c1"];
 }

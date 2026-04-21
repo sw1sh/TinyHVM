@@ -979,13 +979,12 @@ era_continue:
                     GRAD_STATE_RETURN(fwd, bwd);
                 }
 
-                // View ops share the same shape operand for fwd and bwd:
-                // RESHAPE / EXPAND / SHRINK / PAD / PERMUTE. Forward applies
-                // the view to the forward operand; backward flows the derived
-                // gradient through a_bwd unchanged (topology placeholder —
-                // shape-aware inverse view needs the original operand's
-                // shape metadata, which is the job of sum_to_shape-style
-                // helpers a later pass will add).
+                // View ops: forward applies the view to fa, backward sends
+                // da through the inverse view. For RESHAPE we always have
+                // the operand's shape available; for EXPAND we sum over the
+                // broadcast axes. SHRINK / PAD / PERMUTE topology-only for
+                // now (need more metadata than the shape-tensor operand
+                // reveals, but the inverse op exists — future pass).
                 if (uop == UOP_RESHAPE || uop == UOP_EXPAND ||
                     uop == UOP_SHRINK  || uop == UOP_PAD    ||
                     uop == UOP_PERMUTE) {
@@ -994,7 +993,40 @@ era_continue:
                     Term a_fwd, a_bwd;
                     thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
                     Term fwd = thvm_op_raw(ctx, uop, a_fwd, shape);
-                    Term bwd = a_bwd;
+
+                    // Resolve y's shape (output) and a's shape (input).
+                    Shape a_shape = SHAPE(1);
+                    Shape y_shape = SHAPE(1);
+                    if (term_tag(a) == TAG_TEN) {
+                        u32 aid = (u32)term_val(a);
+                        if (aid < ctx->tensor_count)
+                            a_shape = ctx->tensors[aid].view.shape;
+                    } else if (term_tag(a) == TAG_TOP) {
+                        const View *av = st_get(term_val(a));
+                        if (av) a_shape = av->shape;
+                    }
+                    const View *yv = st_get(yloc);
+                    if (yv) y_shape = yv->shape;
+
+                    Term bwd;
+                    if (uop == UOP_EXPAND) {
+                        // dA = sum_to_shape(da, y_shape, a_shape): reduces
+                        // the broadcasted axes. Needs both shapes; skip the
+                        // reduction if shapes are unknown/equal.
+                        if (y_shape.rank != 0 && a_shape.rank != 0)
+                            bwd = sum_to_shape(ctx, a_bwd, y_shape, a_shape);
+                        else
+                            bwd = a_bwd;
+                    } else if (uop == UOP_RESHAPE) {
+                        // dA = reshape(da, a_shape).
+                        if (a_shape.rank != 0)
+                            bwd = thvm_reshape(ctx, a_bwd, a_shape);
+                        else
+                            bwd = a_bwd;
+                    } else {
+                        // SHRINK/PAD/PERMUTE: pass through (topology-only).
+                        bwd = a_bwd;
+                    }
                     GRAD_STATE_RETURN(fwd, bwd);
                 }
 

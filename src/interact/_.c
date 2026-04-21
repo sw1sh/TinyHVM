@@ -1199,6 +1199,109 @@ inet_step:
                             ? thvm_expand(ctx, da, a_shape) : da;
                         ctx->itrs++; RETURN_REDUCED(out);
                     }
+                    // SHRINK: dA = pad(da, complementary pairs of shrink pairs).
+                    if (yuop == UOP_SHRINK) {
+                        Term a     = heap_read(ctx, yloc + 0);
+                        Term shape = heap_read(ctx, yloc + 1);
+                        Shape a_shape = SHAPE(1);
+                        if (term_tag(a) == TAG_TEN) {
+                            u32 aid = (u32)term_val(a);
+                            if (aid < ctx->tensor_count)
+                                a_shape = ctx->tensors[aid].view.shape;
+                        } else if (term_tag(a) == TAG_TOP) {
+                            const View *av = st_get(term_val(a));
+                            if (av) a_shape = av->shape;
+                        }
+                        Term da = thvm_grad_u(ctx, a, tgt);
+                        Term out = da;
+                        if (term_tag(shape) == TAG_TEN && a_shape.rank > 0) {
+                            u32 sid = (u32)term_val(shape);
+                            u32 nd = a_shape.rank;
+                            u32 sf[MAX_DIM * 2]; tensor_meta_read_u32(ctx, sid, sf, MAX_DIM * 2);
+                            u32 pp[MAX_DIM * 2];
+                            for (u32 j = 0; j < nd; j++) {
+                                pp[j*2]   = sf[j*2];
+                                pp[j*2+1] = a_shape.dims[j] - sf[j*2+1];
+                            }
+                            out = thvm_pad(ctx, da, pp, nd);
+                        }
+                        ctx->itrs++; RETURN_REDUCED(out);
+                    }
+                    // PAD: dA = shrink(da, complementary pairs of pad pairs).
+                    if (yuop == UOP_PAD) {
+                        Term a     = heap_read(ctx, yloc + 0);
+                        Term shape = heap_read(ctx, yloc + 1);
+                        Shape a_shape = SHAPE(1);
+                        if (term_tag(a) == TAG_TEN) {
+                            u32 aid = (u32)term_val(a);
+                            if (aid < ctx->tensor_count)
+                                a_shape = ctx->tensors[aid].view.shape;
+                        } else if (term_tag(a) == TAG_TOP) {
+                            const View *av = st_get(term_val(a));
+                            if (av) a_shape = av->shape;
+                        }
+                        Term da = thvm_grad_u(ctx, a, tgt);
+                        Term out = da;
+                        if (term_tag(shape) == TAG_TEN && a_shape.rank > 0) {
+                            u32 pid = (u32)term_val(shape);
+                            u32 nd = a_shape.rank;
+                            u32 pf[MAX_DIM * 2]; tensor_meta_read_u32(ctx, pid, pf, MAX_DIM * 2);
+                            u32 sp[MAX_DIM * 2];
+                            for (u32 j = 0; j < nd; j++) {
+                                sp[j*2]   = pf[j*2];
+                                sp[j*2+1] = pf[j*2] + a_shape.dims[j];
+                            }
+                            out = thvm_shrink(ctx, da, sp, nd);
+                        }
+                        ctx->itrs++; RETURN_REDUCED(out);
+                    }
+                    // EXPAND: dA = sum_to_shape(da, y_shape, a_shape).
+                    if (yuop == UOP_EXPAND) {
+                        Term a = heap_read(ctx, yloc + 0);
+                        Shape a_shape = SHAPE(1), y_shape = SHAPE(1);
+                        if (term_tag(a) == TAG_TEN) {
+                            u32 aid = (u32)term_val(a);
+                            if (aid < ctx->tensor_count)
+                                a_shape = ctx->tensors[aid].view.shape;
+                        } else if (term_tag(a) == TAG_TOP) {
+                            const View *av = st_get(term_val(a));
+                            if (av) a_shape = av->shape;
+                        }
+                        const View *yv = st_get(yloc);
+                        if (yv) y_shape = yv->shape;
+                        Term da = thvm_grad_u(ctx, a, tgt);
+                        Term out = (y_shape.rank != 0 && a_shape.rank != 0)
+                            ? sum_to_shape(ctx, da, y_shape, a_shape) : da;
+                        ctx->itrs++; RETURN_REDUCED(out);
+                    }
+                    // RMAX: dA = da * (a == expand(rmax(a))).  a used 3x.
+                    if (yuop == UOP_RMAX) {
+                        Term a    = heap_read(ctx, yloc + 0);
+                        Term axes = heap_read(ctx, yloc + 1);
+                        Shape a_shape = SHAPE(1);
+                        if (term_tag(a) == TAG_TEN) {
+                            u32 aid = (u32)term_val(a);
+                            if (aid < ctx->tensor_count)
+                                a_shape = ctx->tensors[aid].view.shape;
+                        } else if (term_tag(a) == TAG_TOP) {
+                            const View *av = st_get(term_val(a));
+                            if (av) a_shape = av->shape;
+                        }
+                        Term a0, a1, a2;
+                        thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                        Term a1b;
+                        thvm_dup(ctx, thvm_fresh_label(ctx), a1, &a1b, &a2);
+                        Term da = thvm_grad_u(ctx, a0, tgt);
+                        Term rm = thvm_op_raw(ctx, UOP_RMAX, a1b, axes);
+                        Term rm_bc = (a_shape.rank != 0)
+                            ? thvm_expand(ctx, rm, a_shape) : rm;
+                        // mask = 1 - (rm_bc > a2)  == (a2 >= rm_bc).
+                        Term gt = thvm_op_raw(ctx, UOP_CMP, rm_bc, a2);
+                        Term one = term_num_f32(1.0f);
+                        Term mask = thvm_op_raw(ctx, UOP_SUB, one, gt);
+                        Term out = thvm_op_raw(ctx, UOP_MUL, da, mask);
+                        ctx->itrs++; RETURN_REDUCED(out);
+                    }
                     // CMP: non-differentiable. Zero contribution, shape-matched.
                     if (yuop == UOP_CMP) {
                         u32 ttid = (u32)term_val(tgt);

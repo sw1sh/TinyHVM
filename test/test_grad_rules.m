@@ -702,6 +702,82 @@ static int test_gradu_sum(void) {
     return report("gradu_sum", ok);
 }
 
+// UOP_GRAD2: SHRINK, PAD, EXPAND, RMAX.
+static int test_gradu_shrink(void) {
+    setup_graph_dir("gradu_shrink");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(6));
+    thvm_set_requires_grad(ctx, a);
+    u32 pairs[2] = {1, 5};
+    Term y = thvm_shrink(ctx, a, pairs, 1);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "SHRINK"};
+    const char *post[] = {"CTR", "PAD", "EXPAND"};
+    int ok = topo_check("gradu_shrink", 0, pre, 3)
+          && topo_check("gradu_shrink", 1, post, 3);
+    return report("gradu_shrink", ok);
+}
+static int test_gradu_pad(void) {
+    setup_graph_dir("gradu_pad");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4};
+    Term a = thvm_tensor(ctx, ad, SHAPE(4));
+    thvm_set_requires_grad(ctx, a);
+    u32 pairs[2] = {1, 1};
+    Term y = thvm_pad(ctx, a, pairs, 1);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "PAD"};
+    const char *post[] = {"CTR", "SHRINK", "EXPAND"};
+    int ok = topo_check("gradu_pad", 0, pre, 3)
+          && topo_check("gradu_pad", 1, post, 3);
+    return report("gradu_pad", ok);
+}
+static int test_gradu_expand(void) {
+    setup_graph_dir("gradu_expand");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_expand(ctx, thvm_reshape(ctx, a, SHAPE(1, 3)), SHAPE(4, 3));
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "EXPAND"};
+    const char *post[] = {"CTR", "SUM", "EXPAND"};
+    int ok = topo_check("gradu_expand", 0, pre, 3)
+          && topo_check("gradu_expand", 1, post, 3);
+    return report("gradu_expand", ok);
+}
+static int test_gradu_rmax(void) {
+    setup_graph_dir("gradu_rmax");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 5, 3, 2};
+    Term a = thvm_tensor(ctx, ad, SHAPE(4));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_rmax_axes(ctx, a, (u32[]){0}, 1);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "RMAX"};
+    const char *post[] = {"CTR", "RMAX", "CMP", "MUL"};
+    int ok = topo_check("gradu_rmax", 0, pre, 3)
+          && topo_check("gradu_rmax", 1, post, 4);
+    return report("gradu_rmax", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -748,6 +824,10 @@ int main(void) {
     fails += test_gradu_reshape();
     fails += test_gradu_permute();
     fails += test_gradu_sum();
+    fails += test_gradu_shrink();
+    fails += test_gradu_pad();
+    fails += test_gradu_expand();
+    fails += test_gradu_rmax();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

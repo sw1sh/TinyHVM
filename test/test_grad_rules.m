@@ -1870,6 +1870,22 @@ static int test_e2e_grad_sub_rhs(void) {
     return report("e2e_grad_sub_rhs", ok);
 }
 
+// Baseline: ADD of two expanded shape-[1] TENs → readback [1+0, 1+0, 1+0].
+static int test_e2e_add_of_expands(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1.0f}, bd[] = {0.0f};
+    Term one  = thvm_tensor(ctx, ad, SHAPE(1));
+    Term zero = thvm_tensor(ctx, bd, SHAPE(1));
+    Term e1 = thvm_expand(ctx, one,  SHAPE(3));
+    Term e0 = thvm_expand(ctx, zero, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_ADD, e1, e0);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, y));
+    f32 expect[] = {1, 1, 1};
+    int ok = check_e2e("add_of_expands", h, expect, 3);
+    thvm_free(ctx);
+    return report("e2e_add_of_expands", ok);
+}
+
 // Baseline: NEG of an expanded shape-[1] TEN → readback
 static int test_e2e_neg_of_expand(void) {
     TinyHVM *ctx = thvm_init("cpu");
@@ -2046,6 +2062,7 @@ int main(void) {
     fails += test_e2e_grad_sub_rhs();
     fails += test_e2e_grad_neg();
     fails += test_e2e_grad_relu();
+    fails += test_e2e_add_of_expands();
     fails += test_e2e_neg_of_expand();
     fails += test_e2e_grad_exp();
     fails += test_e2e_grad_sqrt();

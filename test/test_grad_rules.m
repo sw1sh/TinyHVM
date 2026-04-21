@@ -427,6 +427,28 @@ static int test_self_mul(void) {
     return report("self_mul", ok);
 }
 
+// y = t1 + t1*t2, d/dt1 = 1 + t2.  Target appears both at a top-level
+// ADD operand and nested inside MUL — walks exercise the per-leaf
+// tid match in the general chain-rule composition.
+static int test_nested_reuse(void) {
+    setup_graph_dir("nested_reuse");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3}, bd[] = {4, 5, 6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term a0, a1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+    Term y = thvm_op(ctx, UOP_ADD, a0, thvm_op(ctx, UOP_MUL, a1, b));
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "ADD", "MUL"};
+    const char *post[] = {"CTR", "ADD", "MUL"};
+    int ok = topo_check("nested_reuse", 0, pre, 4)
+          && topo_check("nested_reuse", 1, post, 3);
+    return report("nested_reuse", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -454,6 +476,7 @@ int main(void) {
     fails += test_second_derivative();
     fails += test_target_nomatch();
     fails += test_self_mul();
+    fails += test_nested_reuse();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

@@ -136,6 +136,56 @@ UNA_TEST(log,  "log",  UOP_LOG,  "LOG")
 UNA_TEST(sqrt, "sqrt", UOP_SQRT, "SQRT")
 UNA_TEST(relu, "relu", UOP_RELU, "RELU")
 
+// ─── view ops ──────────────────────────────────────────────────────
+
+static int test_reshape(void) {
+    setup_graph_dir("reshape");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(6));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_reshape(ctx, a, SHAPE(2, 3));
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "RESHAPE"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("reshape", 0, pre, 3)
+          && topo_check("reshape", 1, post, 1);
+    return report("reshape", ok);
+}
+
+static int test_expand(void) {
+    setup_graph_dir("expand");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_expand(ctx, thvm_reshape(ctx, a, SHAPE(1, 3)), SHAPE(4, 3));
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "EXPAND"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("expand", 0, pre, 3)
+          && topo_check("expand", 1, post, 1);
+    return report("expand", ok);
+}
+
+static int test_permute(void) {
+    setup_graph_dir("permute");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(2, 3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_permute(ctx, a, (u32[]){1, 0}, 2);
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "PERMUTE"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("permute", 0, pre, 3)
+          && topo_check("permute", 1, post, 1);
+    return report("permute", ok);
+}
+
 // ─── reduction SUM ─────────────────────────────────────────────────
 
 static int test_sum(void) {
@@ -168,6 +218,9 @@ int main(void) {
     fails += test_sqrt();
     fails += test_relu();
     fails += test_sum();
+    fails += test_reshape();
+    fails += test_expand();
+    fails += test_permute();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

@@ -961,19 +961,21 @@ era_continue:
                     GRAD_STATE_RETURN(fwd, bwd);
                 }
 
-                // RESHAPE: view op — fwd = RESHAPE(fa, shape),
-                // bwd = RESHAPE(da, a_shape). For topology, forward the
-                // shape operand through directly.
-                if (uop == UOP_RESHAPE) {
-                    Term a = heap_read(ctx, yloc + 0);
+                // View ops share the same shape operand for fwd and bwd:
+                // RESHAPE / EXPAND / SHRINK / PAD / PERMUTE. Forward applies
+                // the view to the forward operand; backward flows the derived
+                // gradient through a_bwd unchanged (topology placeholder —
+                // shape-aware inverse view needs the original operand's
+                // shape metadata, which is the job of sum_to_shape-style
+                // helpers a later pass will add).
+                if (uop == UOP_RESHAPE || uop == UOP_EXPAND ||
+                    uop == UOP_SHRINK  || uop == UOP_PAD    ||
+                    uop == UOP_PERMUTE) {
+                    Term a     = heap_read(ctx, yloc + 0);
                     Term shape = heap_read(ctx, yloc + 1);
                     Term a_fwd, a_bwd;
                     thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
-                    Term fwd = thvm_op_raw(ctx, UOP_RESHAPE, a_fwd, shape);
-                    /* Backward reshape back to a's original shape is not
-                     * expressible without the original shape metadata; for
-                     * the topology cut, return a_bwd unchanged. Proper
-                     * shape-aware rules land with sum_to_shape support. */
+                    Term fwd = thvm_op_raw(ctx, uop, a_fwd, shape);
                     Term bwd = a_bwd;
                     GRAD_STATE_RETURN(fwd, bwd);
                 }

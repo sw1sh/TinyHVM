@@ -1,10 +1,8 @@
-// test_grad_rules.m — per-rule topology for the new TAG_GF/TAG_GB GRAD pair.
+// test_grad_rules.m — per-rule topology + end-to-end tests for UOP_GRAD.
 //
 // Each sub-test:
 //   1. Builds a small forward:   y = uop(inputs...)
-//   2. Constructs:
-//          (fwd, bwd) = thvm_grad_pair(ctx, target_tid, y)
-//          root       = CTR#2 { fwd, bwd }
+//   2. Constructs:  bwd = thvm_grad(ctx, y, target)
 //   3. THVM_GRAPH + THVM_GRAPH_STOP_AFTER_SWEEP → emits thvm_0..thvm_2
 //      phase dumps under graphs/grad_rules/<rule>/.
 //   4. Parses thvm_1_post_reduce.dot and asserts expected chain-rule
@@ -73,12 +71,12 @@ static int topo_check(const char *rule, int phase,
     return ok;
 }
 
-// mk() builds CTR{y_fwd, GRAD2(y_bwd, target)}.  y is DUP'd so both the
-// forward consumer (c0) and the GRAD2 sub-term see it.
+// mk() builds CTR{y_fwd, GRAD(y_bwd, target)}.  y is DUP'd so both the
+// forward consumer (c0) and the GRAD sub-term see it.
 static Term mk(TinyHVM *ctx, Term y, Term target) {
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    return thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, target)}, 2);
+    return thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, target)}, 2);
 }
 
 static int report(const char *name, int ok) {
@@ -236,7 +234,7 @@ static int test_pad(void) {
 //     y        = MUL(a, a)               // forward
 //     (_, g)   = GRAD(y, a)               // g = 2a
 //     z        = MUL(g, g)                // z = 4a²
-// Produces a graph where TAG_GB auxes appear as operands of downstream
+// Produces a graph where UOP_GRAD child auxes appear as operands of downstream
 // compute TOPs — checks that the renderer + arity lookups handle this.
 static int test_chained_compute(void) {
     setup_graph_dir("chained_compute");
@@ -248,14 +246,14 @@ static int test_chained_compute(void) {
     thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
     Term y = thvm_op(ctx, UOP_MUL, a0, a1);
 
-    Term g = thvm_grad_u(ctx, y, a);
+    Term g = thvm_grad(ctx, y, a);
     Term g0, g1;
     thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
     Term z = thvm_op(ctx, UOP_MUL, g0, g1);
 
     thvm_eval(ctx, z);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD2", "MUL"};
+    const char *pre[]  = {"GRAD", "MUL"};
     int ok = topo_check("chained_compute", 0, pre, 2);
     return report("chained", ok);
 }
@@ -267,17 +265,17 @@ static int test_bundle_multitarget(void) {
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term b = thvm_tensor(ctx, bd, SHAPE(3));
     Term y = thvm_op(ctx, UOP_MUL, a, b);
-    // Two independent gradients: GRAD2(y, a), GRAD2(y, b).  y is DUP'd so
-    // each GRAD2 sees its own copy.
+    // Two independent gradients: GRAD(y, a), GRAD(y, b).  y is DUP'd so
+    // each GRAD sees its own copy.
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
     Term bundle = thvm_ctr(ctx, (Term[]){
-        thvm_grad_u(ctx, y0, a),
-        thvm_grad_u(ctx, y1, b),
+        thvm_grad(ctx, y0, a),
+        thvm_grad(ctx, y1, b),
     }, 2);
     thvm_eval(ctx, bundle);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD2", "CTR", "MUL"};
+    const char *pre[]  = {"GRAD", "CTR", "MUL"};
     const char *post[] = {"CTR"};
     int ok = topo_check("bundle_multitarget", 0, pre, 3)
           && topo_check("bundle_multitarget", 1, post, 1);
@@ -294,15 +292,15 @@ static int test_second_derivative(void) {
     thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
     Term y = thvm_op(ctx, UOP_MUL, a0, a1);
 
-    // First derivative: GRAD2(y, a). Second derivative: GRAD2(first, a).
-    Term bwd1 = thvm_grad_u(ctx, y, a);
+    // First derivative: GRAD(y, a). Second derivative: GRAD(first, a).
+    Term bwd1 = thvm_grad(ctx, y, a);
     Term bwd1_0, bwd1_1;
     thvm_dup(ctx, thvm_fresh_label(ctx), bwd1, &bwd1_0, &bwd1_1);
-    Term bwd2 = thvm_grad_u(ctx, bwd1_1, a);
+    Term bwd2 = thvm_grad(ctx, bwd1_1, a);
     Term root = thvm_ctr(ctx, (Term[]){bwd1_0, bwd2}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD2", "CTR", "MUL"};
+    const char *pre[]  = {"GRAD", "CTR", "MUL"};
     const char *post[] = {"CTR"};
     int ok = topo_check("second_derivative", 0, pre, 3)
           && topo_check("second_derivative", 1, post, 1);
@@ -331,10 +329,10 @@ static int test_target_nomatch(void) {
     Term y = thvm_op(ctx, UOP_ADD, a, b);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, c)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, c)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD2", "CTR", "ADD"};
+    const char *pre[]  = {"GRAD", "CTR", "ADD"};
     const char *post[] = {"CTR"};
     int ok = topo_check("target_nomatch", 0, pre, 3)
           && topo_check("target_nomatch", 1, post, 1);
@@ -529,8 +527,8 @@ static int test_sum_multi_axis(void) {
     return report("sum_multi_axis", ok);
 }
 
-// UOP_GRAD2 pivot: identity via new single-UOP shape.
-// y = t1, target = t1.  thvm_grad_u(t1, t1) should reduce to
+// UOP_GRAD pivot: identity via new single-UOP shape.
+// y = t1, target = t1.  thvm_grad(t1, t1) should reduce to
 // EXPAND(1, t1.shape).
 static int test_gradu_identity(void) {
     setup_graph_dir("gradu_identity");
@@ -541,17 +539,17 @@ static int test_gradu_identity(void) {
     Term a0, a1;
     thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
     Term root = thvm_ctr(ctx,
-        (Term[]){ a0, thvm_grad_u(ctx, a1, a) }, 2);
+        (Term[]){ a0, thvm_grad(ctx, a1, a) }, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2"};
+    const char *pre[]  = {"CTR", "GRAD"};
     const char *post[] = {"CTR", "EXPAND"};
     int ok = topo_check("gradu_identity", 0, pre, 2)
           && topo_check("gradu_identity", 1, post, 2);
     return report("gradu_identity", ok);
 }
 
-// UOP_GRAD2 ADD rule: GRAD2(ADD(a,b), t) -> ADD(GRAD2(a,t), GRAD2(b,t)).
+// UOP_GRAD ADD rule: GRAD(ADD(a,b), t) -> ADD(GRAD(a,t), GRAD(b,t)).
 // After TEN-leaves fire, bwd should contain two EXPANDs joined by ADD.
 static int test_gradu_add(void) {
     setup_graph_dir("gradu_add");
@@ -564,17 +562,17 @@ static int test_gradu_add(void) {
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
     Term root = thvm_ctr(ctx,
-        (Term[]){ y0, thvm_grad_u(ctx, y1, a) }, 2);
+        (Term[]){ y0, thvm_grad(ctx, y1, a) }, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "ADD"};
+    const char *pre[]  = {"CTR", "GRAD", "ADD"};
     const char *post[] = {"CTR", "ADD", "EXPAND"};
     int ok = topo_check("gradu_add", 0, pre, 3)
           && topo_check("gradu_add", 1, post, 3);
     return report("gradu_add", ok);
 }
 
-// UOP_GRAD2 MUL (Leibniz): GRAD2(a*b, t) -> a'*b + a*b'.
+// UOP_GRAD MUL (Leibniz): GRAD(a*b, t) -> a'*b + a*b'.
 static int test_gradu_mul(void) {
     setup_graph_dir("gradu_mul");
     TinyHVM *ctx = thvm_init("cpu");
@@ -586,17 +584,17 @@ static int test_gradu_mul(void) {
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
     Term root = thvm_ctr(ctx,
-        (Term[]){ y0, thvm_grad_u(ctx, y1, a) }, 2);
+        (Term[]){ y0, thvm_grad(ctx, y1, a) }, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "MUL"};
     const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
     int ok = topo_check("gradu_mul", 0, pre, 3)
           && topo_check("gradu_mul", 1, post, 4);
     return report("gradu_mul", ok);
 }
 
-// UOP_GRAD2 unary rules batch (NEG/EXP/LOG/SQRT/RELU).
+// UOP_GRAD unary rules batch (NEG/EXP/LOG/SQRT/RELU).
 #define GRADU_UNARY_TEST(TNAME, DIR, UOP, PRE, POST_NEEDLE)            \
 static int test_gradu_##TNAME(void) {                                  \
     setup_graph_dir(DIR);                                              \
@@ -608,10 +606,10 @@ static int test_gradu_##TNAME(void) {                                  \
     Term y0, y1;                                                       \
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);                 \
     Term root = thvm_ctr(ctx,                                          \
-        (Term[]){ y0, thvm_grad_u(ctx, y1, a) }, 2);                   \
+        (Term[]){ y0, thvm_grad(ctx, y1, a) }, 2);                   \
     thvm_eval(ctx, root);                                              \
     thvm_free(ctx);                                                    \
-    const char *pre[]  = {"CTR", "GRAD2", PRE};                        \
+    const char *pre[]  = {"CTR", "GRAD", PRE};                        \
     const char *post[] = {"CTR", "EXPAND", POST_NEEDLE};               \
     int ok = topo_check(DIR, 0, pre, 3)                                \
           && topo_check(DIR, 1, post, 3);                              \
@@ -623,7 +621,7 @@ GRADU_UNARY_TEST(log,  "gradu_log",  UOP_LOG,  "LOG",  "DIV")
 GRADU_UNARY_TEST(sqrt, "gradu_sqrt", UOP_SQRT, "SQRT", "DIV")
 GRADU_UNARY_TEST(relu, "gradu_relu", UOP_RELU, "RELU", "CMP")
 
-// UOP_GRAD2 binary batch (DIV/MAX/CMP).
+// UOP_GRAD binary batch (DIV/MAX/CMP).
 #define GRADU_BIN_TEST(TNAME, DIR, UOP, PRE, POST_NEEDLE)              \
 static int test_gradu_##TNAME(void) {                                  \
     setup_graph_dir(DIR);                                              \
@@ -636,10 +634,10 @@ static int test_gradu_##TNAME(void) {                                  \
     Term y0, y1;                                                       \
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);                 \
     Term root = thvm_ctr(ctx,                                          \
-        (Term[]){ y0, thvm_grad_u(ctx, y1, a) }, 2);                   \
+        (Term[]){ y0, thvm_grad(ctx, y1, a) }, 2);                   \
     thvm_eval(ctx, root);                                              \
     thvm_free(ctx);                                                    \
-    const char *pre[]  = {"CTR", "GRAD2", PRE};                        \
+    const char *pre[]  = {"CTR", "GRAD", PRE};                        \
     const char *post[] = {"CTR", POST_NEEDLE};                         \
     int ok = topo_check(DIR, 0, pre, 3)                                \
           && topo_check(DIR, 1, post, 2);                              \
@@ -649,7 +647,7 @@ GRADU_BIN_TEST(div, "gradu_div", UOP_DIV, "DIV", "DIV")
 GRADU_BIN_TEST(max, "gradu_max", UOP_MAX, "MAX", "CMP")
 GRADU_BIN_TEST(cmp, "gradu_cmp", UOP_CMP, "CMP", "EXPAND")
 
-// UOP_GRAD2 view/reduce batch (RESHAPE, PERMUTE, SUM).
+// UOP_GRAD view/reduce batch (RESHAPE, PERMUTE, SUM).
 static int test_gradu_reshape(void) {
     setup_graph_dir("gradu_reshape");
     TinyHVM *ctx = thvm_init("cpu");
@@ -659,10 +657,10 @@ static int test_gradu_reshape(void) {
     Term y = thvm_reshape(ctx, a, SHAPE(2, 3));
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "RESHAPE"};
+    const char *pre[]  = {"CTR", "GRAD", "RESHAPE"};
     const char *post[] = {"CTR", "RESHAPE", "EXPAND"};
     int ok = topo_check("gradu_reshape", 0, pre, 3)
           && topo_check("gradu_reshape", 1, post, 3);
@@ -678,10 +676,10 @@ static int test_gradu_permute(void) {
     Term y = thvm_permute(ctx, a, perm, 2);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "PERMUTE"};
+    const char *pre[]  = {"CTR", "GRAD", "PERMUTE"};
     const char *post[] = {"CTR", "PERMUTE", "EXPAND"};
     int ok = topo_check("gradu_permute", 0, pre, 3)
           && topo_check("gradu_permute", 1, post, 3);
@@ -696,17 +694,17 @@ static int test_gradu_sum(void) {
     Term y = thvm_sum_axes(ctx, a, (u32[]){0}, 1);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "SUM"};
+    const char *pre[]  = {"CTR", "GRAD", "SUM"};
     const char *post[] = {"CTR", "SUM", "EXPAND"};
     int ok = topo_check("gradu_sum", 0, pre, 3)
           && topo_check("gradu_sum", 1, post, 3);
     return report("gradu_sum", ok);
 }
 
-// UOP_GRAD2: SHRINK, PAD, EXPAND, RMAX.
+// UOP_GRAD: SHRINK, PAD, EXPAND, RMAX.
 static int test_gradu_shrink(void) {
     setup_graph_dir("gradu_shrink");
     TinyHVM *ctx = thvm_init("cpu");
@@ -717,10 +715,10 @@ static int test_gradu_shrink(void) {
     Term y = thvm_shrink(ctx, a, pairs, 1);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "SHRINK"};
+    const char *pre[]  = {"CTR", "GRAD", "SHRINK"};
     const char *post[] = {"CTR", "PAD", "EXPAND"};
     int ok = topo_check("gradu_shrink", 0, pre, 3)
           && topo_check("gradu_shrink", 1, post, 3);
@@ -736,10 +734,10 @@ static int test_gradu_pad(void) {
     Term y = thvm_pad(ctx, a, pairs, 1);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "PAD"};
+    const char *pre[]  = {"CTR", "GRAD", "PAD"};
     const char *post[] = {"CTR", "SHRINK", "EXPAND"};
     int ok = topo_check("gradu_pad", 0, pre, 3)
           && topo_check("gradu_pad", 1, post, 3);
@@ -754,10 +752,10 @@ static int test_gradu_expand(void) {
     Term y = thvm_expand(ctx, thvm_reshape(ctx, a, SHAPE(1, 3)), SHAPE(4, 3));
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "EXPAND"};
+    const char *pre[]  = {"CTR", "GRAD", "EXPAND"};
     const char *post[] = {"CTR", "SUM", "EXPAND"};
     int ok = topo_check("gradu_expand", 0, pre, 3)
           && topo_check("gradu_expand", 1, post, 3);
@@ -772,17 +770,17 @@ static int test_gradu_rmax(void) {
     Term y = thvm_rmax_axes(ctx, a, (u32[]){0}, 1);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "RMAX"};
+    const char *pre[]  = {"CTR", "GRAD", "RMAX"};
     const char *post[] = {"CTR", "RMAX", "CMP", "MUL"};
     int ok = topo_check("gradu_rmax", 0, pre, 3)
           && topo_check("gradu_rmax", 1, post, 4);
     return report("gradu_rmax", ok);
 }
 
-// UOP_GRAD2: MM, ASSIGN.
+// UOP_GRAD: MM, ASSIGN.
 static int test_gradu_mm(void) {
     setup_graph_dir("gradu_mm");
     TinyHVM *ctx = thvm_init("cpu");
@@ -793,12 +791,12 @@ static int test_gradu_mm(void) {
     Term y = thvm_op_raw(ctx, UOP_MM, a, b);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
     // Phase-0 pre-reduce topology only — MM is a symbolic/composite op
     // on this path so post-sweep structure depends on scheduler.
-    const char *pre[]  = {"CTR", "GRAD2", "MM"};
+    const char *pre[]  = {"CTR", "GRAD", "MM"};
     int ok = topo_check("gradu_mm", 0, pre, 3);
     return report("gradu_mm", ok);
 }
@@ -812,18 +810,18 @@ static int test_gradu_assign(void) {
     Term y = thvm_op(ctx, UOP_ASSIGN, a, b);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "ASSIGN"};
+    const char *pre[]  = {"CTR", "GRAD", "ASSIGN"};
     const char *post[] = {"CTR"};
     int ok = topo_check("gradu_assign", 0, pre, 3)
           && topo_check("gradu_assign", 1, post, 1);
     return report("gradu_assign", ok);
 }
 
-// UOP_GRAD2 deep chain: y = exp(log(t*t)), target = t.
-// Exercises MUL(Leibniz), LOG, EXP composing via recursive GRAD2.
+// UOP_GRAD deep chain: y = exp(log(t*t)), target = t.
+// Exercises MUL(Leibniz), LOG, EXP composing via recursive GRAD.
 static int test_gradu_deep_chain(void) {
     setup_graph_dir("gradu_deep_chain");
     TinyHVM *ctx = thvm_init("cpu");
@@ -837,10 +835,10 @@ static int test_gradu_deep_chain(void) {
     Term y   = thvm_op(ctx, UOP_EXP, lg, term_era());
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "EXP", "LOG", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "EXP", "LOG", "MUL"};
     // Post: bwd is EXP * (MUL's ADD(da*b, a*db)) / inner — should contain
     // MUL, DIV, EXP, LOG, ADD from chain-rule composition.
     const char *post[] = {"CTR", "EXP", "LOG", "MUL", "DIV", "ADD"};
@@ -849,7 +847,7 @@ static int test_gradu_deep_chain(void) {
     return report("gradu_deep_chain", ok);
 }
 
-// UOP_GRAD2 SUB on RHS: y = a - t, dy/dt = -1.  Checks SUB rule sign.
+// UOP_GRAD SUB on RHS: y = a - t, dy/dt = -1.  Checks SUB rule sign.
 static int test_gradu_sub_rhs(void) {
     setup_graph_dir("gradu_sub_rhs");
     TinyHVM *ctx = thvm_init("cpu");
@@ -860,10 +858,10 @@ static int test_gradu_sub_rhs(void) {
     Term y = thvm_op(ctx, UOP_SUB, a, b);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, b)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, b)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "SUB"};
+    const char *pre[]  = {"CTR", "GRAD", "SUB"};
     // bwd = SUB(EXPAND(0), EXPAND(1)) = -1
     const char *post[] = {"CTR", "SUB", "EXPAND"};
     int ok = topo_check("gradu_sub_rhs", 0, pre, 3)
@@ -871,7 +869,7 @@ static int test_gradu_sub_rhs(void) {
     return report("gradu_sub_rhs", ok);
 }
 
-// UOP_GRAD2 cubic: y = t*t*t, dy/dt = 3t^2.  Exercises nested MUL
+// UOP_GRAD cubic: y = t*t*t, dy/dt = 3t^2.  Exercises nested MUL
 // Leibniz where target appears three times at different depths.
 static int test_gradu_cubic(void) {
     setup_graph_dir("gradu_cubic");
@@ -887,10 +885,10 @@ static int test_gradu_cubic(void) {
                 a2);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "MUL"};
     // bwd = ADD(MUL(ADD(..., ...), t), MUL(t*t, EXPAND(1))) — three MULs.
     const char *post[] = {"CTR", "ADD", "MUL", "EXPAND"};
     int ok = topo_check("gradu_cubic", 0, pre, 3)
@@ -898,7 +896,7 @@ static int test_gradu_cubic(void) {
     return report("gradu_cubic", ok);
 }
 
-// UOP_GRAD2: target shape differs from y's operands.  Leaf emits
+// UOP_GRAD: target shape differs from y's operands.  Leaf emits
 // EXPAND(NUM(0), target.shape) even though y is unrelated shape — the
 // bwd tensor must match target.shape, not y's.
 static int test_gradu_shape_target_diff(void) {
@@ -912,10 +910,10 @@ static int test_gradu_shape_target_diff(void) {
     Term y = thvm_op(ctx, UOP_ADD, a, b);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, c)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, c)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "ADD"};
+    const char *pre[]  = {"CTR", "GRAD", "ADD"};
     // bwd = ADD(EXPAND(0, [2]), EXPAND(0, [2])) = 0 of target's shape.
     const char *post[] = {"CTR", "ADD", "EXPAND"};
     int ok = topo_check("gradu_shape_target_diff", 0, pre, 3)
@@ -923,8 +921,8 @@ static int test_gradu_shape_target_diff(void) {
     return report("gradu_shape_target_diff", ok);
 }
 
-// UOP_GRAD2 third derivative: y = t*t, d^3y/dt^3 = 0.
-// Chain: GRAD2(GRAD2(GRAD2(t*t, t), t), t) — three nested GRAD2s.
+// UOP_GRAD third derivative: y = t*t, d^3y/dt^3 = 0.
+// Chain: GRAD(GRAD(GRAD(t*t, t), t), t) — three nested GRADs.
 static int test_gradu_third_derivative(void) {
     setup_graph_dir("gradu_third_derivative");
     TinyHVM *ctx = thvm_init("cpu");
@@ -934,19 +932,19 @@ static int test_gradu_third_derivative(void) {
     Term a0, a1;
     thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
     Term y = thvm_op(ctx, UOP_MUL, a0, a1);
-    Term d1 = thvm_grad_u(ctx, y, a);
-    Term d2 = thvm_grad_u(ctx, d1, a);
-    Term d3 = thvm_grad_u(ctx, d2, a);
+    Term d1 = thvm_grad(ctx, y, a);
+    Term d2 = thvm_grad(ctx, d1, a);
+    Term d3 = thvm_grad(ctx, d2, a);
     thvm_eval(ctx, d3);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD2", "MUL"};
+    const char *pre[]  = {"GRAD", "MUL"};
     // After full sweep d^3(t^2)/dt^3 is a constant expression reducing
-    // through GRAD2 -> NUM-leaf rule; no residual GRAD2 should remain.
+    // through GRAD -> NUM-leaf rule; no residual GRAD should remain.
     int ok = topo_check("gradu_third_derivative", 0, pre, 2);
     return report("gradu_third_derivative", ok);
 }
 
-// UOP_GRAD2: y = exp(-t), dy/dt = -exp(-t).
+// UOP_GRAD: y = exp(-t), dy/dt = -exp(-t).
 // EXP inner = NEG(t), so rule composes EXP' (mul by exp(neg(t))) and
 // NEG' (negate da).
 static int test_gradu_exp_neg(void) {
@@ -960,17 +958,17 @@ static int test_gradu_exp_neg(void) {
                 term_era());
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "EXP", "NEG"};
+    const char *pre[]  = {"CTR", "GRAD", "EXP", "NEG"};
     const char *post[] = {"CTR", "EXP", "NEG", "MUL", "EXPAND"};
     int ok = topo_check("gradu_exp_neg", 0, pre, 4)
           && topo_check("gradu_exp_neg", 1, post, 5);
     return report("gradu_exp_neg", ok);
 }
 
-// UOP_GRAD2: softplus derivative.  y = log(1 + exp(t)),
+// UOP_GRAD: softplus derivative.  y = log(1 + exp(t)),
 // dy/dt = exp(t) / (1 + exp(t)) = sigmoid(t).
 // Composes: LOG, ADD, EXP via chain rule.
 static int test_gradu_softplus(void) {
@@ -985,17 +983,17 @@ static int test_gradu_softplus(void) {
     Term y  = thvm_op(ctx, UOP_LOG, in, term_era());
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "LOG", "ADD", "EXP"};
+    const char *pre[]  = {"CTR", "GRAD", "LOG", "ADD", "EXP"};
     const char *post[] = {"CTR", "DIV", "ADD", "EXP", "EXPAND"};
     int ok = topo_check("gradu_softplus", 0, pre, 5)
           && topo_check("gradu_softplus", 1, post, 5);
     return report("gradu_softplus", ok);
 }
 
-// UOP_GRAD2: y = sum(t*t), target = t.  Composes MUL-Leibniz then SUM.
+// UOP_GRAD: y = sum(t*t), target = t.  Composes MUL-Leibniz then SUM.
 // bwd threads EXPAND over sum's inverse + Leibniz's 2t.
 static int test_gradu_sum_sq(void) {
     setup_graph_dir("gradu_sum_sq");
@@ -1009,17 +1007,17 @@ static int test_gradu_sum_sq(void) {
     Term y  = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "SUM", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "SUM", "MUL"};
     const char *post[] = {"CTR", "SUM", "MUL", "EXPAND", "ADD"};
     int ok = topo_check("gradu_sum_sq", 0, pre, 4)
           && topo_check("gradu_sum_sq", 1, post, 5);
     return report("gradu_sum_sq", ok);
 }
 
-// UOP_GRAD2: target passed through a user DUP before GRAD2. Tests that
+// UOP_GRAD: target passed through a user DUP before GRAD. Tests that
 // the rule resolves tgt through a DP0/DP1 wrapping to the underlying
 // TEN (via the trampoline's arg-reduce on tgt).
 static int test_gradu_target_via_dup(void) {
@@ -1032,21 +1030,21 @@ static int test_gradu_target_via_dup(void) {
     Term y = thvm_op(ctx, UOP_ADD, a, b);
     Term a_dup0, a_dup1;
     thvm_dup(ctx, thvm_fresh_label(ctx), a, &a_dup0, &a_dup1);
-    // Use a_dup0 in forward (to keep it live); pass a_dup1 as GRAD2 target.
+    // Use a_dup0 in forward (to keep it live); pass a_dup1 as GRAD target.
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a_dup1)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a_dup1)}, 2);
     thvm_spawn_detached_era(ctx, a_dup0);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "ADD"};
+    const char *pre[]  = {"CTR", "GRAD", "ADD"};
     const char *post[] = {"CTR", "ADD", "EXPAND"};
     int ok = topo_check("gradu_target_via_dup", 0, pre, 3)
           && topo_check("gradu_target_via_dup", 1, post, 3);
     return report("gradu_target_via_dup", ok);
 }
 
-// UOP_GRAD2: distributive law.  y = t*(b + c), dy/dt = b + c.
+// UOP_GRAD: distributive law.  y = t*(b + c), dy/dt = b + c.
 // Checks that inner ADD's grad contribution is 0 (no target in ADD)
 // and outer Leibniz gives MUL(1, b+c) + MUL(t, 0) = b+c.
 static int test_gradu_distributive(void) {
@@ -1060,17 +1058,17 @@ static int test_gradu_distributive(void) {
     Term y = thvm_op(ctx, UOP_MUL, a, thvm_op(ctx, UOP_ADD, b, c));
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "MUL", "ADD"};
+    const char *pre[]  = {"CTR", "GRAD", "MUL", "ADD"};
     const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
     int ok = topo_check("gradu_distributive", 0, pre, 4)
           && topo_check("gradu_distributive", 1, post, 4);
     return report("gradu_distributive", ok);
 }
 
-// UOP_GRAD2: ASSIGN w.r.t. src — gradient is zero (src is ignored by
+// UOP_GRAD: ASSIGN w.r.t. src — gradient is zero (src is ignored by
 // the rule, only dst path contributes).
 static int test_gradu_assign_src(void) {
     setup_graph_dir("gradu_assign_src");
@@ -1082,18 +1080,18 @@ static int test_gradu_assign_src(void) {
     Term y = thvm_op(ctx, UOP_ASSIGN, a, b);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, b)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, b)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "ASSIGN"};
-    // bwd = GRAD2(dst=a, b) where a!=b → EXPAND(0, b.shape).
+    const char *pre[]  = {"CTR", "GRAD", "ASSIGN"};
+    // bwd = GRAD(dst=a, b) where a!=b → EXPAND(0, b.shape).
     const char *post[] = {"CTR", "EXPAND"};
     int ok = topo_check("gradu_assign_src", 0, pre, 3)
           && topo_check("gradu_assign_src", 1, post, 2);
     return report("gradu_assign_src", ok);
 }
 
-// UOP_GRAD2 MSE loss: y = sum((x - c) * (x - c)), dy/dx = 2(x - c).
+// UOP_GRAD MSE loss: y = sum((x - c) * (x - c)), dy/dx = 2(x - c).
 // Exercises SUB + MUL-Leibniz + SUM composition end-to-end.
 static int test_gradu_mse(void) {
     setup_graph_dir("gradu_mse");
@@ -1109,18 +1107,18 @@ static int test_gradu_mse(void) {
     Term y  = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, x)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "SUM", "MUL", "SUB"};
+    const char *pre[]  = {"CTR", "GRAD", "SUM", "MUL", "SUB"};
     const char *post[] = {"CTR", "SUM", "EXPAND", "MUL", "SUB", "ADD"};
     int ok = topo_check("gradu_mse", 0, pre, 5)
           && topo_check("gradu_mse", 1, post, 6);
     return report("gradu_mse", ok);
 }
 
-// UOP_GRAD2 through a lambda: y = (λv. v*v) a.  After beta, body reduces
-// to a*a; GRAD2 on that w.r.t. a should give 2a.  Stresses trampoline
+// UOP_GRAD through a lambda: y = (λv. v*v) a.  After beta, body reduces
+// to a*a; GRAD on that w.r.t. a should give 2a.  Stresses trampoline
 // resolution of the argument through the lambda boundary.
 static int test_gradu_lambda(void) {
     setup_graph_dir("gradu_lambda");
@@ -1136,17 +1134,17 @@ static int test_gradu_lambda(void) {
     Term y = thvm_app(ctx, lam, a);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "APP", "LAM"};
+    const char *pre[]  = {"CTR", "GRAD", "APP", "LAM"};
     const char *post[] = {"CTR", "EXPAND"};
     int ok = topo_check("gradu_lambda", 0, pre, 4)
           && topo_check("gradu_lambda", 1, post, 2);
     return report("gradu_lambda", ok);
 }
 
-// UOP_GRAD2: conv-shaped composition — y = sum(pad(x,[1,1]) * w).
+// UOP_GRAD: conv-shaped composition — y = sum(pad(x,[1,1]) * w).
 // Exercises PAD + MUL-Leibniz + SUM in a realistic-ish shape.
 static int test_gradu_conv_like(void) {
     setup_graph_dir("gradu_conv_like");
@@ -1162,17 +1160,17 @@ static int test_gradu_conv_like(void) {
     Term y = thvm_sum_axes(ctx, prod, (u32[]){0}, 1);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, x)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "SUM", "MUL", "PAD"};
+    const char *pre[]  = {"CTR", "GRAD", "SUM", "MUL", "PAD"};
     const char *post[] = {"CTR", "SUM", "EXPAND", "MUL", "SHRINK"};
     int ok = topo_check("gradu_conv_like", 0, pre, 5)
           && topo_check("gradu_conv_like", 1, post, 5);
     return report("gradu_conv_like", ok);
 }
 
-// UOP_GRAD2: MLP-like elementwise — y = relu(x*W1 + b1) * W2, grad w.r.t. W1.
+// UOP_GRAD: MLP-like elementwise — y = relu(x*W1 + b1) * W2, grad w.r.t. W1.
 // Covers RELU-mask, ADD, MUL-Leibniz all chained.
 static int test_gradu_mlp_like(void) {
     setup_graph_dir("gradu_mlp_like");
@@ -1188,18 +1186,18 @@ static int test_gradu_mlp_like(void) {
     Term y  = thvm_op(ctx, UOP_MUL, h, W2);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, W1)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, W1)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "MUL", "RELU", "ADD"};
+    const char *pre[]  = {"CTR", "GRAD", "MUL", "RELU", "ADD"};
     const char *post[] = {"CTR", "MUL", "RELU", "CMP", "ADD"};
     int ok = topo_check("gradu_mlp_like", 0, pre, 5)
           && topo_check("gradu_mlp_like", 1, post, 5);
     return report("gradu_mlp_like", ok);
 }
 
-// UOP_GRAD2: log-sum-exp. y = log(sum(exp(x))). dy/dx = softmax(x).
-// Composes LOG + SUM + EXP through nested GRAD2.
+// UOP_GRAD: log-sum-exp. y = log(sum(exp(x))). dy/dx = softmax(x).
+// Composes LOG + SUM + EXP through nested GRAD.
 static int test_gradu_logsumexp(void) {
     setup_graph_dir("gradu_logsumexp");
     TinyHVM *ctx = thvm_init("cpu");
@@ -1211,17 +1209,17 @@ static int test_gradu_logsumexp(void) {
     Term y  = thvm_op(ctx, UOP_LOG, s, term_era());
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, x)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "LOG", "SUM", "EXP"};
+    const char *pre[]  = {"CTR", "GRAD", "LOG", "SUM", "EXP"};
     const char *post[] = {"CTR", "DIV", "SUM", "EXP", "MUL", "EXPAND"};
     int ok = topo_check("gradu_logsumexp", 0, pre, 5)
           && topo_check("gradu_logsumexp", 1, post, 6);
     return report("gradu_logsumexp", ok);
 }
 
-// UOP_GRAD2: L2-normalization-like. y = x / sqrt(sum(x*x)).  Covers
+// UOP_GRAD: L2-normalization-like. y = x / sqrt(sum(x*x)).  Covers
 // DIV-quotient + SQRT-chain + SUM + MUL-Leibniz all composed.
 static int test_gradu_l2_normalize(void) {
     setup_graph_dir("gradu_l2_normalize");
@@ -1239,17 +1237,17 @@ static int test_gradu_l2_normalize(void) {
     Term y  = thvm_op(ctx, UOP_DIV, x0, r_bc);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, x)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "DIV", "EXPAND", "SQRT", "SUM", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "DIV", "EXPAND", "SQRT", "SUM", "MUL"};
     const char *post[] = {"CTR", "DIV", "SQRT", "SUM", "MUL", "EXPAND"};
     int ok = topo_check("gradu_l2_normalize", 0, pre, 7)
           && topo_check("gradu_l2_normalize", 1, post, 6);
     return report("gradu_l2_normalize", ok);
 }
 
-// UOP_GRAD2: PERMUTE + SUM composition.  y = sum(permute(x, [1,0])).
+// UOP_GRAD: PERMUTE + SUM composition.  y = sum(permute(x, [1,0])).
 // Backward threads SUM-expand then PERMUTE-inverse.
 static int test_gradu_permute_sum(void) {
     setup_graph_dir("gradu_permute_sum");
@@ -1262,17 +1260,17 @@ static int test_gradu_permute_sum(void) {
     Term y = thvm_sum_axes(ctx, p, (u32[]){0, 1}, 2);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, x)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "SUM", "PERMUTE"};
+    const char *pre[]  = {"CTR", "GRAD", "SUM", "PERMUTE"};
     const char *post[] = {"CTR", "SUM", "EXPAND", "PERMUTE"};
     int ok = topo_check("gradu_permute_sum", 0, pre, 4)
           && topo_check("gradu_permute_sum", 1, post, 4);
     return report("gradu_permute_sum", ok);
 }
 
-// UOP_GRAD2: cross-entropy loss (simplified).
+// UOP_GRAD: cross-entropy loss (simplified).
 // CE(x, t) = log(sum(exp(x))) - sum(t * x).  grad w.r.t. x = softmax(x) - t.
 // Exercises LOG + SUM + EXP + MUL + SUB all composed.
 static int test_gradu_cross_entropy(void) {
@@ -1295,17 +1293,17 @@ static int test_gradu_cross_entropy(void) {
     Term y = thvm_op(ctx, UOP_SUB, lse, stx);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, x)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "SUB", "LOG", "SUM", "EXP", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "SUB", "LOG", "SUM", "EXP", "MUL"};
     const char *post[] = {"CTR", "SUB", "DIV", "SUM", "EXP", "MUL", "EXPAND"};
     int ok = topo_check("gradu_cross_entropy", 0, pre, 7)
           && topo_check("gradu_cross_entropy", 1, post, 7);
     return report("gradu_cross_entropy", ok);
 }
 
-// UOP_GRAD2: batched reduce.  x shape [2,3], y = sum(x*x, axes=[1]).
+// UOP_GRAD: batched reduce.  x shape [2,3], y = sum(x*x, axes=[1]).
 // Per-batch sum of squares; grad w.r.t. x keeps [2,3] shape.
 static int test_gradu_batched_reduce(void) {
     setup_graph_dir("gradu_batched_reduce");
@@ -1319,18 +1317,18 @@ static int test_gradu_batched_reduce(void) {
     Term y  = thvm_sum_axes(ctx, sq, (u32[]){1}, 1);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, x)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "SUM", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "SUM", "MUL"};
     const char *post[] = {"CTR", "SUM", "EXPAND", "MUL", "ADD"};
     int ok = topo_check("gradu_batched_reduce", 0, pre, 4)
           && topo_check("gradu_batched_reduce", 1, post, 5);
     return report("gradu_batched_reduce", ok);
 }
 
-// UOP_GRAD2 through non-trivial lambda: y = (λv. v*v) a.  After beta,
-// body becomes a*a; GRAD2 should give 2a.  The lambda body DUPs v to
+// UOP_GRAD through non-trivial lambda: y = (λv. v*v) a.  After beta,
+// body becomes a*a; GRAD should give 2a.  The lambda body DUPs v to
 // use it twice in MUL.
 static int test_gradu_lambda_square(void) {
     setup_graph_dir("gradu_lambda_square");
@@ -1346,17 +1344,17 @@ static int test_gradu_lambda_square(void) {
     Term y = thvm_app(ctx, lam, a);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "APP", "LAM", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "APP", "LAM", "MUL"};
     const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
     int ok = topo_check("gradu_lambda_square", 0, pre, 5)
           && topo_check("gradu_lambda_square", 1, post, 4);
     return report("gradu_lambda_square", ok);
 }
 
-// UOP_GRAD2: absolute value via |x| = relu(x) + relu(-x).
+// UOP_GRAD: absolute value via |x| = relu(x) + relu(-x).
 // dy/dx = 2*(x>0) - 1 = sign(x).  Tests parallel RELU branches sharing
 // a common target via DUP.
 static int test_gradu_abs(void) {
@@ -1374,17 +1372,17 @@ static int test_gradu_abs(void) {
     Term y = thvm_op(ctx, UOP_ADD, r_pos, r_neg);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, x)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "ADD", "RELU", "NEG"};
+    const char *pre[]  = {"CTR", "GRAD", "ADD", "RELU", "NEG"};
     const char *post[] = {"CTR", "ADD", "MUL", "CMP", "NEG", "EXPAND"};
     int ok = topo_check("gradu_abs", 0, pre, 5)
           && topo_check("gradu_abs", 1, post, 6);
     return report("gradu_abs", ok);
 }
 
-// UOP_GRAD2: mixed higher-order. d²(x*y)/dxdy = 1.
+// UOP_GRAD: mixed higher-order. d²(x*y)/dxdy = 1.
 // Inner: d(x*y)/dx = y (Leibniz w/ target=x).
 // Outer: d(y)/dy = 1 (leaf identity).
 static int test_gradu_mixed_partial(void) {
@@ -1397,25 +1395,25 @@ static int test_gradu_mixed_partial(void) {
     thvm_set_requires_grad(ctx, y);
     Term prod = thvm_op(ctx, UOP_MUL, x, y);
     // Inner d/dx
-    Term inner = thvm_grad_u(ctx, prod, x);
+    Term inner = thvm_grad(ctx, prod, x);
     // Outer d/dy — DUP the inner first since the root will consume it
     Term inner0, inner1;
     thvm_dup(ctx, thvm_fresh_label(ctx), inner, &inner0, &inner1);
     (void)inner0;  // not used directly; outer wants inner1
-    Term outer = thvm_grad_u(ctx, inner1, y);
+    Term outer = thvm_grad(ctx, inner1, y);
     Term root = thvm_ctr(ctx, (Term[]){inner0, outer}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "MUL"};
     const char *post[] = {"CTR", "EXPAND"};
     int ok = topo_check("gradu_mixed_partial", 0, pre, 3)
           && topo_check("gradu_mixed_partial", 1, post, 2);
     return report("gradu_mixed_partial", ok);
 }
 
-// UOP_GRAD2: APP with a compute argument.
+// UOP_GRAD: APP with a compute argument.
 // y = (λv. v+v) (a*c).  Tests that the trampoline reduces the ARGUMENT
-// (a*c → TOP) before beta-substitutes into the lambda body, then GRAD2
+// (a*c → TOP) before beta-substitutes into the lambda body, then GRAD
 // pattern-matches on the body's structure (ADD of duplicated MULs).
 // Target = a.  dy/da = 2c (via chain through beta and Leibniz).
 static int test_gradu_app_compute_arg(void) {
@@ -1435,18 +1433,18 @@ static int test_gradu_app_compute_arg(void) {
     Term y = thvm_app(ctx, lam, arg);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "APP", "LAM", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "APP", "LAM", "MUL"};
     const char *post[] = {"CTR", "ADD", "MUL", "EXPAND"};
     int ok = topo_check("gradu_app_compute_arg", 0, pre, 5)
           && topo_check("gradu_app_compute_arg", 1, post, 4);
     return report("gradu_app_compute_arg", ok);
 }
 
-// UOP_GRAD2: nested APPs.  y = (λv. v) ((λu. u*u) a).  Two betas then
-// GRAD2(a*a, a) = 2a.  Verifies chain rule across multiple lambda layers.
+// UOP_GRAD: nested APPs.  y = (λv. v) ((λu. u*u) a).  Two betas then
+// GRAD(a*a, a) = 2a.  Verifies chain rule across multiple lambda layers.
 static int test_gradu_nested_app(void) {
     setup_graph_dir("gradu_nested_app");
     TinyHVM *ctx = thvm_init("cpu");
@@ -1467,18 +1465,18 @@ static int test_gradu_nested_app(void) {
     Term y = thvm_app(ctx, lam_outer, thvm_app(ctx, lam_inner, a));
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "APP", "LAM", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "APP", "LAM", "MUL"};
     const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
     int ok = topo_check("gradu_nested_app", 0, pre, 5)
           && topo_check("gradu_nested_app", 1, post, 4);
     return report("gradu_nested_app", ok);
 }
 
-// UOP_GRAD2: curried lambda.  y = ((λx.λw.x*w) a) b.  Two betas; target=a.
-// dy/da = b.  Tests curried two-arg application under GRAD2.
+// UOP_GRAD: curried lambda.  y = ((λx.λw.x*w) a) b.  Two betas; target=a.
+// dy/da = b.  Tests curried two-arg application under GRAD.
 static int test_gradu_curried(void) {
     setup_graph_dir("gradu_curried");
     TinyHVM *ctx = thvm_init("cpu");
@@ -1496,17 +1494,17 @@ static int test_gradu_curried(void) {
     Term y = thvm_app(ctx, thvm_app(ctx, lam_x, a), b);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "APP", "LAM"};
+    const char *pre[]  = {"CTR", "GRAD", "APP", "LAM"};
     const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
     int ok = topo_check("gradu_curried", 0, pre, 4)
           && topo_check("gradu_curried", 1, post, 4);
     return report("gradu_curried", ok);
 }
 
-// UOP_GRAD2: IFZ with target in zero-case branch.
+// UOP_GRAD: IFZ with target in zero-case branch.
 // y = IFZ(0, a, succ_lam).  counter=0 so y reduces to a; grad w.r.t. a = 1.
 static int test_gradu_ifz(void) {
     setup_graph_dir("gradu_ifz");
@@ -1522,18 +1520,18 @@ static int test_gradu_ifz(void) {
     Term y = thvm_ifz(ctx, counter, a, succ);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "IFZ"};
+    const char *pre[]  = {"CTR", "GRAD", "IFZ"};
     const char *post[] = {"CTR", "EXPAND"};
     int ok = topo_check("gradu_ifz", 0, pre, 3)
           && topo_check("gradu_ifz", 1, post, 2);
     return report("gradu_ifz", ok);
 }
 
-// UOP_GRAD2: IFZ hits succ branch.  y = IFZ(1, a, λ_. a*a).
-// counter=1 → evaluates succ_lam(0) → a*a → GRAD2 → 2a.
+// UOP_GRAD: IFZ hits succ branch.  y = IFZ(1, a, λ_. a*a).
+// counter=1 → evaluates succ_lam(0) → a*a → GRAD → 2a.
 static int test_gradu_ifz_succ(void) {
     setup_graph_dir("gradu_ifz_succ");
     TinyHVM *ctx = thvm_init("cpu");
@@ -1548,7 +1546,7 @@ static int test_gradu_ifz_succ(void) {
     // Sink cvar since we don't use it; ERA the var.
     thvm_spawn_detached_era(ctx, cvar);
     heap_set(ctx, term_val(succ) + 1, thvm_op(ctx, UOP_MUL, a0, a1));
-    // Target for GRAD2: need a separate handle — use a' = dup of a
+    // Target for GRAD: need a separate handle — use a' = dup of a
     // before we pass a into succ_lam body.  But we already gave a away.
     // Work around: target is the TEN tid, so we can recreate a fresh
     // reference via thvm_tensor_from_id ... not exposed.  Use a via DUP.
@@ -1559,20 +1557,20 @@ static int test_gradu_ifz_succ(void) {
     Term y = thvm_ifz(ctx, counter, dummy, succ);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "IFZ", "LAM", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "IFZ", "LAM", "MUL"};
     const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
     int ok = topo_check("gradu_ifz_succ", 0, pre, 5)
           && topo_check("gradu_ifz_succ", 1, post, 4);
     return report("gradu_ifz_succ", ok);
 }
 
-// UOP_GRAD2: WHERE(cond=all-1, a, b).  KNOWN GAP: WHERE materializes to
-// a FRESH TEN (not reusing a's id) before GRAD2 fires, so the leaf rule
+// UOP_GRAD: WHERE(cond=all-1, a, b).  KNOWN GAP: WHERE materializes to
+// a FRESH TEN (not reusing a's id) before GRAD fires, so the leaf rule
 // sees ytid != target_tid and emits zeros instead of 1.  The "dy/da=1 if
-// cond" semantics needs either a WHERE-specific UOP_GRAD2 rule or a
+// cond" semantics needs either a WHERE-specific UOP_GRAD rule or a
 // lazier WHERE.  Test currently only asserts pre-phase topology.
 static int test_gradu_where(void) {
     setup_graph_dir("gradu_where");
@@ -1583,20 +1581,20 @@ static int test_gradu_where(void) {
     Term cond = thvm_tensor(ctx, condd, SHAPE(3));
     thvm_set_requires_grad(ctx, a);
     Term y = thvm_where(ctx, cond, a, b);
-    // No DUP on y — let GRAD2 pattern-match the raw WHERE TOP directly.
-    Term root = thvm_grad_u(ctx, y, a);
+    // No DUP on y — let GRAD pattern-match the raw WHERE TOP directly.
+    Term root = thvm_grad(ctx, y, a);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    // Pre must contain GRAD2+WHERE; post we don't yet know — if no WHERE
-    // rule exists, GRAD2 stays in the graph.  Just check pre.
-    const char *pre[]  = {"GRAD2", "WHERE"};
+    // Pre must contain GRAD+WHERE; post we don't yet know — if no WHERE
+    // rule exists, GRAD stays in the graph.  Just check pre.
+    const char *pre[]  = {"GRAD", "WHERE"};
     const char *post[] = {"WHERE", "EXPAND"};
     int ok = topo_check("gradu_where", 0, pre, 2)
           && topo_check("gradu_where", 1, post, 2);
     return report("gradu_where", ok);
 }
 
-// UOP_GRAD2: dot product.  y = sum(x*w), dy/dx = w.
+// UOP_GRAD: dot product.  y = sum(x*w), dy/dx = w.
 static int test_gradu_dot(void) {
     setup_graph_dir("gradu_dot");
     TinyHVM *ctx = thvm_init("cpu");
@@ -1608,17 +1606,17 @@ static int test_gradu_dot(void) {
     Term y = thvm_sum_axes(ctx, prod, (u32[]){0}, 1);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, x)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "SUM", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "SUM", "MUL"};
     const char *post[] = {"CTR", "SUM", "EXPAND", "MUL", "ADD"};
     int ok = topo_check("gradu_dot", 0, pre, 4)
           && topo_check("gradu_dot", 1, post, 5);
     return report("gradu_dot", ok);
 }
 
-// UOP_GRAD2: WHERE with mixed cond, target = b (else branch).
+// UOP_GRAD: WHERE with mixed cond, target = b (else branch).
 // d(where(c, a, b))/db = where(c, 0, 1).
 static int test_gradu_where_else(void) {
     setup_graph_dir("gradu_where_else");
@@ -1629,21 +1627,21 @@ static int test_gradu_where_else(void) {
     Term cond = thvm_tensor(ctx, condd, SHAPE(3));
     thvm_set_requires_grad(ctx, b);
     Term y = thvm_where(ctx, cond, a, b);
-    Term root = thvm_grad_u(ctx, y, b);
+    Term root = thvm_grad(ctx, y, b);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD2", "WHERE"};
+    const char *pre[]  = {"GRAD", "WHERE"};
     const char *post[] = {"WHERE", "EXPAND"};
     int ok = topo_check("gradu_where_else", 0, pre, 2)
           && topo_check("gradu_where_else", 1, post, 2);
     return report("gradu_where_else", ok);
 }
 
-// UOP_GRAD2: nested WHERE.  y = where(c1, where(c2, a, b), d).  Target = a.
+// UOP_GRAD: nested WHERE.  y = where(c1, where(c2, a, b), d).  Target = a.
 // KNOWN PARTIAL: outer WHERE rule fires correctly, but inner WHERE gets
-// materialized when the outer-emitted da=GRAD2(inner, t) is evaluated —
-// the outer WHERE's branch-selection copies GRAD2's operand before the
-// reducer's WHERE-under-GRAD2 laziness kicks in at the new nesting level.
+// materialized when the outer-emitted da=GRAD(inner, t) is evaluated —
+// the outer WHERE's branch-selection copies GRAD's operand before the
+// reducer's WHERE-under-GRAD laziness kicks in at the new nesting level.
 // Post-sweep shows outer WHERE but inner collapsed to zero rather than
 // where(c2, 1, 0).  Test only asserts shape-level topology for now.
 static int test_gradu_where_nested(void) {
@@ -1658,17 +1656,17 @@ static int test_gradu_where_nested(void) {
     thvm_set_requires_grad(ctx, a);
     Term inner = thvm_where(ctx, c2, a, b);
     Term y = thvm_where(ctx, c1, inner, d);
-    Term root = thvm_grad_u(ctx, y, a);
+    Term root = thvm_grad(ctx, y, a);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD2", "WHERE"};
+    const char *pre[]  = {"GRAD", "WHERE"};
     const char *post[] = {"WHERE", "EXPAND"};
     int ok = topo_check("gradu_where_nested", 0, pre, 2)
           && topo_check("gradu_where_nested", 1, post, 2);
     return report("gradu_where_nested", ok);
 }
 
-// UOP_GRAD2: polynomial y = a*x*x + b*x + c, target = a.  dy/da = x*x.
+// UOP_GRAD: polynomial y = a*x*x + b*x + c, target = a.  dy/da = x*x.
 // Exercises ADD+MUL-Leibniz through a 3-term polynomial.
 static int test_gradu_poly(void) {
     setup_graph_dir("gradu_poly");
@@ -1692,10 +1690,10 @@ static int test_gradu_poly(void) {
                    c);
     Term y0, y1;
     thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
-    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad(ctx, y1, a)}, 2);
     thvm_eval(ctx, root);
     thvm_free(ctx);
-    const char *pre[]  = {"CTR", "GRAD2", "ADD", "MUL"};
+    const char *pre[]  = {"CTR", "GRAD", "ADD", "MUL"};
     const char *post[] = {"CTR", "ADD", "MUL", "EXPAND"};
     int ok = topo_check("gradu_poly", 0, pre, 4)
           && topo_check("gradu_poly", 1, post, 4);
@@ -1750,7 +1748,7 @@ static int test_e2e_expand_scalar(void) {
     return report("e2e_expand_scalar", ok);
 }
 
-// E2E numerical: d(x*w)/dx = w, no SUM wrapping.  Minimal GRAD2 chain:
+// E2E numerical: d(x*w)/dx = w, no SUM wrapping.  Minimal GRAD chain:
 // Leibniz → ADD(MUL(EXPAND(1),w), MUL(x,EXPAND(0))) → w.
 static int test_gradu_mul_e2e(void) {
     TinyHVM *ctx = thvm_init("cpu");
@@ -1759,7 +1757,7 @@ static int test_gradu_mul_e2e(void) {
     Term w = thvm_tensor(ctx, wd, SHAPE(3));
     thvm_set_requires_grad(ctx, x);
     Term y = thvm_op(ctx, UOP_MUL, x, w);
-    Term grad = thvm_grad_u(ctx, y, x);
+    Term grad = thvm_grad(ctx, y, x);
     Term r = thvm_eval(ctx, grad);
     f32 *h = thvm_to_host(ctx, r);
     int ok = (h != NULL);
@@ -1814,7 +1812,7 @@ static int test_gradu_dot_e2e(void) {
     thvm_set_requires_grad(ctx, x);
     Term prod = thvm_op(ctx, UOP_MUL, x, w);
     Term y = thvm_sum_axes(ctx, prod, (u32[]){0}, 1);
-    Term grad = thvm_grad_u(ctx, y, x);
+    Term grad = thvm_grad(ctx, y, x);
     Term r = thvm_eval(ctx, grad);
     f32 *h = thvm_to_host(ctx, r);
     int ok = (h != NULL);
@@ -1849,7 +1847,7 @@ static int test_e2e_grad_add(void) {
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term b = thvm_tensor(ctx, bd, SHAPE(3));
     Term y = thvm_op(ctx, UOP_ADD, a, b);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {1,1,1};
     int ok = check_e2e("grad_add", h, expect, 3);
     thvm_free(ctx);
@@ -1863,7 +1861,7 @@ static int test_e2e_grad_sub_rhs(void) {
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term b = thvm_tensor(ctx, bd, SHAPE(3));
     Term y = thvm_op(ctx, UOP_SUB, a, b);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, b)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, b)));
     f32 expect[] = {-1,-1,-1};
     int ok = check_e2e("grad_sub_rhs", h, expect, 3);
     thvm_free(ctx);
@@ -1906,7 +1904,7 @@ static int test_e2e_grad_neg(void) {
     f32 ad[] = {1,2,3};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term y = thvm_op(ctx, UOP_NEG, a, term_era());
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {-1,-1,-1};
     int ok = check_e2e("grad_neg", h, expect, 3);
     thvm_free(ctx);
@@ -1919,7 +1917,7 @@ static int test_e2e_grad_relu(void) {
     f32 ad[] = {-1,1,2};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term y = thvm_op(ctx, UOP_RELU, a, term_era());
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {0,1,1};
     int ok = check_e2e("grad_relu", h, expect, 3);
     thvm_free(ctx);
@@ -1932,7 +1930,7 @@ static int test_e2e_grad_exp(void) {
     f32 ad[] = {0, 1, 2};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term y = thvm_op(ctx, UOP_EXP, a, term_era());
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {1.0f, 2.718281828f, 7.389056099f};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) {
@@ -1953,7 +1951,7 @@ static int test_e2e_grad_sqrt(void) {
     f32 ad[] = {1, 4, 9};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term y = thvm_op(ctx, UOP_SQRT, a, term_era());
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {0.5f, 0.25f, 1.0f/6.0f};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) {
@@ -1974,7 +1972,7 @@ static int test_e2e_grad_log(void) {
     f32 ad[] = {1, 2, 4};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term y = thvm_op(ctx, UOP_LOG, a, term_era());
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {1.0f, 0.5f, 0.25f};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) {
@@ -1992,7 +1990,7 @@ static int test_e2e_grad_div(void) {
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term b = thvm_tensor(ctx, bd, SHAPE(3));
     Term y = thvm_op(ctx, UOP_DIV, a, b);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {0.5f, 0.25f, 0.125f};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) {
@@ -2011,7 +2009,7 @@ static int test_e2e_grad_max(void) {
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term b = thvm_tensor(ctx, bd, SHAPE(3));
     Term y = thvm_op(ctx, UOP_MAX, a, b);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {0, 1, 1};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) {
@@ -2027,7 +2025,7 @@ static int test_e2e_grad_sum(void) {
     f32 ad[] = {1, 2, 3, 4};
     Term a = thvm_tensor(ctx, ad, SHAPE(4));
     Term y = thvm_sum_axes(ctx, a, (u32[]){0}, 1);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {1, 1, 1, 1};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 4; i++) {
@@ -2044,7 +2042,7 @@ static int test_e2e_grad_cmp(void) {
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term b = thvm_tensor(ctx, bd, SHAPE(3));
     Term y = thvm_op(ctx, UOP_CMP, a, b);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {0,0,0};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) if (h[i] != expect[i]) { fprintf(stderr,"  grad_cmp h[%d]=%g\n",i,h[i]); ok=0; }
@@ -2058,7 +2056,7 @@ static int test_e2e_grad_rmax(void) {
     f32 ad[] = {1, 5, 3, 2};
     Term a = thvm_tensor(ctx, ad, SHAPE(4));
     Term y = thvm_rmax_axes(ctx, a, (u32[]){0}, 1);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {0, 1, 0, 0};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 4; i++) if (h[i] != expect[i]) { fprintf(stderr,"  grad_rmax h[%d]=%g\n",i,h[i]); ok=0; }
@@ -2072,7 +2070,7 @@ static int test_e2e_grad_reshape(void) {
     f32 ad[] = {1,2,3,4,5,6};
     Term a = thvm_tensor(ctx, ad, SHAPE(6));
     Term y = thvm_reshape(ctx, a, SHAPE(2, 3));
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {1,1,1,1,1,1};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 6; i++) if (h[i] != expect[i]) { fprintf(stderr,"  grad_reshape h[%d]=%g\n",i,h[i]); ok=0; }
@@ -2087,7 +2085,7 @@ static int test_e2e_grad_permute(void) {
     Term a = thvm_tensor(ctx, ad, SHAPE(2, 3));
     u32 perm[] = {1,0};
     Term y = thvm_permute(ctx, a, perm, 2);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {1,1,1,1,1,1};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 6; i++) if (h[i] != expect[i]) { fprintf(stderr,"  grad_permute h[%d]=%g\n",i,h[i]); ok=0; }
@@ -2102,7 +2100,7 @@ static int test_e2e_grad_shrink(void) {
     Term a = thvm_tensor(ctx, ad, SHAPE(6));
     u32 pairs[2] = {1, 5};
     Term y = thvm_shrink(ctx, a, pairs, 1);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {0,1,1,1,1,0};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 6; i++) if (h[i] != expect[i]) { fprintf(stderr,"  grad_shrink h[%d]=%g\n",i,h[i]); ok=0; }
@@ -2117,7 +2115,7 @@ static int test_e2e_grad_pad(void) {
     Term a = thvm_tensor(ctx, ad, SHAPE(4));
     u32 pairs[2] = {1, 1};
     Term y = thvm_pad(ctx, a, pairs, 1);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {1,1,1,1};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 4; i++) if (h[i] != expect[i]) { fprintf(stderr,"  grad_pad h[%d]=%g\n",i,h[i]); ok=0; }
@@ -2131,7 +2129,7 @@ static int test_e2e_grad_expand(void) {
     f32 ad[] = {1,2,3};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
     Term y = thvm_expand(ctx, thvm_reshape(ctx, a, SHAPE(1,3)), SHAPE(4,3));
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, a)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, a)));
     f32 expect[] = {4,4,4};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) if (h[i] != expect[i]) { fprintf(stderr,"  grad_expand h[%d]=%g\n",i,h[i]); ok=0; }
@@ -2149,7 +2147,7 @@ static int test_e2e_mse_grad(void) {
     thvm_dup(ctx, thvm_fresh_label(ctx), thvm_op(ctx, UOP_SUB, x, c), &d0, &d1);
     Term sq = thvm_op(ctx, UOP_MUL, d0, d1);
     Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, x)));
     f32 expect[] = {2,2,2};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) {
@@ -2171,7 +2169,7 @@ static int test_e2e_conv_like(void) {
     Term px = thvm_pad(ctx, x, pairs, 1);
     Term prod = thvm_op(ctx, UOP_MUL, px, w);
     Term y = thvm_sum_axes(ctx, prod, (u32[]){0}, 1);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, x)));
     // dy/dx = shrink(w_shape_match, [1,5]) = w middle 4: [0,1,0,1]
     f32 expect[] = {0, 1, 0, 1};
     int ok = (h != NULL);
@@ -2189,7 +2187,7 @@ static int test_e2e_softmax(void) {
     Term ex = thvm_op(ctx, UOP_EXP, x, term_era());
     Term s = thvm_sum_axes(ctx, ex, (u32[]){0}, 1);
     Term y = thvm_op(ctx, UOP_LOG, s, term_era());
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, x)));
     f32 expect[] = {0.0900f, 0.2447f, 0.6652f};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) {
@@ -2202,7 +2200,7 @@ static int test_e2e_softmax(void) {
 
 // SGD loop (host-driven): minimize loss = 0.5 * w^2 starting w=[4.0].
 // Update rule: w <- w - 0.1 * grad(loss, w) = w - 0.1 * w = 0.9*w.
-// After 10 steps: w ≈ 4.0 * 0.9^10 ≈ 1.395.  Exercises GRAD2 under repeated eval.
+// After 10 steps: w ≈ 4.0 * 0.9^10 ≈ 1.395.  Exercises GRAD under repeated eval.
 static int test_e2e_sgd_loop(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 wd[] = {4.0f};
@@ -2218,7 +2216,7 @@ static int test_e2e_sgd_loop(void) {
         f32 halfv = 0.5f;
         Term half = thvm_tensor(ctx, &halfv, SHAPE(1));
         Term loss = thvm_op(ctx, UOP_MUL, half, wsq);
-        Term g = thvm_grad_u(ctx, loss, w1);
+        Term g = thvm_grad(ctx, loss, w1);
         Term ge = thvm_eval(ctx, g);
         f32 *gh = thvm_to_host(ctx, ge);
         if (!gh) { thvm_free(ctx); return report("e2e_sgd_loop", 0); }
@@ -2311,7 +2309,7 @@ static int test_e2e_mlp_bwd(void) {
     Term z  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MUL, x, w1), b1);
     Term h  = thvm_op(ctx, UOP_RELU, z, term_era());
     Term y  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MUL, h, w2), b2);
-    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, w1)));
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, w1)));
     f32 expect[] = {1, 2, 3};
     int ok = (g != NULL);
     if (g) for (int i = 0; i < 3; i++) {
@@ -2336,7 +2334,7 @@ static int test_e2e_adam(void) {
         f32 hv = 0.5f;
         Term half = thvm_tensor(ctx, &hv, SHAPE(1));
         Term loss = thvm_op(ctx, UOP_MUL, half, thvm_op(ctx, UOP_MUL, w0a, w0b));
-        f32 *gh = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, loss, w1v)));
+        f32 *gh = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, loss, w1v)));
         if (!gh) { thvm_free(ctx); return report("e2e_adam", 0); }
         f32 grad = gh[0];
         m = b1*m + (1-b1)*grad;
@@ -2358,7 +2356,7 @@ static int test_e2e_maxpool_like(void) {
     f32 xd[] = {1,5,3,2};
     Term x = thvm_tensor(ctx, xd, SHAPE(2, 2));
     Term y = thvm_rmax_axes(ctx, x, (u32[]){1}, 1);
-    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, x)));
     f32 expect[] = {0, 1, 1, 0};
     int ok = (g != NULL);
     if (g) for (int i = 0; i < 4; i++) if (g[i] != expect[i]) {
@@ -2394,7 +2392,7 @@ static int test_e2e_adam_linear_fit(void) {
             // target W — but W was consumed by expand.  Make a fresh tensor
             // with the same data as a target sentinel.
             Term Wtgt = thvm_tensor(ctx, &w, SHAPE(1));
-            f32 *gw = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, loss, Wtgt)));
+            f32 *gw = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, loss, Wtgt)));
             if (!gw) { thvm_free(ctx); return report("e2e_adam_linear_fit", 0); }
             (void)Wtgt;
             // Actually target's tid must match W's tid to trigger leaf.
@@ -2444,7 +2442,7 @@ static int test_e2e_mm_bwd(void) {
     Term x = thvm_tensor(ctx, xd, SHAPE(2, 3));
     Term w = thvm_tensor(ctx, wd, SHAPE(3, 2));
     Term y = thvm_op_raw(ctx, UOP_MM, x, w);
-    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, x)));
     f32 expect[] = {2,2,2,2,2,2};
     int ok = (g != NULL);
     if (g) for (int i = 0; i < 6; i++) {
@@ -2463,7 +2461,7 @@ static int test_e2e_scalar_mul_grad(void) {
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
     Term k = thvm_expand(ctx, thvm_tensor(ctx, kd, SHAPE(1)), SHAPE(3));
     Term y = thvm_op(ctx, UOP_MUL, k, x);
-    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, x)));
     f32 expect[]={2,2,2};
     int ok = (g != NULL);
     if (g) for (int i = 0; i < 3; i++) if (g[i] != expect[i]) {
@@ -2486,7 +2484,7 @@ static int test_e2e_mlp_scalar_loss(void) {
     Term h = thvm_op(ctx, UOP_RELU, z, term_era());
     Term hw = thvm_op(ctx, UOP_MUL, h, w2);
     Term y = thvm_sum_axes(ctx, hw, (u32[]){0}, 1);
-    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, w1)));
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, w1)));
     f32 expect[]={2, 4, 6};
     int ok = (g != NULL);
     if (g) for (int i = 0; i < 3; i++) {
@@ -2509,7 +2507,7 @@ static int test_e2e_sigmoid_grad(void) {
     Term den = thvm_op(ctx, UOP_ADD, one, e);
     Term one2 = thvm_tensor(ctx, oned, SHAPE(1));
     Term y = thvm_op(ctx, UOP_DIV, one2, den);
-    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, x)));
     f32 expect = 0.25f;
     int ok = (g != NULL);
     if (g) {
@@ -2533,14 +2531,14 @@ static int test_e2e_d2_square(void) {
     Term xA, xB;  thvm_dup(ctx, thvm_fresh_label(ctx), x, &xA, &xB);
     Term xA0, xA1; thvm_dup(ctx, thvm_fresh_label(ctx), xA, &xA0, &xA1);
     Term y = thvm_op(ctx, UOP_MUL, xA0, xA1);
-    Term g1 = thvm_grad_u(ctx, y, xB);
+    Term g1 = thvm_grad(ctx, y, xB);
     // second deriv: grad of g1 w.r.t. a fresh x_tensor with same value
     f32 xd2[]={5.0f};
     Term x2 = thvm_tensor(ctx, xd2, SHAPE(1));
     Term xB0, xB1; thvm_dup(ctx, thvm_fresh_label(ctx), x2, &xB0, &xB1);
     Term y2 = thvm_op(ctx, UOP_MUL, xB0, xB0); (void)xB1;
     // Easier: just check first-derivative; second derivative requires
-    // GRAD2 to compose over GRAD2 which currently has shape/recursion gaps.
+    // GRAD to compose over GRAD which currently has shape/recursion gaps.
     f32 *h = thvm_to_host(ctx, thvm_eval(ctx, g1));
     int ok = (h != NULL) && (h[0] > 9.9f && h[0] < 10.1f);
     if (!ok) fprintf(stderr, "  d2_square g1=%g (want 10)\n", h ? h[0] : 0);
@@ -2549,10 +2547,10 @@ static int test_e2e_d2_square(void) {
     return report("e2e_d2_square_first", ok);
 }
 
-// Nested GRAD2 at term-construction level: GRAD2(GRAD2(f, x), x).
+// Nested GRAD at term-construction level: GRAD(GRAD(f, x), x).
 // f = x^3 via x*x*x.  df/dx = 3x^2.  d²f/dx² = 6x.
 // At x=2: f=8, df/dx=12, d²f/dx²=12.  We verify both levels reduce
-// to a numeric tensor (topology/pipeline test for nested GRAD2).
+// to a numeric tensor (topology/pipeline test for nested GRAD).
 static int test_e2e_nested_grad(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[]={2.0f};
@@ -2565,8 +2563,8 @@ static int test_e2e_nested_grad(void) {
     Term xc, xd2; thvm_dup(ctx, thvm_fresh_label(ctx), xa, &xc, &xd2);
     Term x2 = thvm_op(ctx, UOP_MUL, xc, xd2);
     Term x3 = thvm_op(ctx, UOP_MUL, x2, xb);
-    Term g1 = thvm_grad_u(ctx, x3, x_inner_tgt);
-    Term g2 = thvm_grad_u(ctx, g1, x_outer_tgt);
+    Term g1 = thvm_grad(ctx, x3, x_inner_tgt);
+    Term g2 = thvm_grad(ctx, g1, x_outer_tgt);
     Term ev = thvm_eval(ctx, g2);
     f32 *h = thvm_to_host(ctx, ev);
     // Pipeline test: require non-NULL readback. Numeric exactness of
@@ -2589,7 +2587,7 @@ static int test_e2e_cross_partial(void) {
     Term xa, xb; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xb);
     Term ya, yb; thvm_dup(ctx, thvm_fresh_label(ctx), y, &ya, &yb);
     Term f = thvm_op(ctx, UOP_MUL, xa, ya);
-    Term df_dx = thvm_grad_u(ctx, f, xb);  // should be y numerically
+    Term df_dx = thvm_grad(ctx, f, xb);  // should be y numerically
     f32 *h = thvm_to_host(ctx, thvm_eval(ctx, df_dx));
     int ok = (h != NULL) && (h[0] > 3.9f && h[0] < 4.1f);
     if (!ok) fprintf(stderr, "  cross_partial df/dx=%g (want 4)\n", h ? h[0] : 0);
@@ -2609,7 +2607,7 @@ static int test_e2e_shared_target_mul(void) {
     Term xB0, xB1;  thvm_dup(ctx, thvm_fresh_label(ctx), xB, &xB0, &xB1);
     Term sq = thvm_op(ctx, UOP_MUL, xB0, xB1);
     Term y = thvm_op(ctx, UOP_ADD, xA, sq);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, xT)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, xT)));
     int ok = (h != NULL) && (h[0] > 6.9f && h[0] < 7.1f);
     if (!ok) fprintf(stderr, "  shared_target h=%g (want 7)\n", h ? h[0] : 0);
     thvm_free(ctx);
@@ -2625,7 +2623,7 @@ static int test_e2e_view_chain_grad(void) {
     Term p = thvm_permute(ctx, x, (u32[]){1,0}, 2);
     Term r = thvm_reshape(ctx, p, SHAPE(6));
     Term y = thvm_sum_axes(ctx, r, (u32[]){0}, 1);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, x)));
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 6; i++) {
         f32 d = h[i]-1.0f; if (d<0) d=-d;
@@ -2649,7 +2647,7 @@ static int test_e2e_div_chain(void) {
     Term num = thvm_op(ctx, UOP_MUL, xa0, xa1);
     Term den = thvm_op(ctx, UOP_ADD, xb, one);
     Term y = thvm_op(ctx, UOP_DIV, num, den);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, xt)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, xt)));
     int ok = (h != NULL) && (h[0] > 0.93f && h[0] < 0.95f);
     if (!ok) fprintf(stderr, "  div_chain h=%g (want ~0.9375)\n", h ? h[0] : 0);
     thvm_free(ctx);
@@ -2665,7 +2663,7 @@ static int test_e2e_disconnected_target(void) {
     Term b = thvm_tensor(ctx, bd, SHAPE(2));
     Term c = thvm_tensor(ctx, cd, SHAPE(3));
     Term y = thvm_op(ctx, UOP_ADD, a, b);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, c)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, c)));
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) if (h[i] != 0.0f) {
         fprintf(stderr,"  disconnected h[%d]=%g (want 0)\n",i,h[i]); ok=0;
@@ -2807,7 +2805,7 @@ int main(void) {
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.
-    // Low priority; GRAD2-through-LAM not a critical topology path.
+    // Low priority; GRAD-through-LAM not a critical topology path.
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

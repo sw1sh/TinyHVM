@@ -3,28 +3,28 @@
 
 (* ── Extract layer list from WL net ──────────────────────────────── *)
 
-iExtractLayers[net_NetChain] := Normal[net];
-iExtractLayers[net_NetGraph] := Normal[net];
-iExtractLayers[specs_List] := specs;
+extractLayerSpecs[net_NetChain] := Normal[net];
+extractLayerSpecs[net_NetGraph] := Normal[net];
+extractLayerSpecs[specs_List] := specs;
 
 (* ── TCompileNet: WL net → TNet (fresh random weights) ──────────── *)
 
-TCompileNet[net_, inputShape_List] := Module[{specs},
-    specs = iExtractLayers[net];
+TCompileNet[net_, inputShape_List] := Block[{specs},
+    specs = extractLayerSpecs[net];
     specs = Select[specs, !MatchQ[#, _SoftmaxLayer] &];
     TNet[specs, inputShape]
 ];
 
 (* ── TCompileNet with weight import from trained net ─────────────── *)
 
-TCompileNet[net_, inputShape_List, "ImportWeights" -> True] := Module[{
+TCompileNet[net_, inputShape_List, "ImportWeights" -> True] := Block[{
     layerList, layers = {}, shape = inputShape, result, layer, i
 },
     layerList = Normal[net];
     Do[
         layer = layerList[[i]];
         If[MatchQ[layer, _SoftmaxLayer], Continue[]];
-        result = iCompileSpecImport[layer, shape, net, i];
+        result = compileLayerSpecImport[layer, shape, net, i];
         AppendTo[layers, result[[1]]];
         shape = result[[2]],
         {i, Length[layerList]}
@@ -34,8 +34,8 @@ TCompileNet[net_, inputShape_List, "ImportWeights" -> True] := Module[{
 
 (* ── Per-layer weight import ─────────────────────────────────────── *)
 
-iCompileSpecImport[layer_ConvolutionLayer, {inC_, h_, w_}, net_, key_] :=
-Module[{outC, k, stride, pad, wData, bData, tW, tB, pp, newH, newW},
+compileLayerSpecImport[layer_ConvolutionLayer, {inC_, h_, w_}, net_, key_] :=
+Block[{outC, k, stride, pad, wData, bData, tW, tB, pp, newH, newW},
     outC = layer["OutputChannels"];
     k = layer["KernelSize"];
     stride = layer["Stride"];
@@ -63,8 +63,8 @@ Module[{outC, k, stride, pad, wData, bData, tW, tB, pp, newH, newW},
     ]
 ];
 
-iCompileSpecImport[layer_LinearLayer, {inF_}, net_, key_] :=
-Module[{outF, wData, bData, tW, tB},
+compileLayerSpecImport[layer_LinearLayer, {inF_}, net_, key_] :=
+Block[{outF, wData, bData, tW, tB},
     outF = layer["OutputSize"];
     If[ListQ[outF], outF = First[outF]];
 
@@ -79,7 +79,7 @@ Module[{outF, wData, bData, tW, tB},
     With[{ww = tW, bb = tB, of = outF},
         {TLayer[<|"Type" -> "Linear", "InFeatures" -> inF, "OutFeatures" -> of,
             "Params" -> {ww, bb},
-            "Forward" -> Function[{x}, Module[{bs = First[TDimensions[x]]},
+            "Forward" -> Function[{x}, Block[{bs = First[TDimensions[x]]},
                 TOp["Add"][TOp["MatMul"][x, ww],
                     TOp["Expand"][TOp["Reshape"][bb, {1, of}], {bs, of}]]
             ]]|>],
@@ -87,12 +87,12 @@ Module[{outF, wData, bData, tW, tB},
     ]
 ];
 
-(* Non-parametric layers: delegate to existing iCompileSpec *)
-iCompileSpecImport[layer_ElementwiseLayer, shape_, _, _] := iCompileSpec[layer, shape];
-iCompileSpecImport[layer_FlattenLayer, shape_, _, _] := iCompileSpec[layer, shape];
-iCompileSpecImport[layer_PoolingLayer, shape_, _, _] := iCompileSpec[layer, shape];
-iCompileSpecImport[_SoftmaxLayer, shape_, _, _] := Sequence[];
-iCompileSpecImport[layer_, shape_, _, _] := iCompileSpec[layer, shape];
+(* Non-parametric layers: delegate to existing compileLayerSpec *)
+compileLayerSpecImport[layer_ElementwiseLayer, shape_, _, _] := compileLayerSpec[layer, shape];
+compileLayerSpecImport[layer_FlattenLayer, shape_, _, _] := compileLayerSpec[layer, shape];
+compileLayerSpecImport[layer_PoolingLayer, shape_, _, _] := compileLayerSpec[layer, shape];
+compileLayerSpecImport[_SoftmaxLayer, shape_, _, _] := Sequence[];
+compileLayerSpecImport[layer_, shape_, _, _] := compileLayerSpec[layer, shape];
 
 (* ── Single-inet training term ───────────────────────────────────── *)
 (*
@@ -108,7 +108,7 @@ iCompileSpecImport[layer_, shape_, _, _] := iCompileSpec[layer, shape];
 
 TBuildTrainLoop[net_TNet, xBatch_TTensor, yOneHot_TTensor,
                 nSteps_Integer, lr_?NumericQ] :=
-Module[{params, nP, lrTen, defSlot,
+Block[{params, nP, lrTen, defSlot,
         outerLam, outerVar, innerLam, innerVar,
         logits, loss, grads, logLoss, assigns, rec, chain},
     params = TParams[net];
@@ -157,7 +157,7 @@ Module[{params, nP, lrTen, defSlot,
 (* ── Evaluate accuracy ───────────────────────────────────────────── *)
 
 TEvalAccuracy[net_TNet, testImages_List, testLabels_List, batchSize_Integer: 64] :=
-Module[{nTest, nBatches, correct = 0, nWeights, xb, logits, probs, preds, actual},
+Block[{nTest, nBatches, correct = 0, nWeights, xb, logits, probs, preds, actual},
     nTest = Length[testImages];
     nBatches = Floor[nTest / batchSize];
     nWeights = TTensorCount[];

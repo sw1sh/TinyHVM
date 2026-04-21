@@ -61,7 +61,6 @@ static struct {
 void term_use_clear(void) { memset(term_use_table, 0, sizeof(term_use_table)); }
 
 void thvm_free(TinyHVM *ctx) {
-    thvm_grad_targets_clear(ctx);
     thvm_sched_reset_runtime();
     // Free GPU buffers via each tensor's own backend
     for (u32 i = 0; i < ctx->tensor_count; i++) {

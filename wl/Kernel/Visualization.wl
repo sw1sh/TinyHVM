@@ -2,6 +2,7 @@
 (* Get'd from TinyHVM.wl inside Begin["`Private`"]. All public symbols declared there. *)
 
 ClearAll[
+    $visualizationSourceDirectory,
     ensureDOTImporterLoaded,
     numText,
     dotKernelOpChain,
@@ -25,11 +26,15 @@ ClearAll[
     withDOTImport
 ];
 
+$visualizationSourceDirectory = DirectoryName[$InputFileName];
+
 ensureDOTImporterLoaded[] := Block[{},
-    If[DownValues[ImportDOT] === {},
-        Quiet @ Check[
-            Get @ FileNameJoin[{DirectoryName[$InputFileName], "ImportCallGraphDOT.wl"}],
-            $Failed
+    Block[{$Context = "Global`", $ContextPath = {"System`", "Global`"}},
+        If[DownValues[ImportDOT] === {},
+            Quiet @ Check[
+                Get @ FileNameJoin[{$visualizationSourceDirectory, "ImportCallGraphDOT.wl"}],
+                $Failed
+            ]
         ]
     ]
 ]
@@ -538,7 +543,10 @@ withDOTImport[dot_String, opts___?OptionQ] := Block[{
     ];
     Internal`WithLocalSettings[
         Export[path, dot, "String"],
-        result = ImportDOT[path, Sequence @@ importOpts],
+        Block[{$Context = "Global`", $ContextPath = {"System`", "Global`"}},
+            ensureDOTImporterLoaded[];
+            result = Global`ImportDOT[path, Sequence @@ importOpts]
+        ],
         Quiet @ Check[DeleteFile[path], Null]
     ];
     result
@@ -854,19 +862,19 @@ TProfileData[] := Block[{
     raw = Normal[thvmProfileDataFn[]];
     If[Length[raw] < 3 n + 18, Return[$Failed]];
     <|
-        "UOpTime" -> AssociationThread[Take[Values[$uopName], n], Take[raw, n] / 1. *^6],
+        "UOpTime" -> AssociationThread[Take[Values[$uopName], n], Take[raw, n] / 1.*^6],
         "UOpCount" -> AssociationThread[Take[Values[$uopName], n], Round /@ raw[[n + 1 ;; 2 n]]],
         "PhaseMs" -> <|
-            "Forward" -> raw[[3 n + 1]] / 1. *^6,
-            "Backward" -> raw[[3 n + 2]] / 1. *^6,
-            "Adam" -> raw[[3 n + 3]] / 1. *^6,
-            "Reset" -> raw[[3 n + 4]] / 1. *^6,
-            "Other" -> raw[[3 n + 5]] / 1. *^6
+            "Forward" -> raw[[3 n + 1]] / 1.*^6,
+            "Backward" -> raw[[3 n + 2]] / 1.*^6,
+            "Adam" -> raw[[3 n + 3]] / 1.*^6,
+            "Reset" -> raw[[3 n + 4]] / 1.*^6,
+            "Other" -> raw[[3 n + 5]] / 1.*^6
         |>,
         "Memory" -> <|
-            "AllocMB" -> raw[[3 n + 6]] / 1. *^6,
-            "PeakMB" -> raw[[3 n + 8]] / 1. *^6,
-            "CurrentMB" -> raw[[3 n + 9]] / 1. *^6
+            "AllocMB" -> raw[[3 n + 6]] / 1.*^6,
+            "PeakMB" -> raw[[3 n + 8]] / 1.*^6,
+            "CurrentMB" -> raw[[3 n + 9]] / 1.*^6
         |>,
         "Tensors" -> <|
             "Peak" -> Round[raw[[3 n + 10]]],

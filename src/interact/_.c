@@ -19,9 +19,9 @@ static Term thvm_eval_exec_fixed_point(TinyHVM *ctx, Term t);
 static Term thvm_force_dispatch_kid(TinyHVM *ctx, u32 kid, u32 depth);
 static int thvm_kernel_register(TinyHVM *ctx, Term kernel, u32 *out_kid);
 static Term thvm_alo_force(TinyHVM *ctx, Term alo);
-// Defined in grad/_.c (included after interact). Used by diag sites here.
-static u32 thvm_probe_ten_tid(TinyHVM *ctx, Term t);
-static void thvm_probe_print_ten(TinyHVM *ctx, Term t, const char *label);
+static inline void thvm_probe_print_ten(TinyHVM *ctx, Term t, const char *label) {
+    (void)ctx; (void)t; (void)label;
+}
 
 static Term thvm_era_payload(TinyHVM *ctx, Term item) {
     while (term_tag(item) == TAG_ERA) {
@@ -451,7 +451,7 @@ static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 de
                                    uop == UOP_ASSIGN || uop == UOP_DETACH ||
                                    uop == UOP_FUSE ||
                                    uop == UOP_IFZ || uop == UOP_WHERE ||
-                                   uop == UOP_GRAD || uop == UOP_GRAD2 ||
+                                   uop == UOP_GRAD || uop == UOP_GRAD ||
                                    uop == UOP_LOG_PRINT ||
                                    uop == UOP_TODEVICE);
                 if (maybe_force) {
@@ -462,7 +462,7 @@ static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 de
                         continue;
                     }
                 }
-                if (uop != UOP_FUSE && uop != UOP_GRAD && uop != UOP_GRAD2 &&
+                if (uop != UOP_FUSE && uop != UOP_GRAD && uop != UOP_GRAD &&
                     uop != UOP_EXEC && uop != UOP_KERNEL &&
                     uop != UOP_ASSIGN && uop != UOP_DETACH &&
                     uop != UOP_IFZ && uop != UOP_WHERE &&
@@ -840,75 +840,6 @@ static Term thvm_alo_realize(TinyHVM *ctx, Term book_term, u32 state_id) {
         Term child = (old_loc > 0 && old_loc + i < ctx->book_heap_pos) ? ctx->book_heap[old_loc + i] : term_era();
         heap_set(ctx, new_loc + i, thvm_alo_suspend_child(ctx, child, node_state));
     }
-    if (tag == TAG_APP && ar == 2) {
-        Term fun_book = (old_loc > 0 && old_loc < ctx->book_heap_pos) ? ctx->book_heap[old_loc + 0] : term_era();
-        Term fun_dyn  = heap_read(ctx, new_loc + 0);
-        if (term_tag(fun_book) == TAG_TOP && term_ext(fun_book) == UOP_GRAD &&
-            term_tag(fun_dyn)  == TAG_TOP && term_ext(fun_dyn)  == UOP_GRAD) {
-            u64 grad_loc = term_val(fun_dyn);
-            thvm_grad_keep_app_loc_set(ctx, grad_loc, new_loc);
-            thvm_grad_keep_bundle_set(ctx, grad_loc, heap_read(ctx, new_loc + 1));
-        }
-    }
-    if (tag == TAG_TOP && term_ext(book_term) == UOP_GRAD) {
-        u64 book_grad_loc = thvm_grad_book_loc_key(old_loc);
-        Term dyn_target = thvm_alo_suspend_child(ctx, thvm_grad_target_get(ctx, book_grad_loc), state_id);
-        u32 dyn_mode = thvm_grad_mode_get(ctx, book_grad_loc);
-        thvm_grad_target_set(ctx, new_loc, dyn_target);
-        thvm_grad_mode_set(ctx, new_loc, dyn_mode);
-        u32 nt = thvm_grad_targets_count_at(ctx, book_grad_loc);
-        if (nt > 0) {
-            Term params[THVM_GRAD_TARGETS_MAX];
-            Term slots[THVM_GRAD_TARGETS_MAX];
-            assert(nt <= THVM_GRAD_TARGETS_MAX);
-            for (u32 i = 0; i < nt; i++) {
-                params[i] = thvm_alo_suspend_child(ctx,
-                                                   thvm_grad_targets_get_term_at(ctx, book_grad_loc, i),
-                                                   state_id);
-                slots[i] = thvm_alo_suspend_child(ctx,
-                                                  thvm_grad_targets_get_slot_at(ctx, book_grad_loc, i),
-                                                  state_id);
-            }
-            thvm_grad_targets_set_for_loc(ctx, new_loc, params, slots, nt);
-        }
-        Term bundle = thvm_grad_keep_bundle_get(ctx, book_grad_loc);
-        if (!(term_tag(bundle) == TAG_ERA && term_val(bundle) == 0)) {
-            thvm_grad_keep_bundle_set(ctx, new_loc, thvm_alo_suspend_child(ctx, bundle, state_id));
-        }
-        u64 book_app_loc = thvm_grad_keep_app_loc_get(ctx, book_grad_loc);
-        if (book_app_loc != 0) {
-            u64 dyn_or_book_app_loc = book_app_loc;
-            if (thvm_grad_is_book_loc(book_app_loc)) {
-                u64 dyn_app_loc = 0;
-                if (thvm_alo_lookup_node(ctx, state_id, thvm_grad_unkey_book_loc(book_app_loc), &dyn_app_loc))
-                    dyn_or_book_app_loc = dyn_app_loc;
-            }
-            thvm_grad_keep_app_loc_set(ctx, new_loc, dyn_or_book_app_loc);
-        }
-        if (getenv("THVM_LOOP_DIAG")) {
-            fprintf(stderr,
-                    "ALO_GRAD book_loc=%llu dyn_loc=%llu mode=%u targets=%u target_tag=%u target_ext=%u target_val=%llu bundle_tag=%u bundle_ext=%u bundle_val=%llu\n",
-                    (unsigned long long)old_loc,
-                    (unsigned long long)new_loc,
-                    dyn_mode,
-                    nt,
-                    (u32)term_tag(dyn_target),
-                    (u32)term_ext(dyn_target),
-                    (unsigned long long)term_val(dyn_target),
-                    (u32)term_tag(bundle),
-                    (u32)term_ext(bundle),
-                    (unsigned long long)term_val(bundle));
-            for (u32 i = 0; i < nt; i++) {
-                Term pt = thvm_grad_targets_get_term_at(ctx, new_loc, i);
-                Term ps = thvm_grad_targets_get_slot_at(ctx, new_loc, i);
-                fprintf(stderr,
-                        "  ALO_GRAD_TARGET[%u]=term(tag=%u ext=%u val=%llu) slot(tag=%u ext=%u val=%llu)\n",
-                        i,
-                        (u32)term_tag(pt), (u32)term_ext(pt), (unsigned long long)term_val(pt),
-                        (u32)term_tag(ps), (u32)term_ext(ps), (unsigned long long)term_val(ps));
-            }
-        }
-    }
     return term_new(tag, term_ext(book_term), new_loc);
 }
 
@@ -1021,9 +952,6 @@ inet_step:
         case TAG_TOP: {
             u32 uop = term_ext(t);
             u64 loc = term_val(t);
-
-            // === UOP_GRAD2 (new UOP-shape gradient) ===
-#include "grad2.c"
 
             // === UOP_GRAD ===
 #include "grad.c"

@@ -3,7 +3,7 @@
 
 (* ── Layer constructors — all return TLayer[<|...|>] ──────────────────── *)
 
-TLinearLayer[inF_Integer, outF_Integer] := Module[{w, b, bound},
+TLinearLayer[inF_Integer, outF_Integer] := Block[{w, b, bound},
     bound = 1./Sqrt[N[inF]];
     w = TCreate[RandomReal[{-bound, bound}, inF * outF], {inF, outF}];
     b = TCreate[ConstantArray[0., outF], {outF}];
@@ -12,7 +12,7 @@ TLinearLayer[inF_Integer, outF_Integer] := Module[{w, b, bound},
         TLayer[<|"Type" -> "Linear", "InFeatures" -> inf, "OutFeatures" -> of,
           "Params" -> {ww, bb},
           "Forward" -> Function[{x},
-            Module[{bs = First[TDimensions[x]]},
+            Block[{bs = First[TDimensions[x]]},
                 TOp["Add"][TOp["MatMul"][x, ww],
                     TOp["Expand"][TOp["Reshape"][bb, {1, of}], {bs, of}]]
             ]]|>]
@@ -20,7 +20,7 @@ TLinearLayer[inF_Integer, outF_Integer] := Module[{w, b, bound},
 ];
 
 TConvLayer[inC_Integer, outC_Integer, k_Integer, opts___Rule] :=
-Module[{w, b, stride, padding, groups, hasBias, bound},
+Block[{w, b, stride, padding, groups, hasBias, bound},
     stride = "Stride" /. {opts} /. {"Stride" -> {1, 1}};
     padding = "Padding" /. {opts} /. {"Padding" -> {0, 0, 0, 0}};
     groups = "Groups" /. {opts} /. {"Groups" -> 1};
@@ -54,11 +54,11 @@ TActivation[name_String] := With[{n = name},
 
 TFlattenLayer[] := TLayer[<|"Type" -> "Flatten", "Params" -> {},
     "Forward" -> Function[{x},
-        Module[{dims = TDimensions[x]},
+        Block[{dims = TDimensions[x]},
             TOp["Reshape"][x, {First[dims], Times @@ Rest[dims]}]
         ]]|>];
 
-TMaxPoolLayer[k_Integer:2, opts___Rule] := Module[{stride},
+TMaxPoolLayer[k_Integer:2, opts___Rule] := Block[{stride},
     stride = "Stride" /. {opts} /. {"Stride" -> {k, k}};
     With[{kk = k, ss = stride},
         TLayer[<|"Type" -> "MaxPool", "PoolSize" -> kk, "Params" -> {},
@@ -69,7 +69,7 @@ TMaxPoolLayer[k_Integer:2, opts___Rule] := Module[{stride},
 (* ── WL spec compilation with shape flow ──────────────────────────────── *)
 
 (* Output shape for a TLayer *)
-iLayerOutputShape[TLayer[assoc_], shape_] := Switch[assoc["Type"],
+layerOutputShape[TLayer[assoc_], shape_] := Switch[assoc["Type"],
     "Linear", {assoc["OutFeatures"]},
     "Conv2D", {assoc["OutChannels"], shape[[2]] - assoc["KernelSize"] + 1,
                shape[[3]] - assoc["KernelSize"] + 1},
@@ -82,45 +82,45 @@ iLayerOutputShape[TLayer[assoc_], shape_] := Switch[assoc["Type"],
 
 (* --- Unevaluated WL layer specs (NN framework not loaded) --- *)
 
-iCompileSpec[HoldPattern[ConvolutionLayer[outC_Integer, {k_Integer, k2_Integer}]], {inC_, h_, w_}] :=
+compileLayerSpec[HoldPattern[ConvolutionLayer[outC_Integer, {k_Integer, k2_Integer}]], {inC_, h_, w_}] :=
     {TConvLayer[inC, outC, k], {outC, h - k + 1, w - k2 + 1}};
-iCompileSpec[HoldPattern[ConvolutionLayer[outC_Integer, k_Integer]], shape_] :=
-    iCompileSpec[ConvolutionLayer[outC, {k, k}], shape];
+compileLayerSpec[HoldPattern[ConvolutionLayer[outC_Integer, k_Integer]], shape_] :=
+    compileLayerSpec[ConvolutionLayer[outC, {k, k}], shape];
 
-iCompileSpec[HoldPattern[LinearLayer[outF_Integer]], {inF_}] :=
+compileLayerSpec[HoldPattern[LinearLayer[outF_Integer]], {inF_}] :=
     {TLinearLayer[inF, outF], {outF}};
 
-iCompileSpec[HoldPattern[ElementwiseLayer[Ramp]], shape_] := {TActivation["Relu"], shape};
-iCompileSpec[HoldPattern[ElementwiseLayer["ReLU" | "Relu"]], shape_] := {TActivation["Relu"], shape};
+compileLayerSpec[HoldPattern[ElementwiseLayer[Ramp]], shape_] := {TActivation["Relu"], shape};
+compileLayerSpec[HoldPattern[ElementwiseLayer["ReLU" | "Relu"]], shape_] := {TActivation["Relu"], shape};
 
-iCompileSpec[HoldPattern[FlattenLayer[]], shape_] := {TFlattenLayer[], {Times @@ shape}};
+compileLayerSpec[HoldPattern[FlattenLayer[]], shape_] := {TFlattenLayer[], {Times @@ shape}};
 
-iCompileSpec[HoldPattern[PoolingLayer[{k_Integer, k2_Integer}, ___]], {c_, h_, w_}] :=
+compileLayerSpec[HoldPattern[PoolingLayer[{k_Integer, k2_Integer}, ___]], {c_, h_, w_}] :=
     {TMaxPoolLayer[k], {c, Floor[h/k], Floor[w/k2]}};
-iCompileSpec[HoldPattern[PoolingLayer[k_Integer, rest___]], shape_] :=
-    iCompileSpec[PoolingLayer[{k, k}, rest], shape];
+compileLayerSpec[HoldPattern[PoolingLayer[k_Integer, rest___]], shape_] :=
+    compileLayerSpec[PoolingLayer[{k, k}, rest], shape];
 
 (* --- Evaluated WL layer objects (atomic — extract via Information) --- *)
 
-iCompileSpec[spec_ConvolutionLayer, {inC_, h_, w_}] := Module[{outC, k},
+compileLayerSpec[spec_ConvolutionLayer, {inC_, h_, w_}] := Block[{outC, k},
     {outC, k} = Replace[Quiet[Information[spec, "InputForm"]],
         HoldForm[ConvolutionLayer[oc_, ks_, ___]] :> {oc, ks}];
     If[IntegerQ[k], k = {k, k}];
     {TConvLayer[inC, outC, k[[1]]], {outC, h - k[[1]] + 1, w - k[[2]] + 1}}
 ];
 
-iCompileSpec[spec_LinearLayer, {inF_}] := Module[{outF},
+compileLayerSpec[spec_LinearLayer, {inF_}] := Block[{outF},
     outF = Replace[Quiet[Information[spec, "InputForm"]],
         HoldForm[LinearLayer[out_, ___]] :> out];
     If[ListQ[outF], outF = First[outF]];
     {TLinearLayer[inF, outF], {outF}}
 ];
 
-iCompileSpec[_ElementwiseLayer, shape_] := {TActivation["Relu"], shape};
+compileLayerSpec[_ElementwiseLayer, shape_] := {TActivation["Relu"], shape};
 
-iCompileSpec[_FlattenLayer, shape_] := {TFlattenLayer[], {Times @@ shape}};
+compileLayerSpec[_FlattenLayer, shape_] := {TFlattenLayer[], {Times @@ shape}};
 
-iCompileSpec[spec_PoolingLayer, {c_, h_, w_}] := Module[{k},
+compileLayerSpec[spec_PoolingLayer, {c_, h_, w_}] := Block[{k},
     k = Replace[Quiet[Information[spec, "InputForm"]],
         HoldForm[PoolingLayer[ks_, ___]] :> ks];
     If[IntegerQ[k], k = {k, k}];
@@ -129,7 +129,7 @@ iCompileSpec[spec_PoolingLayer, {c_, h_, w_}] := Module[{k},
 
 (* --- TLayer passthrough --- *)
 
-iCompileSpec[layer_TLayer, shape_] := {layer, iLayerOutputShape[layer, shape]};
+compileLayerSpec[layer_TLayer, shape_] := {layer, layerOutputShape[layer, shape]};
 
 (* ── Sequential composition ─────────────────────────────────────────────── *)
 
@@ -142,9 +142,9 @@ TNet[layers_List] /; AllTrue[layers, MatchQ[#, _TLayer] &] := With[{
 ];
 
 (* From WL specs + input shape — compile with shape flow *)
-TNet[specs_List, inputShape_List] := Module[{layers = {}, shape = inputShape, result},
+TNet[specs_List, inputShape_List] := Block[{layers = {}, shape = inputShape, result},
     Do[
-        result = iCompileSpec[spec, shape];
+        result = compileLayerSpec[spec, shape];
         AppendTo[layers, result[[1]]];
         shape = result[[2]],
         {spec, specs}
@@ -161,7 +161,7 @@ TParams[layer_TLayer] := First[layer]["Params"];
 (* ── Loss functions ─────────────────────────────────────────────────────── *)
 
 TCrossEntropyLoss[logits_TTensor, oneHot_TTensor] :=
-Module[{dims, bs, nc, xmax, shifted, e, esum, probs, eps, clamped, lp, masked},
+Block[{dims, bs, nc, xmax, shifted, e, esum, probs, eps, clamped, lp, masked},
     dims = TDimensions[logits];
     bs = dims[[1]]; nc = dims[[2]];
     xmax = TOp["Expand"][TOp["RMax"][logits], {bs, nc}];
@@ -189,7 +189,7 @@ TSGD[params_List, gradSlots_List, lrTen_TTensor] :=
     ];
 
 TTrainStep[params_List, loss_TTensor, lr_?NumericQ] :=
-Module[{n = Length[params], gradSlots, gradTerm, lrTen, sgdChain, lossVal},
+Block[{n = Length[params], gradSlots, gradTerm, lrTen, sgdChain, lossVal},
     gradSlots = Table[
         TCreate[ConstantArray[0., Times @@ TDimensions[params[[i]]]],
                 TDimensions[params[[i]]]],
@@ -206,7 +206,7 @@ Module[{n = Length[params], gradSlots, gradTerm, lrTen, sgdChain, lossVal},
 
 (* ── Formatting ─────────────────────────────────────────────────────────── *)
 
-TLayer /: MakeBoxes[layer:TLayer[assoc_Association], StandardForm] := Module[
+TLayer /: MakeBoxes[layer:TLayer[assoc_Association], StandardForm] := Block[
     {type, visibleItems, hiddenItems, icon, nParams},
     type = assoc["Type"];
     nParams = With[{dims = Quiet[TDimensions /@ assoc["Params"]]},
@@ -247,7 +247,7 @@ TLayer /: MakeBoxes[layer:TLayer[assoc_Association], StandardForm] := Module[
     }
 ];
 
-TNet /: MakeBoxes[net:TNet[assoc_Association], StandardForm] := Module[
+TNet /: MakeBoxes[net:TNet[assoc_Association], StandardForm] := Block[
     {nLayers, nParams, visibleItems, hiddenItems, icon, layerTypes},
     nLayers = Length[assoc["Layers"]];
     nParams = With[{dims = Quiet[TDimensions /@ assoc["Params"]]},

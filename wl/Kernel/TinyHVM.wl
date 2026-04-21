@@ -126,6 +126,8 @@ TEvalAccuracy::usage = "TEvalAccuracy[net, testImages, testLabels] evaluates cla
 
 TINetGraph::usage = "TINetGraph[tensor|term] returns a Graph of the interaction net by walking the C heap.";
 TINetGraph::usage = "TINetGraph[tensor|term|snapshot] renders the interaction-net graph rooted at the given term — boxed nodes with per-tag shapes, port labels, heap-location tails, and the next active pair highlighted in red when one exists. Accepts a live term, a walk snapshot (from TStepTrace), or a raw walker association with \"Nodes\" and \"Edges\".";
+TINetGraphDOT::usage = "TINetGraphDOT[tensor|term|snapshot] returns a DOT string for the current interaction-net heap walk, using the same labels and active-edge highlighting as the WL renderer.";
+TINetGraphImport::usage = "TINetGraphImport[tensor|term|snapshot] renders the current interaction-net heap walk by exporting DOT and feeding it through ImportDOT. ImportDOT options can be passed through.";
 
 (* ── Heap introspection ──────────────────────────────────────────────── *)
 
@@ -615,7 +617,7 @@ loadLibrary[] := If[!$libraryLoaded && FileExistsQ[$TinyHVMLibrary],
 (* Context lifecycle                                                       *)
 (* ════════════════════════════════════════════════════════════════════════ *)
 
-TInit[device_String:"cpu"] := Module[{ok},
+TInit[device_String:"cpu"] := Block[{ok},
     loadLibrary[];
     If[FileExistsQ[$metallibPath],
         thvmSetMetallibPathFn[$metallibPath]
@@ -633,14 +635,14 @@ TReset[keep_Integer] := (loadLibrary[]; thvmResetFn[keep];);
 (* Data transfer — all tensor functions return TTensor                     *)
 (* ════════════════════════════════════════════════════════════════════════ *)
 
-TCreate[data_List, shape_List] := Module[{na, out = allocId[]},
+TCreate[data_List, shape_List] := Block[{na, out = allocId[]},
     loadLibrary[];
     na = NumericArray[N[Flatten[data]], "Real32"];
     thvmTensorFn[out, na, shape];
     TTensor[out]
 ];
 
-TCreate[na_NumericArray, shape_List] := Module[{out = allocId[]},
+TCreate[na_NumericArray, shape_List] := Block[{out = allocId[]},
     loadLibrary[];
     thvmTensorFn[out, na, shape];
     TTensor[out]
@@ -651,13 +653,13 @@ TCreate[data_List] := TCreate[data, Dimensions[data]];
 TGet[TTensor[id_Integer]] := (loadLibrary[]; thvmToHostFn[id]);
 TGet[TTerm[id_Integer]] := (loadLibrary[]; thvmToHostFn[id]);
 
-TReduce[TTensor[id_Integer]] := Module[{out = allocId[]},
+TReduce[TTensor[id_Integer]] := Block[{out = allocId[]},
     loadLibrary[];
     thvmReduceFn[id, out];
     TTensor[out]
 ];
 
-TReduce[TTerm[id_Integer]] := Module[{out = allocId[], tag},
+TReduce[TTerm[id_Integer]] := Block[{out = allocId[], tag},
     loadLibrary[];
     thvmReduceFn[id, out];
     tag = thvmTermTagFn[out];
@@ -675,13 +677,13 @@ TDimensions[TTensor[id_Integer]] := (loadLibrary[]; Normal[thvmDimensionsFn[id]]
 TDimensions[TTerm[id_Integer]] := (loadLibrary[]; Normal[thvmDimensionsFn[id]]);
 
 (* TTermTag returns a string, not an integer *)
-TTermTag[TTensor[id_Integer]] := Module[{tag},
+TTermTag[TTensor[id_Integer]] := Block[{tag},
     loadLibrary[];
     tag = thvmTermTagFn[id];
     Lookup[$tagName, tag, "Unknown"]
 ];
 
-TTermTag[TTerm[id_Integer]] := Module[{tag},
+TTermTag[TTerm[id_Integer]] := Block[{tag},
     loadLibrary[];
     tag = thvmTermTagFn[id];
     Lookup[$tagName, tag, "Unknown"]
@@ -701,13 +703,13 @@ TInteractionCount[] := (loadLibrary[]; thvmInteractionCountFn[]);
 (* Device & View queries                                                   *)
 (* ════════════════════════════════════════════════════════════════════════ *)
 
-TDevice[TTensor[id_Integer]] := Module[{devIdx},
+TDevice[TTensor[id_Integer]] := Block[{devIdx},
     loadLibrary[];
     devIdx = thvmTensorDeviceFn[id];
     Lookup[$deviceName, devIdx, "unknown"]
 ];
 
-TView[TTensor[id_Integer]] := Module[{raw, r, dims, strides, offset, numel, contig, hasMask, result},
+TView[TTensor[id_Integer]] := Block[{raw, r, dims, strides, offset, numel, contig, hasMask, result},
     loadLibrary[];
     raw = Normal[thvmViewInfoFn[id]];
     r = Round[raw[[1]]];
@@ -731,7 +733,7 @@ TView[TTensor[id_Integer]] := Module[{raw, r, dims, strides, offset, numel, cont
     result
 ];
 
-TToDevice[t_TTensor, device_String] := Module[{out = allocId[], devIdx},
+TToDevice[t_TTensor, device_String] := Block[{out = allocId[], devIdx},
     loadLibrary[];
     devIdx = Switch[device, "cpu", 0, "metal", 1, _, Return[$Failed]];
     thvmToDeviceFn[out, t[[1]], devIdx];
@@ -759,7 +761,7 @@ TTensor[id_Integer]["Op"]           := With[{tag = TTermTag[TTensor[id]]},
 
 TOp[op_String][a_TTensor, b_TTensor] /;
     KeyExistsQ[$uopCode, op] && !MemberQ[$unaryOps, op] :=
-Module[{out = allocId[]},
+Block[{out = allocId[]},
     loadLibrary[];
     thvmOpFn[out, $uopCode[op], a[[1]], b[[1]]];
     TTensor[out]
@@ -770,7 +772,7 @@ Module[{out = allocId[]},
 (* ════════════════════════════════════════════════════════════════════════ *)
 
 TOp[op_String][a_TTensor] /; MemberQ[$unaryOps, op] :=
-Module[{out = allocId[]},
+Block[{out = allocId[]},
     loadLibrary[];
     thvmOpFn[out, $uopCode[op], a[[1]], 0];
     TTensor[out]
@@ -780,37 +782,37 @@ Module[{out = allocId[]},
 (* TOp dispatch — movement ops                                             *)
 (* ════════════════════════════════════════════════════════════════════════ *)
 
-TOp["Reshape"][t_TTensor, shape_List] := Module[{out = allocId[]},
+TOp["Reshape"][t_TTensor, shape_List] := Block[{out = allocId[]},
     loadLibrary[];
     thvmReshapeFn[out, t[[1]], shape];
     TTensor[out]
 ];
 
-TOp["Expand"][t_TTensor, shape_List] := Module[{out = allocId[]},
+TOp["Expand"][t_TTensor, shape_List] := Block[{out = allocId[]},
     loadLibrary[];
     thvmExpandFn[out, t[[1]], shape];
     TTensor[out]
 ];
 
-TOp["Permute"][t_TTensor, axes_List] := Module[{out = allocId[]},
+TOp["Permute"][t_TTensor, axes_List] := Block[{out = allocId[]},
     loadLibrary[];
     thvmPermuteFn[out, t[[1]], axes];
     TTensor[out]
 ];
 
-TOp["Pad"][t_TTensor, pairs_List] := Module[{out = allocId[]},
+TOp["Pad"][t_TTensor, pairs_List] := Block[{out = allocId[]},
     loadLibrary[];
     thvmPadFn[out, t[[1]], Flatten[pairs]];
     TTensor[out]
 ];
 
-TOp["Shrink"][t_TTensor, pairs_List] := Module[{out = allocId[]},
+TOp["Shrink"][t_TTensor, pairs_List] := Block[{out = allocId[]},
     loadLibrary[];
     thvmShrinkFn[out, t[[1]], Flatten[pairs]];
     TTensor[out]
 ];
 
-TOp["Sum"][t_TTensor, axes_List] := Module[{out = allocId[]},
+TOp["Sum"][t_TTensor, axes_List] := Block[{out = allocId[]},
     loadLibrary[];
     thvmSumAxesFn[out, t[[1]], axes];
     TTensor[out]
@@ -820,14 +822,14 @@ TOp["Sum"][t_TTensor, axes_List] := Module[{out = allocId[]},
 (* Interaction net primitives (TTerm only — not tensor ops)                *)
 (* ════════════════════════════════════════════════════════════════════════ *)
 
-TLam[body_TTerm] := Module[{lamId = allocId[], varId = allocId[]},
+TLam[body_TTerm] := Block[{lamId = allocId[], varId = allocId[]},
     loadLibrary[];
     thvmLamFn[lamId, varId, body[[1]]];
     {TTerm[lamId], TTerm[varId]}
 ];
 
 (* Pure function form: TLam[var |-> body_using_var] *)
-TLam[f_Function] := Module[{lam, var, body},
+TLam[f_Function] := Block[{lam, var, body},
     {lam, var} = TLamOpen[];
     body = f[var];
     If[!MatchQ[body, _TTerm],
@@ -838,7 +840,7 @@ TLam[f_Function] := Module[{lam, var, body},
 TLam::badret = "Lambda body must return TTerm, got `1`.";
 
 
-TApp[fun_TTerm, arg_TTerm] := Module[{out = allocId[]},
+TApp[fun_TTerm, arg_TTerm] := Block[{out = allocId[]},
     loadLibrary[];
     thvmAppFn[out, fun[[1]], arg[[1]]];
     TTerm[out]
@@ -848,7 +850,7 @@ TApp[fun_TTensor, arg_TTensor] := TApp[ToTTerm[fun], ToTTerm[arg]];
 TApp[fun_TTensor, arg_TTerm]   := TApp[ToTTerm[fun], arg];
 TApp[fun_TTerm, arg_TTensor]   := TApp[fun, ToTTerm[arg]];
 
-TSeq[effect_TTerm, continuation_TTerm] := Module[{out = allocId[]},
+TSeq[effect_TTerm, continuation_TTerm] := Block[{out = allocId[]},
     loadLibrary[];
     thvmSeqFn[out, effect[[1]], continuation[[1]]];
     TTerm[out]
@@ -859,7 +861,7 @@ TSeq[effect_TTerm, continuation_TTensor]   := TSeq[effect, ToTTerm[continuation]
 
 (* TSup[a, b] — fresh label; TSup[label, a, b] — explicit label *)
 TSup[a_TTerm, b_TTerm] := TSup[TFreshLabel[], a, b];
-TSup[label_Integer, a_TTerm, b_TTerm] := Module[{out = allocId[]},
+TSup[label_Integer, a_TTerm, b_TTerm] := Block[{out = allocId[]},
     loadLibrary[];
     thvmSupFn[out, label, a[[1]], b[[1]]];
     TTerm[out]
@@ -869,21 +871,21 @@ TFreshLabel[] := (loadLibrary[]; thvmFreshLabelFn[]);
 
 (* TDup[z] — fresh label; TDup[label, z] — explicit label *)
 TDup[z_TTerm] := TDup[TFreshLabel[], z];
-TDup[label_Integer, z_TTerm] := Module[{dp0 = allocId[], dp1 = allocId[]},
+TDup[label_Integer, z_TTerm] := Block[{dp0 = allocId[], dp1 = allocId[]},
     loadLibrary[];
     thvmDupFn[label, z[[1]], dp0, dp1];
     {TTerm[dp0], TTerm[dp1]}
 ];
 
 (* TBri[body] — create bridge (θx.body), returns {TTerm[bri], TTerm[var]} *)
-TBri[body_TTerm] := Module[{out = allocId[], varId},
+TBri[body_TTerm] := Block[{out = allocId[], varId},
     loadLibrary[];
     varId = thvmBriFn[out, body[[1]]];
     {TTerm[out], TTerm[varId]}
 ];
 
 (* Pure function form: TBri[var |-> body_using_var] — same pattern as TLam *)
-TBri[f_Function] := Module[{bri, var, body},
+TBri[f_Function] := Block[{bri, var, body},
     {bri, var} = TBri[TNum[0]];  (* placeholder body *)
     body = f[var];
     If[!MatchQ[body, _TTerm],
@@ -894,35 +896,35 @@ TBri[f_Function] := Module[{bri, var, body},
 TBri::badret = "Bridge body must return TTerm, got `1`.";
 
 (* TAnn[term, type] — create annotation {term : type} *)
-TAnn[term_TTerm, type_TTerm] := Module[{out = allocId[]},
+TAnn[term_TTerm, type_TTerm] := Block[{out = allocId[]},
     loadLibrary[];
     thvmAnnFn[out, term[[1]], type[[1]]];
     TTerm[out]
 ];
 
 (* TDsu[labelExpr, a, b] — dynamic SUP (label is an expression) *)
-TDsu[label_TTerm, a_TTerm, b_TTerm] := Module[{out = allocId[]},
+TDsu[label_TTerm, a_TTerm, b_TTerm] := Block[{out = allocId[]},
     loadLibrary[];
     thvmDsuFn[out, label[[1]], a[[1]], b[[1]]];
     TTerm[out]
 ];
 
 (* TDdu[labelExpr, val, bod] — dynamic DUP (label is an expression) *)
-TDdu[label_TTerm, val_TTerm, bod_TTerm] := Module[{out = allocId[]},
+TDdu[label_TTerm, val_TTerm, bod_TTerm] := Block[{out = allocId[]},
     loadLibrary[];
     thvmDduFn[out, label[[1]], val[[1]], bod[[1]]];
     TTerm[out]
 ];
 
 (* TInc[term] — priority wrapper (transparent to reduce, lower priority in collapse) *)
-TInc[term_TTerm] := Module[{out = allocId[]},
+TInc[term_TTerm] := Block[{out = allocId[]},
     loadLibrary[];
     thvmIncFn[out, term[[1]]];
     TTerm[out]
 ];
 
 (* TCollapse[term] — PQ-based collapse, respects INC priority *)
-TCollapse[t_TTerm] := Module[{base, count},
+TCollapse[t_TTerm] := Block[{base, count},
     loadLibrary[];
     base = allocId[];
     $nextId += 255;
@@ -931,7 +933,7 @@ TCollapse[t_TTerm] := Module[{base, count},
 ];
 
 (* TCollapsePar[term, nThreads] — parallel work-stealing collapse *)
-TCollapsePar[t_TTerm, nThreads_Integer:4] := Module[{base, count},
+TCollapsePar[t_TTerm, nThreads_Integer:4] := Block[{base, count},
     loadLibrary[];
     base = allocId[];
     $nextId += 255;
@@ -944,7 +946,7 @@ TCollapsePar[t_TTerm, nThreads_Integer:4] := Module[{base, count},
    Each bf (branch function) maps SUP labels to branch choices (0=left, 1=right).
    Recover bf for result i:  gr["bf"][[i]]
    Look up branch for label L: gr["bf"][[i]][L] *)
-TCollapseGrouped[t_TTerm] := Module[{base, packed, count, pos, values, bfs},
+TCollapseGrouped[t_TTerm] := Block[{base, packed, count, pos, values, bfs},
     loadLibrary[];
     base = allocId[];
     $nextId += 255;
@@ -952,7 +954,7 @@ TCollapseGrouped[t_TTerm] := Module[{base, packed, count, pos, values, bfs},
     count = packed[[1]];
     values = Table[TTerm[base + i], {i, 0, count - 1}];
     pos = 2;
-    bfs = Table[Module[{plen, bf},
+    bfs = Table[Block[{plen, bf},
         plen = packed[[pos]]; pos++;
         bf = Association @@ Table[
             packed[[pos + 2 j]] -> packed[[pos + 2 j + 1]],
@@ -990,25 +992,25 @@ TGroupings[elems:{__TTerm}, f_] := With[{
     alts = Table[
         f[TGroupings[elems[[;; k]], f], TGroupings[elems[[k + 1 ;;]], f]],
         {k, 1, Length[elems] - 1}]},
-    iSupTree[alts]
+    supTree[alts]
 ];
 (* Factory form: each element is a zero-arg Function creating a fresh TTerm *)
-TGroupings[facs:{__Function}, f_] := iGroupFacs[facs, f];
-iGroupFacs[{fac_Function}, _] := fac[];
-iGroupFacs[{f1_Function, f2_Function}, f_] := f[f1[], f2[]];
-iGroupFacs[facs:{__Function}, f_] := With[{
+TGroupings[facs:{__Function}, f_] := groupFacs[facs, f];
+groupFacs[{fac_Function}, _] := fac[];
+groupFacs[{f1_Function, f2_Function}, f_] := f[f1[], f2[]];
+groupFacs[facs:{__Function}, f_] := With[{
     alts = Table[
-        f[iGroupFacs[facs[[;; k]], f], iGroupFacs[facs[[k + 1 ;;]], f]],
+        f[groupFacs[facs[[;; k]], f], groupFacs[facs[[k + 1 ;;]], f]],
         {k, 1, Length[facs] - 1}]},
-    iSupTree[alts]
+    supTree[alts]
 ];
 (* Encode a list of alternatives as a balanced binary SUP tree *)
-iSupTree[{x_}] := x;
-iSupTree[alts_List] := With[{mid = Ceiling[Length[alts] / 2]},
-    TSup[TFreshLabel[], iSupTree[alts[[;; mid]]], iSupTree[alts[[mid + 1 ;;]]]]
+supTree[{x_}] := x;
+supTree[alts_List] := With[{mid = Ceiling[Length[alts] / 2]},
+    TSup[TFreshLabel[], supTree[alts[[;; mid]]], supTree[alts[[mid + 1 ;;]]]]
 ];
 
-TNum[n_Integer] := Module[{out = allocId[]},
+TNum[n_Integer] := Block[{out = allocId[]},
     loadLibrary[];
     thvmNumFn[out, n];
     TTerm[out]
@@ -1017,7 +1019,7 @@ TNum[n_Integer] := Module[{out = allocId[]},
 $op2Code = <|"Add" -> 0, "Sub" -> 1, "Mul" -> 2, "Div" -> 3, "Eq" -> 4, "Mod" -> 5|>;
 
 TOp2[op_String, x_TTerm, y_TTerm] /; KeyExistsQ[$op2Code, op] :=
-Module[{out = allocId[]},
+Block[{out = allocId[]},
     loadLibrary[];
     thvmOp2Fn[out, $op2Code[op], x[[1]], y[[1]]];
     TTerm[out]
@@ -1034,7 +1036,7 @@ TSupNumValues[t_TTerm] := TNumValue /@ TSupValues[t];
 
 TDefine[body_TTerm] := (loadLibrary[]; thvmDefineFn[body[[1]]]);
 
-TRef[name_Integer] := Module[{out = allocId[]},
+TRef[name_Integer] := Block[{out = allocId[]},
     loadLibrary[];
     thvmRefFn[out, name];
     TTerm[out]
@@ -1044,25 +1046,25 @@ TRef[name_Integer] := Module[{out = allocId[]},
 (* Advanced ops — accept TTensor                                           *)
 (* ════════════════════════════════════════════════════════════════════════ *)
 
-TWhere[cond_TTensor, then_TTensor, else_TTensor] := Module[{out = allocId[]},
+TWhere[cond_TTensor, then_TTensor, else_TTensor] := Block[{out = allocId[]},
     loadLibrary[];
     thvmWhereFn[out, cond[[1]], then[[1]], else[[1]]];
     TTensor[out]
 ];
 
-TAssign[dst_TTensor, src_TTensor] := Module[{out = allocId[]},
+TAssign[dst_TTensor, src_TTensor] := Block[{out = allocId[]},
     loadLibrary[];
     thvmAssignFn[out, dst[[1]], src[[1]]];
     TTensor[out]
 ];
 
-TIfz[counter_TTensor, zeroCase_TTensor, succLam_TTerm] := Module[{out = allocId[]},
+TIfz[counter_TTensor, zeroCase_TTensor, succLam_TTerm] := Block[{out = allocId[]},
     loadLibrary[];
     thvmIfzFn[out, counter[[1]], zeroCase[[1]], succLam[[1]]];
     TTensor[out]
 ];
 (* TTerm overloads — lambda variables are TTerm, not TTensor *)
-TIfz[counter_TTerm, zeroCase_TTensor, succLam_TTerm] := Module[{out = allocId[]},
+TIfz[counter_TTerm, zeroCase_TTensor, succLam_TTerm] := Block[{out = allocId[]},
     loadLibrary[];
     thvmIfzFn[out, counter[[1]], zeroCase[[1]], succLam[[1]]];
     TTensor[out]
@@ -1071,7 +1073,7 @@ TIfz[counter_TTerm, zeroCase_TTensor, succLam_TTerm] := Module[{out = allocId[]}
 THintShape[term_TTerm, shape_List] := (loadLibrary[]; thvmHintShapeFn[term[[1]], shape]; term);
 THintShape[term_TTensor, shape_List] := (loadLibrary[]; thvmHintShapeFn[term[[1]], shape]; term);
 
-TLogPrint[t_TTensor] := Module[{out = allocId[]},
+TLogPrint[t_TTensor] := Block[{out = allocId[]},
     loadLibrary[];
     thvmLogPrintFn[out, t[[1]]];
     TTensor[out]
@@ -1083,21 +1085,21 @@ TLogPrint[t_TTensor] := Module[{out = allocId[]},
 
 TSetRequiresGrad[t_TTensor] := (loadLibrary[]; thvmSetRequiresGradFn[t[[1]]];);
 
-TGrad[y_TTensor, x_TTensor] := Module[{out = allocId[]},
+TGrad[y_TTensor, x_TTensor] := Block[{out = allocId[]},
     loadLibrary[];
     thvmGradFn[out, y[[1]], x[[1]]];
     TTensor[out]
 ];
 
 TGradMulti[loss_TTensor, params:{__TTensor}, slots:{__TTensor}] :=
-Module[{out = allocId[]},
+Block[{out = allocId[]},
     loadLibrary[];
     thvmGradMultiFn[out, loss[[1]], params[[All, 1]], slots[[All, 1]]];
     TTensor[out]
 ];
 
 TBackward[loss_TTensor, params:{__TTensor}] :=
-Module[{gradIds, n = Length[params]},
+Block[{gradIds, n = Length[params]},
     loadLibrary[];
     gradIds = Table[allocId[], n];
     thvmBackwardFn[loss[[1]], params[[All, 1]], gradIds];
@@ -1111,7 +1113,7 @@ Module[{gradIds, n = Length[params]},
 TConv2d[x_TTensor, w_TTensor, b_TTensor, groups_Integer:1,
         stride:{_Integer, _Integer}:{1, 1},
         padding:{_Integer, _Integer, _Integer, _Integer}:{0, 0, 0, 0}] :=
-Module[{out = allocId[]},
+Block[{out = allocId[]},
     loadLibrary[];
     thvmConv2dFn[out, x[[1]], w[[1]], b[[1]], groups, stride, padding];
     TTensor[out]
@@ -1120,7 +1122,7 @@ Module[{out = allocId[]},
 TConv2d[x_TTensor, w_TTensor, None, groups_Integer:1,
         stride:{_Integer, _Integer}:{1, 1},
         padding:{_Integer, _Integer, _Integer, _Integer}:{0, 0, 0, 0}] :=
-Module[{out = allocId[]},
+Block[{out = allocId[]},
     loadLibrary[];
     thvmConv2dFn[out, x[[1]], w[[1]], 0, groups, stride, padding];
     TTensor[out]
@@ -1128,14 +1130,14 @@ Module[{out = allocId[]},
 
 TMaxPool2d[x_TTensor, kernel:{_Integer, _Integer}:{2, 2},
            stride:{_Integer, _Integer}:{2, 2}] :=
-Module[{out = allocId[]},
+Block[{out = allocId[]},
     loadLibrary[];
     thvmMaxPool2dFn[out, x[[1]], kernel, stride];
     TTensor[out]
 ];
 
 TPool[x_TTensor, kernel_List, stride_List, nSpatial_Integer:2] :=
-Module[{out = allocId[]},
+Block[{out = allocId[]},
     loadLibrary[];
     thvmPoolFn[out, x[[1]], kernel, stride, nSpatial];
     TTensor[out]
@@ -1158,7 +1160,7 @@ TAllocDef[] := (loadLibrary[]; thvmAllocDefFn[]);
 
 TSetDef[name_Integer, body_TTerm] := (loadLibrary[]; thvmSetDefFn[name, body[[1]]];);
 
-TLamOpen[] := Module[{lamId = allocId[], varId = allocId[]},
+TLamOpen[] := Block[{lamId = allocId[], varId = allocId[]},
     loadLibrary[];
     thvmLamOpenFn[lamId, varId];
     {TTerm[lamId], TTerm[varId]}
@@ -1201,7 +1203,7 @@ $tagIcon = <|
 
 tMakeItem[name_, value_] := BoxForm`MakeSummaryItem[{name <> ": ", value}, StandardForm];
 
-TTensor /: MakeBoxes[t:TTensor[id_Integer], StandardForm] := Module[
+TTensor /: MakeBoxes[t:TTensor[id_Integer], StandardForm] := Block[
     {tag, dims, shapeStr, device, opName,
      visibleItems = {}, hiddenItems = {}, icon},
 
@@ -1260,7 +1262,7 @@ TTensor /: MakeBoxes[t:TTensor[id_Integer], StandardForm] := Module[
 ];
 
 (* TTerm MakeBoxes — for inet primitives only *)
-TTerm /: MakeBoxes[t:TTerm[id_Integer], StandardForm] := Module[
+TTerm /: MakeBoxes[t:TTerm[id_Integer], StandardForm] := Block[
     {tag, tagStr, visibleItems, hiddenItems, icon},
 
     tag = Quiet[TTermTag[t]];
@@ -1305,12 +1307,12 @@ TTraceEnable[]  := (loadLibrary[]; thvmTraceEnableFn[1]);
 TTraceDisable[] := (loadLibrary[]; thvmTraceEnableFn[0]);
 TTraceClear[]   := (loadLibrary[]; thvmTraceClearFn[]);
 
-TTrace[] := Module[{raw, n},
+TTrace[] := Block[{raw, n},
     loadLibrary[];
     raw = Round[Normal[thvmTraceDataFn[]]];
     n = Length[raw] / 7;
     Table[
-        iMakeInteraction[
+        makeInteraction[
             raw[[7 i - 6]], raw[[7 i - 5]],
             raw[[7 i - 4]], raw[[7 i - 3]],
             raw[[7 i - 2]], raw[[7 i - 1]], raw[[7 i]]
@@ -1318,7 +1320,7 @@ TTrace[] := Module[{raw, n},
     {i, n}]
 ];
 
-TReduceSteps[t_TTensor, n_Integer] := Module[{out = allocId[], steps, tag},
+TReduceSteps[t_TTensor, n_Integer] := Block[{out = allocId[], steps, tag},
     loadLibrary[];
     steps = thvmReduceStepsFn[out, t[[1]], n];
     tag = thvmTermTagFn[out];
@@ -1329,7 +1331,7 @@ TReduceSteps[t_TTerm, n_Integer] := TReduceSteps[ToTTensor[t], n];
 (* TStep: reduce until the walker-visible graph changes (skipping admin
    reductions that don't affect the root-visible tree). Default budget 100
    admin interactions. Returns {nextState, fired}. *)
-TStep[t_TTensor, maxAttempts_Integer: 100] := Module[{out = allocId[], fired, tag},
+TStep[t_TTensor, maxAttempts_Integer: 100] := Block[{out = allocId[], fired, tag},
     loadLibrary[];
     fired = thvmStepToNextVisibleFn[out, t[[1]], maxAttempts];
     tag = thvmTermTagFn[out];
@@ -1339,7 +1341,7 @@ TStep[t_TTerm, args___] := TStep[ToTTensor[t], args];
 
 (* Signature from actual walker output — what TINetGraph renders. Two states
    with identical node/edge sets hash to the same sig. *)
-walkerGraphSig[t_] := Module[{w = heapWalk[rootTermOf[t]]},
+walkerGraphSig[t_] := Block[{w = heapWalk[rootTermOf[t]]},
     Hash[{
         Sort[KeyValueMap[{#1, #2["Tag"], #2["Ext"]} &, w["Nodes"]]],
         Sort[Map[{#["From"], #["To"], #["Port"]} &, w["Edges"]]]
@@ -1355,7 +1357,7 @@ walkerGraphSig[t_] := Module[{w = heapWalk[rootTermOf[t]]},
    Stops at fixed point (0 interactions fired), on dispatch to a pure
    tensor (TAG_TEN), or when maxSteps reached. Pure public-graph
    reduction only — does not cross into materialization. *)
-TStepTrace[t_, maxSteps_Integer: 50] := Module[
+TStepTrace[t_, maxSteps_Integer: 50] := Block[
     {base, n, cap, tag, walk, acc = {}},
     loadLibrary[];
     cap = Min[maxSteps + 1, 256];
@@ -1363,7 +1365,7 @@ TStepTrace[t_, maxSteps_Integer: 50] := Module[
     n = thvmReduceCollectFn[termId[t], base, cap];
     Do[
         tag = thvmTermTagFn[base + i - 1];
-        Module[{h = If[tag === 10, TTensor[base + i - 1], TTerm[base + i - 1]]},
+        Block[{h = If[tag === 10, TTensor[base + i - 1], TTerm[base + i - 1]]},
             walk = heapWalk[rootTermOf[h]];
             AppendTo[acc, <|"Term" -> h, "Walk" -> walk|>]],
         {i, n}];
@@ -1403,7 +1405,7 @@ $interactionRuleName = <|
     {"Ref", _}     -> "REF Expansion"
 |>;
 
-iRuleName[beforeTag_String, afterTag_String] :=
+ruleNameForInteraction[beforeTag_String, afterTag_String] :=
     Lookup[$interactionRuleName, Key[{beforeTag, afterTag}],
         Lookup[$interactionRuleName, Key[{beforeTag, _}],
             Which[
@@ -1414,7 +1416,7 @@ iRuleName[beforeTag_String, afterTag_String] :=
         ]
     ];
 
-iRuleColor[ruleName_String] := Which[
+ruleColorForInteraction[ruleName_String] := Which[
     StringContainsQ[ruleName, "Annihilation" | "Beta" | "Compute" | "Sequencing"], RGBColor[0.3, 0.7, 0.3],
     StringContainsQ[ruleName, "Commutation" | "Expansion" | "Copy"], RGBColor[0.9, 0.6, 0.2],
     StringContainsQ[ruleName, "Erasure"], GrayLevel[0.5],
@@ -1422,12 +1424,12 @@ iRuleColor[ruleName_String] := Which[
 ];
 
 (* Build a TInteraction from raw trace fields *)
-iMakeInteraction[beforeTagCode_, beforeExt_, afterTagCode_, afterExt_,
+makeInteraction[beforeTagCode_, beforeExt_, afterTagCode_, afterExt_,
                  ruleId_, beforeLoc_, afterLoc_] :=
-Module[{bt, at, rn},
+Block[{bt, at, rn},
     bt = Lookup[$tagName, beforeTagCode, "?"];
     at = Lookup[$tagName, afterTagCode, "?"];
-    rn = iRuleName[bt, at];
+    rn = ruleNameForInteraction[bt, at];
     TInteraction[<|
         "RuleName"   -> rn,
         "BeforeTag"  -> bt,
@@ -1444,13 +1446,13 @@ Module[{bt, at, rn},
 
 TInteraction[data_Association][key_String] := data[key];
 
-TInteraction /: MakeBoxes[t:TInteraction[data_Association], StandardForm] := Module[
+TInteraction /: MakeBoxes[t:TInteraction[data_Association], StandardForm] := Block[
     {ruleName, beforeTag, afterTag, visibleItems, hiddenItems, icon, col},
 
     ruleName = Lookup[data, "RuleName", "?"];
     beforeTag = Lookup[data, "BeforeTag", "?"];
     afterTag = Lookup[data, "AfterTag", "?"];
-    col = iRuleColor[ruleName];
+    col = ruleColorForInteraction[ruleName];
 
     visibleItems = {
         tMakeItem["Rule", ruleName],
@@ -1482,7 +1484,7 @@ TInteraction /: MakeBoxes[t:TInteraction[data_Association], StandardForm] := Mod
 
 THeap[data_Association][key_String] := data[key];
 
-THeapSnapshot[] := Module[{raw},
+THeapSnapshot[] := Block[{raw},
     loadLibrary[];
     raw = thvmHeapSnapshotFn[];
     (* Subtract sentinels: heap_pos starts at 1, tensor_count starts at 1 *)
@@ -1496,7 +1498,7 @@ THeapSnapshot[] := Module[{raw},
     |>]
 ];
 
-THeap /: MakeBoxes[t:THeap[data_Association], StandardForm] := Module[
+THeap /: MakeBoxes[t:THeap[data_Association], StandardForm] := Block[
     {visibleItems, hiddenItems, icon},
 
     visibleItems = {
@@ -1526,7 +1528,7 @@ THeap /: MakeBoxes[t:THeap[data_Association], StandardForm] := Module[
 
 (* ── THeapRead ───────────────────────────────────────────────────────── *)
 
-iHeapTermAssoc[tagCode_Integer, ext_Integer, val_Integer, loc_Integer] := Module[
+heapTermAssoc[tagCode_Integer, ext_Integer, val_Integer, loc_Integer] := Block[
     {tag = Lookup[$tagName, tagCode, "?"], assoc},
     assoc = <|"Tag" -> tag, "TagCode" -> tagCode,
               "Ext" -> ext, "Val" -> val, "Loc" -> loc|>;
@@ -1536,32 +1538,32 @@ iHeapTermAssoc[tagCode_Integer, ext_Integer, val_Integer, loc_Integer] := Module
     ]
 ];
 
-THeapRead[loc_Integer] := Module[{raw},
+THeapRead[loc_Integer] := Block[{raw},
     loadLibrary[];
     raw = thvmHeapReadFn[loc];
-    iHeapTermAssoc[raw[[1]], raw[[2]], raw[[3]], loc]
+    heapTermAssoc[raw[[1]], raw[[2]], raw[[3]], loc]
 ];
 
-TDefRead[name_Integer] := Module[{raw, tag},
+TDefRead[name_Integer] := Block[{raw, tag},
     loadLibrary[];
     raw = thvmDefReadFn[name];
     tag = Lookup[$tagName, raw[[1]], "?"];
-    iHeapTermAssoc[raw[[1]], raw[[2]], raw[[3]],
+    heapTermAssoc[raw[[1]], raw[[2]], raw[[3]],
         If[tag === "Top" || KeyExistsQ[$heapTagArity, tag], raw[[3]], 0]]
 ];
 
 (* Bulk read [lo, lo+count). Returns a list of associations like THeapRead. *)
-THeapReadRange[lo_Integer, count_Integer] := Module[{raw},
+THeapReadRange[lo_Integer, count_Integer] := Block[{raw},
     loadLibrary[];
     raw = Normal[thvmHeapReadRangeFn[lo, count]];
     Table[
-        iHeapTermAssoc[raw[[i, 1]], raw[[i, 2]], raw[[i, 3]], lo + i - 1],
+        heapTermAssoc[raw[[i, 1]], raw[[i, 2]], raw[[i, 3]], lo + i - 1],
         {i, count}]
 ];
 
 (* ── TStepReduce ─────────────────────────────────────────────────────── *)
 
-TStepReduce[t_TTensor] := Module[{result, steps, traces, interaction, heap},
+TStepReduce[t_TTensor] := Block[{result, steps, traces, interaction, heap},
     loadLibrary[];
     TTraceEnable[]; TTraceClear[];
     {result, steps} = TReduceSteps[t, 1];

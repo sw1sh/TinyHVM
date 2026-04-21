@@ -695,10 +695,6 @@ era_continue:
 	                    st_set_tracker(r0, ast);
 	                    st_set_tracker(r1, ast);
 	                }
-	                if (uop == UOP_GRAD) {
-	                    thvm_grad_targets_share(ctx, r0, val_loc);
-	                    thvm_grad_targets_share(ctx, r1, val_loc);
-	                }
 
 	                DUP_STATE_RETURN(val, n0, n1);
 	            }

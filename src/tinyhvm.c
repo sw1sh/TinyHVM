@@ -167,7 +167,7 @@ static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel)
 // ── lower/ — private lowering IC arena for backend UOp kernels ───────────────
 #include "lower/_.c"
 
-// ── grad/ — thvm_grad, thvm_grad_multi (pure IC term constructors) ────────────
+// ── grad/ — thvm_grad_bundle_get (CTR bundle accessor) ──────────────────────
 #include "grad/_.c"
 
 // ── parallel/ — work-stealing deque + per-thread state ──────────────────────

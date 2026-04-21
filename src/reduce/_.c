@@ -135,7 +135,7 @@ static inline int reduce_fuse_payload_ready(TinyHVM *ctx, Term t) {
 }
 
 static inline int reduce_top_direct_uop(u32 uop) {
-    return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_GRAD2 || uop == UOP_IFZ ||
+    return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_GRAD || uop == UOP_IFZ ||
            uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_CAST ||
            uop == UOP_DETACH ||
            uop == UOP_WHERE ||
@@ -544,12 +544,12 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
             next = r;
             goto enter;
         }
-        // Keep WHERE lazy under GRAD2 parent frame so the GRAD2 rule
+        // Keep WHERE lazy under GRAD parent frame so the GRAD rule
         // can pattern-match on the WHERE TOP (otherwise eager WHERE
         // reduction picks a branch and materializes a fresh TEN,
         // losing target-identity for the leaf rule).
         if (_uop == UOP_WHERE && sp > 0 && term_tag(stk[sp-1]) == TAG_TOP
-            && term_ext(stk[sp-1]) == UOP_GRAD2) {
+            && term_ext(stk[sp-1]) == UOP_GRAD) {
             whnf = next; goto apply;
         }
         if (!reduce_top_direct_uop_ctx(ctx, _uop)) {
@@ -634,7 +634,7 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
                 term_tag(whnf) == TAG_ERA ||
                 term_tag(whnf) == TAG_NUM ||
                 term_tag(whnf) == TAG_SUP ||
-                (term_tag(whnf) == TAG_TOP && (frame_uop == UOP_GRAD || frame_uop == UOP_GRAD2)) ||
+                (term_tag(whnf) == TAG_TOP && (frame_uop == UOP_GRAD || frame_uop == UOP_GRAD)) ||
                 (term_tag(whnf) == TAG_VAR && frame_uop == UOP_DETACH) ||
                 (frame_uop == UOP_FUSE) ||
                 // UOP_KERNEL accepts most WNF payloads, but NOT DP0/DP1 —
@@ -650,8 +650,8 @@ Term thvm_reduce_steps(TinyHVM *ctx, Term root, u32 max_steps) {
             }
             heap_set(ctx, loc + 0, whnf);  // store arg0 result
 
-            // GRAD/GRAD2: target stays lazy. Fire once y is in WNF.
-            if (frame_uop == UOP_GRAD || frame_uop == UOP_GRAD2) {
+            // GRAD/GRAD: target stays lazy. Fire once y is in WNF.
+            if (frame_uop == UOP_GRAD || frame_uop == UOP_GRAD) {
                 if (budget_exhausted || BUDGET_HIT()) { whnf = frame; continue; }
                 Term r = thvm_interact(ctx, frame);
                 if (r == frame) { whnf = frame; continue; }

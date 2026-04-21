@@ -97,18 +97,7 @@ typedef u64 Term;
 #define TAG_SEQ  25  // SEQ(a, b): strict on a, discard result, return b. Heap: [a, b].
 #define TAG_ALO  26  // Lazy allocation wrapper for static/book terms. Heap: [book_term, state_id].
 
-// Jacobian pair projections — GRAD works like DUP.
-// Construction:  (x, dx) = GRAD_PAIR(y, target)
-//   - heap_alloc(1); heap[loc] = y
-//   - x  = term_new(TAG_GF, target_label, loc)
-//   - dx = term_new(TAG_GB, target_label, loc)
-// Interaction:  when either aux is consumed by a principal, the rule reads
-// body y, produces the forward or backward projection, and substitutes the
-// sibling via the HVM4 SUB-bit mechanism (same shape as DP0/DP1).
-#define TAG_GF   27  // Jacobian forward projection:  (x, _)  = GRAD(y)
-#define TAG_GB   28  // Jacobian backward projection: (_, dx) = GRAD(y)
-
-#define TAG_COUNT 29
+#define TAG_COUNT 27
 
 // ============================================================
 // UOps — Minimal tensor operations (tinygrad-inspired)
@@ -160,7 +149,7 @@ typedef u64 Term;
                           // counter==0 → zero_case; counter>0 → APP(succ_lam, counter-1)
 #define UOP_LOG_PRINT 27  // print value and consume the branch
 
-#define UOP_GRAD      28   // IC gradient: DUP-op interaction in the reducer
+// UOP 28 reserved (legacy per-op DUP-shaped GRAD — removed 2026-04).
 #define UOP_TODEVICE  29   // lazy device transfer: TODEVICE(tensor, device_idx_scalar)
 #define UOP_DETACH    30   // realize current value and return a provenance-free tensor leaf
 
@@ -170,9 +159,10 @@ typedef u64 Term;
 #define UOP_EXEC      33   // executable kernel trigger: EXEC(NUM(kid), deps, NUM(flags))
                            // installed by global compiler passes; fires JIT/dispatch on reduce
 
-// UOP_GRAD2: clean UOP-shape gradient.  heap[loc+0]=y, heap[loc+1]=target.
-// Shape = target.shape.  Parallel to legacy UOP_GRAD during migration.
-#define UOP_GRAD2     34
+// UOP_GRAD: gradient node. heap[loc+0]=y, heap[loc+1]=target.
+// Reduces to a tensor of target.shape holding ∂(sum y)/∂target
+// (reverse-mode autodiff with implicit ones cotangent on y).
+#define UOP_GRAD      34
 
 #define UOP_COUNT     35
 
@@ -184,8 +174,8 @@ static const char *uop_names[] = {
     "LOAD","STORE","COPY","NEG","EXP","LOG","RELU","CAST","SQRT",
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
     "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","KERNEL","ASSIGN","WHERE",
-    "IFZ","LOG_PRINT","GRAD","TODEVICE","DETACH","FUSE","LEGACY32","EXEC",
-    "GRAD2"
+    "IFZ","LOG_PRINT","RESERVED28","TODEVICE","DETACH","FUSE","LEGACY32","EXEC",
+    "GRAD"
 };
 
 // ============================================================
@@ -1353,10 +1343,7 @@ Term     thvm_ref(TinyHVM *ctx, u32 name);                   // TAG_REF(name)
 Term     thvm_book_from_dynamic(TinyHVM *ctx, Term body);    // internal: freeze dynamic term into static/book heap
 Term     thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b);   // TAG_SUP with label
 void     thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1); // DUP with label
-Term     thvm_grad_u(TinyHVM *ctx, Term y, Term target); // UOP_GRAD2(y, target) — new pivot shape
-void     thvm_grad_pair(TinyHVM *ctx, u32 label, Term y, Term *out_fwd, Term *out_bwd); // (x, dx) = GRAD(y); raw u32 label
-void     thvm_grad_pair_target(TinyHVM *ctx, Term target, Term y, Term *out_fwd, Term *out_bwd); // safer; takes Term target
-Term     thvm_grad_pair_bundle(TinyHVM *ctx, Term y, Term *targets, u32 n_params); // CTR of per-target bwd
+Term     thvm_grad_bundle(TinyHVM *ctx, Term y, Term *targets, u32 n_params); // CTR of per-target bwd
 u32      thvm_fresh_label(TinyHVM *ctx);                     // allocate next label
 
 // ICC: Bridge + Annotation
@@ -1443,48 +1430,11 @@ Term     thvm_argmax(TinyHVM *ctx, Term x, u32 rows, u32 cols);
 f32      thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
                             u32 n_samples, u32 n_classes);
 
-// Graph-level gradient (JAX-style)
-// Returns a lazy Term — when reduced, computes ∂y/∂x.
-// Gradient ops go through thvm_op → get taped → grad(grad(f)) works.
-Term     thvm_grad(TinyHVM *ctx, Term y, Term x);
-Term     thvm_grad_multi(TinyHVM *ctx, Term loss, Term *params, Term *grad_slots, u32 n_params);
-Term     thvm_grad_keep(TinyHVM *ctx, Term y, Term x);
-Term     thvm_grad_multi_keep(TinyHVM *ctx, Term loss, Term *params, u32 n_params);
+// Gradient.  Builds a UOP_GRAD(y, target) node that reduces to a tensor of
+// target.shape holding ∂(sum y)/∂target (reverse-mode, ones-seed cotangent).
+Term     thvm_grad(TinyHVM *ctx, Term y, Term target);
 u32      thvm_grad_bundle_count(TinyHVM *ctx, Term bundle);
 Term     thvm_grad_bundle_get(TinyHVM *ctx, Term bundle, u32 index);
-
-// Internal GRAD target registry used by phase-1 GRAD interactions and debug labels.
-#define THVM_GRAD_TARGETS_MAX 512
-#define THVM_GRAD_BOOK_LOC_BIT (1ULL << 63)
-static inline u64 thvm_grad_book_loc_key(u64 book_loc) {
-    return book_loc ? (book_loc | THVM_GRAD_BOOK_LOC_BIT) : 0;
-}
-static inline int thvm_grad_is_book_loc(u64 grad_loc) {
-    return (grad_loc & THVM_GRAD_BOOK_LOC_BIT) != 0;
-}
-static inline u64 thvm_grad_unkey_book_loc(u64 grad_loc) {
-    return grad_loc & ~THVM_GRAD_BOOK_LOC_BIT;
-}
-void     thvm_grad_targets_clear(TinyHVM *ctx);
-void     thvm_grad_target_set(TinyHVM *ctx, u64 grad_loc, Term x);
-Term     thvm_grad_target_get(TinyHVM *ctx, u64 grad_loc);
-void     thvm_grad_mode_set(TinyHVM *ctx, u64 grad_loc, u32 mode);
-u32      thvm_grad_mode_get(TinyHVM *ctx, u64 grad_loc);
-void     thvm_grad_targets_set_for_loc(TinyHVM *ctx, u64 grad_loc,
-                                       Term *params, Term *grad_slots, u32 n_params);
-void     thvm_grad_targets_share(TinyHVM *ctx, u64 dst_loc, u64 src_loc);
-int      thvm_grad_targets_find_slot_at(TinyHVM *ctx, u64 grad_loc, u32 tid, Term *out_slot);
-int      thvm_grad_targets_find_index_at(TinyHVM *ctx, u64 grad_loc, u32 tid, u32 *out_index, Term *out_slot);
-int      thvm_grad_targets_find_term_at(TinyHVM *ctx, u64 grad_loc, Term t, u32 *out_index, Term *out_slot);
-u32      thvm_grad_targets_count_at(TinyHVM *ctx, u64 grad_loc);
-u32      thvm_grad_targets_get_tid_at(TinyHVM *ctx, u64 grad_loc, u32 index);
-Term     thvm_grad_targets_get_term_at(TinyHVM *ctx, u64 grad_loc, u32 index);
-Term     thvm_grad_targets_get_slot_at(TinyHVM *ctx, u64 grad_loc, u32 index);
-void     thvm_grad_keep_bundle_set(TinyHVM *ctx, u64 grad_loc, Term bundle);
-Term     thvm_grad_keep_bundle_get(TinyHVM *ctx, u64 grad_loc);
-void     thvm_grad_keep_app_loc_set(TinyHVM *ctx, u64 grad_loc, u64 app_loc);
-u64      thvm_grad_keep_app_loc_get(TinyHVM *ctx, u64 grad_loc);
-void     thvm_grad_bundle_accum(TinyHVM *ctx, u64 grad_loc, u32 index, Term grad);
 void     term_use_clear(void);
 
 // Movement ops

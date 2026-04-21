@@ -141,12 +141,6 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
                      term_clone_r(ctx, heap_read(ctx, old_loc + 1),
                                   relocs, n_relocs, lmap, n_labels, tmap, n_tmap));
             Term out = term_new(tag, term_ext(t), new_loc);
-            if (tag == TAG_APP &&
-                term_tag(old_fun) == TAG_TOP && term_ext(old_fun) == UOP_GRAD &&
-                thvm_grad_keep_app_loc_get(ctx, term_val(old_fun)) == old_loc &&
-                term_tag(new_fun) == TAG_TOP && term_ext(new_fun) == UOP_GRAD) {
-                thvm_grad_keep_app_loc_set(ctx, term_val(new_fun), new_loc);
-            }
             clone_term_map_add(tmap, n_tmap, t, out);
             return out;
         }
@@ -272,40 +266,6 @@ static Term term_clone_r(TinyHVM *ctx, Term t, Reloc *relocs, u32 *n_relocs,
              * stride-0 on broadcast dims gets lost across the clone. */
             const ShapeTracker *ast = st_get_tracker(old_loc);
             if (ast) st_set_tracker(new_loc, ast);
-            if (uop == UOP_GRAD) {
-                Term gx = term_clone_r(ctx, thvm_grad_target_get(ctx, old_loc),
-                                       relocs, n_relocs, lmap, n_labels, tmap, n_tmap);
-                thvm_grad_target_set(ctx, new_loc, gx);
-                thvm_grad_mode_set(ctx, new_loc, thvm_grad_mode_get(ctx, old_loc));
-                u32 nt = thvm_grad_targets_count_at(ctx, old_loc);
-                if (nt > 0) {
-                    Term params[THVM_GRAD_TARGETS_MAX];
-                    Term slots[THVM_GRAD_TARGETS_MAX];
-                    assert(nt <= THVM_GRAD_TARGETS_MAX);
-                    for (u32 i = 0; i < nt; i++) {
-                        params[i] = term_clone_r(ctx, thvm_grad_targets_get_term_at(ctx, old_loc, i),
-                                                 relocs, n_relocs, lmap, n_labels, tmap, n_tmap);
-                        slots[i] = term_clone_r(ctx, thvm_grad_targets_get_slot_at(ctx, old_loc, i),
-                                                relocs, n_relocs, lmap, n_labels, tmap, n_tmap);
-                    }
-                    thvm_grad_targets_set_for_loc(ctx, new_loc, params, slots, nt);
-                }
-                Term gb = thvm_grad_keep_bundle_get(ctx, old_loc);
-                Term gb_old = gb;
-                gb = term_clone_r(ctx, gb, relocs, n_relocs, lmap, n_labels, tmap, n_tmap);
-                if (!(term_tag(gb) == TAG_ERA && term_val(gb) == 0))
-                    thvm_grad_keep_bundle_set(ctx, new_loc, gb);
-                if (getenv("THVM_LOOP_DIAG")) {
-                    fprintf(stderr,
-                            "CLONE_GRAD old_loc=%llu new_loc=%llu old_bundle_tag=%u old_bundle_val=%llu new_bundle_tag=%u new_bundle_val=%llu\n",
-                            (unsigned long long)old_loc,
-                            (unsigned long long)new_loc,
-                            (u32)term_tag(gb_old),
-                            (unsigned long long)term_val(gb_old),
-                            (u32)term_tag(gb),
-                            (unsigned long long)term_val(gb));
-                }
-            }
             Term out = term_new(TAG_TOP, uop, new_loc);
             clone_term_map_add(tmap, n_tmap, t, out);
             return out;

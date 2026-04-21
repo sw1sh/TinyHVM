@@ -48,11 +48,11 @@ Tensor tensor_sum_axes(Tensor x, const u32 *axes, u32 n_axes) {
     return tensor_from_term(x.ctx, thvm_tg_sum(x.ctx, x.term, axes, n_axes));
 }
 
-// Backward helper: returns a CTR#1 bundle wrapped as Tensor. Backed by
-// the new TAG_GF/TAG_GB GRAD pair (thvm_grad_pair_bundle).
+// Backward helper: returns a CTR#1 bundle wrapped as Tensor.
+// Backed by UOP_GRAD (thvm_grad_bundle).
 Tensor tensor_backward_keep(Tensor y, Tensor x) {
     Term targets[1] = {x.term};
-    return tensor_from_term(y.ctx, thvm_grad_pair_bundle(y.ctx, y.term, targets, 1));
+    return tensor_from_term(y.ctx, thvm_grad_bundle(y.ctx, y.term, targets, 1));
 }
 
 u32 tensor_bundle_count(Tensor bundle) {

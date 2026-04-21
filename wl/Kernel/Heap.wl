@@ -25,10 +25,10 @@ uopDataArity[uop_String] := Which[
     uop === "Exec",   1,   (* NUM(kid), deps, NUM(flags) — only deps is data *)
     True,             uopArity[uop]
 ];
-termChildCount[n_Association] := Module[{tag = n["Tag"]},
+termChildCount[n_Association] := Block[{tag = n["Tag"]},
     Which[
         tag === "Top",
-            Module[{uop = Lookup[n, "UOp", Lookup[$uopName, n["Ext"], "?"]]},
+            Block[{uop = Lookup[n, "UOp", Lookup[$uopName, n["Ext"], "?"]]},
                 If[uop === "Kernel" && IntegerQ[n["Val"]] && n["Val"] > 0 &&
                    kernelMonolithicAt[n["Val"]],
                     0,
@@ -45,7 +45,7 @@ termPortName[n_Association, i_Integer] := Which[
     True,               heapPortName[n["Tag"], i]
 ];
 
-kernelMonolithicAt[val_Integer] := Module[{slot1},
+kernelMonolithicAt[val_Integer] := Block[{slot1},
     slot1 = Quiet@Check[THeapRead[val + 1], None];
     AssociationQ[slot1] && slot1["Tag"] === "Any"
 ];
@@ -71,7 +71,7 @@ termKey[n_Association] := If[
     atomKey[n]
 ];
 
-walkNodeRecord[n_Association] := Module[{derived = <||>, chain, dims},
+walkNodeRecord[n_Association] := Block[{derived = <||>, chain, dims},
     If[n["Tag"] === "Top" && IntegerQ[n["Val"]] && n["Val"] > 0,
         derived["UOp"] = Lookup[n, "UOp", Lookup[$uopName, n["Ext"], "?"]];
         If[derived["UOp"] === "Kernel",
@@ -85,7 +85,7 @@ walkNodeRecord[n_Association] := Module[{derived = <||>, chain, dims},
         derived|>
 ];
 
-refDefRoot[n_Association] := Module[{d},
+refDefRoot[n_Association] := Block[{d},
     If[n["Tag"] =!= "Ref", Return[None]];
     d = Quiet@Check[TDefRead[n["Ext"]], None];
     If[AssociationQ[d] && d["Tag"] =!= "Era", d, None]
@@ -97,33 +97,33 @@ refDefRoot[n_Association] := Module[{d},
 (* Chain comes from the cached KernelEntry's FusedOp[] (built lazily by
    fuse_build_kernel for monolithic on-heap kernels). Same path dump.c uses,
    exposed via thvm_kernel_op_chain. *)
-kernelOpChainAt[tagCode_Integer, ext_Integer, val_Integer] := Module[{s},
+kernelOpChainAt[tagCode_Integer, ext_Integer, val_Integer] := Block[{s},
     s = Quiet@Check[thvmKernelOpChainFn[tagCode, ext, val], ""];
     If[StringQ[s], ToUpperCase[s], ""]];
 
 (* Infer shape of a compound term at heap base `val` by walking to first
    TEN leaf — also captured at walk time. *)
-inferShapeAt[val_Integer] := Module[{seen = <||>, go, dims},
+inferShapeAt[val_Integer] := Block[{seen = <||>, go, dims},
     go[loc_] := If[loc <= 0 || KeyExistsQ[seen, loc], None,
         seen[loc] = True;
-        Module[{n = Quiet@Check[THeapRead[loc], None], arity, i, d},
-            If[!AssociationQ[n], Return[None, Module]];
+        Block[{n = Quiet@Check[THeapRead[loc], None], arity, i, d},
+            If[!AssociationQ[n], Return[None, Block]];
             Which[
                 n["Tag"] === "Ten",
                     Quiet[TDimensions[TTensor[n["Val"]]]],
                 n["Tag"] === "Top" || KeyExistsQ[$heapTagArity, n["Tag"]],
                     arity = termChildCount[n];
                     Do[d = go[n["Val"] + i];
-                       If[ListQ[d], Return[d, Module]],
+                       If[ListQ[d], Return[d, Block]],
                        {i, 0, arity - 1}]; None,
                 True, None]]];
     dims = go[val];
     If[ListQ[dims], dims, None]];
 
-kernelSemanticLeavesAt[val_Integer] := Module[{payload, leaves = <||>, seen = <||>, visit},
+kernelSemanticLeavesAt[val_Integer] := Block[{payload, leaves = <||>, seen = <||>, visit},
     payload = Quiet@Check[THeapRead[val], None];
     If[!AssociationQ[payload], Return[{}]];
-    visit[n_Association] := Module[{uop, loc, arity, child, childUOp, key, port},
+    visit[n_Association] := Block[{uop, loc, arity, child, childUOp, key, port},
         If[n["Tag"] =!= "Top" || !IntegerQ[n["Val"]] || n["Val"] <= 0, Return[]];
         loc = n["Val"];
         If[KeyExistsQ[seen, loc], Return[]];
@@ -154,9 +154,9 @@ kernelSemanticLeavesAt[val_Integer] := Module[{payload, leaves = <||>, seen = <|
     Values[leaves]
 ];
 
-heapWalk[rootTerm_Association] := Module[
+heapWalk[rootTerm_Association] := Block[
     {nodes = <||>, edges = {}, rootKey, visit},
-    visit[nAssoc_Association] := Module[
+    visit[nAssoc_Association] := Block[
         {n = nAssoc, k, dk, defRoot, nChildren, childLoc, child, pname, ck, semanticLeaves},
         k = termKey[n];
         If[KeyExistsQ[nodes, k], Return[k]];
@@ -210,12 +210,12 @@ heapWalk[rootTerm_Association] := Module[
 ];
 
 (* Get the root term of a TTensor/TTerm handle as a THeapRead-shaped assoc. *)
-rootTermOf[t_] := Module[{id, tagCode, ext, val, tag},
+rootTermOf[t_] := Block[{id, tagCode, ext, val, tag},
     id = termId[t];
     tagCode = thvmTermTagFn[id];
     ext     = thvmTermExtFn[id];
     val     = thvmTermValFn[id];
     tag     = Lookup[$tagName, tagCode, "?"];
-    iHeapTermAssoc[tagCode, ext, val,
+    heapTermAssoc[tagCode, ext, val,
       If[tag === "Top" || KeyExistsQ[$heapTagArity, tag], val, 0]]
 ];

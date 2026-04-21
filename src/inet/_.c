@@ -77,81 +77,27 @@ void thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1) {
     *out1 = term_new(TAG_DP1, label, loc);
 }
 
-// GRAD as a DUP-shaped combinator: single heap cell holding y (the body),
-// two aux projections — forward (TAG_GF) and backward (TAG_GB) — both
-// referencing the cell. Analogous to DUP's DP0/DP1 pair.
-//
-//     (x, dx) = GRAD(y)
-//
-// `label` encodes the target identity (same role as DUP label: projections
-// with matching labels interact with each other's substitution; target
-// metadata is carried by the label or a side table).
-void thvm_grad_pair(TinyHVM *ctx, u32 label, Term y,
-                    Term *out_fwd, Term *out_bwd) {
-    u64 loc = heap_alloc(ctx, 1);
-    heap_set(ctx, loc, y);
-    *out_fwd = term_new(TAG_GF, label, loc);
-    *out_bwd = term_new(TAG_GB, label, loc);
-}
-
-// UOP_GRAD2 builder: single-UOP gradient, no label/side-table.
-// heap[loc+0] = y, heap[loc+1] = target.  Reduces via chain rule to a
-// tensor of target.shape.  Parallel to thvm_grad_pair during migration.
-Term thvm_grad_u(TinyHVM *ctx, Term y, Term target) {
+// UOP_GRAD builder.  heap[loc+0] = y, heap[loc+1] = target.
+// Reduces to a tensor of target.shape holding ∂(sum y)/∂target
+// (reverse-mode autodiff with an implicit ones cotangent on y).
+Term thvm_grad(TinyHVM *ctx, Term y, Term target) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc + 0, y);
     heap_set(ctx, loc + 1, target);
-    // Record shape on the GRAD2 TOP so downstream ops (ADD/NEG/etc.)
-    // that wrap it can compute their output view and the scheduler can
-    // allocate a raw_output_tid.  GRAD2's result shape = target.shape.
+    // Record target.shape on the GRAD TOP so downstream wrappers (ADD, NEG,…)
+    // can compute their output view and the scheduler can allocate a
+    // raw_output_tid.  GRAD's result shape = target.shape.
     const View *tv = term_view(ctx, target);
     if (tv) {
         View v = *tv;
         st_set(loc, &v);
     }
-    return term_new(TAG_TOP, UOP_GRAD2, loc);
+    return term_new(TAG_TOP, UOP_GRAD, loc);
 }
 
-// Safer target-typed wrapper. Extracts the tensor id from a TAG_TEN
-// target (walking DP/VAR chains first), or uses the ~0u no-match
-// sentinel when the target isn't a tensor. Using this instead of the
-// raw u32 variant avoids the heap-loc/tensor-id collision in the
-// 20-bit label field.
-void thvm_grad_pair_target(TinyHVM *ctx, Term target, Term y,
-                           Term *out_fwd, Term *out_bwd) {
-    u32 tid = ~0u;
-    Term t = target;
-    for (int i = 0; i < 32; i++) {
-        u8 tag = term_tag(t);
-        if (tag == TAG_TEN) { tid = (u32)term_val(t); break; }
-        if (tag == TAG_DP0 || tag == TAG_DP1) {
-            u64 l = term_val(t);
-            if (l == 0 || l >= ctx->heap_pos) break;
-            Term next = heap_read(ctx, l);
-            if (term_is_sub(next)) next = term_strip_sub(next);
-            if (next == t) break;
-            t = next;
-            continue;
-        }
-        if (tag == TAG_VAR) {
-            u64 l = term_val(t);
-            if (l == 0 || l >= ctx->heap_pos) break;
-            Term sub = heap_read(ctx, l);
-            if (term_is_sub(sub)) break;
-            if (sub == t) break;
-            t = sub;
-            continue;
-        }
-        break;
-    }
-    thvm_grad_pair(ctx, tid, y, out_fwd, out_bwd);
-}
-
-// Adapter for legacy bundle-style callers: returns a CTR#n_params where
-// each slot is the bwd of GRAD(y, targets[i]). Caller reads via
-// thvm_grad_bundle_get (CTR child access). y is DUP'd n_params-1 times so
-// each target's GRAD gets its own copy.
-Term thvm_grad_pair_bundle(TinyHVM *ctx, Term y, Term *targets, u32 n_params) {
+// Multi-target bundle: returns CTR#n_params where each slot is GRAD(y, targets[i]).
+// y is DUP'd n_params-1 times so each target's GRAD gets its own copy.
+Term thvm_grad_bundle(TinyHVM *ctx, Term y, Term *targets, u32 n_params) {
     if (n_params == 0) return thvm_ctr(ctx, NULL, 0);
     Term *ys = (Term *)malloc((size_t)n_params * sizeof(Term));
     ys[0] = y;
@@ -163,7 +109,7 @@ Term thvm_grad_pair_bundle(TinyHVM *ctx, Term y, Term *targets, u32 n_params) {
     }
     Term *bwds = (Term *)malloc((size_t)n_params * sizeof(Term));
     for (u32 i = 0; i < n_params; i++) {
-        bwds[i] = thvm_grad_u(ctx, ys[i], targets[i]);
+        bwds[i] = thvm_grad(ctx, ys[i], targets[i]);
     }
     Term bundle = thvm_ctr(ctx, bwds, (u8)n_params);
     free(ys);
@@ -303,75 +249,13 @@ static Term thvm_book_from_dynamic_r(TinyHVM *ctx, Term t,
             u64 old_loc = term_val(t);
             u64 new_loc = thvm_book_heap_alloc(ctx, ar);
             thvm_book_copy_shape_state(ctx, old_loc, new_loc);
-            if ((tag == TAG_APP || (tag == TAG_TOP && term_ext(t) == UOP_GRAD)) &&
-                *n_relocs < 4096)
+            if (tag == TAG_APP && *n_relocs < 4096)
                 relocs[(*n_relocs)++] = (BookReloc){old_loc, new_loc};
             for (u32 i = 0; i < ar; i++) {
                 ctx->book_heap[new_loc + i] = thvm_book_from_dynamic_r(ctx, heap_read(ctx, old_loc + i),
                                                                         relocs, n_relocs);
             }
             Term out = term_new(tag, term_ext(t), new_loc);
-            if (tag == TAG_TOP && term_ext(t) == UOP_GRAD) {
-                u64 book_grad_loc = thvm_grad_book_loc_key(new_loc);
-                Term book_target = thvm_book_from_dynamic_r(ctx, thvm_grad_target_get(ctx, old_loc),
-                                                            relocs, n_relocs);
-                u32 book_mode = thvm_grad_mode_get(ctx, old_loc);
-                thvm_grad_target_set(ctx, book_grad_loc, book_target);
-                thvm_grad_mode_set(ctx, book_grad_loc, book_mode);
-                u32 nt = thvm_grad_targets_count_at(ctx, old_loc);
-                if (nt > 0) {
-                    Term params[THVM_GRAD_TARGETS_MAX];
-                    Term slots[THVM_GRAD_TARGETS_MAX];
-                    assert(nt <= THVM_GRAD_TARGETS_MAX);
-                    for (u32 i = 0; i < nt; i++) {
-                        params[i] = thvm_book_from_dynamic_r(ctx,
-                                                             thvm_grad_targets_get_term_at(ctx, old_loc, i),
-                                                             relocs, n_relocs);
-                        slots[i] = thvm_book_from_dynamic_r(ctx,
-                                                            thvm_grad_targets_get_slot_at(ctx, old_loc, i),
-                                                            relocs, n_relocs);
-                    }
-                    thvm_grad_targets_set_for_loc(ctx, book_grad_loc, params, slots, nt);
-                }
-                Term bundle = thvm_grad_keep_bundle_get(ctx, old_loc);
-                if (!(term_tag(bundle) == TAG_ERA && term_val(bundle) == 0)) {
-                    thvm_grad_keep_bundle_set(ctx, book_grad_loc,
-                                              thvm_book_from_dynamic_r(ctx, bundle, relocs, n_relocs));
-                }
-                u64 app_loc = thvm_grad_keep_app_loc_get(ctx, old_loc);
-                if (app_loc != 0) {
-                    for (u32 i = 0; i < *n_relocs; i++) {
-                        if (relocs[i].old_loc == app_loc) {
-                            thvm_grad_keep_app_loc_set(ctx, book_grad_loc,
-                                                       thvm_grad_book_loc_key(relocs[i].new_loc));
-                            break;
-                        }
-                    }
-                }
-                if (getenv("THVM_LOOP_DIAG")) {
-                    fprintf(stderr,
-                            "BOOK_GRAD old_loc=%llu book_loc=%llu mode=%u targets=%u target_tag=%u target_ext=%u target_val=%llu bundle_tag=%u bundle_ext=%u bundle_val=%llu\n",
-                            (unsigned long long)old_loc,
-                            (unsigned long long)new_loc,
-                            book_mode,
-                            nt,
-                            (u32)term_tag(book_target),
-                            (u32)term_ext(book_target),
-                            (unsigned long long)term_val(book_target),
-                            (u32)term_tag(bundle),
-                            (u32)term_ext(bundle),
-                            (unsigned long long)term_val(bundle));
-                    for (u32 i = 0; i < nt; i++) {
-                        Term pt = thvm_grad_targets_get_term_at(ctx, book_grad_loc, i);
-                        Term ps = thvm_grad_targets_get_slot_at(ctx, book_grad_loc, i);
-                        fprintf(stderr,
-                                "  BOOK_GRAD_TARGET[%u]=term(tag=%u ext=%u val=%llu) slot(tag=%u ext=%u val=%llu)\n",
-                                i,
-                                (u32)term_tag(pt), (u32)term_ext(pt), (unsigned long long)term_val(pt),
-                                (u32)term_tag(ps), (u32)term_ext(ps), (unsigned long long)term_val(ps));
-                    }
-                }
-            }
             return out;
         }
     }

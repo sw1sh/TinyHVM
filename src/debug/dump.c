@@ -1360,12 +1360,6 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     fprintf(f, "  num_d%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n", (unsigned long long)_cur, (double)_fv); \
                     fprintf(f, "  num_d%llu -> dup%llu%s;\n", (unsigned long long)_cur, (unsigned long long)_cur, _hl_principal ? " [color=\"#cc0000\",penwidth=2.0]" : ""); } \
                 else if (_stag == TAG_ANY) { EMIT_ANY_NODE(_cur); fprintf(f, "  any%llu -> dup%llu%s;\n", (unsigned long long)_cur, (unsigned long long)_cur, _hl_principal ? " [color=\"#cc0000\",penwidth=2.0]" : ""); } \
-                else if (_stag == TAG_GF || _stag == TAG_GB) { \
-                    EMIT_GRAD_CELL(term_val(_shared)); \
-                    const char *_gport = (_stag == TAG_GF) ? "fwd" : "bwd"; \
-                    fprintf(f, "  grad%llu -> dup%llu [label=\"%s\"];\n", \
-                            (unsigned long long)term_val(_shared), (unsigned long long)_cur, _gport); \
-                } \
                 else { EMIT_RAW_NODE(_cur, _shared); fprintf(f, "  h%llu -> dup%llu%s;\n", (unsigned long long)_cur, (unsigned long long)_cur, _hl_principal ? " [color=\"#cc0000\",penwidth=2.0]" : ""); } \
             } \
             break; \
@@ -1442,11 +1436,6 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     fprintf(f, "  ref%llu -> era%llu [label=\"p\"%s];\n", (unsigned long long)_ev, (unsigned long long)(epos), EDGE_HL_LABEL_TERM(epos, _et)); \
                 } else if (_st == TAG_VAR) { \
                     EMIT_VAR_OR_RESOLVED_TO_TARGET(_src, term_val(_src), "era", (epos), "p", DOT_HL_MATCH_TERM(epos, _et), ""); \
-                } else if (_st == TAG_GF || _st == TAG_GB) { \
-                    EMIT_GRAD_CELL(term_val(_src)); \
-                    const char *_gport = (_st == TAG_GF) ? "fwd" : "bwd"; \
-                    fprintf(f, "  grad%llu -> era%llu [label=\"%s\"%s];\n", \
-                            (unsigned long long)term_val(_src), (unsigned long long)(epos), _gport, EDGE_HL_LABEL_TERM(epos, _et)); \
                 } else if (dot_visible_heap_loc_tag(_st)) { \
                     fprintf(f, "  n%llu -> era%llu [label=\"p\"%s];\n", (unsigned long long)term_val(_src), (unsigned long long)(epos), EDGE_HL_LABEL_TERM(epos, _et)); \
                 } else if (_st == TAG_NUM) { \
@@ -1836,25 +1825,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                          kid, (unsigned long long)val);
                 color = "#ccccff";  // light blue for exec triggers
             } else if (ext == UOP_GRAD) {
-                // GRAD bead: y (input below), gy (output above).
-                Term gx = thvm_grad_target_get(ctx, val);
-                char tgt[32] = "?";
-                if (term_tag(gx) == TAG_ANY) {
-                    int p = 0;
-                    u32 nt = thvm_grad_targets_count_at(ctx, val);
-                    if (nt == 0) {
-                        snprintf(tgt, sizeof(tgt), "all");
-                    } else {
-                        for (u32 gi = 0; gi < nt && p < 24; gi++) {
-                            u32 tid = thvm_grad_targets_get_tid_at(ctx, val, gi);
-                            if (tid != ~0u)
-                                p += snprintf(tgt + p, sizeof(tgt) - p, "%st%u", gi ? "," : "", tid);
-                        }
-                    }
-                } else if (term_tag(gx) == TAG_TEN) {
-                    snprintf(tgt, sizeof(tgt), "t%u", (u32)term_val(gx));
-                }
-                snprintf(label, sizeof(label), "GRAD\\nd/d(%s)\\n@%llu", tgt, (unsigned long long)val);
+                snprintf(label, sizeof(label), "GRAD\\n@%llu", (unsigned long long)val);
                 color = "#e8d0ff"; nshape = "box";
             } else {
                 if (ext == UOP_FUSE) {
@@ -1937,14 +1908,6 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     char dp_lbl[64];
                     fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n", dl, val,
                             dot_dp_port_label(dp_lbl, sizeof(dp_lbl), elbl, ctag, cpos));
-                } else if (ctag == TAG_GF || ctag == TAG_GB) {
-                    // (x, dx) = GRAD(y): render the GRAD cell once; emit an
-                    // edge from the cell to this consumer labeled fwd or bwd.
-                    u64 gl = cval;
-                    EMIT_GRAD_CELL(gl);
-                    const char *port = (ctag == TAG_GF) ? "fwd" : "bwd";
-                    fprintf(f, "  grad%llu -> n%llu [label=\"%s\"];\n",
-                            (unsigned long long)gl, (unsigned long long)val, port);
                 } else if (ctag == TAG_TEN) {
                     EMIT_TEN((u32)cval);
                     char slot_attrs[96];
@@ -2262,11 +2225,6 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                         else         fprintf(f, "  dup%llu -> ctr%llu [label=\"%s\"];\n",
                                              (unsigned long long)dl, (unsigned long long)val,
                                              dot_dp_port_label(dp_lbl, sizeof(dp_lbl), clbl, ctag, cpos));
-                    } else if (ctag == TAG_GF || ctag == TAG_GB) {
-                        EMIT_GRAD_CELL(cval);
-                        const char *port = (ctag == TAG_GF) ? "fwd" : "bwd";
-                        fprintf(f, "  grad%llu -> ctr%llu [label=\"%s (%s)\"];\n",
-                                (unsigned long long)cval, (unsigned long long)val, clbl, port);
                     } else if (ctag == TAG_NUM) {
                         f32 fv; u32 bv = (u32)cval; memcpy(&fv, &bv, 4);
                         fprintf(f, "  num_ctr%llu_%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n",
@@ -2724,24 +2682,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     color = "#ccffcc"; \
                 } \
             } else if ((_ext) == UOP_GRAD) { \
-                Term gx = thvm_grad_target_get(ctx, (_loc)); \
-                char tgt[32] = "?"; \
-                if (term_tag(gx) == TAG_ANY) { \
-                    int p = 0; \
-                    u32 nt = thvm_grad_targets_count_at(ctx, (_loc)); \
-                    if (nt == 0) { \
-                        snprintf(tgt, sizeof(tgt), "all"); \
-                    } else { \
-                        for (u32 gi = 0; gi < nt && p < 24; gi++) { \
-                            u32 tid = thvm_grad_targets_get_tid_at(ctx, (_loc), gi); \
-                            if (tid != ~0u) \
-                                p += snprintf(tgt + p, sizeof(tgt) - p, "%st%u", gi ? "," : "", tid); \
-                        } \
-                    } \
-                } else if (term_tag(gx) == TAG_TEN) { \
-                    snprintf(tgt, sizeof(tgt), "t%u", (u32)term_val(gx)); \
-                } \
-                snprintf(label, sizeof(label), "GRAD\\nd/d(%s)", tgt); \
+                snprintf(label, sizeof(label), "GRAD"); \
                 color = "#e8d0ff"; \
             } else { \
                 snprintf(label, sizeof(label), "%s\\n[%s]", opn, sh); \

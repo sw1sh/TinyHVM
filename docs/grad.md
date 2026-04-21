@@ -1,34 +1,32 @@
-# GRAD2: Gradient Semantics in TinyHVM
+# GRAD: Gradient Semantics in TinyHVM
 
 TinyHVM differentiates through its interaction-calculus term graph via a single
-UOP: **`UOP_GRAD2(y, target)`**. Reducing a `GRAD2` term produces a tensor of
+UOP: **`UOP_GRAD(y, target)`**. Reducing a `GRAD` term produces a tensor of
 `target.shape` holding the scalar-loss gradient `∂(sum y)/∂target` — i.e.
 reverse-mode automatic differentiation seeded with a ones-cotangent on `y`.
 
-The previous DUP-shaped `TAG_GF/TAG_GB` pair + `GRAD_ENTRY` macro system
-(`thvm_grad`, `thvm_grad_multi`, `thvm_grad_multi_keep`, `BG`/`UG`/`GRAD_RETURN`)
-was removed 2026-04. The active implementation lives in
-[`src/interact/grad2.c`](../src/interact/grad2.c).
+The implementation lives in [`src/interact/grad.c`](../src/interact/grad.c)
+(rules) and [`src/inet/_.c`](../src/inet/_.c) (`thvm_grad` builder).
 
 ## Primitive
 
 ```c
-Term thvm_grad_u(TinyHVM *ctx, Term y, Term target);
+Term thvm_grad(TinyHVM *ctx, Term y, Term target);
 ```
 
-Constructs a `TAG_TOP` term with `UOP_GRAD2` at a 2-slot heap cell:
+Constructs a `TAG_TOP` term with `UOP_GRAD` at a 2-slot heap cell:
 `heap[loc+0] = y`, `heap[loc+1] = target`. The shape of the result is tracked
 as `target.shape` in the shape table so downstream wrappers (ADD, NEG, …) can
 infer their own output shapes and the scheduler can allocate a `raw_output_tid`.
 
 There is **one** GRAD node kind. No separate forward projection; no DUP-shaped
-pair; no side channel. The bundled multi-target helper `thvm_grad_pair_bundle`
-is a thin wrapper that emits `n_params` independent `GRAD2` terms inside a
+pair; no side channel. The bundled multi-target helper `thvm_grad_bundle`
+is a thin wrapper that emits `n_params` independent `GRAD` terms inside a
 `CTR`.
 
 ## Contract
 
-`GRAD2(y, target)` reduces to a tensor `g` such that
+`GRAD(y, target)` reduces to a tensor `g` such that
 
 ```
 g[i] = ∂ (Σⱼ y[j]) / ∂ target[i]
@@ -36,7 +34,7 @@ g.shape = target.shape
 ```
 
 This is **reverse-mode** with an implicit ones-cotangent on `y`. Composing two
-`GRAD2` nodes (`GRAD2(GRAD2(f, x), x)`) yields the scalar-loss Hessian-vector
+`GRAD` nodes (`GRAD(GRAD(f, x), x)`) yields the scalar-loss Hessian-vector
 product, not a forward-mode JVP. See *JVP vs VJP* below.
 
 ### Why reverse mode with ones-seed
@@ -57,12 +55,12 @@ product, not a forward-mode JVP. See *JVP vs VJP* below.
 | **JVP** (forward-mode) | tangent on input (`target.shape`) | `y.shape` | forward tangent, Hessian-vector products via trick |
 | **VJP** (reverse-mode) | cotangent on output (`y.shape`) | `target.shape` | `∂loss/∂θ` (standard training) |
 
-`UOP_GRAD2` is VJP with `cotangent = ones(y.shape)`. TinyHVM has no separate
+`UOP_GRAD` is VJP with `cotangent = ones(y.shape)`. TinyHVM has no separate
 JVP primitive today; higher-order derivatives are expressed as nested
-`GRAD2`s, which is VJP-of-VJP.
+`GRAD`s, which is VJP-of-VJP.
 
-Higher-order note: for `f : ℝⁿ → ℝ`, `GRAD2(f, x)` gives `∇f` of shape `n`.
-Then `GRAD2(sum(∇f), x)` gives a vector whose `i`-th entry is
+Higher-order note: for `f : ℝⁿ → ℝ`, `GRAD(f, x)` gives `∇f` of shape `n`.
+Then `GRAD(sum(∇f), x)` gives a vector whose `i`-th entry is
 `Σⱼ ∂²f / ∂xⱼ ∂xᵢ` — the Hessian row-sum, i.e. `H · 1`. To recover a clean
 second derivative on a scalar `y = f(x)` where `x` is a single scalar,
 nesting the primitives just works: the ones-seed collapses correctly because
@@ -70,39 +68,39 @@ nesting the primitives just works: the ones-seed collapses correctly because
 
 ## Rules
 
-All rules live in [`src/interact/grad2.c`](../src/interact/grad2.c) and fire
+All rules live in [`src/interact/grad.c`](../src/interact/grad.c) and fire
 from the `TAG_TOP` branch of `src/interact/_.c` when the TOP's uop is
-`UOP_GRAD2`. Each rule reads `y = heap[loc+0]`, dispatches on `y`'s tag, and
+`UOP_GRAD`. Each rule reads `y = heap[loc+0]`, dispatches on `y`'s tag, and
 returns the gradient term.
 
 ### Leaf rules
 
 - `y = TAG_TEN` (literal tensor): if `TEN id == target id` (after stripping
   `DP0`/`DP1`/`VAR` projections), emit `ones(target.shape)`; else
-  `zeros(target.shape)`. Built via `GRAD2_SCALAR_TEN` helper — a rank-matched
+  `zeros(target.shape)`. Built via `GRAD_SCALAR_TEN` helper — a rank-matched
   shape-`[1,1,…]` TEN expanded to `target.shape`.
 - `y = TAG_NUM`: constant → `zeros(target.shape)`.
 
 ### Elementwise (Leibniz forward-style, valid for diagonal Jacobians)
 
-- `UOP_ADD`: `GRAD2(a, t) + GRAD2(b, t)`
-- `UOP_SUB`: `GRAD2(a, t) - GRAD2(b, t)`
-- `UOP_NEG`: `-GRAD2(a, t)`
-- `UOP_MUL`: `b * GRAD2(a, t) + a * GRAD2(b, t)` (Leibniz; requires
+- `UOP_ADD`: `GRAD(a, t) + GRAD(b, t)`
+- `UOP_SUB`: `GRAD(a, t) - GRAD(b, t)`
+- `UOP_NEG`: `-GRAD(a, t)`
+- `UOP_MUL`: `b * GRAD(a, t) + a * GRAD(b, t)` (Leibniz; requires
   `a.shape = b.shape = target.shape`)
-- `UOP_DIV`: `(GRAD2(a, t) / b) - a * GRAD2(b, t) / b²`
-- `UOP_EXP`: `exp(a) * GRAD2(a, t)`
-- `UOP_LOG`: `GRAD2(a, t) / a`
-- `UOP_SQRT`: `GRAD2(a, t) / (2 √a)`
-- `UOP_RELU`: `(a > 0) * GRAD2(a, t)`
-- `UOP_MAX`: `(a >= b) * GRAD2(a, t) + (a < b) * GRAD2(b, t)`
+- `UOP_DIV`: `(GRAD(a, t) / b) - a * GRAD(b, t) / b²`
+- `UOP_EXP`: `exp(a) * GRAD(a, t)`
+- `UOP_LOG`: `GRAD(a, t) / a`
+- `UOP_SQRT`: `GRAD(a, t) / (2 √a)`
+- `UOP_RELU`: `(a > 0) * GRAD(a, t)`
+- `UOP_MAX`: `(a >= b) * GRAD(a, t) + (a < b) * GRAD(b, t)`
 - `UOP_CMP`: constant zero (non-differentiable)
-- `UOP_WHERE`: `where(cond, GRAD2(a, t), GRAD2(b, t))` (condition assumed
+- `UOP_WHERE`: `where(cond, GRAD(a, t), GRAD(b, t))` (condition assumed
   constant w.r.t. target)
 
 ### Reductions
 
-- `UOP_SUM(a, axes)`: recurse `GRAD2(a, t)`, then `expand` to `a.shape`.
+- `UOP_SUM(a, axes)`: recurse `GRAD(a, t)`, then `expand` to `a.shape`.
 - `UOP_RMAX(a, axes)`: mask-expand with argmax indicator; requires three DUP
   copies of `a`.
 
@@ -139,19 +137,19 @@ Any `TAG_TOP` uop not listed above falls through to `zeros(target.shape)`.
 The previous design's fallthrough-to-`NUM(0.0)` rule is preserved but now
 produces a shape-correct tensor rather than a bare scalar.
 
-## Helper macros (grad2.c)
+## Helper macros (grad.c)
 
 ```c
-GRAD2_SCALAR_TEN(v, shape)   // rank-matched shape-[1,..] TEN of v, expanded
-GRAD2_ONES_OF(shape)         // same, hardcoded value 1.0
-GRAD2_TERM_SHAPE(term, out)  // read TEN/TOP shape into `out` Shape lvalue
+GRAD_SCALAR_TEN(v, shape)   // rank-matched shape-[1,..] TEN of v, expanded
+GRAD_ONES_OF(shape)         // same, hardcoded value 1.0
+GRAD_TERM_SHAPE(term, out)  // read TEN/TOP shape into `out` Shape lvalue
 ```
 
 ## DUP interaction
 
-GRAD2 wraps its operands through normal IC DUP sharing. Where the rule needs
+GRAD wraps its operands through normal IC DUP sharing. Where the rule needs
 the same subterm twice (`a0, a1 = DUP(a)`), it emits an explicit
-`thvm_dup(...)`. No special-case DUP handling for GRAD2 is needed in the
+`thvm_dup(...)`. No special-case DUP handling for GRAD is needed in the
 DUP combinator — it falls through via the HVM4-style SUB-bit substitution
 (see *DUP + ERA sweeps* below).
 
@@ -160,7 +158,7 @@ DUP combinator — it falls through via the HVM4-style SUB-bit substitution
 - **MUL-Leibniz shape mismatch.** `UOP_MUL` currently emits the elementwise
   Leibniz rule, which requires both operands to have shape `target.shape`.
   Pipelines where one operand is a `pad(x)` or `expand(x)` and the other is
-  `target.shape` fail shape-check: `b * GRAD2(a, t)` multiplies `b` (y-shape)
+  `target.shape` fail shape-check: `b * GRAD(a, t)` multiplies `b` (y-shape)
   by a `target.shape` gradient. Fixing this requires a general reverse-mode
   VJP for MUL: `sum_to_shape(b ⊙ upstream_grad_of_a, target.shape)`. Affects
   `test_e2e_conv_like`.
@@ -176,12 +174,12 @@ DUP combinator — it falls through via the HVM4-style SUB-bit substitution
 
 ## Files
 
-- [`src/interact/grad2.c`](../src/interact/grad2.c) — rule implementations.
-- [`src/interact/_.c`](../src/interact/_.c) — `UOP_GRAD2` dispatch under
+- [`src/interact/grad.c`](../src/interact/grad.c) — rule implementations.
+- [`src/interact/_.c`](../src/interact/_.c) — `UOP_GRAD` dispatch under
   `TAG_TOP`, helper macros.
-- [`src/inet/_.c`](../src/inet/_.c) — `thvm_grad_u` builder,
-  `thvm_grad_pair_bundle` multi-target wrapper.
-- [`src/reduce/_.c`](../src/reduce/_.c) — `UOP_GRAD2` added to reduce-trampoline
+- [`src/inet/_.c`](../src/inet/_.c) — `thvm_grad` builder,
+  `thvm_grad_bundle` multi-target wrapper.
+- [`src/reduce/_.c`](../src/reduce/_.c) — `UOP_GRAD` added to reduce-trampoline
   direct-uop list and frame acceptance logic.
 - [`test/test_grad_rules.m`](../test/test_grad_rules.m) — topology + E2E
   numeric tests.
@@ -234,7 +232,7 @@ No global tracking table, no side channel. `heap_set` is a plain write.
 When a DP aux pulls and reads a non-effectful `TAG_TOP` at the DUP cell, both
 auxes can share the same TAG_TOP handle without firing the DUP — the scheduler
 materializes the TOP once and both auxes read the resulting TEN. Effectful
-uops (`UOP_ASSIGN`, `UOP_KERNEL`, `UOP_EXEC`, `UOP_DETACH`, `UOP_GRAD2`) still
+uops (`UOP_ASSIGN`, `UOP_KERNEL`, `UOP_EXEC`, `UOP_DETACH`, `UOP_GRAD`) still
 go through the full fire + subst_cop path.
 
 ## Bounded recursion guards

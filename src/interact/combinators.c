@@ -365,7 +365,8 @@
 
             // DUP collapse: if ERA consumes one DP port, project shared value
             // to the opposite port and clear the shared slot.
-            if (vtag == TAG_DP0 || vtag == TAG_DP1) {
+            if (vtag == TAG_DP0 || vtag == TAG_DP1 ||
+                vtag == TAG_GF  || vtag == TAG_GB) {
                 /* HVM4-style: ERA on an aux DP port is handled via the
                  * DUP cell itself, not via a side channel into the
                  * sibling's consumer slot. Two cases:

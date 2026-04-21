@@ -22,18 +22,18 @@ digraph G {
   n34 -> n32 [label="a"];
   n41 -> n32 [label="b"];
   n34 [label="EXPAND\n[3]\n@34", shape=box, fillcolor="#fff3cd"];
-  num34_0 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num34_0 -> n34 [label="in"];
-  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t3 -> n34 [label="shape",taillabel="@35",labelfontsize=7,fontcolor="#666666"];
+  t3 [label="t3\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n34 [label="in",taillabel="@34",labelfontsize=7,fontcolor="#666666"];
+  t4 [label="t4\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 -> n34 [label="shape",taillabel="@35",labelfontsize=7,fontcolor="#666666"];
   n41 [label="MUL\n[3]\n@41", shape=box, fillcolor="#cce5ff"];
   n43 -> n41 [label="a"];
   n39 -> n41 [label="b"];
   n43 [label="EXPAND\n[3]\n@43", shape=box, fillcolor="#fff3cd"];
-  num43_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num43_0 -> n43 [label="in"];
-  t4 [label="t4\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t4 -> n43 [label="shape",taillabel="@44",labelfontsize=7,fontcolor="#666666"];
+  t5 [label="t5\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t5 -> n43 [label="in",taillabel="@43",labelfontsize=7,fontcolor="#666666"];
+  t6 [label="t6\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t6 -> n43 [label="shape",taillabel="@44",labelfontsize=7,fontcolor="#666666"];
   n39 [label="EXP\n[3]\n@39", shape=box, fillcolor="#cce5ff"];
   t1 -> n39 [label="",taillabel="@39",labelfontsize=7,fontcolor="#666666"];
 }

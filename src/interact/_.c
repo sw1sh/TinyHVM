@@ -1037,9 +1037,12 @@ inet_step:
                     u32 ttid = (u32)term_val(tgt);
                     Shape tsh = (ttid < ctx->tensor_count)
                         ? ctx->tensors[ttid].view.shape : SHAPE(1);
-                    Term zero = term_num_f32(0.0f);
+                    // Wrap scalar in a shape-[1] TEN so EXPAND has a live
+                    // buf_id to share (avoids lazy TOP that later defers).
+                    f32 zd = 0.0f;
+                    Term zten = thvm_tensor(ctx, &zd, SHAPE(1));
                     Term out = (tsh.rank > 0 && !(tsh.rank == 1 && tsh.dims[0] == 1))
-                        ? thvm_expand(ctx, zero, tsh) : zero;
+                        ? thvm_expand(ctx, zten, tsh) : zten;
                     ctx->itrs++; RETURN_REDUCED(out);
                 }
                 if (term_tag(y) == TAG_TEN && term_tag(tgt) == TAG_TEN) {
@@ -1047,10 +1050,10 @@ inet_step:
                     u32 ttid = (u32)term_val(tgt);
                     Shape tsh = (ttid < ctx->tensor_count)
                         ? ctx->tensors[ttid].view.shape : SHAPE(1);
-                    Term scalar = (ytid == ttid) ? term_num_f32(1.0f)
-                                                 : term_num_f32(0.0f);
+                    f32 sd = (ytid == ttid) ? 1.0f : 0.0f;
+                    Term sten = thvm_tensor(ctx, &sd, SHAPE(1));
                     Term out = (tsh.rank > 0 && !(tsh.rank == 1 && tsh.dims[0] == 1))
-                        ? thvm_expand(ctx, scalar, tsh) : scalar;
+                        ? thvm_expand(ctx, sten, tsh) : sten;
                     ctx->itrs++;
                     RETURN_REDUCED(out);
                 }

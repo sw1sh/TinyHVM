@@ -12,8 +12,8 @@ digraph G {
   n11 -> ctr8 [label="c0"];
   n17 -> ctr8 [label="c1"];
   n19 [label="EXPAND\n[3]\n@19", shape=box, fillcolor="#fff3cd"];
-  num19_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num19_0 -> n19 [label="in"];
-  t2 [label="t2\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t2 -> n19 [label="shape",taillabel="@20",labelfontsize=7,fontcolor="#666666"];
+  t2 [label="t2\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n19 [label="in",taillabel="@19",labelfontsize=7,fontcolor="#666666"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n19 [label="shape",taillabel="@20",labelfontsize=7,fontcolor="#666666"];
 }

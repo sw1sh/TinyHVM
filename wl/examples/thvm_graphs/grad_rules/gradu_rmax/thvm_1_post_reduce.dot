@@ -25,10 +25,10 @@ digraph G {
   n22 -> n24 [label="a"];
   t1 -> n24 [label="b",taillabel="@25",labelfontsize=7,fontcolor="#666666"];
   n30 [label="EXPAND\n[4]\n@30", shape=box, fillcolor="#fff3cd"];
-  num30_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num30_0 -> n30 [label="in"];
-  t4 [label="t4\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t4 -> n30 [label="shape",taillabel="@31",labelfontsize=7,fontcolor="#666666"];
+  t4 [label="t4\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 -> n30 [label="in",taillabel="@30",labelfontsize=7,fontcolor="#666666"];
+  t5 [label="t5\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t5 -> n30 [label="shape",taillabel="@31",labelfontsize=7,fontcolor="#666666"];
   n26 [label="SUB\n[4]\n@26", shape=box, fillcolor="#cce5ff"];
   num26_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
   num26_0 -> n26 [label="a"];

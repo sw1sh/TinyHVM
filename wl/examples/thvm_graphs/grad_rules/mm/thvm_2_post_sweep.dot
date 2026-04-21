@@ -77,13 +77,13 @@ digraph G {
   t13 [label="t13\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
   t13 -> n69 [label="axes",taillabel="@70",labelfontsize=7,fontcolor="#666666"];
   n81 [label="EXPAND\n[2,3]\n@81", shape=box, fillcolor="#fff3cd"];
-  num81_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num81_0 -> n81 [label="in"];
-  t17 [label="t17\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t17 -> n81 [label="shape",taillabel="@82",labelfontsize=7,fontcolor="#666666"];
-  n83 [label="EXPAND\n[2,3]\n@83", shape=box, fillcolor="#fff3cd"];
-  num83_0 [label="0",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num83_0 -> n83 [label="in"];
+  t17 [label="t17\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t17 -> n81 [label="in",taillabel="@81",labelfontsize=7,fontcolor="#666666"];
   t18 [label="t18\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t18 -> n83 [label="shape",taillabel="@84",labelfontsize=7,fontcolor="#666666"];
+  t18 -> n81 [label="shape",taillabel="@82",labelfontsize=7,fontcolor="#666666"];
+  n83 [label="EXPAND\n[2,3]\n@83", shape=box, fillcolor="#fff3cd"];
+  t19 [label="t19\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t19 -> n83 [label="in",taillabel="@83",labelfontsize=7,fontcolor="#666666"];
+  t20 [label="t20\n[2]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t20 -> n83 [label="shape",taillabel="@84",labelfontsize=7,fontcolor="#666666"];
 }

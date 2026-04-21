@@ -19,8 +19,8 @@ digraph G {
   n21 [label="EXP\n[3]\n@21", shape=box, fillcolor="#cce5ff"];
   n14 -> n21 [label=""];
   n29 [label="EXPAND\n[3]\n@29", shape=box, fillcolor="#fff3cd"];
-  num29_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num29_0 -> n29 [label="in"];
-  t2 [label="t2\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t2 -> n29 [label="shape",taillabel="@30",labelfontsize=7,fontcolor="#666666"];
+  t2 [label="t2\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n29 [label="in",taillabel="@29",labelfontsize=7,fontcolor="#666666"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n29 [label="shape",taillabel="@30",labelfontsize=7,fontcolor="#666666"];
 }

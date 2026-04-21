@@ -20,8 +20,8 @@ digraph G {
   n21 [label="EXP\n[3]\n@21", shape=box, fillcolor="#cce5ff"];
   n14 -> n21 [label=""];
   n30 [label="EXPAND\n[3]\n@30", shape=box, fillcolor="#fff3cd"];
-  num30_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num30_0 -> n30 [label="in"];
-  t2 [label="t2\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t2 -> n30 [label="shape",taillabel="@31",labelfontsize=7,fontcolor="#666666"];
+  t2 [label="t2\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n30 [label="in",taillabel="@30",labelfontsize=7,fontcolor="#666666"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n30 [label="shape",taillabel="@31",labelfontsize=7,fontcolor="#666666"];
 }

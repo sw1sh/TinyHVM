@@ -15,10 +15,10 @@ digraph G {
   n18 [label="SQRT\n[3]\n@18", shape=box, fillcolor="#cce5ff"];
   t1 -> n18 [label="",taillabel="@18",labelfontsize=7,fontcolor="#666666"];
   n24 [label="EXPAND\n[3]\n@24", shape=box, fillcolor="#fff3cd"];
-  num24_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num24_0 -> n24 [label="in"];
-  t2 [label="t2\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t2 -> n24 [label="shape",taillabel="@25",labelfontsize=7,fontcolor="#666666"];
+  t2 [label="t2\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t2 -> n24 [label="in",taillabel="@24",labelfontsize=7,fontcolor="#666666"];
+  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n24 [label="shape",taillabel="@25",labelfontsize=7,fontcolor="#666666"];
   n20 [label="MUL\n[3]\n@20", shape=box, fillcolor="#cce5ff"];
   num20_0 [label="2",shape=triangle,fillcolor="#fff2cc",fontsize=8];
   num20_0 -> n20 [label="a"];

@@ -1702,6 +1702,32 @@ static int test_gradu_poly(void) {
     return report("gradu_poly", ok);
 }
 
+// E2E: MUL of a broadcast-expanded scalar with a full tensor.
+// MUL(EXPAND([1]=1, [3]), w=[10,20,30]) → [10,20,30].
+static int test_e2e_mul_broadcast(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 od[] = {1.0f}, wd[] = {10, 20, 30};
+    Term one = thvm_tensor(ctx, od, SHAPE(1));
+    Term exp_one = thvm_expand(ctx, one, SHAPE(3));
+    Term w = thvm_tensor(ctx, wd, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_MUL, exp_one, w);
+    Term r = thvm_eval(ctx, y);
+    f32 *h = thvm_to_host(ctx, r);
+    int ok = (h != NULL);
+    if (h) {
+        f32 expect[] = {10, 20, 30};
+        for (int i = 0; i < 3; i++) {
+            if (h[i] != expect[i]) {
+                fprintf(stderr, "  e2e_mul_broadcast: h[%d]=%g expect=%g\n",
+                        i, h[i], expect[i]);
+                ok = 0;
+            }
+        }
+    }
+    thvm_free(ctx);
+    return report("e2e_mul_broadcast", ok);
+}
+
 // E2E: verify EXPAND broadcast from [1] to [3].  Uses a shape-[1] TEN
 // input so it's a real broadcast.
 static int test_e2e_expand_scalar(void) {
@@ -1893,6 +1919,7 @@ int main(void) {
     fails += test_gradu_poly();
     fails += test_e2e_mul_baseline();
     fails += test_e2e_expand_scalar();
+    fails += test_e2e_mul_broadcast();
     fails += test_gradu_mul_e2e();
     fails += test_gradu_dot_e2e();
     // test_gradu_lambda() deferred — thvm_lam requires two-step

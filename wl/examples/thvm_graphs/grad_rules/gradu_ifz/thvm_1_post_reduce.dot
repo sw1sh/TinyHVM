@@ -4,10 +4,10 @@ digraph G {
   edge [fontsize=8, fontname="Helvetica"];
 
   n26 [label="EXPAND\n[3]\n@26", shape=box, fillcolor="#fff3cd"];
-  num26_0 [label="1",shape=triangle,fillcolor="#fff2cc",fontsize=8];
-  num26_0 -> n26 [label="in"];
-  t3 [label="t3\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
-  t3 -> n26 [label="shape",taillabel="@27",labelfontsize=7,fontcolor="#666666"];
+  t3 [label="t3\n[1]\nf32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t3 -> n26 [label="in",taillabel="@26",labelfontsize=7,fontcolor="#666666"];
+  t4 [label="t4\n[1]\ni32 cpu",shape=box,fillcolor="#e0e0e0"];
+  t4 -> n26 [label="shape",taillabel="@27",labelfontsize=7,fontcolor="#666666"];
   n17 [label="LAM\n#0@17", shape=triangle, fillcolor="#f2e8ff"];
   n17 -> n17 [label="body"];
   ctr11 [label="CTR\nN=2", shape=hexagon, fillcolor="#f3f3f3", fontsize=9];

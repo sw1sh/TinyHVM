@@ -2710,10 +2710,8 @@ static int test_e2e_jvp_elementwise(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1,2,3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
-    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
-    Term xa0, xa1; thvm_dup(ctx, thvm_fresh_label(ctx), xa, &xa0, &xa1);
-    Term y = thvm_op(ctx, UOP_MUL, xa0, xa1);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_fwd(ctx, y, xt)));
+    Term y = thvm_op(ctx, UOP_MUL, x, x);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_fwd(ctx, y, x)));
     f32 expect[] = {2,4,6};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) if (h[i] != expect[i]) {
@@ -2730,11 +2728,9 @@ static int test_e2e_vjp_sum_of_square(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1,2,3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
-    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
-    Term xa0, xa1; thvm_dup(ctx, thvm_fresh_label(ctx), xa, &xa0, &xa1);
-    Term sq = thvm_op(ctx, UOP_MUL, xa0, xa1);
+    Term sq = thvm_op(ctx, UOP_MUL, x, x);
     Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, xt)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, x)));
     f32 expect[] = {2,4,6};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) if (h[i] != expect[i]) {
@@ -2753,11 +2749,9 @@ static int test_e2e_jvp_sum_of_square(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1,2,3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
-    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
-    Term xa0, xa1; thvm_dup(ctx, thvm_fresh_label(ctx), xa, &xa0, &xa1);
-    Term sq = thvm_op(ctx, UOP_MUL, xa0, xa1);
+    Term sq = thvm_op(ctx, UOP_MUL, x, x);
     Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_fwd(ctx, y, xt)));
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_fwd(ctx, y, x)));
     int ok = (h != NULL) && (h[0] > 11.9f && h[0] < 12.1f);
     if (!ok) fprintf(stderr, "  jvp_sum h=%g want 12\n", h ? h[0] : 0);
     thvm_free(ctx);
@@ -2775,9 +2769,8 @@ static int test_e2e_jvp_mm(void) {
     f32 xd[] = {1,2,3,4,5,6}, wd[] = {1,1,1,1,1,1};
     Term x = thvm_tensor(ctx, xd, SHAPE(2,3));
     Term w = thvm_tensor(ctx, wd, SHAPE(3,2));
-    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
-    Term y = thvm_op_raw(ctx, UOP_MM, xa, w);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_fwd(ctx, y, xt)));
+    Term y = thvm_op_raw(ctx, UOP_MM, x, w);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_fwd(ctx, y, x)));
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 4; i++) {
         f32 d = h[i] - 3.0f; if (d<0) d=-d;

@@ -1828,10 +1828,9 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                          kid, (unsigned long long)val);
                 color = "#ccccff";  // light blue for exec triggers
             } else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) {
-                // Render GRAD as a DUP-shaped pair: principal y (in), two
-                // aux projections fw/bw.  Target is metadata, shown in the
-                // label, not as an operand edge.
-                const char *mode = (ext == UOP_GRAD_FWD) ? "JVP" : "GRAD";
+                // GRAD: one input (y/gy), one output (gy) — rendered
+                // identically for both reverse and forward modes.
+                // Target is metadata in the label, not an operand edge.
                 char tgt_desc[64] = "?";
                 if (val + 1 < ctx->heap_pos) {
                     Term tgt = heap_read(ctx, val + 1);
@@ -1841,8 +1840,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                         snprintf(tgt_desc, sizeof(tgt_desc), "dp@%llu",
                                  (unsigned long long)term_val(tgt));
                 }
-                snprintf(label, sizeof(label), "%s\\nd/d(%s)\\n@%llu",
-                         mode, tgt_desc, (unsigned long long)val);
+                snprintf(label, sizeof(label), "GRAD\\nd/d(%s)\\n@%llu",
+                         tgt_desc, (unsigned long long)val);
                 color = "#e8d0ff"; nshape = "box";
             } else {
                 if (ext == UOP_FUSE) {
@@ -1910,7 +1909,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 else if (ext == UOP_FUSE) elbl = "in";
                 else if (ext >= UOP_RESHAPE && ext <= UOP_PAD) elbl = ai==0 ? "in" : "shape";
                 else if (ext == UOP_SUM || ext == UOP_RMAX) elbl = ai==0 ? "in" : "axes";
-                else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) elbl = "y";
+                else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) elbl = "gy";
                 else if (ext == UOP_DETACH) elbl = "in";
                 else if (is_binary(ext)) elbl = ai==0 ? "a" : "b";
                 int rev = 0;
@@ -2083,8 +2082,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 Term _self = term_new(TAG_TOP, ext, val);
                 if (!TERM_HAS_PARENT_REF(_self) && !TERM_IS_DEF_ROOT(_self) && !REF_TARGETS_LOC(val)) {
                     const char *out_lbl =
-                        (ext == UOP_GRAD)     ? "bw" :
-                        (ext == UOP_GRAD_FWD) ? "fw" : "out";
+                        (ext == UOP_GRAD || ext == UOP_GRAD_FWD) ? "gy" : "out";
                     EMIT_FREE_PORT(val, 1000u);
                     fprintf(f, "  n%llu -> free%llu_%u [label=\"%s\"];\n",
                             (unsigned long long)val, (unsigned long long)val, 1000u, out_lbl);

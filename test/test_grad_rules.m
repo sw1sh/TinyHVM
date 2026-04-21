@@ -170,6 +170,25 @@ static int test_expand(void) {
     return report("expand", ok);
 }
 
+static int test_mm(void) {
+    setup_graph_dir("mm");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6};
+    f32 bd[] = {1,2,3,4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(2, 3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3, 2));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_mm(ctx, a, b);
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    // thvm_mm decomposes into RESHAPE/EXPAND/MUL/SUM primitives.
+    const char *pre[]  = {"GRAD", "CTR", "MUL"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("mm", 0, pre, 3)
+          && topo_check("mm", 1, post, 1);
+    return report("mm", ok);
+}
+
 static int test_permute(void) {
     setup_graph_dir("permute");
     TinyHVM *ctx = thvm_init("cpu");
@@ -221,6 +240,7 @@ int main(void) {
     fails += test_reshape();
     fails += test_expand();
     fails += test_permute();
+    fails += test_mm();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

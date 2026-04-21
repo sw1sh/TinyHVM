@@ -831,6 +831,24 @@ era_continue:
                     GRAD_STATE_RETURN(fwd, bwd);
                 }
 
+                // MM: Leibniz same shape as MUL — emit
+                // fwd = MM(fa, fb),  bwd = MM(da, fb') + MM(fa', db).
+                if (uop == UOP_MM) {
+                    Term a = heap_read(ctx, yloc + 0);
+                    Term b = heap_read(ctx, yloc + 1);
+                    Term a_fwd, a_bwd, b_fwd, b_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    thvm_grad_pair(ctx, target_tid, b, &b_fwd, &b_bwd);
+                    Term af0, af1, bf0, bf1;
+                    thvm_dup(ctx, thvm_fresh_label(ctx), a_fwd, &af0, &af1);
+                    thvm_dup(ctx, thvm_fresh_label(ctx), b_fwd, &bf0, &bf1);
+                    Term fwd = thvm_op_raw(ctx, UOP_MM, af0, bf0);
+                    Term l = thvm_op_raw(ctx, UOP_MM, a_bwd, bf1);
+                    Term r = thvm_op_raw(ctx, UOP_MM, af1, b_bwd);
+                    Term bwd = thvm_op_raw(ctx, UOP_ADD, l, r);
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
                 // Unary NEG: d(-a) = -da. No operand reuse.
                 if (uop == UOP_NEG) {
                     Term a = heap_read(ctx, yloc + 0);

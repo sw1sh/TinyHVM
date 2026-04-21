@@ -77,6 +77,23 @@ void thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1) {
     *out1 = term_new(TAG_DP1, label, loc);
 }
 
+// GRAD as a DUP-shaped combinator: single heap cell holding y (the body),
+// two aux projections — forward (TAG_GF) and backward (TAG_GB) — both
+// referencing the cell. Analogous to DUP's DP0/DP1 pair.
+//
+//     (x, dx) = GRAD(y)
+//
+// `label` encodes the target identity (same role as DUP label: projections
+// with matching labels interact with each other's substitution; target
+// metadata is carried by the label or a side table).
+void thvm_grad_pair(TinyHVM *ctx, u32 label, Term y,
+                    Term *out_fwd, Term *out_bwd) {
+    u64 loc = heap_alloc(ctx, 1);
+    heap_set(ctx, loc, y);
+    *out_fwd = term_new(TAG_GF, label, loc);
+    *out_bwd = term_new(TAG_GB, label, loc);
+}
+
 // Allocate a fresh label (monotonic counter). Only call at search-space construction
 // time — interaction rules propagate existing labels, never create fresh ones.
 u32 thvm_fresh_label(TinyHVM *ctx) {

@@ -97,7 +97,18 @@ typedef u64 Term;
 #define TAG_SEQ  25  // SEQ(a, b): strict on a, discard result, return b. Heap: [a, b].
 #define TAG_ALO  26  // Lazy allocation wrapper for static/book terms. Heap: [book_term, state_id].
 
-#define TAG_COUNT 27
+// Jacobian pair projections — GRAD works like DUP.
+// Construction:  (x, dx) = GRAD_PAIR(y, target)
+//   - heap_alloc(1); heap[loc] = y
+//   - x  = term_new(TAG_GF, target_label, loc)
+//   - dx = term_new(TAG_GB, target_label, loc)
+// Interaction:  when either aux is consumed by a principal, the rule reads
+// body y, produces the forward or backward projection, and substitutes the
+// sibling via the HVM4 SUB-bit mechanism (same shape as DP0/DP1).
+#define TAG_GF   27  // Jacobian forward projection:  (x, _)  = GRAD(y)
+#define TAG_GB   28  // Jacobian backward projection: (_, dx) = GRAD(y)
+
+#define TAG_COUNT 29
 
 // ============================================================
 // UOps — Minimal tensor operations (tinygrad-inspired)
@@ -1337,6 +1348,7 @@ Term     thvm_ref(TinyHVM *ctx, u32 name);                   // TAG_REF(name)
 Term     thvm_book_from_dynamic(TinyHVM *ctx, Term body);    // internal: freeze dynamic term into static/book heap
 Term     thvm_sup(TinyHVM *ctx, u32 label, Term a, Term b);   // TAG_SUP with label
 void     thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1); // DUP with label
+void     thvm_grad_pair(TinyHVM *ctx, u32 label, Term y, Term *out_fwd, Term *out_bwd); // (x, dx) = GRAD(y)
 u32      thvm_fresh_label(TinyHVM *ctx);                     // allocate next label
 
 // ICC: Bridge + Annotation

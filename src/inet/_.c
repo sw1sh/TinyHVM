@@ -133,37 +133,6 @@ void thvm_grad_pair_target(TinyHVM *ctx, Term target, Term y,
 // each slot is the bwd of GRAD(y, targets[i]). Caller reads via
 // thvm_grad_bundle_get (CTR child access). y is DUP'd n_params-1 times so
 // each target's GRAD gets its own copy.
-/* Walk DP chains and VAR bindings to find the underlying TEN id.
- * Callers often pass DUP projections (DP0/DP1) of tensors as targets
- * so the target term stays linear through forward + grad. Return ~0u
- * if the target isn't actually a TEN. */
-static u32 resolve_target_tid(TinyHVM *ctx, Term t) {
-    for (int i = 0; i < 32; i++) {
-        u8 tag = term_tag(t);
-        if (tag == TAG_TEN) return (u32)term_val(t);
-        if (tag == TAG_DP0 || tag == TAG_DP1) {
-            u64 l = term_val(t);
-            if (l == 0 || l >= ctx->heap_pos) return ~0u;
-            Term next = heap_read(ctx, l);
-            if (term_is_sub(next)) next = term_strip_sub(next);
-            if (next == t) return ~0u;
-            t = next;
-            continue;
-        }
-        if (tag == TAG_VAR) {
-            u64 l = term_val(t);
-            if (l == 0 || l >= ctx->heap_pos) return ~0u;
-            Term sub = heap_read(ctx, l);
-            if (term_is_sub(sub)) return ~0u;
-            if (sub == t) return ~0u;
-            t = sub;
-            continue;
-        }
-        return ~0u;
-    }
-    return ~0u;
-}
-
 Term thvm_grad_pair_bundle(TinyHVM *ctx, Term y, Term *targets, u32 n_params) {
     if (n_params == 0) return thvm_ctr(ctx, NULL, 0);
     Term *ys = (Term *)malloc((size_t)n_params * sizeof(Term));
@@ -176,9 +145,8 @@ Term thvm_grad_pair_bundle(TinyHVM *ctx, Term y, Term *targets, u32 n_params) {
     }
     Term *bwds = (Term *)malloc((size_t)n_params * sizeof(Term));
     for (u32 i = 0; i < n_params; i++) {
-        u32 tid = resolve_target_tid(ctx, targets[i]);
         Term fwd, bwd;
-        thvm_grad_pair(ctx, tid, ys[i], &fwd, &bwd);
+        thvm_grad_pair_target(ctx, targets[i], ys[i], &fwd, &bwd);
         /* Forward port is unused by bundle callers — sink it to an ERA
          * so the chain rule doesn't leak un-consumed fwd wires. */
         thvm_spawn_detached_era(ctx, fwd);

@@ -1333,6 +1333,7 @@ void     thvm_print_term(TinyHVM *ctx, Term t);
 void     thvm_heap_graph(TinyHVM *ctx, Term root,
                          i32 **out_nodes, u32 *out_n_nodes,
                          i32 **out_edges, u32 *out_n_edges);
+char    *thvm_heap_dot_string(TinyHVM *ctx, Term root);
 
 // Autograd
 void     thvm_set_requires_grad(TinyHVM *ctx, Term t);

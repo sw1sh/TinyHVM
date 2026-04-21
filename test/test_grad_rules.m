@@ -2687,6 +2687,7 @@ static int test_e2e_disconnected_target(void) {
 // y = x*x, x=[1,2,3], target=x.   dy/dx = 2x = [2,4,6].
 // VJP: shape [3] = target.shape.   JVP: shape [3] = y.shape.   Both [2,4,6].
 static int test_e2e_jvp_elementwise(void) {
+    setup_graph_dir("jvp_elementwise");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1,2,3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
@@ -2703,11 +2704,33 @@ static int test_e2e_jvp_elementwise(void) {
     return report("e2e_jvp_elementwise", ok);
 }
 
+// VJP counterpart to JVP(sum(x*x)) — same forward, reverse gradient.
+// Emits graph under graphs/grad_rules/vjp_sum_of_square/ for side-by-side viz.
+static int test_e2e_vjp_sum_of_square(void) {
+    setup_graph_dir("vjp_sum_of_square");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term xa, xt; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xt);
+    Term xa0, xa1; thvm_dup(ctx, thvm_fresh_label(ctx), xa, &xa0, &xa1);
+    Term sq = thvm_op(ctx, UOP_MUL, xa0, xa1);
+    Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, xt)));
+    f32 expect[] = {2,4,6};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) if (h[i] != expect[i]) {
+        fprintf(stderr, "  vjp_sum h[%d]=%g want %g\n", i, h[i], expect[i]); ok=0;
+    }
+    thvm_free(ctx);
+    return report("e2e_vjp_sum_of_square", ok);
+}
+
 // Non-diagonal: SUM — shapes diverge.
 // y = sum(x*x), x=[1,2,3].
 // VJP:  shape [3] (target.shape), value 2x = [2,4,6].
 // JVP:  shape [1] (y.shape=scalar), value sum(2x · 1) = 12.
 static int test_e2e_jvp_sum_of_square(void) {
+    setup_graph_dir("jvp_sum_of_square");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1,2,3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
@@ -2728,6 +2751,7 @@ static int test_e2e_jvp_sum_of_square(void) {
 // JVP:  grad_fwd(y, x) shape [2,2] = y.shape.
 //       = JVP(x,x)@w + x@JVP(w,x) = I(shape x)@w + 0 = ones(2,3)@ones(3,2) = 3·ones(2,2).
 static int test_e2e_jvp_mm(void) {
+    setup_graph_dir("jvp_mm");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1,2,3,4,5,6}, wd[] = {1,1,1,1,1,1};
     Term x = thvm_tensor(ctx, xd, SHAPE(2,3));
@@ -2874,6 +2898,7 @@ int main(void) {
     fails += test_e2e_div_chain();
     fails += test_e2e_disconnected_target();
     fails += test_e2e_jvp_elementwise();
+    fails += test_e2e_vjp_sum_of_square();
     fails += test_e2e_jvp_sum_of_square();
     fails += test_e2e_jvp_mm();
 

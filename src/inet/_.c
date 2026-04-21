@@ -155,12 +155,7 @@ Term thvm_grad_pair_bundle(TinyHVM *ctx, Term y, Term *targets, u32 n_params) {
     }
     Term *bwds = (Term *)malloc((size_t)n_params * sizeof(Term));
     for (u32 i = 0; i < n_params; i++) {
-        Term fwd, bwd;
-        thvm_grad_pair_target(ctx, targets[i], ys[i], &fwd, &bwd);
-        /* Forward port is unused by bundle callers — sink it to an ERA
-         * so the chain rule doesn't leak un-consumed fwd wires. */
-        thvm_spawn_detached_era(ctx, fwd);
-        bwds[i] = bwd;
+        bwds[i] = thvm_grad_u(ctx, ys[i], targets[i]);
     }
     Term bundle = thvm_ctr(ctx, bwds, (u8)n_params);
     free(ys);

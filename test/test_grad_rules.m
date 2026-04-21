@@ -1247,6 +1247,29 @@ static int test_gradu_l2_normalize(void) {
     return report("gradu_l2_normalize", ok);
 }
 
+// UOP_GRAD2: PERMUTE + SUM composition.  y = sum(permute(x, [1,0])).
+// Backward threads SUM-expand then PERMUTE-inverse.
+static int test_gradu_permute_sum(void) {
+    setup_graph_dir("gradu_permute_sum");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3,4,5,6};
+    Term x = thvm_tensor(ctx, xd, SHAPE(2, 3));
+    thvm_set_requires_grad(ctx, x);
+    u32 perm[] = {1, 0};
+    Term p = thvm_permute(ctx, x, perm, 2);
+    Term y = thvm_sum_axes(ctx, p, (u32[]){0, 1}, 2);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, x)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "SUM", "PERMUTE"};
+    const char *post[] = {"CTR", "SUM", "EXPAND", "PERMUTE"};
+    int ok = topo_check("gradu_permute_sum", 0, pre, 4)
+          && topo_check("gradu_permute_sum", 1, post, 4);
+    return report("gradu_permute_sum", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1315,6 +1338,7 @@ int main(void) {
     fails += test_gradu_mlp_like();
     fails += test_gradu_logsumexp();
     fails += test_gradu_l2_normalize();
+    fails += test_gradu_permute_sum();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

@@ -2297,6 +2297,60 @@ static int test_e2e_recursive_sgd(void) {
     return report("e2e_recursive_sgd", ok);
 }
 
+// 2-layer MLP bwd (elementwise only, no MM).
+// For x=[1,2,3], w1=[0.1,0.2,0.3], b1=0, w2=[1,1,1], b2=0:
+// z=x*w1=[0.1,0.4,0.9]>0 so relu'=1, dy/dw1 = w2*x = [1,2,3].
+static int test_e2e_mlp_bwd(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[]={1,2,3}, w1d[]={0.1f,0.2f,0.3f}, b1d[]={0,0,0}, w2d[]={1,1,1}, b2d[]={0,0,0};
+    Term x  = thvm_tensor(ctx, xd, SHAPE(3));
+    Term w1 = thvm_tensor(ctx, w1d, SHAPE(3));
+    Term b1 = thvm_tensor(ctx, b1d, SHAPE(3));
+    Term w2 = thvm_tensor(ctx, w2d, SHAPE(3));
+    Term b2 = thvm_tensor(ctx, b2d, SHAPE(3));
+    Term z  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MUL, x, w1), b1);
+    Term h  = thvm_op(ctx, UOP_RELU, z, term_era());
+    Term y  = thvm_op(ctx, UOP_ADD, thvm_op(ctx, UOP_MUL, h, w2), b2);
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, w1)));
+    f32 expect[] = {1, 2, 3};
+    int ok = (g != NULL);
+    if (g) for (int i = 0; i < 3; i++) {
+        f32 d = g[i]-expect[i]; if (d<0) d=-d;
+        if (d > 1e-3f) { fprintf(stderr,"  mlp_bwd g[%d]=%g e=%g\n", i, g[i], expect[i]); ok=0; }
+    }
+    thvm_free(ctx);
+    return report("e2e_mlp_bwd", ok);
+}
+
+// Adam optimizer step (host-driven).  Single param w=[2.0], loss=0.5*w^2.
+static int test_e2e_adam(void) {
+    f32 w = 2.0f, m = 0.0f, v = 0.0f;
+    f32 lr = 0.1f, b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+    for (int t = 1; t <= 20; t++) {
+        TinyHVM *ctx = thvm_init("cpu");
+        Term wt = thvm_tensor(ctx, &w, SHAPE(1));
+        Term w0, w1v;
+        thvm_dup(ctx, thvm_fresh_label(ctx), wt, &w0, &w1v);
+        Term w0a, w0b;
+        thvm_dup(ctx, thvm_fresh_label(ctx), w0, &w0a, &w0b);
+        f32 hv = 0.5f;
+        Term half = thvm_tensor(ctx, &hv, SHAPE(1));
+        Term loss = thvm_op(ctx, UOP_MUL, half, thvm_op(ctx, UOP_MUL, w0a, w0b));
+        f32 *gh = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, loss, w1v)));
+        if (!gh) { thvm_free(ctx); return report("e2e_adam", 0); }
+        f32 grad = gh[0];
+        m = b1*m + (1-b1)*grad;
+        v = b2*v + (1-b2)*grad*grad;
+        f32 mh = m / (1 - powf(b1, (f32)t));
+        f32 vh = v / (1 - powf(b2, (f32)t));
+        w = w - lr * mh / (sqrtf(vh) + eps);
+        thvm_free(ctx);
+    }
+    int ok = (w < 1.5f && w > -1.5f);
+    if (!ok) fprintf(stderr, "  adam final w=%g (expected |w|<1.5)\n", w);
+    return report("e2e_adam", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -2411,6 +2465,8 @@ int main(void) {
     fails += test_e2e_softmax();
     fails += test_e2e_sgd_loop();
     // fails += test_e2e_recursive_sgd();  // FIXME: IFZ+REF+ASSIGN integration readback NULL
+    fails += test_e2e_mlp_bwd();
+    fails += test_e2e_adam();
 
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);

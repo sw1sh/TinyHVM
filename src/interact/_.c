@@ -1232,18 +1232,34 @@ inet_step:
                             const View *av = st_get(term_val(a));
                             if (av) a_shape = av->shape;
                         }
-                        Term da = thvm_grad_u(ctx, a, tgt);
-                        Term out = da;
+                        // SHRINK shape-preserving bwd.  For target == a (leaf
+                        // identity), emit PAD(ones(y_shape), pad_pairs) directly
+                        // so the output has target.shape with mask (=1 in kept
+                        // region, 0 in padded).  Recursion via thvm_grad_u(a,t)
+                        // returns target.shape (not y.shape), so we'd over-pad.
+                        Term out;
                         if (term_tag(shape) == TAG_TEN && a_shape.rank > 0) {
                             u32 sid = (u32)term_val(shape);
                             u32 nd = a_shape.rank;
                             u32 sf[MAX_DIM * 2]; tensor_meta_read_u32(ctx, sid, sf, MAX_DIM * 2);
+                            // y_shape = shrink output shape
+                            Shape ys = {.rank = nd};
+                            for (u32 j = 0; j < nd; j++) ys.dims[j] = sf[j*2+1] - sf[j*2];
+                            // Build rank-matched ones(y_shape) tensor
+                            Shape one_sh = {.rank = nd};
+                            for (u32 j = 0; j < nd; j++) one_sh.dims[j] = 1;
+                            f32 one_val = 1.0f;
+                            Term one_ten = thvm_tensor(ctx, &one_val, one_sh);
+                            Term y_ones = thvm_expand(ctx, one_ten, ys);
+                            // Pad back to target shape using complementary pairs.
                             u32 pp[MAX_DIM * 2];
                             for (u32 j = 0; j < nd; j++) {
                                 pp[j*2]   = sf[j*2];
                                 pp[j*2+1] = a_shape.dims[j] - sf[j*2+1];
                             }
-                            out = thvm_pad(ctx, da, pp, nd);
+                            out = thvm_pad(ctx, y_ones, pp, nd);
+                        } else {
+                            out = thvm_grad_u(ctx, a, tgt);
                         }
                         ctx->itrs++; RETURN_REDUCED(out);
                     }

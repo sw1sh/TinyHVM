@@ -1046,6 +1046,16 @@ inet_step:
                                   ((_tsh).rank == 1 && (_tsh).dims[0] == 1); \
                     _scalar ? _t : thvm_expand(ctx, _t, (_tsh));        \
                 })
+                // Emit ones tensor of the given shape (rank-matched ones-shape TEN
+                // then EXPAND).  Used by view-op direct-emit bwd.
+                #define GRAD2_ONES_OF(_shape) ({                         \
+                    Shape _os = {.rank = (_shape).rank};                 \
+                    for (u32 _i = 0; _i < (_shape).rank; _i++) _os.dims[_i] = 1; \
+                    if (_os.rank == 0) { _os.rank = 1; _os.dims[0] = 1; } \
+                    f32 _v = 1.0f;                                       \
+                    Term _t = thvm_tensor(ctx, &_v, _os);                \
+                    ((_shape).rank == 0) ? _t : thvm_expand(ctx, _t, (_shape)); \
+                })
                 // NUM constant: d(const)/dt = 0 of target-shape.
                 if (term_tag(y) == TAG_NUM && term_tag(tgt) == TAG_TEN) {
                     u32 ttid = (u32)term_val(tgt);
@@ -1244,12 +1254,7 @@ inet_step:
                             // y_shape = shrink output shape
                             Shape ys = {.rank = nd};
                             for (u32 j = 0; j < nd; j++) ys.dims[j] = sf[j*2+1] - sf[j*2];
-                            // Build rank-matched ones(y_shape) tensor
-                            Shape one_sh = {.rank = nd};
-                            for (u32 j = 0; j < nd; j++) one_sh.dims[j] = 1;
-                            f32 one_val = 1.0f;
-                            Term one_ten = thvm_tensor(ctx, &one_val, one_sh);
-                            Term y_ones = thvm_expand(ctx, one_ten, ys);
+                            Term y_ones = GRAD2_ONES_OF(ys);
                             // Pad back to target shape using complementary pairs.
                             u32 pp[MAX_DIM * 2];
                             for (u32 j = 0; j < nd; j++) {
@@ -1283,11 +1288,7 @@ inet_step:
                             u32 pid = (u32)term_val(shape);
                             u32 nd = a_shape.rank;
                             u32 pf[MAX_DIM * 2]; tensor_meta_read_u32(ctx, pid, pf, MAX_DIM * 2);
-                            Shape one_sh = {.rank = y_shape.rank};
-                            for (u32 j = 0; j < y_shape.rank; j++) one_sh.dims[j] = 1;
-                            f32 one_v = 1.0f;
-                            Term one_ten = thvm_tensor(ctx, &one_v, one_sh);
-                            Term y_ones = thvm_expand(ctx, one_ten, y_shape);
+                            Term y_ones = GRAD2_ONES_OF(y_shape);
                             u32 sp[MAX_DIM * 2];
                             for (u32 j = 0; j < nd; j++) {
                                 sp[j*2]   = pf[j*2];
@@ -1310,13 +1311,7 @@ inet_step:
                         u32 ttid = (u32)term_val(tgt);
                         Shape tsh = (ttid < ctx->tensor_count)
                             ? ctx->tensors[ttid].view.shape : SHAPE(1);
-                        // Build rank-matched ones(y_shape).
-                        Shape one_sh = {.rank = y_shape.rank};
-                        for (u32 i = 0; i < y_shape.rank; i++) one_sh.dims[i] = 1;
-                        if (one_sh.rank == 0) { one_sh.rank = 1; one_sh.dims[0] = 1; }
-                        f32 one_v = 1.0f;
-                        Term one_ten = thvm_tensor(ctx, &one_v, one_sh);
-                        Term y_ones = (y_shape.rank != 0) ? thvm_expand(ctx, one_ten, y_shape) : one_ten;
+                        Term y_ones = GRAD2_ONES_OF(y_shape);
                         Term out = (y_shape.rank != 0 && tsh.rank != 0)
                             ? sum_to_shape(ctx, y_ones, y_shape, tsh) : y_ones;
                         ctx->itrs++; RETURN_REDUCED(out);

@@ -135,7 +135,7 @@ static inline int reduce_fuse_payload_ready(TinyHVM *ctx, Term t) {
 }
 
 static inline int reduce_top_direct_uop(u32 uop) {
-    return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_IFZ ||
+    return uop == UOP_ASSIGN || uop == UOP_GRAD || uop == UOP_GRAD2 || uop == UOP_IFZ ||
            uop == UOP_LOG_PRINT || uop == UOP_TODEVICE || uop == UOP_CAST ||
            uop == UOP_DETACH ||
            uop == UOP_WHERE ||

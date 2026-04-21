@@ -451,7 +451,8 @@ static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 de
                                    uop == UOP_ASSIGN || uop == UOP_DETACH ||
                                    uop == UOP_FUSE ||
                                    uop == UOP_IFZ || uop == UOP_WHERE ||
-                                   uop == UOP_GRAD || uop == UOP_LOG_PRINT ||
+                                   uop == UOP_GRAD || uop == UOP_GRAD2 ||
+                                   uop == UOP_LOG_PRINT ||
                                    uop == UOP_TODEVICE);
                 if (maybe_force) {
                     next = (uop == UOP_EXEC) ? thvm_eval_exec_fixed_point(ctx, t)
@@ -461,7 +462,7 @@ static int thvm_kernel_normalize_compute(TinyHVM *ctx, Term t, Term *out, u32 de
                         continue;
                     }
                 }
-                if (uop != UOP_FUSE && uop != UOP_GRAD &&
+                if (uop != UOP_FUSE && uop != UOP_GRAD && uop != UOP_GRAD2 &&
                     uop != UOP_EXEC && uop != UOP_KERNEL &&
                     uop != UOP_ASSIGN && uop != UOP_DETACH &&
                     uop != UOP_IFZ && uop != UOP_WHERE &&

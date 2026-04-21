@@ -579,9 +579,7 @@ int main(void) {
     fails += test_nested_unary();
     fails += test_identity();
     fails += test_sum_multi_axis();
-    // test_gradu_identity() disabled — UOP_GRAD2 rule not yet plumbed into
-    // the trampoline's TOP enter-paths (src/interact/_.c:454, 464, 845).
-    // Re-enable once trampoline gating lands.
+    fails += test_gradu_identity();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

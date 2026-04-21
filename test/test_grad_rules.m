@@ -2310,7 +2310,7 @@ int main(void) {
     fails += test_e2e_grad_pad();
     fails += test_e2e_grad_expand();
     fails += test_e2e_mse_grad();
-    // fails += test_e2e_conv_like();  // pad+mul+sum composition bwd needs shape rework
+    // fails += test_e2e_conv_like();  // MUL Leibniz shape-mismatch when operand is PAD'd
     fails += test_e2e_softmax();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);

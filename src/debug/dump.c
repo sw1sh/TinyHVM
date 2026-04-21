@@ -915,6 +915,8 @@ static u32 dot_term_arity(TinyHVM *ctx, Term t) {
             return ext;
         case TAG_DP0:
         case TAG_DP1:
+        case TAG_GF:
+        case TAG_GB:
         case TAG_UDP:
         case TAG_ERA:
         case TAG_VAR:
@@ -1366,6 +1368,37 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         } \
     } while(0)
     #define EMIT_DUP_STUB(dloc) EMIT_DUP_CHAIN(dloc)
+
+    // EMIT_GRAD_CELL: render a GRAD cell (the heap slot holding y for a
+    // (x,dx) = GRAD(y) pair). Drawn as an upside-down triangle with fwd
+    // and bwd aux ports. Idempotent: first caller emits the node + fwd+bwd
+    // free-port stubs if they have no visible consumer; subsequent callers
+    // just wire their edge.
+    #define EMIT_GRAD_CELL(gloc) do { \
+        u64 _gcur = (gloc); \
+        if (_gcur > 0 && _gcur < ctx->heap_pos) { \
+            if (!NODE_SEEN(_gcur + 0x200000)) { \
+                NODE_MARK(_gcur + 0x200000); \
+                fprintf(f, "  grad%llu [label=\"GRAD\\n@%llu\", shape=invtriangle, fillcolor=\"#e8d0ff\"];\n", \
+                        (unsigned long long)_gcur, (unsigned long long)_gcur); \
+                /* Wire body (y) INTO the cell — the principal port. */ \
+                Term _gy = heap_read(ctx, _gcur); \
+                u8 _gyt = term_tag(_gy); \
+                if (_gyt == TAG_TOP) \
+                    fprintf(f, "  n%llu -> grad%llu [label=\"y\",color=\"#cc0000\",penwidth=2.0];\n", \
+                            (unsigned long long)term_val(_gy), (unsigned long long)_gcur); \
+                else if (_gyt == TAG_TEN) { \
+                    EMIT_TEN((u32)term_val(_gy)); \
+                    fprintf(f, "  t%u -> grad%llu [label=\"y\",color=\"#cc0000\",penwidth=2.0];\n", \
+                            (u32)term_val(_gy), (unsigned long long)_gcur); \
+                } else if (_gyt == TAG_CTR) { \
+                    EMIT_CTR_NODE(term_val(_gy)); \
+                    fprintf(f, "  ctr%llu -> grad%llu [label=\"y\",color=\"#cc0000\",penwidth=2.0];\n", \
+                            (unsigned long long)term_val(_gy), (unsigned long long)_gcur); \
+                } \
+            } \
+        } \
+    } while (0)
     #define ERA_DEDUP_MAX 1024
     u64 era_emitted[ERA_DEDUP_MAX]; u32 n_era_emitted = 0;
     #define ERA_SEEN(v) ({ int _s=0; for(u32 _i=0;_i<n_era_emitted;_i++) \
@@ -1895,6 +1928,14 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     char dp_lbl[64];
                     fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n", dl, val,
                             dot_dp_port_label(dp_lbl, sizeof(dp_lbl), elbl, ctag, cpos));
+                } else if (ctag == TAG_GF || ctag == TAG_GB) {
+                    // (x, dx) = GRAD(y): render the GRAD cell once; emit an
+                    // edge from the cell to this consumer labeled fwd or bwd.
+                    u64 gl = cval;
+                    EMIT_GRAD_CELL(gl);
+                    const char *port = (ctag == TAG_GF) ? "fwd" : "bwd";
+                    fprintf(f, "  grad%llu -> n%llu [label=\"%s\"];\n",
+                            (unsigned long long)gl, (unsigned long long)val, port);
                 } else if (ctag == TAG_TEN) {
                     EMIT_TEN((u32)cval);
                     char slot_attrs[96];
@@ -2212,6 +2253,11 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                         else         fprintf(f, "  dup%llu -> ctr%llu [label=\"%s\"];\n",
                                              (unsigned long long)dl, (unsigned long long)val,
                                              dot_dp_port_label(dp_lbl, sizeof(dp_lbl), clbl, ctag, cpos));
+                    } else if (ctag == TAG_GF || ctag == TAG_GB) {
+                        EMIT_GRAD_CELL(cval);
+                        const char *port = (ctag == TAG_GF) ? "fwd" : "bwd";
+                        fprintf(f, "  grad%llu -> ctr%llu [label=\"%s (%s)\"];\n",
+                                (unsigned long long)cval, (unsigned long long)val, clbl, port);
                     } else if (ctag == TAG_NUM) {
                         f32 fv; u32 bv = (u32)cval; memcpy(&fv, &bv, 4);
                         fprintf(f, "  num_ctr%llu_%llu [label=\"%.4g\",shape=triangle,fillcolor=\"#fff2cc\",fontsize=8];\n",

@@ -559,6 +559,8 @@ static u32 step_term_arity(Term t) {
             return ext;
         case TAG_DP0:
         case TAG_DP1:
+        case TAG_GF:
+        case TAG_GB:
         case TAG_UDP:
         case TAG_ERA:
         case TAG_VAR:

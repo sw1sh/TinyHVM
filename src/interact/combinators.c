@@ -1030,17 +1030,32 @@ era_continue:
                     GRAD_STATE_RETURN(fwd, bwd);
                 }
 
-                // Reduction SUM: d(sum(a)) emits the grad of a's shape.
-                // For first cut, we don't handle the shape broadcast here —
-                // a later pass will add sum_to_shape / expand for general
-                // cases. For leaf-only tests it works out.
+                // Reduction SUM: forward keeps axes; backward expands da
+                // back to a's shape.
+                //   fwd = SUM(a_fwd, axes)
+                //   bwd = EXPAND(a_bwd, a_shape)      (after RESHAPE to
+                //         match a's rank if axes collapsed dims)
                 if (uop == UOP_SUM) {
-                    Term a = heap_read(ctx, yloc + 0);
+                    Term a    = heap_read(ctx, yloc + 0);
+                    Term axes = heap_read(ctx, yloc + 1);
                     Term a_fwd, a_bwd;
                     thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
-                    Term axes = heap_read(ctx, yloc + 1);
                     Term fwd = thvm_op_raw(ctx, UOP_SUM, a_fwd, axes);
-                    Term bwd = a_bwd;
+
+                    Shape a_shape = SHAPE(1);
+                    if (term_tag(a) == TAG_TEN) {
+                        u32 aid = (u32)term_val(a);
+                        if (aid < ctx->tensor_count)
+                            a_shape = ctx->tensors[aid].view.shape;
+                    } else if (term_tag(a) == TAG_TOP) {
+                        const View *av = st_get(term_val(a));
+                        if (av) a_shape = av->shape;
+                    }
+                    Term bwd;
+                    if (a_shape.rank != 0)
+                        bwd = thvm_expand(ctx, a_bwd, a_shape);
+                    else
+                        bwd = a_bwd;
                     GRAD_STATE_RETURN(fwd, bwd);
                 }
             }

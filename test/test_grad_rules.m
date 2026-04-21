@@ -407,6 +407,26 @@ static int test_sum(void) {
     return report("sum", ok);
 }
 
+// y = t1 * t1, d/dt1 = 2*t1 via Leibniz.  Both operands of MUL are the
+// same tensor, so the GRAD pair fires twice on the shared target.
+static int test_self_mul(void) {
+    setup_graph_dir("self_mul");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term a0, a1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+    Term y = thvm_op(ctx, UOP_MUL, a0, a1);
+    thvm_eval(ctx, mk(ctx, y, a));
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "MUL"};
+    const char *post[] = {"CTR", "ADD", "MUL"};
+    int ok = topo_check("self_mul", 0, pre, 3)
+          && topo_check("self_mul", 1, post, 3);
+    return report("self_mul", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -433,6 +453,7 @@ int main(void) {
     fails += test_chained_compute();
     fails += test_second_derivative();
     fails += test_target_nomatch();
+    fails += test_self_mul();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

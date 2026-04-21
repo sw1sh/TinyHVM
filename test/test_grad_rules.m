@@ -2630,10 +2630,10 @@ int main(void) {
     fails += test_e2e_grad_pad();
     fails += test_e2e_grad_expand();
     fails += test_e2e_mse_grad();
-    // fails += test_e2e_conv_like();  // MUL Leibniz shape-mismatch when operand is PAD'd
+    // fails += test_e2e_conv_like();  // BLOCKED: MUL Leibniz fails when a,b shapes != tgt.shape (pad(x)*w); needs reverse-mode MUL VJP with sum_to_shape
     fails += test_e2e_softmax();
     fails += test_e2e_sgd_loop();
-    // fails += test_e2e_recursive_sgd();  // FIXME: IFZ+REF+ASSIGN integration readback NULL
+    // fails += test_e2e_recursive_sgd();  // BLOCKED: in-VM IFZ+REF+APP+ASSIGN+SEQ loop readback NULL; needs pipeline integration work
     fails += test_e2e_mlp_bwd();
     fails += test_e2e_adam();
     fails += test_e2e_maxpool_like();

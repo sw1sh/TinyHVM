@@ -31,11 +31,22 @@ Verified against source:
   the `thvm_step_predict_next_redex` switch ([src/schedule/_.c:917](src/schedule/_.c#L917)),
   and in the "no global cleanup" set ([src/schedule/_.c:512](src/schedule/_.c#L512)).
   Nothing recurses into the body.
+- **Fusion happens by interaction rewriting, not by walking.** `UOP_FUSE` is a
+  propagating agent ([src/interact/tensor_ops.c:340](src/interact/tensor_ops.c#L340)):
+  it passes through atoms, distributes through CTR, wraps ASSIGN's src, and on
+  a compute TAG_TOP calls `thvm_fuse_public_term` ([src/interact/_.c:215](src/interact/_.c#L215))
+  which produces either a growing KERNEL (children still FUSE-wrapped) or a
+  monolithic KERNEL (all children locally ready). No FUSE rule exists for
+  LAM — default is pass-through ([src/interact/tensor_ops.c:431-432](src/interact/tensor_ops.c#L431-L432)).
+- **`fuse_walk_inner` / `fuse_build_kernel` is the lowering pass**, not the
+  fuser ([src/fuse/_.c:1017](src/fuse/_.c#L1017)). It's called from
+  `thvm_kernel_register` ([src/interact/_.c:567](src/interact/_.c#L567)) once
+  a KERNEL DAG has been built by FUSE, flattening it into a `KernelEntry` for
+  codegen. It walks a *clean* DAG of compute TOPs + TEN/NUM leaves — not raw
+  structure with unreduced VARs.
 - **VAR is unbound until beta.** `thvm_lam` writes `term_set_sub(var)` at the
   binder slot ([src/inet/_.c:5](src/inet/_.c#L5)); APP-LAM is the only site
   that overwrites it ([src/interact/combinators.c:53-54](src/interact/combinators.c#L53-L54)).
-- **Fuser bails on unbound VAR.** `fuse_walk_inner` dereferences substituted
-  VARs, but on unbound VAR returns `-1` ([src/fuse/_.c:414-422](src/fuse/_.c#L414-L422)).
 - **No shape on VAR slot.** `term_view(VAR)` reads `st_get(var_loc)`
   ([src/ctx/init.c:182-187](src/ctx/init.c#L182-L187)); nothing writes there
   today, so `thvm_track_top_shape` skips every UOP whose input is the VAR
@@ -44,13 +55,20 @@ Verified against source:
   `{NONE, TENSOR, NUM}` ([src/tinyhvm.h:720-724](src/tinyhvm.h#L720-L724)).
   Leaves are concrete `leaf_ids[i] = tid` or immediates.
 
-Net: LAM bodies with UOPs are fully dormant. There is no representation for
-"the i-th kernel input is a formal parameter of shape S and dtype D".
+Net: LAM bodies with UOPs are fully dormant because **no FUSE rule propagates
+into a LAM**, and even if one did, VARs have no shape and the lowering pass
+has no way to emit a formal-parameter leaf.
 
 ## Design
 
-Two new pieces: **typed binders** (shapes on VARs) and **parametric kernels**
-(a new leaf kind).
+Three pieces, split along the existing fuser-vs-lowering boundary:
+
+1. **Typed binders** — shapes on VARs (affects term construction + ST table).
+2. **New FUSE interaction rules** — FUSE ⊳ LAM and FUSE ⊳ APP(LAM,·) so the
+   existing rewrite-driven fuser can enter a LAM body or absorb an
+   APP(LAM, arg) pre-beta. This is the main architectural change.
+3. **Parametric kernels** — a new `KERNEL_LEAF_PARAM` leaf kind, read only by
+   the lowering pass (`fuse_walk_inner`) when it sees a typed unbound VAR.
 
 ### 1. Typed binders
 
@@ -75,7 +93,67 @@ no regressions.
 `term_view(a)` (including VAR) and `st_get_tracker(var_loc)` via the VAR path
 — so typed binders light up the whole downstream ST composition for free.
 
-### 2. KERNEL_LEAF_PARAM
+### 2. New FUSE interaction rules
+
+#### 2a. FUSE ⊳ APP(LAM, arg) — pre-beta fusion (start here)
+
+Add a case to `UOP_FUSE` in [tensor_ops.c:340+](src/interact/tensor_ops.c#L340)
+that pattern-matches `FUSE(APP(LAM<x,body>, arg))` and, instead of forcing
+beta-then-fuse, substitutes `x ← arg` directly and wraps the result:
+
+```c
+// New case in UOP_FUSE handler, before "Default: pass through"
+if (ptag == TAG_APP) {
+    u64 aloc = term_val(payload);
+    Term fun = heap_read(ctx, aloc + 0);
+    Term arg = heap_read(ctx, aloc + 1);
+    if (term_tag(fun) == TAG_LAM) {
+        u64 lam_loc = term_val(fun);
+        Term body = heap_read(ctx, lam_loc + 1);
+        // substitute x ← arg (overwrite VAR slot, same as APP-LAM body)
+        heap_set(ctx, lam_loc + 0, arg);
+        // re-wrap the substituted body in FUSE and re-reduce
+        u64 fl = heap_alloc(ctx, 1);
+        heap_set(ctx, fl, body);
+        RETURN_REDUCED(term_new(TAG_TOP, UOP_FUSE, fl));
+    }
+}
+```
+
+This is one new rule, ~10 lines. Effect: if a LAM is immediately applied, FUSE
+sees the APP, binds the VAR, and then the existing FUSE-TOP rule handles the
+body exactly as it would after ordinary beta. Advantage vs. letting regular
+APP-LAM fire first: the rewrite happens inside a FUSE context so children stay
+FUSE-wrapped as they enter the body — no "unFUSE then re-FUSE" churn.
+
+Does NOT require typed binders or PARAM leaves. This alone might be enough
+for the JIT / training-step case where every LAM is immediately applied.
+
+#### 2b. FUSE ⊳ LAM — enter an unapplied body (requires §1 typed binders)
+
+Only useful when the LAM is NOT about to be applied (e.g. pre-compiling a
+function). The rule propagates FUSE under the binder:
+
+```c
+if (ptag == TAG_LAM) {
+    // Only enter if the VAR has a typed binding (shape available).
+    u64 lam_loc = term_val(payload);
+    Term var_slot = heap_read(ctx, lam_loc + 0);
+    if (term_is_sub(var_slot) && st_get(lam_loc) != NULL) {
+        Term body = heap_read(ctx, lam_loc + 1);
+        u64 fl = heap_alloc(ctx, 1);
+        heap_set(ctx, fl, body);
+        heap_set(ctx, lam_loc + 1, term_new(TAG_TOP, UOP_FUSE, fl));
+        RETURN_REDUCED(payload);  // LAM<x, FUSE(body)>
+    }
+    // Untyped binder → pass through (current behavior)
+    RETURN_REDUCED(payload);
+}
+```
+
+Now the body's TOPs reduce under FUSE; unbound typed VARs become leaves via §3.
+
+### 3. KERNEL_LEAF_PARAM (only needed for §2b)
 
 ```c
 typedef enum {
@@ -89,7 +167,7 @@ typedef enum {
 `leaf_ids[i]` for a PARAM leaf holds the **parameter index** (0-based,
 de-Bruijn-ish — the nearest enclosing LAM is index 0).
 
-`fuse_walk_inner` gets one new case:
+In the lowering pass `fuse_walk_inner` ([src/fuse/_.c:415](src/fuse/_.c#L415)):
 
 ```c
 if (term_tag(t) == TAG_VAR) {
@@ -103,56 +181,35 @@ if (term_tag(t) == TAG_VAR) {
 }
 ```
 
-### 3. Kernel construction under a LAM
-
-`fuse_build_kernel` stays shape-agnostic: it sees PARAM leaves with concrete
-views exactly like it sees TENSOR leaves. The codegen (Metal MSL / CPU
-interpreter) already consumes `leaf_views[i]` + `leaf_sts[i]`, so PARAM leaves
-compile identically.
-
-Two placements for the resulting KERNEL term:
-
-- **Lazy placement (preferred).** A new `scheduler pass` (or `sched_one`
-  extension) walks into LAM bodies once, builds the kernel, and stashes it
-  **inside** the LAM as a KERNEL term whose formal leaves point back at the
-  enclosing VAR(s). The LAM now reads `LAM<VAR_typed, KERNEL(..., params=[x])>`.
-- **Eager placement.** Add a `thvm_compile_lam(ctx, lam_term)` entry point
-  callable from user code (and from JIT capture). Same resulting shape, just
-  user-driven.
-
-Start with eager — it's a simpler invariant and unblocks JIT re-use.
+Codegen stays shape-agnostic: PARAM leaves carry `leaf_views[i]` + `leaf_sts[i]`
+exactly like TENSOR leaves, so Metal MSL / CPU interpreter paths need no
+changes.
 
 ### 4. APP-LAM for compiled bodies
 
-When APP-LAM fires and `body = KERNEL(..., params=[x0, x1, ...])`, do **not**
-heap-substitute the VAR. Instead:
+When APP-LAM fires and the LAM's body is `KERNEL(..., params=[x0,x1,...])`
+(produced by §2b's path), don't heap-substitute the VAR — rewrite to a
+KERNEL with PARAMs bound:
 
 ```c
 // combinators.c — APP-LAM, body = KERNEL
 if (term_tag(body) == TAG_TOP && term_ext(body) == UOP_KERNEL) {
-    // Collect formal params (VARs of enclosing LAMs).
-    // Build a PARAM binding list: param_idx -> arg_tid.
-    // Rewrite to a new KERNEL term with PARAM leaves resolved to TENSOR leaves.
-    // (Or: carry a binding side-table on the KernelEntry; dispatch reads it.)
+    // Build a PARAM binding: param_idx → arg_tid.
+    // Option A (specialise-on-apply): clone the KernelEntry with PARAM
+    //   leaves rewritten to TENSOR leaves carrying the app-time tid.
+    // Option B (late-bind): keep PARAM leaves in the cached entry;
+    //   dispatch takes a {param_idx → buf_id} map.
 }
 ```
 
-Two implementation choices:
-
-- **Specialise-on-apply.** Clone the KernelEntry with PARAMs rewritten to
-  TENSOR leaves carrying the app-time tid. One cache hit per shape class,
-  zero re-fusion.
-- **Late-bind.** Keep PARAM leaves in the cached entry; dispatch takes an
-  `{param_idx -> buf_id}` map. One KernelEntry per body, many call sites.
-
-Late-bind matches the "one JIT cache entry, reusable across steps" goal
-(`unified_codegen.md`). Specialise-on-apply is easier to build first.
+Specialise-on-apply is easier to land first; late-bind is the cache-efficient
+end state (matches the "one JIT cache entry per body" goal).
 
 ### 5. Multi-arg LAMs (curried)
 
-`λx. λy. body` nests typed binders; PARAM leaves carry de-Bruijn indices.
-Nothing new in the fuser — it just walks into multiple LAMs and assigns
-params sequentially. APP-LAM binds one level at a time (as it does now).
+`λx. λy. body` nests typed binders; PARAM leaves carry de-Bruijn indices. The
+FUSE ⊳ LAM rule (§2b) just fires twice, once per binder level. APP-LAM binds
+one level at a time (as it does now).
 
 ## What this does NOT cover
 
@@ -180,24 +237,35 @@ params sequentially. APP-LAM binds one level at a time (as it does now).
 
 ## Milestones
 
-1. **M1 — Typed binders.** `thvm_lam_typed`, VAR-slot ST population, dtype
-   side-table. `thvm_track_top_shape` starts assigning STs to UOPs inside LAM
-   bodies. No codegen changes yet. **Exit criterion:** a unit test reads
-   `st_get(top_loc)` for a TOP inside a LAM body and gets the right view.
-2. **M2 — PARAM leaf kind.** Extend `KernelLeafKind`, teach
-   `fuse_append_leaf_*` to emit PARAM leaves, update kernel signature hashing
-   (so PARAM-leaf kernels cache under their own key). **Exit:** `fuse_walk_inner`
-   on a LAM body returns a leaf set containing PARAM leaves without `-1`.
-3. **M3 — Eager compile.** `thvm_compile_lam(ctx, lam)` builds a KernelEntry
-   and stores it as the LAM body. **Exit:** a two-op body (e.g. `x*x + x`)
-   compiles to one fused KernelEntry whose n_leaves=1 and leaf_kinds[0]=PARAM.
-4. **M4 — APP-LAM specialise-on-apply.** APP-LAM onto a KERNEL body rewrites
-   PARAM leaves to TENSOR leaves at bind time. **Exit:** applying the compiled
-   LAM twice with different inputs produces correct outputs, no re-fusion.
-5. **M5 — Late-bind dispatch.** Dispatch accepts `{param_idx -> buf_id}`
-   without cloning the entry. **Exit:** one KernelEntry in the cache serves N
-   apps with different arg tids.
-6. **M6 — JIT integration.** Training step captures to a single LAM; each
+The pre-beta fusion rule (§2a) can ship on its own and may already close a
+large fraction of the gap for the JIT case. Typed binders (§1, §2b, §3, §4)
+only matter when the LAM must be compiled before being applied.
+
+1. **M1 — FUSE ⊳ APP(LAM,·) interaction rule** (§2a). Single rule in
+   [tensor_ops.c:340](src/interact/tensor_ops.c#L340). No new term tags, no
+   KernelEntry changes. **Exit:** `FUSE(APP(LAM<x, x*x>, T))` reduces to a
+   KERNEL whose compute is `MUL(T, T)` in one step, without a separate
+   beta-then-fuse round.
+2. **M2 — Typed binders** (§1). `thvm_lam_typed`, VAR-slot ST population,
+   dtype side-table. `thvm_track_top_shape` starts composing STs through
+   unbound typed VARs. **Exit:** a unit test reads `st_get(top_loc)` for a
+   TOP inside a LAM body and gets the right composed view.
+3. **M3 — FUSE ⊳ LAM propagation** (§2b). New interaction rule that enters
+   typed LAMs. **Exit:** `FUSE(LAM<x_typed, x*x>)` reduces to
+   `LAM<x_typed, KERNEL(MUL(x,x))>` with `x` still a typed unbound VAR inside
+   the growing kernel.
+4. **M4 — KERNEL_LEAF_PARAM** (§3). Extend `KernelLeafKind`, teach
+   `fuse_walk_inner` to emit PARAM leaves when it hits a typed unbound VAR,
+   update signature hashing. **Exit:** M3's kernel lowers to a `KernelEntry`
+   with `n_leaves=1`, `leaf_kinds[0]=PARAM`, `leaf_views[0]=var_view`.
+5. **M5 — APP-LAM specialise-on-apply** (§4). APP-LAM onto a KERNEL body
+   rewrites PARAM leaves to TENSOR leaves at bind time. **Exit:** applying a
+   compiled LAM twice with different inputs produces correct outputs without
+   re-running the fuser.
+6. **M6 — Late-bind dispatch.** Dispatch accepts `{param_idx → buf_id}`
+   without cloning the entry. **Exit:** one `KernelEntry` in the cache serves
+   N apps with different arg tids.
+7. **M7 — JIT integration.** Training step captures to a single LAM; each
    iteration is one APP-LAM dispatch. **Exit:** measured dispatch count per
    step drops from ~375 to ~(1 + reduce count) on a small MLP.
 

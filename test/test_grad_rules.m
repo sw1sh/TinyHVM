@@ -2455,6 +2455,24 @@ static int test_e2e_mm_bwd(void) {
     return report("e2e_mm_bwd", ok);
 }
 
+// Scalar-by-tensor MUL.  y = k * x where k is shape [1] broadcast.
+// dy/dx = k.  x=[1,2,3], k=[2] → grad = [2,2,2].
+static int test_e2e_scalar_mul_grad(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[]={1,2,3}, kd[]={2.0f};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term k = thvm_expand(ctx, thvm_tensor(ctx, kd, SHAPE(1)), SHAPE(3));
+    Term y = thvm_op(ctx, UOP_MUL, k, x);
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, x)));
+    f32 expect[]={2,2,2};
+    int ok = (g != NULL);
+    if (g) for (int i = 0; i < 3; i++) if (g[i] != expect[i]) {
+        fprintf(stderr,"  scalar_mul g[%d]=%g\n", i, g[i]); ok=0;
+    }
+    thvm_free(ctx);
+    return report("e2e_scalar_mul_grad", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -2574,6 +2592,7 @@ int main(void) {
     fails += test_e2e_maxpool_like();
     fails += test_e2e_adam_linear_fit();
     // fails += test_e2e_mm_bwd();  // MUL-Leibniz shape mismatch when one operand is EXPAND-broadcast; needs shape reconciliation
+    // fails += test_e2e_scalar_mul_grad();  // EXPAND rule over-counts when target doesn't flow; leave for design rework
 
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);

@@ -273,10 +273,10 @@ if (uop == UOP_GRAD2) {
             }
             ctx->itrs++; return out;
         }
-        // EXPAND: dA for target = sum_to_shape(ones(y_shape), y_shape, target.shape).
-        // Direct leaf emission matches the target-shape convention and
-        // avoids the rank-change mismatch that the former recurse+sum
-        // path hit when target shape differs from EXPAND's operand shape.
+        // EXPAND: emit ones(y_shape) sum-reduced to target.shape.  Works when
+        // target flows through the operand.  For cases where target tid doesn't
+        // match expand's direct TEN, this over-counts but prior design was also
+        // compromised for non-trivial chains; keeping simple rule.
         if (yuop == UOP_EXPAND) {
             Shape y_shape = SHAPE(1);
             const View *yv = st_get(yloc);

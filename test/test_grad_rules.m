@@ -1702,6 +1702,78 @@ static int test_gradu_poly(void) {
     return report("gradu_poly", ok);
 }
 
+// E2E: verify EXPAND(NUM(1), [3]) materializes as [1,1,1].
+static int test_e2e_expand_scalar(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    Term one = term_num_f32(1.0f);
+    Term y = thvm_expand(ctx, one, SHAPE(3));
+    Term r = thvm_eval(ctx, y);
+    f32 *h = thvm_to_host(ctx, r);
+    int ok = (h != NULL);
+    if (h) {
+        for (int i = 0; i < 3; i++) {
+            if (h[i] != 1.0f) {
+                fprintf(stderr, "  e2e_expand: h[%d]=%g expect=1\n", i, h[i]);
+                ok = 0;
+            }
+        }
+    }
+    thvm_free(ctx);
+    return report("e2e_expand_scalar", ok);
+}
+
+// E2E numerical: d(x*w)/dx = w, no SUM wrapping.  Minimal GRAD2 chain:
+// Leibniz → ADD(MUL(EXPAND(1),w), MUL(x,EXPAND(0))) → w.
+static int test_gradu_mul_e2e(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1, 2, 3}, wd[] = {10, 20, 30};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term w = thvm_tensor(ctx, wd, SHAPE(3));
+    thvm_set_requires_grad(ctx, x);
+    Term y = thvm_op(ctx, UOP_MUL, x, w);
+    Term grad = thvm_grad_u(ctx, y, x);
+    Term r = thvm_eval(ctx, grad);
+    f32 *h = thvm_to_host(ctx, r);
+    int ok = (h != NULL);
+    if (h) {
+        f32 expect[] = {10, 20, 30};
+        for (int i = 0; i < 3; i++) {
+            if (h[i] != expect[i]) {
+                fprintf(stderr, "  gradu_mul_e2e: h[%d]=%g expect=%g\n",
+                        i, h[i], expect[i]);
+                ok = 0;
+            }
+        }
+    }
+    thvm_free(ctx);
+    return report("gradu_mul_e2e", ok);
+}
+
+// E2E sanity: plain forward MUL without any grad — baseline check that
+// the pipeline computes elementwise multiply correctly.
+static int test_e2e_mul_baseline(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1, 2, 3}, wd[] = {10, 20, 30};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term w = thvm_tensor(ctx, wd, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_MUL, x, w);
+    Term r = thvm_eval(ctx, y);
+    f32 *h = thvm_to_host(ctx, r);
+    int ok = (h != NULL);
+    if (h) {
+        f32 expect[] = {10, 40, 90};
+        for (int i = 0; i < 3; i++) {
+            if (h[i] != expect[i]) {
+                fprintf(stderr, "  e2e_mul: h[%d]=%g expect=%g\n",
+                        i, h[i], expect[i]);
+                ok = 0;
+            }
+        }
+    }
+    thvm_free(ctx);
+    return report("e2e_mul_baseline", ok);
+}
+
 // End-to-end numerical: y = sum(x*w), dy/dx = w.  Run full pipeline
 // (no STOP_AFTER_SWEEP) and read the gradient tensor back; check
 // against the known analytical answer.
@@ -1817,6 +1889,9 @@ int main(void) {
     fails += test_gradu_where_else();
     fails += test_gradu_where_nested();
     fails += test_gradu_poly();
+    fails += test_e2e_mul_baseline();
+    fails += test_e2e_expand_scalar();
+    fails += test_gradu_mul_e2e();
     fails += test_gradu_dot_e2e();
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);

@@ -1070,6 +1070,29 @@ static int test_gradu_distributive(void) {
     return report("gradu_distributive", ok);
 }
 
+// UOP_GRAD2: ASSIGN w.r.t. src — gradient is zero (src is ignored by
+// the rule, only dst path contributes).
+static int test_gradu_assign_src(void) {
+    setup_graph_dir("gradu_assign_src");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {0,0,0}, bd[] = {1,2,3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    thvm_set_requires_grad(ctx, b);
+    Term y = thvm_op(ctx, UOP_ASSIGN, a, b);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, b)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "ASSIGN"};
+    // bwd = GRAD2(dst=a, b) where a!=b → EXPAND(0, b.shape).
+    const char *post[] = {"CTR", "EXPAND"};
+    int ok = topo_check("gradu_assign_src", 0, pre, 3)
+          && topo_check("gradu_assign_src", 1, post, 2);
+    return report("gradu_assign_src", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -1132,6 +1155,7 @@ int main(void) {
     fails += test_gradu_sum_sq();
     fails += test_gradu_target_via_dup();
     fails += test_gradu_distributive();
+    fails += test_gradu_assign_src();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

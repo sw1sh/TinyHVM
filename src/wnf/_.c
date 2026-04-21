@@ -27,16 +27,23 @@
 enum {
     WNF_F_NONE = 0,
     // Descend into y of GRAD(y, tgt).  On apply, dispatch on whnf.
-    WNF_F_GRAD,          // t0=tgt (Term), t1=is_fwd (0/1)
-    // Leibniz phases for ADD/SUB: after da computed, descend into db.
-    //   out = op(da, db)
-    WNF_F_GRAD_AB_PHASE1, // t0=b, t1=tgt, t2=is_fwd|op<<1 — have nothing yet, da pending
-    WNF_F_GRAD_AB_PHASE2, // t0=da, t1=op, t2=is_fwd — have da, db pending; assemble op(da,db)
-    // NEG: after da, wrap in NEG.
-    WNF_F_GRAD_NEG,       // (no extra fields)
+    WNF_F_GRAD,            // t0=tgt
+    // ADD/SUB Leibniz, 2-phase
+    WNF_F_GRAD_AB_PHASE1,  // t0=b, t1=tgt, t2=op
+    WNF_F_GRAD_AB_PHASE2,  // t0=da, t1=op
+    // NEG: wrap in NEG.
+    WNF_F_GRAD_NEG,
     // MUL Leibniz: b*da + a*db
-    WNF_F_GRAD_MUL_PHASE1, // t0=a, t1=b, t2=tgt, t3=is_fwd — need da
-    WNF_F_GRAD_MUL_PHASE2, // t0=l=MUL(b,da), t1=a, t2=tgt, t3=is_fwd — have l, need db
+    WNF_F_GRAD_MUL_PHASE1, // t0=a, t1=b, t2=tgt
+    WNF_F_GRAD_MUL_PHASE2, // t0=l=MUL(b,da), t1=a
+    // DIV quotient rule: (da*b - a*db) / b²
+    WNF_F_GRAD_DIV_PHASE1, // t0=a, t1=b, t2=tgt
+    WNF_F_GRAD_DIV_PHASE2, // t0=l=MUL(da,b), t1=a, t2=b
+    // Unary nonlinear: da scaled by a function of the operand forward value.
+    WNF_F_GRAD_EXP_POST,   // t0=y_whnf (= exp(a) already computed)
+    WNF_F_GRAD_LOG_POST,   // t0=a
+    WNF_F_GRAD_SQRT_POST,  // t0=y_whnf (= sqrt(a))
+    WNF_F_GRAD_RELU_POST,  // t0=a (for mask = a>0)
 };
 
 typedef struct {
@@ -272,7 +279,114 @@ apply: {
                     goto enter;
                 }
 
-                // Unhandled compute TOP: fall back.
+                // DIV quotient rule: d(a/b)/dt = (da*b - a*db) / b²
+                if (wuop == UOP_DIV) {
+                    Term a = heap_read(ctx, wloc + 0);
+                    Term b = heap_read(ctx, wloc + 1);
+                    WnfFrame ph1 = {
+                        .kind = WNF_F_GRAD_DIV_PHASE1, .flags = (u8)is_fwd,
+                        .t0 = a, .t1 = b, .t2 = tgt, .t3 = 0
+                    };
+                    wnf_stack_push(ph1);
+                    WnfFrame inner = {
+                        .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                        .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(inner);
+                    next = a;
+                    goto enter;
+                }
+
+                // EXP: d(exp a)/dt = exp(a) * da — whnf IS exp(a).
+                if (wuop == UOP_EXP) {
+                    Term a = heap_read(ctx, wloc + 0);
+                    WnfFrame post = {
+                        .kind = WNF_F_GRAD_EXP_POST, .flags = 0,
+                        .t0 = whnf, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(post);
+                    WnfFrame inner = {
+                        .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                        .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(inner);
+                    next = a;
+                    goto enter;
+                }
+
+                // LOG: d(log a)/dt = da / a.
+                if (wuop == UOP_LOG) {
+                    Term a = heap_read(ctx, wloc + 0);
+                    WnfFrame post = {
+                        .kind = WNF_F_GRAD_LOG_POST, .flags = 0,
+                        .t0 = a, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(post);
+                    WnfFrame inner = {
+                        .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                        .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(inner);
+                    next = a;
+                    goto enter;
+                }
+
+                // SQRT: d(sqrt a)/dt = da / (2 * sqrt(a)) — whnf IS sqrt(a).
+                if (wuop == UOP_SQRT) {
+                    Term a = heap_read(ctx, wloc + 0);
+                    WnfFrame post = {
+                        .kind = WNF_F_GRAD_SQRT_POST, .flags = 0,
+                        .t0 = whnf, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(post);
+                    WnfFrame inner = {
+                        .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                        .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(inner);
+                    next = a;
+                    goto enter;
+                }
+
+                // RELU: d(relu a)/dt = (a>0) * da.
+                if (wuop == UOP_RELU) {
+                    Term a = heap_read(ctx, wloc + 0);
+                    WnfFrame post = {
+                        .kind = WNF_F_GRAD_RELU_POST, .flags = 0,
+                        .t0 = a, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(post);
+                    WnfFrame inner = {
+                        .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                        .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(inner);
+                    next = a;
+                    goto enter;
+                }
+
+                // CMP: non-differentiable → ERA.
+                if (wuop == UOP_CMP) {
+                    whnf = term_era();
+                    ctx->itrs++;
+                    continue;
+                }
+
+                // ASSIGN: gradient flows through dst only.  Re-enter with
+                // a fresh GRAD frame on dst.
+                if (wuop == UOP_ASSIGN) {
+                    Term dst = heap_read(ctx, wloc + 0);
+                    WnfFrame inner = {
+                        .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                        .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(inner);
+                    next = dst;
+                    goto enter;
+                }
+
+                // Unhandled compute TOP: fall back (SUM, RMAX, EXPAND,
+                // RESHAPE, PERMUTE, SHRINK, PAD, MM, WHERE).
                 whnf = wnf_grad_apply_top_fallback(ctx, tgt, whnf, is_fwd);
                 continue;
             }
@@ -344,6 +458,77 @@ apply: {
             Term l = f.t0, a = f.t1;
             Term r = wnf_mk_mul(ctx, a, whnf);
             whnf = wnf_mk_add(ctx, l, r);
+            ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_GRAD_DIV_PHASE1: {
+            // whnf = da.  Compute l = MUL(da, b), then descend into GRAD(b, tgt).
+            Term da = whnf;
+            Term a = f.t0, b = f.t1, tgt = f.t2;
+            int is_fwd = f.flags & 1;
+            Term l = wnf_mk_mul(ctx, da, b);
+            WnfFrame ph2 = {
+                .kind = WNF_F_GRAD_DIV_PHASE2, .flags = (u8)is_fwd,
+                .t0 = l, .t1 = a, .t2 = b, .t3 = 0
+            };
+            wnf_stack_push(ph2);
+            WnfFrame inner = {
+                .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+            };
+            wnf_stack_push(inner);
+            next = b;
+            goto enter;
+        }
+
+        case WNF_F_GRAD_DIV_PHASE2: {
+            // whnf = db.  Assemble (l - a*db) / b².
+            Term l = f.t0, a = f.t1, b = f.t2;
+            Term r = wnf_mk_mul(ctx, a, whnf);
+            Term num = wnf_mk_sub(ctx, l, r);
+            if (wnf_is_era(num)) { whnf = term_era(); ctx->itrs++; continue; }
+            Term den = thvm_op_raw(ctx, UOP_MUL, b, b);
+            whnf = thvm_op_raw(ctx, UOP_DIV, num, den);
+            ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_GRAD_EXP_POST: {
+            // whnf = da.  Multiply by exp(a) (stored as y_whnf in f.t0).
+            Term exp_a = f.t0;
+            whnf = wnf_mk_mul(ctx, exp_a, whnf);
+            ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_GRAD_LOG_POST: {
+            // whnf = da.  Divide by a.
+            Term a = f.t0;
+            if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
+            whnf = thvm_op_raw(ctx, UOP_DIV, whnf, a);
+            ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_GRAD_SQRT_POST: {
+            // whnf = da.  Divide by 2 * sqrt(a) (stored as y_whnf in f.t0).
+            Term sq = f.t0;
+            if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
+            Term two = term_num_f32(2.0f);
+            Term den = thvm_op_raw(ctx, UOP_MUL, two, sq);
+            whnf = thvm_op_raw(ctx, UOP_DIV, whnf, den);
+            ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_GRAD_RELU_POST: {
+            // whnf = da.  Mask by (a > 0).
+            Term a = f.t0;
+            if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
+            Term zero = term_num_f32(0.0f);
+            Term mask = thvm_op_raw(ctx, UOP_CMP, a, zero);
+            whnf = wnf_mk_mul(ctx, whnf, mask);
             ctx->itrs++;
             continue;
         }

@@ -816,6 +816,33 @@ static int test_gradu_assign(void) {
     return report("gradu_assign", ok);
 }
 
+// UOP_GRAD2 deep chain: y = exp(log(t*t)), target = t.
+// Exercises MUL(Leibniz), LOG, EXP composing via recursive GRAD2.
+static int test_gradu_deep_chain(void) {
+    setup_graph_dir("gradu_deep_chain");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term a0, a1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+    Term sq  = thvm_op(ctx, UOP_MUL, a0, a1);
+    Term lg  = thvm_op(ctx, UOP_LOG, sq, term_era());
+    Term y   = thvm_op(ctx, UOP_EXP, lg, term_era());
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "EXP", "LOG", "MUL"};
+    // Post: bwd is EXP * (MUL's ADD(da*b, a*db)) / inner — should contain
+    // MUL, DIV, EXP, LOG, ADD from chain-rule composition.
+    const char *post[] = {"CTR", "EXP", "LOG", "MUL", "DIV", "ADD"};
+    int ok = topo_check("gradu_deep_chain", 0, pre, 5)
+          && topo_check("gradu_deep_chain", 1, post, 6);
+    return report("gradu_deep_chain", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -868,6 +895,7 @@ int main(void) {
     fails += test_gradu_rmax();
     fails += test_gradu_mm();
     fails += test_gradu_assign();
+    fails += test_gradu_deep_chain();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

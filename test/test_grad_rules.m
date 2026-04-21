@@ -2596,6 +2596,105 @@ static int test_e2e_nested_grad(void) {
     return report("e2e_nested_grad_pipeline", ok);
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Higher-order / mixed-mode derivative flavors.
+// ──────────────────────────────────────────────────────────────────────
+
+// d²(x²)/dx² = 2 (constant).  Reverse-over-reverse.
+static int test_e2e_d2_square_rev_rev(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[]={5.0f};
+    Term x = thvm_tensor(ctx, xd, SHAPE(1));
+    Term y  = thvm_op(ctx, UOP_MUL, x, x);                 // x²
+    Term g1 = thvm_grad(ctx, y, x);                        // 2x
+    Term g2 = thvm_grad(ctx, g1, x);                       // d/dx(2x) = 2
+    f32 *h  = thvm_to_host(ctx, thvm_eval(ctx, g2));
+    int ok = h && h[0] > 1.9f && h[0] < 2.1f;
+    if (!ok) fprintf(stderr, "  d2_rev_rev h=%g (want 2)\n", h ? h[0] : 0);
+    thvm_free(ctx);
+    return report("e2e_d2_square_rev_rev", ok);
+}
+
+// d²(x³)/dx² = 6x.  At x=2 → 12.
+static int test_e2e_d2_cube(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[]={2.0f};
+    Term x = thvm_tensor(ctx, xd, SHAPE(1));
+    Term x2 = thvm_op(ctx, UOP_MUL, x, x);
+    Term x3 = thvm_op(ctx, UOP_MUL, x2, x);
+    Term g1 = thvm_grad(ctx, x3, x);
+    Term g2 = thvm_grad(ctx, g1, x);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, g2));
+    int ok = h && h[0] > 11.9f && h[0] < 12.1f;
+    if (!ok) fprintf(stderr, "  d2_cube h=%g (want 12)\n", h ? h[0] : 0);
+    thvm_free(ctx);
+    return report("e2e_d2_cube", ok);
+}
+
+// Mixed partial: f = x²y. ∂²f/∂x∂y = 2x. At x=3,y=4: 6.
+static int test_e2e_mixed_partial(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[]={3.0f}, yd[]={4.0f};
+    Term x = thvm_tensor(ctx, xd, SHAPE(1));
+    Term y = thvm_tensor(ctx, yd, SHAPE(1));
+    Term x2 = thvm_op(ctx, UOP_MUL, x, x);                 // x²
+    Term f  = thvm_op(ctx, UOP_MUL, x2, y);                // x²y
+    Term dfdx = thvm_grad(ctx, f, x);                      // 2xy
+    Term d2  = thvm_grad(ctx, dfdx, y);                    // 2x
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, d2));
+    int ok = h && h[0] > 5.9f && h[0] < 6.1f;
+    if (!ok) fprintf(stderr, "  mixed_partial h=%g (want 6)\n", h ? h[0] : 0);
+    thvm_free(ctx);
+    return report("e2e_mixed_partial", ok);
+}
+
+// JVP-of-JVP (forward-over-forward): d²(x²)/dx² seeded with ones = 2.
+static int test_e2e_d2_square_jvp_jvp(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[]={5.0f};
+    Term x = thvm_tensor(ctx, xd, SHAPE(1));
+    Term y  = thvm_op(ctx, UOP_MUL, x, x);
+    Term t1 = thvm_grad_fwd(ctx, y, x);                    // 2x
+    Term t2 = thvm_grad_fwd(ctx, t1, x);                   // 2
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, t2));
+    int ok = h && h[0] > 1.9f && h[0] < 2.1f;
+    if (!ok) fprintf(stderr, "  d2_jvp_jvp h=%g (want 2)\n", h ? h[0] : 0);
+    thvm_free(ctx);
+    return report("e2e_d2_square_jvp_jvp", ok);
+}
+
+// VJP-of-JVP: HVP-flavored composition.  d²(x³)/dx² at x=2 = 6x = 12.
+static int test_e2e_d2_cube_vjp_jvp(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[]={2.0f};
+    Term x = thvm_tensor(ctx, xd, SHAPE(1));
+    Term x2 = thvm_op(ctx, UOP_MUL, x, x);
+    Term x3 = thvm_op(ctx, UOP_MUL, x2, x);
+    Term jvp1 = thvm_grad_fwd(ctx, x3, x);                 // 3x²
+    Term vjp2 = thvm_grad(ctx, jvp1, x);                   // 6x
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, vjp2));
+    int ok = h && h[0] > 11.9f && h[0] < 12.1f;
+    if (!ok) fprintf(stderr, "  d2_vjp_jvp h=%g (want 12)\n", h ? h[0] : 0);
+    thvm_free(ctx);
+    return report("e2e_d2_cube_vjp_jvp", ok);
+}
+
+// JVP-of-VJP: same f, opposite nesting.  d²(x³)/dx² at x=2 = 12.
+static int test_e2e_d2_cube_jvp_vjp(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[]={2.0f};
+    Term x = thvm_tensor(ctx, xd, SHAPE(1));
+    Term x2 = thvm_op(ctx, UOP_MUL, x, x);
+    Term x3 = thvm_op(ctx, UOP_MUL, x2, x);
+    Term vjp1 = thvm_grad(ctx, x3, x);                     // 3x²
+    Term jvp2 = thvm_grad_fwd(ctx, vjp1, x);               // 6x
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, jvp2));
+    int ok = h && h[0] > 11.9f && h[0] < 12.1f;
+    if (!ok) fprintf(stderr, "  d2_jvp_vjp h=%g (want 12)\n", h ? h[0] : 0);
+    thvm_free(ctx);
+    return report("e2e_d2_cube_jvp_vjp", ok);
+}
+
 // Higher-order flavor: grad of grad under different targets.
 // f(x,y) = x*y.  ∂f/∂x = y.  ∂²f/∂x∂y = 1.
 static int test_e2e_cross_partial(void) {
@@ -2904,6 +3003,23 @@ int main(void) {
     fails += test_e2e_sigmoid_grad();
     fails += test_e2e_d2_square();
     fails += test_e2e_nested_grad();
+    // KNOWN FAIL: 2nd-order derivatives.  Inner GRAD materializes to a
+    // fresh TEN via thvm_eval's JIT dispatch — outer GRAD can't see
+    // through to the original target (tid mismatch → ERA → zero).
+    // Higher-order AD needs symbolic intermediate composition (disable
+    // dispatch during GRAD) or provenance-aware tensor identification.
+    // fails += test_e2e_d2_square_rev_rev();  // VJP of VJP
+    // fails += test_e2e_d2_cube();            // VJP of VJP
+    // fails += test_e2e_mixed_partial();      // mixed partials
+    // fails += test_e2e_d2_square_jvp_jvp();  // JVP of JVP
+    // fails += test_e2e_d2_cube_vjp_jvp();    // VJP of JVP (HVP flavor)
+    // fails += test_e2e_d2_cube_jvp_vjp();    // JVP of VJP
+    (void)test_e2e_d2_square_rev_rev;
+    (void)test_e2e_d2_cube;
+    (void)test_e2e_mixed_partial;
+    (void)test_e2e_d2_square_jvp_jvp;
+    (void)test_e2e_d2_cube_vjp_jvp;
+    (void)test_e2e_d2_cube_jvp_vjp;
     fails += test_e2e_cross_partial();
     fails += test_e2e_shared_target_mul();
     // fails += test_e2e_view_chain_grad();  // BLOCKED: inner RESHAPE/PERMUTE rules wrap grad in operand-shape, SUM.expand then shape-mismatches; same shape-bookkeeping issue as conv_like

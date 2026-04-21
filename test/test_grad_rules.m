@@ -222,6 +222,68 @@ static int test_pad(void) {
     return report("pad", ok);
 }
 
+// ─── edge cases ────────────────────────────────────────────────────
+
+// Second derivative:  d²/da²(a·a) = d/da(2a) = 2
+// First pair produces bwd1 = Leibniz; wrap bwd1 in a second pair to
+// capture the derivative of the derivative.
+static int test_second_derivative(void) {
+    setup_graph_dir("second_derivative");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term a0, a1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+    Term y = thvm_op(ctx, UOP_MUL, a0, a1);
+
+    Term fwd1, bwd1;
+    thvm_grad_pair(ctx, (u32)term_val(a), y, &fwd1, &bwd1);
+    thvm_spawn_detached_era(ctx, fwd1);
+
+    Term fwd2, bwd2;
+    thvm_grad_pair(ctx, (u32)term_val(a), bwd1, &fwd2, &bwd2);
+
+    Term root = thvm_ctr(ctx, (Term[]){fwd2, bwd2}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "MUL"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("second_derivative", 0, pre, 3)
+          && topo_check("second_derivative", 1, post, 1);
+    return report("d2da2", ok);
+}
+
+// No-match target sentinel: GRAD(ADD(a, b), target = ~0u).
+// No leaf will compare equal → every sub-GRAD on a TEN returns NUM(0)
+// → combined backward reduces to NUM(0). Exercises the "target never
+// hits a leaf" path that e.g. GRAD wrt a tensor not in the forward
+// graph would produce.
+//
+// NB: the raw u32-target API lets callers pass anything. Real targets
+// should be TEN tensor ids; passing `(u32)term_val(TOP)` collides
+// with tensor ids that happen to numerically match a heap slot (both
+// live in the same 20-bit label field). Use ~0u or the tid of a
+// TAG_TEN, never a TOP's val.
+static int test_target_nomatch(void) {
+    setup_graph_dir("target_nomatch");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3}, bd[] = {4,5,6};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    Term y = thvm_op(ctx, UOP_ADD, a, b);
+    Term fwd, bwd;
+    thvm_grad_pair(ctx, ~0u, y, &fwd, &bwd);
+    Term root = thvm_ctr(ctx, (Term[]){fwd, bwd}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"GRAD", "CTR", "ADD"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("target_nomatch", 0, pre, 3)
+          && topo_check("target_nomatch", 1, post, 1);
+    return report("nomatch", ok);
+}
+
 static int test_assign(void) {
     setup_graph_dir("assign");
     TinyHVM *ctx = thvm_init("cpu");
@@ -314,6 +376,8 @@ int main(void) {
     fails += test_shrink();
     fails += test_pad();
     fails += test_assign();
+    fails += test_second_derivative();
+    fails += test_target_nomatch();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

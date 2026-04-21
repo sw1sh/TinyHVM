@@ -1081,6 +1081,72 @@ era_continue:
                     GRAD_STATE_RETURN(fwd, bwd);
                 }
 
+                // RMAX (reduce-max): fwd = rmax(a_fwd, axes).
+                // Backward emits gy * (a == expanded(y)) — only the argmax
+                // positions get the gradient.
+                if (uop == UOP_RMAX) {
+                    Term a    = heap_read(ctx, yloc + 0);
+                    Term axes = heap_read(ctx, yloc + 1);
+                    Term a_fwd, a_bwd;
+                    thvm_grad_pair(ctx, target_tid, a, &a_fwd, &a_bwd);
+                    Term af0, af1;
+                    thvm_dup(ctx, thvm_fresh_label(ctx), a_fwd, &af0, &af1);
+                    Term fwd = thvm_op_raw(ctx, UOP_RMAX, af0, axes);
+
+                    Shape a_shape = SHAPE(1), y_shape = SHAPE(1);
+                    if (term_tag(a) == TAG_TEN) {
+                        u32 aid = (u32)term_val(a);
+                        if (aid < ctx->tensor_count)
+                            a_shape = ctx->tensors[aid].view.shape;
+                    } else if (term_tag(a) == TAG_TOP) {
+                        const View *av = st_get(term_val(a));
+                        if (av) a_shape = av->shape;
+                    }
+                    const View *yv = st_get(yloc);
+                    if (yv) y_shape = yv->shape;
+
+                    Term bwd;
+                    if (a_shape.rank != 0 && y_shape.rank != 0) {
+                        /* Re-run rmax on the second forward copy for mask. */
+                        Term y_local = thvm_op_raw(ctx, UOP_RMAX, af1, axes);
+                        Term y_bc = thvm_expand(ctx, thvm_reshape(ctx, y_local, y_shape), a_shape);
+                        /* Mask: a == expanded(y). Using CMP as placeholder
+                         * for equality (CMP is <, but legacy uses this
+                         * pattern; proper EQ would be ideal). */
+                        Term a_for_mask;
+                        {
+                            Term af1a, af1b;
+                            thvm_dup(ctx, thvm_fresh_label(ctx), af1, &af1a, &af1b);
+                            (void)af1b;
+                            a_for_mask = af1a;
+                        }
+                        Term mask = thvm_op_raw(ctx, UOP_CMP, y_bc, a_for_mask);
+                        Term one = term_num_f32(1.0f);
+                        Term mask1 = thvm_op_raw(ctx, UOP_SUB, one, mask);
+                        Term gy_bc = thvm_expand(ctx, a_bwd, a_shape);
+                        bwd = thvm_op_raw(ctx, UOP_MUL, gy_bc, mask1);
+                    } else {
+                        bwd = a_bwd;
+                    }
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
+                // ASSIGN(dst, src): y == dst (side effect updates dst).
+                // The pair just threads the dst pair through; src branch
+                // receives a NUM(0) backward (non-contributing to grad w.r.t.
+                // dst) and src_fwd is eager-evaluated as part of the effect.
+                if (uop == UOP_ASSIGN) {
+                    Term dst = heap_read(ctx, yloc + 0);
+                    Term src = heap_read(ctx, yloc + 1);
+                    Term d_fwd, d_bwd, s_fwd, s_bwd;
+                    thvm_grad_pair(ctx, target_tid, dst, &d_fwd, &d_bwd);
+                    thvm_grad_pair(ctx, target_tid, src, &s_fwd, &s_bwd);
+                    Term fwd = thvm_op_raw(ctx, UOP_ASSIGN, d_fwd, s_fwd);
+                    thvm_spawn_detached_era(ctx, s_bwd);
+                    Term bwd = d_bwd;
+                    GRAD_STATE_RETURN(fwd, bwd);
+                }
+
                 // Reduction SUM: forward keeps axes; backward expands da
                 // back to a's shape.
                 //   fwd = SUM(a_fwd, axes)

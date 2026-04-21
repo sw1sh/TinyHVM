@@ -28,6 +28,22 @@
 
 static int g_pass = 0, g_fail = 0;
 
+#define REWRITE_GRAPH_ROOT "graphs/rewrite_rules"
+
+// Configure per-test graph dump directory: one folder per rule, holding
+// pre-reduce / post-reduce / post-sweep .dot snapshots.  Called at the
+// top of each test_rule_* function.
+static void setup_rule_graph_dir(const char *rule) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "%s/%s", REWRITE_GRAPH_ROOT, rule);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", dir, dir);
+    int r = system(cmd); (void)r;
+    setenv("THVM_GRAPH", "1", 1);
+    setenv("THVM_GRAPH_DIR", dir, 1);
+    setenv("THVM_GRAPH_STOP_AFTER_SWEEP", "1", 1);
+}
+
 static int report(const char *name, int ok) {
     printf("%-40s %s\n", name, ok ? "PASS" : "FAIL");
     if (ok) g_pass++; else g_fail++;
@@ -163,6 +179,7 @@ static int term_eq(TinyHVM *ctx, Term a, Term b, int depth) {
 //   expected: (x, x)  (same tensor id, incref'd)
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_dup_ten(void) {
+    setup_rule_graph_dir("dup_ten");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
@@ -183,6 +200,7 @@ static int test_rule_dup_ten(void) {
 //   expected: y
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_app_lam_identity(void) {
+    setup_rule_graph_dir("app_lam_identity");
     TinyHVM *ctx = thvm_init("cpu");
     f32 yd[] = {4, 5, 6};
     Term y = thvm_tensor(ctx, yd, SHAPE(3));
@@ -205,6 +223,7 @@ static int test_rule_app_lam_identity(void) {
 //   expected: ones([3])      (reverse-mode ones-seed on target leaf)
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_grad_leaf_match(void) {
+    setup_rule_graph_dir("grad_leaf_match");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
@@ -228,6 +247,7 @@ static int test_rule_grad_leaf_match(void) {
 //   expected: zeros([3])
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_grad_leaf_nomatch(void) {
+    setup_rule_graph_dir("grad_leaf_nomatch");
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3}, bd[] = {4, 5, 6};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -251,6 +271,7 @@ static int test_rule_grad_leaf_nomatch(void) {
 //   Value-level: grad = ones([3]).
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_grad_add(void) {
+    setup_rule_graph_dir("grad_add");
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3}, bd[] = {4, 5, 6};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -272,6 +293,7 @@ static int test_rule_grad_add(void) {
 //   expected value: 2x  (structural equality via materialized TEN).
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_grad_mul_square(void) {
+    setup_rule_graph_dir("grad_mul_square");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
@@ -293,6 +315,7 @@ static int test_rule_grad_mul_square(void) {
 //   expected: ones([3])
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_grad_fwd_leaf_match(void) {
+    setup_rule_graph_dir("grad_fwd_leaf_match");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
@@ -312,6 +335,7 @@ static int test_rule_grad_fwd_leaf_match(void) {
 //   expected: [12]          (sum of tangent = sum of 2x for x=[1,2,3])
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_grad_fwd_sum_of_square(void) {
+    setup_rule_graph_dir("grad_fwd_sum_of_square");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
@@ -340,6 +364,7 @@ static int test_rule_grad_fwd_sum_of_square(void) {
 //   expected: [5,7,9]
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_add_ten_ten(void) {
+    setup_rule_graph_dir("add_ten_ten");
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3}, bd[] = {4, 5, 6};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -359,6 +384,7 @@ static int test_rule_add_ten_ten(void) {
 //   expected: [6]
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_sum_ten(void) {
+    setup_rule_graph_dir("sum_ten");
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {1, 2, 3};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -377,6 +403,7 @@ static int test_rule_sum_ten(void) {
 //   expected: [5,5,5]
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_expand_ten(void) {
+    setup_rule_graph_dir("expand_ten");
     TinyHVM *ctx = thvm_init("cpu");
     f32 v = 5.0f;
     Term a = thvm_tensor(ctx, &v, SHAPE(1));
@@ -396,6 +423,7 @@ static int test_rule_expand_ten(void) {
 //   expected: CTR{p, q}
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_dup_sup_same_label(void) {
+    setup_rule_graph_dir("dup_sup_same_label");
     TinyHVM *ctx = thvm_init("cpu");
     f32 pd[] = {1,2,3}, qd[] = {4,5,6};
     Term p = thvm_tensor(ctx, pd, SHAPE(3));
@@ -415,6 +443,7 @@ static int test_rule_dup_sup_same_label(void) {
 // Rule: GRAD ⊳ NEG.   d(-x)/dx = -1.
 // ──────────────────────────────────────────────────────────────────────
 static int test_rule_grad_neg(void) {
+    setup_rule_graph_dir("grad_neg");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1, 2, 3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));

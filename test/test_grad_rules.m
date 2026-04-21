@@ -2239,6 +2239,82 @@ static int test_e2e_sgd_loop(void) {
     return report("e2e_sgd_loop", ok);
 }
 
+// Trampoline-native recursive SGD.
+// train := λc.λw. IFZ(c, w, λm. SEQ(ASSIGN(dst, w - lr*grad), train(m)(rec)))
+// where loss = 0.5*w*w, grad = w (so update = w - 0.1*w = 0.9*w).
+static int test_e2e_recursive_sgd(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 wd[] = {4.0f};
+    Term w_init = thvm_tensor(ctx, wd, SHAPE(1));
+    u32 train_id = ctx->def_count++;
+
+    Term cvar = 0, wvar = 0, next_c = 0;
+    Term lam_c = thvm_lam(ctx, &cvar, term_new(TAG_ERA, 0, 0));
+    Term lam_w = thvm_lam(ctx, &wvar, term_new(TAG_ERA, 0, 0));
+    Term succ  = thvm_lam(ctx, &next_c, term_new(TAG_ERA, 0, 0));
+    thvm_hint_shape(ctx, wvar, SHAPE(1));
+
+    // Need 6 uses of wvar: base_case, loss_a, loss_b, grad_target, sub_lhs, assign_dst, recurse_arg = 7.
+    // Build via successive DUPs.
+    Term s0, s1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), wvar, &s0, &s1);
+    Term w_base, r0;
+    thvm_dup(ctx, thvm_fresh_label(ctx), s0, &w_base, &r0);
+    Term w_loss_a, r1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), r0, &w_loss_a, &r1);
+    Term w_loss_b, r2;
+    thvm_dup(ctx, thvm_fresh_label(ctx), r1, &w_loss_b, &r2);
+    Term w_grad_tgt, r3;
+    thvm_dup(ctx, thvm_fresh_label(ctx), r2, &w_grad_tgt, &r3);
+    Term w_sub_lhs, r4;
+    thvm_dup(ctx, thvm_fresh_label(ctx), s1, &w_sub_lhs, &r4);
+    Term w_assign_dst, w_recurse;
+    thvm_dup(ctx, thvm_fresh_label(ctx), r4, &w_assign_dst, &w_recurse);
+    (void)r3;
+
+    // loss = 0.5 * w * w
+    f32 hv = 0.5f;
+    Term half = thvm_tensor(ctx, &hv, SHAPE(1));
+    Term wsq  = thvm_op(ctx, UOP_MUL, w_loss_a, w_loss_b);
+    Term loss = thvm_op(ctx, UOP_MUL, half, wsq);
+    // grad(loss, w)
+    Term g = thvm_grad_u(ctx, loss, w_grad_tgt);
+    // step = lr * g ; new = w - step
+    f32 lrv = 0.1f;
+    Term lr = thvm_tensor(ctx, &lrv, SHAPE(1));
+    Term step = thvm_op(ctx, UOP_MUL, lr, g);
+    Term new_w = thvm_op(ctx, UOP_SUB, w_sub_lhs, step);
+    // ASSIGN(dst, new_w)
+    Term assign = thvm_assign(ctx, w_assign_dst, new_w);
+    // train(m)(w_recurse)
+    Term rec = thvm_app(ctx,
+               thvm_app(ctx, thvm_ref(ctx, train_id), next_c),
+                        w_recurse);
+    // SEQ(assign, rec)
+    Term seq_body = thvm_seq(ctx, assign, rec);
+    heap_set(ctx, term_val(succ) + 1, seq_body);
+    // IFZ(counter, base, succ)
+    heap_set(ctx, term_val(lam_w) + 1, thvm_ifz(ctx, cvar, w_base, succ));
+    heap_set(ctx, term_val(lam_c) + 1, lam_w);
+    ctx->defs[train_id] = lam_c;
+
+    u32 n_steps = 10;
+    Term start = thvm_app(ctx,
+                 thvm_app(ctx, thvm_ref(ctx, train_id), thvm_scalar_u32(ctx, n_steps)),
+                          w_init);
+    Term r = thvm_eval(ctx, start);
+    f32 *h = thvm_to_host(ctx, r);
+    f32 expect = 4.0f;
+    for (u32 i = 0; i < n_steps; i++) expect *= 0.9f;
+    int ok = (h != NULL);
+    if (h) {
+        f32 diff = h[0] - expect; if (diff < 0) diff = -diff;
+        if (diff > 1e-2f) { fprintf(stderr, "  rec_sgd: w=%g expect=%g\n", h[0], expect); ok = 0; }
+    }
+    thvm_free(ctx);
+    return report("e2e_recursive_sgd", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -2352,6 +2428,7 @@ int main(void) {
     // fails += test_e2e_conv_like();  // MUL Leibniz shape-mismatch when operand is PAD'd
     fails += test_e2e_softmax();
     fails += test_e2e_sgd_loop();
+    // fails += test_e2e_recursive_sgd();  // FIXME: IFZ+REF+LAM+ASSIGN+GRAD2 integration — readback NULL
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);
     // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.

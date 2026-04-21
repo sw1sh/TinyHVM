@@ -778,6 +778,46 @@ static int test_gradu_rmax(void) {
     return report("gradu_rmax", ok);
 }
 
+// UOP_GRAD2: MM, ASSIGN.
+static int test_gradu_mm(void) {
+    setup_graph_dir("gradu_mm");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {1,2,3,4,5,6}, bd[] = {1,0,0,1,1,0};
+    Term a = thvm_tensor(ctx, ad, SHAPE(2, 3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3, 2));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_op_raw(ctx, UOP_MM, a, b);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    // Phase-0 pre-reduce topology only — MM is a symbolic/composite op
+    // on this path so post-sweep structure depends on scheduler.
+    const char *pre[]  = {"CTR", "GRAD2", "MM"};
+    int ok = topo_check("gradu_mm", 0, pre, 3);
+    return report("gradu_mm", ok);
+}
+static int test_gradu_assign(void) {
+    setup_graph_dir("gradu_assign");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {0,0,0}, bd[] = {1,2,3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_op(ctx, UOP_ASSIGN, a, b);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){y0, thvm_grad_u(ctx, y1, a)}, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD2", "ASSIGN"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("gradu_assign", 0, pre, 3)
+          && topo_check("gradu_assign", 1, post, 1);
+    return report("gradu_assign", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -828,6 +868,8 @@ int main(void) {
     fails += test_gradu_pad();
     fails += test_gradu_expand();
     fails += test_gradu_rmax();
+    fails += test_gradu_mm();
+    fails += test_gradu_assign();
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

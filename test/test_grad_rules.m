@@ -2473,6 +2473,30 @@ static int test_e2e_scalar_mul_grad(void) {
     return report("e2e_scalar_mul_grad", ok);
 }
 
+// Full scalar-loss backward through 2-layer elementwise MLP:
+// y = sum(relu(x*w1)*w2).  target = w1.  Analytical: dy/dw1_i = x_i*w2_i for z_i>0.
+// x=[1,2,3] w1=[0.1,0.2,0.3] w2=[2,2,2] → z=[0.1,0.4,0.9]>0, dy/dw1=[2,4,6].
+static int test_e2e_mlp_scalar_loss(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[]={1,2,3}, w1d[]={0.1f,0.2f,0.3f}, w2d[]={2,2,2};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term w1 = thvm_tensor(ctx, w1d, SHAPE(3));
+    Term w2 = thvm_tensor(ctx, w2d, SHAPE(3));
+    Term z = thvm_op(ctx, UOP_MUL, x, w1);
+    Term h = thvm_op(ctx, UOP_RELU, z, term_era());
+    Term hw = thvm_op(ctx, UOP_MUL, h, w2);
+    Term y = thvm_sum_axes(ctx, hw, (u32[]){0}, 1);
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad_u(ctx, y, w1)));
+    f32 expect[]={2, 4, 6};
+    int ok = (g != NULL);
+    if (g) for (int i = 0; i < 3; i++) {
+        f32 d = g[i]-expect[i]; if (d<0) d=-d;
+        if (d > 1e-3f) { fprintf(stderr,"  mlp_scalar g[%d]=%g e=%g\n", i, g[i], expect[i]); ok=0; }
+    }
+    thvm_free(ctx);
+    return report("e2e_mlp_scalar_loss", ok);
+}
+
 int main(void) {
     int fails = 0;
     fails += test_add();
@@ -2593,6 +2617,7 @@ int main(void) {
     fails += test_e2e_adam_linear_fit();
     // fails += test_e2e_mm_bwd();  // MUL-Leibniz shape mismatch when one operand is EXPAND-broadcast; needs shape reconciliation
     // fails += test_e2e_scalar_mul_grad();  // EXPAND rule over-counts when target doesn't flow; leave for design rework
+    fails += test_e2e_mlp_scalar_loss();
 
     // test_gradu_lambda() deferred — thvm_lam requires two-step
     // construction (ERA body placeholder, then heap_set the real body);

@@ -346,11 +346,30 @@ static inline int wnf_is_atom(u8 tag) {
 
 // Share-or-DUP: VJP rules need the same operand twice — once as a
 // recursion target, once embedded in the returned cotangent expression.
-// For shareable-by-reference terms (TEN, NUM, ERA, ANY) we skip DUP and
-// alias directly: avoids phantom DP0/DP1 ports that clutter the step
-// graph without doing work.  TEN refcount is incremented so the second
-// alias is a full reference holder.  For non-atoms (DP0/DP1, TOP, VAR,
-// CTR) we fall back to thvm_dup which goes through the IC protocol.
+// For shareable-by-reference terms we skip DUP and alias directly —
+// avoids phantom DP0/DP1 ports that clutter the step graph without
+// doing IC work.
+//
+// Aliasable:
+//   TEN — tensor handle; bump refcount, return the same handle twice.
+//   NUM, ERA, ANY — pure value terms.
+//   Pure compute TOP — reducing a compute TOP produces a TEN which
+//     gets written to the TOP's heap slot.  Two references to the
+//     same TOP observe the same TEN after the first reduction; the
+//     transparent-projection DUP rule for compute TOPs in
+//     interact/combinators.c:510 does exactly this with an extra
+//     heap cell and phantom aux port.  Aliasing is the same behaviour
+//     without the cell.  UOP_GRAD, UOP_ASSIGN, UOP_KERNEL, UOP_EXEC,
+//     UOP_DETACH are NOT pure (effectful / target-bound) and need
+//     real DUP.
+//
+// DP0/DP1, LAM, VAR, CTR, SUP: IC rules matter → use thvm_dup.
+static inline int wnf_top_is_pure_compute(u32 uop) {
+    return uop != UOP_GRAD && uop != UOP_GRAD_FWD &&
+           uop != UOP_ASSIGN && uop != UOP_KERNEL &&
+           uop != UOP_EXEC && uop != UOP_DETACH;
+}
+
 static inline void wnf_share_or_dup(TinyHVM *ctx, Term t, Term *a, Term *b) {
     u8 tag = term_tag(t);
     if (tag == TAG_TEN) {
@@ -360,6 +379,11 @@ static inline void wnf_share_or_dup(TinyHVM *ctx, Term t, Term *a, Term *b) {
         return;
     }
     if (tag == TAG_NUM || tag == TAG_ERA || tag == TAG_ANY) {
+        *a = t;
+        *b = t;
+        return;
+    }
+    if (tag == TAG_TOP && wnf_top_is_pure_compute(term_ext(t))) {
         *a = t;
         *b = t;
         return;

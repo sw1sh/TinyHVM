@@ -1854,30 +1854,15 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
     const char *step_graph_dir = thvm_step_graph_dir();
     step_graph_root_term = root;
     u64 sig = thvm_step_graph_sig(ctx);
+    // Dedup identical heap sigs (e.g. no-op hook fires before full wnf
+    // reduction settles), but no longer dedup on rendered-dot sig — the
+    // wnf stack machine often mutates unreachable scratch cells that
+    // don't surface in root-only rendering, yet still represent real
+    // interactions worth their own frame.
     if (sig == step_graph_last_sig) {
         thvm_step_alo_substs_clear(ctx);
         return;
     }
-    char tmp_struct[256];
-    snprintf(tmp_struct, sizeof(tmp_struct), "%s/.tmp_step_struct.dot", step_graph_dir);
-    thvm_heap_dot_set_highlight(0, 0);
-    thvm_heap_dot_set_step_meta("", "");
-    heap_dot_root_only = 1;
-    thvm_heap_dot_root(ctx, tmp_struct, root);
-    heap_dot_root_only = 0;
-    u64 dot_sig = thvm_file_sig(tmp_struct);
-    if (dot_sig == step_graph_last_dot_sig) {
-        step_graph_last_sig = sig;
-        remove(tmp_struct);
-        step_graph_before_grad_y = 0;
-        step_graph_before_era_payload = 0;
-        step_graph_before_top_had_era = 0;
-        step_graph_before_top_partner = 0;
-        step_graph_before_top_partner_slot = 0;
-        thvm_step_alo_substs_clear(ctx);
-        return;
-    }
-    remove(tmp_struct);
     char tmp[384];
     snprintf(tmp, sizeof(tmp), "%s/.tmp_step.dot", step_graph_dir);
     u64 next_hs = 0; Term next_ht = 0; u64 next_source_slot = 0; Term next_before = 0;
@@ -1923,9 +1908,12 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
     } else {
         thvm_heap_dot_set_highlight(0, 0);
         thvm_heap_dot_set_step_meta("pending", "pending");
-        heap_dot_root_only = 1;
+        // Render the full heap (root_only=0) so wnf's off-root scaffolding
+        // (DUP cells, intermediate TOPs built by the stack machine) shows
+        // up in each snapshot — the wnf CPS style stages work off-tree
+        // before substituting back, so root-only rendering would collapse
+        // many interactions into identical-looking frames.
         thvm_heap_dot_root(ctx, tmp, root);
-        heap_dot_root_only = 0;
     }
     // Edge highlight is the only acceptable highlight for step graphs.
     // If it couldn't be drawn, leave the snapshot un-highlighted rather
@@ -1966,7 +1954,6 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
     if (render_sig == step_graph_last_render_sig) {
         remove(p);
         step_graph_last_sig = sig;
-        step_graph_last_dot_sig = dot_sig;
         step_graph_before_grad_y = 0;
         step_graph_before_era_payload = 0;
         step_graph_before_top_had_era = 0;
@@ -1987,7 +1974,6 @@ static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Ter
              current_name);
     step_graph_n++;
     step_graph_last_sig = sig;
-    step_graph_last_dot_sig = dot_sig;
     step_graph_last_render_sig = render_sig;
     step_graph_before_grad_y = 0;
     step_graph_before_era_payload = 0;

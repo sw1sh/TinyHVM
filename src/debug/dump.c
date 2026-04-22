@@ -15,6 +15,14 @@ static int heap_dot_hl_hit = 0;
 static char heap_dot_prev_name[96] = {0};
 static char heap_dot_next_name[96] = {0};
 static int heap_dot_include_sched_kernels = 0;
+// When set, the heap dumper seeds the walk from every non-ERA heap slot
+// in addition to `root`, so off-root scaffolding created by the wnf
+// stack machine (DUP cells, intermediate compute TOPs pending
+// substitution) shows up in per-step graphs.
+static int heap_dot_include_all_slots = 0;
+static void thvm_heap_dot_set_include_all(int enabled) {
+    heap_dot_include_all_slots = enabled ? 1 : 0;
+}
 #define DOT_KERNEL_FALLBACK_MAX 1024
 static u64 heap_dot_kernel_fallback_locs[DOT_KERNEL_FALLBACK_MAX];
 static u32 heap_dot_kernel_fallback_n = 0;
@@ -1185,6 +1193,14 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     slot_live[h] = 1;
                     PUSH_TERM(ht);
                 }
+            }
+            if (heap_dot_include_all_slots &&
+                !(term_tag(ht) == TAG_ERA && term_val(ht) == 0)) {
+                // Force every non-inert slot live so wnf scaffolding
+                // (DUP cells, intermediate TOPs, ALO stubs, …) shows up
+                // in each per-step snapshot.
+                slot_live[h] = 1;
+                PUSH_TERM(ht);
             }
         }
 

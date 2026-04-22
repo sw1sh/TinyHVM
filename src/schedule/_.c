@@ -2,6 +2,12 @@
 static void thvm_heap_dot(TinyHVM *ctx, const char *path);
 static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 static void thvm_heap_dot_set_sched_kernels(int enabled);
+static void thvm_heap_dot_set_highlight(u64 slot, Term term);
+static void thvm_heap_dot_set_step_meta(const char *prev_name, const char *next_name);
+static void thvm_heap_dot_set_include_all(int enabled);
+static u64  thvm_file_sig(const char *path);
+static const char *thvm_step_graph_dir(void);
+static u32 thvm_step_graph_max_steps(void);
 static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root);
 static void thvm_step_graph_name_for_interaction(TinyHVM *ctx, u64 source_slot, Term before,
                                                  char *buf, size_t nbuf);
@@ -1615,32 +1621,104 @@ static Term thvm_step_session_init(TinyHVM *ctx, Term root,
     return traced;
 }
 
+// wnf-driven step-graph session: run thvm_reduce once with a per-rule
+// hook that emits one dot frame per wnf interaction.  Minimal emitter
+// — no sig dedup, no highlight prediction, no next-redex forecasting.
+// Just: after each wnf rule fires, snapshot the whole heap.
+static TinyHVM *g_step_session_ctx   = NULL;
+static Term     g_step_session_root  = 0;
+static u32      g_step_session_frame = 0;
+static char     g_step_session_dir[512] = {0};
+
+static u64 g_step_session_last_render_sig = 0;
+
+static void wnf_step_session_hook(TinyHVM *ctx) {
+    if (ctx != g_step_session_ctx) return;
+    if (g_step_session_dir[0] == 0) return;
+    if (g_step_session_frame >= thvm_step_graph_max_steps()) return;
+    char path[640];
+    snprintf(path, sizeof(path), "%s/step_%03u.dot",
+             g_step_session_dir, g_step_session_frame);
+    thvm_heap_dot_set_highlight(0, 0);
+    thvm_heap_dot_set_step_meta("", "");
+    thvm_heap_dot_set_include_all(1);
+    thvm_heap_dot_root(ctx, path, g_step_session_root);
+    thvm_heap_dot_set_include_all(0);
+    // Dedup on rendered content — collapses enter-phase administrative
+    // firings (VAR resolve, INC unwrap, ...) that don't change what the
+    // step graph actually shows.
+    u64 render_sig = thvm_file_sig(path);
+    if (render_sig == g_step_session_last_render_sig) {
+        remove(path);
+        return;
+    }
+    g_step_session_last_render_sig = render_sig;
+    g_step_session_frame++;
+}
+
 static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
-    u8 *reach = NULL;
-    size_t reach_cap = 0;
-    traced = thvm_step_session_init(ctx, traced, &reach, &reach_cap);
-    thvm_step_graph_eval_begin(ctx, traced);
+    const char *dir = thvm_step_graph_dir();
+    snprintf(g_step_session_dir, sizeof(g_step_session_dir), "%s", dir);
+    char cmd[640];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s && rm -f %s/step_*.dot %s/step_*.png",
+             dir, dir, dir);
+    system(cmd);
 
-    for (u32 guard = 0; guard < 100000; guard++) {
-        StepMeta meta;
-        if (!thvm_reduce_step_collect(ctx, &traced, &meta, &reach, &reach_cap))
-            break;
-        thvm_step_graph_after_interaction(ctx, meta.source_slot, meta.before, meta.name, traced);
-    }
-    free(reach);
+    // Frame 0: initial state.
+    g_step_session_root              = traced;
+    g_step_session_ctx               = ctx;
+    g_step_session_frame             = 0;
+    g_step_session_last_render_sig   = 0;
+    char p0[640];
+    snprintf(p0, sizeof(p0), "%s/step_%03u.dot", dir, g_step_session_frame);
+    thvm_heap_dot_set_highlight(0, 0);
+    thvm_heap_dot_set_step_meta("", "");
+    thvm_heap_dot_set_include_all(1);
+    thvm_heap_dot_root(ctx, p0, traced);
+    thvm_heap_dot_set_include_all(0);
+    g_step_session_last_render_sig = thvm_file_sig(p0);
+    g_step_session_frame++;
 
-    // Finalize BEFORE phase-2 quiesce so the final snapshot reflects the
-    // step-by-step IC normal form (e.g. the KERNEL DAG), not the dispatched
-    // tensor produced by phase-2.
-    thvm_step_graph_set_root(traced);
-    thvm_step_graph_finalize(ctx);
-    // When the caller has asked to stop after the sweep phase (e.g. GRAD
-    // rule topology tests), skip the post-loop quiesce — it drives the
-    // graph into compute territory that chokes on NUM operands.
-    if (!getenv("THVM_GRAPH_STOP_AFTER_SWEEP")) {
-        traced = reduce_net_quiesce(ctx, traced);
+    // Drive reduction; hook emits one dot per wnf interaction.
+    thvm_wnf_set_step_hook(wnf_step_session_hook);
+    traced = thvm_reduce(ctx, traced);
+    thvm_wnf_clear_step_hook();
+
+    // Final-state frame (skipped if identical to last).
+    g_step_session_root = traced;
+    char pF[640];
+    snprintf(pF, sizeof(pF), "%s/step_%03u_final.dot", dir, g_step_session_frame);
+    thvm_heap_dot_set_highlight(0, 0);
+    thvm_heap_dot_set_step_meta("", "");
+    thvm_heap_dot_set_include_all(1);
+    thvm_heap_dot_root(ctx, pF, traced);
+    thvm_heap_dot_set_include_all(0);
+    u64 final_sig = thvm_file_sig(pF);
+    if (final_sig != g_step_session_last_render_sig) {
+        g_step_session_frame++;
+    } else {
+        remove(pF);
     }
+
+    // Render PNGs.
+    if (!getenv("THVM_STEP_GRAPH_NO_PNG")) {
+        snprintf(cmd, sizeof(cmd),
+                 "for f in %s/step_*.dot; do dot -Tpng -Gdpi=150 \"$f\" -o \"${f%%.dot}.png\" 2>/dev/null; done",
+                 dir);
+        system(cmd);
+    }
+    fprintf(stderr, "Step graphs (%u frames) → %s/\n",
+            g_step_session_frame, dir);
+
+    g_step_session_ctx  = NULL;
+    g_step_session_root = 0;
+    g_step_session_frame = 0;
+    g_step_session_dir[0] = 0;
     step_root_slot = 0;
+
+    // Phase-2 quiesce unless the caller wants post-sweep topology only.
+    if (!getenv("THVM_GRAPH_STOP_AFTER_SWEEP"))
+        traced = reduce_net_quiesce(ctx, traced);
     sched_planner_release_detached_slots();
     return traced;
 }

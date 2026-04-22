@@ -137,6 +137,20 @@ static WnfFrame *g_wnf_stack_buf = NULL;
 static u32       g_wnf_stack_cap = 0;
 static u32       g_wnf_stack_pos = 0;
 
+// Per-rule hook fired at each interaction (each ctx->itrs++).  Default
+// NULL (no overhead).  Callers register a hook to snapshot heap state
+// after each rule — used by the step-graph dumper.
+typedef void (*WnfStepHook)(TinyHVM *ctx);
+static WnfStepHook g_wnf_step_hook = NULL;
+
+void thvm_wnf_set_step_hook(WnfStepHook hook) { g_wnf_step_hook = hook; }
+void thvm_wnf_clear_step_hook(void)          { g_wnf_step_hook = NULL; }
+
+#define WNF_FIRED() do { \
+    ctx->itrs++; \
+    if (g_wnf_step_hook) g_wnf_step_hook(ctx); \
+} while (0)
+
 static void wnf_stack_push(WnfFrame f) {
     if (!g_wnf_stack_buf) {
         g_wnf_stack_buf = (WnfFrame *)malloc(sizeof(WnfFrame) * WNF_STACK_INIT_CAP);
@@ -250,7 +264,7 @@ static Term wnf_grad_ten_leaf(TinyHVM *ctx, Term tgt, Term y_whnf, int is_fwd) {
     }
     u32 ytid = (u32)term_val(y_whnf);
     u32 ttid = (u32)term_val(tgt);
-    if (ytid != ttid) { ctx->itrs++; return term_era(); }
+    if (ytid != ttid) { WNF_FIRED(); return term_era(); }
     Shape osh = SHAPE(1);
     if (ytid < ctx->tensor_count) osh = ctx->tensors[ytid].view.shape;
     if (is_fwd && osh.rank > 0) {
@@ -259,7 +273,7 @@ static Term wnf_grad_ten_leaf(TinyHVM *ctx, Term tgt, Term y_whnf, int is_fwd) {
         for (u32 i = 0; i < n; i++) buf[i] = 1.0f;
         Term out = thvm_tensor(ctx, buf, osh);
         free(buf);
-        ctx->itrs++; return out;
+        WNF_FIRED(); return out;
     }
     Shape one_shape = {.rank = osh.rank};
     for (u32 i = 0; i < osh.rank; i++) one_shape.dims[i] = 1;
@@ -268,7 +282,7 @@ static Term wnf_grad_ten_leaf(TinyHVM *ctx, Term tgt, Term y_whnf, int is_fwd) {
     Term scalar = thvm_tensor(ctx, &v, one_shape);
     int is_scalar_shape = (osh.rank == 0) ||
                           (osh.rank == 1 && osh.dims[0] == 1);
-    ctx->itrs++;
+    WNF_FIRED();
     return is_scalar_shape ? scalar : thvm_expand(ctx, scalar, osh);
 }
 
@@ -363,7 +377,7 @@ enter: {
         Term sub = heap_read(ctx, loc);
         if (term_is_sub(sub)) { whnf = next; goto apply; }
         if (term_tag(sub) == TAG_ERA && term_val(sub) != 0) {
-            ctx->itrs++;
+            WNF_FIRED();
             whnf = thvm_make_active_era(ctx, sub);
             goto apply;
         }
@@ -371,7 +385,7 @@ enter: {
             Term forced = thvm_force_tensor_term(ctx, sub);
             if (term_tag(forced) == TAG_TEN) {
                 heap_set(ctx, loc, forced);
-                ctx->itrs++;
+                WNF_FIRED();
                 whnf = forced;
                 goto apply;
             }
@@ -386,7 +400,7 @@ enter: {
     if (tag == TAG_ANN) {
         u64 loc = term_val(next);
         if (loc >= ctx->heap_pos) { whnf = next; goto apply; }
-        ctx->itrs++;
+        WNF_FIRED();
         next = heap_read(ctx, loc);
         goto enter;
     }
@@ -405,12 +419,12 @@ enter: {
         }
         Term head = heap_read(ctx, loc);
         if (ar == 1) {
-            ctx->itrs++;
+            WNF_FIRED();
             next = head;
             goto enter;
         }
         if (term_tag(head) == TAG_ERA) {
-            ctx->itrs++;
+            WNF_FIRED();
             next = term_new(TAG_CTR, (u8)(ar - 1), loc + 1);
             goto enter;
         }
@@ -425,14 +439,14 @@ enter: {
         if (name >= ctx->def_count) { whnf = next; goto apply; }
         if (ctx->def_books[name] == 0)
             ctx->def_books[name] = thvm_book_from_dynamic(ctx, ctx->defs[name]);
-        ctx->itrs++;
+        WNF_FIRED();
         next = thvm_alo_realize(ctx, ctx->def_books[name], 0);
         goto enter;
     }
 
     // ALO: force exactly one static/book layer into dynamic net.
     if (tag == TAG_ALO) {
-        ctx->itrs++;
+        WNF_FIRED();
         next = thvm_alo_force(ctx, next);
         goto enter;
     }
@@ -451,7 +465,7 @@ enter: {
             Term v = term_strip_sub(cell);
             if (term_tag(v) == TAG_TEN)
                 tensor_incref(ctx, (u32)term_val(v));
-            ctx->itrs++;
+            WNF_FIRED();
             whnf = v;
             goto apply;
         }
@@ -623,7 +637,7 @@ enter: {
             }
             Term r = thvm_interact(ctx, next);
             if (r != next) {
-                ctx->itrs++;
+                WNF_FIRED();
                 next = r;
                 goto enter;
             }
@@ -642,7 +656,7 @@ enter: {
     if (tag == TAG_INC) {
         u64 loc = term_val(next);
         if (loc >= ctx->heap_pos) { whnf = next; goto apply; }
-        ctx->itrs++;
+        WNF_FIRED();
         next = heap_read(ctx, loc);
         goto enter;
     }
@@ -780,14 +794,14 @@ enter: {
 
             if (done) {
                 heap_set(ctx, era_loc, term_era());
-                ctx->itrs++;
+                WNF_FIRED();
                 whnf = term_era();
                 #undef WNF_ERA_ARITY
                 goto apply;
             }
             // Continue walking: install cont at era_loc, flip ext bit, loop.
             heap_set(ctx, era_loc, cont);
-            ctx->itrs++;
+            WNF_FIRED();
             ext_bit ^= 1u;
             // Continue iterating — next = ERA(ext_bit, era_loc).
             (void)ext_bit;
@@ -860,7 +874,7 @@ apply: {
             }
             if (wtag == TAG_NUM || wtag == TAG_ERA) {
                 whnf = term_era();
-                ctx->itrs++;
+                WNF_FIRED();
                 continue;
             }
 
@@ -1012,7 +1026,7 @@ apply: {
                 // CMP: non-differentiable → ERA.
                 if (wuop == UOP_CMP) {
                     whnf = term_era();
-                    ctx->itrs++;
+                    WNF_FIRED();
                     continue;
                 }
 
@@ -1056,7 +1070,7 @@ apply: {
                             int is_sc = (tsh.rank == 0) ||
                                         (tsh.rank == 1 && tsh.dims[0] == 1);
                             whnf = is_sc ? scalar : thvm_expand(ctx, scalar, tsh);
-                            ctx->itrs++;
+                            WNF_FIRED();
                             continue;
                         }
                     }
@@ -1070,7 +1084,7 @@ apply: {
                         ? scalar : thvm_expand(ctx, scalar, y_shape);
                     whnf = (y_shape.rank != 0 && tsh.rank != 0)
                         ? sum_to_shape(ctx, y_ones, y_shape, tsh) : y_ones;
-                    ctx->itrs++;
+                    WNF_FIRED();
                     continue;
                 }
 
@@ -1153,7 +1167,7 @@ apply: {
                                 pp[j*2+1] = a_shape.dims[j] - sf[j*2+1];
                             }
                             whnf = thvm_pad(ctx, y_ones, pp, nd);
-                            ctx->itrs++;
+                            WNF_FIRED();
                             continue;
                         } else { // UOP_PAD
                             Shape y_shape = SHAPE(1);
@@ -1174,7 +1188,7 @@ apply: {
                                     sp[j*2+1] = sf[j*2] + a_shape.dims[j];
                                 }
                                 whnf = thvm_shrink(ctx, y_ones, sp, nd);
-                                ctx->itrs++;
+                                WNF_FIRED();
                                 continue;
                             }
                         }
@@ -1227,7 +1241,7 @@ apply: {
                         Term scalar = thvm_tensor(ctx, &z, one_shape);
                         int is_sc = (tsh.rank == 0) || (tsh.rank == 1 && tsh.dims[0] == 1);
                         whnf = is_sc ? scalar : thvm_expand(ctx, scalar, tsh);
-                        ctx->itrs++;
+                        WNF_FIRED();
                         continue;
                     }
                     Shape one_ysh = {.rank = ysh.rank};
@@ -1239,13 +1253,13 @@ apply: {
                     if (t_tid == a_tid && a_tid != ~0u) {
                         Term bT = thvm_permute(ctx, b, ax, 2);
                         whnf = thvm_op(ctx, UOP_MM, gy, bT);
-                        ctx->itrs++;
+                        WNF_FIRED();
                         continue;
                     }
                     if (t_tid == b_tid && b_tid != ~0u) {
                         Term aT = thvm_permute(ctx, a, ax, 2);
                         whnf = thvm_op(ctx, UOP_MM, aT, gy);
-                        ctx->itrs++;
+                        WNF_FIRED();
                         continue;
                     }
                     // Neither leaf matches → zeros of target shape.
@@ -1256,7 +1270,7 @@ apply: {
                     Term scalar = thvm_tensor(ctx, &z, one_shape);
                     int is_sc = (tsh.rank == 0) || (tsh.rank == 1 && tsh.dims[0] == 1);
                     whnf = is_sc ? scalar : thvm_expand(ctx, scalar, tsh);
-                    ctx->itrs++;
+                    WNF_FIRED();
                     continue;
                 }
 
@@ -1394,7 +1408,7 @@ apply: {
                 if (term_tag(tgt) == TAG_TEN) {
                     u32 wtid = (u32)term_val(whnf);
                     u32 ttid = (u32)term_val(tgt);
-                    ctx->itrs++;
+                    WNF_FIRED();
                     whnf = (wtid == ttid) ? g : term_era();
                     continue;
                 }
@@ -1404,7 +1418,7 @@ apply: {
             }
             if (wtag == TAG_NUM || wtag == TAG_ERA) {
                 whnf = term_era();
-                ctx->itrs++;
+                WNF_FIRED();
                 continue;
             }
 
@@ -1420,7 +1434,7 @@ apply: {
             // CMP and DETACH are non-differentiable.
             if (wuop == UOP_CMP || wuop == UOP_DETACH) {
                 whnf = term_era();
-                ctx->itrs++;
+                WNF_FIRED();
                 continue;
             }
 
@@ -1751,7 +1765,7 @@ apply: {
             Term grad_a = f.t0;
             Term grad_b = whnf;
             whnf = wnf_mk_add(ctx, grad_a, grad_b);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
@@ -1781,14 +1795,14 @@ apply: {
             u32 op = (u32)(u64)f.t1;
             whnf = (op == UOP_ADD) ? wnf_mk_add(ctx, da, whnf)
                                     : wnf_mk_sub(ctx, da, whnf);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
         case WNF_F_GRAD_NEG: {
             // whnf = da.  Produce NEG(da).
             whnf = wnf_mk_neg(ctx, whnf);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
@@ -1817,7 +1831,7 @@ apply: {
             Term l = f.t0, a = f.t1;
             Term r = wnf_mk_mul(ctx, a, whnf);
             whnf = wnf_mk_add(ctx, l, r);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
@@ -1846,10 +1860,10 @@ apply: {
             Term l = f.t0, a = f.t1, b = f.t2;
             Term r = wnf_mk_mul(ctx, a, whnf);
             Term num = wnf_mk_sub(ctx, l, r);
-            if (wnf_is_era(num)) { whnf = term_era(); ctx->itrs++; continue; }
+            if (wnf_is_era(num)) { whnf = term_era(); WNF_FIRED(); continue; }
             Term den = thvm_op_raw(ctx, UOP_MUL, b, b);
             whnf = thvm_op_raw(ctx, UOP_DIV, num, den);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
@@ -1857,44 +1871,44 @@ apply: {
             // whnf = da.  Multiply by exp(a) (stored as y_whnf in f.t0).
             Term exp_a = f.t0;
             whnf = wnf_mk_mul(ctx, exp_a, whnf);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
         case WNF_F_GRAD_LOG_POST: {
             // whnf = da.  Divide by a.
             Term a = f.t0;
-            if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
+            if (wnf_is_era(whnf)) { WNF_FIRED(); continue; }
             whnf = thvm_op_raw(ctx, UOP_DIV, whnf, a);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
         case WNF_F_GRAD_SQRT_POST: {
             // whnf = da.  Divide by 2 * sqrt(a) (stored as y_whnf in f.t0).
             Term sq = f.t0;
-            if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
+            if (wnf_is_era(whnf)) { WNF_FIRED(); continue; }
             Term two = term_num_f32(2.0f);
             Term den = thvm_op_raw(ctx, UOP_MUL, two, sq);
             whnf = thvm_op_raw(ctx, UOP_DIV, whnf, den);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
         case WNF_F_GRAD_RELU_POST: {
             // whnf = da.  Mask by (a > 0).
             Term a = f.t0;
-            if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
+            if (wnf_is_era(whnf)) { WNF_FIRED(); continue; }
             Term zero = term_num_f32(0.0f);
             Term mask = thvm_op_raw(ctx, UOP_CMP, a, zero);
             whnf = wnf_mk_mul(ctx, whnf, mask);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
         case WNF_F_GRAD_VIEW_POST: {
             // whnf = da.  flags bit 0 = is_fwd, bits 1+ = uop (RESHAPE/PERMUTE/EXPAND).
-            if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
+            if (wnf_is_era(whnf)) { WNF_FIRED(); continue; }
             int is_fwd = f.flags & 1;
             u32 uop = f.flags >> 1;
             Term a = f.t0, shape = f.t1, y_tp = f.t2;
@@ -1938,17 +1952,17 @@ apply: {
                 }
             }
             whnf = out;
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
         case WNF_F_GRAD_SHRINKPAD_FWD_POST: {
             // whnf = da.  Apply same shrink/pad.
-            if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
+            if (wnf_is_era(whnf)) { WNF_FIRED(); continue; }
             u32 uop = f.flags >> 1;
             Term shape = f.t0;
             whnf = thvm_op_raw(ctx, uop, whnf, shape);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
@@ -1977,7 +1991,7 @@ apply: {
             Term db = whnf;
             Term r = wnf_is_era(db) ? term_era() : thvm_op(ctx, UOP_MM, a, db);
             whnf = wnf_mk_add(ctx, l, r);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
@@ -2003,14 +2017,14 @@ apply: {
             // whnf = db.  Assemble masked ADD.
             Term a = f.t0, b = f.t1, da = f.t2;
             Term db = whnf;
-            if (wnf_is_era(da) && wnf_is_era(db)) { whnf = term_era(); ctx->itrs++; continue; }
+            if (wnf_is_era(da) && wnf_is_era(db)) { whnf = term_era(); WNF_FIRED(); continue; }
             Term mask_a = thvm_op_raw(ctx, UOP_CMP, a, b);
             Term one = term_num_f32(1.0f);
             Term mask_b = thvm_op_raw(ctx, UOP_SUB, one, mask_a);
             Term l = wnf_mk_mul(ctx, da, mask_a);
             Term r = wnf_mk_mul(ctx, db, mask_b);
             whnf = wnf_mk_add(ctx, l, r);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
@@ -2036,20 +2050,20 @@ apply: {
             // whnf = db.  out = WHERE(cond, da, db).
             Term cond = f.t0, da = f.t2;
             Term db = whnf;
-            if (wnf_is_era(da) && wnf_is_era(db)) { whnf = term_era(); ctx->itrs++; continue; }
+            if (wnf_is_era(da) && wnf_is_era(db)) { whnf = term_era(); WNF_FIRED(); continue; }
             if (wnf_is_era(da)) da = thvm_expand(ctx, term_num_f32(0.0f), SHAPE(1));
             if (wnf_is_era(db)) db = thvm_expand(ctx, term_num_f32(0.0f), SHAPE(1));
             whnf = thvm_where(ctx, cond, da, db);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
         case WNF_F_GRAD_RMAX_POST: {
             // whnf = da; frame t0 = pre-built mask.
             Term mask = f.t0;
-            if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
+            if (wnf_is_era(whnf)) { WNF_FIRED(); continue; }
             whnf = thvm_op_raw(ctx, UOP_MUL, whnf, mask);
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
@@ -2059,7 +2073,7 @@ apply: {
             // semantics, da already carries target.shape (derived from the
             // leaf), so expanding to a_shape would over-shape it.  Only
             // expand when da is smaller than a (numel-wise).
-            if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
+            if (wnf_is_era(whnf)) { WNF_FIRED(); continue; }
             int is_fwd = f.flags & 1;
             Term a = f.t0, axes = f.t1;
             if (is_fwd) {
@@ -2091,7 +2105,7 @@ apply: {
                     whnf = thvm_expand(ctx, whnf, a_shape);
                 }
             }
-            ctx->itrs++;
+            WNF_FIRED();
             continue;
         }
 
@@ -2111,7 +2125,7 @@ apply: {
                 heap_set(ctx, dup_loc, y);
                 Term y0 = term_new(TAG_DP0, lab, dup_loc);
                 Term y1 = term_new(TAG_DP1, lab, dup_loc);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_sup(ctx, lab,
                     thvm_op2(ctx, opr, x0, y0),
                     thvm_op2(ctx, opr, x1, y1));
@@ -2137,7 +2151,7 @@ apply: {
                 u64 sup_loc = term_val(whnf);
                 Term y0 = heap_read(ctx, sup_loc + 0);
                 Term y1 = heap_read(ctx, sup_loc + 1);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_sup(ctx, lab,
                     thvm_op2(ctx, opr, x, y0),
                     thvm_op2(ctx, opr, x, y1));
@@ -2155,7 +2169,7 @@ apply: {
                     case 5: r = yv ? xv % yv : 0; break;
                     default: r = 0;
                 }
-                ctx->itrs++;
+                WNF_FIRED();
                 whnf = term_num_u32(r);
                 continue;
             }
@@ -2354,7 +2368,7 @@ apply: {
                 Term sibling = (side == 0) ? v1 : v0;
                 Term mine    = (side == 0) ? v0 : v1;
                 heap_set(ctx, dup_loc, term_set_sub(sibling));
-                ctx->itrs++;
+                WNF_FIRED();
                 whnf = mine;
                 continue;
             }
@@ -2386,7 +2400,7 @@ apply: {
                 u64 s1loc = heap_alloc(ctx, 2);
                 heap_set(ctx, s1loc + 0, a1);
                 heap_set(ctx, s1loc + 1, term_new(TAG_DP1, lab, dup));
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_sup(ctx, lab,
                     term_new(TAG_SEQ, 0, s0loc),
                     term_new(TAG_SEQ, 0, s1loc));
@@ -2403,7 +2417,7 @@ apply: {
             }
 
             // SEQ ⊳ {ERA, TEN, NUM, CTR, LAM, ...}: value — discard, return b.
-            ctx->itrs++;
+            WNF_FIRED();
             next = b;
             goto enter;
         }
@@ -2428,7 +2442,7 @@ apply: {
                 heap_set(ctx, lam_loc + 0, arg);
                 heap_set(ctx, app_loc + 0, term_era());
                 heap_set(ctx, app_loc + 1, term_era());
-                ctx->itrs++;
+                WNF_FIRED();
                 next = heap_read(ctx, lam_loc + 1);
                 goto enter;
             }
@@ -2436,14 +2450,14 @@ apply: {
             // APP ⊳ TEN: discard tensor, return arg (sequencing).
             if (term_tag(whnf) == TAG_TEN) {
                 tensor_release(ctx, (u32)term_val(whnf));
-                ctx->itrs++;
+                WNF_FIRED();
                 next = arg;
                 goto enter;
             }
 
             // APP ⊳ NUM: numeric sequencing terminal (grad bundles etc.).
             if (term_tag(whnf) == TAG_NUM) {
-                ctx->itrs++;
+                WNF_FIRED();
                 next = arg;
                 goto enter;
             }
@@ -2458,7 +2472,7 @@ apply: {
                     if (term_tag(forced) == TAG_TEN) arg = forced;
                 }
                 heap_set(ctx, bri_loc + 0, arg);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = heap_read(ctx, bri_loc + 1);
                 goto enter;
             }
@@ -2466,7 +2480,7 @@ apply: {
             // APP ⊳ ERA: erasure propagates.  Discard arg via explicit ERA.
             if (term_tag(whnf) == TAG_ERA) {
                 thvm_spawn_detached_era(ctx, arg);
-                ctx->itrs++;
+                WNF_FIRED();
                 whnf = term_era();
                 continue;
             }
@@ -2482,7 +2496,7 @@ apply: {
                 heap_set(ctx, dup_loc, arg);
                 Term arg0 = term_new(TAG_DP0, lab, dup_loc);
                 Term arg1 = term_new(TAG_DP1, lab, dup_loc);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_sup(ctx, lab,
                     thvm_app(ctx, f0, arg0),
                     thvm_app(ctx, f1, arg1));
@@ -2500,7 +2514,7 @@ apply: {
                 Term f1 = heap_read(ctx, usp_loc + 1);
                 u64 dup_loc = heap_alloc(ctx, 1);
                 heap_set(ctx, dup_loc, arg);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_usp(ctx, lab,
                     thvm_app(ctx, f0, term_new(TAG_UDP, lab, dup_loc)),
                     thvm_app(ctx, f1, term_new(TAG_UDP, lab, dup_loc)));
@@ -2547,7 +2561,7 @@ apply: {
                 Term b = heap_read(ctx, sloc + 1);
                 u64 dup = heap_alloc(ctx, 1);
                 heap_set(ctx, dup, fun);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_sup(ctx, lab,
                     thvm_app(ctx, term_new(TAG_DP0, lab, dup), a),
                     thvm_app(ctx, term_new(TAG_DP1, lab, dup), b));
@@ -2562,7 +2576,7 @@ apply: {
                 Term b = heap_read(ctx, sloc + 1);
                 u64 dup = heap_alloc(ctx, 1);
                 heap_set(ctx, dup, fun);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_usp(ctx, lab,
                     thvm_app(ctx, term_new(TAG_UDP, lab, dup), a),
                     thvm_app(ctx, term_new(TAG_UDP, lab, dup), b));
@@ -2573,7 +2587,7 @@ apply: {
             // depending on whether tags match.
             if (atag == TAG_CTR) {
                 u32 ctr_tag = term_ext(whnf);
-                ctx->itrs++;
+                WNF_FIRED();
                 if (match_tag == ctr_tag) {
                     u64 ctr_loc = term_val(whnf);
                     Term r = heap_read(ctx, mat_loc + 0);
@@ -2590,7 +2604,7 @@ apply: {
             // APP-MAT-NUM: numeric match.
             if (atag == TAG_NUM) {
                 u32 num_val = term_as_u32(whnf);
-                ctx->itrs++;
+                WNF_FIRED();
                 if (match_tag == num_val) {
                     next = heap_read(ctx, mat_loc + 0);  // handler
                 } else {
@@ -2628,7 +2642,7 @@ apply: {
                 Term b = heap_read(ctx, loc + 1);
                 u64 dup = heap_alloc(ctx, 1);
                 heap_set(ctx, dup, b);
-                ctx->itrs++;
+                WNF_FIRED();
                 Term (*op)(TinyHVM *, Term, Term) = is_or ? thvm_or : thvm_and;
                 next = thvm_sup(ctx, lab,
                     op(ctx, a0, term_new(TAG_DP0, lab, dup)),
@@ -2643,7 +2657,7 @@ apply: {
                 Term b = heap_read(ctx, loc + 1);
                 u64 dup = heap_alloc(ctx, 1);
                 heap_set(ctx, dup, b);
-                ctx->itrs++;
+                WNF_FIRED();
                 Term (*op)(TinyHVM *, Term, Term) = is_or ? thvm_or : thvm_and;
                 next = thvm_usp(ctx, lab,
                     op(ctx, a0, term_new(TAG_UDP, lab, dup)),
@@ -2651,11 +2665,11 @@ apply: {
                 goto enter;
             }
             // ERA → ERA.
-            if (at == TAG_ERA) { whnf = term_era(); ctx->itrs++; continue; }
+            if (at == TAG_ERA) { whnf = term_era(); WNF_FIRED(); continue; }
             // NUM: short-circuit.
             if (at == TAG_NUM) {
                 u32 av = term_as_u32(whnf);
-                ctx->itrs++;
+                WNF_FIRED();
                 if (is_or) {
                     if (av == 0) { next = heap_read(ctx, loc + 1); goto enter; }
                     whnf = term_num_u32(1);
@@ -2687,7 +2701,7 @@ apply: {
                 Term b = heap_read(ctx, loc + 1);
                 u64 dup = heap_alloc(ctx, 1);
                 heap_set(ctx, dup, b);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_sup(ctx, lab,
                     thvm_eql(ctx, a0, term_new(TAG_DP0, lab, dup)),
                     thvm_eql(ctx, a1, term_new(TAG_DP1, lab, dup)));
@@ -2702,21 +2716,21 @@ apply: {
                 Term b = heap_read(ctx, loc + 1);
                 u64 dup = heap_alloc(ctx, 1);
                 heap_set(ctx, dup, b);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_usp(ctx, lab,
                     thvm_eql(ctx, a0, term_new(TAG_UDP, lab, dup)),
                     thvm_eql(ctx, a1, term_new(TAG_UDP, lab, dup)));
                 goto enter;
             }
             // EQL-ERA-L.
-            if (xt == TAG_ERA) { whnf = term_era(); ctx->itrs++; continue; }
+            if (xt == TAG_ERA) { whnf = term_era(); WNF_FIRED(); continue; }
             // EQL-ANY-L.
-            if (xt == TAG_ANY) { whnf = term_num_u32(1); ctx->itrs++; continue; }
+            if (xt == TAG_ANY) { whnf = term_num_u32(1); WNF_FIRED(); continue; }
             // EQL-INC-L.
             if (xt == TAG_INC) {
                 Term inner_a = heap_read(ctx, term_val(whnf));
                 Term b = heap_read(ctx, loc + 1);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_inc(ctx, thvm_eql(ctx, inner_a, b));
                 goto enter;
             }
@@ -2746,7 +2760,7 @@ apply: {
                 u64 sloc = term_val(whnf);
                 Term b0 = heap_read(ctx, sloc + 0);
                 Term b1 = heap_read(ctx, sloc + 1);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_sup(ctx, lab,
                     thvm_eql(ctx, x, b0),
                     thvm_eql(ctx, x, b1));
@@ -2758,24 +2772,24 @@ apply: {
                 u64 sloc = term_val(whnf);
                 Term b0 = heap_read(ctx, sloc + 0);
                 Term b1 = heap_read(ctx, sloc + 1);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_usp(ctx, lab,
                     thvm_eql(ctx, x, b0),
                     thvm_eql(ctx, x, b1));
                 goto enter;
             }
-            if (yt == TAG_ERA) { whnf = term_era(); ctx->itrs++; continue; }
-            if (yt == TAG_ANY) { whnf = term_num_u32(1); ctx->itrs++; continue; }
+            if (yt == TAG_ERA) { whnf = term_era(); WNF_FIRED(); continue; }
+            if (yt == TAG_ANY) { whnf = term_num_u32(1); WNF_FIRED(); continue; }
             // EQL-INC-R.
             if (yt == TAG_INC) {
                 Term inner_b = heap_read(ctx, term_val(whnf));
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_inc(ctx, thvm_eql(ctx, x, inner_b));
                 goto enter;
             }
             // EQL-NUM.
             if (term_tag(x) == TAG_NUM && yt == TAG_NUM) {
-                ctx->itrs++;
+                WNF_FIRED();
                 whnf = term_num_u32(term_as_u32(x) == term_as_u32(whnf) ? 1 : 0);
                 continue;
             }
@@ -2789,7 +2803,7 @@ apply: {
                 Term fresh_var = term_num_u32(fresh);
                 heap_set(ctx, a_loc, fresh_var);
                 heap_set(ctx, b_loc, fresh_var);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_eql(ctx, a_body, b_body);
                 goto enter;
             }
@@ -2804,7 +2818,7 @@ apply: {
                          yt == TAG_CTR || yt == TAG_LAM);
             (void)eql_orig;
             if (x_val && y_val) {
-                ctx->itrs++;
+                WNF_FIRED();
                 whnf = term_num_u32(0);
                 continue;
             }
@@ -2828,7 +2842,7 @@ apply: {
             u32 label = term_as_u32(whnf);
             Term a = heap_read(ctx, loc + 1);
             Term b = heap_read(ctx, loc + 2);
-            ctx->itrs++;
+            WNF_FIRED();
             next = thvm_sup(ctx, label, a, b);
             goto enter;
         }
@@ -2847,7 +2861,7 @@ apply: {
             Term bod = heap_read(ctx, loc + 2);
             Term dp0, dp1;
             thvm_dup(ctx, label, val, &dp0, &dp1);
-            ctx->itrs++;
+            WNF_FIRED();
             next = thvm_app(ctx, thvm_app(ctx, bod, dp0), dp1);
             goto enter;
         }
@@ -2866,7 +2880,7 @@ apply: {
                 Term a = heap_read(ctx, usp_loc + 0);
                 Term b = heap_read(ctx, usp_loc + 1);
                 heap_set(ctx, udp_loc, b);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = a;
                 goto enter;
             }
@@ -2878,7 +2892,7 @@ apply: {
                 Term b = heap_read(ctx, usp_loc + 1);
                 u64 du_a = heap_alloc(ctx, 1); heap_set(ctx, du_a, a);
                 u64 du_b = heap_alloc(ctx, 1); heap_set(ctx, du_b, b);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_usp(ctx, usp_label,
                     term_new(TAG_UDP, udp_label, du_a),
                     term_new(TAG_UDP, udp_label, du_b));
@@ -2892,7 +2906,7 @@ apply: {
                 Term b = heap_read(ctx, sup_loc + 1);
                 u64 du_a = heap_alloc(ctx, 1); heap_set(ctx, du_a, a);
                 u64 du_b = heap_alloc(ctx, 1); heap_set(ctx, du_b, b);
-                ctx->itrs++;
+                WNF_FIRED();
                 next = thvm_sup(ctx, sup_label,
                     term_new(TAG_UDP, udp_label, du_a),
                     term_new(TAG_UDP, udp_label, du_b));
@@ -2915,7 +2929,7 @@ apply: {
                 u64 vdup = heap_alloc(ctx, 1);
                 heap_set(ctx, vdup, var0);
                 heap_set(ctx, lam_loc, term_new(TAG_UDP, udp_label, vdup));
-                ctx->itrs++;
+                WNF_FIRED();
                 whnf = lam_new;
                 continue;
             }

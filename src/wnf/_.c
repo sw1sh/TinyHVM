@@ -221,6 +221,71 @@ enter: {
 
     if (wnf_is_atom(tag)) { whnf = next; goto apply; }
 
+    // VAR: look up substitution.  If sub-flagged → unbound, return as-is.
+    // ERA payload (nonzero val) → active-ERA clone.  DETACH TOP → force.
+    // Otherwise → take the sub and re-enter.
+    if (tag == TAG_VAR) {
+        u64 loc = term_val(next);
+        if (loc >= ctx->heap_pos) { whnf = next; goto apply; }
+        Term sub = heap_read(ctx, loc);
+        if (term_is_sub(sub)) { whnf = next; goto apply; }
+        if (term_tag(sub) == TAG_ERA && term_val(sub) != 0) {
+            ctx->itrs++;
+            whnf = thvm_make_active_era(ctx, sub);
+            goto apply;
+        }
+        if (term_tag(sub) == TAG_TOP && term_ext(sub) == UOP_DETACH) {
+            Term forced = thvm_force_tensor_term(ctx, sub);
+            if (term_tag(forced) == TAG_TEN) {
+                heap_set(ctx, loc, forced);
+                ctx->itrs++;
+                whnf = forced;
+                goto apply;
+            }
+            whnf = forced;
+            goto apply;
+        }
+        next = sub;
+        goto enter;
+    }
+
+    // ANN: annotation — strip and return inner (slot 0).
+    if (tag == TAG_ANN) {
+        u64 loc = term_val(next);
+        if (loc >= ctx->heap_pos) { whnf = next; goto apply; }
+        ctx->itrs++;
+        next = heap_read(ctx, loc);
+        goto enter;
+    }
+
+    // BRI: bridge — WNF until applied (like LAM).
+    if (tag == TAG_BRI) { whnf = next; goto apply; }
+
+    // CTR: unary unwrap / ERA-head shrink; otherwise WNF.
+    //   CTR#1{x} → x
+    //   CTR#N{ERA, xs...} → CTR#(N-1){xs...}
+    if (tag == TAG_CTR) {
+        u32 ar = term_ext(next);
+        u64 loc = term_val(next);
+        if (ar == 0 || loc == 0 || loc >= ctx->heap_pos) {
+            whnf = next; goto apply;
+        }
+        Term head = heap_read(ctx, loc);
+        if (ar == 1) {
+            ctx->itrs++;
+            next = head;
+            goto enter;
+        }
+        if (term_tag(head) == TAG_ERA) {
+            ctx->itrs++;
+            next = term_new(TAG_CTR, (u8)(ar - 1), loc + 1);
+            goto enter;
+        }
+        // Multi-field CTR with non-ERA head: WNF.
+        whnf = next;
+        goto apply;
+    }
+
     // REF: unfold named definition into lazy allocation frontier.
     if (tag == TAG_REF) {
         u32 name = (u32)term_ext(next);

@@ -3004,7 +3004,7 @@ int main(void) {
     fails += test_e2e_grad_pad();
     fails += test_e2e_grad_expand();
     fails += test_e2e_mse_grad();
-    // fails += test_e2e_conv_like();  // BLOCKED: MUL Leibniz fails when a,b shapes != tgt.shape (pad(x)*w); needs reverse-mode MUL VJP with sum_to_shape
+    // fails += test_e2e_conv_like();  // BLOCKED: MUL Leibniz of pad(x)*w uses da with target.shape=[4] vs b.shape=[6]; needs reverse-mode MUL VJP with sum_to_shape
     fails += test_e2e_softmax();
     fails += test_e2e_sgd_loop();
     fails += test_e2e_recursive_sgd();
@@ -3030,7 +3030,7 @@ int main(void) {
     fails += test_e2e_d2_cube_jvp_vjp();
     fails += test_e2e_cross_partial();
     fails += test_e2e_shared_target_mul();
-    // fails += test_e2e_view_chain_grad();  // BLOCKED: inner RESHAPE/PERMUTE rules wrap grad in operand-shape, SUM.expand then shape-mismatches; same shape-bookkeeping issue as conv_like
+    fails += test_e2e_view_chain_grad();
     fails += test_e2e_div_chain();
     fails += test_e2e_disconnected_target();
     fails += test_e2e_jvp_elementwise();

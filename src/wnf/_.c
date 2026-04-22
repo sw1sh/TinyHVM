@@ -1548,7 +1548,11 @@ apply: {
         }
 
         case WNF_F_GRAD_SUM_POST: {
-            // whnf = da.  Fwd: SUM(da, axes).  Rev: EXPAND(da, a_shape).
+            // whnf = da.  Fwd: SUM(da, axes).  Rev: broadcast cotangent
+            // back to operand shape — but under our propagate-up-from-leaf
+            // semantics, da already carries target.shape (derived from the
+            // leaf), so expanding to a_shape would over-shape it.  Only
+            // expand when da is smaller than a (numel-wise).
             if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
             int is_fwd = f.flags & 1;
             Term a = f.t0, axes = f.t1;
@@ -1563,7 +1567,23 @@ apply: {
                     const View *v = st_get(term_val(a));
                     if (v) a_shape = v->shape;
                 }
-                whnf = (a_shape.rank != 0) ? thvm_expand(ctx, whnf, a_shape) : whnf;
+                // Compute da's numel from its view.  If already >= a_shape
+                // numel, leave as-is (leaf seeded ones(target.shape) and
+                // inner propagation already shaped it).
+                u32 a_numel = 1;
+                for (u32 i = 0; i < a_shape.rank; i++) a_numel *= a_shape.dims[i];
+                const View *dv = NULL;
+                u32 da_numel = 1;
+                if (term_tag(whnf) == TAG_TEN) {
+                    u32 id = (u32)term_val(whnf);
+                    if (id < ctx->tensor_count) { dv = &ctx->tensors[id].view; }
+                } else if (term_tag(whnf) == TAG_TOP) {
+                    dv = st_get(term_val(whnf));
+                }
+                if (dv) da_numel = dv->numel;
+                if (a_shape.rank != 0 && da_numel < a_numel) {
+                    whnf = thvm_expand(ctx, whnf, a_shape);
+                }
             }
             ctx->itrs++;
             continue;

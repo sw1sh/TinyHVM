@@ -60,8 +60,11 @@ static struct {
 } term_use_table[TERM_USE_SIZE];
 void term_use_clear(void) { memset(term_use_table, 0, sizeof(term_use_table)); }
 
+void thvm_grad_bundle_cache_reset(TinyHVM *ctx);  // defined in grad/_.c
+
 void thvm_free(TinyHVM *ctx) {
     thvm_sched_reset_runtime();
+    thvm_grad_bundle_cache_reset(ctx);
     // Free GPU buffers via each tensor's own backend
     for (u32 i = 0; i < ctx->tensor_count; i++) {
         if (ctx->tensors[i].buf_id && ctx->tensors[i].backend)

@@ -16,6 +16,7 @@
 #ifdef __APPLE__
   #include "../src/backend/metal/_.m"
 #endif
+#include "../src/nn/_.c"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2547,6 +2548,269 @@ static int test_e2e_mlp_scalar_loss(void) {
     return report("e2e_mlp_scalar_loss", ok);
 }
 
+// Smoke test for gradient flow through thvm_conv2d.
+// x=[BS=1, Cin=1, 3, 3] all ones, w=[Cout=1, 1, 2, 2] all ones, no padding
+// → y=[1,1,2,2] where each output elt = sum of 4 ones = 4.
+// loss = sum(y) = 16.  d(loss)/dw[k] = sum of input patches covered by k.
+// For this 3x3 input with 2x2 kernel:
+//   kernel position (0,0) covers top-left input = 1+1+1+1 = 4
+//   position (0,1) covers top-right = 4
+//   position (1,0) covers bottom-left = 4
+//   position (1,1) covers bottom-right = 4
+// Each kernel weight appears once per output position (2x2=4 positions), and
+// each position contributes its corresponding input (=1). So dw[any]=4.
+static int test_e2e_conv_grad_w(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[9]; for (int i = 0; i < 9; i++) xd[i] = 1.0f;
+    f32 wd[4]; for (int i = 0; i < 4; i++) wd[i] = 1.0f;
+    Term x = thvm_tensor(ctx, xd, SHAPE(1, 1, 3, 3));
+    Term w = thvm_tensor(ctx, wd, SHAPE(1, 1, 2, 2));
+    thvm_set_requires_grad(ctx, w);
+    u32 pad[4] = {0, 0, 0, 0};
+    u32 stride[2] = {1, 1};
+    Term y = thvm_conv2d(ctx, x, w, term_era(), 1, stride, pad);
+    // y shape = [1,1,2,2].  Scalar loss = sum over all dims.
+    Term loss = thvm_sum_axes(ctx, y, (u32[]){0, 1, 2, 3}, 4);
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, loss, w)));
+    int ok = (g != NULL);
+    if (g) {
+        for (int i = 0; i < 4; i++) {
+            f32 d = g[i] - 4.0f; if (d < 0) d = -d;
+            if (d > 1e-3f) { fprintf(stderr, "  conv_grad_w g[%d]=%g want 4\n", i, g[i]); ok = 0; }
+        }
+    }
+    thvm_free(ctx);
+    return report("e2e_conv_grad_w", ok);
+}
+
+// Smoke: gradient through thvm_tg_linear.
+// x=[2, 4] constants, w=[4, 1] params; y = x @ w: [2, 1].
+// loss = sum(y^2).  d(loss)/dw[k] = 2 * sum_i y[i] * x[i,k].
+static int test_e2e_tg_linear_grad_w(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[8] = {1, 2, 3, 4,  5, 6, 7, 8};
+    f32 wd[4] = {0.1f, -0.2f, 0.3f, 0.4f};
+    Term x = thvm_tensor(ctx, xd, SHAPE(2, 4));
+    Term w = thvm_tensor(ctx, wd, SHAPE(4, 1));
+    thvm_set_requires_grad(ctx, w);
+    Term y = thvm_tg_linear(ctx, x, w, NULL);
+    Term y0, y1; thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term sq = thvm_op(ctx, UOP_MUL, y0, y1);
+    Term loss = thvm_sum_axes(ctx, sq, (u32[]){0, 1}, 2);
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, loss, w)));
+    int ok = (g != NULL);
+    if (!ok) fprintf(stderr, "  tg_linear_grad_w: grad readback NULL\n");
+    else {
+        // Sanity: at least one component should be non-trivial.
+        int any_nonzero = 0;
+        for (int i = 0; i < 4; i++) if (g[i] != 0.0f) any_nonzero = 1;
+        if (!any_nonzero) {
+            fprintf(stderr, "  tg_linear_grad_w: all-zero grad\n");
+            ok = 0;
+        }
+    }
+    thvm_free(ctx);
+    return report("e2e_tg_linear_grad_w", ok);
+}
+
+// Bisect the conv_linear_sgd failure: is grad(loss, w_l) alive when
+// the forward is conv→reshape→linear (no training loop)?
+static int test_e2e_conv_reshape_linear_grad_wl(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[18] = {
+        1, 0, 1,  0, 1, 0,  1, 0, 1,
+        0, 1, 0,  1, 0, 1,  0, 1, 0
+    };
+    f32 wCd[4] = {0.5f, -0.3f, 0.2f, 0.1f};
+    f32 wLd[4] = {0.1f, -0.2f, 0.3f, 0.05f};
+    Term x  = thvm_tensor(ctx, xd,  SHAPE(2, 1, 3, 3));
+    Term wC = thvm_tensor(ctx, wCd, SHAPE(1, 1, 2, 2));
+    Term wL = thvm_tensor(ctx, wLd, SHAPE(4, 1));
+    thvm_set_requires_grad(ctx, wL);
+    u32 pad[4] = {0, 0, 0, 0};
+    u32 stride[2] = {1, 1};
+    Term conv = thvm_conv2d(ctx, x, wC, term_era(), 1, stride, pad);
+    Term flat = thvm_reshape(ctx, conv, SHAPE(2, 4));
+    // thvm_mm accepts lazy TOP on the left; thvm_tg_linear insists on TAG_TEN.
+    Term out  = thvm_mm(ctx, flat, wL);
+    Term out0, out1; thvm_dup(ctx, thvm_fresh_label(ctx), out, &out0, &out1);
+    Term sq   = thvm_op(ctx, UOP_MUL, out0, out1);
+    Term loss = thvm_sum_axes(ctx, sq, (u32[]){0, 1}, 2);
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, loss, wL)));
+    int ok = (g != NULL);
+    if (!ok) fprintf(stderr, "  conv_reshape_linear_grad_wL: NULL readback\n");
+    else {
+        int any_nonzero = 0;
+        for (int i = 0; i < 4; i++) if (g[i] != 0.0f) any_nonzero = 1;
+        if (!any_nonzero) {
+            fprintf(stderr, "  conv_reshape_linear_grad_wL: all-zero grad\n");
+            ok = 0;
+        }
+    }
+    thvm_free(ctx);
+    return report("e2e_conv_reshape_linear_grad_wl", ok);
+}
+
+// grad_bundle correctness: y = a*b, grad_bundle(y, [a, b]) yields (b, a).
+// Regression test for the thvm_grad_bundle_get re-eval bug (fixed by
+// caching the evaluated bundle instead of re-evaluating on each field
+// access — repeated eval of an already-evaluated CTR ERAs out sibling
+// fields under the phase-2 sweep).
+static int test_e2e_bundle_mul_both(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {2,3,4}, bd[] = {5,6,7};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    thvm_set_requires_grad(ctx, b);
+    Term y = thvm_op(ctx, UOP_MUL, a, b);
+    Term targets[2] = {a, b};
+    Term bundle = thvm_grad_bundle(ctx, y, targets, 2);
+    Term gA = thvm_grad_bundle_get(ctx, bundle, 0);
+    Term gB = thvm_grad_bundle_get(ctx, bundle, 1);
+    f32 *gAh = thvm_to_host(ctx, gA);
+    f32 *gBh = thvm_to_host(ctx, gB);
+    int ok = (gAh != NULL) && (gBh != NULL);
+    if (!ok) {
+        fprintf(stderr, "  bundle_mul_both: gA=%p gB=%p\n", (void*)gAh, (void*)gBh);
+    } else {
+        // d(a*b)/da = b, d(a*b)/db = a
+        for (int i = 0; i < 3; i++) {
+            if (gAh[i] != bd[i]) { fprintf(stderr, "  gA[%d]=%g want %g\n", i, gAh[i], bd[i]); ok = 0; }
+            if (gBh[i] != ad[i]) { fprintf(stderr, "  gB[%d]=%g want %g\n", i, gBh[i], ad[i]); ok = 0; }
+        }
+    }
+    thvm_free(ctx);
+    return report("e2e_bundle_mul_both", ok);
+}
+
+// Bisect: conv→reshape→mm→loss, grad w.r.t. BOTH wC and wL via DUPd loss
+// (no bundle, no training loop).  Matches the structure inside
+// test_e2e_conv_linear_sgd but reads both grads in one shot.
+static int test_e2e_conv_reshape_linear_grads_both(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[18] = {
+        1, 0, 1,  0, 1, 0,  1, 0, 1,
+        0, 1, 0,  1, 0, 1,  0, 1, 0
+    };
+    f32 wCd[4] = {0.5f, -0.3f, 0.2f, 0.1f};
+    f32 wLd[4] = {0.1f, -0.2f, 0.3f, 0.05f};
+    Term x  = thvm_tensor(ctx, xd,  SHAPE(2, 1, 3, 3));
+    Term wC = thvm_tensor(ctx, wCd, SHAPE(1, 1, 2, 2));
+    Term wL = thvm_tensor(ctx, wLd, SHAPE(4, 1));
+    thvm_set_requires_grad(ctx, wC);
+    thvm_set_requires_grad(ctx, wL);
+    u32 pad[4] = {0, 0, 0, 0};
+    u32 stride[2] = {1, 1};
+    Term conv = thvm_conv2d(ctx, x, wC, term_era(), 1, stride, pad);
+    Term flat = thvm_reshape(ctx, conv, SHAPE(2, 4));
+    Term out  = thvm_mm(ctx, flat, wL);
+    Term out0, out1; thvm_dup(ctx, thvm_fresh_label(ctx), out, &out0, &out1);
+    Term sq   = thvm_op(ctx, UOP_MUL, out0, out1);
+    Term loss = thvm_sum_axes(ctx, sq, (u32[]){0, 1}, 2);
+    Term targets[2] = {wC, wL};
+    Term bundle = thvm_grad_bundle(ctx, loss, targets, 2);
+    Term gC = thvm_grad_bundle_get(ctx, bundle, 0);
+    Term gL = thvm_grad_bundle_get(ctx, bundle, 1);
+    f32 *gCh = thvm_to_host(ctx, gC);
+    f32 *gLh = thvm_to_host(ctx, gL);
+    int ok = (gCh != NULL) && (gLh != NULL);
+    if (!ok) {
+        fprintf(stderr, "  conv_linear_grads_both: gC=%p gL=%p\n",
+                (void*)gCh, (void*)gLh);
+    }
+    thvm_free(ctx);
+    return report("e2e_conv_reshape_linear_grads_both", ok);
+}
+
+// Build forward graph for the conv_linear_sgd test and optionally mark
+// conv/linear weights as grad-targets.  Returns the scalar loss Term.
+// When loss-only is needed (no grad), pass targets=NULL.
+static Term conv_sgd_forward(TinyHVM *ctx, const f32 *xd, const f32 *w_c,
+                             const f32 *w_l, Term *out_wC, Term *out_wL) {
+    Term x  = thvm_tensor(ctx, (f32 *)xd,  SHAPE(2, 1, 3, 3));
+    Term wC = thvm_tensor(ctx, (f32 *)w_c, SHAPE(1, 1, 2, 2));
+    Term wL = thvm_tensor(ctx, (f32 *)w_l, SHAPE(4, 1));
+    if (out_wC) *out_wC = wC;
+    if (out_wL) *out_wL = wL;
+    u32 pad[4] = {0, 0, 0, 0};
+    u32 stride[2] = {1, 1};
+    Term conv = thvm_conv2d(ctx, x, wC, term_era(), 1, stride, pad);
+    Term flat = thvm_reshape(ctx, conv, SHAPE(2, 4));
+    Term out  = thvm_mm(ctx, flat, wL);
+    Term o0, o1; thvm_dup(ctx, thvm_fresh_label(ctx), out, &o0, &o1);
+    Term sq   = thvm_op(ctx, UOP_MUL, o0, o1);
+    return thvm_sum_axes(ctx, sq, (u32[]){0, 1}, 2);
+}
+
+// Minimal conv+linear SGD loop on synthetic data.
+// Model:  y = flat(conv2d(x, w_c)) @ w_l   (no bias)
+//   x: [2, 1, 3, 3]  (BS=2, Cin=1, 3x3 image)
+//   w_c: [1, 1, 2, 2]  → conv output [2, 1, 2, 2]
+//   flatten → [2, 4]
+//   w_l: [4, 1]      → out [2, 1]
+// Loss = sum(y * y).  Target = 0 implicitly (regression toward zero).
+// 10 steps SGD at lr=0.05; assert loss halves.
+static int test_e2e_conv_linear_sgd(void) {
+    f32 xd[18] = {
+        1, 0, 1,  0, 1, 0,  1, 0, 1,
+        0, 1, 0,  1, 0, 1,  0, 1, 0
+    };
+    f32 w_c[4]  = {0.5f, -0.3f, 0.2f, 0.1f};
+    f32 w_l[4]  = {0.1f, -0.2f, 0.3f, 0.05f};
+    f32 lr = 0.05f;
+
+    f32 initial_loss = 0.0f, final_loss = 0.0f;
+    {
+        TinyHVM *ctx = thvm_init("cpu");
+        Term loss = conv_sgd_forward(ctx, xd, w_c, w_l, NULL, NULL);
+        f32 *lh = thvm_to_host(ctx, thvm_eval(ctx, loss));
+        if (lh) initial_loss = lh[0];
+        thvm_free(ctx);
+    }
+
+    for (int step = 0; step < 10; step++) {
+        TinyHVM *ctx = thvm_init("cpu");
+        Term wC, wL;
+        Term loss = conv_sgd_forward(ctx, xd, w_c, w_l, &wC, &wL);
+        thvm_set_requires_grad(ctx, wC);
+        thvm_set_requires_grad(ctx, wL);
+
+        Term targets[2] = {wC, wL};
+        Term bundle = thvm_grad_bundle(ctx, loss, targets, 2);
+        Term gC = thvm_grad_bundle_get(ctx, bundle, 0);
+        Term gL = thvm_grad_bundle_get(ctx, bundle, 1);
+        f32 *gCh = thvm_to_host(ctx, gC);
+        f32 *gLh = thvm_to_host(ctx, gL);
+        if (!gCh || !gLh) {
+            fprintf(stderr, "  conv_sgd step %d: gC=%p gL=%p\n",
+                    step, (void*)gCh, (void*)gLh);
+            thvm_free(ctx);
+            return report("e2e_conv_linear_sgd", 0);
+        }
+
+        for (int i = 0; i < 4; i++) {
+            w_c[i] -= lr * gCh[i];
+            w_l[i] -= lr * gLh[i];
+        }
+        thvm_free(ctx);
+    }
+
+    {
+        TinyHVM *ctx = thvm_init("cpu");
+        Term loss = conv_sgd_forward(ctx, xd, w_c, w_l, NULL, NULL);
+        f32 *lh = thvm_to_host(ctx, thvm_eval(ctx, loss));
+        if (lh) final_loss = lh[0];
+        thvm_free(ctx);
+    }
+
+    int ok = (final_loss >= 0.0f) && (final_loss < initial_loss * 0.5f);
+    if (!ok)
+        fprintf(stderr, "  conv_sgd: initial=%g final=%g (need final < 0.5*initial)\n",
+                initial_loss, final_loss);
+    return report("e2e_conv_linear_sgd", ok);
+}
+
 // Sigmoid via 1/(1+exp(-x)).  d/dx sigmoid(x) = sigmoid(x)*(1-sigmoid(x)).
 // For x=0: sigmoid=0.5, grad=0.25.  x=[0] check grad[0]≈0.25.
 static int test_e2e_sigmoid_grad(void) {
@@ -3021,6 +3285,12 @@ int main(void) {
     fails += test_e2e_mm_bwd();
     fails += test_e2e_scalar_mul_grad();
     fails += test_e2e_mlp_scalar_loss();
+    fails += test_e2e_conv_grad_w();
+    fails += test_e2e_tg_linear_grad_w();
+    fails += test_e2e_conv_reshape_linear_grad_wl();
+    fails += test_e2e_bundle_mul_both();
+    fails += test_e2e_conv_reshape_linear_grads_both();
+    fails += test_e2e_conv_linear_sgd();
     fails += test_e2e_sigmoid_grad();
     fails += test_e2e_d2_square();
     fails += test_e2e_nested_grad();

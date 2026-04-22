@@ -34,7 +34,6 @@ static void thvm_heap_dot_set_highlight(u64 slot, Term term) {
     heap_dot_hl_term = term;
     heap_dot_hl_hit = 0;
 }
-static int thvm_heap_dot_highlight_was_drawn(void) { return heap_dot_hl_hit; }
 static void thvm_heap_dot_set_step_meta(const char *prev_name, const char *next_name) {
     snprintf(heap_dot_prev_name, sizeof(heap_dot_prev_name), "%s", prev_name ? prev_name : "");
     snprintf(heap_dot_next_name, sizeof(heap_dot_next_name), "%s", next_name ? next_name : "");
@@ -491,9 +490,6 @@ static const char *dot_fuse_payload_label_r(TinyHVM *ctx, Term payload, char *bu
     return buf;
 }
 
-static const char *dot_fuse_payload_label(TinyHVM *ctx, Term payload, char *buf, size_t nbuf) {
-    return dot_fuse_payload_label_r(ctx, payload, buf, nbuf, 0);
-}
 
 static u32 dot_book_struct_arity(Term t) {
     u8 tag = term_tag(t);
@@ -883,18 +879,6 @@ static int dot_infer_top_shape(TinyHVM *ctx, u32 uop, u64 loc, Shape *out) {
     return 0;
 }
 
-static u64 dot_dup_canon_loc(TinyHVM *ctx, u64 dloc) {
-    for (int depth = 0; depth < 64; depth++) {
-        if (dloc == 0 || dloc >= ctx->heap_pos) break;
-        Term dv = heap_read(ctx, dloc);
-        u8 dt = term_tag(dv);
-        if (dt != TAG_DP0 && dt != TAG_DP1) break;
-        u64 up = term_val(dv);
-        if (up == dloc || up == 0 || up >= ctx->heap_pos) break;
-        dloc = up;
-    }
-    return dloc;
-}
 
 static u32 dot_term_arity(TinyHVM *ctx, Term t) {
     u8 tag = term_tag(t);
@@ -936,81 +920,7 @@ static u32 dot_term_arity(TinyHVM *ctx, Term t) {
     }
 }
 
-static int dot_term_maybe_active(Term t) {
-    u8 tag = term_tag(t);
-    if (tag == TAG_TOP) return term_ext(t) == UOP_GRAD;
-    if (tag == TAG_ERA) return term_val(t) != 0;
-    return 0;
-}
 
-static void thvm_dump_dot(TinyHVM *ctx, const char *path) {
-    FILE *f = fopen(path, "w");
-    if (!f) { fprintf(stderr, "dump_dot: can't open %s\n", path); return; }
-
-    fprintf(f, "digraph G {\n");
-    fprintf(f, "  graph [ordering=\"out\", nodesep=0.35, ranksep=0.55];\n");
-    fprintf(f, "  rankdir=BT;\n");
-    fprintf(f, "  node [shape=record, fontname=\"Courier\", fontsize=10];\n");
-    fprintf(f, "  edge [fontsize=8];\n\n");
-
-    for (u32 i = 0; i < ctx->tensor_count; i++) {
-        TensorMeta *m = &ctx->tensors[i];
-        if (m->view.numel == 0) continue;
-
-        // Shape string
-        char shape_str[128] = {0};
-        int pos = 0;
-        for (u32 d = 0; d < m->view.shape.rank && d < MAX_DIM; d++)
-            pos += snprintf(shape_str + pos, sizeof(shape_str) - pos, "%s%u",
-                           d > 0 ? "×" : "", m->view.shape.dims[d]);
-
-        // Strides string
-        char stride_str[128] = {0};
-        pos = 0;
-        for (u32 d = 0; d < m->view.shape.rank && d < MAX_DIM; d++)
-            pos += snprintf(stride_str + pos, sizeof(stride_str) - pos, "%s%d",
-                           d > 0 ? "," : "", m->view.strides[d]);
-
-        // Color
-        const char *color = "white";
-        u32 planned_slot = dot_tensor_planned_slot(ctx, i);
-        int planned = (m->creator_op == UOP_KERNEL && m->buf_id == 0 && planned_slot != 0);
-        if (m->requires_grad) color = "#e8f4e8";
-        if (m->view.has_mask) color = "#fff0e0";
-        if (!m->creator_op && m->requires_grad) color = "#e0e8ff"; // param
-        if (planned) color = "#d9f2e6";
-
-        const char *op = (m->creator_op < UOP_COUNT) ? uop_names[m->creator_op] : "?";
-
-        char slot_str[32] = {0};
-        if (planned) snprintf(slot_str, sizeof(slot_str), "|slot=%u planned", planned_slot);
-        else if (planned_slot) snprintf(slot_str, sizeof(slot_str), "|slot=%u", planned_slot);
-
-        fprintf(f, "  t%u [label=\"{t%u|%s %s|buf=%u off=%d%s|strides=[%s]%s}\", "
-                   "style=filled, fillcolor=\"%s\"];\n",
-                i, i, m->creator_op ? op : "LEAF", shape_str,
-                m->buf_id, m->view.offset,
-                slot_str,
-                stride_str,
-                m->view.has_mask ? " MASKED" : "",
-                color);
-
-        // Edges from sources
-        if (m->creator_op) {
-            fprintf(f, "  t%u -> t%u [label=\"a\"];\n", m->src_ids[0], i);
-            if (m->src_ids[1] && m->src_ids[1] < ctx->tensor_count) {
-                TensorMeta *mb = &ctx->tensors[m->src_ids[1]];
-                // Skip small metadata tensors (shapes, axes, pairs)
-                if (mb->view.numel > MAX_DIM)
-                    fprintf(f, "  t%u -> t%u [label=\"b\"];\n", m->src_ids[1], i);
-            }
-        }
-    }
-
-    fprintf(f, "}\n");
-    fclose(f);
-    fprintf(stderr, "dump_dot: wrote %u tensors to %s\n", ctx->tensor_count, path);
-}
 
 // Dump heap as DOT — flat walk, no BFS. Every combinator shown faithfully.
 static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
@@ -3062,53 +2972,3 @@ cleanup:
     return buf;
 }
 
-static void thvm_dump_json(TinyHVM *ctx, const char *path) {
-    FILE *f = fopen(path, "w");
-    if (!f) { fprintf(stderr, "dump_json: can't open %s\n", path); return; }
-
-    fprintf(f, "{\n  \"tensors\": [\n");
-    for (u32 i = 0; i < ctx->tensor_count; i++) {
-        TensorMeta *m = &ctx->tensors[i];
-        if (m->view.numel == 0) { fprintf(f, "    null%s\n", i+1<ctx->tensor_count?",":""); continue; }
-
-        fprintf(f, "    {\"id\":%u, \"op\":\"%s\", \"src\":[%u,%u], ",
-                i, (m->creator_op < UOP_COUNT) ? uop_names[m->creator_op] : "LEAF",
-                m->src_ids[0], m->src_ids[1]);
-
-        fprintf(f, "\"shape\":[");
-        for (u32 d = 0; d < m->view.shape.rank; d++)
-            fprintf(f, "%s%u", d > 0 ? "," : "", m->view.shape.dims[d]);
-
-        fprintf(f, "], \"strides\":[");
-        for (u32 d = 0; d < m->view.shape.rank; d++)
-            fprintf(f, "%s%d", d > 0 ? "," : "", m->view.strides[d]);
-
-        fprintf(f, "], \"numel\":%u, \"buf\":%u, \"offset\":%d, \"grad\":%d, \"mask\":%d",
-                m->view.numel, m->buf_id, m->view.offset, m->requires_grad, m->view.has_mask);
-
-        if (m->view.has_mask) {
-            fprintf(f, ", \"mask_begin\":[");
-            for (u32 d = 0; d < m->view.shape.rank; d++)
-                fprintf(f, "%s%u", d > 0 ? "," : "", m->view.mask_begin[d]);
-            fprintf(f, "], \"mask_end\":[");
-            for (u32 d = 0; d < m->view.shape.rank; d++)
-                fprintf(f, "%s%u", d > 0 ? "," : "", m->view.mask_end[d]);
-            fprintf(f, "]");
-        }
-
-        // First few values (for debugging)
-        if (m->buf_id && m->view.numel <= 16 && m->view.contiguous) {
-            f32 vals[16];
-            m->backend->buf_read(m->buf_id, vals, m->view.numel * sizeof(f32));
-            fprintf(f, ", \"vals\":[");
-            for (u32 j = 0; j < m->view.numel; j++)
-                fprintf(f, "%s%.6g", j > 0 ? "," : "", vals[j]);
-            fprintf(f, "]");
-        }
-
-        fprintf(f, "}%s\n", i+1<ctx->tensor_count?",":"");
-    }
-    fprintf(f, "  ]\n}\n");
-    fclose(f);
-    fprintf(stderr, "dump_json: wrote %u tensors to %s\n", ctx->tensor_count, path);
-}

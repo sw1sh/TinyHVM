@@ -1,5 +1,4 @@
 // Forward declarations (defined in debug/dump.c, included after this file)
-static void thvm_heap_dot(TinyHVM *ctx, const char *path);
 static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 static void thvm_heap_dot_set_sched_kernels(int enabled);
 static void thvm_heap_dot_set_highlight(u64 slot, Term term);
@@ -9,8 +8,6 @@ static u64  thvm_file_sig(const char *path);
 static const char *thvm_step_graph_dir(void);
 static u32 thvm_step_graph_max_steps(void);
 // Still used by legacy thvm_reduce_step_collect (scheduler dispatch loop):
-static void thvm_step_graph_name_for_interaction(TinyHVM *ctx, u64 source_slot, Term before,
-                                                 char *buf, size_t nbuf);
 static void thvm_step_graph_set_before_grad_y(Term y);
 static void thvm_step_graph_set_before_era_payload(Term payload);
 static void thvm_step_graph_set_before_top_era(int had_era);
@@ -27,17 +24,7 @@ typedef struct {
     char name[160];
 } StepMeta;
 
-static int thvm_reduce_step_collect(TinyHVM *ctx, Term *traced_io,
-                                    StepMeta *meta,
-                                    u8 **reach_io, size_t *reach_cap_io);
 
-static void thvm_step_meta_apply_kind_name(u8 kind, char *buf, size_t nbuf) {
-    if (!buf || nbuf == 0 || kind != THVM_STEP_KIND_SWEEP || !buf[0]) return;
-    if (strncmp(buf, "SWEEP_", 6) == 0) return;
-    char tmp[160];
-    snprintf(tmp, sizeof(tmp), "SWEEP_%s", buf);
-    snprintf(buf, nbuf, "%s", tmp);
-}
 
 // schedule/_.c — Unified IC eval: reduce + fuse in two passes.
 //
@@ -381,7 +368,6 @@ static u32 step_top_arity(u32 ext) {
 }
 
 static u32 step_term_arity(Term t);
-static int step_has_parent_ref(TinyHVM *ctx, Term target);
 
 static u64 step_find_child_slot_in_term(TinyHVM *ctx, Term parent, Term target, u32 depth) {
     if (depth > 64) return 0;
@@ -414,11 +400,6 @@ static u64 step_find_child_slot_in_term(TinyHVM *ctx, Term parent, Term target, 
     return 0;
 }
 
-static u64 thvm_step_redex_source_slot(TinyHVM *ctx, u64 container_slot, Term container, Term before) {
-    if (container == before) return container_slot;
-    u64 hit = step_find_child_slot_in_term(ctx, container, before, 0);
-    return hit ? hit : container_slot;
-}
 
 static int step_term_is_active_era_like(TinyHVM *ctx, Term t, Term *era_out) {
     if (term_tag(t) == TAG_ERA && term_val(t) != 0) {
@@ -481,57 +462,10 @@ static int step_top_direct_uop_ctx(TinyHVM *ctx, u32 uop) {
     return step_top_direct_uop(uop);
 }
 
-static int step_fuse_payload_is_terminal_passthru(Term t) {
-    switch (term_tag(t)) {
-        case TAG_TEN:
-        case TAG_ERA:
-        case TAG_NUM:
-            return 1;
-        default:
-            return 0;
-    }
-}
 
-static int step_top_is_hidden_trace_passthru(TinyHVM *ctx, Term t) {
-    if (term_tag(t) != TAG_TOP) return 0;
-    u32 uop = term_ext(t);
-    if (uop != UOP_FUSE) return 0;
-    u64 loc = term_val(t);
-    if (loc == 0 || loc >= ctx->heap_pos) return 0;
-    return step_fuse_payload_is_terminal_passthru(heap_read(ctx, loc));
-}
 
-static int step_term_maybe_active(TinyHVM *ctx, Term t) {
-    u8 tag = term_tag(t);
-    if (tag == TAG_TOP) {
-        if (step_top_is_hidden_trace_passthru(ctx, t))
-            return 0;
-        return step_top_direct_uop_ctx(ctx, term_ext(t)) ||
-               step_top_has_era_arg(ctx, t, NULL, NULL) ||
-               step_top_has_add_zero_arg(ctx, t, NULL, NULL);
-    }
-    if (tag == TAG_ERA) return term_val(t) != 0 && !step_has_parent_ref(ctx, t);
-    if (tag == TAG_TEN || tag == TAG_NUM || tag == TAG_LAM || tag == TAG_SUP ||
-        tag == TAG_BRI || tag == TAG_MAT || tag == TAG_ANY || tag == TAG_USP)
-        return 0;
-    return 1;
-}
 
-static int step_term_needs_global_cleanup(TinyHVM *ctx, Term t) {
-    u8 tag = term_tag(t);
-    if (tag == TAG_ERA) return term_val(t) != 0 && !step_has_parent_ref(ctx, t);
-    if (tag != TAG_TOP) return 0;
-    return step_top_has_era_arg(ctx, t, NULL, NULL) ||
-           step_top_has_add_zero_arg(ctx, t, NULL, NULL);
-}
 
-static int step_term_first_reachable_occurrence(TinyHVM *ctx, u64 h, Term t, const u8 *reach) {
-    for (u64 i = 1; i < h; i++) {
-        if (reach && !reach[i]) continue;
-        if (ctx->heap[i] == t) return 0;
-    }
-    return 1;
-}
 
 static u32 step_term_arity(Term t) {
     u8 tag = term_tag(t);
@@ -571,18 +505,6 @@ static u32 step_term_arity(Term t) {
     }
 }
 
-static int step_has_parent_ref(TinyHVM *ctx, Term target) {
-    for (u64 h = 1; h < ctx->heap_pos; h++) {
-        Term p = ctx->heap[h];
-        u32 ar = step_term_arity(p);
-        u64 loc = term_val(p);
-        if (ar == 0 || loc == 0 || loc + ar > ctx->heap_pos) continue;
-        for (u32 i = 0; i < ar; i++) {
-            if (heap_read(ctx, loc + i) == target) return 1;
-        }
-    }
-    return 0;
-}
 
 static int step_term_is_seq_kernel(TinyHVM *ctx, Term t) {
     if (term_tag(t) != TAG_TOP || term_ext(t) != UOP_KERNEL) return 0;
@@ -592,10 +514,6 @@ static int step_term_is_seq_kernel(TinyHVM *ctx, Term t) {
     return term_tag(root_uop) == TAG_NUM && (u32)term_val(root_uop) == UOP_COUNT;
 }
 
-static int step_slot_is_local_assign_target(TinyHVM *ctx, u64 slot) {
-    (void)ctx; (void)slot;
-    return 0;
-}
 
 static void step_mark_reachable_slots(TinyHVM *ctx, Term root, u8 *reach) {
     if (!reach || ctx->heap_pos == 0) return;
@@ -779,9 +697,6 @@ static int step_fuse_payload_ready(TinyHVM *ctx, Term t) {
     }
 }
 
-static int step_trace_root_is_terminal(TinyHVM *ctx, Term t) {
-    return step_term_is_whnf_atom(t) || step_top_is_hidden_trace_passthru(ctx, t);
-}
 
 static int step_top_frame_arg0_ready(Term t, u32 uop) {
     u8 tag = term_tag(t);
@@ -1252,277 +1167,12 @@ Term thvm_eval(TinyHVM *ctx, Term t);
 //
 // This is THE step primitive: thvm_reduce_collect loops it without meta;
 // thvm_trace_step_graph_session loops it with meta to drive the dumper.
-static int thvm_reduce_step_collect(TinyHVM *ctx, Term *traced_io,
-                                    StepMeta *meta,
-                                    u8 **reach_io, size_t *reach_cap_io) {
-    if ((size_t)ctx->heap_pos > *reach_cap_io) {
-        size_t new_cap = (size_t)ctx->heap_pos;
-        u8 *nr = (u8 *)realloc(*reach_io, new_cap);
-        if (!nr) return 0;
-        memset(nr + *reach_cap_io, 0, new_cap - *reach_cap_io);
-        *reach_io = nr;
-        *reach_cap_io = new_cap;
-    }
-    Term traced = *traced_io;
-
-    // ── Root-driven attempt: reduce the visible root for one step. ──
-    {
-        Term container_before = traced;
-        Term predicted_before = traced;
-        u64 predicted_source_slot = step_root_slot;
-        char predicted_name[160] = {0};
-        int root_predicted = thvm_step_predict_next_redex(ctx, traced, &predicted_before, NULL);
-        thvm_step_capture_step_before_meta(ctx, predicted_before);
-        if (root_predicted || step_top_is_hidden_trace_passthru(ctx, traced))
-            predicted_source_slot = thvm_step_redex_source_slot(ctx, step_root_slot, traced, predicted_before);
-        else
-            predicted_source_slot = 0;
-        thvm_step_graph_name_for_interaction(ctx, predicted_source_slot, predicted_before,
-                                             predicted_name, sizeof(predicted_name));
-
-        // Only use whole-root reduction when the next visible redex is the
-        // root itself. If the actual next step lives inside the heap, driving
-        // reduction from the root can also collapse administrative parents
-        // (for example APP(NUM, x) or FUSE(CTR(...))) in the same budget-1
-        // call, which makes one snapshot contain multiple interactions.
-        if (predicted_source_slot == step_root_slot) {
-            if (getenv("THVM_LOOP_DIAG")) {
-                static u32 root_step_dbg_count = 0;
-                if (root_step_dbg_count < 16) {
-                    root_step_dbg_count++;
-                    fprintf(stderr,
-                            "STEP_ROOT enter slot=%llu before=(tag=%u ext=%u val=%llu) name=%s traced=(tag=%u ext=%u val=%llu)\n",
-                            (unsigned long long)predicted_source_slot,
-                            (u32)term_tag(predicted_before), (u32)term_ext(predicted_before), (unsigned long long)term_val(predicted_before),
-                            predicted_name,
-                            (u32)term_tag(traced), (u32)term_ext(traced), (unsigned long long)term_val(traced));
-                }
-            }
-            struct InteractionTrace tr = {0};
-            struct InteractionTrace *saved_buf = ctx->trace_buf;
-            u32 saved_count = ctx->trace_count;
-            u32 saved_cap = ctx->trace_cap;
-            u8 saved_en = ctx->trace_enabled;
-            ctx->trace_buf = &tr;
-            ctx->trace_count = 0;
-            ctx->trace_cap = 1;
-            ctx->trace_enabled = 1;
-
-            u64 itrs_before = ctx->itrs;
-            Term result = thvm_reduce_steps(ctx, traced, 1);
-            int did_fire = (ctx->steps_taken > 0 && ctx->trace_count > 0) ||
-                           (ctx->itrs != itrs_before);
-
-            if (getenv("THVM_LOOP_DIAG")) {
-                static u32 root_step_ret_dbg_count = 0;
-                if (root_step_ret_dbg_count < 16) {
-                    root_step_ret_dbg_count++;
-                    fprintf(stderr,
-                            "STEP_ROOT exit fired=%d result=(tag=%u ext=%u val=%llu) trace_count=%u itrs_before=%llu itrs_after=%llu\n",
-                            did_fire,
-                            (u32)term_tag(result), (u32)term_ext(result), (unsigned long long)term_val(result),
-                            ctx->trace_count,
-                            (unsigned long long)itrs_before,
-                            (unsigned long long)ctx->itrs);
-                }
-            }
-
-            Term before = predicted_before;
-            if (ctx->trace_count > 0) {
-                Term traced_before = term_new((u8)tr.before_tag, tr.before_ext, tr.before_loc);
-                before = traced_before;
-                if (traced_before != predicted_before) {
-                    predicted_source_slot = thvm_step_redex_source_slot(ctx, step_root_slot,
-                                                                        container_before, traced_before);
-                    thvm_step_graph_set_before_grad_y(term_era());
-                    thvm_step_graph_set_before_era_payload(term_era());
-                    thvm_step_graph_set_before_top_era(0);
-                    thvm_step_graph_set_before_top_add_zero(0);
-                    thvm_step_graph_set_before_top_partner(term_era(), 0);
-                    thvm_step_graph_name_for_interaction(ctx, predicted_source_slot, traced_before,
-                                                         predicted_name, sizeof(predicted_name));
-                }
-            }
-
-            ctx->trace_buf = saved_buf;
-            ctx->trace_count = saved_count;
-            ctx->trace_cap = saved_cap;
-            ctx->trace_enabled = saved_en;
-
-            if (did_fire) {
-                traced = result;
-                if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
-                    heap_set(ctx, step_root_slot, traced);
-                *traced_io = traced;
-                if (meta) {
-                    meta->before = before;
-                    meta->source_slot = predicted_source_slot;
-                    meta->kind = THVM_STEP_KIND_ROOT;
-                    snprintf(meta->name, sizeof(meta->name), "%s", predicted_name);
-                }
-                return 1;
-            }
-        }
-    }
-    int root_terminal = step_trace_root_is_terminal(ctx, traced);
-
-    // ── Heap sweep: fire on the first reachable heap redex, then detached cleanup. ──
-    u8 *reach = *reach_io;
-    step_mark_reachable_slots(ctx, traced, reach);
-    for (u64 h = 1; h < ctx->heap_pos; h++) {
-        if (h == step_root_slot) continue;
-        if (step_slot_is_local_assign_target(ctx, h)) continue;
-        Term ht = ctx->heap[h];
-        int reachable = !(reach && !reach[h]);
-        if (!reachable && !step_term_needs_global_cleanup(ctx, ht)) continue;
-        if (!step_term_maybe_active(ctx, ht)) continue;
-        if ((term_tag(ht) == TAG_DP0 || term_tag(ht) == TAG_DP1) &&
-            reachable &&
-            !step_term_first_reachable_occurrence(ctx, h, ht, reach)) continue;
-        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD &&
-            reachable &&
-            !step_term_first_reachable_occurrence(ctx, h, ht, reach)) continue;
-
-        Term container_before = ht;
-        Term predicted_before = ht;
-        u64 predicted_source_slot = h;
-        u8 predicted_kind = reachable ? THVM_STEP_KIND_HEAP
-                                      : THVM_STEP_KIND_SWEEP;
-        char predicted_name[160] = {0};
-        int heap_predicted = thvm_step_predict_next_redex(ctx, ht, &predicted_before, NULL);
-        if (!heap_predicted)
-            continue;
-        thvm_step_capture_step_before_meta(ctx, predicted_before);
-        predicted_source_slot = thvm_step_redex_source_slot(ctx, h, ht, predicted_before);
-        thvm_step_graph_name_for_interaction(ctx, predicted_source_slot, predicted_before,
-                                             predicted_name, sizeof(predicted_name));
-        if (predicted_kind == THVM_STEP_KIND_SWEEP || root_terminal)
-            thvm_step_meta_apply_kind_name(THVM_STEP_KIND_SWEEP,
-                                           predicted_name, sizeof(predicted_name));
-
-        u64 target_slot = (predicted_source_slot > 0 && predicted_source_slot < ctx->heap_pos &&
-                           heap_read(ctx, predicted_source_slot) == predicted_before)
-                        ? predicted_source_slot
-                        : h;
-        Term target_before = (target_slot > 0 && target_slot < ctx->heap_pos)
-                           ? heap_read(ctx, target_slot)
-                           : ht;
-        if (getenv("THVM_LOOP_DIAG")) {
-            static u32 heap_step_dbg_count = 0;
-            if (heap_step_dbg_count < 24) {
-                heap_step_dbg_count++;
-                fprintf(stderr,
-                        "STEP_HEAP enter scan=%llu target_slot=%llu reachable=%d kind=%u before=(tag=%u ext=%u val=%llu) predicted=(tag=%u ext=%u val=%llu) name=%s\n",
-                        (unsigned long long)h,
-                        (unsigned long long)target_slot,
-                        reachable,
-                        predicted_kind,
-                        (u32)term_tag(target_before), (u32)term_ext(target_before), (unsigned long long)term_val(target_before),
-                        (u32)term_tag(predicted_before), (u32)term_ext(predicted_before), (unsigned long long)term_val(predicted_before),
-                        predicted_name);
-            }
-        }
-        struct InteractionTrace tr = {0};
-        struct InteractionTrace *saved_buf = ctx->trace_buf;
-        u32 saved_count = ctx->trace_count;
-        u32 saved_cap = ctx->trace_cap;
-        u8 saved_en = ctx->trace_enabled;
-        ctx->trace_buf = &tr;
-        ctx->trace_count = 0;
-        ctx->trace_cap = 1;
-        ctx->trace_enabled = 1;
-
-        u64 itrs_before = ctx->itrs;
-        Term hr = thvm_reduce_steps(ctx, target_before, 1);
-        int did_fire = (ctx->steps_taken > 0 && ctx->trace_count > 0) ||
-                       (ctx->itrs != itrs_before);
-        if (getenv("THVM_LOOP_DIAG")) {
-            static u32 heap_step_ret_dbg_count = 0;
-            if (heap_step_ret_dbg_count < 24) {
-                heap_step_ret_dbg_count++;
-                fprintf(stderr,
-                        "STEP_HEAP exit fired=%d result=(tag=%u ext=%u val=%llu) trace_count=%u itrs_before=%llu itrs_after=%llu\n",
-                        did_fire,
-                        (u32)term_tag(hr), (u32)term_ext(hr), (unsigned long long)term_val(hr),
-                        ctx->trace_count,
-                        (unsigned long long)itrs_before,
-                        (unsigned long long)ctx->itrs);
-            }
-        }
-        Term before_h = predicted_before;
-        if (ctx->trace_count > 0) {
-            Term tb = term_new((u8)tr.before_tag, tr.before_ext, tr.before_loc);
-            before_h = tb;
-            if (tb != predicted_before) {
-                predicted_source_slot = thvm_step_redex_source_slot(ctx, h, container_before, tb);
-                thvm_step_graph_set_before_grad_y(term_era());
-                thvm_step_graph_set_before_era_payload(term_era());
-                thvm_step_graph_set_before_top_era(0);
-                thvm_step_graph_set_before_top_add_zero(0);
-                thvm_step_graph_set_before_top_partner(term_era(), 0);
-                thvm_step_graph_name_for_interaction(ctx, predicted_source_slot, tb,
-                                                     predicted_name, sizeof(predicted_name));
-                if (predicted_kind == THVM_STEP_KIND_SWEEP || root_terminal)
-                    thvm_step_meta_apply_kind_name(THVM_STEP_KIND_SWEEP,
-                                                   predicted_name, sizeof(predicted_name));
-            }
-        }
-        ctx->trace_buf = saved_buf;
-        ctx->trace_count = saved_count;
-        ctx->trace_cap = saved_cap;
-        ctx->trace_enabled = saved_en;
-
-        if (!did_fire) continue;
-
-        if (term_tag(target_before) == TAG_TOP && term_ext(target_before) == UOP_GRAD) {
-            for (u64 i = 1; i < ctx->heap_pos; i++)
-                if (ctx->heap[i] == target_before)
-                    heap_set(ctx, i, hr);
-        } else {
-            heap_set(ctx, target_slot, hr);
-        }
-        if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
-            heap_set(ctx, step_root_slot, traced);
-        *traced_io = traced;
-        if (meta) {
-            meta->before = before_h;
-            meta->source_slot = predicted_source_slot;
-            meta->kind = (predicted_kind == THVM_STEP_KIND_SWEEP || root_terminal)
-                       ? THVM_STEP_KIND_SWEEP
-                       : THVM_STEP_KIND_HEAP;
-            snprintf(meta->name, sizeof(meta->name), "%s", predicted_name);
-        }
-        return 1;
-    }
-    return 0;
-}
 
 // Deep-clone the input so the trace's heap mutations don't corrupt the
 // caller's view of the original term. FUSE-wraps the clone so compute ops
 // fire (ADD/MUL etc. are WNF without it), seeds the root mirror slot, and
 // returns the wrapped term plus a reach buffer the loop will reuse.
 // step_root_slot is set as a side effect.
-static Term thvm_step_session_init(TinyHVM *ctx, Term root,
-                                   u8 **reach_out, size_t *reach_cap_out) {
-    step_root_slot = 0;
-    Term cloned = term_clone(ctx, root);
-    Term traced;
-    // Skip the UOP_FUSE wrap when the caller only wants Phase 1+2 topology
-    // (GRAD rule tests). FUSE injects a redex that drives the reducer into
-    // local fusion + dispatch, which chokes on NUM operands in unary
-    // backward formulas. Without it the step trace is pure IC reduction.
-    if (getenv("THVM_GRAPH_STOP_AFTER_SWEEP")) {
-        traced = cloned;
-    } else {
-        u64 fuse_loc = heap_alloc(ctx, 1);
-        heap_set(ctx, fuse_loc, cloned);
-        traced = term_new(TAG_TOP, UOP_FUSE, fuse_loc);
-    }
-    traced = thvm_step_seed_root_grad(ctx, traced);
-    *reach_cap_out = (size_t)ctx->heap_pos;
-    *reach_out = (u8 *)calloc(*reach_cap_out ? *reach_cap_out : 1, 1);
-    return traced;
-}
 
 // wnf-driven step-graph session: run thvm_reduce once with a per-rule
 // hook that emits one dot frame per wnf interaction.  Minimal emitter
@@ -1625,30 +1275,6 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     sched_planner_release_detached_slots();
     return traced;
 }
-
-// Public: drive thvm_reduce_step_collect to NF (or `cap` steps), recording
-// each post-step term in `out_terms`. Same harness the step-graph dumper
-// uses, minus the meta — for callers that just want the state sequence.
-// Does NOT enable dispatch, so the final term is the IC normal form
-// (e.g. the KERNEL DAG), not a dispatched TEN.
-u32 thvm_reduce_collect(TinyHVM *ctx, Term root, Term *out_terms, u32 cap) {
-    u32 n = 0;
-    u8 *reach = NULL;
-    size_t reach_cap = 0;
-    Term traced = thvm_step_session_init(ctx, root, &reach, &reach_cap);
-    // Freeze each snapshot with a deep clone so WL can walk it later without
-    // seeing heap mutations from subsequent interactions.
-    if (n < cap) out_terms[n++] = term_clone(ctx, traced);
-    while (n < cap &&
-           thvm_reduce_step_collect(ctx, &traced, NULL, &reach, &reach_cap)) {
-        out_terms[n++] = term_clone(ctx, traced);
-    }
-    free(reach);
-    step_root_slot = 0;
-    return n;
-}
-
-
 
 
 // Walk through view ops, monolithic local KERNELs, and DP refs to find the

@@ -3,10 +3,6 @@ static int is_elementwise(u32 uop);
 static int is_binary(u32 uop);
 
 // Reduce a term to TAG_TEN and return its tensor ID (or ~0u on failure)
-static u32 reduce_id(TinyHVM *ctx, Term t) {
-    t = thvm_reduce(ctx, t);
-    return (term_tag(t) == TAG_TEN) ? (u32)term_val(t) : ~0u;
-}
 
 // Does this UOP allocate a fresh buffer (safe to decref inputs)?
 // Movement ops share the input buffer → NOT safe to decref.

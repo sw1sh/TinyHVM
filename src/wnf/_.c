@@ -150,8 +150,7 @@ static void wnf_stack_push(WnfFrame f) {
     g_wnf_stack_buf[g_wnf_stack_pos++] = f;
 }
 
-// thvm_reduce_fallback is no longer called from wnf; the declaration
-// stays in reduce/_.c for any external callers.
+// All combinator and GRAD rules are handled natively in this file.
 
 // ──────────────────────────────────────────────────────────────────────
 // Shape / cotangent helpers (used by VJP rules).

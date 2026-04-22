@@ -495,6 +495,125 @@ enter: {
         goto enter;
     }
 
+    // ERA: active eraser — iterative walker, no frame needed.  Drives the
+    // payload term at era_loc through one layer at a time, erasing children
+    // and routing one child as the continuation (others become detached
+    // ERAs).  Terminates when the payload becomes an atom (TEN/NUM/LAM/ANY/
+    // SUP/USP/ERA(0)/CTR-empty) or hits a DP/VAR boundary.
+    if (tag == TAG_ERA) {
+        u64 era_loc = term_val(next);
+        if (era_loc == 0 || era_loc >= ctx->heap_pos) { whnf = next; goto apply; }
+        #define WNF_ERA_ARITY(_tg, _ext) ({ \
+            u32 _ar = 0; \
+            switch ((_tg)) { \
+                case TAG_TOP: _ar = thvm_uop_storage_arity((_ext)); break; \
+                case TAG_APP: case TAG_LAM: case TAG_BRI: case TAG_SEQ: \
+                case TAG_SUP: case TAG_USP: case TAG_OP2: case TAG_EQL: \
+                case TAG_AND: case TAG_OR:  case TAG_MAT: case TAG_ANN: \
+                case TAG_ALO: _ar = 2; break; \
+                case TAG_DSU: case TAG_DDU: _ar = 3; break; \
+                case TAG_DP0: case TAG_DP1: case TAG_UDP: case TAG_ERA: \
+                case TAG_VAR: case TAG_INC: _ar = 1; break; \
+                default: _ar = 0; break; \
+            } \
+            _ar; \
+        })
+        u32 ext_bit = term_ext(next) & 1u;
+        while (1) {
+            Term cur = thvm_era_payload(ctx, heap_read(ctx, era_loc));
+            u8 vtag = term_tag(cur);
+            u32 vext = term_ext(cur);
+            u64 vval = term_val(cur);
+            Term cont = term_era();
+            int have_cont = 0;
+            int done = 0;
+
+            if (vtag == TAG_DP0 || vtag == TAG_DP1) {
+                u64 dl = vval;
+                if (dl < ctx->heap_pos) {
+                    Term cell = heap_read(ctx, dl);
+                    if (term_is_sub(cell)) {
+                        Term orphan = term_strip_sub(cell);
+                        if (term_tag(orphan) != TAG_ERA)
+                            thvm_spawn_detached_era(ctx, orphan);
+                        heap_set(ctx, dl, term_era());
+                    } else {
+                        heap_set(ctx, dl, term_set_sub(cell));
+                    }
+                }
+                done = 1;
+            } else if (vtag == TAG_VAR) {
+                if (vval >= ctx->heap_pos) { done = 1; }
+                else {
+                    Term sub = heap_read(ctx, vval);
+                    if (term_is_sub(sub)) {
+                        u64 el2 = heap_alloc(ctx, 1);
+                        heap_set(ctx, el2, term_era());
+                        heap_set(ctx, vval, term_era_at(el2));
+                        done = 1;
+                    } else {
+                        Term payload = thvm_era_payload(ctx, sub);
+                        if (term_tag(payload) == TAG_ERA && term_val(payload) == 0) {
+                            done = 1;
+                        } else {
+                            cont = payload;
+                            have_cont = 1;
+                        }
+                    }
+                }
+            } else if (vtag == TAG_TEN) {
+                tensor_release(ctx, (u32)vval);
+                done = 1;
+            } else if (vtag == TAG_CTR) {
+                u32 ar = vext;
+                if (vval < ctx->heap_pos) {
+                    for (u32 i = 0; i < ar; i++) {
+                        Term child = thvm_era_payload(ctx, heap_read(ctx, vval + i));
+                        heap_set(ctx, vval + i, term_era());
+                        if (term_tag(child) == TAG_ERA && term_val(child) == 0) continue;
+                        if (!have_cont) {
+                            cont = child;
+                            have_cont = 1;
+                        } else {
+                            thvm_spawn_detached_era(ctx, child);
+                        }
+                    }
+                }
+                if (!have_cont) done = 1;
+            } else {
+                u32 ar = WNF_ERA_ARITY(vtag, vext);
+                if (ar > 0 && vval < ctx->heap_pos) {
+                    for (u32 i = 0; i < ar; i++) {
+                        Term child = thvm_era_payload(ctx, heap_read(ctx, vval + i));
+                        heap_set(ctx, vval + i, term_era());
+                        if (term_tag(child) == TAG_ERA && term_val(child) == 0) continue;
+                        if (!have_cont) {
+                            cont = child;
+                            have_cont = 1;
+                        } else {
+                            thvm_spawn_detached_era(ctx, child);
+                        }
+                    }
+                }
+                if (!have_cont) done = 1;
+            }
+
+            if (done) {
+                heap_set(ctx, era_loc, term_era());
+                ctx->itrs++;
+                whnf = term_era();
+                #undef WNF_ERA_ARITY
+                goto apply;
+            }
+            // Continue walking: install cont at era_loc, flip ext bit, loop.
+            heap_set(ctx, era_loc, cont);
+            ctx->itrs++;
+            ext_bit ^= 1u;
+            // Continue iterating — next = ERA(ext_bit, era_loc).
+            (void)ext_bit;
+        }
+    }
+
     // AND / OR: short-circuit boolean — reduce left, dispatch.
     if (tag == TAG_AND || tag == TAG_OR) {
         u64 loc = term_val(next);

@@ -221,6 +221,24 @@ enter: {
 
     if (wnf_is_atom(tag)) { whnf = next; goto apply; }
 
+    // REF: unfold named definition into lazy allocation frontier.
+    if (tag == TAG_REF) {
+        u32 name = (u32)term_ext(next);
+        if (name >= ctx->def_count) { whnf = next; goto apply; }
+        if (ctx->def_books[name] == 0)
+            ctx->def_books[name] = thvm_book_from_dynamic(ctx, ctx->defs[name]);
+        ctx->itrs++;
+        next = thvm_alo_realize(ctx, ctx->def_books[name], 0);
+        goto enter;
+    }
+
+    // ALO: force exactly one static/book layer into dynamic net.
+    if (tag == TAG_ALO) {
+        ctx->itrs++;
+        next = thvm_alo_force(ctx, next);
+        goto enter;
+    }
+
     // DP0 / DP1: check SUB-bit shortcut, else push frame and descend
     // into body (principal).  Transparent projection for pure compute
     // TOP is inline (no frame push) — HVM4 SUB-bit pattern.

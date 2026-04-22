@@ -1237,9 +1237,15 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     g_step_session_last_render_sig = thvm_file_sig(p0);
     g_step_session_frame++;
 
-    // Drive reduction; hook emits one dot per wnf interaction.
+    // Drive reduction; hook emits one dot per wnf interaction.  We run
+    // thvm_reduce (to WHNF) followed by thvm_normalize (deep WHNF of
+    // every reachable arg slot) — together they match what
+    // thvm_eval_collect_fixed_point drives, so the captured step
+    // sequence covers the whole reduction including field-by-field
+    // descent into CTR bundles.
     thvm_wnf_set_step_hook(wnf_step_session_hook);
     traced = thvm_reduce(ctx, traced);
+    traced = thvm_normalize(ctx, traced);
     thvm_wnf_clear_step_hook();
 
     // Final-state frame (skipped if identical to last).

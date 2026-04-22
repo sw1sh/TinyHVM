@@ -48,6 +48,14 @@ static void setup_step_graph_dir(const char *rule) {
     setenv("THVM_STEP_GRAPH_DIR", sdir, 1);
 }
 
+// Call at the end of a test that used setup_step_graph_dir so subsequent
+// tests (which might not touch THVM_STEP_GRAPH) don't inherit the dir and
+// stomp the just-written step graphs with their own firing trace.
+static void teardown_step_graph_dir(void) {
+    unsetenv("THVM_STEP_GRAPH");
+    unsetenv("THVM_STEP_GRAPH_DIR");
+}
+
 static char *slurp(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
@@ -2560,6 +2568,7 @@ static int test_e2e_mlp_scalar_loss(void) {
 // Each kernel weight appears once per output position (2x2=4 positions), and
 // each position contributes its corresponding input (=1). So dw[any]=4.
 static int test_e2e_conv_grad_w(void) {
+    setup_step_graph_dir("conv_grad_w");
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[9]; for (int i = 0; i < 9; i++) xd[i] = 1.0f;
     f32 wd[4]; for (int i = 0; i < 4; i++) wd[i] = 1.0f;
@@ -2580,6 +2589,7 @@ static int test_e2e_conv_grad_w(void) {
         }
     }
     thvm_free(ctx);
+    teardown_step_graph_dir();
     return report("e2e_conv_grad_w", ok);
 }
 
@@ -2657,6 +2667,7 @@ static int test_e2e_conv_reshape_linear_grad_wl(void) {
 // access — repeated eval of an already-evaluated CTR ERAs out sibling
 // fields under the phase-2 sweep).
 static int test_e2e_bundle_mul_both(void) {
+    setup_step_graph_dir("bundle_mul_both");
     TinyHVM *ctx = thvm_init("cpu");
     f32 ad[] = {2,3,4}, bd[] = {5,6,7};
     Term a = thvm_tensor(ctx, ad, SHAPE(3));
@@ -2681,6 +2692,7 @@ static int test_e2e_bundle_mul_both(void) {
         }
     }
     thvm_free(ctx);
+    teardown_step_graph_dir();
     return report("e2e_bundle_mul_both", ok);
 }
 
@@ -3121,6 +3133,7 @@ static int test_e2e_vjp_sum_of_square(void) {
         fprintf(stderr, "  vjp_sum h[%d]=%g want %g\n", i, h[i], expect[i]); ok=0;
     }
     thvm_free(ctx);
+    teardown_step_graph_dir();
     return report("e2e_vjp_sum_of_square", ok);
 }
 
@@ -3139,6 +3152,7 @@ static int test_e2e_jvp_sum_of_square(void) {
     int ok = (h != NULL) && (h[0] > 11.9f && h[0] < 12.1f);
     if (!ok) fprintf(stderr, "  jvp_sum h=%g want 12\n", h ? h[0] : 0);
     thvm_free(ctx);
+    teardown_step_graph_dir();
     return report("e2e_jvp_sum_of_square", ok);
 }
 

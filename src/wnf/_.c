@@ -72,6 +72,10 @@ enum {
     // t1 = b (slot 1).
     // t2 = SEQ heap loc.
     WNF_F_SEQ,
+    // DUP aux (DP0/DP1): reduce body, then dispatch.
+    // t0 = original DP term (for rebuild on unhandled whnf).
+    // flags bit 0 = side (0 for DP0, 1 for DP1).
+    WNF_F_DUP,
 };
 
 typedef struct {
@@ -216,6 +220,46 @@ enter: {
     u8 tag = term_tag(next);
 
     if (wnf_is_atom(tag)) { whnf = next; goto apply; }
+
+    // DP0 / DP1: check SUB-bit shortcut, else push frame and descend
+    // into body (principal).  Transparent projection for pure compute
+    // TOP is inline (no frame push) — HVM4 SUB-bit pattern.
+    if (tag == TAG_DP0 || tag == TAG_DP1) {
+        u64 dup_loc = term_val(next);
+        if (dup_loc == 0 || dup_loc >= ctx->heap_pos) {
+            whnf = next; goto apply;
+        }
+        Term cell = heap_read(ctx, dup_loc);
+        if (term_is_sub(cell)) {
+            // Sibling already fired (or DUP collapsed via ERA) — take stored.
+            Term v = term_strip_sub(cell);
+            if (term_tag(v) == TAG_TEN)
+                tensor_incref(ctx, (u32)term_val(v));
+            ctx->itrs++;
+            whnf = v;
+            goto apply;
+        }
+        // Transparent projection for pure compute TOPs: both auxes can
+        // share the same TAG_TOP handle without firing the DUP.
+        if (term_tag(cell) == TAG_TOP) {
+            u32 cu = term_ext(cell);
+            if (cu != UOP_DETACH && cu != UOP_ASSIGN &&
+                cu != UOP_KERNEL && cu != UOP_EXEC &&
+                cu != UOP_GRAD && cu != UOP_GRAD_FWD) {
+                whnf = cell;
+                goto apply;
+            }
+        }
+        // Push frame, drive body to WHNF.
+        WnfFrame f = {
+            .kind = WNF_F_DUP,
+            .flags = (u8)(tag == TAG_DP1 ? 1 : 0),
+            .t0 = next, .t1 = 0, .t2 = 0, .t3 = 0
+        };
+        wnf_stack_push(f);
+        next = cell;
+        goto enter;
+    }
 
     // SEQ: push continuation frame, descend into slot 0 (strict arg).
     if (tag == TAG_SEQ) {
@@ -1019,6 +1063,46 @@ apply: {
                 whnf = (a_shape.rank != 0) ? thvm_expand(ctx, whnf, a_shape) : whnf;
             }
             ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_DUP: {
+            // frame: original DP term (t0); flags bit 0 = side (0=DP0, 1=DP1).
+            // whnf is the body reduced to WHNF.
+            Term dp_orig = f.t0;
+            u32 side = f.flags & 1;
+            u64 dup_loc = term_val(dp_orig);
+
+            // DUP ⊳ TEN: atomic.  Incref, store sibling copy via SUB bit.
+            if (term_tag(whnf) == TAG_TEN) {
+                tensor_incref(ctx, (u32)term_val(whnf));
+                heap_set(ctx, dup_loc, term_set_sub(whnf));
+                ctx->itrs++;
+                // `whnf` is our copy — continue.
+                continue;
+            }
+
+            // DUP ⊳ ERA: erasure annihilates the DUP; both auxes become ERA.
+            if (term_tag(whnf) == TAG_ERA) {
+                heap_set(ctx, dup_loc, term_set_sub(term_era()));
+                ctx->itrs++;
+                whnf = term_era();
+                continue;
+            }
+
+            // DUP ⊳ NUM: atomic number, similar to TEN but no refcount.
+            if (term_tag(whnf) == TAG_NUM) {
+                heap_set(ctx, dup_loc, term_set_sub(whnf));
+                ctx->itrs++;
+                continue;
+            }
+
+            // Other whnf tags (SUP, LAM, BRI, TOP, …): complex IC rules
+            // (annihilate, commute, etc.).  Reinstall whnf at body slot
+            // and fall back to legacy combinators for now.
+            heap_set(ctx, dup_loc, whnf);
+            (void)side;
+            whnf = thvm_reduce_fallback(ctx, dp_orig);
             continue;
         }
 

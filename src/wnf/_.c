@@ -137,11 +137,27 @@ static WnfFrame *g_wnf_stack_buf = NULL;
 static u32       g_wnf_stack_cap = 0;
 static u32       g_wnf_stack_pos = 0;
 
+// Safe accessor for uop name (avoids out-of-bounds on unknown uops).
+static inline const char *wnf_uop_name_safe(u32 uop) {
+    return (uop < UOP_COUNT) ? uop_names[uop] : "?";
+}
+
 // Per-rule hook fired at each interaction (each ctx->itrs++).  Default
 // NULL (no overhead).  Callers register a hook to snapshot heap state
 // after each rule — used by the step-graph dumper.
 typedef void (*WnfStepHook)(TinyHVM *ctx);
 static WnfStepHook g_wnf_step_hook = NULL;
+
+// Cursor info set by each rule dispatch before firing WNF_FIRED().  The
+// step-graph hook reads these to highlight the currently-active
+// differentiation site (VJP descent target + rule name).
+static const char *g_wnf_last_rule     = "";
+static u64         g_wnf_last_cursor   = 0;
+static Term        g_wnf_last_tgt      = 0;
+
+const char *thvm_wnf_last_rule(void)   { return g_wnf_last_rule; }
+u64         thvm_wnf_last_cursor(void) { return g_wnf_last_cursor; }
+Term        thvm_wnf_last_tgt(void)    { return g_wnf_last_tgt; }
 
 void thvm_wnf_set_step_hook(WnfStepHook hook) { g_wnf_step_hook = hook; }
 void thvm_wnf_clear_step_hook(void)          { g_wnf_step_hook = NULL; }
@@ -159,6 +175,22 @@ static int g_wnf_budget_hit    = 0;
     if (g_wnf_step_hook) g_wnf_step_hook(ctx); \
     if (g_wnf_budget > 0 && ++g_wnf_budget_fired >= g_wnf_budget) \
         g_wnf_budget_hit = 1; \
+    g_wnf_last_rule = ""; g_wnf_last_cursor = 0; g_wnf_last_tgt = 0; \
+} while (0)
+
+// Annotated fire for rules that want to report their rule name + the
+// heap slot of the term being differentiated.  The hook reads these
+// globals after the fire (before they reset) to drive step-graph
+// highlighting.  rule_name is a static string literal.
+#define WNF_FIRED_AT(rule_name, cursor_loc, tgt_term) do { \
+    g_wnf_last_rule   = (rule_name); \
+    g_wnf_last_cursor = (cursor_loc); \
+    g_wnf_last_tgt    = (tgt_term); \
+    ctx->itrs++; \
+    if (g_wnf_step_hook) g_wnf_step_hook(ctx); \
+    if (g_wnf_budget > 0 && ++g_wnf_budget_fired >= g_wnf_budget) \
+        g_wnf_budget_hit = 1; \
+    g_wnf_last_rule = ""; g_wnf_last_cursor = 0; g_wnf_last_tgt = 0; \
 } while (0)
 
 #define WNF_BUDGET_HIT() (g_wnf_budget_hit)
@@ -1630,13 +1662,15 @@ apply: {
             // cotangent `gv`, then enter it.  Each VJP rule dispatch
             // counts as ONE step — the rule's continuation frames
             // (VJP_BIN1, VJP_BIN2) only fire when they produce their
-            // own output.
+            // own output.  Reports wloc (slot of the TOP being
+            // differentiated) so the step-graph dumper can highlight
+            // the current descent position.
             #define VJP_RECURSE_INTO(op, gv) do { \
                 WnfFrame _inner = { .kind = WNF_F_VJP, .flags = 0, \
                     .t0 = tgt, .t1 = (gv), .t2 = 0, .t3 = 0 }; \
                 wnf_stack_push(_inner); \
                 next = (op); \
-                WNF_FIRED(); \
+                WNF_FIRED_AT(wnf_uop_name_safe(wuop), wloc, tgt); \
                 goto enter; \
             } while (0)
 
@@ -1651,7 +1685,7 @@ apply: {
                     .t0 = tgt, .t1 = (ga), .t2 = 0, .t3 = 0 }; \
                 wnf_stack_push(_inner); \
                 next = (av); \
-                WNF_FIRED(); \
+                WNF_FIRED_AT(wnf_uop_name_safe(wuop), wloc, tgt); \
                 goto enter; \
             } while (0)
 

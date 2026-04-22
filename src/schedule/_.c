@@ -1196,8 +1196,22 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
     char path[640];
     snprintf(path, sizeof(path), "%s/step_%03u.dot",
              g_step_session_dir, g_step_session_frame);
-    thvm_heap_dot_set_highlight(0, 0);
-    thvm_heap_dot_set_step_meta("", "");
+    // Pull cursor info from the rule that just fired.  For VJP rules
+    // this is the heap slot of the forward TOP being differentiated,
+    // giving the dumper a "currently-here" anchor to highlight.
+    u64 cursor_loc = thvm_wnf_last_cursor();
+    const char *rule_name = thvm_wnf_last_rule();
+    if (cursor_loc && cursor_loc < ctx->heap_pos)
+        thvm_heap_dot_set_highlight(cursor_loc, 0);
+    else
+        thvm_heap_dot_set_highlight(0, 0);
+    if (rule_name && rule_name[0]) {
+        char meta[64];
+        snprintf(meta, sizeof(meta), "VJP/%s", rule_name);
+        thvm_heap_dot_set_step_meta(meta, "");
+    } else {
+        thvm_heap_dot_set_step_meta("", "");
+    }
     thvm_heap_dot_set_include_all(1);
     thvm_heap_dot_root(ctx, path, g_step_session_root);
     thvm_heap_dot_set_include_all(0);
@@ -1242,10 +1256,15 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // every reachable arg slot) — together they match what
     // thvm_eval_collect_fixed_point drives, so the captured step
     // sequence covers the whole reduction including field-by-field
-    // descent into CTR bundles.
+    // descent into CTR bundles.  Then wrap the result in UOP_FUSE and
+    // run the fuse fixed-point so the session also captures the
+    // kernel-building FUSE interactions that turn lazy compute TOPs
+    // into KERNEL terms.
     thvm_wnf_set_step_hook(wnf_step_session_hook);
     traced = thvm_reduce(ctx, traced);
     traced = thvm_normalize(ctx, traced);
+    if (!getenv("THVM_STEP_GRAPH_NO_FUSE"))
+        traced = thvm_eval_fuse_fixed_point(ctx, traced, thvm_eval_mixed_dispatch_enabled());
     thvm_wnf_clear_step_hook();
 
     // Final-state frame (skipped if identical to last).

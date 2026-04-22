@@ -4,6 +4,7 @@ static void thvm_heap_dot_set_sched_kernels(int enabled);
 static void thvm_heap_dot_set_highlight(u64 slot, Term term);
 static void thvm_heap_dot_set_step_meta(const char *prev_name, const char *next_name);
 static void thvm_heap_dot_set_include_all(int enabled);
+static void thvm_heap_dot_set_grad_cursor(u64 grad_slot, u64 cursor_loc);
 static u64  thvm_file_sig(const char *path);
 static const char *thvm_step_graph_dir(void);
 static u32 thvm_step_graph_max_steps(void);
@@ -1212,35 +1213,21 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
     } else {
         thvm_heap_dot_set_step_meta("", "");
     }
-    // Slide the GRAD node visually: temporarily point heap[grad_slot+0]
-    // at the current VJP descent operand TOP, then restore after
-    // dumping.  The GRAD cell has been consumed into a frame at this
-    // point — its slot content is only used for display.  The cursor
-    // Term is reconstructed from the rule name (→ uop) and cursor_loc
-    // so the dumper draws it as a TOP feeding the GRAD.
+    // Tell the dumper to draw a "cursor" overlay edge from the GRAD
+    // node to the currently-active forward TOP so the descent is
+    // visible without disconnecting the original forward tree.
     u64 grad_slot = thvm_wnf_current_grad_slot();
-    Term saved_grad_y = 0;
-    int sliding = 0;
-    if (grad_slot != 0 && cursor_loc != 0 && rule_name && rule_name[0] &&
-        grad_slot + 1 < ctx->heap_pos && cursor_loc < ctx->heap_pos) {
-        u32 cursor_uop = UOP_COUNT;
-        for (u32 u = 0; u < UOP_COUNT; u++)
-            if (strcmp(rule_name, uop_names[u]) == 0) { cursor_uop = u; break; }
-        if (cursor_uop < UOP_COUNT) {
-            Term cursor_top = term_new(TAG_TOP, cursor_uop, cursor_loc);
-            saved_grad_y = heap_read(ctx, grad_slot + 0);
-            if (cursor_top != saved_grad_y) {
-                heap_set(ctx, grad_slot + 0, cursor_top);
-                sliding = 1;
-            }
-        }
-    }
+    if (grad_slot != 0 && cursor_loc != 0 && cursor_loc < ctx->heap_pos)
+        thvm_heap_dot_set_grad_cursor(grad_slot, cursor_loc);
+    else
+        thvm_heap_dot_set_grad_cursor(0, 0);
+    // Include ALL heap slots during per-step frames so the user sees
+    // cotangents and scratch cells accumulate as the VJP recurses.
+    // The initial + final frames use reachable-only (cleaner start/end).
     thvm_heap_dot_set_include_all(1);
     thvm_heap_dot_root(ctx, path, g_step_session_root);
     thvm_heap_dot_set_include_all(0);
-    if (sliding) {
-        heap_set(ctx, grad_slot + 0, saved_grad_y);
-    }
+    thvm_heap_dot_set_grad_cursor(0, 0);
     // Dedup on rendered content — collapses enter-phase administrative
     // firings (VAR resolve, INC unwrap, ...) that don't change what the
     // step graph actually shows.
@@ -1300,9 +1287,10 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     snprintf(pF, sizeof(pF), "%s/step_%03u_final.dot", dir, g_step_session_frame);
     thvm_heap_dot_set_highlight(0, 0);
     thvm_heap_dot_set_step_meta("", "");
-    thvm_heap_dot_set_include_all(1);
+    // Final uses reachable-only (include_all=0) — the accumulated scratch
+    // from the VJP and FUSE phases is not semantically part of the final
+    // reduced form.
     thvm_heap_dot_root(ctx, pF, traced);
-    thvm_heap_dot_set_include_all(0);
     u64 final_sig = thvm_file_sig(pF);
     if (final_sig != g_step_session_last_render_sig) {
         g_step_session_frame++;

@@ -34,6 +34,18 @@ static void thvm_heap_dot_set_highlight(u64 slot, Term term) {
     heap_dot_hl_term = term;
     heap_dot_hl_hit = 0;
 }
+
+// GRAD cursor overlay: draws a dotted edge from the node at
+// heap[grad_slot] (a GRAD) to the node at heap[cursor_loc] (the
+// currently-active forward TOP being differentiated).  Used by the
+// step-graph hook to show the VJP descent cursor without mutating
+// heap.  Both 0 disables.
+static u64 heap_dot_grad_cursor_grad  = 0;
+static u64 heap_dot_grad_cursor_loc   = 0;
+static void thvm_heap_dot_set_grad_cursor(u64 grad_slot, u64 cursor_loc) {
+    heap_dot_grad_cursor_grad = grad_slot;
+    heap_dot_grad_cursor_loc  = cursor_loc;
+}
 static void thvm_heap_dot_set_step_meta(const char *prev_name, const char *next_name) {
     snprintf(heap_dot_prev_name, sizeof(heap_dot_prev_name), "%s", prev_name ? prev_name : "");
     snprintf(heap_dot_next_name, sizeof(heap_dot_next_name), "%s", next_name ? next_name : "");
@@ -2856,6 +2868,21 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         fprintf(f, "  rootout_t%u [label=\"\",shape=circle,width=0.14,height=0.14,fixedsize=true,fillcolor=\"#ffffff\",color=\"#888888\",fontsize=1];\n",
                 root_tid);
         fprintf(f, "  t%u -> rootout_t%u [label=\"out\"];\n", root_tid, root_tid);
+    }
+
+    // Step-graph GRAD-cursor overlay: if both the GRAD slot and the
+    // current forward TOP are live & rendered as n<val> nodes, draw a
+    // dashed edge from the GRAD to the cursor TOP.  This is the
+    // "slide" visualization — without mutating the heap — that shows
+    // which forward node the VJP is currently differentiating.
+    if (heap_dot_grad_cursor_grad != 0 && heap_dot_grad_cursor_loc != 0 &&
+        heap_dot_grad_cursor_grad < ctx->heap_pos &&
+        heap_dot_grad_cursor_loc < ctx->heap_pos) {
+        fprintf(f,
+            "  n%llu -> n%llu [label=\"cursor\",style=dashed,color=\"#cc0000\","
+            "penwidth=1.5,fontcolor=\"#cc0000\",constraint=false];\n",
+            (unsigned long long)heap_dot_grad_cursor_loc,
+            (unsigned long long)heap_dot_grad_cursor_grad);
     }
 
     fprintf(f, "}\n");

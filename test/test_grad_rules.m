@@ -70,6 +70,42 @@ static char *slurp(const char *path) {
     return buf;
 }
 
+// Count occurrences of `label="<needle>` (an op tag) in the dot file.
+// Used by per-step topology assertions.
+static int count_op_nodes(const char *buf, const char *op) {
+    int n = 0;
+    const char *p = buf;
+    char pat[64];
+    snprintf(pat, sizeof(pat), "label=\"%s", op);
+    while ((p = strstr(p, pat)) != NULL) { n++; p += strlen(pat); }
+    return n;
+}
+
+// Per-step topology assertion for a step graph dump.  Reads
+// graphs/grad_rules/<rule>/steps/step_NNN.dot and requires each
+// (op, count) pair in `expect` to match exactly.  `step` names the
+// .dot file (e.g. "step_000", "step_004_final").
+static int step_topo_check(const char *rule, const char *step,
+                           const char *const (*expect)[2], int n_expect) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s/steps/%s.dot", GRAPH_ROOT, rule, step);
+    char *buf = slurp(path);
+    if (!buf) { printf("  STEP miss: %s not written\n", path); return 0; }
+    int ok = 1;
+    for (int i = 0; i < n_expect; i++) {
+        const char *op = expect[i][0];
+        int want = atoi(expect[i][1]);
+        int got = count_op_nodes(buf, op);
+        if (got != want) {
+            printf("  STEP %s/%s: op=%s want=%d got=%d\n",
+                   rule, step, op, want, got);
+            ok = 0;
+        }
+    }
+    free(buf);
+    return ok;
+}
+
 static int topo_check(const char *rule, int phase,
                       const char **needles, int n_needles) {
     const char *name[] = {
@@ -3118,9 +3154,13 @@ static int test_e2e_jvp_elementwise(void) {
 }
 
 // VJP counterpart to JVP(sum(x*x)) — same forward, reverse gradient.
-// Emits graph under graphs/grad_rules/vjp_sum_of_square/ for side-by-side viz.
+// Emits graph under graphs/grad_rules/vjp_sum_of_square/ for side-by-side
+// viz and asserts per-step topology.  Disables FUSE-phase steps so the
+// numbering is stable (otherwise every kernel rule fired after VJP
+// shifts the indices).
 static int test_e2e_vjp_sum_of_square(void) {
     setup_step_graph_dir("vjp_sum_of_square");
+    setenv("THVM_STEP_GRAPH_NO_FUSE", "1", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1,2,3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
@@ -3133,6 +3173,21 @@ static int test_e2e_vjp_sum_of_square(void) {
         fprintf(stderr, "  vjp_sum h[%d]=%g want %g\n", i, h[i], expect[i]); ok=0;
     }
     thvm_free(ctx);
+    // Per-step topology: initial forward-only, then cotangents grow in.
+    const char *init[][2] = {{"MUL","1"},{"SUM","1"},{"GRAD","1"},{"EXPAND","0"}};
+    ok = ok && step_topo_check("vjp_sum_of_square", "step_000", init, 4);
+    // After VJP/SUM fires, EXPAND cotangent appears (forward still
+    // visible via include_all).
+    const char *after_sum[][2] = {{"MUL","1"},{"SUM","1"},{"EXPAND","1"},{"GRAD","1"}};
+    ok = ok && step_topo_check("vjp_sum_of_square", "step_002", after_sum, 4);
+    // After VJP/MUL fires — MUL-Leibniz emits two MUL cotangents (3 total).
+    const char *after_mul[][2] = {{"MUL","3"},{"EXPAND","1"},{"SUM","1"},{"GRAD","1"}};
+    ok = ok && step_topo_check("vjp_sum_of_square", "step_004", after_mul, 4);
+    // Final (reachable-only): ADD of MUL cotangents, no forward/GRAD.
+    const char *final_t[][2] = {{"ADD","1"},{"MUL","2"},{"EXPAND","1"},
+                                {"GRAD","0"},{"SUM","0"}};
+    ok = ok && step_topo_check("vjp_sum_of_square", "step_005_final", final_t, 5);
+    unsetenv("THVM_STEP_GRAPH_NO_FUSE");
     teardown_step_graph_dir();
     return report("e2e_vjp_sum_of_square", ok);
 }

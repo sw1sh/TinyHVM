@@ -664,7 +664,27 @@ static int test_gradu_##TNAME(void) {                                  \
 }
 GRADU_BIN_TEST(div, "gradu_div", UOP_DIV, "DIV", "DIV")
 GRADU_BIN_TEST(max, "gradu_max", UOP_MAX, "MAX", "CMP")
-GRADU_BIN_TEST(cmp, "gradu_cmp", UOP_CMP, "CMP", "EXPAND")
+// CMP: non-differentiable → ERA.  Post-reduce keeps only the CTR
+// wrapper (ERA child collapsed via peephole).
+static int test_gradu_cmp(void) {
+    setup_graph_dir("gradu_cmp");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 ad[] = {4, 5, 6}, bd[] = {1, 2, 3};
+    Term a = thvm_tensor(ctx, ad, SHAPE(3));
+    Term b = thvm_tensor(ctx, bd, SHAPE(3));
+    thvm_set_requires_grad(ctx, a);
+    Term y = thvm_op(ctx, UOP_CMP, a, b);
+    Term y0, y1;
+    thvm_dup(ctx, thvm_fresh_label(ctx), y, &y0, &y1);
+    Term root = thvm_ctr(ctx, (Term[]){ y0, thvm_grad(ctx, y1, a) }, 2);
+    thvm_eval(ctx, root);
+    thvm_free(ctx);
+    const char *pre[]  = {"CTR", "GRAD", "CMP"};
+    const char *post[] = {"CTR"};
+    int ok = topo_check("gradu_cmp", 0, pre, 3)
+          && topo_check("gradu_cmp", 1, post, 1);
+    return report("gradu_cmp", ok);
+}
 
 // UOP_GRAD view/reduce batch (RESHAPE, PERMUTE, SUM).
 static int test_gradu_reshape(void) {
@@ -933,10 +953,11 @@ static int test_gradu_shape_target_diff(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "ADD"};
-    // bwd = ADD(EXPAND(0, [2]), EXPAND(0, [2])) = 0 of target's shape.
-    const char *post[] = {"CTR", "ADD", "EXPAND"};
+    // bwd = ERA (both leaves mismatch target) — stack machine collapses
+    // to ERA via peepholes; CTR retains ERA child.
+    const char *post[] = {"CTR"};
     int ok = topo_check("gradu_shape_target_diff", 0, pre, 3)
-          && topo_check("gradu_shape_target_diff", 1, post, 3);
+          && topo_check("gradu_shape_target_diff", 1, post, 1);
     return report("gradu_shape_target_diff", ok);
 }
 
@@ -1103,10 +1124,11 @@ static int test_gradu_assign_src(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "ASSIGN"};
-    // bwd = GRAD(dst=a, b) where a!=b → EXPAND(0, b.shape).
-    const char *post[] = {"CTR", "EXPAND"};
+    // bwd = GRAD(dst=a, b) where a!=b → ERA (dead branch via peepholes);
+    // CTR retains ERA.
+    const char *post[] = {"CTR"};
     int ok = topo_check("gradu_assign_src", 0, pre, 3)
-          && topo_check("gradu_assign_src", 1, post, 2);
+          && topo_check("gradu_assign_src", 1, post, 1);
     return report("gradu_assign_src", ok);
 }
 
@@ -2226,16 +2248,12 @@ static int test_e2e_sgd_loop(void) {
     Term w = thvm_tensor(ctx, wd, SHAPE(1));
     f32 lr = 0.1f;
     for (int step = 0; step < 10; step++) {
-        // w_dup for loss + target; loss = 0.5 * w * w
-        Term w0, w1;
-        thvm_dup(ctx, thvm_fresh_label(ctx), w, &w0, &w1);
-        Term w0a, w0b;
-        thvm_dup(ctx, thvm_fresh_label(ctx), w0, &w0a, &w0b);
-        Term wsq = thvm_op(ctx, UOP_MUL, w0a, w0b);
+        // loss = 0.5 * w * w — compute-op convention shares w directly.
+        Term wsq = thvm_op(ctx, UOP_MUL, w, w);
         f32 halfv = 0.5f;
         Term half = thvm_tensor(ctx, &halfv, SHAPE(1));
         Term loss = thvm_op(ctx, UOP_MUL, half, wsq);
-        Term g = thvm_grad(ctx, loss, w1);
+        Term g = thvm_grad(ctx, loss, w);
         Term ge = thvm_eval(ctx, g);
         f32 *gh = thvm_to_host(ctx, ge);
         if (!gh) { thvm_free(ctx); return report("e2e_sgd_loop", 0); }
@@ -2346,14 +2364,10 @@ static int test_e2e_adam(void) {
     for (int t = 1; t <= 20; t++) {
         TinyHVM *ctx = thvm_init("cpu");
         Term wt = thvm_tensor(ctx, &w, SHAPE(1));
-        Term w0, w1v;
-        thvm_dup(ctx, thvm_fresh_label(ctx), wt, &w0, &w1v);
-        Term w0a, w0b;
-        thvm_dup(ctx, thvm_fresh_label(ctx), w0, &w0a, &w0b);
         f32 hv = 0.5f;
         Term half = thvm_tensor(ctx, &hv, SHAPE(1));
-        Term loss = thvm_op(ctx, UOP_MUL, half, thvm_op(ctx, UOP_MUL, w0a, w0b));
-        f32 *gh = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, loss, w1v)));
+        Term loss = thvm_op(ctx, UOP_MUL, half, thvm_op(ctx, UOP_MUL, wt, wt));
+        f32 *gh = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, loss, wt)));
         if (!gh) { thvm_free(ctx); return report("e2e_adam", 0); }
         f32 grad = gh[0];
         m = b1*m + (1-b1)*grad;

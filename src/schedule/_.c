@@ -1290,28 +1290,23 @@ static int thvm_eval_needs_followup_round(Term t) {
 }
 
 static Term thvm_eval_collect_fixed_point(TinyHVM *ctx, Term t, int dispatch_enabled) {
-    u8 *reach = NULL;
-    size_t reach_cap = 0;
     step_root_slot = 0;
     Term traced = thvm_step_seed_root_grad(ctx, t);
     int saved_dispatch_enabled = ctx->dispatch_enabled;
     ctx->dispatch_enabled = dispatch_enabled;
-    u64 loop_steps = 0;
-    while (thvm_reduce_step_collect(ctx, &traced, NULL, &reach, &reach_cap)) {
-        loop_steps++;
-        if (getenv("THVM_LOOP_DIAG") && (loop_steps % 1000) == 0) {
-            char summary[128];
-            thvm_graph_term_summary(traced, summary, sizeof(summary));
-            fprintf(stderr, "EVAL_COLLECT step=%llu dispatch=%d root=%s heap_pos=%llu itrs=%llu\n",
-                    (unsigned long long)loop_steps,
-                    dispatch_enabled,
-                    summary,
-                    (unsigned long long)ctx->heap_pos,
-                    (unsigned long long)ctx->itrs);
-        }
+    // Drive reductions until fixed point.  wnf reduces the root in one
+    // shot; we then loop until `ctx->itrs` stops increasing so any heap
+    // side-effects (ASSIGN, KERNEL dispatch) that expose further redexes
+    // reachable from the root get re-reduced.
+    for (u32 guard = 0; guard < 1024; guard++) {
+        u64 itrs_before = ctx->itrs;
+        traced = thvm_reduce(ctx, traced);
+        // Also sweep any detached/unreachable heap redexes that direct
+        // uops (FUSE, KERNEL, EXEC) leave behind during scheduler passes.
+        traced = reduce_net_quiesce(ctx, traced);
+        if (ctx->itrs == itrs_before) break;
     }
     ctx->dispatch_enabled = saved_dispatch_enabled;
-    free(reach);
     if (step_root_slot > 0 && step_root_slot < ctx->heap_pos)
         heap_set(ctx, step_root_slot, term_era());
     step_root_slot = 0;

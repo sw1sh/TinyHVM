@@ -101,6 +101,9 @@ enum {
     // EQL phase 2 — x is an atom (t1), reducing y (slot 1).
     // t0 = original EQL, t1 = x (atom), t2 = EQL loc.
     WNF_F_EQL_Y,
+    // AND / OR single-phase — reduce a (slot 0), then dispatch.
+    // t0 = original term, t2 = loc, flags bit 0: 0=AND, 1=OR.
+    WNF_F_AND_OR,
 };
 
 typedef struct {
@@ -489,6 +492,20 @@ enter: {
         };
         wnf_stack_push(f);
         next = label_expr;
+        goto enter;
+    }
+
+    // AND / OR: short-circuit boolean — reduce left, dispatch.
+    if (tag == TAG_AND || tag == TAG_OR) {
+        u64 loc = term_val(next);
+        if (loc == 0 || loc + 1 >= ctx->heap_pos) { whnf = next; goto apply; }
+        Term a = heap_read(ctx, loc + 0);
+        WnfFrame f = {
+            .kind = WNF_F_AND_OR, .flags = (u8)(tag == TAG_OR ? 1 : 0),
+            .t0 = next, .t1 = 0, .t2 = (Term)loc, .t3 = 0
+        };
+        wnf_stack_push(f);
+        next = a;
         goto enter;
     }
 
@@ -1776,6 +1793,66 @@ apply: {
             heap_set(ctx, app_loc + 0, fun);
             heap_set(ctx, app_loc + 1, whnf);
             whnf = app_orig;
+            continue;
+        }
+
+        case WNF_F_AND_OR: {
+            // whnf = a reduced; frame t0=orig, t2=loc, flags bit 0 = is_or.
+            Term orig = f.t0;
+            u64 loc = (u64)f.t2;
+            int is_or = f.flags & 1;
+            u8 at = term_tag(whnf);
+
+            // Distribute through SUP.
+            if (at == TAG_SUP) {
+                u32 lab = term_ext(whnf);
+                u64 sloc = term_val(whnf);
+                Term a0 = heap_read(ctx, sloc + 0);
+                Term a1 = heap_read(ctx, sloc + 1);
+                Term b = heap_read(ctx, loc + 1);
+                u64 dup = heap_alloc(ctx, 1);
+                heap_set(ctx, dup, b);
+                ctx->itrs++;
+                Term (*op)(TinyHVM *, Term, Term) = is_or ? thvm_or : thvm_and;
+                next = thvm_sup(ctx, lab,
+                    op(ctx, a0, term_new(TAG_DP0, lab, dup)),
+                    op(ctx, a1, term_new(TAG_DP1, lab, dup)));
+                goto enter;
+            }
+            if (at == TAG_USP) {
+                u32 lab = term_ext(whnf);
+                u64 sloc = term_val(whnf);
+                Term a0 = heap_read(ctx, sloc + 0);
+                Term a1 = heap_read(ctx, sloc + 1);
+                Term b = heap_read(ctx, loc + 1);
+                u64 dup = heap_alloc(ctx, 1);
+                heap_set(ctx, dup, b);
+                ctx->itrs++;
+                Term (*op)(TinyHVM *, Term, Term) = is_or ? thvm_or : thvm_and;
+                next = thvm_usp(ctx, lab,
+                    op(ctx, a0, term_new(TAG_UDP, lab, dup)),
+                    op(ctx, a1, term_new(TAG_UDP, lab, dup)));
+                goto enter;
+            }
+            // ERA → ERA.
+            if (at == TAG_ERA) { whnf = term_era(); ctx->itrs++; continue; }
+            // NUM: short-circuit.
+            if (at == TAG_NUM) {
+                u32 av = term_as_u32(whnf);
+                ctx->itrs++;
+                if (is_or) {
+                    if (av == 0) { next = heap_read(ctx, loc + 1); goto enter; }
+                    whnf = term_num_u32(1);
+                    continue;
+                } else {
+                    if (av == 0) { whnf = term_num_u32(0); continue; }
+                    next = heap_read(ctx, loc + 1);
+                    goto enter;
+                }
+            }
+            // Stuck: rebuild AND/OR with reduced left.
+            heap_set(ctx, loc + 0, whnf);
+            whnf = orig;
             continue;
         }
 

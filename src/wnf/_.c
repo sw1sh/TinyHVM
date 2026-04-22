@@ -67,6 +67,11 @@ enum {
     // t1 = arg (APP.slot 1).
     // t2 = APP heap loc.
     WNF_F_APP,
+    // SEQ frame — sequential evaluation: reduce slot 0, discard, return slot 1.
+    // t0 = original SEQ term (for rebuild when blocked).
+    // t1 = b (slot 1).
+    // t2 = SEQ heap loc.
+    WNF_F_SEQ,
 };
 
 typedef struct {
@@ -211,6 +216,23 @@ enter: {
     u8 tag = term_tag(next);
 
     if (wnf_is_atom(tag)) { whnf = next; goto apply; }
+
+    // SEQ: push continuation frame, descend into slot 0 (strict arg).
+    if (tag == TAG_SEQ) {
+        u64 loc = term_val(next);
+        if (loc == 0 || loc + 1 >= ctx->heap_pos) {
+            whnf = next; goto apply;
+        }
+        Term a = heap_read(ctx, loc + 0);
+        Term b = heap_read(ctx, loc + 1);
+        WnfFrame f = {
+            .kind = WNF_F_SEQ, .flags = 0,
+            .t0 = next, .t1 = b, .t2 = (Term)loc, .t3 = 0
+        };
+        wnf_stack_push(f);
+        next = a;
+        goto enter;
+    }
 
     // APP: push continuation frame, descend into fun (principal).
     if (tag == TAG_APP) {
@@ -998,6 +1020,49 @@ apply: {
             }
             ctx->itrs++;
             continue;
+        }
+
+        case WNF_F_SEQ: {
+            // frame: original SEQ term (t0), b (t1), SEQ loc (t2).
+            // whnf is `a` in WHNF — dispatch on its tag.
+            Term seq_orig = f.t0;
+            Term b = f.t1;
+            u64 seq_loc = (u64)f.t2;
+
+            // SEQ ⊳ SUP: distribute through superposition.
+            if (term_tag(whnf) == TAG_SUP) {
+                u32 lab = term_ext(whnf);
+                u64 sloc = term_val(whnf);
+                Term a0 = heap_read(ctx, sloc + 0);
+                Term a1 = heap_read(ctx, sloc + 1);
+                u64 dup = heap_alloc(ctx, 1);
+                heap_set(ctx, dup, b);
+                u64 s0loc = heap_alloc(ctx, 2);
+                heap_set(ctx, s0loc + 0, a0);
+                heap_set(ctx, s0loc + 1, term_new(TAG_DP0, lab, dup));
+                u64 s1loc = heap_alloc(ctx, 2);
+                heap_set(ctx, s1loc + 0, a1);
+                heap_set(ctx, s1loc + 1, term_new(TAG_DP1, lab, dup));
+                ctx->itrs++;
+                next = thvm_sup(ctx, lab,
+                    term_new(TAG_SEQ, 0, s0loc),
+                    term_new(TAG_SEQ, 0, s1loc));
+                goto enter;
+            }
+
+            // SEQ ⊳ TAG_TOP: blocked — compute op not yet materialized.
+            // Reinstall whnf in slot 0 and return the SEQ term as-is
+            // (not further reducible in pure IC at this point).
+            if (term_tag(whnf) == TAG_TOP) {
+                heap_set(ctx, seq_loc + 0, whnf);
+                whnf = seq_orig;
+                continue;
+            }
+
+            // SEQ ⊳ {ERA, TEN, NUM, CTR, LAM, ...}: value — discard, return b.
+            ctx->itrs++;
+            next = b;
+            goto enter;
         }
 
         case WNF_F_APP: {

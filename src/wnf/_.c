@@ -76,6 +76,13 @@ enum {
     // t0 = original DP term (for rebuild on unhandled whnf).
     // flags bit 0 = side (0 for DP0, 1 for DP1).
     WNF_F_DUP,
+    // OP2 phase 1: x being reduced (slot 0).  After x is WHNF, need y.
+    // t0 = original OP2 term, t2 = OP2 loc, flags = opr.
+    WNF_F_OP2_X,
+    // OP2 phase 2: x is NUM (stored in t1), now reducing y.  After y is
+    // WHNF, compute op.
+    // t0 = original OP2, t1 = x (NUM), t2 = OP2 loc, flags = opr.
+    WNF_F_OP2_Y,
 };
 
 typedef struct {
@@ -341,6 +348,23 @@ enter: {
         };
         wnf_stack_push(f);
         next = cell;
+        goto enter;
+    }
+
+    // OP2: numeric binary op.  Reduce x first.
+    if (tag == TAG_OP2) {
+        u64 loc = term_val(next);
+        if (loc == 0 || loc + 1 >= ctx->heap_pos) {
+            whnf = next; goto apply;
+        }
+        u32 opr = term_ext(next);
+        Term x = heap_read(ctx, loc + 0);
+        WnfFrame f = {
+            .kind = WNF_F_OP2_X, .flags = (u8)opr,
+            .t0 = next, .t1 = 0, .t2 = (Term)loc, .t3 = 0
+        };
+        wnf_stack_push(f);
+        next = x;
         goto enter;
     }
 
@@ -1146,6 +1170,79 @@ apply: {
                 whnf = (a_shape.rank != 0) ? thvm_expand(ctx, whnf, a_shape) : whnf;
             }
             ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_OP2_X: {
+            // whnf = x (WHNF).
+            Term op2_orig = f.t0;
+            u64 op2_loc = (u64)f.t2;
+            u32 opr = f.flags;
+            Term y = heap_read(ctx, op2_loc + 1);
+            // OP2-SUP (left): distribute.
+            if (term_tag(whnf) == TAG_SUP) {
+                u32 lab = term_ext(whnf);
+                u64 sup_loc = term_val(whnf);
+                Term x0 = heap_read(ctx, sup_loc + 0);
+                Term x1 = heap_read(ctx, sup_loc + 1);
+                u64 dup_loc = heap_alloc(ctx, 1);
+                heap_set(ctx, dup_loc, y);
+                Term y0 = term_new(TAG_DP0, lab, dup_loc);
+                Term y1 = term_new(TAG_DP1, lab, dup_loc);
+                ctx->itrs++;
+                next = thvm_sup(ctx, lab,
+                    thvm_op2(ctx, opr, x0, y0),
+                    thvm_op2(ctx, opr, x1, y1));
+                goto enter;
+            }
+            // x is WHNF (typically NUM); push phase 2 to reduce y.
+            WnfFrame f2 = {
+                .kind = WNF_F_OP2_Y, .flags = (u8)opr,
+                .t0 = op2_orig, .t1 = whnf, .t2 = (Term)op2_loc, .t3 = 0
+            };
+            wnf_stack_push(f2);
+            next = y;
+            goto enter;
+        }
+
+        case WNF_F_OP2_Y: {
+            // whnf = y (WHNF).  x is f.t1 (WHNF from phase 1).
+            Term x = f.t1;
+            u32 opr = f.flags;
+            // OP2-SUP (right): distribute.
+            if (term_tag(whnf) == TAG_SUP) {
+                u32 lab = term_ext(whnf);
+                u64 sup_loc = term_val(whnf);
+                Term y0 = heap_read(ctx, sup_loc + 0);
+                Term y1 = heap_read(ctx, sup_loc + 1);
+                ctx->itrs++;
+                next = thvm_sup(ctx, lab,
+                    thvm_op2(ctx, opr, x, y0),
+                    thvm_op2(ctx, opr, x, y1));
+                goto enter;
+            }
+            // NUM op NUM → compute.
+            if (term_tag(x) == TAG_NUM && term_tag(whnf) == TAG_NUM) {
+                u32 xv = term_as_u32(x), yv = term_as_u32(whnf), r;
+                switch (opr) {
+                    case 0: r = xv + yv; break;
+                    case 1: r = xv - yv; break;
+                    case 2: r = xv * yv; break;
+                    case 3: r = yv ? xv / yv : 0; break;
+                    case 4: r = (xv == yv) ? 1 : 0; break;
+                    case 5: r = yv ? xv % yv : 0; break;
+                    default: r = 0;
+                }
+                ctx->itrs++;
+                whnf = term_num_u32(r);
+                continue;
+            }
+            // Stuck: rebuild OP2 with reduced x,y — return legacy OP2.
+            Term op2_orig = f.t0;
+            u64 op2_loc = (u64)f.t2;
+            heap_set(ctx, op2_loc + 0, x);
+            heap_set(ctx, op2_loc + 1, whnf);
+            whnf = op2_orig;
             continue;
         }
 

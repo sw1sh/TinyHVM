@@ -456,19 +456,47 @@ enter: {
         // materialization path in the legacy trampoline.  Pure compute
         // TOPs (ADD/MUL/SUM/MM/etc.) are already WNF under IC; return
         // them as-is without touching the fallback.
-        if (g_wnf_stack_pos == base) {
-            if (reduce_top_direct_uop_ctx(ctx, ext) ||
-                reduce_top_has_era_arg(ctx, next) ||
-                reduce_top_has_add_zero_arg(ctx, next)) {
-                // Direct uop or peephole trigger: fire one interaction step.
-                // If it rewrote, re-enter (trampoline equivalent).  Prevents
-                // infinite loops via a step-budget guard.
-                Term r = thvm_interact(ctx, next);
-                if (r != next) {
-                    ctx->itrs++;
-                    next = r;
-                    goto enter;
+        // Direct uops (ASSIGN/IFZ/LOG_PRINT/TODEVICE/CAST/DETACH/WHERE/
+        // EXEC/KERNEL/FUSE) and peephole triggers (ERA-arg, ADD-zero)
+        // fire eagerly regardless of frame depth — they're effectful
+        // and should run wherever they appear (inside SEQ, at root, ...).
+        // Pure compute TOPs (ADD/MUL/SUM/MM/...) remain WNF so that
+        // enclosing GRAD frames see the unmaterialized TOP.
+        // Exception: WHERE under an immediate WNF_F_GRAD parent must stay
+        // lazy so the GRAD rule can pattern-match on WHERE(cond,a,b) and
+        // distribute through branches (legacy reduce/_.c:547).
+        int under_grad = (g_wnf_stack_pos > 0 &&
+                          g_wnf_stack_buf[g_wnf_stack_pos - 1].kind == WNF_F_GRAD);
+        if (ext == UOP_WHERE && under_grad) {
+            whnf = next;
+            goto apply;
+        }
+        if (reduce_top_direct_uop_ctx(ctx, ext) ||
+            reduce_top_has_era_arg(ctx, next) ||
+            reduce_top_has_add_zero_arg(ctx, next)) {
+            // Drive arg0 (and for ASSIGN also src) to WHNF first —
+            // matches the legacy TOP trampoline's "reduce arg0 then fire"
+            // scheme so IFZ sees a TEN counter, ASSIGN sees TEN dst, etc.
+            u64 tloc = term_val(next);
+            if (tloc != 0 && tloc < ctx->heap_pos) {
+                Term a0 = heap_read(ctx, tloc + 0);
+                Term a0r = thvm_reduce(ctx, a0);
+                if (a0r != a0) heap_set(ctx, tloc + 0, a0r);
+                if (ext == UOP_ASSIGN && tloc + 1 < ctx->heap_pos) {
+                    Term a1 = heap_read(ctx, tloc + 1);
+                    Term a1r = thvm_reduce(ctx, a1);
+                    // ASSIGN fires only when src is TEN/ERA.  If src is
+                    // still a compute TOP, force materialisation via the
+                    // scheduler so the blit has a buffer to copy.
+                    if (term_tag(a1r) == TAG_TOP) a1r = thvm_eval(ctx, a1r);
+                    if (a1r != a1) heap_set(ctx, tloc + 1, a1r);
                 }
+            }
+            Term r = thvm_interact(ctx, next);
+            if (r != next) {
+                ctx->itrs++;
+                next = r;
+                goto enter;
             }
         }
         whnf = next;

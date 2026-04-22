@@ -2278,6 +2278,12 @@ static int test_e2e_sgd_loop(void) {
 // train := λc.λw. IFZ(c, w, λm. SEQ(ASSIGN(dst, w - lr*grad), train(m)(rec)))
 // where loss = 0.5*w*w, grad = w (so update = w - 0.1*w = 0.9*w).
 static int test_e2e_recursive_sgd(void) {
+    // Disable graph tracing for this test — the step-graph snapshot/restore
+    // mechanism takes a buffer snapshot before eval and writes it back after,
+    // which would undo the in-place ASSIGN mutations we're measuring.
+    unsetenv("THVM_GRAPH");
+    unsetenv("THVM_STEP_GRAPH");
+    unsetenv("THVM_GRAPH_STOP_AFTER_SWEEP");
     TinyHVM *ctx = thvm_init("cpu");
     f32 wd[] = {4.0f};
     Term w_init = thvm_tensor(ctx, wd, SHAPE(1));
@@ -2319,16 +2325,23 @@ static int test_e2e_recursive_sgd(void) {
     Term start = thvm_app(ctx,
                  thvm_app(ctx, thvm_ref(ctx, train_id), thvm_scalar_u32(ctx, n_steps)),
                           w_init);
-    Term r = thvm_eval(ctx, start);
-    f32 *h = thvm_to_host(ctx, r);
+    (void)thvm_eval(ctx, start);
+    // ASSIGN mutates w_init's buffer in place; read it directly.
+    f32 *h = thvm_to_host(ctx, w_init);
     f32 expect = 4.0f;
     for (u32 i = 0; i < n_steps; i++) expect *= 0.9f;
     int ok = (h != NULL);
     if (h) {
         f32 diff = h[0] - expect; if (diff < 0) diff = -diff;
         if (diff > 1e-2f) { fprintf(stderr, "  rec_sgd: w=%g expect=%g\n", h[0], expect); ok = 0; }
+    } else {
+        fprintf(stderr, "  rec_sgd: w_init buf readback NULL\n");
     }
     thvm_free(ctx);
+    // Restore graph env so subsequent tests that use setup_graph_dir
+    // still dump their graphs correctly.
+    setenv("THVM_GRAPH", "1", 1);
+    setenv("THVM_GRAPH_STOP_AFTER_SWEEP", "1", 1);
     return report("e2e_recursive_sgd", ok);
 }
 
@@ -2994,7 +3007,7 @@ int main(void) {
     // fails += test_e2e_conv_like();  // BLOCKED: MUL Leibniz fails when a,b shapes != tgt.shape (pad(x)*w); needs reverse-mode MUL VJP with sum_to_shape
     fails += test_e2e_softmax();
     fails += test_e2e_sgd_loop();
-    // fails += test_e2e_recursive_sgd();  // BLOCKED: in-VM IFZ+REF+APP+ASSIGN+SEQ loop readback NULL; needs pipeline integration work
+    fails += test_e2e_recursive_sgd();
     fails += test_e2e_mlp_bwd();
     fails += test_e2e_adam();
     fails += test_e2e_maxpool_like();

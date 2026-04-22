@@ -1041,6 +1041,26 @@ apply: {
                 continue;
             }
 
+            // APP ⊳ SUP: distribute.
+            //   (&L{f0,f1} arg) → !&L{a0,a1}=arg; &L{(f0 a0), (f1 a1)}
+            if (term_tag(whnf) == TAG_SUP) {
+                u32 lab = term_ext(whnf);
+                u64 sup_loc = term_val(whnf);
+                Term f0 = heap_read(ctx, sup_loc + 0);
+                Term f1 = heap_read(ctx, sup_loc + 1);
+                u64 dup_loc = heap_alloc(ctx, 1);
+                heap_set(ctx, dup_loc, arg);
+                Term arg0 = term_new(TAG_DP0, lab, dup_loc);
+                Term arg1 = term_new(TAG_DP1, lab, dup_loc);
+                ctx->itrs++;
+                next = thvm_sup(ctx, lab,
+                    thvm_app(ctx, f0, arg0),
+                    thvm_app(ctx, f1, arg1));
+                heap_set(ctx, app_loc + 0, term_era());
+                heap_set(ctx, app_loc + 1, term_era());
+                goto enter;
+            }
+
             // Unhandled whnf tag (SUP, BRI, REF, NUM, MAT, …): rebuild
             // original APP with updated fun and fall back to the legacy
             // reducer for that case.

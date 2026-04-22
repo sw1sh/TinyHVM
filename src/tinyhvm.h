@@ -1293,6 +1293,7 @@ void     jit_replay(void);
 // step-bounded worker (src/reduce/_.c), used only by the step-graph
 // tracer in schedule/_.c.
 Term     thvm_reduce(TinyHVM *ctx, Term t);
+Term     thvm_reduce_budget(TinyHVM *ctx, Term t, u32 budget);
 Term     thvm_reduce_steps(TinyHVM *ctx, Term t, u32 max_steps);
 Term     thvm_eval(TinyHVM *ctx, Term t);
 void     thvm_sched_reset_runtime(void);

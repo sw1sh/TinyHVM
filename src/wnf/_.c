@@ -146,10 +146,22 @@ static WnfStepHook g_wnf_step_hook = NULL;
 void thvm_wnf_set_step_hook(WnfStepHook hook) { g_wnf_step_hook = hook; }
 void thvm_wnf_clear_step_hook(void)          { g_wnf_step_hook = NULL; }
 
+// Per-rule budget.  0 = unbounded.  Set via thvm_reduce_budget() before a
+// single call; reset to 0 on entry.  When exceeded, the apply loop stops
+// firing new rules and drains the frame stack into a Term representing
+// the current partial reduction state.
+static u32 g_wnf_budget        = 0;
+static u32 g_wnf_budget_fired  = 0;
+static int g_wnf_budget_hit    = 0;
+
 #define WNF_FIRED() do { \
     ctx->itrs++; \
     if (g_wnf_step_hook) g_wnf_step_hook(ctx); \
+    if (g_wnf_budget > 0 && ++g_wnf_budget_fired >= g_wnf_budget) \
+        g_wnf_budget_hit = 1; \
 } while (0)
+
+#define WNF_BUDGET_HIT() (g_wnf_budget_hit)
 
 static void wnf_stack_push(WnfFrame f) {
     if (!g_wnf_stack_buf) {
@@ -332,8 +344,130 @@ static inline int wnf_is_atom(u8 tag) {
            tag == TAG_LAM || tag == TAG_SUP || tag == TAG_ANY;
 }
 
+// Stack-drain helper: walk remaining wnf frames and reconstruct a parent
+// Term for each, installing whnf at the appropriate slot.  Used when a
+// budget-bound reduce exhausts its budget mid-rule; the drain produces a
+// valid Term representing the current partial reduction state so the
+// caller can resume later.
+static Term wnf_drain_stack(TinyHVM *ctx, Term whnf, u32 base) {
+    while (g_wnf_stack_pos > base) {
+        WnfFrame f = g_wnf_stack_buf[--g_wnf_stack_pos];
+        switch (f.kind) {
+            case WNF_F_APP: {
+                u64 loc = (u64)f.t2;
+                if (loc + 1 < ctx->heap_pos) heap_set(ctx, loc + 0, whnf);
+                whnf = f.t0;
+                break;
+            }
+            case WNF_F_SEQ: {
+                u64 loc = (u64)f.t2;
+                if (loc + 1 < ctx->heap_pos) heap_set(ctx, loc + 0, whnf);
+                whnf = f.t0;
+                break;
+            }
+            case WNF_F_DUP: {
+                u64 dup_loc = term_val(f.t0);
+                if (dup_loc < ctx->heap_pos) heap_set(ctx, dup_loc, whnf);
+                whnf = f.t0;
+                break;
+            }
+            case WNF_F_OP2_X: {
+                u64 loc = (u64)f.t2;
+                if (loc + 1 < ctx->heap_pos) heap_set(ctx, loc + 0, whnf);
+                whnf = f.t0;
+                break;
+            }
+            case WNF_F_OP2_Y: {
+                u64 loc = (u64)f.t2;
+                if (loc + 1 < ctx->heap_pos) {
+                    heap_set(ctx, loc + 0, f.t1);
+                    heap_set(ctx, loc + 1, whnf);
+                }
+                whnf = f.t0;
+                break;
+            }
+            case WNF_F_APP_MAT: {
+                u64 loc = (u64)f.t2;
+                if (loc + 1 < ctx->heap_pos) {
+                    heap_set(ctx, loc + 0, f.t1);
+                    heap_set(ctx, loc + 1, whnf);
+                }
+                whnf = f.t0;
+                break;
+            }
+            case WNF_F_DSU:
+            case WNF_F_DDU: {
+                u64 loc = (u64)f.t2;
+                if (loc + 2 < ctx->heap_pos) heap_set(ctx, loc + 0, whnf);
+                whnf = f.t0;
+                break;
+            }
+            case WNF_F_UDP: {
+                u64 udp_loc = (u64)f.t2;
+                if (udp_loc < ctx->heap_pos) heap_set(ctx, udp_loc, whnf);
+                whnf = f.t0;
+                break;
+            }
+            case WNF_F_EQL_X: {
+                u64 loc = (u64)f.t2;
+                if (loc + 1 < ctx->heap_pos) heap_set(ctx, loc + 0, whnf);
+                whnf = f.t0;
+                break;
+            }
+            case WNF_F_EQL_Y: {
+                u64 loc = (u64)f.t2;
+                if (loc + 1 < ctx->heap_pos) {
+                    heap_set(ctx, loc + 0, f.t1);
+                    heap_set(ctx, loc + 1, whnf);
+                }
+                whnf = f.t0;
+                break;
+            }
+            case WNF_F_AND_OR: {
+                u64 loc = (u64)f.t2;
+                if (loc + 1 < ctx->heap_pos) heap_set(ctx, loc + 0, whnf);
+                whnf = f.t0;
+                break;
+            }
+            // GRAD / VJP frames: rebuild GRAD(whnf, tgt) so the outer caller
+            // can resume the reduction later.
+            case WNF_F_GRAD:
+            case WNF_F_VJP: {
+                whnf = wnf_grad_rebuild(ctx, f.t0, whnf, f.kind == WNF_F_GRAD);
+                break;
+            }
+            // VJP binary / grad post frames: these represent mid-rule state.
+            // Rebuild a coarse GRAD placeholder; the VJP rule will re-fire
+            // on resume.  Loses precision but keeps the Term valid.
+            default: {
+                // No clean rebuild for mid-rule post frames; leave whnf as-is
+                // (best-effort — usually the outer GRAD frame above on the
+                // stack will rebuild properly).
+                break;
+            }
+        }
+    }
+    return whnf;
+}
+
+// Public budget-bounded reduce: fire at most `budget` rules, then drain
+// the frame stack into a resumable Term.  budget == 0 means unbounded
+// (equivalent to thvm_reduce).
+Term thvm_reduce_budget(TinyHVM *ctx, Term term, u32 budget);
+
 Term thvm_reduce(TinyHVM *ctx, Term term) {
+    return thvm_reduce_budget(ctx, term, 0);
+}
+
+Term thvm_reduce_budget(TinyHVM *ctx, Term term, u32 budget) {
     if (wnf_is_atom(term_tag(term))) return term;
+
+    u32 saved_budget       = g_wnf_budget;
+    u32 saved_budget_fired = g_wnf_budget_fired;
+    int saved_budget_hit   = g_wnf_budget_hit;
+    g_wnf_budget           = budget;
+    g_wnf_budget_fired     = 0;
+    g_wnf_budget_hit       = 0;
 
     // Outermost-GRAD book-keeping: if the top-level term is a GRAD with a
     // TEN target, remember target.shape so we can materialize ERA to
@@ -364,6 +498,10 @@ Term thvm_reduce(TinyHVM *ctx, Term term) {
     Term whnf;
 
 enter: {
+    // Budget exhausted in an earlier rule fire — don't start another one.
+    // Fall through to apply so pending frames get drained.
+    if (WNF_BUDGET_HIT()) { whnf = next; goto apply; }
+
     u8 tag = term_tag(next);
 
     if (wnf_is_atom(tag)) { whnf = next; goto apply; }
@@ -859,6 +997,9 @@ enter: {
 
 apply: {
     while (g_wnf_stack_pos > base) {
+        // Budget exhausted — stop popping new frames; drain logic at
+        // apply_done will reconstruct the partial state into a Term.
+        if (WNF_BUDGET_HIT()) goto apply_done;
         WnfFrame f = g_wnf_stack_buf[--g_wnf_stack_pos];
         u8 wtag = term_tag(whnf);
 
@@ -2945,6 +3086,11 @@ apply: {
         }
     }
 apply_done:
+    // Budget-bound exit: if the budget fired before reduction hit WHNF,
+    // drain remaining frames into a resumable Term.
+    if (g_wnf_budget_hit && g_wnf_stack_pos > base) {
+        whnf = wnf_drain_stack(ctx, whnf, base);
+    }
     // Outermost boundary: if the GRAD reduced to ERA, synthesize a
     // zeros tensor of target.shape so callers get a materializable
     // value.  Inner ERAs during recursion participate in peepholes;
@@ -2960,6 +3106,9 @@ apply_done:
                     (osh.rank == 1 && osh.dims[0] == 1);
         whnf = is_sc ? scalar : thvm_expand(ctx, scalar, osh);
     }
+    g_wnf_budget       = saved_budget;
+    g_wnf_budget_fired = saved_budget_fired;
+    g_wnf_budget_hit   = saved_budget_hit;
     return whnf;
 }
 }

@@ -3044,10 +3044,6 @@ int main(void) {
     fails += test_e2e_jvp_sum_of_square();
     fails += test_e2e_jvp_mm();
 
-    // test_gradu_lambda() deferred — thvm_lam requires two-step
-    // construction (ERA body placeholder, then heap_set the real body);
-    // single-shot `thvm_lam(ctx, &v, v)` reads v before it's initialized.
-    // Low priority; GRAD-through-LAM not a critical topology path.
     printf("\ntotal failures: %d\n", fails);
     return fails ? 1 : 0;
 }

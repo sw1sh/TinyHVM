@@ -212,6 +212,23 @@ enter: {
 
     if (wnf_is_atom(tag)) { whnf = next; goto apply; }
 
+    // APP: push continuation frame, descend into fun (principal).
+    if (tag == TAG_APP) {
+        u64 loc = term_val(next);
+        if (loc == 0 || loc + 1 >= ctx->heap_pos) {
+            whnf = next; goto apply;
+        }
+        Term fun = heap_read(ctx, loc + 0);
+        Term arg = heap_read(ctx, loc + 1);
+        WnfFrame f = {
+            .kind = WNF_F_APP, .flags = 0,
+            .t0 = next, .t1 = arg, .t2 = (Term)loc, .t3 = 0
+        };
+        wnf_stack_push(f);
+        next = fun;
+        goto enter;
+    }
+
     if (tag == TAG_TOP) {
         u32 ext = term_ext(next);
         if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) {
@@ -980,6 +997,55 @@ apply: {
                 whnf = (a_shape.rank != 0) ? thvm_expand(ctx, whnf, a_shape) : whnf;
             }
             ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_APP: {
+            // frame: original APP term (t0), arg (t1), APP loc (t2).
+            // whnf is fun in WHNF — dispatch.
+            Term app_orig = f.t0;
+            Term arg = f.t1;
+            u64 app_loc = (u64)f.t2;
+
+            // APP ⊳ LAM: beta.  Write arg into LAM's var slot, re-enter body.
+            if (term_tag(whnf) == TAG_LAM) {
+                u64 lam_loc = term_val(whnf);
+                // DETACH handling: if arg is UOP_DETACH TOP and resolves to
+                // a TEN, use the forced TEN so downstream var reads get a
+                // materialized value.
+                if (term_tag(arg) == TAG_TOP && term_ext(arg) == UOP_DETACH) {
+                    Term forced = thvm_force_tensor_term(ctx, arg);
+                    if (term_tag(forced) == TAG_TEN) arg = forced;
+                }
+                heap_set(ctx, lam_loc + 0, arg);
+                heap_set(ctx, app_loc + 0, term_era());
+                heap_set(ctx, app_loc + 1, term_era());
+                ctx->itrs++;
+                next = heap_read(ctx, lam_loc + 1);
+                goto enter;
+            }
+
+            // APP ⊳ TEN: discard tensor, return arg (sequencing).
+            if (term_tag(whnf) == TAG_TEN) {
+                tensor_release(ctx, (u32)term_val(whnf));
+                ctx->itrs++;
+                next = arg;
+                goto enter;
+            }
+
+            // APP ⊳ ERA: erasure propagates.  Discard arg via explicit ERA.
+            if (term_tag(whnf) == TAG_ERA) {
+                thvm_spawn_detached_era(ctx, arg);
+                ctx->itrs++;
+                whnf = term_era();
+                continue;
+            }
+
+            // Unhandled whnf tag (SUP, BRI, REF, NUM, MAT, …): rebuild
+            // original APP with updated fun and fall back to the legacy
+            // reducer for that case.
+            heap_set(ctx, app_loc + 0, whnf);
+            whnf = thvm_reduce_fallback(ctx, app_orig);
             continue;
         }
 

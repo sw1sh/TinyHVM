@@ -1622,16 +1622,15 @@ static int test_gradu_where(void) {
     Term cond = thvm_tensor(ctx, condd, SHAPE(3));
     thvm_set_requires_grad(ctx, a);
     Term y = thvm_where(ctx, cond, a, b);
-    // No DUP on y — let GRAD pattern-match the raw WHERE TOP directly.
     Term root = thvm_grad(ctx, y, a);
-    thvm_eval(ctx, root);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, root));
+    // dy/da = where(c, 1, 0); c=[1,1,1] → [1,1,1].
+    f32 expect[] = {1, 1, 1};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) if (h[i] != expect[i]) { fprintf(stderr, "  gradu_where h[%d]=%g e=%g\n", i, h[i], expect[i]); ok = 0; }
+    const char *pre[] = {"GRAD", "WHERE"};
+    ok = ok && topo_check("gradu_where", 0, pre, 2);
     thvm_free(ctx);
-    // Pre must contain GRAD+WHERE; post we don't yet know — if no WHERE
-    // rule exists, GRAD stays in the graph.  Just check pre.
-    const char *pre[]  = {"GRAD", "WHERE"};
-    const char *post[] = {"WHERE", "EXPAND"};
-    int ok = topo_check("gradu_where", 0, pre, 2)
-          && topo_check("gradu_where", 1, post, 2);
     return report("gradu_where", ok);
 }
 
@@ -1669,12 +1668,14 @@ static int test_gradu_where_else(void) {
     thvm_set_requires_grad(ctx, b);
     Term y = thvm_where(ctx, cond, a, b);
     Term root = thvm_grad(ctx, y, b);
-    thvm_eval(ctx, root);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, root));
+    // dy/db = where(c, 0, 1); c=[0,1,0] → [1,0,1].
+    f32 expect[] = {1, 0, 1};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) if (h[i] != expect[i]) { fprintf(stderr, "  gradu_where_else h[%d]=%g e=%g\n", i, h[i], expect[i]); ok = 0; }
+    const char *pre[] = {"GRAD", "WHERE"};
+    ok = ok && topo_check("gradu_where_else", 0, pre, 2);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD", "WHERE"};
-    const char *post[] = {"WHERE", "EXPAND"};
-    int ok = topo_check("gradu_where_else", 0, pre, 2)
-          && topo_check("gradu_where_else", 1, post, 2);
     return report("gradu_where_else", ok);
 }
 
@@ -1698,12 +1699,14 @@ static int test_gradu_where_nested(void) {
     Term inner = thvm_where(ctx, c2, a, b);
     Term y = thvm_where(ctx, c1, inner, d);
     Term root = thvm_grad(ctx, y, a);
-    thvm_eval(ctx, root);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, root));
+    // dy/da = c1 * c2 pointwise; c1=[1,0,1], c2=[1,1,0] → [1,0,0].
+    f32 expect[] = {1, 0, 0};
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) if (h[i] != expect[i]) { fprintf(stderr, "  gradu_where_nested h[%d]=%g e=%g\n", i, h[i], expect[i]); ok = 0; }
+    const char *pre[] = {"GRAD", "WHERE"};
+    ok = ok && topo_check("gradu_where_nested", 0, pre, 2);
     thvm_free(ctx);
-    const char *pre[]  = {"GRAD", "WHERE"};
-    const char *post[] = {"WHERE", "EXPAND"};
-    int ok = topo_check("gradu_where_nested", 0, pre, 2)
-          && topo_check("gradu_where_nested", 1, post, 2);
     return report("gradu_where_nested", ok);
 }
 
@@ -3004,7 +3007,7 @@ int main(void) {
     fails += test_e2e_grad_pad();
     fails += test_e2e_grad_expand();
     fails += test_e2e_mse_grad();
-    // fails += test_e2e_conv_like();  // BLOCKED: MUL Leibniz of pad(x)*w uses da with target.shape=[4] vs b.shape=[6]; needs reverse-mode MUL VJP with sum_to_shape
+    fails += test_e2e_conv_like();
     fails += test_e2e_softmax();
     fails += test_e2e_sgd_loop();
     fails += test_e2e_recursive_sgd();

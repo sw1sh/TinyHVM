@@ -106,6 +106,23 @@ enum {
     // AND / OR single-phase — reduce a (slot 0), then dispatch.
     // t0 = original term, t2 = loc, flags bit 0: 0=AND, 1=OR.
     WNF_F_AND_OR,
+
+    // ─── VJP (reverse-mode) frames ────────────────────────────────────
+    // Proper reverse-mode auto-diff: seed cotangent g = ones(y.shape) at
+    // outermost entry; each op's rule consumes upstream g and produces
+    // downstream cotangents for operands.  Leaf rule returns g on match.
+    // Kept separate from WNF_F_GRAD (JVP) so the two modes don't entangle.
+    //
+    // t0 = tgt, t1 = cotangent g (0 sentinel = seed on first apply).
+    WNF_F_VJP,
+    // Binary-op accumulator phase 1: got grad_a from inner recursion on a,
+    // now descend into b with its cotangent g_b.
+    // t0 = tgt, t1 = b (operand), t2 = g_b (cotangent for b).
+    WNF_F_VJP_BIN1,
+    // Binary-op accumulator phase 2: got grad_b.  Return grad_a + grad_b
+    // (with ERA peephole).
+    // t0 = grad_a (saved from phase 1).
+    WNF_F_VJP_BIN2,
 };
 
 typedef struct {
@@ -137,7 +154,89 @@ static void wnf_stack_push(WnfFrame f) {
 // stays in reduce/_.c for any external callers.
 
 // ──────────────────────────────────────────────────────────────────────
-// Leaf-rule helpers.
+// Shape / cotangent helpers (used by VJP rules).
+// ──────────────────────────────────────────────────────────────────────
+
+static Shape wnf_shape_of(TinyHVM *ctx, Term t) {
+    Shape s = SHAPE(1);
+    // Follow DP / VAR / ANN chains to the underlying shape-carrying term.
+    for (int hops = 0; hops < 32; hops++) {
+        u8 tag = term_tag(t);
+        if (tag == TAG_TEN) {
+            u32 id = (u32)term_val(t);
+            if (id < ctx->tensor_count) s = ctx->tensors[id].view.shape;
+            return s;
+        }
+        if (tag == TAG_TOP) {
+            u64 loc = term_val(t);
+            const View *v = st_get(loc);
+            if (v) { s = v->shape; return s; }
+            // No registered ShapeTracker — derive from operands.
+            u32 ext = term_ext(t);
+            if (loc == 0) return s;
+            u64 shape_slot = 0;
+            if (ext == UOP_WHERE) shape_slot = 1;
+            t = heap_read(ctx, loc + shape_slot);
+            continue;
+        }
+        if (tag == TAG_DP0 || tag == TAG_DP1) {
+            u64 dl = term_val(t);
+            if (dl == 0 || dl >= ctx->heap_pos) return s;
+            Term cell = heap_read(ctx, dl);
+            if (term_is_sub(cell)) cell = term_strip_sub(cell);
+            t = cell;
+            continue;
+        }
+        if (tag == TAG_VAR) {
+            u64 vl = term_val(t);
+            if (vl == 0 || vl >= ctx->heap_pos) return s;
+            Term sub = heap_read(ctx, vl);
+            if (term_is_sub(sub)) return s;
+            t = sub;
+            continue;
+        }
+        if (tag == TAG_ANN) {
+            u64 al = term_val(t);
+            if (al == 0 || al >= ctx->heap_pos) return s;
+            t = heap_read(ctx, al);
+            continue;
+        }
+        return s;
+    }
+    return s;
+}
+
+static Term wnf_ones_of_shape(TinyHVM *ctx, Shape s) {
+    // Build a concrete ones TEN of shape s.  We allocate a host buffer so
+    // the result is a materialised TEN (rather than EXPAND TOP), which
+    // keeps downstream elementwise interactions (WHERE, MUL, ...) from
+    // stalling on unmaterialised compute TOPs.
+    u32 n = 1;
+    for (u32 i = 0; i < s.rank; i++) n *= s.dims[i];
+    if (n == 0) n = 1;
+    Shape out = s;
+    if (out.rank == 0) { out.rank = 1; out.dims[0] = 1; }
+    f32 *buf = (f32 *)malloc((size_t)n * sizeof(f32));
+    for (u32 i = 0; i < n; i++) buf[i] = 1.0f;
+    Term t = thvm_tensor(ctx, buf, out);
+    free(buf);
+    return t;
+}
+
+static Term wnf_zeros_of_shape(TinyHVM *ctx, Shape s) {
+    u32 n = 1;
+    for (u32 i = 0; i < s.rank; i++) n *= s.dims[i];
+    if (n == 0) n = 1;
+    Shape out = s;
+    if (out.rank == 0) { out.rank = 1; out.dims[0] = 1; }
+    f32 *buf = (f32 *)calloc((size_t)n, sizeof(f32));
+    Term t = thvm_tensor(ctx, buf, out);
+    free(buf);
+    return t;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Leaf-rule helpers (legacy JVP path).
 // ──────────────────────────────────────────────────────────────────────
 
 static Term wnf_grad_ten_leaf(TinyHVM *ctx, Term tgt, Term y_whnf, int is_fwd) {
@@ -439,11 +538,29 @@ enter: {
             }
             Term y = heap_read(ctx, loc + 0);
             Term tgt = heap_read(ctx, loc + 1);
-            WnfFrame f = {
-                .kind = WNF_F_GRAD, .flags = (u8)(ext == UOP_GRAD_FWD ? 1 : 0),
-                .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
-            };
-            wnf_stack_push(f);
+            // Resolve target to WHNF so DP-wrapped leaves compare as TEN.
+            if (term_tag(tgt) != TAG_TEN) {
+                Term tgt_r = thvm_reduce(ctx, tgt);
+                if (tgt_r != tgt) {
+                    heap_set(ctx, loc + 1, tgt_r);
+                    tgt = tgt_r;
+                }
+            }
+            if (ext == UOP_GRAD_FWD) {
+                // JVP path (unchanged).
+                WnfFrame f = {
+                    .kind = WNF_F_GRAD, .flags = 1,
+                    .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                };
+                wnf_stack_push(f);
+            } else {
+                // VJP (reverse) path — cotangent g seeded on first apply.
+                WnfFrame f = {
+                    .kind = WNF_F_VJP, .flags = 0,
+                    .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                };
+                wnf_stack_push(f);
+            }
             next = y;
             goto enter;
         }
@@ -462,11 +579,12 @@ enter: {
         // and should run wherever they appear (inside SEQ, at root, ...).
         // Pure compute TOPs (ADD/MUL/SUM/MM/...) remain WNF so that
         // enclosing GRAD frames see the unmaterialized TOP.
-        // Exception: WHERE under an immediate WNF_F_GRAD parent must stay
-        // lazy so the GRAD rule can pattern-match on WHERE(cond,a,b) and
-        // distribute through branches (legacy reduce/_.c:547).
-        int under_grad = (g_wnf_stack_pos > 0 &&
-                          g_wnf_stack_buf[g_wnf_stack_pos - 1].kind == WNF_F_GRAD);
+        // Exception: WHERE under an immediate GRAD/VJP parent stays lazy
+        // so the GRAD/VJP rule can pattern-match on WHERE(c,a,b).
+        u8 parent_kind = (g_wnf_stack_pos > base)
+            ? g_wnf_stack_buf[g_wnf_stack_pos - 1].kind : 0;
+        int under_grad = (parent_kind == WNF_F_GRAD ||
+                          parent_kind == WNF_F_VJP);
         if (ext == UOP_WHERE && under_grad) {
             whnf = next;
             goto apply;
@@ -491,6 +609,18 @@ enter: {
                     if (term_tag(a1r) == TAG_TOP) a1r = thvm_eval(ctx, a1r);
                     if (a1r != a1) heap_set(ctx, tloc + 1, a1r);
                 }
+                // WHERE needs cond + then + else all in WHNF (and materialized
+                // to TEN) for the interact rule to fire.
+                if (ext == UOP_WHERE && tloc + 2 < ctx->heap_pos) {
+                    for (u32 i = 1; i <= 2; i++) {
+                        Term ai = heap_read(ctx, tloc + i);
+                        Term air = thvm_reduce(ctx, ai);
+                        if (term_tag(air) == TAG_TOP) air = thvm_eval(ctx, air);
+                        if (air != ai) heap_set(ctx, tloc + i, air);
+                    }
+                }
+                // IFZ needs its counter (arg 0) as a TEN — already covered
+                // by the a0 reduction above.
             }
             Term r = thvm_interact(ctx, next);
             if (r != next) {
@@ -1246,6 +1376,383 @@ apply: {
 
             // Other whnf shapes (DP-stuck, VAR, etc.): fall back.
             whnf = wnf_grad_rebuild(ctx, tgt, whnf, is_fwd);
+            continue;
+        }
+
+        case WNF_F_VJP: {
+            // Reverse-mode (VJP) apply.  Cotangent g is carried in t1;
+            // seed at outermost entry if t1 == 0.
+            Term tgt = f.t0;
+            Term g   = f.t1;
+            if (g == 0) {
+                // Outermost: seed g = ones(y.shape).
+                Shape ys = wnf_shape_of(ctx, whnf);
+                g = wnf_ones_of_shape(ctx, ys);
+            }
+
+            // Leaf rules.
+            if (wtag == TAG_TEN) {
+                if (term_tag(tgt) == TAG_TEN) {
+                    u32 wtid = (u32)term_val(whnf);
+                    u32 ttid = (u32)term_val(tgt);
+                    ctx->itrs++;
+                    whnf = (wtid == ttid) ? g : term_era();
+                    continue;
+                }
+                // Target not yet resolved — rebuild stuck GRAD(whnf, tgt).
+                whnf = wnf_grad_rebuild(ctx, tgt, whnf, 0);
+                continue;
+            }
+            if (wtag == TAG_NUM || wtag == TAG_ERA) {
+                whnf = term_era();
+                ctx->itrs++;
+                continue;
+            }
+
+            if (wtag != TAG_TOP) {
+                // DP-stuck / VAR / other — rebuild as stuck.
+                whnf = wnf_grad_rebuild(ctx, tgt, whnf, 0);
+                continue;
+            }
+
+            u32 wuop = term_ext(whnf);
+            u64 wloc = term_val(whnf);
+
+            // CMP and DETACH are non-differentiable.
+            if (wuop == UOP_CMP || wuop == UOP_DETACH) {
+                whnf = term_era();
+                ctx->itrs++;
+                continue;
+            }
+
+            // Helper macro: push inner VJP frame on operand `op` with
+            // cotangent `gv`, then enter it.
+            #define VJP_RECURSE_INTO(op, gv) do { \
+                WnfFrame _inner = { .kind = WNF_F_VJP, .flags = 0, \
+                    .t0 = tgt, .t1 = (gv), .t2 = 0, .t3 = 0 }; \
+                wnf_stack_push(_inner); \
+                next = (op); \
+                goto enter; \
+            } while (0)
+
+            // Helper: push accumulator for binary op.  Descend into a with
+            // cotangent g_a; on return we'll descend into b with g_b and
+            // sum.
+            #define VJP_BINARY(av, bv, ga, gb) do { \
+                WnfFrame _ph1 = { .kind = WNF_F_VJP_BIN1, .flags = 0, \
+                    .t0 = tgt, .t1 = (bv), .t2 = (gb), .t3 = 0 }; \
+                wnf_stack_push(_ph1); \
+                WnfFrame _inner = { .kind = WNF_F_VJP, .flags = 0, \
+                    .t0 = tgt, .t1 = (ga), .t2 = 0, .t3 = 0 }; \
+                wnf_stack_push(_inner); \
+                next = (av); \
+                goto enter; \
+            } while (0)
+
+            // ADD: grad_a = g, grad_b = g (cotangent passes through).
+            if (wuop == UOP_ADD) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term b = heap_read(ctx, wloc + 1);
+                Term g0, g1;
+                thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
+                VJP_BINARY(a, b, g0, g1);
+            }
+            // SUB: grad_a = g, grad_b = -g.
+            if (wuop == UOP_SUB) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term b = heap_read(ctx, wloc + 1);
+                Term g0, g1;
+                thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
+                Term g1_neg = thvm_op_raw(ctx, UOP_NEG, g1, term_era());
+                VJP_BINARY(a, b, g0, g1_neg);
+            }
+            // NEG: grad_a = -g.
+            if (wuop == UOP_NEG) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term ng = thvm_op_raw(ctx, UOP_NEG, g, term_era());
+                VJP_RECURSE_INTO(a, ng);
+            }
+            // MUL: grad_a = g * b, grad_b = g * a.
+            if (wuop == UOP_MUL) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term b = heap_read(ctx, wloc + 1);
+                Term g0, g1; thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
+                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                Term b0, b1; thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
+                Term g_a = thvm_op_raw(ctx, UOP_MUL, g0, b0);
+                Term g_b = thvm_op_raw(ctx, UOP_MUL, g1, a1);
+                VJP_BINARY(a0, b1, g_a, g_b);
+                (void)a0; (void)b1; // silence unused if macros short-circuit
+            }
+            // DIV: grad_a = g / b, grad_b = -g * a / (b*b).
+            if (wuop == UOP_DIV) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term b = heap_read(ctx, wloc + 1);
+                Term g0, g1; thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
+                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                Term b0, b1; thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
+                Term b1a, b1b; thvm_dup(ctx, thvm_fresh_label(ctx), b1, &b1a, &b1b);
+                Term g_a = thvm_op_raw(ctx, UOP_DIV, g0, b0);
+                // grad_b = -g * a / (b*b)
+                Term bb = thvm_op_raw(ctx, UOP_MUL, b1a, b1b);
+                Term ga_num = thvm_op_raw(ctx, UOP_MUL, g1, a1);
+                Term ga_neg = thvm_op_raw(ctx, UOP_NEG, ga_num, term_era());
+                Term g_b = thvm_op_raw(ctx, UOP_DIV, ga_neg, bb);
+                VJP_BINARY(a0, b0, g_a, g_b);
+            }
+            // EXP: grad_a = g * y (where y = exp(a), = whnf).
+            if (wuop == UOP_EXP) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term y0, y1; thvm_dup(ctx, thvm_fresh_label(ctx), whnf, &y0, &y1);
+                Term g_a = thvm_op_raw(ctx, UOP_MUL, g, y0);
+                (void)y1; // y was the output; the other copy is dead but keep
+                          // the DUP to match other nodes' patterns — TEN DUP
+                          // just incref'd, no real cost.
+                VJP_RECURSE_INTO(a, g_a);
+            }
+            // LOG: grad_a = g / a.
+            if (wuop == UOP_LOG) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                Term g_a = thvm_op_raw(ctx, UOP_DIV, g, a0);
+                VJP_RECURSE_INTO(a1, g_a);
+            }
+            // SQRT: grad_a = g / (2 * y).
+            if (wuop == UOP_SQRT) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term y0 = whnf;
+                f32 two_v = 2.0f;
+                Shape ys = wnf_shape_of(ctx, whnf);
+                Shape one_shape = {.rank = ys.rank};
+                for (u32 i = 0; i < ys.rank; i++) one_shape.dims[i] = 1;
+                if (one_shape.rank == 0) { one_shape.rank = 1; one_shape.dims[0] = 1; }
+                Term two_t = thvm_tensor(ctx, &two_v, one_shape);
+                int is_sc = (ys.rank == 0) || (ys.rank == 1 && ys.dims[0] == 1);
+                Term two_b = is_sc ? two_t : thvm_expand(ctx, two_t, ys);
+                Term den = thvm_op_raw(ctx, UOP_MUL, two_b, y0);
+                Term g_a = thvm_op_raw(ctx, UOP_DIV, g, den);
+                VJP_RECURSE_INTO(a, g_a);
+            }
+            // RELU: grad_a = g * (a > 0).  Represent (a > 0) as 1-CMP(0,a).
+            // Simpler: use mask = CMP(0, a) returning 1 where a>0 else 0, then
+            // g_a = g * mask.
+            if (wuop == UOP_RELU) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                // CMP returns 1 if x > y else 0: we want (a > 0).
+                Shape ash = wnf_shape_of(ctx, a0);
+                f32 zero_v = 0.0f;
+                Shape one_shape = {.rank = ash.rank};
+                for (u32 i = 0; i < ash.rank; i++) one_shape.dims[i] = 1;
+                if (one_shape.rank == 0) { one_shape.rank = 1; one_shape.dims[0] = 1; }
+                Term zero_t = thvm_tensor(ctx, &zero_v, one_shape);
+                int is_sc = (ash.rank == 0) || (ash.rank == 1 && ash.dims[0] == 1);
+                Term zero_b = is_sc ? zero_t : thvm_expand(ctx, zero_t, ash);
+                Term mask = thvm_op_raw(ctx, UOP_CMP, a0, zero_b);
+                Term g_a = thvm_op_raw(ctx, UOP_MUL, g, mask);
+                VJP_RECURSE_INTO(a1, g_a);
+            }
+            // SUM: grad_a = expand(g, a.shape).
+            if (wuop == UOP_SUM) {
+                Term a = heap_read(ctx, wloc + 0);
+                Shape ash = wnf_shape_of(ctx, a);
+                Term g_a = (ash.rank != 0) ? thvm_expand(ctx, g, ash) : g;
+                VJP_RECURSE_INTO(a, g_a);
+            }
+            // EXPAND: grad_a = sum_to_shape(g, a.shape).  Sum over broadcast
+            // axes where output > input.
+            if (wuop == UOP_EXPAND) {
+                Term a = heap_read(ctx, wloc + 0);
+                Shape ash = wnf_shape_of(ctx, a);
+                Shape ysh = SHAPE(1);
+                const View *yv = st_get(wloc); if (yv) ysh = yv->shape;
+                Term g_a = (ysh.rank != 0 && ash.rank != 0)
+                    ? sum_to_shape(ctx, g, ysh, ash) : g;
+                VJP_RECURSE_INTO(a, g_a);
+            }
+            // RESHAPE: grad_a = reshape(g, a.shape).
+            if (wuop == UOP_RESHAPE) {
+                Term a = heap_read(ctx, wloc + 0);
+                Shape ash = wnf_shape_of(ctx, a);
+                Term g_a = (ash.rank != 0) ? thvm_reshape(ctx, g, ash) : g;
+                VJP_RECURSE_INTO(a, g_a);
+            }
+            // PERMUTE: grad_a = permute(g, inv_perm).
+            if (wuop == UOP_PERMUTE) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term shape = heap_read(ctx, wloc + 1);
+                Shape ash = wnf_shape_of(ctx, a);
+                Term g_a = g;
+                if (term_tag(shape) == TAG_TEN && ash.rank > 0) {
+                    u32 pid = (u32)term_val(shape);
+                    u32 nd = ash.rank;
+                    u32 pf[MAX_DIM]; tensor_meta_read_u32(ctx, pid, pf, MAX_DIM);
+                    u32 inv[MAX_DIM]; for (u32 j = 0; j < nd; j++) inv[pf[j]] = j;
+                    g_a = thvm_permute(ctx, g, inv, nd);
+                }
+                VJP_RECURSE_INTO(a, g_a);
+            }
+            // SHRINK: grad_a = pad(g, derived_pairs).
+            //   forward shrink(a, pairs) keeps a[pair[0]:pair[1]].
+            //   Adjoint pads g with zeros: pad(g, [pair[0], a_dim - pair[1]]).
+            if (wuop == UOP_SHRINK) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term shape_t = heap_read(ctx, wloc + 1);
+                Shape ash = wnf_shape_of(ctx, a);
+                Term g_a = g;
+                if (term_tag(shape_t) == TAG_TEN && ash.rank > 0) {
+                    u32 sid = (u32)term_val(shape_t);
+                    u32 nd = ash.rank;
+                    u32 sf[MAX_DIM * 2]; tensor_meta_read_u32(ctx, sid, sf, MAX_DIM * 2);
+                    u32 pp[MAX_DIM * 2];
+                    for (u32 j = 0; j < nd; j++) {
+                        pp[j*2]   = sf[j*2];
+                        pp[j*2+1] = ash.dims[j] - sf[j*2+1];
+                    }
+                    g_a = thvm_pad(ctx, g, pp, nd);
+                }
+                VJP_RECURSE_INTO(a, g_a);
+            }
+            // PAD: grad_a = shrink(g, derived_pairs).
+            //   forward pad(a, pairs) = wider output.
+            //   Adjoint shrinks g back to a.shape: shrink(g, [pair[0], pair[0]+a_dim]).
+            if (wuop == UOP_PAD) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term shape_t = heap_read(ctx, wloc + 1);
+                Shape ash = wnf_shape_of(ctx, a);
+                Term g_a = g;
+                if (term_tag(shape_t) == TAG_TEN && ash.rank > 0) {
+                    u32 pid = (u32)term_val(shape_t);
+                    u32 nd = ash.rank;
+                    u32 pf[MAX_DIM * 2]; tensor_meta_read_u32(ctx, pid, pf, MAX_DIM * 2);
+                    u32 sp[MAX_DIM * 2];
+                    for (u32 j = 0; j < nd; j++) {
+                        sp[j*2]   = pf[j*2];
+                        sp[j*2+1] = pf[j*2] + ash.dims[j];
+                    }
+                    g_a = thvm_shrink(ctx, g, sp, nd);
+                }
+                VJP_RECURSE_INTO(a, g_a);
+            }
+            // RMAX: mask = (a == expand(rmax(a), a.shape)); grad_a = expand(g, a.shape) * mask.
+            if (wuop == UOP_RMAX) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term axes = heap_read(ctx, wloc + 1);
+                Shape ash = wnf_shape_of(ctx, a);
+                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                Term a1b, a2; thvm_dup(ctx, thvm_fresh_label(ctx), a1, &a1b, &a2);
+                Term rm = thvm_op_raw(ctx, UOP_RMAX, a1b, axes);
+                Term rm_bc = (ash.rank != 0) ? thvm_expand(ctx, rm, ash) : rm;
+                // mask: 1 where a2 >= rm_bc else 0. CMP(x,y) = 1 if x>y else 0.
+                // 1 - CMP(rm_bc, a2) == a2 >= rm_bc.
+                Term gt = thvm_op_raw(ctx, UOP_CMP, rm_bc, a2);
+                Term one = term_num_f32(1.0f);
+                Term mask = thvm_op_raw(ctx, UOP_SUB, one, gt);
+                Term g_bc = (ash.rank != 0) ? thvm_expand(ctx, g, ash) : g;
+                Term g_a = thvm_op_raw(ctx, UOP_MUL, g_bc, mask);
+                VJP_RECURSE_INTO(a0, g_a);
+            }
+            // MM: grad_a = g @ bᵀ, grad_b = aᵀ @ g.
+            if (wuop == UOP_MM) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term b = heap_read(ctx, wloc + 1);
+                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                Term b0, b1; thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
+                Term g0, g1; thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
+                u32 ax[2] = {1, 0};
+                Term bT = thvm_permute(ctx, b0, ax, 2);
+                Term aT = thvm_permute(ctx, a0, ax, 2);
+                Term g_a = thvm_op(ctx, UOP_MM, g0, bT);
+                Term g_b = thvm_op(ctx, UOP_MM, aT, g1);
+                VJP_BINARY(a1, b1, g_a, g_b);
+            }
+            // MAX: grad_a = where(a>=b, g, 0), grad_b = where(a<b, g, 0).
+            if (wuop == UOP_MAX) {
+                Term a = heap_read(ctx, wloc + 0);
+                Term b = heap_read(ctx, wloc + 1);
+                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                Term b0, b1; thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
+                Term g0, g1; thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
+                // mask_a = (a >= b) = 1 - CMP(b, a).  CMP(b,a)=1 if b>a.
+                Term cmp_ba = thvm_op_raw(ctx, UOP_CMP, b0, a0);
+                Term one = term_num_f32(1.0f);
+                Term mask_a = thvm_op_raw(ctx, UOP_SUB, one, cmp_ba);
+                // mask_b = (b > a) = CMP(b, a)  — but we consumed cmp_ba in mask_a.
+                // Build a fresh CMP with DUPs already consumed; just use a different path.
+                // Actually: mask_b = 1 - mask_a. Use DUP of mask_a if available, else re-cmp.
+                Term cmp_ba2 = thvm_op_raw(ctx, UOP_CMP, b1, a1);  // re-build (a, b already dup'd)
+                Term g_a = thvm_op_raw(ctx, UOP_MUL, g0, mask_a);
+                Term g_b = thvm_op_raw(ctx, UOP_MUL, g1, cmp_ba2);
+                // Use the original unduped a, b as recursion targets.  But we
+                // already consumed them above; refetch by reading heap slots
+                // again — the MUL node's slots are unchanged.
+                Term a_for_rec = heap_read(ctx, wloc + 0);
+                Term b_for_rec = heap_read(ctx, wloc + 1);
+                // But those are the pre-DUP terms; they still work as recursion
+                // starting points because DUP is non-destructive from term
+                // viewpoint (the cell content is the original).
+                VJP_BINARY(a_for_rec, b_for_rec, g_a, g_b);
+            }
+            // WHERE(c, a, b): grad_a = where(c, g, 0), grad_b = where(c, 0, g).
+            // c is non-differentiable.  Resolve c and g to concrete TENs up
+            // front (thvm_reduce flushes DP chains) so the two downstream
+            // WHERE nodes don't both reference the same DUP cell — that
+            // would dead-end one aux under IC linearity and the phase-2
+            // reachability sweep can then collapse the result to ERA.
+            if (wuop == UOP_WHERE) {
+                Term c = heap_read(ctx, wloc + 0);
+                Term a = heap_read(ctx, wloc + 1);
+                Term b = heap_read(ctx, wloc + 2);
+                Term c_r = thvm_reduce(ctx, c);
+                Term g_r = thvm_reduce(ctx, g);
+                Shape gsh = wnf_shape_of(ctx, g_r);
+                Term z_a = wnf_zeros_of_shape(ctx, gsh);
+                Term z_b = wnf_zeros_of_shape(ctx, gsh);
+                Term g_a = thvm_where(ctx, c_r, g_r, z_a);
+                Term g_b = thvm_where(ctx, c_r, z_b, g_r);
+                VJP_BINARY(a, b, g_a, g_b);
+            }
+            // ASSIGN: gradient flows through dst (first arg).
+            if (wuop == UOP_ASSIGN) {
+                Term dst = heap_read(ctx, wloc + 0);
+                VJP_RECURSE_INTO(dst, g);
+            }
+
+            #undef VJP_RECURSE_INTO
+            #undef VJP_BINARY
+
+            // Unhandled compute TOP: rebuild stuck GRAD.
+            whnf = wnf_grad_rebuild(ctx, tgt, whnf, 0);
+            continue;
+        }
+
+        case WNF_F_VJP_BIN1: {
+            // whnf = grad_a (result of inner recursion on a).  Descend into b
+            // with cotangent g_b; on return, BIN2 will sum grad_a + grad_b.
+            Term grad_a = whnf;
+            Term tgt = f.t0;
+            Term b   = f.t1;
+            Term g_b = f.t2;
+            WnfFrame ph2 = {
+                .kind = WNF_F_VJP_BIN2, .flags = 0,
+                .t0 = grad_a, .t1 = 0, .t2 = 0, .t3 = 0
+            };
+            wnf_stack_push(ph2);
+            WnfFrame inner = {
+                .kind = WNF_F_VJP, .flags = 0,
+                .t0 = tgt, .t1 = g_b, .t2 = 0, .t3 = 0
+            };
+            wnf_stack_push(inner);
+            next = b;
+            goto enter;
+        }
+
+        case WNF_F_VJP_BIN2: {
+            // whnf = grad_b.  Return grad_a + grad_b (with ERA peepholes).
+            Term grad_a = f.t0;
+            Term grad_b = whnf;
+            whnf = wnf_mk_add(ctx, grad_a, grad_b);
+            ctx->itrs++;
             continue;
         }
 

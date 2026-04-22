@@ -1197,37 +1197,55 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
     char path[640];
     snprintf(path, sizeof(path), "%s/step_%03u.dot",
              g_step_session_dir, g_step_session_frame);
-    // Pull cursor info from the rule that just fired.  For VJP rules
-    // this is the heap slot of the forward TOP being differentiated,
-    // giving the dumper a "currently-here" anchor to highlight.
     u64 cursor_loc = thvm_wnf_last_cursor();
     const char *rule_name = thvm_wnf_last_rule();
-    if (cursor_loc && cursor_loc < ctx->heap_pos)
-        thvm_heap_dot_set_highlight(cursor_loc, 0);
-    else
-        thvm_heap_dot_set_highlight(0, 0);
+    u64 grad_slot = thvm_wnf_current_grad_slot();
+
+    // Slide GRAD visually: point heap[grad_slot+0] at the current
+    // descent operand TOP (the thing that's about to be differentiated
+    // next).  Before the dump we overwrite, after the dump we restore
+    // — the GRAD cell is semantically consumed into a frame at this
+    // point, so the mutation only affects what the dumper sees.
+    Term cursor_top = 0;
+    Term saved_grad_y = 0;
+    int sliding = 0;
+    if (grad_slot != 0 && cursor_loc != 0 && rule_name && rule_name[0] &&
+        grad_slot + 1 < ctx->heap_pos && cursor_loc < ctx->heap_pos) {
+        u32 cursor_uop = UOP_COUNT;
+        for (u32 u = 0; u < UOP_COUNT; u++)
+            if (strcmp(rule_name, uop_names[u]) == 0) { cursor_uop = u; break; }
+        if (cursor_uop < UOP_COUNT) {
+            cursor_top = term_new(TAG_TOP, cursor_uop, cursor_loc);
+            saved_grad_y = heap_read(ctx, grad_slot + 0);
+            if (cursor_top != saved_grad_y) {
+                heap_set(ctx, grad_slot + 0, cursor_top);
+                sliding = 1;
+            }
+        }
+    }
+
+    // Redex edge = the principal-port y→GRAD edge.  Always at
+    // grad_slot+0 when a GRAD is active — even if cursor_loc is 0
+    // (e.g. operand is a TEN leaf about to annihilate).  Falls back
+    // to cursor_loc when no GRAD is active (non-GRAD rule firings).
+    u64 hl_slot = (grad_slot != 0 && grad_slot + 1 < ctx->heap_pos)
+                  ? (grad_slot + 0)
+                  : (cursor_loc != 0 && cursor_loc < ctx->heap_pos ? cursor_loc : 0);
+    thvm_heap_dot_set_highlight(hl_slot, 0);
     if (rule_name && rule_name[0]) {
-        char meta[64];
-        snprintf(meta, sizeof(meta), "VJP/%s", rule_name);
+        char meta[96];
+        snprintf(meta, sizeof(meta), "%s", rule_name);
         thvm_heap_dot_set_step_meta(meta, "");
     } else {
         thvm_heap_dot_set_step_meta("", "");
     }
-    // Tell the dumper to draw a "cursor" overlay edge from the GRAD
-    // node to the currently-active forward TOP so the descent is
-    // visible without disconnecting the original forward tree.
-    u64 grad_slot = thvm_wnf_current_grad_slot();
-    if (grad_slot != 0 && cursor_loc != 0 && cursor_loc < ctx->heap_pos)
-        thvm_heap_dot_set_grad_cursor(grad_slot, cursor_loc);
-    else
-        thvm_heap_dot_set_grad_cursor(0, 0);
-    // Include ALL heap slots during per-step frames so the user sees
-    // cotangents and scratch cells accumulate as the VJP recurses.
-    // The initial + final frames use reachable-only (cleaner start/end).
+    thvm_heap_dot_set_grad_cursor(0, 0);  // disable overlay; slide + hl does the job
+
     thvm_heap_dot_set_include_all(1);
     thvm_heap_dot_root(ctx, path, g_step_session_root);
     thvm_heap_dot_set_include_all(0);
-    thvm_heap_dot_set_grad_cursor(0, 0);
+
+    if (sliding) heap_set(ctx, grad_slot + 0, saved_grad_y);
     // Dedup on rendered content — collapses enter-phase administrative
     // firings (VAR resolve, INC unwrap, ...) that don't change what the
     // step graph actually shows.
@@ -1248,7 +1266,9 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
              dir, dir, dir);
     system(cmd);
 
-    // Frame 0: initial state.
+    // Frame 0: initial state.  Highlight the initial redex edge —
+    // for a GRAD root term, that's the y→GRAD principal-port edge
+    // (slot grad_loc+0).
     g_step_session_root              = traced;
     g_step_session_ctx               = ctx;
     g_step_session_frame             = 0;
@@ -1256,11 +1276,17 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     thvm_step_seed_root_grad(ctx, traced);
     char p0[640];
     snprintf(p0, sizeof(p0), "%s/step_%03u.dot", dir, g_step_session_frame);
-    thvm_heap_dot_set_highlight(0, 0);
+    u64 init_hl = 0;
+    if (term_tag(traced) == TAG_TOP &&
+        (term_ext(traced) == UOP_GRAD || term_ext(traced) == UOP_GRAD_FWD)) {
+        init_hl = term_val(traced);  // y slot of the GRAD (redex edge endpoint)
+    }
+    thvm_heap_dot_set_highlight(init_hl, 0);
     thvm_heap_dot_set_step_meta("", "");
     thvm_heap_dot_set_include_all(1);
     thvm_heap_dot_root(ctx, p0, traced);
     thvm_heap_dot_set_include_all(0);
+    thvm_heap_dot_set_highlight(0, 0);
     g_step_session_last_render_sig = thvm_file_sig(p0);
     g_step_session_frame++;
 

@@ -3176,17 +3176,19 @@ static int test_e2e_vjp_sum_of_square(void) {
     // Per-step topology: initial forward-only, then cotangents grow in.
     const char *init[][2] = {{"MUL","1"},{"SUM","1"},{"GRAD","1"},{"EXPAND","0"}};
     ok = ok && step_topo_check("vjp_sum_of_square", "step_000", init, 4);
-    // After VJP/SUM fires, EXPAND cotangent appears (forward still
-    // visible via include_all).
+    // After VJP/SUM fires, GRAD slides to MUL for the step-001 dump
+    // (then restored after dump).  Step 002 fires VJP on MUL: cotangent
+    // EXPAND is allocated; forward still visible via include_all after
+    // slide restore.
     const char *after_sum[][2] = {{"MUL","1"},{"SUM","1"},{"EXPAND","1"},{"GRAD","1"}};
     ok = ok && step_topo_check("vjp_sum_of_square", "step_002", after_sum, 4);
-    // After VJP/MUL fires — MUL-Leibniz emits two MUL cotangents (3 total).
+    // After VJP/MUL fires — MUL-Leibniz emits two MUL cotangents.
     const char *after_mul[][2] = {{"MUL","3"},{"EXPAND","1"},{"SUM","1"},{"GRAD","1"}};
-    ok = ok && step_topo_check("vjp_sum_of_square", "step_004", after_mul, 4);
+    ok = ok && step_topo_check("vjp_sum_of_square", "step_003", after_mul, 4);
     // Final (reachable-only): ADD of MUL cotangents, no forward/GRAD.
     const char *final_t[][2] = {{"ADD","1"},{"MUL","2"},{"EXPAND","1"},
                                 {"GRAD","0"},{"SUM","0"}};
-    ok = ok && step_topo_check("vjp_sum_of_square", "step_005_final", final_t, 5);
+    ok = ok && step_topo_check("vjp_sum_of_square", "step_004_final", final_t, 5);
     unsetenv("THVM_STEP_GRAPH_NO_FUSE");
     teardown_step_graph_dir();
     return report("e2e_vjp_sum_of_square", ok);

@@ -1106,6 +1106,19 @@ apply: {
             int is_fwd = f.flags & 1;
             Term tgt = f.t0;
 
+            // Helper: push frames, set next to operand, fire WNF hook
+            // reporting the descent target for step-graph cursor.  Use at
+            // end of each rule in place of `next = op; goto enter;`.
+            #define GRAD_DESCEND(op) do { \
+                Term _op = (op); \
+                next = _op; \
+                u64 _nloc = (term_tag(_op) == TAG_TOP) ? term_val(_op) : 0; \
+                const char *_nname = (term_tag(_op) == TAG_TOP) \
+                    ? wnf_uop_name_safe(term_ext(_op)) : ""; \
+                WNF_FIRED_AT(_nname, _nloc, tgt); \
+                goto enter; \
+            } while (0)
+
             // Leaf rules
             if (wtag == TAG_TEN) {
                 whnf = wnf_grad_ten_leaf(ctx, tgt, whnf, is_fwd);
@@ -1137,8 +1150,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // NEG: d(-a)/dt = -da
@@ -1154,8 +1166,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // MUL Leibniz: d(a*b)/dt = b*da + a*db — phase 1 (compute da).
@@ -1172,8 +1183,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // DIV quotient rule: d(a/b)/dt = (da*b - a*db) / b²
@@ -1190,8 +1200,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // EXP: d(exp a)/dt = exp(a) * da — whnf IS exp(a).
@@ -1207,8 +1216,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // LOG: d(log a)/dt = da / a.
@@ -1224,8 +1232,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // SQRT: d(sqrt a)/dt = da / (2 * sqrt(a)) — whnf IS sqrt(a).
@@ -1241,8 +1248,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // RELU: d(relu a)/dt = (a>0) * da.
@@ -1258,8 +1264,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // CMP: non-differentiable → ERA.
@@ -1290,8 +1295,7 @@ apply: {
                             .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                         };
                         wnf_stack_push(inner);
-                        next = a;
-                        goto enter;
+                        GRAD_DESCEND(a);
                     }
                     // Reverse mode — direct emit, no recursion.
                     u32 ttid = (u32)term_val(tgt);
@@ -1343,8 +1347,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // SHRINK / PAD fwd: apply same op to tangent.
@@ -1362,8 +1365,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
                 // SHRINK / PAD rev: direct-emit from shape metadata.
                 //   SHRINK bwd: PAD(ones(y_shape), complement_pairs)
@@ -1439,8 +1441,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // MM: fwd is Leibniz (push both operands); rev is direct
@@ -1460,8 +1461,7 @@ apply: {
                             .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                         };
                         wnf_stack_push(inner);
-                        next = a;
-                        goto enter;
+                        GRAD_DESCEND(a);
                     }
                     // Reverse mode: leaf-match direct emit via tensor id check.
                     u32 a_tid = (term_tag(a) == TAG_TEN) ? (u32)term_val(a) : ~0u;
@@ -1527,8 +1527,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // WHERE(cond, a, b): grad distributes linearly through a,b.
@@ -1547,8 +1546,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // SUM: fwd → SUM(da, axes); rev → EXPAND(da, a_shape).
@@ -1565,8 +1563,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a;
-                    goto enter;
+                    GRAD_DESCEND(a);
                 }
 
                 // RMAX: dA = da * mask, mask = (a >= expand(rmax(a))).
@@ -1603,8 +1600,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = a0;
-                    goto enter;
+                    GRAD_DESCEND(a0);
                 }
 
                 // ASSIGN: gradient flows through dst only.  Re-enter with
@@ -1616,8 +1612,7 @@ apply: {
                         .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                     };
                     wnf_stack_push(inner);
-                    next = dst;
-                    goto enter;
+                    GRAD_DESCEND(dst);
                 }
 
                 // Unhandled compute TOP: fall back (SUM, RMAX, EXPAND,
@@ -1679,32 +1674,37 @@ apply: {
 
             // Helper macro: push inner VJP frame on operand `op` with
             // cotangent `gv`, then enter it.  Each VJP rule dispatch
-            // counts as ONE step — the rule's continuation frames
-            // (VJP_BIN1, VJP_BIN2) only fire when they produce their
-            // own output.  Reports wloc (slot of the TOP being
-            // differentiated) so the step-graph dumper can highlight
-            // the current descent position.
+            // counts as ONE step.  Reports the NEW descent target
+            // (op's heap slot, if op is a TOP) so the step-graph hook
+            // slides GRAD to the next active forward node.
             #define VJP_RECURSE_INTO(op, gv) do { \
+                Term _op = (op); \
                 WnfFrame _inner = { .kind = WNF_F_VJP, .flags = 0, \
                     .t0 = tgt, .t1 = (gv), .t2 = 0, .t3 = 0 }; \
                 wnf_stack_push(_inner); \
-                next = (op); \
-                WNF_FIRED_AT(wnf_uop_name_safe(wuop), wloc, tgt); \
+                next = _op; \
+                u64 _nloc = (term_tag(_op) == TAG_TOP) ? term_val(_op) : 0; \
+                const char *_nname = (term_tag(_op) == TAG_TOP) \
+                    ? wnf_uop_name_safe(term_ext(_op)) : ""; \
+                WNF_FIRED_AT(_nname, _nloc, tgt); \
                 goto enter; \
             } while (0)
 
-            // Helper: push accumulator for binary op.  Descend into a with
-            // cotangent g_a; on return we'll descend into b with g_b and
-            // sum.
+            // Helper: push accumulator for binary op.  Descend into av with
+            // cotangent ga; on return we'll descend into bv with gb and sum.
             #define VJP_BINARY(av, bv, ga, gb) do { \
+                Term _av = (av); \
                 WnfFrame _ph1 = { .kind = WNF_F_VJP_BIN1, .flags = 0, \
                     .t0 = tgt, .t1 = (bv), .t2 = (gb), .t3 = 0 }; \
                 wnf_stack_push(_ph1); \
                 WnfFrame _inner = { .kind = WNF_F_VJP, .flags = 0, \
                     .t0 = tgt, .t1 = (ga), .t2 = 0, .t3 = 0 }; \
                 wnf_stack_push(_inner); \
-                next = (av); \
-                WNF_FIRED_AT(wnf_uop_name_safe(wuop), wloc, tgt); \
+                next = _av; \
+                u64 _nloc = (term_tag(_av) == TAG_TOP) ? term_val(_av) : 0; \
+                const char *_nname = (term_tag(_av) == TAG_TOP) \
+                    ? wnf_uop_name_safe(term_ext(_av)) : ""; \
+                WNF_FIRED_AT(_nname, _nloc, tgt); \
                 goto enter; \
             } while (0)
 

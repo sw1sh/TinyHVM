@@ -62,6 +62,11 @@ enum {
     // MM forward-mode (JVP): Leibniz JVP(a)@b + a@JVP(b).
     WNF_F_GRAD_MM_FWD_PHASE1, // t0=a, t1=b, t2=tgt — need da
     WNF_F_GRAD_MM_FWD_PHASE2, // t0=l=MM(da,b), t1=a — need db
+    // APP frame — pushed in enter, popped in apply.
+    // t0 = original APP term (for rebuild on unhandled whnf).
+    // t1 = arg (APP.slot 1).
+    // t2 = APP heap loc.
+    WNF_F_APP,
 };
 
 typedef struct {

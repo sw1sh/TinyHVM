@@ -254,10 +254,14 @@ static int test_rule_grad_leaf_nomatch(void) {
     Term b = thvm_tensor(ctx, bd, SHAPE(3));
     Term g = thvm_grad(ctx, a, b);
     Term reduced = thvm_eval(ctx, g);
-    // Rule: GRAD leaf non-match reduces to ERA (dead gradient branch).
-    // ERA propagates through adjacent ops via GRAD_ADD/SUB/MUL peepholes.
-    int ok = (term_tag(reduced) == TAG_ERA);
-    if (!ok) dbg_term(ctx, "reduced (expected ERA)", reduced);
+    // Rule: GRAD leaf non-match reduces to ERA internally; at the
+    // outermost boundary it materializes to zeros(target.shape) so
+    // callers get a tensor.
+    u32 dt = DTYPE_F32; Shape sh = SHAPE(1);
+    f32 *h = (f32*)thvm_to_host_raw(ctx, reduced, &dt, &sh);
+    int ok = (h != NULL);
+    if (h) for (int i = 0; i < 3; i++) if (h[i] != 0.0f) ok = 0;
+    if (!ok) dbg_term(ctx, "reduced (expected zeros)", reduced);
     thvm_free(ctx);
     return report("grad_leaf_nomatch", ok);
 }

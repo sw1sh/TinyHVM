@@ -95,6 +95,12 @@ enum {
     // UDP: unordered DUP consumer — reduce body to WHNF, then dispatch.
     // t0 = original UDP term, t2 = UDP heap loc.
     WNF_F_UDP,
+    // EQL phase 1 — x (slot 0) being reduced.
+    // t0 = original EQL term, t2 = EQL loc.
+    WNF_F_EQL_X,
+    // EQL phase 2 — x is an atom (t1), reducing y (slot 1).
+    // t0 = original EQL, t1 = x (atom), t2 = EQL loc.
+    WNF_F_EQL_Y,
 };
 
 typedef struct {
@@ -483,6 +489,20 @@ enter: {
         };
         wnf_stack_push(f);
         next = label_expr;
+        goto enter;
+    }
+
+    // EQL: structural equality — 2-phase CPS reduce x then y.
+    if (tag == TAG_EQL) {
+        u64 loc = term_val(next);
+        if (loc == 0 || loc + 1 >= ctx->heap_pos) { whnf = next; goto apply; }
+        Term x = heap_read(ctx, loc + 0);
+        WnfFrame f = {
+            .kind = WNF_F_EQL_X, .flags = 0,
+            .t0 = next, .t1 = 0, .t2 = (Term)loc, .t3 = 0
+        };
+        wnf_stack_push(f);
+        next = x;
         goto enter;
     }
 
@@ -1756,6 +1776,149 @@ apply: {
             heap_set(ctx, app_loc + 0, fun);
             heap_set(ctx, app_loc + 1, whnf);
             whnf = app_orig;
+            continue;
+        }
+
+        case WNF_F_EQL_X: {
+            // whnf = x reduced; frame t0=eql_orig, t2=eql_loc.
+            Term eql_orig = f.t0;
+            u64 loc = (u64)f.t2;
+            u8 xt = term_tag(whnf);
+
+            // EQL-SUP-L: distribute, cloning b.
+            if (xt == TAG_SUP) {
+                u32 lab = term_ext(whnf);
+                u64 sloc = term_val(whnf);
+                Term a0 = heap_read(ctx, sloc + 0);
+                Term a1 = heap_read(ctx, sloc + 1);
+                Term b = heap_read(ctx, loc + 1);
+                u64 dup = heap_alloc(ctx, 1);
+                heap_set(ctx, dup, b);
+                ctx->itrs++;
+                next = thvm_sup(ctx, lab,
+                    thvm_eql(ctx, a0, term_new(TAG_DP0, lab, dup)),
+                    thvm_eql(ctx, a1, term_new(TAG_DP1, lab, dup)));
+                goto enter;
+            }
+            // EQL-USP-L.
+            if (xt == TAG_USP) {
+                u32 lab = term_ext(whnf);
+                u64 sloc = term_val(whnf);
+                Term a0 = heap_read(ctx, sloc + 0);
+                Term a1 = heap_read(ctx, sloc + 1);
+                Term b = heap_read(ctx, loc + 1);
+                u64 dup = heap_alloc(ctx, 1);
+                heap_set(ctx, dup, b);
+                ctx->itrs++;
+                next = thvm_usp(ctx, lab,
+                    thvm_eql(ctx, a0, term_new(TAG_UDP, lab, dup)),
+                    thvm_eql(ctx, a1, term_new(TAG_UDP, lab, dup)));
+                goto enter;
+            }
+            // EQL-ERA-L.
+            if (xt == TAG_ERA) { whnf = term_era(); ctx->itrs++; continue; }
+            // EQL-ANY-L.
+            if (xt == TAG_ANY) { whnf = term_num_u32(1); ctx->itrs++; continue; }
+            // EQL-INC-L.
+            if (xt == TAG_INC) {
+                Term inner_a = heap_read(ctx, term_val(whnf));
+                Term b = heap_read(ctx, loc + 1);
+                ctx->itrs++;
+                next = thvm_inc(ctx, thvm_eql(ctx, inner_a, b));
+                goto enter;
+            }
+
+            // Otherwise: promote to phase 2.  Push Y frame with x=whnf,
+            // descend into y.
+            Term y = heap_read(ctx, loc + 1);
+            WnfFrame yf = {
+                .kind = WNF_F_EQL_Y, .flags = 0,
+                .t0 = eql_orig, .t1 = whnf, .t2 = (Term)loc, .t3 = 0
+            };
+            wnf_stack_push(yf);
+            next = y;
+            goto enter;
+        }
+
+        case WNF_F_EQL_Y: {
+            // whnf = y reduced; frame t0=eql_orig, t1=x atom, t2=eql_loc.
+            Term eql_orig = f.t0;
+            Term x        = f.t1;
+            u64 loc       = (u64)f.t2;
+            u8 yt = term_tag(whnf);
+
+            // EQL-SUP-R: distribute — x is atom, no DUP needed.
+            if (yt == TAG_SUP) {
+                u32 lab = term_ext(whnf);
+                u64 sloc = term_val(whnf);
+                Term b0 = heap_read(ctx, sloc + 0);
+                Term b1 = heap_read(ctx, sloc + 1);
+                ctx->itrs++;
+                next = thvm_sup(ctx, lab,
+                    thvm_eql(ctx, x, b0),
+                    thvm_eql(ctx, x, b1));
+                goto enter;
+            }
+            // EQL-USP-R.
+            if (yt == TAG_USP) {
+                u32 lab = term_ext(whnf);
+                u64 sloc = term_val(whnf);
+                Term b0 = heap_read(ctx, sloc + 0);
+                Term b1 = heap_read(ctx, sloc + 1);
+                ctx->itrs++;
+                next = thvm_usp(ctx, lab,
+                    thvm_eql(ctx, x, b0),
+                    thvm_eql(ctx, x, b1));
+                goto enter;
+            }
+            if (yt == TAG_ERA) { whnf = term_era(); ctx->itrs++; continue; }
+            if (yt == TAG_ANY) { whnf = term_num_u32(1); ctx->itrs++; continue; }
+            // EQL-INC-R.
+            if (yt == TAG_INC) {
+                Term inner_b = heap_read(ctx, term_val(whnf));
+                ctx->itrs++;
+                next = thvm_inc(ctx, thvm_eql(ctx, x, inner_b));
+                goto enter;
+            }
+            // EQL-NUM.
+            if (term_tag(x) == TAG_NUM && yt == TAG_NUM) {
+                ctx->itrs++;
+                whnf = term_num_u32(term_as_u32(x) == term_as_u32(whnf) ? 1 : 0);
+                continue;
+            }
+            // EQL-LAM: fresh-var compare bodies.
+            if (term_tag(x) == TAG_LAM && yt == TAG_LAM) {
+                u64 a_loc = term_val(x);
+                u64 b_loc = term_val(whnf);
+                Term a_body = heap_read(ctx, a_loc + 1);
+                Term b_body = heap_read(ctx, b_loc + 1);
+                u32 fresh = ctx->next_sup_label++;
+                Term fresh_var = term_num_u32(fresh);
+                heap_set(ctx, a_loc, fresh_var);
+                heap_set(ctx, b_loc, fresh_var);
+                ctx->itrs++;
+                next = thvm_eql(ctx, a_body, b_body);
+                goto enter;
+            }
+            // Different types (or stuck compound) — rebuild EQL and return.
+            // Legacy rule emits 0 for genuinely different head tags; we
+            // replicate that for all atomic / value-like forms.
+            u8 xt = term_tag(x);
+            int x_val = (xt == TAG_NUM || xt == TAG_TEN ||
+                         xt == TAG_CTR || xt == TAG_LAM ||
+                         xt == TAG_NUM);
+            int y_val = (yt == TAG_NUM || yt == TAG_TEN ||
+                         yt == TAG_CTR || yt == TAG_LAM);
+            (void)eql_orig;
+            if (x_val && y_val) {
+                ctx->itrs++;
+                whnf = term_num_u32(0);
+                continue;
+            }
+            // Otherwise rebuild EQL with reduced operands.
+            heap_set(ctx, loc + 0, x);
+            heap_set(ctx, loc + 1, whnf);
+            whnf = eql_orig;
             continue;
         }
 

@@ -522,9 +522,9 @@ static int test_identity(void) {
     thvm_eval(ctx, mk(ctx, a, a));
     thvm_free(ctx);
     const char *pre[]  = {"GRAD", "CTR"};
-    const char *post[] = {"CTR", "EXPAND"};
+    const char *post[] = {"CTR"};
     int ok = topo_check("identity", 0, pre, 2)
-          && topo_check("identity", 1, post, 2);
+          && topo_check("identity", 1, post, 1);
     return report("identity", ok);
 }
 
@@ -562,9 +562,9 @@ static int test_gradu_identity(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD"};
-    const char *post[] = {"CTR", "EXPAND"};
+    const char *post[] = {"CTR"};
     int ok = topo_check("gradu_identity", 0, pre, 2)
-          && topo_check("gradu_identity", 1, post, 2);
+          && topo_check("gradu_identity", 1, post, 1);
     return report("gradu_identity", ok);
 }
 
@@ -585,9 +585,9 @@ static int test_gradu_add(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "ADD"};
-    const char *post[] = {"CTR", "ADD", "EXPAND"};
+    const char *post[] = {"CTR", "ADD"};
     int ok = topo_check("gradu_add", 0, pre, 3)
-          && topo_check("gradu_add", 1, post, 3);
+          && topo_check("gradu_add", 1, post, 2);
     return report("gradu_add", ok);
 }
 
@@ -607,9 +607,9 @@ static int test_gradu_mul(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "MUL"};
-    const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
+    const char *post[] = {"CTR", "MUL"};
     int ok = topo_check("gradu_mul", 0, pre, 3)
-          && topo_check("gradu_mul", 1, post, 4);
+          && topo_check("gradu_mul", 1, post, 2);
     return report("gradu_mul", ok);
 }
 
@@ -629,9 +629,9 @@ static int test_gradu_##TNAME(void) {                                  \
     thvm_eval(ctx, root);                                              \
     thvm_free(ctx);                                                    \
     const char *pre[]  = {"CTR", "GRAD", PRE};                        \
-    const char *post[] = {"CTR", "EXPAND", POST_NEEDLE};               \
+    const char *post[] = {"CTR", POST_NEEDLE};                         \
     int ok = topo_check(DIR, 0, pre, 3)                                \
-          && topo_check(DIR, 1, post, 3);                              \
+          && topo_check(DIR, 1, post, 2);                              \
     return report(DIR, ok);                                            \
 }
 GRADU_UNARY_TEST(neg,  "gradu_neg",  UOP_NEG,  "NEG",  "NEG")
@@ -700,9 +700,9 @@ static int test_gradu_reshape(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "RESHAPE"};
-    const char *post[] = {"CTR", "RESHAPE", "EXPAND"};
+    const char *post[] = {"CTR", "RESHAPE"};
     int ok = topo_check("gradu_reshape", 0, pre, 3)
-          && topo_check("gradu_reshape", 1, post, 3);
+          && topo_check("gradu_reshape", 1, post, 2);
     return report("gradu_reshape", ok);
 }
 static int test_gradu_permute(void) {
@@ -719,9 +719,9 @@ static int test_gradu_permute(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "PERMUTE"};
-    const char *post[] = {"CTR", "PERMUTE", "EXPAND"};
+    const char *post[] = {"CTR", "PERMUTE"};
     int ok = topo_check("gradu_permute", 0, pre, 3)
-          && topo_check("gradu_permute", 1, post, 3);
+          && topo_check("gradu_permute", 1, post, 2);
     return report("gradu_permute", ok);
 }
 static int test_gradu_sum(void) {
@@ -758,9 +758,9 @@ static int test_gradu_shrink(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "SHRINK"};
-    const char *post[] = {"CTR", "PAD", "EXPAND"};
+    const char *post[] = {"CTR", "PAD"};
     int ok = topo_check("gradu_shrink", 0, pre, 3)
-          && topo_check("gradu_shrink", 1, post, 3);
+          && topo_check("gradu_shrink", 1, post, 2);
     return report("gradu_shrink", ok);
 }
 static int test_gradu_pad(void) {
@@ -777,9 +777,9 @@ static int test_gradu_pad(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "PAD"};
-    const char *post[] = {"CTR", "SHRINK", "EXPAND"};
+    const char *post[] = {"CTR", "SHRINK"};
     int ok = topo_check("gradu_pad", 0, pre, 3)
-          && topo_check("gradu_pad", 1, post, 3);
+          && topo_check("gradu_pad", 1, post, 2);
     return report("gradu_pad", ok);
 }
 static int test_gradu_expand(void) {
@@ -901,8 +901,8 @@ static int test_gradu_sub_rhs(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "SUB"};
-    // bwd = SUB(EXPAND(0), EXPAND(1)) = -1
-    const char *post[] = {"CTR", "SUB", "EXPAND"};
+    // bwd = NEG(ones) = -1 after normalize materializes the EXPANDs.
+    const char *post[] = {"CTR", "SUB", "NEG"};
     int ok = topo_check("gradu_sub_rhs", 0, pre, 3)
           && topo_check("gradu_sub_rhs", 1, post, 3);
     return report("gradu_sub_rhs", ok);
@@ -928,10 +928,10 @@ static int test_gradu_cubic(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "MUL"};
-    // bwd = ADD(MUL(ADD(..., ...), t), MUL(t*t, EXPAND(1))) — three MULs.
-    const char *post[] = {"CTR", "ADD", "MUL", "EXPAND"};
+    // bwd = ADD(MUL(ADD(..., ...), t), MUL(t*t, ones)) — three MULs.
+    const char *post[] = {"CTR", "ADD", "MUL"};
     int ok = topo_check("gradu_cubic", 0, pre, 3)
-          && topo_check("gradu_cubic", 1, post, 4);
+          && topo_check("gradu_cubic", 1, post, 3);
     return report("gradu_cubic", ok);
 }
 
@@ -1002,9 +1002,9 @@ static int test_gradu_exp_neg(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "EXP", "NEG"};
-    const char *post[] = {"CTR", "EXP", "NEG", "MUL", "EXPAND"};
+    const char *post[] = {"CTR", "EXP", "NEG", "MUL"};
     int ok = topo_check("gradu_exp_neg", 0, pre, 4)
-          && topo_check("gradu_exp_neg", 1, post, 5);
+          && topo_check("gradu_exp_neg", 1, post, 4);
     return report("gradu_exp_neg", ok);
 }
 
@@ -1027,9 +1027,9 @@ static int test_gradu_softplus(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "LOG", "ADD", "EXP"};
-    const char *post[] = {"CTR", "DIV", "ADD", "EXP", "EXPAND"};
+    const char *post[] = {"CTR", "DIV", "ADD", "EXP"};
     int ok = topo_check("gradu_softplus", 0, pre, 5)
-          && topo_check("gradu_softplus", 1, post, 5);
+          && topo_check("gradu_softplus", 1, post, 4);
     return report("gradu_softplus", ok);
 }
 
@@ -1078,9 +1078,9 @@ static int test_gradu_target_via_dup(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "ADD"};
-    const char *post[] = {"CTR", "ADD", "EXPAND"};
+    const char *post[] = {"CTR", "ADD"};
     int ok = topo_check("gradu_target_via_dup", 0, pre, 3)
-          && topo_check("gradu_target_via_dup", 1, post, 3);
+          && topo_check("gradu_target_via_dup", 1, post, 2);
     return report("gradu_target_via_dup", ok);
 }
 
@@ -1102,9 +1102,9 @@ static int test_gradu_distributive(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "MUL", "ADD"};
-    const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
+    const char *post[] = {"CTR", "MUL", "ADD"};
     int ok = topo_check("gradu_distributive", 0, pre, 4)
-          && topo_check("gradu_distributive", 1, post, 4);
+          && topo_check("gradu_distributive", 1, post, 3);
     return report("gradu_distributive", ok);
 }
 
@@ -1179,9 +1179,9 @@ static int test_gradu_lambda(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "APP", "LAM"};
-    const char *post[] = {"CTR", "EXPAND"};
+    const char *post[] = {"CTR"};
     int ok = topo_check("gradu_lambda", 0, pre, 4)
-          && topo_check("gradu_lambda", 1, post, 2);
+          && topo_check("gradu_lambda", 1, post, 1);
     return report("gradu_lambda", ok);
 }
 
@@ -1446,7 +1446,7 @@ static int test_gradu_mixed_partial(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "MUL"};
-    const char *post[] = {"CTR", "EXPAND"};
+    const char *post[] = {"CTR", "MUL"};
     int ok = topo_check("gradu_mixed_partial", 0, pre, 3)
           && topo_check("gradu_mixed_partial", 1, post, 2);
     return report("gradu_mixed_partial", ok);
@@ -1510,9 +1510,9 @@ static int test_gradu_nested_app(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "APP", "LAM", "MUL"};
-    const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
+    const char *post[] = {"CTR", "MUL", "ADD"};
     int ok = topo_check("gradu_nested_app", 0, pre, 5)
-          && topo_check("gradu_nested_app", 1, post, 4);
+          && topo_check("gradu_nested_app", 1, post, 3);
     return report("gradu_nested_app", ok);
 }
 
@@ -1539,9 +1539,9 @@ static int test_gradu_curried(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "APP", "LAM"};
-    const char *post[] = {"CTR", "MUL", "ADD"};
+    const char *post[] = {"CTR", "MUL"};
     int ok = topo_check("gradu_curried", 0, pre, 4)
-          && topo_check("gradu_curried", 1, post, 3);
+          && topo_check("gradu_curried", 1, post, 2);
     return report("gradu_curried", ok);
 }
 
@@ -1565,9 +1565,11 @@ static int test_gradu_ifz(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "IFZ"};
-    const char *post[] = {"CTR", "EXPAND"};
+    // IFZ holds both branches lazily under normalize; the GRAD TOP is
+    // present in the unreduced success arm until the outer IFZ fires.
+    const char *post[] = {"CTR", "IFZ", "GRAD"};
     int ok = topo_check("gradu_ifz", 0, pre, 3)
-          && topo_check("gradu_ifz", 1, post, 2);
+          && topo_check("gradu_ifz", 1, post, 3);
     return report("gradu_ifz", ok);
 }
 
@@ -1602,7 +1604,8 @@ static int test_gradu_ifz_succ(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "IFZ", "LAM", "MUL"};
-    const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
+    // IFZ holds both branches lazily; GRAD in unselected arm is visible.
+    const char *post[] = {"CTR", "IFZ", "MUL", "GRAD"};
     int ok = topo_check("gradu_ifz_succ", 0, pre, 5)
           && topo_check("gradu_ifz_succ", 1, post, 4);
     return report("gradu_ifz_succ", ok);
@@ -1650,9 +1653,9 @@ static int test_gradu_dot(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "SUM", "MUL"};
-    const char *post[] = {"CTR", "SUM", "EXPAND", "MUL", "ADD"};
+    const char *post[] = {"CTR", "SUM", "EXPAND", "MUL"};
     int ok = topo_check("gradu_dot", 0, pre, 4)
-          && topo_check("gradu_dot", 1, post, 5);
+          && topo_check("gradu_dot", 1, post, 4);
     return report("gradu_dot", ok);
 }
 
@@ -1738,9 +1741,9 @@ static int test_gradu_poly(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "ADD", "MUL"};
-    const char *post[] = {"CTR", "ADD", "MUL", "EXPAND"};
+    const char *post[] = {"CTR", "ADD", "MUL"};
     int ok = topo_check("gradu_poly", 0, pre, 4)
-          && topo_check("gradu_poly", 1, post, 4);
+          && topo_check("gradu_poly", 1, post, 3);
     return report("gradu_poly", ok);
 }
 

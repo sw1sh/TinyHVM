@@ -1189,6 +1189,10 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
     if (ctx != g_step_session_ctx) return;
     if (g_step_session_dir[0] == 0) return;
     if (g_step_session_frame >= thvm_step_graph_max_steps()) return;
+    // Mirror the current root Term into step_root_slot so the dumper
+    // (which is heap-driven) picks up root-shaped TOPs like GRAD even
+    // when the root itself isn't held in any other heap cell.
+    thvm_step_seed_root_grad(ctx, g_step_session_root);
     char path[640];
     snprintf(path, sizeof(path), "%s/step_%03u.dot",
              g_step_session_dir, g_step_session_frame);
@@ -1222,6 +1226,7 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     g_step_session_ctx               = ctx;
     g_step_session_frame             = 0;
     g_step_session_last_render_sig   = 0;
+    thvm_step_seed_root_grad(ctx, traced);
     char p0[640];
     snprintf(p0, sizeof(p0), "%s/step_%03u.dot", dir, g_step_session_frame);
     thvm_heap_dot_set_highlight(0, 0);
@@ -1239,6 +1244,7 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
 
     // Final-state frame (skipped if identical to last).
     g_step_session_root = traced;
+    thvm_step_seed_root_grad(ctx, traced);
     char pF[640];
     snprintf(pF, sizeof(pF), "%s/step_%03u_final.dot", dir, g_step_session_frame);
     thvm_heap_dot_set_highlight(0, 0);

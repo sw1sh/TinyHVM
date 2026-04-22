@@ -1293,6 +1293,7 @@ void     jit_replay(void);
 // rules then drains the frame stack into a resumable Term.
 Term     thvm_reduce(TinyHVM *ctx, Term t);
 Term     thvm_reduce_budget(TinyHVM *ctx, Term t, u32 budget);
+Term     thvm_normalize(TinyHVM *ctx, Term t);
 Term     thvm_eval(TinyHVM *ctx, Term t);
 void     thvm_sched_reset_runtime(void);
 

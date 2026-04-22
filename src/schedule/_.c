@@ -1130,7 +1130,7 @@ static Term thvm_eval_collect_fixed_point(TinyHVM *ctx, Term t, int dispatch_ena
         traced = thvm_reduce(ctx, traced);
         // Also sweep any detached/unreachable heap redexes that direct
         // uops (FUSE, KERNEL, EXEC) leave behind during scheduler passes.
-        traced = reduce_net_quiesce(ctx, traced);
+        traced = thvm_normalize(ctx, traced);
         if (ctx->itrs == itrs_before) break;
     }
     ctx->dispatch_enabled = saved_dispatch_enabled;
@@ -1277,7 +1277,7 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
 
     // Phase-2 quiesce unless the caller wants post-sweep topology only.
     if (!getenv("THVM_GRAPH_STOP_AFTER_SWEEP"))
-        traced = reduce_net_quiesce(ctx, traced);
+        traced = thvm_normalize(ctx, traced);
     sched_planner_release_detached_slots();
     return traced;
 }
@@ -2058,7 +2058,7 @@ u32 sched_all(TinyHVM *ctx, Term root) {
             SchedBoundary *b = &sched_boundaries[i];
             if (!b->is_boundary) continue;
             Term root_before = b->root_term;
-            Term root_after = reduce_net_quiesce(ctx, root_before);
+            Term root_after = thvm_normalize(ctx, root_before);
             if (root_after == root_before) continue;
             /* Guard against quiesce accidentally collapsing a live
              * kernel-boundary root to ERA. Under atom-shared TOP DUPs,
@@ -2315,7 +2315,7 @@ static Term thvm_eval_internal(TinyHVM *ctx, Term t, int pre_reduce_phase) {
         // every interaction rule fires to completion — that's what shows the
         // full chain-rule unfolding in the phase-1 dump.
         traced = thvm_reduce(ctx, traced);
-        traced = reduce_net_quiesce(ctx, traced);
+        traced = thvm_normalize(ctx, traced);
         if (getenv("THVM_SCHED_DIAG"))
             fprintf(stderr, "PHASE1_RESULT: tag=%u ext=%u val=%llu\n",
                     term_tag(traced), term_ext(traced), (unsigned long long)term_val(traced));

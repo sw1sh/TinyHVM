@@ -176,6 +176,7 @@ static f32 *thvm_to_host_view(Backend *be, u32 buf_id, const View *v, u32 numel)
 // ── parallel/ — work-stealing deque + per-thread state ──────────────────────
 #include "parallel/wsdeque.c"
 #include "parallel/workers.c"
+#include "parallel/normalize.c"
 
 // ── inet/ — interaction combinator term constructors ─────────────────────────
 #include "inet/_.c"

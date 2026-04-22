@@ -209,7 +209,9 @@ static Term wnf_mk_neg(TinyHVM *ctx, Term a) {
 // ──────────────────────────────────────────────────────────────────────
 
 static inline int wnf_is_atom(u8 tag) {
-    return tag == TAG_TEN || tag == TAG_NUM || tag == TAG_ERA ||
+    // TAG_ERA intentionally excluded: inert ERA(0) is WNF but active
+    // ERA(val != 0) must run the walker (handled in enter-phase).
+    return tag == TAG_TEN || tag == TAG_NUM ||
            tag == TAG_LAM || tag == TAG_SUP || tag == TAG_ANY;
 }
 

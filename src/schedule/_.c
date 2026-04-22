@@ -1110,61 +1110,6 @@ static int thvm_step_predict_next_redex(TinyHVM *ctx, Term t, Term *out_before, 
     return 0;
 }
 
-static int thvm_step_find_next_actual(TinyHVM *ctx, Term root,
-                                      u64 *out_source_slot, Term *out_before,
-                                      u8 *out_kind) {
-    Term before = 0;
-    Term whnf = root;
-    if (thvm_step_predict_next_redex(ctx, root, &before, &whnf)) {
-        if (out_source_slot) *out_source_slot = step_root_slot;
-        if (out_before) *out_before = before;
-        if (out_kind) *out_kind = THVM_STEP_KIND_ROOT;
-        return 1;
-    }
-    // The collector still gives the mirrored root one real step even when the
-    // predictor classifies FUSE(TEN/ERA/NUM) as a hidden terminal passthrough.
-    // Keep next-step discovery aligned with that behavior so the handoff from
-    // mainline root work to detached sweep cleanup doesn't skip the final root
-    // interaction in filenames/highlights.
-    if (step_top_is_hidden_trace_passthru(ctx, root)) {
-        if (out_source_slot) *out_source_slot = step_root_slot;
-        if (out_before) *out_before = root;
-        if (out_kind) *out_kind = THVM_STEP_KIND_ROOT;
-        return 1;
-    }
-
-    u8 *reach = (u8 *)calloc((size_t)ctx->heap_pos, 1);
-    step_mark_reachable_slots(ctx, root, reach);
-    for (u64 h = 1; h < ctx->heap_pos; h++) {
-        if (h == step_root_slot) continue;
-        if (step_slot_is_local_assign_target(ctx, h)) continue;
-        Term ht = ctx->heap[h];
-        int reachable = !(reach && !reach[h]);
-        if (!reachable && !step_term_needs_global_cleanup(ctx, ht)) continue;
-        if (!step_term_maybe_active(ctx, ht)) continue;
-        if ((term_tag(ht) == TAG_DP0 || term_tag(ht) == TAG_DP1) &&
-            reachable &&
-            !step_term_first_reachable_occurrence(ctx, h, ht, reach)) {
-            continue;
-        }
-        if (term_tag(ht) == TAG_TOP && term_ext(ht) == UOP_GRAD &&
-            reachable &&
-            !step_term_first_reachable_occurrence(ctx, h, ht, reach)) {
-            continue;
-        }
-        Term w = ht;
-        if (thvm_step_predict_next_redex(ctx, ht, &before, &w)) {
-            if (out_source_slot) *out_source_slot = h;
-            if (out_before) *out_before = before;
-            if (out_kind) *out_kind = reachable ? THVM_STEP_KIND_HEAP
-                                                : THVM_STEP_KIND_SWEEP;
-            free(reach);
-            return 1;
-        }
-    }
-    free(reach);
-    return 0;
-}
 
 static void thvm_step_capture_step_before_meta(TinyHVM *ctx, Term before) {
     if (term_tag(before) == TAG_TOP && term_ext(before) == UOP_GRAD) {
@@ -1229,39 +1174,6 @@ static Term thvm_step_seed_root_grad(TinyHVM *ctx, Term t) {
     return t;
 }
 
-static void thvm_step_graph_scrub_detached_eras(TinyHVM *ctx) {
-    u32 removed = 0;
-    u32 first_tag = 0;
-    u64 first_loc = 0;
-    for (u64 h = 1; h < ctx->heap_pos; h++) {
-        Term ht = ctx->heap[h];
-        if (term_tag(ht) != TAG_ERA || term_val(ht) == 0) continue;
-        if (step_has_parent_ref(ctx, ht)) continue;
-        u64 loc = term_val(ht);
-        if (loc > 0 && loc < ctx->heap_pos) {
-            if (removed == 0) {
-                first_tag = term_tag(heap_read(ctx, loc));
-                first_loc = loc;
-            }
-            removed++;
-            heap_set(ctx, loc, term_era());
-        }
-        ctx->heap[h] = term_era();
-    }
-    // #region agent log
-    do {
-        static u32 scrub_dbg_count = 0;
-        if (removed == 0 || scrub_dbg_count >= 12) break;
-        scrub_dbg_count++;
-        char _dbg[192];
-        snprintf(_dbg, sizeof(_dbg),
-                 "{\"removed\":%u,\"first_tag\":%u,\"first_loc\":%llu}",
-                 removed, first_tag, (unsigned long long)first_loc);
-        thvm_agent_debug_log("pre-fix", "H10", "src/schedule/_.c:792",
-                             "step_graph_scrub_detached_eras", _dbg);
-    } while (0);
-    // #endregion
-}
 
 
 static int thvm_eval_mixed_dispatch_enabled(void) {
@@ -1736,18 +1648,6 @@ u32 thvm_reduce_collect(TinyHVM *ctx, Term root, Term *out_terms, u32 cap) {
     return n;
 }
 
-static void sched_dump_heap(TinyHVM *ctx) {
-    u32 counts[UOP_COUNT] = {0};
-    u32 n_ten = 0, n_top = 0;
-    for (u64 h = 1; h < ctx->heap_pos; h++) {
-        Term t = ctx->heap[h];
-        if (term_tag(t) == TAG_TEN) n_ten++;
-        else if (term_tag(t) == TAG_TOP) { n_top++; u32 uop = term_ext(t); if (uop < UOP_COUNT) counts[uop]++; }
-    }
-    fprintf(stderr, "HEAP[%llu]: TEN=%u TOP=%u | ", ctx->heap_pos, n_ten, n_top);
-    for (u32 u = 0; u < UOP_COUNT; u++) if (counts[u]) fprintf(stderr, "%s=%u ", uop_names[u], counts[u]);
-    fprintf(stderr, "\n");
-}
 
 
 

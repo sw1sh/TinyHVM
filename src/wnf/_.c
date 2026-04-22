@@ -86,6 +86,15 @@ enum {
     // APP ⊳ MAT second phase: whnf of APP.fun was MAT; now drive arg to WHNF.
     // t0 = original APP term, t1 = MAT term (fun), t2 = APP heap loc.
     WNF_F_APP_MAT,
+    // DSU: dynamic SUP — reduce slot 0 (label) to WHNF, then build SUP.
+    // t0 = original DSU term, t2 = DSU heap loc.
+    WNF_F_DSU,
+    // DDU: dynamic DUP — reduce slot 0 (label) to WHNF, then DUP+APP.
+    // t0 = original DDU term, t2 = DDU heap loc.
+    WNF_F_DDU,
+    // UDP: unordered DUP consumer — reduce body to WHNF, then dispatch.
+    // t0 = original UDP term, t2 = UDP heap loc.
+    WNF_F_UDP,
 };
 
 typedef struct {
@@ -432,6 +441,63 @@ enter: {
         }
         whnf = next;
         goto apply;
+    }
+
+    // USP: unordered superposition — WNF (like SUP/LAM).
+    if (tag == TAG_USP) { whnf = next; goto apply; }
+
+    // MAT: pattern matcher — WNF until applied.
+    if (tag == TAG_MAT) { whnf = next; goto apply; }
+
+    // INC: priority wrapper — transparent, tail-call into slot 0.
+    if (tag == TAG_INC) {
+        u64 loc = term_val(next);
+        if (loc >= ctx->heap_pos) { whnf = next; goto apply; }
+        ctx->itrs++;
+        next = heap_read(ctx, loc);
+        goto enter;
+    }
+
+    // DSU: dynamic SUP — reduce slot 0 (label) to WHNF, then build SUP.
+    if (tag == TAG_DSU) {
+        u64 loc = term_val(next);
+        if (loc == 0 || loc + 2 >= ctx->heap_pos) { whnf = next; goto apply; }
+        Term label_expr = heap_read(ctx, loc + 0);
+        WnfFrame f = {
+            .kind = WNF_F_DSU, .flags = 0,
+            .t0 = next, .t1 = 0, .t2 = (Term)loc, .t3 = 0
+        };
+        wnf_stack_push(f);
+        next = label_expr;
+        goto enter;
+    }
+
+    // DDU: dynamic DUP — reduce slot 0 (label) to WHNF, then DUP(val)+APP(bod).
+    if (tag == TAG_DDU) {
+        u64 loc = term_val(next);
+        if (loc == 0 || loc + 2 >= ctx->heap_pos) { whnf = next; goto apply; }
+        Term label_expr = heap_read(ctx, loc + 0);
+        WnfFrame f = {
+            .kind = WNF_F_DDU, .flags = 0,
+            .t0 = next, .t1 = 0, .t2 = (Term)loc, .t3 = 0
+        };
+        wnf_stack_push(f);
+        next = label_expr;
+        goto enter;
+    }
+
+    // UDP: unordered DUP consumer — drive body to WHNF, then dispatch.
+    if (tag == TAG_UDP) {
+        u64 udp_loc = term_val(next);
+        if (udp_loc == 0 || udp_loc >= ctx->heap_pos) { whnf = next; goto apply; }
+        Term body = heap_read(ctx, udp_loc);
+        WnfFrame f = {
+            .kind = WNF_F_UDP, .flags = 0,
+            .t0 = next, .t1 = 0, .t2 = (Term)udp_loc, .t3 = 0
+        };
+        wnf_stack_push(f);
+        next = body;
+        goto enter;
     }
 
     // Other tags: fall back.
@@ -1690,6 +1756,116 @@ apply: {
             heap_set(ctx, app_loc + 0, fun);
             heap_set(ctx, app_loc + 1, whnf);
             whnf = app_orig;
+            continue;
+        }
+
+        case WNF_F_DSU: {
+            // frame: DSU orig (t0), DSU loc (t2); whnf = label in WHNF.
+            Term dsu_orig = f.t0;
+            u64 loc = (u64)f.t2;
+            if (term_tag(whnf) != TAG_NUM) {
+                // Label not ready — write back and return stuck.
+                heap_set(ctx, loc + 0, whnf);
+                whnf = dsu_orig;
+                continue;
+            }
+            u32 label = term_as_u32(whnf);
+            Term a = heap_read(ctx, loc + 1);
+            Term b = heap_read(ctx, loc + 2);
+            ctx->itrs++;
+            next = thvm_sup(ctx, label, a, b);
+            goto enter;
+        }
+
+        case WNF_F_DDU: {
+            // frame: DDU orig (t0), DDU loc (t2); whnf = label in WHNF.
+            Term ddu_orig = f.t0;
+            u64 loc = (u64)f.t2;
+            if (term_tag(whnf) != TAG_NUM) {
+                heap_set(ctx, loc + 0, whnf);
+                whnf = ddu_orig;
+                continue;
+            }
+            u32 label = term_as_u32(whnf);
+            Term val = heap_read(ctx, loc + 1);
+            Term bod = heap_read(ctx, loc + 2);
+            Term dp0, dp1;
+            thvm_dup(ctx, label, val, &dp0, &dp1);
+            ctx->itrs++;
+            next = thvm_app(ctx, thvm_app(ctx, bod, dp0), dp1);
+            goto enter;
+        }
+
+        case WNF_F_UDP: {
+            // frame: UDP orig (t0), UDP loc (t2); whnf = body in WHNF.
+            Term udp_orig = f.t0;
+            u64 udp_loc = (u64)f.t2;
+            u32 udp_label = term_ext(udp_orig);
+            u8 vtag = term_tag(whnf);
+
+            // UDP ⊳ USP (same label): consume one branch, keep producing from the
+            // other; the UDP cell slides to the remainder.
+            if (vtag == TAG_USP && term_ext(whnf) == udp_label) {
+                u64 usp_loc = term_val(whnf);
+                Term a = heap_read(ctx, usp_loc + 0);
+                Term b = heap_read(ctx, usp_loc + 1);
+                heap_set(ctx, udp_loc, b);
+                ctx->itrs++;
+                next = a;
+                goto enter;
+            }
+            // UDP ⊳ USP (different label): commutation preserving USP.
+            if (vtag == TAG_USP) {
+                u32 usp_label = term_ext(whnf);
+                u64 usp_loc = term_val(whnf);
+                Term a = heap_read(ctx, usp_loc + 0);
+                Term b = heap_read(ctx, usp_loc + 1);
+                u64 du_a = heap_alloc(ctx, 1); heap_set(ctx, du_a, a);
+                u64 du_b = heap_alloc(ctx, 1); heap_set(ctx, du_b, b);
+                ctx->itrs++;
+                next = thvm_usp(ctx, usp_label,
+                    term_new(TAG_UDP, udp_label, du_a),
+                    term_new(TAG_UDP, udp_label, du_b));
+                goto enter;
+            }
+            // UDP ⊳ SUP: distribute UDP over ordered SUP branches.
+            if (vtag == TAG_SUP) {
+                u32 sup_label = term_ext(whnf);
+                u64 sup_loc = term_val(whnf);
+                Term a = heap_read(ctx, sup_loc + 0);
+                Term b = heap_read(ctx, sup_loc + 1);
+                u64 du_a = heap_alloc(ctx, 1); heap_set(ctx, du_a, a);
+                u64 du_b = heap_alloc(ctx, 1); heap_set(ctx, du_b, b);
+                ctx->itrs++;
+                next = thvm_sup(ctx, sup_label,
+                    term_new(TAG_UDP, udp_label, du_a),
+                    term_new(TAG_UDP, udp_label, du_b));
+                goto enter;
+            }
+            // UDP ⊳ atoms: UDP vanishes.
+            if (vtag == TAG_NUM || vtag == TAG_ERA ||
+                vtag == TAG_TEN || vtag == TAG_ANY) {
+                // whnf is already the value; fall through.
+                continue;
+            }
+            // UDP ⊳ LAM: commutation — wrap body in UDP, SUBST var with UDP of new var.
+            if (vtag == TAG_LAM) {
+                u64 lam_loc = term_val(whnf);
+                Term body = heap_read(ctx, lam_loc + 1);
+                u64 bdup = heap_alloc(ctx, 1);
+                heap_set(ctx, bdup, body);
+                Term var0;
+                Term lam_new = thvm_lam(ctx, &var0, term_new(TAG_UDP, udp_label, bdup));
+                u64 vdup = heap_alloc(ctx, 1);
+                heap_set(ctx, vdup, var0);
+                heap_set(ctx, lam_loc, term_new(TAG_UDP, udp_label, vdup));
+                ctx->itrs++;
+                whnf = lam_new;
+                continue;
+            }
+            // Stuck: rebuild UDP with body at cell and return as-is.
+            heap_set(ctx, udp_loc, whnf);
+            whnf = udp_orig;
             continue;
         }
 

@@ -1252,37 +1252,194 @@ apply: {
             Term dp_orig = f.t0;
             u32 side = f.flags & 1;
             u64 dup_loc = term_val(dp_orig);
+            u32 dup_label = term_ext(dp_orig);
 
-            // DUP ⊳ TEN: atomic.  Incref, store sibling copy via SUB bit.
-            if (term_tag(whnf) == TAG_TEN) {
+            // Transparent projection for pure compute TOPs: don't fire the
+            // DUP.  Both auxes share the same TAG_TOP handle so the compute
+            // materialises once; tensor refcounting on the shared TEN is
+            // handled when the TOP later reduces.
+            if (term_tag(whnf) == TAG_TOP) {
+                u32 vuop = term_ext(whnf);
+                if (vuop != UOP_DETACH && vuop != UOP_ASSIGN &&
+                    vuop != UOP_KERNEL && vuop != UOP_EXEC &&
+                    vuop != UOP_GRAD && vuop != UOP_GRAD_FWD) {
+                    // Don't touch the DUP cell; return whnf unchanged.
+                    continue;
+                }
+            }
+
+            Term v0 = 0, v1 = 0;
+            int fired = 0;
+            u8 wtag = term_tag(whnf);
+
+            // Atoms: DUP just copies.  TEN needs incref.
+            if (wtag == TAG_TEN) {
                 tensor_incref(ctx, (u32)term_val(whnf));
-                heap_set(ctx, dup_loc, term_set_sub(whnf));
+                v0 = whnf; v1 = whnf; fired = 1;
+            } else if (wtag == TAG_ERA || wtag == TAG_NUM ||
+                       wtag == TAG_ANY || wtag == TAG_CTR) {
+                v0 = whnf; v1 = whnf; fired = 1;
+            }
+            // DUP ⊳ SUP: annihilate (same label) or commute (different).
+            else if (wtag == TAG_SUP) {
+                u32 sup_label = term_ext(whnf);
+                u64 sup_loc = term_val(whnf);
+                if (dup_label == sup_label) {
+                    v0 = heap_read(ctx, sup_loc + 0);
+                    v1 = heap_read(ctx, sup_loc + 1);
+                } else {
+                    Term b = heap_read(ctx, sup_loc + 1);
+                    u64 du0 = sup_loc;
+                    u64 du1 = heap_alloc(ctx, 1);
+                    heap_set(ctx, du1, b);
+                    u64 su0 = heap_alloc(ctx, 2);
+                    u64 su1 = heap_alloc(ctx, 2);
+                    heap_set(ctx, su0 + 0, term_new(TAG_DP0, dup_label, du0));
+                    heap_set(ctx, su0 + 1, term_new(TAG_DP0, dup_label, du1));
+                    heap_set(ctx, su1 + 0, term_new(TAG_DP1, dup_label, du0));
+                    heap_set(ctx, su1 + 1, term_new(TAG_DP1, dup_label, du1));
+                    v0 = term_new(TAG_SUP, sup_label, su0);
+                    v1 = term_new(TAG_SUP, sup_label, su1);
+                }
+                fired = 1;
+            }
+            // DUP ⊳ USP: commute preserving unordered tag.
+            else if (wtag == TAG_USP) {
+                u32 usp_label = term_ext(whnf);
+                u64 usp_loc = term_val(whnf);
+                Term b = heap_read(ctx, usp_loc + 1);
+                u64 du0 = usp_loc;
+                u64 du1 = heap_alloc(ctx, 1);
+                heap_set(ctx, du1, b);
+                u64 su0 = heap_alloc(ctx, 2);
+                u64 su1 = heap_alloc(ctx, 2);
+                heap_set(ctx, su0 + 0, term_new(TAG_DP0, dup_label, du0));
+                heap_set(ctx, su0 + 1, term_new(TAG_DP0, dup_label, du1));
+                heap_set(ctx, su1 + 0, term_new(TAG_DP1, dup_label, du0));
+                heap_set(ctx, su1 + 1, term_new(TAG_DP1, dup_label, du1));
+                v0 = term_new(TAG_USP, usp_label, su0);
+                v1 = term_new(TAG_USP, usp_label, su1);
+                fired = 1;
+            }
+            // DUP ⊳ LAM: commutation — duplicate lambda.
+            else if (wtag == TAG_LAM) {
+                u64 lam_loc = term_val(whnf);
+                Term body = heap_read(ctx, lam_loc + 1);
+                u64 bdup = heap_alloc(ctx, 1);
+                heap_set(ctx, bdup, body);
+                Term var0, var1;
+                v0 = thvm_lam(ctx, &var0, term_new(TAG_DP0, dup_label, bdup));
+                v1 = thvm_lam(ctx, &var1, term_new(TAG_DP1, dup_label, bdup));
+                u64 vsup = heap_alloc(ctx, 2);
+                heap_set(ctx, vsup + 0, var0);
+                heap_set(ctx, vsup + 1, var1);
+                heap_set(ctx, lam_loc, term_new(TAG_SUP, dup_label, vsup));
+                fired = 1;
+            }
+            // DUP ⊳ BRI: same as LAM but TAG_BRI.
+            else if (wtag == TAG_BRI) {
+                u64 bri_loc = term_val(whnf);
+                Term body = heap_read(ctx, bri_loc + 1);
+                u64 bdup = heap_alloc(ctx, 1);
+                heap_set(ctx, bdup, body);
+                Term var0, var1;
+                v0 = thvm_bri(ctx, &var0, term_new(TAG_DP0, dup_label, bdup));
+                v1 = thvm_bri(ctx, &var1, term_new(TAG_DP1, dup_label, bdup));
+                u64 vsup = heap_alloc(ctx, 2);
+                heap_set(ctx, vsup + 0, var0);
+                heap_set(ctx, vsup + 1, var1);
+                heap_set(ctx, bri_loc, term_new(TAG_SUP, dup_label, vsup));
+                fired = 1;
+            }
+            // DUP ⊳ ANN: duplicate both term and type.
+            else if (wtag == TAG_ANN) {
+                u64 ann_loc = term_val(whnf);
+                Term inner = heap_read(ctx, ann_loc);
+                Term type  = heap_read(ctx, ann_loc + 1);
+                u64 idup = heap_alloc(ctx, 1);
+                heap_set(ctx, idup, inner);
+                u64 tdup = heap_alloc(ctx, 1);
+                heap_set(ctx, tdup, type);
+                v0 = thvm_ann(ctx, term_new(TAG_DP0, dup_label, idup),
+                                   term_new(TAG_DP0, dup_label, tdup));
+                v1 = thvm_ann(ctx, term_new(TAG_DP1, dup_label, idup),
+                                   term_new(TAG_DP1, dup_label, tdup));
+                fired = 1;
+            }
+            // DUP ⊳ 2-slot compounds (OP2/APP/EQL/AND/OR/MAT/SEQ): DUP-NOD.
+            else if (wtag == TAG_OP2 || wtag == TAG_APP ||
+                     wtag == TAG_EQL || wtag == TAG_AND ||
+                     wtag == TAG_OR  || wtag == TAG_MAT ||
+                     wtag == TAG_SEQ) {
+                u64 val_loc = term_val(whnf);
+                u64 r0 = heap_alloc(ctx, 2);
+                u64 r1 = heap_alloc(ctx, 2);
+                for (u32 i = 0; i < 2; i++) {
+                    Term child = heap_read(ctx, val_loc + i);
+                    u64 cdup = heap_alloc(ctx, 1);
+                    heap_set(ctx, cdup, child);
+                    heap_set(ctx, r0 + i, term_new(TAG_DP0, dup_label, cdup));
+                    heap_set(ctx, r1 + i, term_new(TAG_DP1, dup_label, cdup));
+                }
+                v0 = term_new(wtag, term_ext(whnf), r0);
+                v1 = term_new(wtag, term_ext(whnf), r1);
+                fired = 1;
+            }
+            // DUP ⊳ TOP (effectful uops only — pure compute took the
+            // transparent projection above).  DETACH force, else DUP-NOD.
+            else if (wtag == TAG_TOP) {
+                u32 uop = term_ext(whnf);
+                if (uop == UOP_DETACH) {
+                    Term forced = thvm_eval(ctx, whnf);
+                    u8 ft = term_tag(forced);
+                    if (ft == TAG_TEN || ft == TAG_ERA || ft == TAG_NUM ||
+                        ft == TAG_ANY || ft == TAG_CTR) {
+                        if (ft == TAG_TEN) tensor_incref(ctx, (u32)term_val(forced));
+                        v0 = forced; v1 = forced; fired = 1;
+                    }
+                }
+                if (!fired) {
+                    u64 val_loc = term_val(whnf);
+                    u32 arity = thvm_uop_storage_arity(uop);
+                    u64 r0 = heap_alloc(ctx, arity);
+                    u64 r1 = heap_alloc(ctx, arity);
+                    for (u32 i = 0; i < arity; i++) {
+                        Term child = heap_read(ctx, val_loc + i);
+                        u8 ct = term_tag(child);
+                        if (ct == TAG_TEN || ct == TAG_NUM || ct == TAG_ERA ||
+                            ct == TAG_ANY || ct == TAG_CTR || ct == TAG_ALO) {
+                            heap_set(ctx, r0 + i, child);
+                            heap_set(ctx, r1 + i, child);
+                        } else {
+                            u64 cdup = heap_alloc(ctx, 1);
+                            heap_set(ctx, cdup, child);
+                            heap_set(ctx, r0 + i, term_new(TAG_DP0, dup_label, cdup));
+                            heap_set(ctx, r1 + i, term_new(TAG_DP1, dup_label, cdup));
+                        }
+                    }
+                    v0 = term_new(TAG_TOP, uop, r0);
+                    v1 = term_new(TAG_TOP, uop, r1);
+                    const ShapeTracker *ast = st_get_tracker(val_loc);
+                    if (ast) {
+                        st_set_tracker(r0, ast);
+                        st_set_tracker(r1, ast);
+                    }
+                    fired = 1;
+                }
+            }
+
+            if (fired) {
+                Term sibling = (side == 0) ? v1 : v0;
+                Term mine    = (side == 0) ? v0 : v1;
+                heap_set(ctx, dup_loc, term_set_sub(sibling));
                 ctx->itrs++;
-                // `whnf` is our copy — continue.
+                whnf = mine;
                 continue;
             }
 
-            // DUP ⊳ ERA: erasure annihilates the DUP; both auxes become ERA.
-            if (term_tag(whnf) == TAG_ERA) {
-                heap_set(ctx, dup_loc, term_set_sub(term_era()));
-                ctx->itrs++;
-                whnf = term_era();
-                continue;
-            }
-
-            // DUP ⊳ NUM: atomic number, similar to TEN but no refcount.
-            if (term_tag(whnf) == TAG_NUM) {
-                heap_set(ctx, dup_loc, term_set_sub(whnf));
-                ctx->itrs++;
-                continue;
-            }
-
-            // Other whnf tags (SUP, LAM, BRI, TOP, …): complex IC rules
-            // (annihilate, commute, etc.).  Reinstall whnf at body slot
-            // and fall back to legacy combinators for now.
+            // Truly stuck (unknown tag): rebuild DP with body at cell.
             heap_set(ctx, dup_loc, whnf);
-            (void)side;
-            whnf = thvm_reduce_fallback(ctx, dp_orig);
+            whnf = dp_orig;
             continue;
         }
 

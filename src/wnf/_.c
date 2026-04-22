@@ -932,11 +932,82 @@ apply: {
                     next = a;
                     goto enter;
                 }
-                // SHRINK / PAD rev: direct-emit at leaf-identity path.
-                // Too intricate for a simple post frame — fall back.
+                // SHRINK / PAD rev: direct-emit from shape metadata.
+                //   SHRINK bwd: PAD(ones(y_shape), complement_pairs)
+                //   PAD    bwd: SHRINK(ones(y_shape), unpad_pairs)
+                // If shape metadata is missing / rank 0, recurse on a and
+                // drop the view (matches legacy grad.c:344 / grad.c:370).
                 if (wuop == UOP_SHRINK || wuop == UOP_PAD) {
-                    whnf = wnf_grad_apply_top_fallback(ctx, tgt, whnf, is_fwd);
-                    continue;
+                    Term a = heap_read(ctx, wloc + 0);
+                    Term shape_t = heap_read(ctx, wloc + 1);
+                    Shape a_shape = SHAPE(1);
+                    if (term_tag(a) == TAG_TEN) {
+                        u32 aid = (u32)term_val(a);
+                        if (aid < ctx->tensor_count)
+                            a_shape = ctx->tensors[aid].view.shape;
+                    } else if (term_tag(a) == TAG_TOP) {
+                        const View *av = st_get(term_val(a));
+                        if (av) a_shape = av->shape;
+                    }
+                    if (term_tag(shape_t) == TAG_TEN && a_shape.rank > 0) {
+                        u32 sid = (u32)term_val(shape_t);
+                        u32 nd = a_shape.rank;
+                        u32 sf[MAX_DIM * 2];
+                        tensor_meta_read_u32(ctx, sid, sf, MAX_DIM * 2);
+                        if (wuop == UOP_SHRINK) {
+                            Shape ys = {.rank = nd};
+                            for (u32 j = 0; j < nd; j++)
+                                ys.dims[j] = sf[j*2+1] - sf[j*2];
+                            Shape one_shape = {.rank = ys.rank};
+                            for (u32 i = 0; i < ys.rank; i++) one_shape.dims[i] = 1;
+                            if (one_shape.rank == 0) {
+                                one_shape.rank = 1; one_shape.dims[0] = 1;
+                            }
+                            f32 v1 = 1.0f;
+                            Term scalar = thvm_tensor(ctx, &v1, one_shape);
+                            Term y_ones = (ys.rank == 0)
+                                ? scalar : thvm_expand(ctx, scalar, ys);
+                            u32 pp[MAX_DIM * 2];
+                            for (u32 j = 0; j < nd; j++) {
+                                pp[j*2]   = sf[j*2];
+                                pp[j*2+1] = a_shape.dims[j] - sf[j*2+1];
+                            }
+                            whnf = thvm_pad(ctx, y_ones, pp, nd);
+                            ctx->itrs++;
+                            continue;
+                        } else { // UOP_PAD
+                            Shape y_shape = SHAPE(1);
+                            const View *yv2 = st_get(wloc);
+                            if (yv2) y_shape = yv2->shape;
+                            if (y_shape.rank > 0) {
+                                Shape one_shape = {.rank = y_shape.rank};
+                                for (u32 i = 0; i < y_shape.rank; i++) one_shape.dims[i] = 1;
+                                if (one_shape.rank == 0) {
+                                    one_shape.rank = 1; one_shape.dims[0] = 1;
+                                }
+                                f32 v1 = 1.0f;
+                                Term scalar = thvm_tensor(ctx, &v1, one_shape);
+                                Term y_ones = thvm_expand(ctx, scalar, y_shape);
+                                u32 sp[MAX_DIM * 2];
+                                for (u32 j = 0; j < nd; j++) {
+                                    sp[j*2]   = sf[j*2];
+                                    sp[j*2+1] = sf[j*2] + a_shape.dims[j];
+                                }
+                                whnf = thvm_shrink(ctx, y_ones, sp, nd);
+                                ctx->itrs++;
+                                continue;
+                            }
+                        }
+                    }
+                    // Fallback: recurse on a with plain GRAD frame — the
+                    // view drops in bwd (matches legacy pass-through).
+                    WnfFrame inner = {
+                        .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                        .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(inner);
+                    next = a;
+                    goto enter;
                 }
 
                 // MM: fwd is Leibniz (push both operands); rev is direct

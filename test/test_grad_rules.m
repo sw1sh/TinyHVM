@@ -2574,24 +2574,14 @@ static int test_e2e_nested_grad(void) {
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[]={2.0f};
     Term x = thvm_tensor(ctx, xd, SHAPE(1));
-    Term x_outer_tgt, x_for_f;
-    thvm_dup(ctx, thvm_fresh_label(ctx), x, &x_outer_tgt, &x_for_f);
-    Term x_inner_tgt, x_for_body;
-    thvm_dup(ctx, thvm_fresh_label(ctx), x_for_f, &x_inner_tgt, &x_for_body);
-    Term xa, xb; thvm_dup(ctx, thvm_fresh_label(ctx), x_for_body, &xa, &xb);
-    Term xc, xd2; thvm_dup(ctx, thvm_fresh_label(ctx), xa, &xc, &xd2);
-    Term x2 = thvm_op(ctx, UOP_MUL, xc, xd2);
-    Term x3 = thvm_op(ctx, UOP_MUL, x2, xb);
-    Term g1 = thvm_grad(ctx, x3, x_inner_tgt);
-    Term g2 = thvm_grad(ctx, g1, x_outer_tgt);
-    Term ev = thvm_eval(ctx, g2);
-    f32 *h = thvm_to_host(ctx, ev);
-    // Pipeline test: require non-NULL readback. Numeric exactness of
-    // second-derivative under the current VJP-with-ones-seed contract is
-    // not guaranteed; correctness of first-level already covered by
-    // test_e2e_d2_square_first.
-    int ok = (h != NULL);
-    if (!ok) fprintf(stderr, "  nested_grad readback NULL\n");
+    // f = x³, d²f/dx² = 6x.  At x=2: 12.
+    Term x2 = thvm_op(ctx, UOP_MUL, x, x);
+    Term x3 = thvm_op(ctx, UOP_MUL, x2, x);
+    Term g1 = thvm_grad(ctx, x3, x);
+    Term g2 = thvm_grad(ctx, g1, x);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, g2));
+    int ok = (h != NULL) && (h[0] > 11.9f && h[0] < 12.1f);
+    if (!ok) fprintf(stderr, "  nested_grad h=%g (want 12)\n", h ? h[0] : -1.0f);
     thvm_free(ctx);
     return report("e2e_nested_grad_pipeline", ok);
 }
@@ -2703,14 +2693,11 @@ static int test_e2e_cross_partial(void) {
     f32 xd[]={3.0f}, yd[]={4.0f};
     Term x = thvm_tensor(ctx, xd, SHAPE(1));
     Term y = thvm_tensor(ctx, yd, SHAPE(1));
-    Term xa, xb; thvm_dup(ctx, thvm_fresh_label(ctx), x, &xa, &xb);
-    Term ya, yb; thvm_dup(ctx, thvm_fresh_label(ctx), y, &ya, &yb);
-    Term f = thvm_op(ctx, UOP_MUL, xa, ya);
-    Term df_dx = thvm_grad(ctx, f, xb);  // should be y numerically
+    Term f = thvm_op(ctx, UOP_MUL, x, y);
+    Term df_dx = thvm_grad(ctx, f, x);  // = y = 4
     f32 *h = thvm_to_host(ctx, thvm_eval(ctx, df_dx));
     int ok = (h != NULL) && (h[0] > 3.9f && h[0] < 4.1f);
     if (!ok) fprintf(stderr, "  cross_partial df/dx=%g (want 4)\n", h ? h[0] : 0);
-    (void)yb;
     thvm_free(ctx);
     return report("e2e_cross_partial", ok);
 }

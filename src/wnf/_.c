@@ -174,6 +174,30 @@ static inline int wnf_is_atom(u8 tag) {
 Term thvm_reduce(TinyHVM *ctx, Term term) {
     if (wnf_is_atom(term_tag(term))) return term;
 
+    // Outermost-GRAD book-keeping: if the top-level term is a GRAD with a
+    // TEN target, remember target.shape so we can materialize ERA to
+    // zeros(target.shape) at return.  Inner GRADs flowing through
+    // recursion continue to emit ERA (which participates in peephole
+    // collapses above them); only the *outermost* result materializes.
+    Shape outermost_tgt_shape = {.rank = 0};
+    int outermost_is_grad = 0;
+    if (g_wnf_stack_pos == 0 && term_tag(term) == TAG_TOP) {
+        u32 uop = term_ext(term);
+        if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
+            u64 loc = term_val(term);
+            if (loc != 0 && loc + 1 < ctx->heap_pos) {
+                Term tgt = heap_read(ctx, loc + 1);
+                if (term_tag(tgt) == TAG_TEN) {
+                    u32 ttid = (u32)term_val(tgt);
+                    if (ttid < ctx->tensor_count) {
+                        outermost_tgt_shape = ctx->tensors[ttid].view.shape;
+                        outermost_is_grad = 1;
+                    }
+                }
+            }
+        }
+    }
+
     u32 base = g_wnf_stack_pos;
     Term next = term;
     Term whnf;
@@ -960,6 +984,21 @@ apply: {
         }
     }
 apply_done:
+    // Outermost boundary: if the GRAD reduced to ERA, synthesize a
+    // zeros tensor of target.shape so callers get a materializable
+    // value.  Inner ERAs during recursion participate in peepholes;
+    // only the outer boundary materializes.
+    if (outermost_is_grad && term_tag(whnf) == TAG_ERA) {
+        Shape osh = outermost_tgt_shape;
+        Shape one_shape = {.rank = osh.rank};
+        for (u32 i = 0; i < osh.rank; i++) one_shape.dims[i] = 1;
+        if (one_shape.rank == 0) { one_shape.rank = 1; one_shape.dims[0] = 1; }
+        f32 z = 0.0f;
+        Term scalar = thvm_tensor(ctx, &z, one_shape);
+        int is_sc = (osh.rank == 0) ||
+                    (osh.rank == 1 && osh.dims[0] == 1);
+        whnf = is_sc ? scalar : thvm_expand(ctx, scalar, osh);
+    }
     return whnf;
 }
 }

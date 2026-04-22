@@ -1603,12 +1603,16 @@ apply: {
             }
 
             // Helper macro: push inner VJP frame on operand `op` with
-            // cotangent `gv`, then enter it.
+            // cotangent `gv`, then enter it.  Each VJP rule dispatch
+            // counts as ONE step — the rule's continuation frames
+            // (VJP_BIN1, VJP_BIN2) only fire when they produce their
+            // own output.
             #define VJP_RECURSE_INTO(op, gv) do { \
                 WnfFrame _inner = { .kind = WNF_F_VJP, .flags = 0, \
                     .t0 = tgt, .t1 = (gv), .t2 = 0, .t3 = 0 }; \
                 wnf_stack_push(_inner); \
                 next = (op); \
+                WNF_FIRED(); \
                 goto enter; \
             } while (0)
 
@@ -1623,6 +1627,7 @@ apply: {
                     .t0 = tgt, .t1 = (ga), .t2 = 0, .t3 = 0 }; \
                 wnf_stack_push(_inner); \
                 next = (av); \
+                WNF_FIRED(); \
                 goto enter; \
             } while (0)
 

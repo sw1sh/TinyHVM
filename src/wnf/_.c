@@ -1033,6 +1033,28 @@ apply: {
                 goto enter;
             }
 
+            // APP ⊳ NUM: numeric sequencing terminal (grad bundles etc.).
+            if (term_tag(whnf) == TAG_NUM) {
+                ctx->itrs++;
+                next = arg;
+                goto enter;
+            }
+
+            // APP ⊳ BRI: (θx.body arg) → body[x ← arg].  Beta on bridge
+            // binder; same shape as LAM but no APP-slot clearing (matches
+            // legacy combinator behaviour).
+            if (term_tag(whnf) == TAG_BRI) {
+                u64 bri_loc = term_val(whnf);
+                if (term_tag(arg) == TAG_TOP && term_ext(arg) == UOP_DETACH) {
+                    Term forced = thvm_force_tensor_term(ctx, arg);
+                    if (term_tag(forced) == TAG_TEN) arg = forced;
+                }
+                heap_set(ctx, bri_loc + 0, arg);
+                ctx->itrs++;
+                next = heap_read(ctx, bri_loc + 1);
+                goto enter;
+            }
+
             // APP ⊳ ERA: erasure propagates.  Discard arg via explicit ERA.
             if (term_tag(whnf) == TAG_ERA) {
                 thvm_spawn_detached_era(ctx, arg);

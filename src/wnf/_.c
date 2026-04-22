@@ -62,6 +62,8 @@ enum {
     // MM forward-mode (JVP): Leibniz JVP(a)@b + a@JVP(b).
     WNF_F_GRAD_MM_FWD_PHASE1, // t0=a, t1=b, t2=tgt — need da
     WNF_F_GRAD_MM_FWD_PHASE2, // t0=l=MM(da,b), t1=a — need db
+    // RMAX post: dA = da * mask where mask = 1 - (expand(rmax(a)) > a).
+    WNF_F_GRAD_RMAX_POST, // t0 = pre-built mask term
     // APP frame — pushed in enter, popped in apply.
     // t0 = original APP term (for rebuild on unhandled whnf).
     // t1 = arg (APP.slot 1).
@@ -1136,6 +1138,44 @@ apply: {
                     goto enter;
                 }
 
+                // RMAX: dA = da * mask, mask = (a >= expand(rmax(a))).
+                // Build the mask eagerly at enter-time using 3 copies of a
+                // (via two DUPs), then recurse on the first copy for da.
+                if (wuop == UOP_RMAX) {
+                    Term a = heap_read(ctx, wloc + 0);
+                    Term axes = heap_read(ctx, wloc + 1);
+                    Shape a_shape = SHAPE(1);
+                    if (term_tag(a) == TAG_TEN) {
+                        u32 aid = (u32)term_val(a);
+                        if (aid < ctx->tensor_count)
+                            a_shape = ctx->tensors[aid].view.shape;
+                    } else if (term_tag(a) == TAG_TOP) {
+                        const View *av = st_get(term_val(a));
+                        if (av) a_shape = av->shape;
+                    }
+                    Term a0, a1, a1b, a2;
+                    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                    thvm_dup(ctx, thvm_fresh_label(ctx), a1, &a1b, &a2);
+                    Term rm = thvm_op_raw(ctx, UOP_RMAX, a1b, axes);
+                    Term rm_bc = (a_shape.rank != 0)
+                        ? thvm_expand(ctx, rm, a_shape) : rm;
+                    Term gt = thvm_op_raw(ctx, UOP_CMP, rm_bc, a2);
+                    Term one = term_num_f32(1.0f);
+                    Term mask = thvm_op_raw(ctx, UOP_SUB, one, gt);
+                    WnfFrame post = {
+                        .kind = WNF_F_GRAD_RMAX_POST, .flags = (u8)is_fwd,
+                        .t0 = mask, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(post);
+                    WnfFrame inner = {
+                        .kind = WNF_F_GRAD, .flags = (u8)is_fwd,
+                        .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                    };
+                    wnf_stack_push(inner);
+                    next = a0;
+                    goto enter;
+                }
+
                 // ASSIGN: gradient flows through dst only.  Re-enter with
                 // a fresh GRAD frame on dst.
                 if (wuop == UOP_ASSIGN) {
@@ -1445,6 +1485,15 @@ apply: {
             if (wnf_is_era(da)) da = thvm_expand(ctx, term_num_f32(0.0f), SHAPE(1));
             if (wnf_is_era(db)) db = thvm_expand(ctx, term_num_f32(0.0f), SHAPE(1));
             whnf = thvm_where(ctx, cond, da, db);
+            ctx->itrs++;
+            continue;
+        }
+
+        case WNF_F_GRAD_RMAX_POST: {
+            // whnf = da; frame t0 = pre-built mask.
+            Term mask = f.t0;
+            if (wnf_is_era(whnf)) { ctx->itrs++; continue; }
+            whnf = thvm_op_raw(ctx, UOP_MUL, whnf, mask);
             ctx->itrs++;
             continue;
         }

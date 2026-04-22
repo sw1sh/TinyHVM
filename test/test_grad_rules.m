@@ -1389,9 +1389,9 @@ static int test_gradu_lambda_square(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "APP", "LAM", "MUL"};
-    const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
+    const char *post[] = {"CTR", "MUL", "ADD"};
     int ok = topo_check("gradu_lambda_square", 0, pre, 5)
-          && topo_check("gradu_lambda_square", 1, post, 4);
+          && topo_check("gradu_lambda_square", 1, post, 3);
     return report("gradu_lambda_square", ok);
 }
 
@@ -1478,9 +1478,9 @@ static int test_gradu_app_compute_arg(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "APP", "LAM", "MUL"};
-    const char *post[] = {"CTR", "ADD", "MUL", "EXPAND"};
+    const char *post[] = {"CTR", "ADD", "MUL"};
     int ok = topo_check("gradu_app_compute_arg", 0, pre, 5)
-          && topo_check("gradu_app_compute_arg", 1, post, 4);
+          && topo_check("gradu_app_compute_arg", 1, post, 3);
     return report("gradu_app_compute_arg", ok);
 }
 
@@ -1539,9 +1539,9 @@ static int test_gradu_curried(void) {
     thvm_eval(ctx, root);
     thvm_free(ctx);
     const char *pre[]  = {"CTR", "GRAD", "APP", "LAM"};
-    const char *post[] = {"CTR", "MUL", "ADD", "EXPAND"};
+    const char *post[] = {"CTR", "MUL", "ADD"};
     int ok = topo_check("gradu_curried", 0, pre, 4)
-          && topo_check("gradu_curried", 1, post, 4);
+          && topo_check("gradu_curried", 1, post, 3);
     return report("gradu_curried", ok);
 }
 

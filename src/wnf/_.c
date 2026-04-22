@@ -155,9 +155,18 @@ static const char *g_wnf_last_rule     = "";
 static u64         g_wnf_last_cursor   = 0;
 static Term        g_wnf_last_tgt      = 0;
 
-const char *thvm_wnf_last_rule(void)   { return g_wnf_last_rule; }
-u64         thvm_wnf_last_cursor(void) { return g_wnf_last_cursor; }
-Term        thvm_wnf_last_tgt(void)    { return g_wnf_last_tgt; }
+// Slot of the outer GRAD/GRAD_FWD heap cell that initiated the current
+// VJP/JVP descent.  Set when the GRAD rule fires, cleared when the
+// resulting root cotangent is produced.  The step-graph hook uses this
+// to visually "slide" the GRAD node down to the active differentiation
+// point by temporarily pointing heap[grad_slot+0] at the current
+// descent operand before dumping, restoring it afterward.
+static u64 g_wnf_current_grad_slot = 0;
+
+const char *thvm_wnf_last_rule(void)          { return g_wnf_last_rule; }
+u64         thvm_wnf_last_cursor(void)        { return g_wnf_last_cursor; }
+Term        thvm_wnf_last_tgt(void)           { return g_wnf_last_tgt; }
+u64         thvm_wnf_current_grad_slot(void)  { return g_wnf_current_grad_slot; }
 
 void thvm_wnf_set_step_hook(WnfStepHook hook) { g_wnf_step_hook = hook; }
 void thvm_wnf_clear_step_hook(void)          { g_wnf_step_hook = NULL; }
@@ -547,6 +556,10 @@ Term thvm_reduce_budget(TinyHVM *ctx, Term term, u32 budget) {
     g_wnf_budget           = budget;
     g_wnf_budget_fired     = 0;
     g_wnf_budget_hit       = 0;
+    // Reset the step-graph GRAD-slot tracker; it's set by the GRAD rule
+    // as it fires inside this reduction.
+    u64 saved_grad_slot    = g_wnf_current_grad_slot;
+    g_wnf_current_grad_slot = 0;
 
     // Outermost-GRAD book-keeping: if the top-level term is a GRAD with a
     // TEN target, remember target.shape so we can materialize ERA to
@@ -791,6 +804,12 @@ enter: {
                 };
                 wnf_stack_push(f);
             }
+            // Record the GRAD's heap slot for step-graph viz (hook uses
+            // it to slide the GRAD node visually to the active node).
+            // Always overwrite: the outermost GRAD rule to fire wins
+            // for this reduction.  Reset happens at next thvm_reduce
+            // entry (see thvm_reduce_budget).
+            g_wnf_current_grad_slot = loc;
             next = y;
             goto enter;
         }
@@ -3190,6 +3209,7 @@ apply_done:
     g_wnf_budget       = saved_budget;
     g_wnf_budget_fired = saved_budget_fired;
     g_wnf_budget_hit   = saved_budget_hit;
+    g_wnf_current_grad_slot = saved_grad_slot;
     return whnf;
 }
 }

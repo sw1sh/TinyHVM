@@ -1212,9 +1212,35 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
     } else {
         thvm_heap_dot_set_step_meta("", "");
     }
+    // Slide the GRAD node visually: temporarily point heap[grad_slot+0]
+    // at the current VJP descent operand TOP, then restore after
+    // dumping.  The GRAD cell has been consumed into a frame at this
+    // point — its slot content is only used for display.  The cursor
+    // Term is reconstructed from the rule name (→ uop) and cursor_loc
+    // so the dumper draws it as a TOP feeding the GRAD.
+    u64 grad_slot = thvm_wnf_current_grad_slot();
+    Term saved_grad_y = 0;
+    int sliding = 0;
+    if (grad_slot != 0 && cursor_loc != 0 && rule_name && rule_name[0] &&
+        grad_slot + 1 < ctx->heap_pos && cursor_loc < ctx->heap_pos) {
+        u32 cursor_uop = UOP_COUNT;
+        for (u32 u = 0; u < UOP_COUNT; u++)
+            if (strcmp(rule_name, uop_names[u]) == 0) { cursor_uop = u; break; }
+        if (cursor_uop < UOP_COUNT) {
+            Term cursor_top = term_new(TAG_TOP, cursor_uop, cursor_loc);
+            saved_grad_y = heap_read(ctx, grad_slot + 0);
+            if (cursor_top != saved_grad_y) {
+                heap_set(ctx, grad_slot + 0, cursor_top);
+                sliding = 1;
+            }
+        }
+    }
     thvm_heap_dot_set_include_all(1);
     thvm_heap_dot_root(ctx, path, g_step_session_root);
     thvm_heap_dot_set_include_all(0);
+    if (sliding) {
+        heap_set(ctx, grad_slot + 0, saved_grad_y);
+    }
     // Dedup on rendered content — collapses enter-phase administrative
     // firings (VAR resolve, INC unwrap, ...) that don't change what the
     // step graph actually shows.

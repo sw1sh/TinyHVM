@@ -449,10 +449,19 @@ enter: {
         // Non-GRAD TOPs (ADD/MUL/KERNEL/ASSIGN/etc.): compute TOPs are
         // treated as WHNF from IC's perspective; dispatch logic lives
         // in enclosing GRAD frames (if any) via apply-phase dispatch.
-        // For root-level non-GRAD, fall back to thvm_reduce_fallback.
+        // At root level, direct uops (ASSIGN/IFZ/LOG_PRINT/TODEVICE/
+        // CAST/DETACH/WHERE/EXEC/KERNEL/FUSE) and certain peephole
+        // triggers (ERA-arg, ADD-zero) need the scheduler/tensor
+        // materialization path in the legacy trampoline.  Pure compute
+        // TOPs (ADD/MUL/SUM/MM/etc.) are already WNF under IC; return
+        // them as-is without touching the fallback.
         if (g_wnf_stack_pos == base) {
-            whnf = thvm_reduce_fallback(ctx, next);
-            goto apply;
+            if (reduce_top_direct_uop_ctx(ctx, ext) ||
+                reduce_top_has_era_arg(ctx, next) ||
+                reduce_top_has_add_zero_arg(ctx, next)) {
+                whnf = thvm_reduce_fallback(ctx, next);
+                goto apply;
+            }
         }
         whnf = next;
         goto apply;

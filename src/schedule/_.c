@@ -8,13 +8,9 @@ static void thvm_heap_dot_set_include_all(int enabled);
 static u64  thvm_file_sig(const char *path);
 static const char *thvm_step_graph_dir(void);
 static u32 thvm_step_graph_max_steps(void);
-static void thvm_step_graph_eval_begin(TinyHVM *ctx, Term root);
+// Still used by legacy thvm_reduce_step_collect (scheduler dispatch loop):
 static void thvm_step_graph_name_for_interaction(TinyHVM *ctx, u64 source_slot, Term before,
                                                  char *buf, size_t nbuf);
-static void thvm_step_graph_after_interaction(TinyHVM *ctx, u64 source_slot, Term before,
-                                              const char *current_name, Term root);
-static void thvm_step_graph_finalize(TinyHVM *ctx);
-static void thvm_step_graph_set_root(Term root);
 static void thvm_step_graph_set_before_grad_y(Term y);
 static void thvm_step_graph_set_before_era_payload(Term payload);
 static void thvm_step_graph_set_before_top_era(int had_era);

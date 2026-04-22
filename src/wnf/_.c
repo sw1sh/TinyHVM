@@ -83,6 +83,9 @@ enum {
     // WHNF, compute op.
     // t0 = original OP2, t1 = x (NUM), t2 = OP2 loc, flags = opr.
     WNF_F_OP2_Y,
+    // APP ⊳ MAT second phase: whnf of APP.fun was MAT; now drive arg to WHNF.
+    // t0 = original APP term, t1 = MAT term (fun), t2 = APP heap loc.
+    WNF_F_APP_MAT,
 };
 
 typedef struct {
@@ -1569,11 +1572,124 @@ apply: {
                 goto enter;
             }
 
-            // Unhandled whnf tag (SUP, BRI, REF, NUM, MAT, …): rebuild
-            // original APP with updated fun and fall back to the legacy
-            // reducer for that case.
+            // APP ⊳ USP: same as SUP but preserves unordered tag.  UDP
+            // consumers share the single dup slot.
+            if (term_tag(whnf) == TAG_USP) {
+                u32 lab = term_ext(whnf);
+                u64 usp_loc = term_val(whnf);
+                Term f0 = heap_read(ctx, usp_loc + 0);
+                Term f1 = heap_read(ctx, usp_loc + 1);
+                u64 dup_loc = heap_alloc(ctx, 1);
+                heap_set(ctx, dup_loc, arg);
+                ctx->itrs++;
+                next = thvm_usp(ctx, lab,
+                    thvm_app(ctx, f0, term_new(TAG_UDP, lab, dup_loc)),
+                    thvm_app(ctx, f1, term_new(TAG_UDP, lab, dup_loc)));
+                heap_set(ctx, app_loc + 0, term_era());
+                heap_set(ctx, app_loc + 1, term_era());
+                goto enter;
+            }
+
+            // APP ⊳ MAT: pattern-match combinator.  Need arg in WHNF
+            // before we can dispatch on its shape (SUP/USP/CTR/NUM/ERA).
+            // Push a second-phase frame and descend into arg.
+            if (term_tag(whnf) == TAG_MAT) {
+                WnfFrame mf = {
+                    .kind = WNF_F_APP_MAT, .flags = 0,
+                    .t0 = app_orig, .t1 = whnf, .t2 = (Term)app_loc, .t3 = 0
+                };
+                wnf_stack_push(mf);
+                next = arg;
+                goto enter;
+            }
+
+            // Unhandled whnf tag (REF, NUM, …): rebuild original APP with
+            // updated fun and return as-is (stuck).
             heap_set(ctx, app_loc + 0, whnf);
-            whnf = thvm_reduce_fallback(ctx, app_orig);
+            whnf = app_orig;
+            continue;
+        }
+
+        case WNF_F_APP_MAT: {
+            // frame: app_orig (t0), fun=MAT (t1), app_loc (t2).
+            // whnf is arg reduced to WHNF — dispatch on its shape.
+            Term app_orig = f.t0;
+            Term fun      = f.t1;
+            u64 app_loc   = (u64)f.t2;
+            u64 mat_loc   = term_val(fun);
+            u32 match_tag = term_ext(fun);
+            u8  atag      = term_tag(whnf);
+
+            // APP-MAT-SUP: distribute match through superposition.
+            if (atag == TAG_SUP) {
+                u32 lab = term_ext(whnf);
+                u64 sloc = term_val(whnf);
+                Term a = heap_read(ctx, sloc + 0);
+                Term b = heap_read(ctx, sloc + 1);
+                u64 dup = heap_alloc(ctx, 1);
+                heap_set(ctx, dup, fun);
+                ctx->itrs++;
+                next = thvm_sup(ctx, lab,
+                    thvm_app(ctx, term_new(TAG_DP0, lab, dup), a),
+                    thvm_app(ctx, term_new(TAG_DP1, lab, dup), b));
+                goto enter;
+            }
+
+            // APP-MAT-USP: same as APP-MAT-SUP for unordered SUP.
+            if (atag == TAG_USP) {
+                u32 lab = term_ext(whnf);
+                u64 sloc = term_val(whnf);
+                Term a = heap_read(ctx, sloc + 0);
+                Term b = heap_read(ctx, sloc + 1);
+                u64 dup = heap_alloc(ctx, 1);
+                heap_set(ctx, dup, fun);
+                ctx->itrs++;
+                next = thvm_usp(ctx, lab,
+                    thvm_app(ctx, term_new(TAG_UDP, lab, dup), a),
+                    thvm_app(ctx, term_new(TAG_UDP, lab, dup), b));
+                goto enter;
+            }
+
+            // APP-MAT-CTR: constructor match.  Bind handler or fallback
+            // depending on whether tags match.
+            if (atag == TAG_CTR) {
+                u32 ctr_tag = term_ext(whnf);
+                ctx->itrs++;
+                if (match_tag == ctr_tag) {
+                    u64 ctr_loc = term_val(whnf);
+                    Term r = heap_read(ctx, mat_loc + 0);
+                    for (u32 i = 0; i < ctr_tag; i++) {
+                        r = thvm_app(ctx, r, heap_read(ctx, ctr_loc + i));
+                    }
+                    next = r;
+                } else {
+                    next = thvm_app(ctx, heap_read(ctx, mat_loc + 1), whnf);
+                }
+                goto enter;
+            }
+
+            // APP-MAT-NUM: numeric match.
+            if (atag == TAG_NUM) {
+                u32 num_val = term_as_u32(whnf);
+                ctx->itrs++;
+                if (match_tag == num_val) {
+                    next = heap_read(ctx, mat_loc + 0);  // handler
+                } else {
+                    next = thvm_app(ctx, heap_read(ctx, mat_loc + 1), whnf);
+                }
+                goto enter;
+            }
+
+            // APP-MAT-ERA: erased arg → ERA.
+            if (atag == TAG_ERA) {
+                whnf = term_era();
+                continue;
+            }
+
+            // Stuck: arg not in matchable form — rebuild APP(MAT, arg).
+            heap_set(ctx, app_loc + 0, fun);
+            heap_set(ctx, app_loc + 1, whnf);
+            whnf = app_orig;
             continue;
         }
 

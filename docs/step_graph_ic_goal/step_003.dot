@@ -1,0 +1,43 @@
+// GRAD ⊳ TEN fires on the left arm (t1 matches tgt).  GRAD_a
+// annihilates; its gy (MUL_cot_a) takes GRAD_a's place in ADD.
+// Redex: t1 → GRAD_b (right arm still pending).
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1     [label="t1\n[3] f32", fillcolor="#ffe0e0"];
+  ones   [label="ones\n[1] f32", fillcolor="#e0e0e0"];
+  shape3 [label="[3]\nshape", fillcolor="#e0e0e0"];
+
+  EXPAND [label="EXPAND\n[3]", fillcolor="#fff3cd"];
+  DUP    [label="", shape=circle, width=0.16, fixedsize=true,
+          fillcolor="#d4b8e8", color="#8a63b7"];
+
+  MUL_a  [label="MUL_cot_a\n[3]", fillcolor="#cce5ff"];
+  MUL_b  [label="MUL_cot_b\n[3]", fillcolor="#cce5ff"];
+
+  GRAD_b [label="GRAD_b\nd/d(t1)", fillcolor="#e8d0ff"];
+
+  ADD    [label="ADD\n[3]", fillcolor="#cce5ff"];
+
+  ones   -> EXPAND [label="in"];
+  shape3 -> EXPAND [label="shape"];
+  EXPAND -> DUP    [label=""];
+  DUP    -> MUL_a  [label="dp0"];
+  DUP    -> MUL_b  [label="dp1"];
+  t1     -> MUL_a  [label="b"];
+  t1     -> MUL_b  [label="b"];
+
+  // GRAD_a annihilated — its place in ADD now held by MUL_cot_a directly.
+  MUL_a  -> ADD    [label="a"];
+
+  t1     -> GRAD_b [label="y", color="#cc0000", penwidth=2];
+  MUL_b  -> GRAD_b [label="gy"];
+  t1     -> GRAD_b [label="tgt"];
+
+  GRAD_b -> ADD    [label="b"];
+
+  out [label="", shape=circle, width=0.12, fixedsize=true, fillcolor="#ffffff"];
+  ADD -> out [label="out"];
+}

@@ -1,0 +1,20 @@
+// FUSE phase compiles the ADD/MUL/EXPAND subtree into a single kernel.
+// ones + t1 become kernel inputs; the kernel body is ADD(MUL(EXPAND,t1),
+// MUL(EXPAND,t1)).  Running it produces [2, 4, 6] — the gradient of
+// sum(t1*t1) w.r.t. t1 at t1=[1,2,3].
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1     [label="t1\n[3] f32", fillcolor="#ffe0e0"];
+  ones   [label="ones\n[1] f32", fillcolor="#e0e0e0"];
+  KERNEL [label="KERNEL\nADD(MUL(EXPAND,t1),\n    MUL(EXPAND,t1))\n[3]",
+          fillcolor="#ccffcc"];
+
+  t1   -> KERNEL [label="t1",   style=dashed, color="#009900"];
+  ones -> KERNEL [label="ones", style=dashed, color="#009900"];
+
+  out [label="", shape=circle, width=0.12, fixedsize=true, fillcolor="#ffffff"];
+  KERNEL -> out [label="out = [2,4,6]"];
+}

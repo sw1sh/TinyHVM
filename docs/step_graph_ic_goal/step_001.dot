@@ -1,0 +1,27 @@
+// GRAD ⊳ SUM fires: SUM is consumed, GRAD slides to MUL, old gy wrapped
+// in EXPAND to match MUL's shape [3].
+// Redex: MUL → GRAD (y-port of new GRAD).
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1     [label="t1\n[3] f32", fillcolor="#ffe0e0"];
+  ones   [label="ones\n[1] f32", fillcolor="#e0e0e0"];
+  shape3 [label="[3]\nshape", fillcolor="#e0e0e0"];
+
+  MUL    [label="MUL\n[3]\n@1", fillcolor="#cce5ff"];
+  EXPAND [label="EXPAND\n[3]\n@8", fillcolor="#fff3cd"];
+  GRAD   [label="GRAD\nd/d(t1)\n@9", fillcolor="#e8d0ff"];
+
+  t1     -> MUL    [label="a"];
+  t1     -> MUL    [label="b"];
+  ones   -> EXPAND [label="in"];
+  shape3 -> EXPAND [label="shape"];
+  MUL    -> GRAD   [label="y", color="#cc0000", penwidth=2];
+  EXPAND -> GRAD   [label="gy"];
+  t1     -> GRAD   [label="tgt"];
+
+  out [label="", shape=circle, width=0.12, fixedsize=true, fillcolor="#ffffff"];
+  GRAD -> out [label="out"];
+}

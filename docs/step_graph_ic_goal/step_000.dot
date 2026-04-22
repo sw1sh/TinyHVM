@@ -1,0 +1,26 @@
+// Initial state: forward built + outermost GRAD seeded with ones(y.shape).
+// Redex: SUM → GRAD (y-port of GRAD).
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1   [label="t1\n[3] f32", fillcolor="#ffe0e0"];
+  axes [label="axes\n[1] i32", fillcolor="#e0e0e0"];
+  ones [label="ones\n[1] f32", fillcolor="#e0e0e0"];
+
+  MUL  [label="MUL\n[3]\n@1", fillcolor="#cce5ff"];
+  SUM  [label="SUM\n[1]\n@3", fillcolor="#ffcccc"];
+  GRAD [label="GRAD\nd/d(t1)\n@5", fillcolor="#e8d0ff"];
+
+  t1   -> MUL  [label="a"];
+  t1   -> MUL  [label="b"];
+  MUL  -> SUM  [label="in"];
+  axes -> SUM  [label="axes"];
+  SUM  -> GRAD [label="y", color="#cc0000", penwidth=2];
+  ones -> GRAD [label="gy"];
+  t1   -> GRAD [label="tgt"];
+
+  out  [label="", shape=circle, width=0.12, fixedsize=true, fillcolor="#ffffff"];
+  GRAD -> out [label="out"];
+}

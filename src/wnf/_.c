@@ -662,8 +662,10 @@ enter: {
         goto enter;
     }
 
-    // Other tags: fall back.
-    whnf = thvm_reduce_fallback(ctx, next);
+    // Unknown tag: all 27 TAG_* values are dispatched explicitly above,
+    // so this is unreachable in practice.  Leave the term as-is if a
+    // new tag is introduced later — an explicit rule is required.
+    whnf = next;
     goto apply;
 }
 

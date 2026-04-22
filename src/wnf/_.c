@@ -344,6 +344,29 @@ static inline int wnf_is_atom(u8 tag) {
            tag == TAG_LAM || tag == TAG_SUP || tag == TAG_ANY;
 }
 
+// Share-or-DUP: VJP rules need the same operand twice — once as a
+// recursion target, once embedded in the returned cotangent expression.
+// For shareable-by-reference terms (TEN, NUM, ERA, ANY) we skip DUP and
+// alias directly: avoids phantom DP0/DP1 ports that clutter the step
+// graph without doing work.  TEN refcount is incremented so the second
+// alias is a full reference holder.  For non-atoms (DP0/DP1, TOP, VAR,
+// CTR) we fall back to thvm_dup which goes through the IC protocol.
+static inline void wnf_share_or_dup(TinyHVM *ctx, Term t, Term *a, Term *b) {
+    u8 tag = term_tag(t);
+    if (tag == TAG_TEN) {
+        tensor_incref(ctx, (u32)term_val(t));
+        *a = t;
+        *b = t;
+        return;
+    }
+    if (tag == TAG_NUM || tag == TAG_ERA || tag == TAG_ANY) {
+        *a = t;
+        *b = t;
+        return;
+    }
+    thvm_dup(ctx, thvm_fresh_label(ctx), t, a, b);
+}
+
 // Stack-drain helper: walk remaining wnf frames and reconstruct a parent
 // Term for each, installing whnf at the appropriate slot.  Used when a
 // budget-bound reduce exhausts its budget mid-rule; the drain produces a
@@ -1487,8 +1510,8 @@ apply: {
                         if (av) a_shape = av->shape;
                     }
                     Term a0, a1, a1b, a2;
-                    thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-                    thvm_dup(ctx, thvm_fresh_label(ctx), a1, &a1b, &a2);
+                    wnf_share_or_dup(ctx, a, &a0, &a1);
+                    wnf_share_or_dup(ctx, a1, &a1b, &a2);
                     Term rm = thvm_op_raw(ctx, UOP_RMAX, a1b, axes);
                     Term rm_bc = (a_shape.rank != 0)
                         ? thvm_expand(ctx, rm, a_shape) : rm;
@@ -1608,7 +1631,7 @@ apply: {
                 Term a = heap_read(ctx, wloc + 0);
                 Term b = heap_read(ctx, wloc + 1);
                 Term g0, g1;
-                thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
+                wnf_share_or_dup(ctx, g, &g0, &g1);
                 VJP_BINARY(a, b, g0, g1);
             }
             // SUB: grad_a = g, grad_b = -g.
@@ -1616,7 +1639,7 @@ apply: {
                 Term a = heap_read(ctx, wloc + 0);
                 Term b = heap_read(ctx, wloc + 1);
                 Term g0, g1;
-                thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
+                wnf_share_or_dup(ctx, g, &g0, &g1);
                 Term g1_neg = thvm_op_raw(ctx, UOP_NEG, g1, term_era());
                 VJP_BINARY(a, b, g0, g1_neg);
             }
@@ -1630,22 +1653,21 @@ apply: {
             if (wuop == UOP_MUL) {
                 Term a = heap_read(ctx, wloc + 0);
                 Term b = heap_read(ctx, wloc + 1);
-                Term g0, g1; thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
-                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-                Term b0, b1; thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
+                Term g0, g1; wnf_share_or_dup(ctx, g, &g0, &g1);
+                Term a0, a1; wnf_share_or_dup(ctx, a, &a0, &a1);
+                Term b0, b1; wnf_share_or_dup(ctx, b, &b0, &b1);
                 Term g_a = thvm_op_raw(ctx, UOP_MUL, g0, b0);
                 Term g_b = thvm_op_raw(ctx, UOP_MUL, g1, a1);
                 VJP_BINARY(a0, b1, g_a, g_b);
-                (void)a0; (void)b1; // silence unused if macros short-circuit
             }
             // DIV: grad_a = g / b, grad_b = -g * a / (b*b).
             if (wuop == UOP_DIV) {
                 Term a = heap_read(ctx, wloc + 0);
                 Term b = heap_read(ctx, wloc + 1);
-                Term g0, g1; thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
-                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-                Term b0, b1; thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
-                Term b1a, b1b; thvm_dup(ctx, thvm_fresh_label(ctx), b1, &b1a, &b1b);
+                Term g0, g1; wnf_share_or_dup(ctx, g, &g0, &g1);
+                Term a0, a1; wnf_share_or_dup(ctx, a, &a0, &a1);
+                Term b0, b1; wnf_share_or_dup(ctx, b, &b0, &b1);
+                Term b1a, b1b; wnf_share_or_dup(ctx, b1, &b1a, &b1b);
                 Term g_a = thvm_op_raw(ctx, UOP_DIV, g0, b0);
                 // grad_b = -g * a / (b*b)
                 Term bb = thvm_op_raw(ctx, UOP_MUL, b1a, b1b);
@@ -1657,17 +1679,13 @@ apply: {
             // EXP: grad_a = g * y (where y = exp(a), = whnf).
             if (wuop == UOP_EXP) {
                 Term a = heap_read(ctx, wloc + 0);
-                Term y0, y1; thvm_dup(ctx, thvm_fresh_label(ctx), whnf, &y0, &y1);
-                Term g_a = thvm_op_raw(ctx, UOP_MUL, g, y0);
-                (void)y1; // y was the output; the other copy is dead but keep
-                          // the DUP to match other nodes' patterns — TEN DUP
-                          // just incref'd, no real cost.
+                Term g_a = thvm_op_raw(ctx, UOP_MUL, g, whnf);
                 VJP_RECURSE_INTO(a, g_a);
             }
             // LOG: grad_a = g / a.
             if (wuop == UOP_LOG) {
                 Term a = heap_read(ctx, wloc + 0);
-                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                Term a0, a1; wnf_share_or_dup(ctx, a, &a0, &a1);
                 Term g_a = thvm_op_raw(ctx, UOP_DIV, g, a0);
                 VJP_RECURSE_INTO(a1, g_a);
             }
@@ -1692,7 +1710,7 @@ apply: {
             // g_a = g * mask.
             if (wuop == UOP_RELU) {
                 Term a = heap_read(ctx, wloc + 0);
-                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
+                Term a0, a1; wnf_share_or_dup(ctx, a, &a0, &a1);
                 // CMP returns 1 if x > y else 0: we want (a > 0).
                 Shape ash = wnf_shape_of(ctx, a0);
                 f32 zero_v = 0.0f;
@@ -1793,8 +1811,8 @@ apply: {
                 Term a = heap_read(ctx, wloc + 0);
                 Term axes = heap_read(ctx, wloc + 1);
                 Shape ash = wnf_shape_of(ctx, a);
-                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-                Term a1b, a2; thvm_dup(ctx, thvm_fresh_label(ctx), a1, &a1b, &a2);
+                Term a0, a1; wnf_share_or_dup(ctx, a, &a0, &a1);
+                Term a1b, a2; wnf_share_or_dup(ctx, a1, &a1b, &a2);
                 Term rm = thvm_op_raw(ctx, UOP_RMAX, a1b, axes);
                 Term rm_bc = (ash.rank != 0) ? thvm_expand(ctx, rm, ash) : rm;
                 // mask: 1 where a2 >= rm_bc else 0. CMP(x,y) = 1 if x>y else 0.
@@ -1810,9 +1828,9 @@ apply: {
             if (wuop == UOP_MM) {
                 Term a = heap_read(ctx, wloc + 0);
                 Term b = heap_read(ctx, wloc + 1);
-                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-                Term b0, b1; thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
-                Term g0, g1; thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
+                Term a0, a1; wnf_share_or_dup(ctx, a, &a0, &a1);
+                Term b0, b1; wnf_share_or_dup(ctx, b, &b0, &b1);
+                Term g0, g1; wnf_share_or_dup(ctx, g, &g0, &g1);
                 u32 ax[2] = {1, 0};
                 Term bT = thvm_permute(ctx, b0, ax, 2);
                 Term aT = thvm_permute(ctx, a0, ax, 2);
@@ -1824,9 +1842,9 @@ apply: {
             if (wuop == UOP_MAX) {
                 Term a = heap_read(ctx, wloc + 0);
                 Term b = heap_read(ctx, wloc + 1);
-                Term a0, a1; thvm_dup(ctx, thvm_fresh_label(ctx), a, &a0, &a1);
-                Term b0, b1; thvm_dup(ctx, thvm_fresh_label(ctx), b, &b0, &b1);
-                Term g0, g1; thvm_dup(ctx, thvm_fresh_label(ctx), g, &g0, &g1);
+                Term a0, a1; wnf_share_or_dup(ctx, a, &a0, &a1);
+                Term b0, b1; wnf_share_or_dup(ctx, b, &b0, &b1);
+                Term g0, g1; wnf_share_or_dup(ctx, g, &g0, &g1);
                 // mask_a = (a >= b) = 1 - CMP(b, a).  CMP(b,a)=1 if b>a.
                 Term cmp_ba = thvm_op_raw(ctx, UOP_CMP, b0, a0);
                 Term one = term_num_f32(1.0f);

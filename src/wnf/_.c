@@ -19,7 +19,7 @@
 //   - GRAD × TAG_TOP UOP_ADD/UOP_SUB (Leibniz-phase frames)
 //   - GRAD × TAG_TOP UOP_NEG (single-phase frame)
 //   - GRAD × TAG_TOP UOP_MUL (Leibniz with forward-value cross-term)
-// Other uops: fall back to existing grad.c rule via thvm_reduce_fallback.
+// All combinator and GRAD rules are now handled natively; no fallback.
 
 // ──────────────────────────────────────────────────────────────────────
 // Frame kinds.  Stored on wnf stack.  Not heap terms.
@@ -133,7 +133,8 @@ static void wnf_stack_push(WnfFrame f) {
     g_wnf_stack_buf[g_wnf_stack_pos++] = f;
 }
 
-Term thvm_reduce_fallback(TinyHVM *ctx, Term t);
+// thvm_reduce_fallback is no longer called from wnf; the declaration
+// stays in reduce/_.c for any external callers.
 
 // ──────────────────────────────────────────────────────────────────────
 // Leaf-rule helpers.
@@ -459,8 +460,15 @@ enter: {
             if (reduce_top_direct_uop_ctx(ctx, ext) ||
                 reduce_top_has_era_arg(ctx, next) ||
                 reduce_top_has_add_zero_arg(ctx, next)) {
-                whnf = thvm_reduce_fallback(ctx, next);
-                goto apply;
+                // Direct uop or peephole trigger: fire one interaction step.
+                // If it rewrote, re-enter (trampoline equivalent).  Prevents
+                // infinite loops via a step-budget guard.
+                Term r = thvm_interact(ctx, next);
+                if (r != next) {
+                    ctx->itrs++;
+                    next = r;
+                    goto enter;
+                }
             }
         }
         whnf = next;

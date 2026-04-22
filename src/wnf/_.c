@@ -141,12 +141,13 @@ Term thvm_reduce_fallback(TinyHVM *ctx, Term t);
 
 static Term wnf_grad_ten_leaf(TinyHVM *ctx, Term tgt, Term y_whnf, int is_fwd) {
     if (term_tag(tgt) != TAG_TEN) {
-        // Target not yet resolved — fall back.  Build GRAD(y_whnf, tgt).
+        // Target not yet resolved — rebuild GRAD(y_whnf, tgt) stuck.
+        // Trampoline / caller will retry when tgt reduces further.
         u64 loc = heap_alloc(ctx, 2);
         heap_set(ctx, loc + 0, y_whnf);
         heap_set(ctx, loc + 1, tgt);
         u32 uop = is_fwd ? UOP_GRAD_FWD : UOP_GRAD;
-        return thvm_reduce_fallback(ctx, term_new(TAG_TOP, uop, loc));
+        return term_new(TAG_TOP, uop, loc);
     }
     u32 ytid = (u32)term_val(y_whnf);
     u32 ttid = (u32)term_val(tgt);
@@ -172,15 +173,16 @@ static Term wnf_grad_ten_leaf(TinyHVM *ctx, Term tgt, Term y_whnf, int is_fwd) {
     return is_scalar_shape ? scalar : thvm_expand(ctx, scalar, osh);
 }
 
-// Fall back to the existing grad.c rule for any TAG_TOP uop we don't
-// handle directly yet (DIV, MAX, SUM, EXPAND, MM, view ops, …).
-static Term wnf_grad_apply_top_fallback(TinyHVM *ctx, Term tgt, Term y_whnf, int is_fwd) {
+// Rebuild a stuck GRAD(y_whnf, tgt) term as-is (no further reduction).
+// Used when the GRAD apply frame encounters an unhandled whnf shape
+// (unknown TOP uop, DP-stuck, VAR, etc.) — matches legacy grad.c's
+// "return unchanged" fall-through path (grad.c:540-541).
+static Term wnf_grad_rebuild(TinyHVM *ctx, Term tgt, Term y_whnf, int is_fwd) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc + 0, y_whnf);
     heap_set(ctx, loc + 1, tgt);
     u32 uop = is_fwd ? UOP_GRAD_FWD : UOP_GRAD;
-    Term t = term_new(TAG_TOP, uop, loc);
-    return thvm_reduce_fallback(ctx, t);
+    return term_new(TAG_TOP, uop, loc);
 }
 
 // ERA peephole helpers (ADD(x, ERA) → x, MUL(x, ERA) → ERA, etc.)
@@ -1191,12 +1193,12 @@ apply: {
 
                 // Unhandled compute TOP: fall back (SUM, RMAX, EXPAND,
                 // RESHAPE, PERMUTE, SHRINK, PAD, MM, WHERE).
-                whnf = wnf_grad_apply_top_fallback(ctx, tgt, whnf, is_fwd);
+                whnf = wnf_grad_rebuild(ctx, tgt, whnf, is_fwd);
                 continue;
             }
 
             // Other whnf shapes (DP-stuck, VAR, etc.): fall back.
-            whnf = wnf_grad_apply_top_fallback(ctx, tgt, whnf, is_fwd);
+            whnf = wnf_grad_rebuild(ctx, tgt, whnf, is_fwd);
             continue;
         }
 

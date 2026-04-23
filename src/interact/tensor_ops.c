@@ -382,10 +382,18 @@
 
                     // Compute-like payloads become visible KERNEL carriers.
                     // Leaf ops can be monolithic immediately; parents with
-                    // still-fused children keep the growing shell.
+                    // still-fused children keep the growing shell.  WRITE
+                    // BACK the resolved kernel into FUSE's slot 0 so
+                    // parent kernels referencing this FUSE cell see the
+                    // resolved kernel directly (no stale MUL/SUM/etc.
+                    // through the FUSE indirection).
                     if (is_elementwise(puop) || puop == UOP_SUM || puop == UOP_RMAX ||
                         (puop >= UOP_RESHAPE && puop <= UOP_PAD)) {
                         Term public_term = thvm_fuse_public_term(ctx, payload, 0);
+                        if (term_tag(public_term) == TAG_TOP &&
+                            term_ext(public_term) == UOP_KERNEL) {
+                            heap_set(ctx, loc, public_term);
+                        }
                         if (getenv("THVM_SCHED_DIAG") &&
                             term_tag(public_term) == TAG_TOP &&
                             term_ext(public_term) == UOP_KERNEL) {

@@ -1689,13 +1689,23 @@ apply: {
                 g = wnf_ones_of_shape(ctx, ys);
             }
 
-            // Leaf rules.
+            // Leaf rules.  GRAD ⊳ TEN target-match: produce the cotangent
+            // seed `g` and store it in the cell's slot 1 so later BW
+            // re-reads and dumper walks find the materialised ones
+            // tensor directly.  Slot 0 becomes SUB(whnf) so PIN reads
+            // see the forward TEN (v_pass aliases target leaf per spec).
             if (wtag == TAG_TEN) {
                 if (term_tag(tgt) == TAG_TEN) {
                     u32 wtid = (u32)term_val(whnf);
                     u32 ttid = (u32)term_val(tgt);
+                    Term result = (wtid == ttid) ? g : term_era();
+                    if (g_wnf_current_grad_slot != 0 &&
+                        g_wnf_current_grad_slot + 1 < ctx->heap_pos) {
+                        heap_set(ctx, g_wnf_current_grad_slot + 0, term_set_sub(whnf));
+                        heap_set(ctx, g_wnf_current_grad_slot + 1, result);
+                    }
                     WNF_FIRED();
-                    whnf = (wtid == ttid) ? g : term_era();
+                    whnf = result;
                     continue;
                 }
                 // Target not yet resolved — rebuild stuck GRAD(whnf, tgt).

@@ -1863,6 +1863,9 @@ apply: {
                     heap_set(ctx, g_wnf_current_grad_slot + 1,
                              add_combined);
                 }
+                // Slide grad-slot to sub_a so next step's redex lands
+                // on t1→sub_GRAD_a[y] per spec step_002.
+                g_wnf_current_grad_slot = sa_loc;
                 whnf = add_combined;
                 WNF_FIRED();
                 continue;
@@ -1963,6 +1966,11 @@ apply: {
                     heap_set(ctx, g_wnf_current_grad_slot + 1,
                              bwd_wrapper);
                 }
+                // Slide the "current grad" pointer to the freshly-allocated
+                // inner cell — the hook's per-step redex highlight then
+                // lands on the NEW principal edge (MUL→inner_GRAD[y]),
+                // matching spec step_001 redex annotation.
+                g_wnf_current_grad_slot = inner_loc;
                 whnf = bwd_wrapper;
                 WNF_FIRED();
                 continue;

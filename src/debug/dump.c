@@ -1425,7 +1425,9 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             u64 _pl = term_val(_pp); \
             if (_pa == 0 || _pl == 0 || _pl + _pa > ctx->heap_pos) continue; \
             for (u32 _pi = 0; _pi < _pa; _pi++) { \
-                if (heap_read(ctx, _pl + _pi) == (tref)) { _hasp = 1; break; } \
+                Term _prt = heap_read(ctx, _pl + _pi); \
+                if (term_is_sub(_prt)) _prt = term_strip_sub(_prt); \
+                if (_prt == (tref)) { _hasp = 1; break; } \
             } \
         } \
         for (u32 _di = 0; _di < ctx->def_count && !_hasp; _di++) { \
@@ -1434,7 +1436,9 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             u64 _pl = term_val(_pp); \
             if (_pa == 0 || _pl == 0 || _pl + _pa > ctx->heap_pos) continue; \
             for (u32 _pi = 0; _pi < _pa; _pi++) { \
-                if (heap_read(ctx, _pl + _pi) == (tref)) { _hasp = 1; break; } \
+                Term _prt = heap_read(ctx, _pl + _pi); \
+                if (term_is_sub(_prt)) _prt = term_strip_sub(_prt); \
+                if (_prt == (tref)) { _hasp = 1; break; } \
             } \
         } \
         _hasp; \
@@ -1858,18 +1862,14 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 else if (ext == UOP_FUSE) elbl = "in";
                 else if (ext >= UOP_RESHAPE && ext <= UOP_PAD) elbl = ai==0 ? "in" : "shape";
                 else if (ext == UOP_SUM || ext == UOP_RMAX) elbl = ai==0 ? "in" : "axes";
-                else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) elbl = ai==0 ? "y" : "gy";
+                else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) elbl = ai==0 ? "y" : "tgt";
                 else if (ext == UOP_DETACH) elbl = "in";
                 else if (is_binary(ext)) elbl = ai==0 ? "a" : "b";
-                int rev = 0;
 
                 if (ctag == TAG_DP0 || ctag == TAG_DP1) {
-                    // Always show full DUP triangle with both ports
                     u64 dl = cval;
                     DP_SLOT_MARK(cpos);
                     EMIT_DUP_CHAIN(dl);
-                    // For DUP redexes, highlight only the DUP principal edge,
-                    // never the auxiliary consumer edge.
                     char dp_lbl[64];
                     fprintf(f, "  dup%llu -> n%llu [label=\"%s\"];\n", dl, val,
                             dot_dp_port_label(dp_lbl, sizeof(dp_lbl), elbl, ctag, cpos));
@@ -1877,56 +1877,29 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     EMIT_TEN((u32)cval);
                     char slot_attrs[96];
                     dot_tensor_edge_slot_attrs(cpos, slot_attrs, sizeof(slot_attrs));
-                    if (rev) {
-                        if (edge_hl) fprintf(f, "  n%llu -> t%u [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", val, (u32)cval, elbl);
-                        else         fprintf(f, "  n%llu -> t%u [label=\"%s\"];\n", val, (u32)cval, elbl);
-                    } else {
-                        if (edge_hl) fprintf(f, "  t%u -> n%llu [label=\"%s\"%s,color=\"#cc0000\",penwidth=2.0];\n", (u32)cval, val, elbl, slot_attrs);
-                        else         fprintf(f, "  t%u -> n%llu [label=\"%s\"%s];\n", (u32)cval, val, elbl, slot_attrs);
-                    }
+                    if (edge_hl) fprintf(f, "  t%u -> n%llu [label=\"%s\"%s,color=\"#cc0000\",penwidth=2.0];\n", (u32)cval, val, elbl, slot_attrs);
+                    else         fprintf(f, "  t%u -> n%llu [label=\"%s\"%s];\n", (u32)cval, val, elbl, slot_attrs);
                 } else if (ctag == TAG_CTR) {
                     EMIT_CTR_NODE(cval);
-                    if (rev) {
-                        if (edge_hl) fprintf(f, "  n%llu -> ctr%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", val, cval, elbl);
-                        else         fprintf(f, "  n%llu -> ctr%llu [label=\"%s\"];\n", val, cval, elbl);
-                    } else {
-                        if (edge_hl) fprintf(f, "  ctr%llu -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", cval, val, elbl);
-                        else         fprintf(f, "  ctr%llu -> n%llu [label=\"%s\"];\n", cval, val, elbl);
-                    }
+                    if (edge_hl) fprintf(f, "  ctr%llu -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", cval, val, elbl);
+                    else         fprintf(f, "  ctr%llu -> n%llu [label=\"%s\"];\n", cval, val, elbl);
                 } else if (ctag == TAG_ANY) {
                     if (ext == UOP_GRAD) continue;
                     EMIT_ANY_NODE(cval);
-                    if (rev) {
-                        if (edge_hl) fprintf(f, "  n%llu -> any%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", val, cval, elbl);
-                        else         fprintf(f, "  n%llu -> any%llu [label=\"%s\"];\n", val, cval, elbl);
-                    } else {
-                        if (edge_hl) fprintf(f, "  any%llu -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", cval, val, elbl);
-                        else         fprintf(f, "  any%llu -> n%llu [label=\"%s\"];\n", cval, val, elbl);
-                    }
+                    if (edge_hl) fprintf(f, "  any%llu -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", cval, val, elbl);
+                    else         fprintf(f, "  any%llu -> n%llu [label=\"%s\"];\n", cval, val, elbl);
                 } else if (ctag == TAG_ERA) {
                     u64 epos = cpos;
                     if (cval != 0) {
                         EMIT_ERA_NODE(epos, child);
-                        if (rev) {
-                            if (edge_hl) fprintf(f, "  n%llu -> era%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", val, (unsigned long long)epos, elbl);
-                            else         fprintf(f, "  n%llu -> era%llu [label=\"%s\"];\n", val, (unsigned long long)epos, elbl);
-                        } else {
-                            if (edge_hl) fprintf(f, "  era%llu -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", (unsigned long long)epos, val, elbl);
-                            else         fprintf(f, "  era%llu -> n%llu [label=\"%s\"];\n", (unsigned long long)epos, val, elbl);
-                        }
+                        if (edge_hl) fprintf(f, "  era%llu -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", (unsigned long long)epos, val, elbl);
+                        else         fprintf(f, "  era%llu -> n%llu [label=\"%s\"];\n", (unsigned long long)epos, val, elbl);
                     } else {
                         EMIT_FREE_PORT(val, ai);
-                        if (rev) {
-                            if (edge_hl) fprintf(f, "  n%llu -> free%llu_%u [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n",
-                                                 (unsigned long long)val, (unsigned long long)val, ai, elbl);
-                            else         fprintf(f, "  n%llu -> free%llu_%u [label=\"%s\"];\n",
-                                                 (unsigned long long)val, (unsigned long long)val, ai, elbl);
-                        } else {
-                            if (edge_hl) fprintf(f, "  free%llu_%u -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n",
-                                                 (unsigned long long)val, ai, (unsigned long long)val, elbl);
-                            else         fprintf(f, "  free%llu_%u -> n%llu [label=\"%s\"];\n",
-                                                 (unsigned long long)val, ai, (unsigned long long)val, elbl);
-                        }
+                        if (edge_hl) fprintf(f, "  free%llu_%u -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n",
+                                             (unsigned long long)val, ai, (unsigned long long)val, elbl);
+                        else         fprintf(f, "  free%llu_%u -> n%llu [label=\"%s\"];\n",
+                                             (unsigned long long)val, ai, (unsigned long long)val, elbl);
                     }
                 } else if (ctag == TAG_NUM) {
                     char num_label[32];
@@ -1945,13 +1918,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 } else if (ctag == TAG_VAR) {
                     EMIT_VAR_OR_RESOLVED_TO_NODE(child, cval, val, elbl, edge_hl);
                 } else if (ctag == TAG_TOP) {
-                    if (rev) {
-                        if (edge_hl) fprintf(f, "  n%llu -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", val, cval, elbl);
-                        else         fprintf(f, "  n%llu -> n%llu [label=\"%s\"];\n", val, cval, elbl);
-                    } else {
-                        if (edge_hl) fprintf(f, "  n%llu -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", cval, val, elbl);
-                        else         fprintf(f, "  n%llu -> n%llu [label=\"%s\"];\n", cval, val, elbl);
-                    }
+                    if (edge_hl) fprintf(f, "  n%llu -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n", cval, val, elbl);
+                    else         fprintf(f, "  n%llu -> n%llu [label=\"%s\"];\n", cval, val, elbl);
                 } else if (dot_visible_heap_loc_tag(ctag)) {
                     if (edge_hl) fprintf(f, "  n%llu -> n%llu [label=\"%s\",color=\"#cc0000\",penwidth=2.0];\n",
                                          (unsigned long long)cval, (unsigned long long)val, elbl);

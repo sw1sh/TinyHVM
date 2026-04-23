@@ -2054,18 +2054,23 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     // the 1-in/2-out T-junction the step-graph spec uses.
                     if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) {
                         // v_pass: point at y_fw (slot 3) if it's a visible
-                        // forward TOP — spec's "GRAD reparented below
-                        // original y" shape.  Fall back to free port
-                        // otherwise (y_fw is TEN/ERA/degenerate).
+                        // forward TOP different from the current BW
+                        // descent (slot 0).  When y_fw == y_bw (fresh
+                        // GRAD cell, no slide yet), omit to avoid
+                        // drawing both incoming "y" and outgoing
+                        // "v_pass" edges against the same node.  Fall
+                        // back to free port otherwise.
+                        Term y_bw = (val + 0 < ctx->heap_pos) ? heap_read(ctx, val + 0) : term_era();
                         Term y_fw = (val + 3 < ctx->heap_pos) ? heap_read(ctx, val + 3) : term_era();
                         u8 fwtag = term_tag(y_fw);
                         u64 fwval = term_val(y_fw);
+                        int slid  = (y_bw != y_fw);
                         int emitted_vpass = 0;
-                        if (fwtag == TAG_TOP && fwval != 0 && fwval < ctx->heap_pos && fwval != val) {
+                        if (slid && fwtag == TAG_TOP && fwval != 0 && fwval < ctx->heap_pos && fwval != val) {
                             fprintf(f, "  n%llu -> n%llu [label=\"v_pass\"];\n",
                                     (unsigned long long)val, (unsigned long long)fwval);
                             emitted_vpass = 1;
-                        } else if (fwtag == TAG_TEN && fwval > 0) {
+                        } else if (slid && fwtag == TAG_TEN && fwval > 0) {
                             EMIT_TEN((u32)fwval);
                             fprintf(f, "  n%llu -> t%u [label=\"v_pass\"];\n",
                                     (unsigned long long)val, (u32)fwval);

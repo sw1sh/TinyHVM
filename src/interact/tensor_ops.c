@@ -338,6 +338,14 @@
             // Entry: FUSE(payload) — heap [payload]
             // Unary: FUSE(op, child) — heap [NUM(op), child] (tag of slot0 == NUM)
             if (uop == UOP_FUSE) {
+                // Defer kernelisation during the VJP phase: caller sets
+                // g_thvm_defer_fuse_kernelize while driving reduce/normalize
+                // so all GRAD commutes finish before FUSE starts absorbing
+                // compute TOPs.  In the deferred state FUSE is a no-op
+                // (returns itself unchanged), which matches spec's phase
+                // separation (VJP steps 0-4, then kernelisation steps 5+).
+                extern int g_thvm_defer_fuse_kernelize;
+                if (g_thvm_defer_fuse_kernelize) return t;
                 Term slot0 = heap_read(ctx, loc);
                 if (getenv("THVM_SCHED_DIAG")) {
                     fprintf(stderr, "FUSE_ENTRY: slot0_tag=%u slot0_ext=%u loc=%llu\n",

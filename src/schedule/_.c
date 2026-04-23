@@ -1302,8 +1302,15 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // kernel-building FUSE interactions that turn lazy compute TOPs
     // into KERNEL terms.
     thvm_wnf_set_step_hook(wnf_step_session_hook);
+    // Phase 1: VJP reduce + normalize (FUSE rule deferred — GRAD
+    // commutes fire first, matching spec's steps 0..4).
+    extern int g_thvm_defer_fuse_kernelize;
+    g_thvm_defer_fuse_kernelize = 1;
     traced = thvm_reduce(ctx, traced);
     traced = thvm_normalize(ctx, traced);
+    g_thvm_defer_fuse_kernelize = 0;
+    // Phase 2: explicit FUSE fixed-point — now kernelisation fires
+    // (spec's steps 5..9).
     if (!getenv("THVM_STEP_GRAPH_NO_FUSE"))
         traced = thvm_eval_fuse_fixed_point(ctx, traced, thvm_eval_mixed_dispatch_enabled());
     thvm_wnf_clear_step_hook();

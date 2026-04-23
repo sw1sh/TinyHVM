@@ -66,6 +66,13 @@ static void thvm_spawn_detached_era(TinyHVM *ctx, Term item) {
     }
 }
 
+// When non-zero, UOP_FUSE rule is a no-op (returns itself).  The
+// step-graph session sets this during VJP reduce/normalize so all GRAD
+// commutes (SUM, MUL, TEN-match) fire first; clears it before the
+// explicit thvm_eval_fuse_fixed_point phase so kernelisation happens
+// as a distinct later set of steps — matching spec's phase order.
+int g_thvm_defer_fuse_kernelize = 0;
+
 static u32 thvm_uop_storage_arity(u32 ext) {
     if (ext == UOP_KERNEL) return 3;
     if (ext == UOP_EXEC) return 3;   // [NUM(kid), deps, NUM(flags)]

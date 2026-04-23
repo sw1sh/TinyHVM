@@ -1259,6 +1259,26 @@ extern u64         thvm_wnf_last_interact_outer(void);
 extern u64         thvm_wnf_last_interact_inner(void);
 extern u64         thvm_wnf_last_grad_loc_at_fire(void);
 
+// Reduce-granularity boundary emit: writes one frame with a stable
+// `step_NNN_<boundary>.dot` name, bypassing the fire-mode pending/rename
+// machinery.  Use at each top-level reduction boundary (phase-1 reduce
+// return, normalize return, phase-2 fuse-fp return).
+static void wnf_step_session_emit_boundary(TinyHVM *ctx, const char *boundary) {
+    if (ctx != g_step_session_ctx) return;
+    if (g_step_session_dir[0] == 0) return;
+    if (g_step_session_frame >= thvm_step_graph_max_steps()) return;
+    char path[640];
+    snprintf(path, sizeof(path), "%s/step_%03u_%s.dot",
+             g_step_session_dir, g_step_session_frame, boundary);
+    thvm_heap_dot_set_highlight(0, 0);
+    thvm_heap_dot_set_step_meta(boundary, "");
+    thvm_heap_dot_root(ctx, path, term_era());
+    u64 sig = thvm_file_sig(path);
+    if (sig == g_step_session_last_render_sig) { remove(path); return; }
+    g_step_session_last_render_sig = sig;
+    g_step_session_frame++;
+}
+
 static void wnf_step_session_hook(TinyHVM *ctx) {
     if (ctx != g_step_session_ctx) return;
     if (g_step_session_dir[0] == 0) return;
@@ -1506,6 +1526,8 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // Frame 0: initial state.  Highlight the initial redex edge —
     // for a GRAD root term, that's the y→GRAD principal-port edge
     // (slot grad_loc+0).
+    const char *_gran_env = getenv("THVM_STEP_GRAPH_GRANULARITY");
+    int _gran_reduce = (_gran_env && strcmp(_gran_env, "reduce") == 0);
     g_step_session_ctx               = ctx;
     g_step_session_frame             = 0;
     g_step_session_last_render_sig   = 0;
@@ -1519,7 +1541,9 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // slot is freed at session end.
     thvm_step_seed_root_grad(ctx, traced);
     char p0[640];
-    snprintf(p0, sizeof(p0), "%s/step_%03u_pending.dot", dir, g_step_session_frame);
+    snprintf(p0, sizeof(p0),
+             _gran_reduce ? "%s/step_%03u_initial.dot" : "%s/step_%03u_pending.dot",
+             dir, g_step_session_frame);
     // Scan heap for the first outermost GRAD cell and highlight its
     // slot 0 (principal y edge) as the initial redex.  Works whether
     // the root is a direct GRAD term, or a compound (CTR / FUSE / ...)
@@ -1543,9 +1567,13 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     thvm_heap_dot_set_include_all(0);
     thvm_heap_dot_set_highlight(0, 0);
     g_step_session_last_render_sig = thvm_file_sig(p0);
-    snprintf(g_step_session_pending_path, sizeof(g_step_session_pending_path),
-             "%s", p0);
-    g_step_session_pending_frame = g_step_session_frame;
+    if (!_gran_reduce) {
+        // Fire mode: initial file is "pending" — will be renamed by the
+        // first rule fire.
+        snprintf(g_step_session_pending_path, sizeof(g_step_session_pending_path),
+                 "%s", p0);
+        g_step_session_pending_frame = g_step_session_frame;
+    }
     g_step_session_frame++;
 
     // Drive reduction; hook emits one dot per wnf interaction.  We run
@@ -1557,7 +1585,10 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // run the fuse fixed-point so the session also captures the
     // kernel-building FUSE interactions that turn lazy compute TOPs
     // into KERNEL terms.
-    thvm_wnf_set_step_hook(wnf_step_session_hook);
+    // Granularity (_gran_reduce computed above): fire mode installs the
+    // per-WNF_FIRED hook; reduce mode emits at explicit boundaries.
+    if (!_gran_reduce)
+        thvm_wnf_set_step_hook(wnf_step_session_hook);
     // Step-graph renders the entire heap state per frame — no root-based
     // reach filtering.  Orphan cells left behind by rule firings remain
     // visible until either ERA interactions garbage-collect them, or
@@ -1569,19 +1600,26 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // commutes fire first, matching spec's steps 0..4).
     extern int g_thvm_defer_fuse_kernelize;
     g_thvm_defer_fuse_kernelize = 1;
+    if (_gran_reduce) wnf_step_session_emit_boundary(ctx, "phase1_entry");
     traced = thvm_reduce(ctx, traced);
+    if (_gran_reduce) wnf_step_session_emit_boundary(ctx, "phase1_reduce");
     traced = thvm_normalize(ctx, traced);
+    if (_gran_reduce) wnf_step_session_emit_boundary(ctx, "phase1_normalize");
     g_thvm_defer_fuse_kernelize = 0;
     // Phase 2: explicit FUSE fixed-point — now kernelisation fires
     // (spec's steps 5..9).
     if (!getenv("THVM_STEP_GRAPH_NO_FUSE"))
         traced = thvm_eval_fuse_fixed_point(ctx, traced, thvm_eval_mixed_dispatch_enabled());
+    if (_gran_reduce) wnf_step_session_emit_boundary(ctx, "phase2_fuse");
     thvm_wnf_clear_step_hook();
 
-    // The last pending frame is the state AFTER all hook-visible rules
-    // have fired.  Any additional changes from the post-hook thvm_normalize
-    // aren't part of the captured sequence, so we overwrite the pending
-    // frame with the truly-final reduced state and name it "_final".
+    // Fire mode only: the last pending frame is the state AFTER all
+    // hook-visible rules have fired.  Any additional changes from the
+    // post-hook thvm_normalize aren't part of the captured sequence,
+    // so we overwrite the pending frame with the truly-final reduced
+    // state and name it "_final".  (Reduce mode already emitted its
+    // last boundary frame above, so skip this.)
+    if (_gran_reduce) goto skip_final_emit;
     char pF[640];
     snprintf(pF, sizeof(pF), "%s/step_%03u_final.dot",
              dir, g_step_session_pending_frame);
@@ -1594,6 +1632,7 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
         remove(g_step_session_pending_path);
     }
     g_step_session_pending_path[0] = 0;
+    skip_final_emit:;
 
     // Render PNGs.
     if (!getenv("THVM_STEP_GRAPH_NO_PNG")) {

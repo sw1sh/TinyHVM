@@ -153,6 +153,33 @@ static const char *dot_uop_port_name(u32 uop, u32 argi) {
     return "in";
 }
 
+// Follow SUB redirects through commuted GRAD cells.  When a GRAD cell's
+// slot 0 has the SUB bit set, the cell is "dead" — BW already fired and
+// stored its sibling redirect.  Edges to such cells render as edges to
+// the actual destination:
+//   TAG_TOP(UOP_GRAD, loc)     → heap[loc+1]  (bwd_wrapper, ∂v target)
+//   TAG_TOP(UOP_GRAD_PIN, loc) → strip(heap[loc+0])  (reparented forward)
+// Loops through chained commutes.
+static Term dot_deref_commuted_grad(TinyHVM *ctx, Term t) {
+    for (u32 hop = 0; hop < 32 && term_tag(t) == TAG_TOP; hop++) {
+        u32 e = term_ext(t);
+        u64 l = term_val(t);
+        if (l == 0 || l + 1 >= ctx->heap_pos) break;
+        Term s0 = heap_read(ctx, l + 0);
+        if (!term_is_sub(s0)) break;
+        if (e == UOP_GRAD || e == UOP_GRAD_FWD) {
+            t = heap_read(ctx, l + 1);
+            continue;
+        }
+        if (e == UOP_GRAD_PIN) {
+            t = term_strip_sub(s0);
+            continue;
+        }
+        break;
+    }
+    return t;
+}
+
 static int dot_visible_heap_loc_tag(u8 tag) {
     switch (tag) {
         case TAG_TOP:
@@ -1697,6 +1724,14 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         // --- TAG_TOP: op nodes (dedup by val) ---
         if (tag == TAG_TOP) {
             if (top_live && (val >= ctx->heap_pos || !top_live[val])) continue;
+            // Commuted GRAD cell (slot 0 has SUB-bit) is "dead"; its edges
+            // are dereferenced through dot_dereference_commuted_grad below.
+            // Don't emit a node for it — spec's "single GRAD" view.
+            if ((ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN)
+                && val + 0 < ctx->heap_pos
+                && term_is_sub(heap_read(ctx, val + 0))) {
+                continue;
+            }
             if (NODE_SEEN(val)) continue;
             NODE_MARK(val);
             char label[128]; const char *color = "#f0f0f0"; const char *nshape = "box";
@@ -1841,6 +1876,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             else if (!is_binary(ext) && is_elementwise(ext)) arity = 1;
             for (u32 ai = 0; ai < arity; ai++) {
                 Term child = heap_read(ctx, val + ai);
+                child = dot_deref_commuted_grad(ctx, child);
                 u64 cpos = val + ai;
                 u8 ctag = term_tag(child); u64 cval = term_val(child);
                 int edge_hl = heap_dot_hl_on && cpos == heap_dot_hl_slot;

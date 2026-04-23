@@ -2402,17 +2402,29 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 fprintf(f, "  ctr%llu [label=\"CTR\\nN=%u\\n%s\", shape=hexagon, fillcolor=\"#f3f3f3\", fontsize=9];\n",
                         (unsigned long long)val, ext, _ctr_span);
                 // Output port: only emit a free-port sink circle when
-                // the CTR has NO outgoing consumer on the heap.  If any
-                // cell holds TAG_CTR with val=this_loc, the CTR's output
-                // flows into that consumer via a normal edge — drawing
-                // an extra free port on top would leave a dangling
-                // orphan circle alongside the real edge.
+                // the CTR has NO LIVE outgoing consumer on the heap.
+                // Dead cells (SUB-marked or all-ERA) that happen to
+                // still hold CTR as a slot value don't count — their
+                // reference is a ghost that the dumper is skipping.
                 int ctr_has_consumer = 0;
                 for (u64 _hh = 1; !ctr_has_consumer && _hh < _dot_live_cap; _hh++) {
                     Term _pt = ctx->heap[_hh];
-                    if (term_tag(_pt) == TAG_CTR && term_val(_pt) == val) {
-                        ctr_has_consumer = 1;
+                    if (term_is_sub(_pt)) continue;  // redirect, not a live ref
+                    if (term_tag(_pt) != TAG_CTR) continue;
+                    if (term_val(_pt) != val) continue;
+                    // Find owner of this slot (heap cell holding _pt as
+                    // part of its storage).  If the owner is dead
+                    // (slot 0 SUB or all-ERA), this ref is a ghost.
+                    // For simplicity: check if the cell at the "head"
+                    // of _hh's owner TOP is live.  Owner head scan up
+                    // to 4 slots back (matches typical storage arities).
+                    int owner_live = 1;
+                    for (u64 _own = _hh; _own > 0 && _hh - _own < 4; _own--) {
+                        Term _own_s0 = (_own < ctx->heap_pos) ?
+                                       heap_read(ctx, _own) : term_era();
+                        if (term_is_sub(_own_s0)) { owner_live = 0; break; }
                     }
+                    if (owner_live) ctr_has_consumer = 1;
                 }
                 if (!ctr_has_consumer) {
                     fprintf(f, "  ctr_out%llu [label=\"\",shape=circle,width=0.16,height=0.16,fixedsize=true,fillcolor=\"#ffffff\",color=\"#888888\"];\n",

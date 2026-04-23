@@ -204,6 +204,7 @@
                                 (puop >= UOP_RESHAPE && puop <= UOP_PAD)) {
                                 // Kernelise the payload: allocate inner
                                 // payload + wrap children in empty kernels.
+                                u64 consumed_loc = term_val(left);
                                 Term public_term = thvm_fuse_public_term(ctx, left, 0);
                                 if (term_tag(public_term) == TAG_TOP &&
                                     term_ext(public_term) == UOP_KERNEL) {
@@ -217,6 +218,15 @@
                                     heap_set(ctx, loc + 2,
                                              heap_read(ctx, pub_loc + 2));
                                     thvm_fuse_copy_public_shape(ctx, t, loc);
+                                    // IC-style: the compute-TOP payload
+                                    // is CONSUMED (its ops inlined into
+                                    // this kernel).  SUB-mark slot 0 so
+                                    // the ghost cell is dead-filtered by
+                                    // the dumper / follow-through
+                                    // dereferenced by future reads.
+                                    if (consumed_loc && consumed_loc < ctx->heap_pos)
+                                        heap_set(ctx, consumed_loc + 0,
+                                                 term_set_sub(t));
                                     return t;  // same outer ref, now populated
                                 }
                                 return left;
@@ -276,10 +286,7 @@
                     // rewrite THIS kernel's slots to become monolithic.
                     // External references to `t` stay valid — same heap
                     // loc, same tag — but the internal structure is now
-                    // a fully fused kernel.  This avoids the "mid-fire
-                    // stale reference" problem where a new kernel at a
-                    // new loc would render as separate until normalize
-                    // propagates the update to parent slots.
+                    // a fully fused kernel.
                     Term raw_left = left;
                     Term raw_right = right;
                     if (!thvm_public_kernel_absorb_child(ctx, left, &raw_left, 0))
@@ -294,6 +301,19 @@
                     heap_set(ctx, loc + 0, inner);
                     heap_set(ctx, loc + 1, thvm_any());
                     // slot 2 already NUM(kernel_uop).  shape stays on @loc.
+                    // IC-style: the two child KERNELs are CONSUMED —
+                    // their payloads inlined into this settled kernel.
+                    // SUB-mark their slot 0 so the dumper skips them.
+                    if (term_tag(left) == TAG_TOP && term_ext(left) == UOP_KERNEL) {
+                        u64 lloc = term_val(left);
+                        if (lloc && lloc < ctx->heap_pos)
+                            heap_set(ctx, lloc + 0, term_set_sub(t));
+                    }
+                    if (term_tag(right) == TAG_TOP && term_ext(right) == UOP_KERNEL) {
+                        u64 rloc = term_val(right);
+                        if (rloc && rloc < ctx->heap_pos)
+                            heap_set(ctx, rloc + 0, term_set_sub(t));
+                    }
                     if (getenv("THVM_SCHED_DIAG"))
                         fprintf(stderr, "KERNEL_SETTLE (in-place): op=%s @%llu\n",
                                 uop_names[kernel_uop], (unsigned long long)loc);

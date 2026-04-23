@@ -1701,10 +1701,27 @@ apply: {
                     u32 wtid = (u32)term_val(whnf);
                     u32 ttid = (u32)term_val(tgt);
                     Term result = (wtid == ttid) ? g : term_era();
-                    if (g_wnf_current_grad_slot != 0 &&
-                        g_wnf_current_grad_slot + 1 < ctx->heap_pos) {
-                        heap_set(ctx, g_wnf_current_grad_slot + 0, term_set_sub(whnf));
-                        heap_set(ctx, g_wnf_current_grad_slot + 1, result);
+                    u64 fired_slot = g_wnf_current_grad_slot;
+                    if (fired_slot != 0 && fired_slot + 1 < ctx->heap_pos) {
+                        heap_set(ctx, fired_slot + 0, term_set_sub(whnf));
+                        heap_set(ctx, fired_slot + 1, result);
+                    }
+                    // Slide grad-slot to the next pending sub-GRAD (if
+                    // any) so the step-graph redex highlight lands on
+                    // the symmetric sibling — matches spec step_003's
+                    // `t1 → GRAD_b [red]` after GRAD_a annihilates.
+                    g_wnf_current_grad_slot = 0;
+                    for (u64 h = fired_slot + 2; h + 1 < ctx->heap_pos; h++) {
+                        Term hh = ctx->heap[h];
+                        if (term_tag(hh) == TAG_TOP &&
+                            (term_ext(hh) == UOP_GRAD || term_ext(hh) == UOP_GRAD_FWD)) {
+                            u64 gl = term_val(hh);
+                            if (gl == 0 || gl + 1 >= ctx->heap_pos) continue;
+                            Term body = heap_read(ctx, gl + 0);
+                            if (term_is_sub(body)) continue;  // already fired
+                            g_wnf_current_grad_slot = gl;
+                            break;
+                        }
                     }
                     WNF_FIRED();
                     whnf = result;

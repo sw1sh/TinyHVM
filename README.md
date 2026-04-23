@@ -2,46 +2,79 @@
 
 Lazy **interaction-net** runtime for tensor programs. Computation is graph rewriting in the style of [HVM4](https://github.com/HigherOrderCO/HVM4); tensor ops and scheduling borrow operational ideas from [tinygrad](https://github.com/tinygrad/tinygrad).
 
-The engine is a **single C translation unit** (`src/tinyhvm.c`), **no third-party runtime deps** beyond libc and the chosen backend (**Accelerate** on Apple, **Metal** on macOS, **CPU + pthread** on Linux in `build.sh`). Optional pieces: **Wolfram Language** (`./build.sh --paclet`) and **Python** (`./build.sh --python`).
+The engine is a single aggregate C translation unit ([`src/tinyhvm.c`](src/tinyhvm.c) includes per-function files from `src/*/`), **no third-party runtime deps** beyond libc and the chosen backend (**Accelerate** on Apple, **Metal** on macOS, **CPU + pthread** on Linux in `build.sh`). Optional wrappers: **Wolfram Language** (`./build.sh --paclet`) and **Python** (`./build.sh --python`).
 
 ---
 
 ## What you get
 
-- **64-bit packed terms** (`TAG` / `EXT` / `VAL`) for the core calculus plus tensor nodes (`TAG_TEN`, `TAG_TOP`, …).
-- **Lazy tensor UOps** (matmul, elementwise, reduce, reshape/permute/expand, conv2d, pooling, fused kernels, in-place assign, …) kept as `TAG_TOP` until **`thvm_eval`** runs schedule + dispatch (or you hit a path that realizes them inside `thvm_reduce`).
-- **Pluggable backends**: CPU (Accelerate) and **Metal** with JIT-style kernel generation under `src/backend/metal/`.
-- **Autograd without a tape**: backward is expressed as **interaction rules** on the same net (`thvm_grad`, multi-arg variants, “keep” bundles for training loops).
-- **Fusion** and pattern materialization under `src/fuse/`.
-- **Tests and benches** as small Objective-C drivers (`test/*.m`) that include `tinyhvm.c` directly.
+- **64-bit packed terms** (`SUB`/`TAG`/`EXT`/`VAL`) for the core calculus plus tensor nodes (`TAG_TEN`, `TAG_TOP`, …) — see [`docs/reduction.md`](docs/reduction.md) for the full layout.
+- **Lazy tensor UOps** (matmul, elementwise, reduce, reshape/permute/expand, conv2d, pooling, fused kernels, in-place assign, …) kept as `TAG_TOP` until **`thvm_eval`** runs the scheduler + dispatch.
+- **Pluggable backends**: CPU (Accelerate) and **Metal** with JIT-style kernel generation under [`src/backend/metal/`](src/backend/metal/).
+- **Autograd without a tape**: backward is expressed as **interaction rules** on the same net (`UOP_GRAD`, `UOP_GRAD_FWD`) — see [`docs/grad.md`](docs/grad.md).
+- **Structural fusion** (`UOP_FUSE` → `UOP_KERNEL`) under [`src/fuse/`](src/fuse/) and [`src/interact/tensor_ops.c`](src/interact/tensor_ops.c) — see [`docs/fusion.md`](docs/fusion.md).
+- **Active test drivers** (`test/*.m`) that `#include` [`src/tinyhvm.c`](src/tinyhvm.c) directly.
 
 Agent-oriented build and file map: [`AGENTS.md`](AGENTS.md).
 
 ---
 
+## How interaction reduction looks
+
+TinyHVM reduces tensor programs as **local graph rewrites**. To make that concrete, here's the canonical VJP trace for `sum((t1 * t1))` differentiated with respect to `t1`, rendered one interaction at a time by `scripts/run_vjp_step_graph.sh png`. The full 10-step walkthrough lives in [`docs/step_graph_ic_goal.md`](docs/step_graph_ic_goal.md).
+
+### Step 0 — initial state
+
+`thvm_grad(sum(t1*t1), t1)` wraps the forward term in a `GRAD` **T-junction** (1-in, 2-out): `y` comes in on the principal port; `v_pass` carries the forward value to a forward `FUSE_f`; `∂v` carries the cotangent to a backward `FUSE_b`. The red edge is the redex about to fire.
+
+![step_000 — GRAD ⊳ SUM about to fire](docs/step_graph_ic_goal/step_000_GRAD-SUM.png)
+
+### Step 2 — `GRAD ⊳ MUL` has just split into two sub-GRADs
+
+Binary Leibniz: each operand of `MUL` gets its own sub-GRAD; each sub-GRAD's `v_pass` feeds the original forward `MUL`, and each `∂v` feeds a **chain MUL** that multiplies the cotangent by the *other* operand. `ADD_leib` sums the two chain MULs back into `∂v` for the parent node. `t1` is a TEN atom — aliased into all four consumers without a DUP.
+
+![step_002 — after GRAD ⊳ MUL](docs/step_graph_ic_goal/step_002_GRAD-TEN_a.png)
+
+### Step 7 — forward kernels merged
+
+`FUSE_f` has absorbed `SUM` and `MUL` into `KERNEL_fwd`.  The backward subtree is still raw compute TOPs; `EXPAND → FUSE_b` is the next redex.
+
+![step_007 — forward kernel merged, backward pending](docs/step_graph_ic_goal/step_007_FUSE-EXPAND.png)
+
+### Step 9 — final WHNF
+
+Both sweeps have settled into exactly two kernels: `KERNEL_fwd = {MUL, SUM}` producing `y` and `KERNEL_bwd = {MUL_ca, MUL_cb, ADD, EXPAND}` producing `∂y/∂t1`.  Running them yields `y = [14]` and `∂y/∂t1 = [2, 4, 6]`.
+
+![step_009 — final WHNF](docs/step_graph_ic_goal/step_009_final.png)
+
+Each step is one interaction rule firing through the WNF stack machine
+([`src/wnf/_.c`](src/wnf/_.c)); the per-interaction hook snapshots the
+heap after every fire.  Enable it with `THVM_STEP_GRAPH=1`; see
+[`docs/step_trampoline.md`](docs/step_trampoline.md).
+
+---
+
 ## Build
 
-**Test binaries** (macOS + Xcode CLT for Metal):
+Everything, including paclet + python:
 
 ```bash
-./build.sh              # all test_*.m → bin/
-make test_metal         # build + run test_term on GPU
-make test_train_metal   # build + run test_train on GPU
+./build.sh --all
 ```
 
-**CPU-only** quick loop:
+Per-binary build (compiles test drivers from `test/*.m` into `bin/`):
 
 ```bash
-make test
+./build.sh
 ```
 
-**README code examples** (forward + autograd bundle; CPU then Metal):
+Metal shader library (once):
 
 ```bash
-make readme-verify
+make shaders.metallib
 ```
 
-**Wolfram paclet** (macOS, Wolfram Language 13+):
+Wolfram paclet:
 
 ```bash
 ./build.sh --paclet
@@ -55,13 +88,7 @@ Get["TinyHVM`"]
 TInit["metal"]
 ```
 
-**Everything**:
-
-```bash
-./build.sh --all
-```
-
-Profiling: set `THVM_PROFILE` in the environment to enable step-level UOp timing (see `ThvmProfile` in `src/tinyhvm.h`).
+Profiling: set `THVM_PROFILE=1` to enable step-level UOp timing (see `ThvmProfile` in [`src/tinyhvm.h`](src/tinyhvm.h)).  Full env-var reference: [`docs/env.md`](docs/env.md).
 
 ---
 
@@ -69,16 +96,14 @@ Profiling: set `THVM_PROFILE` in the environment to enable step-level UOp timing
 
 Tests are plain C inside `.m` files; they `#include "../src/tinyhvm.c"` plus backends.
 
-### Higher-level ops today
-
-- **`Tensor` + `Linear`** ([`src/nn/tensor_api.c`](src/nn/tensor_api.c), declarations in [`src/tinyhvm.h`](src/tinyhvm.h)) — concise C wrappers over lazy terms: `tensor_matmul` / `tensor_add` / `tensor_mul` / `tensor_relu` / `tensor_sum_axes`, plus `linear_forward`.
-- **`thvm_tg_*`** ([`src/nn/tg_tensor.c`](src/nn/tg_tensor.c)) remains the lower-level tinygrad-shaped bridge (`Tensor.linear`/`dot` semantics).
-- **`Layer` + `thvm_sequential`** ([`src/tinyhvm.h`](src/tinyhvm.h), [`src/nn/sequential.c`](src/nn/sequential.c)) stays available for CNN-style stacks (conv, batchnorm, maxpool, flatten, linear, custom `LayerFn`).
+- **`Tensor` + `Linear`** ([`src/nn/tensor_api.c`](src/nn/tensor_api.c), declarations in [`src/tinyhvm.h`](src/tinyhvm.h)) — concise C wrappers over lazy terms: `tensor_matmul` / `tensor_add` / `tensor_mul` / `tensor_relu` / `tensor_sum_axes` / `tensor_conv2d` / `tensor_maxpool2d` / `tensor_batchnorm` / `tensor_softmax` / `tensor_cross_entropy`, plus `linear_forward`.
+- **`thvm_tg_*`** ([`src/nn/tg_tensor.c`](src/nn/tg_tensor.c)) is the lower-level tinygrad-shaped bridge (`Tensor.linear`/`dot` semantics).
+- **`Layer` + `thvm_sequential`** ([`src/tinyhvm.h`](src/tinyhvm.h), [`src/nn/sequential.c`](src/nn/sequential.c)) stacks CNN-style layers (conv, batchnorm, maxpool, flatten, linear, custom `LayerFn`).
 - **Python surface** keeps the same concise names (`tinyhvm.Tensor`, `tinyhvm.nn.Linear`) in [`py/tinyhvm/tensor.py`](py/tinyhvm/tensor.py) and [`py/tinyhvm/nn/__init__.py`](py/tinyhvm/nn/__init__.py).
 
 Lazy tensor compute stays **inet-normal** until you **`thvm_eval`** the term you want realized (scheduler + Metal/CPU dispatch inside the TU). Then **`thvm_to_host`** reads a concrete buffer.
 
-**Forward: `relu(linear(x, w, b))`** — same numerics as the old `relu(x@w+b)` README check (`make readme-verify`):
+**Forward: `relu(linear(x, w, b))`**
 
 ```c
 TinyHVM *ctx = thvm_init("metal");  // or "cpu"
@@ -99,7 +124,7 @@ f32 *out = tensor_to_host_f32(result);
 thvm_free(ctx);
 ```
 
-**Autograd: `sum(relu(x * w))` w.r.t. `w`** (same as `test/test_tiny_single_param_keep.m`; `make readme-verify`):
+**Autograd: `sum(relu(x * w))` w.r.t. `w`**
 
 ```c
 TinyHVM *ctx = thvm_init("metal");
@@ -120,53 +145,23 @@ f32 *dw = tensor_to_host_f32(tensor_bundle_get(bundle, 0));
 thvm_free(ctx);
 ```
 
-Inet-style `thvm_grad` / `thvm_reduce` patterns for tiny scalars still appear in `test/test_term.m` (e.g. `test_grad_x2`); full lazy backward graphs usually use **`thvm_grad_keep`** (or multi-arg variants) plus **`thvm_eval`** before readback.
+Lower-level inet patterns using `thvm_grad` / `thvm_reduce` still appear in the gradient rule tests (e.g. [`test/test_grad_rules.m`](test/test_grad_rules.m)).  For higher-level lazy backward graphs use `tensor_backward_keep` (or `thvm_grad_bundle` for raw Terms) and `thvm_eval` before readback.
 
-Public declarations live in [`src/tinyhvm.h`](src/tinyhvm.h). `thvm_eval` is in [`src/schedule/_.c`](src/schedule/_.c); tests such as [`test/test_tiny.m`](test/test_tiny.m) call it the same way as here.
+Public declarations live in [`src/tinyhvm.h`](src/tinyhvm.h). `thvm_eval` is in [`src/schedule/_.c`](src/schedule/_.c).
 
 ---
 
-## Graph pictures (recent runs)
+## Evaluation stages
 
-The repo keeps **Graphviz** exports from debugging runs (`THVM_STEP_GRAPH` / `THVM_GRAPH`, see `src/debug/graph.c` and `thvm_eval` in `src/schedule/_.c`). Two useful views:
+`thvm_eval` is a staged pipeline; each arrow below is one pass over the term graph. [`docs/eval.md`](docs/eval.md) walks through them in detail, and [`docs/reduction.md`](docs/reduction.md) covers the underlying stack machine.
 
-1. **Step graphs** — PNGs under `graphs/<fixture>/` while the reducer walks a training-shaped graph (examples below: `tiny_linear_bias_keep`).
-2. **Pipeline snapshots** — `thvm_0` … `thvm_3` under `graphs/…` for **pre-reduce → post-reduce → post-schedule → post-dispatch** (Metal fixture `tiny_linear_bias_keep_metal`).
-
-### How step filenames relate to highlights
-
-Each step image is written after a reduction step, and the basename now matches the red-highlighted
-interaction that is actually visible in that image:
-`step_NNN_NAME1_hX_NAME2_hY.png`, for example `step_000_REF_h35_LAM_h39.png` or
-`step_009_ERA_h55_TEN_h38.png`. `NAME1/hX` is the highlighted node/rule focus and `NAME2/hY` is
-the highlighted peer on that same red edge.
-
-The DOT metadata stores that same visible interaction in `PREV_INTERACTION`. Once the following
-step is emitted, the tracer rewrites `NEXT_INTERACTION` to the following step's basename so adjacent
-steps can still be checked for consistency.
-
-Final heap snapshots still end as `step_NNN_state_final.png`.
-
-For loop fixtures the repository now emits two parallel step sets:
-
-1. `n*_steps/` traces structural unfolding without firing FUSE.
-2. `n*_steps_fuse_vals/` traces `FUSE(program)` propagation with tensor values so KERNEL updates stay visible.
-
-### Reduce → schedule → dispatch (phase 2, Metal)
-
-Lazy graph before reduction:
-
-![Pre-reduce — phase2 tiny_linear_bias_keep_metal](graphs/tiny_linear_bias_keep_metal/thvm_0_pre_reduce.png)
-
-After scheduling (work grouped for backends):
-
-![Post-schedule — phase2 tiny_linear_bias_keep_metal](graphs/tiny_linear_bias_keep_metal/thvm_2_post_sched.png)
-
-After dispatch (concrete tensor / kernel wiring):
-
-![Post-dispatch — phase2 tiny_linear_bias_keep_metal](graphs/tiny_linear_bias_keep_metal/thvm_3_post_dispatch.png)
-
-More graphs live under [`graphs/`](graphs/) (other fixtures: `tiny_single_param_keep`, non-`_metal` CPU runs, etc.).
+```
+thvm_reduce       → IC normal form (APP/LAM/IFZ/GRAD/MAT/DUP fire; compute TOPs stay lazy)
+thvm_normalize    → deep-WHNF walk (root-reachable; serial WsDeque)
+FUSE pass         → FUSE(binary(a,b)) → KERNEL(FUSE(a), FUSE(b), uop)
+global passes     → rewrite the settled kernel DAG; install EXEC triggers
+second reduce     → fire EXEC / dispatch KERNEL → TEN on demand
+```
 
 ---
 
@@ -174,14 +169,22 @@ More graphs live under [`graphs/`](graphs/) (other fixtures: `tiny_single_param_
 
 | Topic | Location |
 |--------|-----------|
-| Term layout, UOp codes, profiling | `src/tinyhvm.h` |
-| Interaction rules | `src/interact/_.c`, `src/interact/grad.c` |
-| Reducer | `src/reduce/_.c` |
-| Scheduler | `src/schedule/_.c` |
-| Gradients | `src/grad/_.c` |
-| Metal JIT | `src/backend/metal/codegen.m` |
-| MNIST-style CNN smoke test | `test/test_cnn_small.m` |
-| Design notes | `resources/`, `Notebooks/` |
+| Term layout, UOp codes, context struct | [`src/tinyhvm.h`](src/tinyhvm.h) |
+| **How reduction works** (heap, stack machine, normalize) | [`docs/reduction.md`](docs/reduction.md) |
+| **Canonical VJP step trace** (the pictures above) | [`docs/step_graph_ic_goal.md`](docs/step_graph_ic_goal.md) |
+| **Step-graph tracer C ↔ WL bridge** | [`docs/step_trampoline.md`](docs/step_trampoline.md) |
+| **Evaluation pipeline** (local + global, FUSE, KERNEL) | [`docs/eval.md`](docs/eval.md) |
+| **Gradient semantics** (VJP rules, DUP interaction) | [`docs/grad.md`](docs/grad.md) |
+| **Structural fusion** (FUSE → KERNEL) | [`docs/fusion.md`](docs/fusion.md) |
+| **Kernel cache + epochs** | [`docs/kernel_cache.md`](docs/kernel_cache.md) |
+| **Env vars** (THVM_STEP_GRAPH, THVM_GRAPH, …) | [`docs/env.md`](docs/env.md) |
+| Interaction rules | [`src/interact/_.c`](src/interact/_.c), [`src/interact/grad.c`](src/interact/grad.c), [`src/interact/tensor_ops.c`](src/interact/tensor_ops.c), [`src/interact/combinators.c`](src/interact/combinators.c) |
+| WNF stack machine | [`src/wnf/_.c`](src/wnf/_.c) |
+| Deep-WHNF walker | [`src/parallel/normalize.c`](src/parallel/normalize.c) |
+| Scheduler | [`src/schedule/_.c`](src/schedule/_.c) |
+| Metal JIT | [`src/backend/metal/codegen.m`](src/backend/metal/codegen.m), [`src/backend/metal/jit.m`](src/backend/metal/jit.m) |
+| Tutorial chapters | [`docs/tutorial/`](docs/tutorial/) |
+| Design notes | [`resources/`](resources/), [`Notebooks/`](Notebooks/) |
 
 ---
 

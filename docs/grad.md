@@ -1,9 +1,12 @@
 # GRAD: Gradient Semantics in TinyHVM
 
 TinyHVM differentiates through its interaction-calculus term graph via a single
-UOP: **`UOP_GRAD(y, target)`**. Reducing a `GRAD` term produces a tensor of
-`target.shape` holding the scalar-loss gradient `∂(sum y)/∂target` — i.e.
-reverse-mode automatic differentiation seeded with a ones-cotangent on `y`.
+UOP: **`UOP_GRAD(y, target)`**.  Reducing a `GRAD` term produces a tensor of
+`target.shape` holding `∂(Σⱼ y[j])/∂target` — reverse-mode VJP seeded with a
+ones-cotangent on `y`.  A second UOP, `UOP_GRAD_FWD`, exists in
+[`src/interact/grad.c`](../src/interact/grad.c) for forward-mode (JVP) but is
+not yet part of the public API; the tracing hook in
+[`src/schedule/_.c`](../src/schedule/_.c) detects both.
 
 The implementation lives in [`src/interact/grad.c`](../src/interact/grad.c)
 (rules) and [`src/inet/_.c`](../src/inet/_.c) (`thvm_grad` builder).
@@ -159,18 +162,20 @@ DUP combinator — it falls through via the HVM4-style SUB-bit substitution
   Leibniz rule, which requires both operands to have shape `target.shape`.
   Pipelines where one operand is a `pad(x)` or `expand(x)` and the other is
   `target.shape` fail shape-check: `b * GRAD(a, t)` multiplies `b` (y-shape)
-  by a `target.shape` gradient. Fixing this requires a general reverse-mode
-  VJP for MUL: `sum_to_shape(b ⊙ upstream_grad_of_a, target.shape)`. Affects
+  by a `target.shape` gradient.  The general reverse-mode VJP for MUL —
+  `sum_to_shape(b ⊙ upstream_grad_of_a, target.shape)` — needs an explicit
+  cotangent-carrying primitive (see last bullet).  Affects
   `test_e2e_conv_like`.
 - **In-VM recursive training loop.** `IFZ + REF + APP + ASSIGN + SEQ`
   recursion (for on-device training loops) currently returns NULL on readback.
-  Not a grad-rule problem — reducer/scheduler integration work.
-  Affects `test_e2e_recursive_sgd`.
+  Not a grad-rule problem — reducer/scheduler integration work tracked in
+  [`recursion.md`](recursion.md).  Affects `test_e2e_recursive_sgd`.
 - **No explicit cotangent-carrying primitive.** A GRAD node that takes an
   incoming gradient on its aux port (`GRAD(y, cot)`) would let the rules
-  express reverse-mode VJP naturally without assuming ones-seed. This is the
-  cleanest path to fix MUL/conv; it's the primary design work item for the
-  next GRAD refactor.
+  express reverse-mode VJP naturally without assuming ones-seed.  This is the
+  cleanest path to fix MUL/conv and is the current direction of the VJP
+  refactor — see [`step_graph_ic_goal.md`](step_graph_ic_goal.md) for the
+  target IC topology.
 
 ## Files
 

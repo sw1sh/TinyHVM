@@ -33,9 +33,10 @@ Some helpers explicitly treat `"0"` as false; those are called out below.
 | `THVM_STEP_GRAPH` | bool | Enables per-interaction step tracing and emits `step_*.dot` / `step_*.png`. |
 | `THVM_STEP_GRAPH_DIR` | path, default `graphs` | Output directory for step-graph dumps. |
 | `THVM_STEP_GRAPH_MAX` | integer, default `512` | Maximum number of step snapshots written in one step-graph session. |
-| `THVM_STEP_GRAPH_DIAG` | bool | Prints step-graph chooser/debug diagnostics to stderr. |
+| `THVM_STEP_GRAPH_NO_FUSE` | bool | Skips phase-2 FUSE kernelisation inside the step-graph session. The dumps stop after the GRAD-commute phase. |
 | `THVM_STEP_GRAPH_NO_PNG` | bool | Writes `.dot` files only; skips `dot -Tpng` rendering for step graphs. Lower-graph PNG generation also respects this during step-trace runs. |
 | `THVM_STEP_GRAPH_TENSOR_VALUES` | bool | Includes literal tensor values in step-graph node labels. |
+| `THVM_GRAPH_STOP_AFTER_SWEEP` | bool | Returns the post-FUSE-sweep topology without running the final `thvm_normalize`; useful when inspecting the exact sweep state. |
 | `THVM_HEAP_DOT_RAW_ONLY` | bool, `"0"` disables | Forces the heap renderer into raw-only mode and disables semantic + step overlays. |
 | `THVM_HEAP_DOT_SEMANTIC` | bool, default `1`, `"0"` disables | Controls semantic overlay rendering for heap/graph dumps when raw-only mode is off. |
 | `THVM_HEAP_DOT_STEP` | bool, default `1`, `"0"` disables | Controls step-specific overlay rendering when raw-only mode is off. |
@@ -57,6 +58,8 @@ Some helpers explicitly treat `"0"` as false; those are called out below.
 | `THVM_LOOP_DIAG` | bool | Focused diagnostics for recursive loops, `ALO`, `GRAD`, keep-bundle handling, and related net rewrites. `BUNDLE_ACCUM*` entries include a non-destructive tensor-value probe on each deposit (`probe=`, `prev_v=`, `grad_v=`). `ASSIGN_FIRE` shows the first 3 elements of src/dst tensors. |
 | `THVM_DUP_DIAG` | bool | Logs every DUP firing (`DUP_FIRE`) with label, firing DP index, backing `val`, both consumer slots' current contents, and the values about to be written. Flags cases where one port_slot is 0 (`[ORPHAN]`) — useful when the other DUP port has no consumer yet, which can indicate a race. |
 | `THVM_GRAD_TRACE` | bool | Umbrella flag — turns on `THVM_LOOP_DIAG`, `THVM_SCHED_DIAG`, and `THVM_DUP_DIAG` together for end-to-end grad investigation. |
+| `THVM_INTERACT_TRACE` | bool | Streams each wnf interaction rule name to stderr as it fires. Orthogonal to step-graph dumping. |
+| `THVM_MAT_FORCE_WNF` | bool, `"0"` disables | Forces `MAT` to eagerly `thvm_eval` its scrutinee before matching. Debug-only knob for CTR/MAT-CTR destructuring bugs. |
 | `THVM_LOWER_DIAG` | bool | Prints lowering summaries, including whether a kernel was lowered or left alone. |
 | `THVM_LOWER_TRACE` | bool | Per-kernel lowering trace output. |
 | `THVM_KERN_DIAG` | bool | Additional kernel diagnostics in fusion/lowering paths, especially for reduction kernels. |

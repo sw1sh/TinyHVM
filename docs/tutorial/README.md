@@ -2,7 +2,7 @@
 
 This tutorial builds your understanding of TinyHVM from the ground up — starting with how a single 64-bit word encodes a node, through the interaction rules that drive all computation, up to GPU tensor operations and automatic differentiation.
 
-Each chapter has a companion Wolfram Notebook in `Notebooks/tutorial/` for interactive exploration.
+A companion Wolfram Notebook ([`01-terms.nb`](01-terms.nb)) is provided for Chapter 1; the remaining chapters are markdown and can be explored interactively by pasting the snippets into a notebook with the TinyHVM paclet loaded (see *Setup*).
 
 ## Chapters
 

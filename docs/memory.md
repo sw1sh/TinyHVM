@@ -1,5 +1,12 @@
 # Memory Planning
 
+> **Status: proposal.** This document describes a design direction
+> informed by the tinygrad memory planner.  TLSF is not yet
+> implemented in TinyHVM; the current allocator is the per-step slot
+> reuse logic in `src/schedule/_.c` plus the array pool in
+> `src/backend/cpu/pool.c`.  Treat the "TLSF in TinyHVM" section
+> below as a roadmap, not a spec of existing code.
+
 ## Problem
 
 The scheduler currently allocates physical tensor storage (`tensor_create()`) at schedule time

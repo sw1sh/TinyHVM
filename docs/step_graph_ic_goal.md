@@ -1,14 +1,17 @@
 # Step-graph target: IC-native VJP interaction trace
 
-Goal for the wnf VJP refactor.  Each step is one IC interaction.  The
-redex (principal-port edge of the two interacting terms) is drawn red.
-All mutations are persistent: a consumed node becomes forward history
-(no longer a redex agent), sub-GRADs get fresh cells, leaf-annihilated
-GRADs vanish.  No frames, no restore-after-dump hacks.
+Canonical step-by-step trace of `vjp_sum_of_square` under the IC-native
+VJP rules.  Each step is one wnf interaction.  The redex (the principal
+edge that is about to fire) is drawn in red.  All mutations are
+persistent: consumed redex agents become forward history, sub-GRADs get
+fresh cells, leaf-annihilated GRADs vanish.  No frames, no
+restore-after-dump hacks.
 
-Dot sources + rendered PNGs live in [step_graph_ic_goal/](step_graph_ic_goal/).
+The `.dot` sources and rendered PNGs live in
+[step_graph_ic_goal/](step_graph_ic_goal/); they are produced by
+`scripts/run_vjp_step_graph.sh png`.
 
-Example: `vjp_sum_of_square`
+Example source:
 
 ```c
 f32 xd[] = {1, 2, 3};
@@ -20,291 +23,233 @@ thvm_eval(ctx, thvm_grad(ctx, y, t1));  // expect [2, 4, 6]
 
 ## GRAD term layout (IC)
 
-A `GRAD` agent has 2 principal input ports and 1 output port:
+A `GRAD` agent is a **1-in/2-out T-junction**:
 
-- `y`  — the forward term being differentiated.  Connected to the
-  principal port of whatever produced the scalar.  **This is the redex
-  edge.**
-- `gy` — the cotangent accumulator.  Outermost GRAD is seeded with
-  `ones(y.shape)`.
-- `out` — the contributed gradient.
+- **`y` (principal input)** — the forward term being differentiated.
+  The redex edge is always incident on this port.
+- **`v_pass` (output)** — the forward value being carried through.
+  Feeds a dedicated forward FUSE (`FUSE_f`) that produces `y`.
+- **`∂v` (output)** — the cotangent edge.  Feeds a dedicated backward
+  FUSE (`FUSE_b`) that produces `∂y/∂target`.
 
 The target tensor is carried in the GRAD's label only (`d/d(t1)`); it
-never appears as an edge.  Leaf-annihilation matches the target against
-whatever reduces at the `y` port.
+never appears as an edge.  No concrete `ones` seed is drawn in the
+initial state — cotangent leaves materialize lazily at `GRAD ⊳ TEN`
+(leaf-annihilation), one `ones_<port>` per matching target read.
+
+Both FUSEs wrap the root from step 0 and absorb compute TOPs one at a
+time as they become reachable.
 
 ## Per-rule rewrites
 
-| head at `y`         | rewrite                                                                |
-|---------------------|------------------------------------------------------------------------|
-| `TEN == tgt`        | GRAD annihilates → `gy` becomes the output.                            |
-| `TEN != tgt`        | GRAD annihilates to ERA.                                               |
-| `SUM(a, axes)`      | GRAD slides to `a`; `gy ← EXPAND(gy, shape(a))`.                       |
-| `MUL(a, b)`         | two sub-GRADs (y=a, y=b); cotangents `MUL(gy, b)` / `MUL(gy, a)`; ADD outputs. |
-| `ADD(a, b)`         | two sub-GRADs (y=a, y=b); both share gy via DUP; ADD outputs.          |
-| `NEG(a)`            | slide to `a`; `gy ← NEG(gy)`.                                          |
-| `EXP(a)`            | slide to `a`; `gy ← MUL(gy, EXP(a))` (EXP reuses forward value).       |
-| `LOG(a)`            | slide to `a`; `gy ← DIV(gy, a)`.                                       |
-| … (RELU/SQRT/etc.)  | analogous unary wrap.                                                  |
+The VJP rules match tinygrad's primal-to-backward recipes.  Each rule
+reparents the GRAD around the interacting forward TOP: `v_pass`
+continues through the forward operator, `∂v` gets wrapped in the
+operator's adjoint.
 
-Rules with a binary forward (MUL/ADD/SUB/DIV/MAX/…) always produce
-**two fresh GRAD cells** plus an ADD combining their outputs.  Unary
-rules **mutate** the GRAD cell in place: slide `y` to the forward's
-operand, replace `gy` with the wrapped version.
+| head at `y`         | v_pass rewrite                     | ∂v rewrite                                  |
+|---------------------|------------------------------------|---------------------------------------------|
+| `TEN == tgt`        | aliases to the TEN                 | materializes `ones(tgt.shape)`              |
+| `TEN != tgt`        | aliases to the TEN                 | erases                                      |
+| `SUM(a, axes)`      | feeds `a → SUM → v_pass_out`       | `EXPAND(∂v, a.shape)` (tinygrad: REDUCE_AXIS(ADD) bwd is EXPAND only) |
+| `MUL(a, b)`         | two sub-GRADs (one per operand); each v_pass feeds the original MUL | chain-MUL: left emits `b·∂a`, right emits `a·∂b`; ADD sums them |
+| `ADD(a, b)`         | two sub-GRADs                      | both share `∂v` (via DUP if non-atom); no chain mul |
+| `NEG(a)`            | slide to `a`                       | `NEG(∂v)`                                   |
+| `EXP(a)`            | slide to `a`                       | `MUL(∂v, EXP(a))`                           |
+| `LOG(a)`            | slide to `a`                       | `DIV(∂v, a)`                                |
+| … (RELU/SQRT/etc.) | analogous unary wrap               | analogous unary wrap                        |
 
-`gy` is a compute TOP whenever a binary rule shares it — so a **DUP**
-cell is allocated to fan it out.  `t1` (and other TEN leaves) are
-aliased without DUP.
+Binary forwards (MUL/ADD/SUB/DIV/MAX/…) produce **two fresh GRAD
+cells** plus an ADD combining the per-operand contributions.  Unary
+rules mutate the GRAD in place: `y` slides to the forward's operand,
+`∂v` is wrapped in the operator's adjoint.
 
-**FUSE is always at the root.**  It waits on GRAD to reduce, then
-absorbs compute TOPs one at a time into a growing KERNEL bubble.
-Forward-history nodes (SUM, MUL from the original forward pass) stay
-visible outside the kernel — they're not redex agents anymore.
+`∂v` is a compute TOP whenever a binary rule shares it — a **DUP** cell
+fans it out.  `t1` (and other TEN leaves) are aliased without DUP.
 
 ## Interaction trace for `vjp_sum_of_square`
 
-Red edge = redex (the principal-port edge that's about to fire).
+Red edge = redex (the principal-port edge that is about to fire).
 
 ### step_000 — initial state
 
-Forward `MUL → SUM` already built; `thvm_grad(y, t1)` wraps it with a
-GRAD seeded to `ones([1])`; FUSE sits at the root waiting on GRAD.
+Forward `MUL → SUM` already built.  `thvm_grad(y, t1)` wraps the SUM
+result with a GRAD T-junction.  `FUSE_f`/`FUSE_b` sit at the two roots
+waiting on GRAD.  No concrete seed yet.
 
-![step_000](step_graph_ic_goal/step_000_initial.png)
+![step_000](step_graph_ic_goal/step_000_GRAD-SUM.png)
 
-```mermaid
-flowchart BT
-    t1["t1<br/>[3] f32"]:::ten
-    axes["axes<br/>[1] i32"]:::meta
-    ones["ones<br/>[1] f32"]:::meta
-    MUL["MUL<br/>[3]"]:::ew
-    SUM["SUM<br/>[1]"]:::red
-    GRAD["GRAD d/d(t1)"]:::grad
-    FUSE{{FUSE}}:::fuse
-    out(( ))
-    t1 -->|a| MUL
-    t1 -->|b| MUL
-    MUL -->|in| SUM
-    axes -->|axes| SUM
-    SUM -->|y| GRAD
-    ones -->|gy| GRAD
-    GRAD -->|in| FUSE
-    FUSE -->|out| out
-    linkStyle 4 stroke:#cc0000,stroke-width:3px
-    classDef ten fill:#ffe0e0
-    classDef meta fill:#e0e0e0
-    classDef ew fill:#cce5ff
-    classDef red fill:#ffcccc
-    classDef grad fill:#e8d0ff
-    classDef fuse fill:#b3e6ff
-```
+Redex: `SUM → GRAD` (principal y-edge).
 
 ### step_001 — `GRAD ⊳ SUM` fires
 
-GRAD slides from SUM to MUL (SUM's argument).  SUM stays in the graph
-as forward history.  `ones` is wrapped in a fresh EXPAND to match
-MUL's shape `[3]`.  FUSE still waiting.
+GRAD reparents **above** SUM.  `v_pass` now feeds SUM (forward
+continues through to `FUSE_f`); `∂v` feeds a fresh `EXPAND(·, [3])`
+which then feeds `FUSE_b`.  GRAD's `y` port is now on MUL.
 
-![step_001](step_graph_ic_goal/step_001_GRAD-SUM.png)
+![step_001](step_graph_ic_goal/step_001_GRAD-MUL.png)
 
-```mermaid
-flowchart BT
-    t1["t1<br/>[3] f32"]:::ten
-    axes["axes<br/>[1] i32"]:::meta
-    ones["ones<br/>[1] f32"]:::meta
-    shape3["[3]<br/>shape"]:::meta
-    MUL["MUL<br/>[3]"]:::ew
-    SUM["SUM<br/>[1]"]:::red
-    EXPAND["EXPAND<br/>[3]"]:::view
-    GRAD["GRAD d/d(t1)"]:::grad
-    FUSE{{FUSE}}:::fuse
-    out(( ))
-    t1 -->|a| MUL
-    t1 -->|b| MUL
-    MUL -->|in| SUM
-    axes -->|axes| SUM
-    ones -->|in| EXPAND
-    shape3 -->|shape| EXPAND
-    MUL -->|y| GRAD
-    EXPAND -->|gy| GRAD
-    GRAD -->|in| FUSE
-    FUSE -->|out| out
-    linkStyle 6 stroke:#cc0000,stroke-width:3px
-    classDef ten fill:#ffe0e0
-    classDef meta fill:#e0e0e0
-    classDef ew fill:#cce5ff
-    classDef red fill:#ffcccc
-    classDef view fill:#fff3cd
-    classDef grad fill:#e8d0ff
-    classDef fuse fill:#b3e6ff
-```
+Redex: `MUL → GRAD`.
 
 ### step_002 — `GRAD ⊳ MUL` fires (binary Leibniz)
 
-Two sub-GRADs appear, one per MUL operand (both are `t1` in this
-example).  The incoming EXPAND cotangent is DUP'd; each sub-GRAD
-cross-multiplies with the other operand.  An ADD combines the two
-sub-GRAD outputs and sits below FUSE.  MUL stays as forward history.
+Two sub-GRADs (`GRAD_a`, `GRAD_b`) on `t1`, each a 1-in/2-out
+T-junction.  Each sub-GRAD's `v_pass` feeds the original forward MUL
+(carrying `t1` through the `a` / `b` port).  Each sub-GRAD's `∂v` feeds
+a **chain MUL** that multiplies the cotangent by the *other* operand
+(left: `b·∂a`; right: `a·∂b`).  An `ADD_leib` sums the two chain MULs
+into `∂v` at the MUL level, which feeds the outer EXPAND.  `t1` is a
+TEN atom — aliased into all four consumers without DUP.
 
-![step_002](step_graph_ic_goal/step_002_GRAD-MUL.png)
+![step_002](step_graph_ic_goal/step_002_GRAD-TEN_a.png)
 
-```mermaid
-flowchart BT
-    t1["t1<br/>[3] f32"]:::ten
-    ones["ones<br/>[1] f32"]:::meta
-    shape3["[3]<br/>shape"]:::meta
-    MUL["MUL<br/>[3]"]:::ew
-    EXPAND["EXPAND<br/>[3]"]:::view
-    DUP(( )):::dup
-    MULa["MUL_a<br/>[3]"]:::ew
-    MULb["MUL_b<br/>[3]"]:::ew
-    GRADa["GRAD_a<br/>d/d(t1)"]:::grad
-    GRADb["GRAD_b<br/>d/d(t1)"]:::grad
-    ADD["ADD<br/>[3]"]:::ew
-    FUSE{{FUSE}}:::fuse
-    out(( ))
-    t1 -->|a| MUL
-    t1 -->|b| MUL
-    ones -->|in| EXPAND
-    shape3 -->|shape| EXPAND
-    EXPAND --> DUP
-    DUP -->|dp0| MULa
-    DUP -->|dp1| MULb
-    t1 -->|b| MULa
-    t1 -->|b| MULb
-    t1 -->|y| GRADa
-    MULa -->|gy| GRADa
-    t1 -->|y| GRADb
-    MULb -->|gy| GRADb
-    GRADa -->|a| ADD
-    GRADb -->|b| ADD
-    ADD -->|in| FUSE
-    FUSE -->|out| out
-    linkStyle 9 stroke:#cc0000,stroke-width:3px
-    classDef ten fill:#ffe0e0
-    classDef meta fill:#e0e0e0
-    classDef ew fill:#cce5ff
-    classDef view fill:#fff3cd
-    classDef grad fill:#e8d0ff
-    classDef fuse fill:#b3e6ff
-    classDef dup fill:#d4b8e8,stroke:#8a63b7
-```
+Redex: `t1 → GRAD_a` (left sub-GRAD's principal y-edge).
 
-### step_003 — `GRAD_a ⊳ TEN` fires
+### step_003 — `GRAD_a ⊳ TEN(t1)` fires (target match)
 
-`t1 == tgt` match.  GRAD_a annihilates; its gy (MUL_a) takes GRAD_a's
-place feeding ADD's a-port directly.  The right arm is next.
+Leaf-annihilation: `t1 == tgt`.  GRAD_a vanishes.  Its `v_pass` output
+aliases directly to `t1` (feeding forward MUL's `a` port).  Its `∂v`
+output materializes `ones_a[3]` — the first concrete cotangent leaf in
+the graph — which feeds `MUL_ca`'s `∂a` port.
 
-![step_003](step_graph_ic_goal/step_003_GRAD-TEN_a.png)
+![step_003](step_graph_ic_goal/step_003_GRAD-TEN_b.png)
 
-### step_004 — `GRAD_b ⊳ TEN` fires
+Redex: `t1 → GRAD_b` (symmetric right arm).
 
-Same rule for the right arm.  MUL_b feeds ADD's b-port.  No GRAD nodes
-remain.  Next redex is the FUSE-at-root meeting ADD's principal port.
+### step_004 — `GRAD_b ⊳ TEN(t1)` fires (target match)
 
-![step_004](step_graph_ic_goal/step_004_GRAD-TEN_b.png)
+Same rule for the right arm.  `ones_b[3]` materializes into
+`MUL_cb`'s `∂b` port.  No GRAD agents remain.  Graph is now a pure
+forward + backward compute tree, ready for FUSE kernelisation.
 
-### step_005 — `FUSE ⊳ ADD` fires
+![step_004](step_graph_ic_goal/step_004_FUSE-SUM.png)
 
-ADD absorbed into a growing KERNEL bubble.  FUSE now has two principal
-inputs (MUL_a, MUL_b) where ADD sat.
+Redex: `SUM → FUSE_f` (first forward TOP to absorb).
 
-![step_005](step_graph_ic_goal/step_005_FUSE-ADD.png)
+### step_005 — `FUSE_f ⊳ SUM` fires (forward kernelisation begins)
 
-### step_006 — `FUSE ⊳ MUL_a` fires
+`SUM` becomes `KERNEL_SUM`.  A fresh `FUSE_f` spawns on `SUM`'s compute
+input (axes is metadata, passes through without a FUSE).
 
-Left MUL cotangent absorbed.  Kernel holds {ADD, MUL_a}; boundary
-inputs: DUP.dp0, t1, MUL_b.
+![step_005](step_graph_ic_goal/step_005_FUSE-MUL_fwd.png)
 
-![step_006](step_graph_ic_goal/step_006_FUSE-MUL_a.png)
+Redex: `MUL → FUSE_f` (forward MUL is next).
 
-### step_007 — `FUSE ⊳ MUL_b` fires
+### step_006 — `FUSE_f ⊳ MUL` fires
 
-Right MUL cotangent absorbed.  Kernel holds {ADD, MUL_a, MUL_b}; DUP
-is now at the boundary.
+Forward `MUL` becomes `KERNEL_MUL`.  Its inputs are `t1` (TEN leaves);
+`FUSE ⊳ TEN` annihilates, so `t1` aliases directly into `KERNEL_MUL`
+without spawning new FUSEs.  The graph now has two adjacent forward
+KERNELs sharing a principal edge.
 
-![step_007](step_graph_ic_goal/step_007_FUSE-MUL_b.png)
+![step_006](step_graph_ic_goal/step_006_KERNEL-KERNEL_fwd.png)
 
-### step_008 — `FUSE ⊳ DUP` fires
+Redex: `KERNEL_MUL → KERNEL_SUM` (K ⊳ K merge).
 
-DUP absorbed.  Sharing is kernel-internal.  EXPAND is the last compute
-TOP outside.
+### step_007 — `KERNEL_MUL ⊳ KERNEL_SUM` fires (forward merge)
 
-![step_008](step_graph_ic_goal/step_008_FUSE-DUP.png)
+The two forward kernels merge into `KERNEL_fwd` = `{MUL, SUM}`.
+Forward is now a single kernel taking `(t1, axes)` and producing `y`.
+Backward kernelisation starts next at EXPAND — the only backward TOP
+directly adjacent to `FUSE_b`.
 
-### step_009 — `FUSE ⊳ EXPAND` fires (final)
+![step_007](step_graph_ic_goal/step_007_FUSE-EXPAND.png)
 
-Every backward compute TOP is in the kernel.  Leaves (t1, ones, shape)
-and forward-history nodes (MUL, SUM) remain outside.  No more redexes.
-Running the kernel yields `[2, 4, 6]`.
+Redex: `EXPAND → FUSE_b`.
 
-![step_009](step_graph_ic_goal/step_009_FUSE-EXPAND.png)
+### step_008 — `FUSE_b` sweeps the backward subtree
+
+`FUSE_b` absorbs every backward TOP as it reaches them: EXPAND, then
+ADD_leib, then MUL_ca, then MUL_cb.  Each becomes a singleton
+`KERNEL_*` node wired along its original principal edge.  The snapshot
+shows the state after all four TOPs are singletons and the first K⊳K
+redex is ready to fire (`KERNEL_MUL_ca → KERNEL_ADD`).
+
+![step_008](step_graph_ic_goal/step_008_KERNEL-KERNEL_bwd.png)
+
+Redex: `KERNEL_MUL_ca → KERNEL_ADD` (one of several K⊳K redexes).
+
+### step_009 — K⊳K cascade merges the backward subtree (final)
+
+The backward KERNEL/KERNEL cascade merges all four singletons into
+`KERNEL_bwd` = `{MUL_ca, MUL_cb, ADD, EXPAND}`.  Final state: exactly
+two kernels — `KERNEL_fwd` producing `y`, `KERNEL_bwd` producing
+`∂y/∂t1`.  Both share `t1` as a TEN leaf.  No more redexes — WHNF.
+Running the kernels yields `y = [14]` and `∂y/∂t1 = [2, 4, 6]`.
+
+![step_009](step_graph_ic_goal/step_009_final.png)
 
 ## Summary
 
-| step | just fired         | redex after            |
-|------|--------------------|------------------------|
-| 000  | (initial)          | SUM → GRAD             |
-| 001  | GRAD ⊳ SUM         | MUL → GRAD             |
-| 002  | GRAD ⊳ MUL         | t1 → GRAD_a            |
-| 003  | GRAD_a ⊳ TEN       | t1 → GRAD_b            |
-| 004  | GRAD_b ⊳ TEN       | ADD → FUSE             |
-| 005  | FUSE ⊳ ADD         | MUL_a → FUSE           |
-| 006  | FUSE ⊳ MUL_a       | MUL_b → FUSE           |
-| 007  | FUSE ⊳ MUL_b       | DUP → FUSE             |
-| 008  | FUSE ⊳ DUP         | EXPAND → FUSE          |
-| 009  | FUSE ⊳ EXPAND      | (none — WHNF)          |
+| step | just fired                          | next redex                        |
+|------|-------------------------------------|-----------------------------------|
+| 000  | (initial — GRAD T-junction wired)   | SUM → GRAD                        |
+| 001  | GRAD ⊳ SUM (reparent above SUM)     | MUL → GRAD                        |
+| 002  | GRAD ⊳ MUL (binary split)           | t1 → GRAD_a                       |
+| 003  | GRAD_a ⊳ TEN(t1), ones_a born       | t1 → GRAD_b                       |
+| 004  | GRAD_b ⊳ TEN(t1), ones_b born       | SUM → FUSE_f                      |
+| 005  | FUSE_f ⊳ SUM                         | MUL → FUSE_f                      |
+| 006  | FUSE_f ⊳ MUL                         | KERNEL_MUL → KERNEL_SUM           |
+| 007  | K ⊳ K (forward merge)                | EXPAND → FUSE_b                   |
+| 008  | FUSE_b sweep (EXPAND, ADD, MUL_ca, MUL_cb) | KERNEL_MUL_ca → KERNEL_ADD |
+| 009  | K ⊳ K cascade (backward merge)       | (none — WHNF)                     |
 
 ## Properties the refactor must preserve
 
-1. **Persistent slide.**  Once `GRAD ⊳ SUM` fires, the GRAD is on MUL
-   for subsequent steps.  The heap reflects the IC state at all times;
-   no flicker, no restore-after-dump.
+1. **Persistent slide.**  Once `GRAD ⊳ SUM` fires, GRAD is on MUL for
+   subsequent steps.  The heap reflects the IC state at all times; no
+   flicker, no restore-after-dump.
 
-2. **Fresh cells for new GRADs.**  Each sub-GRAD (from binary rules)
+2. **Fresh cells for new GRADs.**  Each sub-GRAD from a binary rule
    gets its own heap cell.  The parent GRAD cell is consumed.
 
-3. **Forward history stays visible.**  Once a forward node has had its
-   VJP rule fire, it's no longer a redex agent but its cell stays in
-   the graph until the whole program finishes.  The dumper shows the
-   full forward+backward trace.
+3. **Forward history stays visible.**  A forward node that has had its
+   VJP rule fire is no longer a redex agent, but its cell stays in the
+   graph until the whole program finishes.  The dumper shows the full
+   forward + backward trace.
 
-4. **DUP only when sharing a non-atom.**  `gy` is a compute TOP →
-   DUP'd for binary rules.  TEN atoms are aliased without DUP.
+4. **DUP only when sharing a non-atom.**  `∂v` is a compute TOP when a
+   binary rule shares it → DUP'd.  TEN atoms are aliased without DUP.
 
-5. **Leaf annihilation.**  `GRAD ⊳ TEN` with matching target: the GRAD
-   erases and its gy propagates as the output contribution.  Local
-   rewrite — no frame, no stack.
+5. **Lazy cotangent seeds.**  No `ones` nodes exist until a
+   `GRAD ⊳ TEN` with matching target fires; each match materializes its
+   own `ones_<port>` at the point of contact.
 
-6. **FUSE at root always.**  FUSE doesn't wait for GRAD to finish then
-   suddenly appear; it's wrapping the root from step 0 and absorbs
-   compute TOPs one interaction at a time as they become reachable.
+6. **Dual FUSE at root.**  `FUSE_f` and `FUSE_b` wrap the GRAD
+   T-junction's two outputs from step 0 and kernelise compute TOPs one
+   interaction at a time as they become reachable.  Neither waits for
+   GRAD to finish before starting.
 
-7. **Value correctness.**  Final gradient is `[2, 4, 6]` for this
-   example.  All current numeric tests (143/143) continue to pass.
+7. **Value correctness.**  Final `∂y/∂t1 = [2, 4, 6]` for this
+   example.  All current numeric tests continue to pass.
 
 ## Implementation sketch
 
-- `thvm_grad` allocates 2 slots: `{y, gy}`.  `gy` starts as
-  `term_era()`.  Target is encoded in the GRAD head bits / label — not
-  in a heap slot.
+- `thvm_grad` allocates a GRAD cell whose slot 0 holds `y`.  The
+  target is encoded in the TOP head bits (label `d/d(tgt)`), not in a
+  heap slot.
 
-- wnf's `UOP_GRAD` enter: if `gy` is ERA, seed with `ones(y.shape)`
-  and write to slot 1.  Push a `WNF_F_VJP_IC` frame carrying only
-  the GRAD's heap loc.  Descend into y for WHNF.
+- `thvm_trace_step_graph_session` (src/schedule/_.c) wraps the GRAD
+  root in `FUSE_f` (forward output) and `FUSE_b` (backward output)
+  before driving reduction; both are heap-resident so the dumper
+  (include_all=1) walks them.
 
-- Apply-phase for `WNF_F_VJP_IC`: dispatch on `whnf`'s head.
-  - `TEN`: if match tgt → `whnf = gy`; else `whnf = term_era()`.
-    ERA the GRAD cell (sub-GRADs only; outermost GRAD reuses cell).
-  - Unary TOP (SUM/NEG/…): compute new_gy, mutate the GRAD cell in
-    place (`y = operand, gy = new_gy`), push a fresh VJP_IC frame,
-    `next = grad_term`, goto enter.
-  - Binary TOP (MUL/ADD/…): allocate two fresh GRAD cells + one ADD
-    cell + DUP if gy non-atom, wire up, consume old GRAD cell,
-    `whnf = add_term`.
+- wnf's VJP_RECURSE_INTO rewrites, for each `GRAD ⊳ TOP` rule:
+  - Unary TOP (SUM/NEG/…): reparent the GRAD cell above the TOP.
+    `v_pass` now feeds the TOP; `∂v` is wrapped in the TOP's adjoint.
+  - Binary TOP (MUL/ADD/…): allocate two fresh sub-GRAD cells, wire
+    their `v_pass` ports back into the original forward TOP, wire their
+    `∂v` ports through chain-MULs (MUL case) or shared-DUP (ADD case)
+    into an ADD_leib that feeds the parent ∂v.
+  - `TEN`: match target → alias `v_pass` to the TEN, materialize
+    `ones_<port>` on `∂v`, erase the GRAD.  Non-match → erase entirely.
 
-- Delete old `WNF_F_VJP`, `WNF_F_VJP_BIN1`, `WNF_F_VJP_BIN2` frame
-  kinds.  Delete `VJP_RECURSE_INTO` and `VJP_BINARY` macros.
+- Phase-1 of `thvm_trace_step_graph_session` runs `thvm_reduce` +
+  `thvm_normalize` with `g_thvm_defer_fuse_kernelize = 1` — GRAD
+  commutes fire first, matching the spec's steps 000..004.  Phase-2
+  runs the explicit `thvm_eval_fuse_fixed_point` — FUSE_f/FUSE_b
+  kernelisation fires, matching steps 005..009.
 
-- The step-graph hook becomes trivial: just highlight the current
-  redex edge.  No slide hack, no restore.
+- The step-graph hook (`wnf_step_session_hook`) renames each pending
+  frame with the rule that just fired and edits the highlight to point
+  at the next redex's principal edge.

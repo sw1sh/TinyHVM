@@ -184,11 +184,13 @@ TinyHVM exposes the two layers with different debug modes:
 
 ### Local Phase Dumps
 
-Use `THVM_STEP_GRAPH=1`, optionally with `THVM_STEP_GRAPH_FUSE=1`.
+Use `THVM_STEP_GRAPH=1`.  By default the two-phase session dumps
+both the GRAD-commute steps and the FUSE-kernelisation steps; pass
+`THVM_STEP_GRAPH_NO_FUSE=1` to stop after phase 1.
 
-This should show:
+This shows:
 
-1. structural local rewrites
+1. structural local rewrites (GRAD, APP/LAM, IFZ, MAT/CTR, DUP)
 2. `FUSE` propagation
 3. growing public `KERNEL` nodes
 4. the final settled monolithic `KERNEL`
@@ -220,13 +222,16 @@ Run the end-to-end local+global harness with:
 bash scripts/test_loop_local_global_eval.sh
 ```
 
-By default that wrapper uses the full `n=0..3` local regression, but runs the
-global coarse dump at `THVM_GLOBAL_TRAIN_STEPS=1` so the coarse graph artifact
-and the observable buffer update stay aligned in one minimal loop iteration.
+The wrapper reads `THVM_GLOBAL_TRAIN_STEPS` (default `1`) for the
+number of loop iterations in the global-pass dump; internally it
+passes that value as `THVM_TRAIN_STEPS` to the binary.  A value of `1`
+keeps the coarse graph artifact and the observable buffer update
+aligned in one minimal loop iteration.
 
 That script:
 
-1. runs the local step-graph regression on `test/test_loop_assign_simple.m`
+1. runs the local step-graph regression on the archived
+   `test/archive/test_loop_assign_simple.m`
 2. checks the fused local trace contract
 3. checks kernel redispatch on repeated loop iterations
 4. runs a global `THVM_GRAPH` dump for the same loop example
@@ -278,8 +283,10 @@ as richer global passes first, and only secondarily as new lowering opcodes.
 ## Key Files
 
 - `src/schedule/_.c` — `thvm_eval`, global passes, graph dump orchestration
-- `src/reduce/_.c` — reducer trampoline and local kernel readiness
-- `src/interact/_.c` — kernel helpers and public-kernel normalization
+- `src/wnf/_.c` — wnf reducer trampoline (`thvm_reduce`, `thvm_reduce_budget`)
+- `src/reduce/_.c` — kernel-readiness predicates used by FUSE / UOP_KERNEL
+- `src/parallel/normalize.c` — `thvm_normalize`, root-reachable WHNF walker
+- `src/interact/_.c` — interaction dispatcher and public-kernel helpers
 - `src/interact/tensor_ops.c` — `FUSE`, `KERNEL`, `EXEC`, and dispatch behavior
 - `src/lower/_.c` — private lowering IR (`LOP`) and `UOpKernel` emission
 - `src/tinyhvm.h` — `KOP`, `UOpKernel`, and `KernelEntry` definitions

@@ -1,9 +1,11 @@
 # Training Loop: Recursion Research
 
 Status: **active research** — the correct encoding of training loops within TinyHVM's
-interaction calculus is an open design problem.
+interaction calculus is an open design problem.  The existing loop test
+(see *Test* below) still uses DETACH; the architecture described here
+is the intended target, not current behaviour.
 
-## Decided Architecture (from Codex session 019d747c)
+## Decided Architecture
 
 The loop is **purely functional** — no DETACH, no ASSIGN, no side effects:
 
@@ -130,19 +132,21 @@ These are firm decisions — do not revisit:
 
 ## Test
 
-`test/test_tiny_linear_sgd_loop.m` — functional recursive linear SGD with:
+`test/archive/test_tiny_linear_sgd_loop.m` — functional recursive linear SGD with:
 - 4x3 weight matrix, 4-element bias
 - 2 training steps (configurable via `THVM_TRAIN_STEPS`)
 - CTR bundle for gradient returns
 - MAT destructuring for gradient extraction
-- **Currently still uses DETACH** — needs to be removed per this plan
+- **Currently still uses DETACH** — needs to be removed per this plan.
+  The test is parked in `test/archive/` while the loop redesign is in
+  flight; it is not part of the active regression suite.
 
 ## Files
 
-- `test/test_tiny_linear_sgd_loop.m` — functional loop test
+- `test/archive/test_tiny_linear_sgd_loop.m` — archived functional loop test
 - `src/interact/combinators.c` — APP/LAM/MAT/CTR/IFZ rules
 - `src/interact/tensor_ops.c` — DETACH/IFZ handlers
 - `src/schedule/_.c` — thvm_eval 3-phase orchestration
-- `src/reduce/_.c` — WNF conditions, direct UOP list
+- `src/wnf/_.c` — wnf reducer, direct UOP list
 - `src/clone/_.c` — term_clone (TAG_TOP shape metadata fix)
 - HVM4 reference: `/Users/swish/src/HVM4/docs/hvm/interactions`

@@ -1,5 +1,14 @@
 # Kernel Dependency Model
 
+> **Status: design notes.** None of the approaches below (A, B1, B2,
+> B3, or the hybrid) is implemented end-to-end today.  The scheduler
+> currently sequences ASSIGN and kernel reads via buffer epochs
+> (`docs/kernel_cache.md`), which covers the simple stepwise case
+> but not cross-iteration or cross-kernel planning.  This doc captures
+> the design options under consideration for a proper kernel
+> dependency DAG; the BRI / dependent-types section is speculative
+> future research.
+
 ## Problem
 
 When a training loop is unrolled lazily, multiple iterations' kernels and ASSIGNs
@@ -167,7 +176,8 @@ This is type-theoretic verification of buffer safety: proving at the type
 level that reads happen after writes. Much heavier than SEQ for practical
 ordering, but could be valuable for compile-time verification of kernel DAGs.
 
-See: `resources/icc_bridges.md` for full ICC theory.
+See [`resources/icc_bridges.md`](../resources/icc_bridges.md) for
+full ICC theory.
 
 ## Files
 

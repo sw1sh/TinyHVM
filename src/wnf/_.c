@@ -1772,14 +1772,20 @@ apply: {
                 heap_set(ctx, _sb_loc + 3, (bv)); \
                 Term _sub_a = term_new(TAG_TOP, UOP_GRAD, _sa_loc); \
                 Term _sub_b = term_new(TAG_TOP, UOP_GRAD, _sb_loc); \
-                /* Viz anchor: stash sub-GRAD TAG_TOP refs in a scratch slot \
-                 * so the step-graph dumper (include_all=1) walks them and  \
-                 * emits the two sub-GRAD nodes.  Nothing reads this slot — \
-                 * the cell only exists to reveal the Leibniz structure    \
-                 * that's already implied by VJP's stack-based eval. */    \
-                { u64 _anch = heap_alloc(ctx, 2); \
-                  heap_set(ctx, _anch + 0, _sub_a); \
-                  heap_set(ctx, _anch + 1, _sub_b); } \
+                /* Viz anchor: stash sub-GRAD TAG_TOP refs in a scratch cell \
+                 * AND a separate ADD(sub_a, sub_b) viz node so the         \
+                 * step-graph dumper (include_all=1) walks them and emits:   \
+                 *   - two sub-GRAD nodes (from the 2-slot sub_anchor),      \
+                 *   - an ADD node combining them (from the 1-slot           \
+                 *     add_anchor holding a TAG_TOP(UOP_ADD, sub_anchor)).   \
+                 * Eval ignores these cells; the Leibniz combine is still   \
+                 * done by BIN2 via the stack path. */                       \
+                { u64 _subs_loc = heap_alloc(ctx, 2); \
+                  heap_set(ctx, _subs_loc + 0, _sub_a); \
+                  heap_set(ctx, _subs_loc + 1, _sub_b); \
+                  u64 _add_anchor = heap_alloc(ctx, 1); \
+                  heap_set(ctx, _add_anchor, term_new(TAG_TOP, UOP_ADD, _subs_loc)); \
+                } \
                 WnfFrame _ph1 = { .kind = WNF_F_VJP_BIN1, .flags = 0, \
                     .t0 = tgt, .t1 = _sub_b, .t2 = 0, .t3 = 0 }; \
                 wnf_stack_push(_ph1); \

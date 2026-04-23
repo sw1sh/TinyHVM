@@ -1218,9 +1218,13 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
     }
     thvm_heap_dot_set_grad_cursor(0, 0);  // disable overlay; slide + hl does the job
 
-    thvm_heap_dot_set_include_all(1);
+    // Reachable-only rendering: walks only what's reachable from the
+    // session root term.  include_all=1 previously picked up every
+    // non-ERA heap slot, which during the fuse phase surfaces lots of
+    // scaffolding MUL/SUM cells that have been absorbed into kernels
+    // but still sit on heap.  Reachable-only prunes them, matching
+    // spec's cleaner kernel topology in steps 5-9.
     thvm_heap_dot_root(ctx, path, g_step_session_root);
-    thvm_heap_dot_set_include_all(0);
 
     // Dedup on rendered content — collapses enter-phase administrative
     // firings (VAR resolve, INC unwrap, ...) that don't change what the

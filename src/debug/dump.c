@@ -1767,18 +1767,18 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                          kid, (unsigned long long)val);
                 color = "#ccccff";  // light blue for exec triggers
             } else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) {
-                // 2-slot cell [body, target] shared by PIN and BW tag views
-                // (like DP0/DP1 of a DUP cell).  All three tags render as
-                // ONE GRAD node.
+                // 2-slot cell [body, target]; PIN and BW share it.  After
+                // commute, slot 1 gets overwritten with bwd_wrapper — we
+                // look up the original target from the side-table
+                // populated at GRAD construction.
+                extern Term thvm_grad_target_get(u64 loc);
+                Term tgt = thvm_grad_target_get(val);
                 char tgt_desc[64] = "?";
-                if (val + 1 < ctx->heap_pos) {
-                    Term tgt = heap_read(ctx, val + 1);
-                    if (term_tag(tgt) == TAG_TEN)
-                        snprintf(tgt_desc, sizeof(tgt_desc), "t%u", (u32)term_val(tgt));
-                    else if (term_tag(tgt) == TAG_DP0 || term_tag(tgt) == TAG_DP1)
-                        snprintf(tgt_desc, sizeof(tgt_desc), "dp@%llu",
-                                 (unsigned long long)term_val(tgt));
-                }
+                if (term_tag(tgt) == TAG_TEN)
+                    snprintf(tgt_desc, sizeof(tgt_desc), "t%u", (u32)term_val(tgt));
+                else if (term_tag(tgt) == TAG_DP0 || term_tag(tgt) == TAG_DP1)
+                    snprintf(tgt_desc, sizeof(tgt_desc), "dp@%llu",
+                             (unsigned long long)term_val(tgt));
                 snprintf(label, sizeof(label), "GRAD\\nd/d(%s)\\n@%llu",
                          tgt_desc, (unsigned long long)val);
                 color = "#e8d0ff";

@@ -82,10 +82,40 @@ void thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1) {
 // convention (see thvm_op_raw): no linear_use.  Callers who also
 // want to reference y or target outside GRAD must thvm_dup them
 // explicitly beforehand.
+// Side-table: remembers each GRAD cell's original target for the
+// dumper's label.  VJP rules mutate slot 1 after commute/TEN-match
+// (storing bwd_wrapper or ones), so slot 1 can't be relied on for the
+// label anymore.  thvm_grad_target_remember is called by every GRAD
+// builder; thvm_grad_target_get is the dumper's lookup.
+#define THVM_GRAD_TARGET_BUCKETS 4096
+static struct { u64 loc; Term target; u8 used; } g_grad_targets[THVM_GRAD_TARGET_BUCKETS];
+void thvm_grad_target_remember(u64 loc, Term target) {
+    if (loc == 0) return;
+    u32 idx = (u32)((loc * 11400714819323198485ull) & (THVM_GRAD_TARGET_BUCKETS - 1));
+    for (u32 p = 0; p < THVM_GRAD_TARGET_BUCKETS; p++, idx = (idx + 1) & (THVM_GRAD_TARGET_BUCKETS - 1)) {
+        if (!g_grad_targets[idx].used || g_grad_targets[idx].loc == loc) {
+            g_grad_targets[idx].loc = loc;
+            g_grad_targets[idx].target = target;
+            g_grad_targets[idx].used = 1;
+            return;
+        }
+    }
+}
+Term thvm_grad_target_get(u64 loc) {
+    if (loc == 0) return term_era();
+    u32 idx = (u32)((loc * 11400714819323198485ull) & (THVM_GRAD_TARGET_BUCKETS - 1));
+    for (u32 p = 0; p < THVM_GRAD_TARGET_BUCKETS; p++, idx = (idx + 1) & (THVM_GRAD_TARGET_BUCKETS - 1)) {
+        if (!g_grad_targets[idx].used) return term_era();
+        if (g_grad_targets[idx].loc == loc) return g_grad_targets[idx].target;
+    }
+    return term_era();
+}
+
 Term thvm_grad(TinyHVM *ctx, Term y, Term target) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc + 0, y);             // body — shared by PIN and BW tag views
-    heap_set(ctx, loc + 1, target);        // target (constant)
+    heap_set(ctx, loc + 1, target);        // target (constant — may be mutated post-commute)
+    thvm_grad_target_remember(loc, target);
     const View *tv = term_view(ctx, target);
     if (tv) { View v = *tv; st_set(loc, &v); }
     return term_new(TAG_TOP, UOP_GRAD, loc);
@@ -101,8 +131,9 @@ static void thvm_grad_split_with_bw(TinyHVM *ctx, Term y, Term target,
                                      u32 bw_uop,
                                      Term *out_pin, Term *out_bw) {
     u64 loc = heap_alloc(ctx, 2);
-    heap_set(ctx, loc + 0, y);             // body — shared by PIN and BW tag views
+    heap_set(ctx, loc + 0, y);
     heap_set(ctx, loc + 1, target);
+    thvm_grad_target_remember(loc, target);
     const View *tv = term_view(ctx, target);
     if (tv) { View v = *tv; st_set(loc, &v); }
     *out_pin = term_new(TAG_TOP, UOP_GRAD_PIN, loc);

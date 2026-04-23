@@ -163,6 +163,8 @@ static Term        g_wnf_last_tgt      = 0;
 // descent operand before dumping, restoring it afterward.
 static u64 g_wnf_current_grad_slot = 0;
 
+void thvm_grad_target_remember(u64 loc, Term target);
+
 
 // Pending sub-GRAD terms for the "binary rule just fired" step.  Set by
 // VJP_BINARY so the step-graph hook can mirror sub_a/sub_b into phantom
@@ -1836,11 +1838,13 @@ apply: {
                 u64 sa_loc = heap_alloc(ctx, 2);
                 heap_set(ctx, sa_loc + 0, a);
                 heap_set(ctx, sa_loc + 1, tgt);
+                thvm_grad_target_remember(sa_loc, tgt);
                 const View *tv = term_view(ctx, tgt);
                 if (tv) { View v = *tv; st_set(sa_loc, &v); }
                 u64 sb_loc = heap_alloc(ctx, 2);
                 heap_set(ctx, sb_loc + 0, b);
                 heap_set(ctx, sb_loc + 1, tgt);
+                thvm_grad_target_remember(sb_loc, tgt);
                 if (tv) { View v = *tv; st_set(sb_loc, &v); }
                 Term sa_pin = term_new(TAG_TOP, UOP_GRAD_PIN, sa_loc);
                 Term sa_bw  = term_new(TAG_TOP, UOP_GRAD,     sa_loc);
@@ -1942,6 +1946,7 @@ apply: {
                 u64 inner_loc = heap_alloc(ctx, 2);
                 heap_set(ctx, inner_loc + 0, a);
                 heap_set(ctx, inner_loc + 1, tgt);
+                thvm_grad_target_remember(inner_loc, tgt);
                 const View *tv = term_view(ctx, tgt);
                 if (tv) { View v = *tv; st_set(inner_loc, &v); }
                 Term inner_pin = term_new(TAG_TOP, UOP_GRAD_PIN, inner_loc);

@@ -1772,19 +1772,26 @@ apply: {
                 heap_set(ctx, _sb_loc + 3, (bv)); \
                 Term _sub_a = term_new(TAG_TOP, UOP_GRAD, _sa_loc); \
                 Term _sub_b = term_new(TAG_TOP, UOP_GRAD, _sb_loc); \
-                /* Viz anchor: stash sub-GRAD TAG_TOP refs in a scratch cell \
-                 * AND a separate ADD(sub_a, sub_b) viz node so the         \
-                 * step-graph dumper (include_all=1) walks them and emits:   \
-                 *   - two sub-GRAD nodes (from the 2-slot sub_anchor),      \
-                 *   - an ADD node combining them (from the 1-slot           \
-                 *     add_anchor holding a TAG_TOP(UOP_ADD, sub_anchor)).   \
-                 * Eval ignores these cells; the Leibniz combine is still   \
-                 * done by BIN2 via the stack path. */                       \
+                /* Viz anchors: step-graph dumper (include_all=1) walks     \
+                 * heap.  Stash three scratch cells so the Leibniz shape    \
+                 * materializes in the graph:                                \
+                 *  - subs: two TAG_TOP(UOP_GRAD) refs so sub-GRAD nodes    \
+                 *    on the target appear.                                 \
+                 *  - cms:  two chain-MUL refs (ga/gb) so the Leibniz      \
+                 *    products feed a single combiner node, matching       \
+                 *    spec "MUL_ca -> ADD_leib [a]".                        \
+                 *  - add:  TAG_TOP(UOP_ADD, cms) combiner that shows      \
+                 *    ∂a + ∂b as the aggregated cotangent at this level.   \
+                 * Eval ignores these cells; BIN2 still builds the real    \
+                 * ADD via the stack path. */                                \
                 { u64 _subs_loc = heap_alloc(ctx, 2); \
                   heap_set(ctx, _subs_loc + 0, _sub_a); \
                   heap_set(ctx, _subs_loc + 1, _sub_b); \
+                  u64 _cms_loc = heap_alloc(ctx, 2); \
+                  heap_set(ctx, _cms_loc + 0, (ga)); \
+                  heap_set(ctx, _cms_loc + 1, (gb)); \
                   u64 _add_anchor = heap_alloc(ctx, 1); \
-                  heap_set(ctx, _add_anchor, term_new(TAG_TOP, UOP_ADD, _subs_loc)); \
+                  heap_set(ctx, _add_anchor, term_new(TAG_TOP, UOP_ADD, _cms_loc)); \
                 } \
                 WnfFrame _ph1 = { .kind = WNF_F_VJP_BIN1, .flags = 0, \
                     .t0 = tgt, .t1 = _sub_b, .t2 = 0, .t3 = 0 }; \

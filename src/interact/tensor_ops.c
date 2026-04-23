@@ -382,11 +382,14 @@
 
                     // Compute-like payloads become visible KERNEL carriers.
                     // Leaf ops can be monolithic immediately; parents with
-                    // still-fused children keep the growing shell.  WRITE
-                    // BACK the resolved kernel into FUSE's slot 0 so
-                    // parent kernels referencing this FUSE cell see the
-                    // resolved kernel directly (no stale MUL/SUM/etc.
-                    // through the FUSE indirection).
+                    // still-fused children keep the growing shell.
+                    //
+                    // Persistence: the FUSE wrapper *stays* — we write the
+                    // resolved kernel back into its slot 0 (memoisation)
+                    // and return the FUSE term unchanged.  Callers'
+                    // references to this FUSE remain valid; the FUSE node
+                    // itself stays visible in the step graph as the
+                    // kernelisation marker on the bwd / fwd output edge.
                     if (is_elementwise(puop) || puop == UOP_SUM || puop == UOP_RMAX ||
                         (puop >= UOP_RESHAPE && puop <= UOP_PAD)) {
                         Term public_term = thvm_fuse_public_term(ctx, payload, 0);
@@ -401,11 +404,17 @@
                                     uop_names[puop], term_tag(public_term), term_ext(public_term),
                                     (unsigned long long)term_val(public_term));
                         }
-                        return public_term;
+                        return t;  // return FUSE term itself, keeping it visible
                     }
 
-                    // Other TAG_TOP: pass through
-                    return payload;
+                    // Other TAG_TOP (e.g. UOP_GRAD/GRAD_PIN/GRAD_FWD):
+                    // FUSE stays.  Don't pass payload through to the caller —
+                    // that would cause the caller's slot (CTR/etc.) to be
+                    // overwritten with the reduced payload, removing the
+                    // FUSE marker from the step graph.  Normalize will
+                    // recursively descend into FUSE's slot 0 and reduce
+                    // the payload in place.
+                    return t;
                 }
 
                 // SEQ: pass through. Do NOT absorb into a parallel
@@ -416,16 +425,26 @@
                 // later on the next root pass.
                 if (ptag == TAG_SEQ) return payload;
 
-                // CTR: distribute
+                // CTR: distribute FUSE into each non-leaf child slot,
+                // but only if the slot doesn't already hold a FUSE or
+                // KERNEL (those are already kernelisation markers — no
+                // need to wrap them again).  Otherwise the test's
+                // CTR(FUSE(pin), FUSE(bw)) gets endlessly re-wrapped on
+                // each fuse-fixed-point pass, hiding the original FUSEs
+                // from the step graph.
                 if (ptag == TAG_CTR) {
                     u64 cloc = term_val(payload);
                     u32 ar = term_ext(payload);
                     for (u32 i = 0; i < ar; i++) {
                         Term c = heap_read(ctx, cloc + i);
-                        if (term_tag(c) != TAG_TEN && term_tag(c) != TAG_ERA) {
-                            u64 fl = heap_alloc(ctx, 1); heap_set(ctx, fl, c);
-                            heap_set(ctx, cloc + i, term_new(TAG_TOP, UOP_FUSE, fl));
+                        u8 ct = term_tag(c);
+                        if (ct == TAG_TEN || ct == TAG_ERA) continue;
+                        if (ct == TAG_TOP) {
+                            u32 ce = term_ext(c);
+                            if (ce == UOP_FUSE || ce == UOP_KERNEL) continue;
                         }
+                        u64 fl = heap_alloc(ctx, 1); heap_set(ctx, fl, c);
+                        heap_set(ctx, cloc + i, term_new(TAG_TOP, UOP_FUSE, fl));
                     }
                     return payload;
                 }

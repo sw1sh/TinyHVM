@@ -77,24 +77,64 @@ void thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1) {
     *out1 = term_new(TAG_DP1, label, loc);
 }
 
-// UOP_GRAD builder.  heap[loc+0] = y, heap[loc+1] = target.
-// Following compute-op convention (see thvm_op_raw): no linear_use.
-// Callers who also want to reference y or target outside GRAD must
-// thvm_dup them explicitly beforehand.
+// UOP_GRAD builder.  heap[loc+0] = y, heap[loc+1] = gy (cotangent,
+// ERA until seeded), heap[loc+2] = target.  Following compute-op
+// convention (see thvm_op_raw): no linear_use.  Callers who also
+// want to reference y or target outside GRAD must thvm_dup them
+// explicitly beforehand.
 Term thvm_grad(TinyHVM *ctx, Term y, Term target) {
-    u64 loc = heap_alloc(ctx, 2);
-    heap_set(ctx, loc + 0, y);
-    heap_set(ctx, loc + 1, target);
+    u64 loc = heap_alloc(ctx, 4);
+    heap_set(ctx, loc + 0, y);             // y_bw — slides via VJP_RECURSE_INTO
+    heap_set(ctx, loc + 1, term_era());    // gy — seeded on first entry
+    heap_set(ctx, loc + 2, target);
+    heap_set(ctx, loc + 3, y);             // y_fw — PIN view; never mutated
     const View *tv = term_view(ctx, target);
     if (tv) { View v = *tv; st_set(loc, &v); }
     return term_new(TAG_TOP, UOP_GRAD, loc);
 }
 
-// Forward-mode JVP.  heap[loc+0] = y, heap[loc+1] = target.
+// Internal: shared body for thvm_grad_split / thvm_grad_fwd_split.
+// ONE cell [y, gy, target] shared between PIN (UOP_GRAD_PIN) and BW
+// (UOP_GRAD / UOP_GRAD_FWD) tag views — like DP0/DP1 of a DUP cell.
+// No DUP on y: both tags see the same slot 0.  When BW slides (mutates
+// heap[loc+0] to new operand), PIN's view tracks the slide too.  The
+// spec renders this as ONE GRAD node with v_pass + ∂v outputs.
+static void thvm_grad_split_with_bw(TinyHVM *ctx, Term y, Term target,
+                                     u32 bw_uop,
+                                     Term *out_pin, Term *out_bw) {
+    u64 loc = heap_alloc(ctx, 4);
+    heap_set(ctx, loc + 0, y);             // y_bw — slides during BW descent
+    heap_set(ctx, loc + 1, term_era());    // gy / tangent — seeded on first BW entry
+    heap_set(ctx, loc + 2, target);
+    heap_set(ctx, loc + 3, y);             // y_fw — PIN reads here; preserves forward
+    const View *tv = term_view(ctx, target);
+    if (tv) { View v = *tv; st_set(loc, &v); }
+    *out_pin = term_new(TAG_TOP, UOP_GRAD_PIN, loc);
+    *out_bw  = term_new(TAG_TOP, bw_uop,       loc);
+}
+
+// VJP (reverse mode) split: out_pin reduces to y, out_bw reduces to
+// ∂y/∂target.  Pin keeps y reachable from root while bw slides.
+void thvm_grad_split(TinyHVM *ctx, Term y, Term target,
+                     Term *out_pin, Term *out_bw) {
+    thvm_grad_split_with_bw(ctx, y, target, UOP_GRAD, out_pin, out_bw);
+}
+
+// JVP (forward mode) split: out_pin reduces to y, out_bw reduces to
+// dy given a seeded tangent on target.  Symmetric to thvm_grad_split.
+void thvm_grad_fwd_split(TinyHVM *ctx, Term y, Term target,
+                          Term *out_pin, Term *out_bw) {
+    thvm_grad_split_with_bw(ctx, y, target, UOP_GRAD_FWD, out_pin, out_bw);
+}
+
+// Forward-mode JVP.  heap[loc+0] = y, heap[loc+1] = tangent (ERA
+// until seeded), heap[loc+2] = target.
 Term thvm_grad_fwd(TinyHVM *ctx, Term y, Term target) {
-    u64 loc = heap_alloc(ctx, 2);
-    heap_set(ctx, loc + 0, y);
-    heap_set(ctx, loc + 1, target);
+    u64 loc = heap_alloc(ctx, 4);
+    heap_set(ctx, loc + 0, y);             // y_bw — slides
+    heap_set(ctx, loc + 1, term_era());    // tangent
+    heap_set(ctx, loc + 2, target);
+    heap_set(ctx, loc + 3, y);             // y_fw — PIN reads here
     const View *yv = term_view(ctx, y);
     if (yv) { View v = *yv; st_set(loc, &v); }
     return term_new(TAG_TOP, UOP_GRAD_FWD, loc);

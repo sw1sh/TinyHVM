@@ -163,10 +163,40 @@ static Term        g_wnf_last_tgt      = 0;
 // descent operand before dumping, restoring it afterward.
 static u64 g_wnf_current_grad_slot = 0;
 
+
+// Pending sub-GRAD terms for the "binary rule just fired" step.  Set by
+// VJP_BINARY so the step-graph hook can mirror sub_a/sub_b into phantom
+// heap slots (include_all picks them up), rendering both branches of
+// the Leibniz rule even while the reducer is still descending into sub_a.
+
 const char *thvm_wnf_last_rule(void)          { return g_wnf_last_rule; }
 u64         thvm_wnf_last_cursor(void)        { return g_wnf_last_cursor; }
 Term        thvm_wnf_last_tgt(void)           { return g_wnf_last_tgt; }
 u64         thvm_wnf_current_grad_slot(void)  { return g_wnf_current_grad_slot; }
+
+// Peek the current VJP frame's cotangent (gy) term, if any.  Returns 0
+// when no VJP frame is active.  Used by the step-graph hook to mirror
+// the cotangent chain into the heap for viz (gy is normally a
+// frame-only state, invisible to the dumper).
+Term thvm_wnf_current_gy(void) {
+    for (u32 i = g_wnf_stack_pos; i > 0; i--) {
+        WnfFrame *f = &g_wnf_stack_buf[i - 1];
+        if (f->kind == WNF_F_VJP) return f->t1;
+    }
+    return 0;
+}
+
+
+// Peek the topmost VJP_BIN1 frame's pending sub_b GRAD term.  Used by
+// the step-graph hook to mirror the sibling sub-GRAD into a phantom
+// heap slot so include_all=1 renders both branches of a binary rule.
+Term thvm_wnf_vjp_pending_sub_b(void) {
+    for (u32 i = g_wnf_stack_pos; i > 0; i--) {
+        WnfFrame *f = &g_wnf_stack_buf[i - 1];
+        if (f->kind == WNF_F_VJP_BIN1) return f->t1;
+    }
+    return 0;
+}
 
 void thvm_wnf_set_step_hook(WnfStepHook hook) { g_wnf_step_hook = hook; }
 void thvm_wnf_clear_step_hook(void)          { g_wnf_step_hook = NULL; }
@@ -560,6 +590,12 @@ Term thvm_reduce_budget(TinyHVM *ctx, Term term, u32 budget) {
     // as it fires inside this reduction.
     u64 saved_grad_slot    = g_wnf_current_grad_slot;
     g_wnf_current_grad_slot = 0;
+    // Do NOT reset pending sub-GRAD terms at thvm_reduce_budget entry:
+    // they persist across normalize/collect-loop iterations so the
+    // step-graph hook keeps rendering the binary-active sub-structure
+    // for the full duration of the gradient reduction.  They're
+    // cleared at session entry (thvm_eval_collect_fixed_point) and
+    // by the VJP_BIN2 handler when the binary rule completes.
 
     // Outermost-GRAD book-keeping: if the top-level term is a GRAD with a
     // TEN target, remember target.shape so we can materialize ERA to
@@ -572,8 +608,8 @@ Term thvm_reduce_budget(TinyHVM *ctx, Term term, u32 budget) {
         u32 uop = term_ext(term);
         if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
             u64 loc = term_val(term);
-            if (loc != 0 && loc + 1 < ctx->heap_pos) {
-                Term tgt = heap_read(ctx, loc + 1);
+            if (loc != 0 && loc + 2 < ctx->heap_pos) {
+                Term tgt = heap_read(ctx, loc + 2);
                 if (term_tag(tgt) == TAG_TEN) {
                     u32 ttid = (u32)term_val(tgt);
                     if (ttid < ctx->tensor_count) {
@@ -774,18 +810,29 @@ enter: {
 
     if (tag == TAG_TOP) {
         u32 ext = term_ext(next);
+        // GRAD_PIN: forward pin, mode-neutral.  Shares cell with UOP_GRAD
+        // (VJP) or UOP_GRAD_FWD (JVP).  Reduces to y_fw (heap[loc+3]):
+        // the original forward value, preserved regardless of BW slides.
+        if (ext == UOP_GRAD_PIN) {
+            u64 loc = term_val(next);
+            if (loc == 0 || loc + 3 >= ctx->heap_pos) {
+                whnf = next; goto apply;
+            }
+            next = heap_read(ctx, loc + 3);
+            goto enter;
+        }
         if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) {
             u64 loc = term_val(next);
-            if (loc == 0 || loc + 1 >= ctx->heap_pos) {
+            if (loc == 0 || loc + 2 >= ctx->heap_pos) {
                 whnf = next; goto apply;
             }
             Term y = heap_read(ctx, loc + 0);
-            Term tgt = heap_read(ctx, loc + 1);
+            Term tgt = heap_read(ctx, loc + 2);
             // Resolve target to WHNF so DP-wrapped leaves compare as TEN.
             if (term_tag(tgt) != TAG_TEN) {
                 Term tgt_r = thvm_reduce(ctx, tgt);
                 if (tgt_r != tgt) {
-                    heap_set(ctx, loc + 1, tgt_r);
+                    heap_set(ctx, loc + 2, tgt_r);
                     tgt = tgt_r;
                 }
             }
@@ -798,9 +845,15 @@ enter: {
                 wnf_stack_push(f);
             } else {
                 // VJP (reverse) path — cotangent g seeded on first apply.
+                // If the cell has a pre-seeded gy in heap[loc+1] (non-ERA,
+                // stashed by VJP_BINARY's sub-GRAD allocation), carry it
+                // into the frame so the sub-VJP doesn't re-seed with ones.
+                Term stored_gy = heap_read(ctx, loc + 1);
+                Term frame_gy  = (term_tag(stored_gy) == TAG_ERA && term_val(stored_gy) == 0)
+                                 ? (Term)0 : stored_gy;
                 WnfFrame f = {
                     .kind = WNF_F_VJP, .flags = 0,
-                    .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
+                    .t0 = tgt, .t1 = frame_gy, .t2 = 0, .t3 = 0
                 };
                 wnf_stack_push(f);
             }
@@ -1679,8 +1732,17 @@ apply: {
             // slides GRAD to the next active forward node.
             #define VJP_RECURSE_INTO(op, gv) do { \
                 Term _op = (op); \
+                Term _gv = (gv); \
+                /* Persistent slide: mutate the current GRAD cell's y   \
+                 * and gy slots.  Forward nodes stay reachable through \
+                 * PIN's DUP'd y_fw (allocated by thvm_grad_split).    */\
+                if (g_wnf_current_grad_slot != 0 && \
+                    g_wnf_current_grad_slot + 2 < ctx->heap_pos) { \
+                    heap_set(ctx, g_wnf_current_grad_slot + 0, _op); \
+                    heap_set(ctx, g_wnf_current_grad_slot + 1, _gv); \
+                } \
                 WnfFrame _inner = { .kind = WNF_F_VJP, .flags = 0, \
-                    .t0 = tgt, .t1 = (gv), .t2 = 0, .t3 = 0 }; \
+                    .t0 = tgt, .t1 = _gv, .t2 = 0, .t3 = 0 }; \
                 wnf_stack_push(_inner); \
                 next = _op; \
                 u64 _nloc = (term_tag(_op) == TAG_TOP) ? term_val(_op) : 0; \
@@ -1690,21 +1752,39 @@ apply: {
                 goto enter; \
             } while (0)
 
-            // Helper: push accumulator for binary op.  Descend into av with
-            // cotangent ga; on return we'll descend into bv with gb and sum.
+            // VJP_BINARY: allocate heap sub-GRAD cells so binary Leibniz
+            // structure is visible in step graphs.  ALSO allocate an
+            // ADD cell UPFRONT combining sub_a + sub_b, so the whole
+            // Leibniz topology is on heap BEFORE reduction starts.
+            // whnf = ADD_term; falls back into apply for that ADD.
+            // sub_a and sub_b will be reduced when ADD's evaluation
+            // needs their values.
             #define VJP_BINARY(av, bv, ga, gb) do { \
-                Term _av = (av); \
+                u64 _sa_loc = heap_alloc(ctx, 4); \
+                heap_set(ctx, _sa_loc + 0, (av)); \
+                heap_set(ctx, _sa_loc + 1, (ga)); \
+                heap_set(ctx, _sa_loc + 2, tgt); \
+                heap_set(ctx, _sa_loc + 3, (av)); \
+                u64 _sb_loc = heap_alloc(ctx, 4); \
+                heap_set(ctx, _sb_loc + 0, (bv)); \
+                heap_set(ctx, _sb_loc + 1, (gb)); \
+                heap_set(ctx, _sb_loc + 2, tgt); \
+                heap_set(ctx, _sb_loc + 3, (bv)); \
+                Term _sub_a = term_new(TAG_TOP, UOP_GRAD, _sa_loc); \
+                Term _sub_b = term_new(TAG_TOP, UOP_GRAD, _sb_loc); \
+                /* Viz anchor: stash sub-GRAD TAG_TOP refs in a scratch slot \
+                 * so the step-graph dumper (include_all=1) walks them and  \
+                 * emits the two sub-GRAD nodes.  Nothing reads this slot — \
+                 * the cell only exists to reveal the Leibniz structure    \
+                 * that's already implied by VJP's stack-based eval. */    \
+                { u64 _anch = heap_alloc(ctx, 2); \
+                  heap_set(ctx, _anch + 0, _sub_a); \
+                  heap_set(ctx, _anch + 1, _sub_b); } \
                 WnfFrame _ph1 = { .kind = WNF_F_VJP_BIN1, .flags = 0, \
-                    .t0 = tgt, .t1 = (bv), .t2 = (gb), .t3 = 0 }; \
+                    .t0 = tgt, .t1 = _sub_b, .t2 = 0, .t3 = 0 }; \
                 wnf_stack_push(_ph1); \
-                WnfFrame _inner = { .kind = WNF_F_VJP, .flags = 0, \
-                    .t0 = tgt, .t1 = (ga), .t2 = 0, .t3 = 0 }; \
-                wnf_stack_push(_inner); \
-                next = _av; \
-                u64 _nloc = (term_tag(_av) == TAG_TOP) ? term_val(_av) : 0; \
-                const char *_nname = (term_tag(_av) == TAG_TOP) \
-                    ? wnf_uop_name_safe(term_ext(_av)) : ""; \
-                WNF_FIRED_AT(_nname, _nloc, tgt); \
+                next = _sub_a; \
+                WNF_FIRED_AT("GRAD", _sa_loc, tgt); \
                 goto enter; \
             } while (0)
 
@@ -1981,23 +2061,16 @@ apply: {
         }
 
         case WNF_F_VJP_BIN1: {
-            // whnf = grad_a (result of inner recursion on a).  Descend into b
-            // with cotangent g_b; on return, BIN2 will sum grad_a + grad_b.
+            // whnf = grad_a (result of reducing sub_a GRAD cell).  Descend
+            // into sub_b (pre-allocated GRAD cell); BIN2 sums grad_a+grad_b.
             Term grad_a = whnf;
-            Term tgt = f.t0;
-            Term b   = f.t1;
-            Term g_b = f.t2;
+            Term sub_b  = f.t1;
             WnfFrame ph2 = {
                 .kind = WNF_F_VJP_BIN2, .flags = 0,
                 .t0 = grad_a, .t1 = 0, .t2 = 0, .t3 = 0
             };
             wnf_stack_push(ph2);
-            WnfFrame inner = {
-                .kind = WNF_F_VJP, .flags = 0,
-                .t0 = tgt, .t1 = g_b, .t2 = 0, .t3 = 0
-            };
-            wnf_stack_push(inner);
-            next = b;
+            next = sub_b;
             goto enter;
         }
 

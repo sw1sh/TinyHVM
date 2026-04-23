@@ -111,6 +111,36 @@ Term thvm_grad_target_get(u64 loc) {
     return term_era();
 }
 
+// Side-table: which MUL cells are "chain MULs" (allocated by the
+// Leibniz binary-commute rule) and which slot holds the cotangent
+// input.  After TEN-match replaces the sub-GRAD term with a
+// concrete ones tensor, the cotangent slot still holds the
+// ∂-port semantics; the dumper queries this table to label the
+// edge "∂a" / "∂b" regardless of the current child's tag.
+#define THVM_CHAIN_MUL_BUCKETS 2048
+static struct { u64 loc; u8 partial_slot; u8 used; } g_chain_muls[THVM_CHAIN_MUL_BUCKETS];
+void thvm_chain_mul_remember(u64 loc, u8 partial_slot) {
+    if (loc == 0) return;
+    u32 idx = (u32)((loc * 11400714819323198485ull) & (THVM_CHAIN_MUL_BUCKETS - 1));
+    for (u32 p = 0; p < THVM_CHAIN_MUL_BUCKETS; p++, idx = (idx + 1) & (THVM_CHAIN_MUL_BUCKETS - 1)) {
+        if (!g_chain_muls[idx].used || g_chain_muls[idx].loc == loc) {
+            g_chain_muls[idx].loc = loc;
+            g_chain_muls[idx].partial_slot = partial_slot;
+            g_chain_muls[idx].used = 1;
+            return;
+        }
+    }
+}
+int thvm_chain_mul_partial_slot(u64 loc) {
+    if (loc == 0) return -1;
+    u32 idx = (u32)((loc * 11400714819323198485ull) & (THVM_CHAIN_MUL_BUCKETS - 1));
+    for (u32 p = 0; p < THVM_CHAIN_MUL_BUCKETS; p++, idx = (idx + 1) & (THVM_CHAIN_MUL_BUCKETS - 1)) {
+        if (!g_chain_muls[idx].used) return -1;
+        if (g_chain_muls[idx].loc == loc) return g_chain_muls[idx].partial_slot;
+    }
+    return -1;
+}
+
 Term thvm_grad(TinyHVM *ctx, Term y, Term target) {
     u64 loc = heap_alloc(ctx, 2);
     heap_set(ctx, loc + 0, y);             // body — shared by PIN and BW tag views

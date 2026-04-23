@@ -1923,14 +1923,18 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) elbl = ai==0 ? "y" : "tgt";
                 else if (ext == UOP_DETACH) elbl = "in";
                 else if (is_binary(ext)) {
-                    // Spec-match: chain-MUL's cotangent input (from a
-                    // sub-GRAD) is labelled ∂a / ∂b instead of a / b.
-                    // EXPAND's input (from Leibniz ADD) is ∂v.
-                    // Detect by child_raw's tag/ext.
-                    u8 rt = term_tag(child_raw);
-                    u32 re = rt == TAG_TOP ? term_ext(child_raw) : UOP_COUNT;
-                    if (re == UOP_GRAD || re == UOP_GRAD_FWD) elbl = ai==0 ? "\u2202a" : "\u2202b";
-                    else elbl = ai==0 ? "a" : "b";
+                    // Spec-match: chain-MUL's cotangent input gets ∂a/∂b.
+                    // Detected via chain-MUL side table (set by VJP_BINARY
+                    // when the chain MUL is allocated).  Works even after
+                    // TEN-match replaces the sub-GRAD with a concrete
+                    // ones tensor in the same slot.
+                    extern int thvm_chain_mul_partial_slot(u64 loc);
+                    int partial = (ext == UOP_MUL) ? thvm_chain_mul_partial_slot(val) : -1;
+                    if (partial >= 0 && (u32)partial == ai) {
+                        elbl = ai==0 ? "\u2202a" : "\u2202b";
+                    } else {
+                        elbl = ai==0 ? "a" : "b";
+                    }
                 }
 
                 if (ctag == TAG_DP0 || ctag == TAG_DP1) {

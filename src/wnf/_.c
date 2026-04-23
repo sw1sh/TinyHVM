@@ -1869,6 +1869,11 @@ apply: {
                 Term sb_bw  = term_new(TAG_TOP, UOP_GRAD,     sb_loc);
                 Term chain_a = thvm_op_raw(ctx, UOP_MUL, sa_bw, b);
                 Term chain_b = thvm_op_raw(ctx, UOP_MUL, a,     sb_bw);
+                // Mark chain MULs for the dumper: sub-GRAD cotangent
+                // input is slot 0 in chain_a, slot 1 in chain_b.
+                extern void thvm_chain_mul_remember(u64 loc, u8 partial_slot);
+                thvm_chain_mul_remember(term_val(chain_a), 0);
+                thvm_chain_mul_remember(term_val(chain_b), 1);
                 Term add_combined = thvm_op_raw(ctx, UOP_ADD, chain_a, chain_b);
                 heap_set(ctx, wloc + 0, sa_pin);
                 heap_set(ctx, wloc + 1, sb_pin);

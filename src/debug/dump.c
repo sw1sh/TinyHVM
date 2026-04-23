@@ -1875,8 +1875,8 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             else if (ext == UOP_DETACH) arity = 1;
             else if (!is_binary(ext) && is_elementwise(ext)) arity = 1;
             for (u32 ai = 0; ai < arity; ai++) {
-                Term child = heap_read(ctx, val + ai);
-                child = dot_deref_commuted_grad(ctx, child);
+                Term child_raw = heap_read(ctx, val + ai);
+                Term child = dot_deref_commuted_grad(ctx, child_raw);
                 u64 cpos = val + ai;
                 u8 ctag = term_tag(child); u64 cval = term_val(child);
                 int edge_hl = heap_dot_hl_on && cpos == heap_dot_hl_slot;
@@ -1895,7 +1895,18 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     else if (is_binary(kop)) elbl = ai==0 ? "a" : "b";
                     else elbl = ai==0 ? "in" : "";
                 }
-                else if (ext == UOP_FUSE) elbl = "in";
+                else if (ext == UOP_FUSE) {
+                    // Semantic port label based on what's wrapped: PIN
+                    // tag view → "v_pass", BW tag view → "∂v", else "in".
+                    // Display-only; FUSE itself is still a single uop.
+                    u8 rt = term_tag(child_raw);
+                    if (rt == TAG_TOP) {
+                        u32 re = term_ext(child_raw);
+                        if (re == UOP_GRAD_PIN) elbl = "v_pass";
+                        else if (re == UOP_GRAD || re == UOP_GRAD_FWD) elbl = "\u2202v";
+                        else elbl = "in";
+                    } else elbl = "in";
+                }
                 else if (ext >= UOP_RESHAPE && ext <= UOP_PAD) elbl = ai==0 ? "in" : "shape";
                 else if (ext == UOP_SUM || ext == UOP_RMAX) elbl = ai==0 ? "in" : "axes";
                 else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) elbl = ai==0 ? "y" : "tgt";

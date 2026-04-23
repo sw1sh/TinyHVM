@@ -1907,11 +1907,31 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                         else elbl = "in";
                     } else elbl = "in";
                 }
-                else if (ext >= UOP_RESHAPE && ext <= UOP_PAD) elbl = ai==0 ? "in" : "shape";
+                else if (ext >= UOP_RESHAPE && ext <= UOP_PAD) {
+                    // EXPAND wrapping the Leibniz ADD renders as ∂v
+                    // to match spec's backward-chain labelling.  Check
+                    // dereferenced child (post-commute redirect).
+                    if (ai == 0 && ext == UOP_EXPAND) {
+                        u32 ce = (ctag == TAG_TOP) ? term_ext(child) : UOP_COUNT;
+                        if (ce == UOP_ADD) elbl = "\u2202v";
+                        else elbl = "in";
+                    } else {
+                        elbl = ai==0 ? "in" : "shape";
+                    }
+                }
                 else if (ext == UOP_SUM || ext == UOP_RMAX) elbl = ai==0 ? "in" : "axes";
                 else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) elbl = ai==0 ? "y" : "tgt";
                 else if (ext == UOP_DETACH) elbl = "in";
-                else if (is_binary(ext)) elbl = ai==0 ? "a" : "b";
+                else if (is_binary(ext)) {
+                    // Spec-match: chain-MUL's cotangent input (from a
+                    // sub-GRAD) is labelled ∂a / ∂b instead of a / b.
+                    // EXPAND's input (from Leibniz ADD) is ∂v.
+                    // Detect by child_raw's tag/ext.
+                    u8 rt = term_tag(child_raw);
+                    u32 re = rt == TAG_TOP ? term_ext(child_raw) : UOP_COUNT;
+                    if (re == UOP_GRAD || re == UOP_GRAD_FWD) elbl = ai==0 ? "\u2202a" : "\u2202b";
+                    else elbl = ai==0 ? "a" : "b";
+                }
 
                 if (ctag == TAG_DP0 || ctag == TAG_DP1) {
                     u64 dl = cval;

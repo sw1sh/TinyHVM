@@ -1,0 +1,54 @@
+// GRAD_a ⊳ TEN(t1) just fired — target match.  GRAD_a annihilates:
+// v_pass output aliases to t1 (feeds forward MUL.a), ∂v output
+// materialises as ones_a[3] — the first concrete cotangent leaf in
+// the graph.  ones_a feeds MUL_ca (= b·∂a).
+// Redex: t1 → GRAD_b (symmetric right arm).
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1     [label="t1\n[3] f32",   fillcolor="#ffe0e0"];
+  axes   [label="axes\n[1] i32", fillcolor="#e0e0e0"];
+  shape3 [label="[3]\nshape",    fillcolor="#e0e0e0"];
+  ones_a [label="ones_a\n[3]\n(= ∂_t1 t1)", fillcolor="#e0e0e0"];
+
+  MUL      [label="MUL\n[3]",            fillcolor="#cce5ff"];
+  SUM      [label="SUM\n[1]",            fillcolor="#ffcccc"];
+  GRAD_b   [label="GRAD_b\nd/d(t1)",     fillcolor="#e8d0ff"];
+  MUL_ca   [label="MUL\n(b·∂a)",         fillcolor="#cce5ff"];
+  MUL_cb   [label="MUL\n(a·∂b)",         fillcolor="#cce5ff"];
+  ADD_leib [label="ADD\n(Leibniz)",      fillcolor="#cce5ff"];
+  EXPAND   [label="EXPAND\n(SUM bwd)",   fillcolor="#fff3cd"];
+
+  FUSE_f [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+  FUSE_b [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+
+  y_out [label="y",      shape=circle, width=0.20, fixedsize=true, fillcolor="#ffffff"];
+  g_out [label="∂y/∂t1", shape=circle, width=0.30, fixedsize=true, fillcolor="#ffffff"];
+
+  // Left arm: GRAD_a gone.  v_pass = t1 → MUL.a; ∂v = ones_a → MUL_ca.∂a
+  t1     -> MUL    [label="a"];
+  ones_a -> MUL_ca [label="∂a"];
+  t1     -> MUL_ca [label="b"];
+
+  // Right arm still pending
+  t1     -> GRAD_b [label="y", color="#cc0000", penwidth=2];
+  GRAD_b -> MUL    [label="b (v_pass)"];
+  GRAD_b -> MUL_cb [label="∂b"];
+  t1     -> MUL_cb [label="a"];
+
+  // Forward
+  MUL    -> SUM    [label="in"];
+  axes   -> SUM    [label="axes"];
+  SUM    -> FUSE_f;
+  FUSE_f -> y_out;
+
+  MUL_ca -> ADD_leib [label="a"];
+  MUL_cb -> ADD_leib [label="b"];
+
+  ADD_leib -> EXPAND [label="∂v"];
+  shape3   -> EXPAND [label="shape"];
+  EXPAND   -> FUSE_b;
+  FUSE_b   -> g_out;
+}

@@ -608,8 +608,8 @@ Term thvm_reduce_budget(TinyHVM *ctx, Term term, u32 budget) {
         u32 uop = term_ext(term);
         if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
             u64 loc = term_val(term);
-            if (loc != 0 && loc + 2 < ctx->heap_pos) {
-                Term tgt = heap_read(ctx, loc + 2);
+            if (loc != 0 && loc + 1 < ctx->heap_pos) {
+                Term tgt = heap_read(ctx, loc + 1);
                 if (term_tag(tgt) == TAG_TEN) {
                     u32 ttid = (u32)term_val(tgt);
                     if (ttid < ctx->tensor_count) {
@@ -810,34 +810,41 @@ enter: {
 
     if (tag == TAG_TOP) {
         u32 ext = term_ext(next);
-        // GRAD_PIN: forward pin, mode-neutral.  Shares cell with UOP_GRAD
-        // (VJP) or UOP_GRAD_FWD (JVP).  Reduces to y_fw (heap[loc+3]):
-        // the original forward value, preserved regardless of BW slides.
+        // GRAD_PIN: forward passthrough tag view.  Post-commute,
+        // slot 0 is SUB(reparented_forward); PIN strips it.  Pre-commute,
+        // slot 0 = body and PIN returns it directly.
         if (ext == UOP_GRAD_PIN) {
             u64 loc = term_val(next);
-            if (loc == 0 || loc + 3 >= ctx->heap_pos) {
+            if (loc == 0 || loc + 1 >= ctx->heap_pos) {
                 whnf = next; goto apply;
             }
-            next = heap_read(ctx, loc + 3);
+            Term body = heap_read(ctx, loc + 0);
+            if (term_is_sub(body)) body = term_strip_sub(body);
+            next = body;
             goto enter;
         }
         if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) {
             u64 loc = term_val(next);
-            if (loc == 0 || loc + 2 >= ctx->heap_pos) {
+            if (loc == 0 || loc + 1 >= ctx->heap_pos) {
                 whnf = next; goto apply;
             }
-            Term y = heap_read(ctx, loc + 0);
-            Term tgt = heap_read(ctx, loc + 2);
+            Term body = heap_read(ctx, loc + 0);
+            if (term_is_sub(body)) {
+                // Post-commute BW re-entry: take slot 1 (bwd_wrapper).
+                whnf = heap_read(ctx, loc + 1);
+                WNF_FIRED();
+                goto apply;
+            }
+            Term tgt = heap_read(ctx, loc + 1);
             // Resolve target to WHNF so DP-wrapped leaves compare as TEN.
             if (term_tag(tgt) != TAG_TEN) {
                 Term tgt_r = thvm_reduce(ctx, tgt);
                 if (tgt_r != tgt) {
-                    heap_set(ctx, loc + 2, tgt_r);
+                    heap_set(ctx, loc + 1, tgt_r);
                     tgt = tgt_r;
                 }
             }
             if (ext == UOP_GRAD_FWD) {
-                // JVP path (unchanged).
                 WnfFrame f = {
                     .kind = WNF_F_GRAD, .flags = 1,
                     .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
@@ -845,25 +852,17 @@ enter: {
                 wnf_stack_push(f);
             } else {
                 // VJP (reverse) path — cotangent g seeded on first apply.
-                // If the cell has a pre-seeded gy in heap[loc+1] (non-ERA,
-                // stashed by VJP_BINARY's sub-GRAD allocation), carry it
-                // into the frame so the sub-VJP doesn't re-seed with ones.
-                Term stored_gy = heap_read(ctx, loc + 1);
-                Term frame_gy  = (term_tag(stored_gy) == TAG_ERA && term_val(stored_gy) == 0)
-                                 ? (Term)0 : stored_gy;
+                // Cotangent state lives only in the frame stack; the
+                // 2-slot cell has no gy storage.
                 WnfFrame f = {
                     .kind = WNF_F_VJP, .flags = 0,
-                    .t0 = tgt, .t1 = frame_gy, .t2 = 0, .t3 = 0
+                    .t0 = tgt, .t1 = 0, .t2 = 0, .t3 = 0
                 };
                 wnf_stack_push(f);
             }
-            // Record the GRAD's heap slot for step-graph viz (hook uses
-            // it to slide the GRAD node visually to the active node).
-            // Always overwrite: the outermost GRAD rule to fire wins
-            // for this reduction.  Reset happens at next thvm_reduce
-            // entry (see thvm_reduce_budget).
+            // Record the GRAD's heap slot for step-graph viz.
             g_wnf_current_grad_slot = loc;
-            next = y;
+            next = body;
             goto enter;
         }
         // Non-GRAD TOPs (ADD/MUL/KERNEL/ASSIGN/etc.): compute TOPs are
@@ -1733,13 +1732,13 @@ apply: {
             #define VJP_RECURSE_INTO(op, gv) do { \
                 Term _op = (op); \
                 Term _gv = (gv); \
-                /* Persistent slide: mutate the current GRAD cell's y   \
-                 * and gy slots.  Forward nodes stay reachable through \
-                 * PIN's DUP'd y_fw (allocated by thvm_grad_split).    */\
+                /* Persistent slide (temporary during transition to    \
+                 * HVM4-style commute rules): still mutates the current\
+                 * GRAD cell's slot 0.  Will be replaced by proper     \
+                 * commute + heap_subst_cop in the next stage. */      \
                 if (g_wnf_current_grad_slot != 0 && \
-                    g_wnf_current_grad_slot + 2 < ctx->heap_pos) { \
+                    g_wnf_current_grad_slot + 1 < ctx->heap_pos) { \
                     heap_set(ctx, g_wnf_current_grad_slot + 0, _op); \
-                    heap_set(ctx, g_wnf_current_grad_slot + 1, _gv); \
                 } \
                 WnfFrame _inner = { .kind = WNF_F_VJP, .flags = 0, \
                     .t0 = tgt, .t1 = _gv, .t2 = 0, .t3 = 0 }; \
@@ -1759,44 +1758,30 @@ apply: {
             // whnf = ADD_term; falls back into apply for that ADD.
             // sub_a and sub_b will be reduced when ADD's evaluation
             // needs their values.
+            /* 2-slot sub-GRAD cells [body, target] allocated for heap
+             * visibility.  Cotangent seeds (ga, gb) flow through VJP
+             * frames, not through the cell.  BIN1 catches grad_a, pushes
+             * a fresh VJP frame seeded with gb, enters sub_b's body;
+             * BIN2 catches grad_b and combines via ADD. */
             #define VJP_BINARY(av, bv, ga, gb) do { \
-                u64 _sa_loc = heap_alloc(ctx, 4); \
+                u64 _sa_loc = heap_alloc(ctx, 2); \
                 heap_set(ctx, _sa_loc + 0, (av)); \
-                heap_set(ctx, _sa_loc + 1, (ga)); \
-                heap_set(ctx, _sa_loc + 2, tgt); \
-                heap_set(ctx, _sa_loc + 3, (av)); \
-                u64 _sb_loc = heap_alloc(ctx, 4); \
+                heap_set(ctx, _sa_loc + 1, tgt); \
+                u64 _sb_loc = heap_alloc(ctx, 2); \
                 heap_set(ctx, _sb_loc + 0, (bv)); \
-                heap_set(ctx, _sb_loc + 1, (gb)); \
-                heap_set(ctx, _sb_loc + 2, tgt); \
-                heap_set(ctx, _sb_loc + 3, (bv)); \
-                Term _sub_a = term_new(TAG_TOP, UOP_GRAD, _sa_loc); \
-                Term _sub_b = term_new(TAG_TOP, UOP_GRAD, _sb_loc); \
-                /* Viz anchors: step-graph dumper (include_all=1) walks     \
-                 * heap.  Stash three scratch cells so the Leibniz shape    \
-                 * materializes in the graph:                                \
-                 *  - subs: two TAG_TOP(UOP_GRAD) refs so sub-GRAD nodes    \
-                 *    on the target appear.                                 \
-                 *  - cms:  two chain-MUL refs (ga/gb) so the Leibniz      \
-                 *    products feed a single combiner node, matching       \
-                 *    spec "MUL_ca -> ADD_leib [a]".                        \
-                 *  - add:  TAG_TOP(UOP_ADD, cms) combiner that shows      \
-                 *    ∂a + ∂b as the aggregated cotangent at this level.   \
-                 * Eval ignores these cells; BIN2 still builds the real    \
-                 * ADD via the stack path. */                                \
-                { u64 _subs_loc = heap_alloc(ctx, 2); \
-                  heap_set(ctx, _subs_loc + 0, _sub_a); \
-                  heap_set(ctx, _subs_loc + 1, _sub_b); \
-                  u64 _cms_loc = heap_alloc(ctx, 2); \
-                  heap_set(ctx, _cms_loc + 0, (ga)); \
-                  heap_set(ctx, _cms_loc + 1, (gb)); \
-                  u64 _add_anchor = heap_alloc(ctx, 1); \
-                  heap_set(ctx, _add_anchor, term_new(TAG_TOP, UOP_ADD, _cms_loc)); \
-                } \
+                heap_set(ctx, _sb_loc + 1, tgt); \
+                (void)_sb_loc; \
+                /* BIN1 carries sub_b's operand + cotangent for BIN1 to   \
+                 * seed the next VJP frame after sub_a returns. */        \
                 WnfFrame _ph1 = { .kind = WNF_F_VJP_BIN1, .flags = 0, \
-                    .t0 = tgt, .t1 = _sub_b, .t2 = 0, .t3 = 0 }; \
+                    .t0 = tgt, .t1 = (bv), .t2 = (gb), .t3 = 0 }; \
                 wnf_stack_push(_ph1); \
-                next = _sub_a; \
+                /* VJP frame pre-seeded with ga so sub_a's VJP rules       \
+                 * use the Leibniz cotangent, not the default ones. */    \
+                WnfFrame _sa = { .kind = WNF_F_VJP, .flags = 0, \
+                    .t0 = tgt, .t1 = (ga), .t2 = 0, .t3 = 0 }; \
+                wnf_stack_push(_sa); \
+                next = (av); \
                 WNF_FIRED_AT("GRAD", _sa_loc, tgt); \
                 goto enter; \
             } while (0)
@@ -1824,16 +1809,49 @@ apply: {
                 Term ng = thvm_op_raw(ctx, UOP_NEG, g, term_era());
                 VJP_RECURSE_INTO(a, ng);
             }
-            // MUL: grad_a = g * b, grad_b = g * a.
+            // MUL: HVM4-style Leibniz commute.
+            //   Allocates two sub-GRAD cells [a,tgt], [b,tgt] — chain
+            //   MULs reference them via TAG_TOP(UOP_GRAD, sub_*_loc) as
+            //   the cotangent inputs.  Chain MULs cross-multiply with
+            //   the OTHER operand (b for sub_a path, a for sub_b path).
+            //   ADD combines the two contributions.  MUL's own slots
+            //   are mutated to inner PINs (forward reparenting).
+            //   Outer GRAD's slot 0 gets SUB(MUL_with_pins) so PIN
+            //   reads still resolve to the forward expression; BW
+            //   takes ADD directly.
             if (wuop == UOP_MUL) {
                 Term a = heap_read(ctx, wloc + 0);
                 Term b = heap_read(ctx, wloc + 1);
-                Term g0, g1; wnf_share_or_dup(ctx, g, &g0, &g1);
-                Term a0, a1; wnf_share_or_dup(ctx, a, &a0, &a1);
-                Term b0, b1; wnf_share_or_dup(ctx, b, &b0, &b1);
-                Term g_a = thvm_op_raw(ctx, UOP_MUL, g0, b0);
-                Term g_b = thvm_op_raw(ctx, UOP_MUL, g1, a1);
-                VJP_BINARY(a0, b1, g_a, g_b);
+                (void)g;
+                u64 sa_loc = heap_alloc(ctx, 2);
+                heap_set(ctx, sa_loc + 0, a);
+                heap_set(ctx, sa_loc + 1, tgt);
+                const View *tv = term_view(ctx, tgt);
+                if (tv) { View v = *tv; st_set(sa_loc, &v); }
+                u64 sb_loc = heap_alloc(ctx, 2);
+                heap_set(ctx, sb_loc + 0, b);
+                heap_set(ctx, sb_loc + 1, tgt);
+                if (tv) { View v = *tv; st_set(sb_loc, &v); }
+                Term sa_pin = term_new(TAG_TOP, UOP_GRAD_PIN, sa_loc);
+                Term sa_bw  = term_new(TAG_TOP, UOP_GRAD,     sa_loc);
+                Term sb_pin = term_new(TAG_TOP, UOP_GRAD_PIN, sb_loc);
+                Term sb_bw  = term_new(TAG_TOP, UOP_GRAD,     sb_loc);
+                Term chain_a = thvm_op_raw(ctx, UOP_MUL, sa_bw, b);
+                Term chain_b = thvm_op_raw(ctx, UOP_MUL, a,     sb_bw);
+                Term add_combined = thvm_op_raw(ctx, UOP_ADD, chain_a, chain_b);
+                heap_set(ctx, wloc + 0, sa_pin);
+                heap_set(ctx, wloc + 1, sb_pin);
+                Term mul_with_pins = term_new(TAG_TOP, UOP_MUL, wloc);
+                if (g_wnf_current_grad_slot != 0 &&
+                    g_wnf_current_grad_slot + 1 < ctx->heap_pos) {
+                    heap_set(ctx, g_wnf_current_grad_slot + 0,
+                             term_set_sub(mul_with_pins));
+                    heap_set(ctx, g_wnf_current_grad_slot + 1,
+                             add_combined);
+                }
+                whnf = add_combined;
+                WNF_FIRED();
+                continue;
             }
             // DIV: grad_a = g / b, grad_b = -g * a / (b*b).
             if (wuop == UOP_DIV) {
@@ -1899,12 +1917,40 @@ apply: {
                 Term g_a = thvm_op_raw(ctx, UOP_MUL, g, mask);
                 VJP_RECURSE_INTO(a1, g_a);
             }
-            // SUM: grad_a = expand(g, a.shape).
+            // SUM: HVM4-style commute.  Produces:
+            //   - inner GRAD cell [a, tgt]
+            //   - EXPAND(inner_BW, a.shape) — bwd_wrapper
+            //   - mutates SUM's slot 0 to inner_PIN (forward reparent)
+            //   - outer GRAD slot 0 = SUB(SUM)  so PIN reads follow
+            //     the mutated SUM (v_pass chain)
+            //   - outer GRAD slot 1 = bwd_wrapper  so dumper & BW
+            //     re-entry can find EXPAND (∂v chain)
             if (wuop == UOP_SUM) {
                 Term a = heap_read(ctx, wloc + 0);
                 Shape ash = wnf_shape_of(ctx, a);
-                Term g_a = (ash.rank != 0) ? thvm_expand(ctx, g, ash) : g;
-                VJP_RECURSE_INTO(a, g_a);
+                (void)g;
+                u64 inner_loc = heap_alloc(ctx, 2);
+                heap_set(ctx, inner_loc + 0, a);
+                heap_set(ctx, inner_loc + 1, tgt);
+                const View *tv = term_view(ctx, tgt);
+                if (tv) { View v = *tv; st_set(inner_loc, &v); }
+                Term inner_pin = term_new(TAG_TOP, UOP_GRAD_PIN, inner_loc);
+                Term inner_bw  = term_new(TAG_TOP, UOP_GRAD,     inner_loc);
+                Term bwd_wrapper = (ash.rank != 0)
+                    ? thvm_expand(ctx, inner_bw, ash)
+                    : inner_bw;
+                heap_set(ctx, wloc + 0, inner_pin);
+                Term sum_with_pin = term_new(TAG_TOP, UOP_SUM, wloc);
+                if (g_wnf_current_grad_slot != 0 &&
+                    g_wnf_current_grad_slot + 1 < ctx->heap_pos) {
+                    heap_set(ctx, g_wnf_current_grad_slot + 0,
+                             term_set_sub(sum_with_pin));
+                    heap_set(ctx, g_wnf_current_grad_slot + 1,
+                             bwd_wrapper);
+                }
+                whnf = bwd_wrapper;
+                WNF_FIRED();
+                continue;
             }
             // EXPAND: grad_a = sum_to_shape(g, a.shape).  Sum over broadcast
             // axes where output > input.

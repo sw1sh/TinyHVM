@@ -4,13 +4,30 @@ Everything in TinyHVM is a **term** — a 64-bit word that either *is* a value (
 
 ---
 
+## Setup
+
+```wolfram
+Needs["TinyHVM`"]
+```
+
+```wolfram
+TInit[]
+```
+
+The helpers used throughout this chapter — `TBitField`, `TShapeLegend`, `THeapStrip` — are part of the TinyHVM paclet, so the `Needs[]` above is all you need.
+
+---
+
 ## The 64-Bit Encoding
 
 Every term packs four fields into a single machine word:
 
-```
- 63      62..56      55..38         37..0
-[SUB:1]  [TAG:7]     [EXT:18]       [VAL:38]
+```wolfram
+TBitField[{
+    {"SUB", 1, "flag"},
+    {"TAG", 7, "node kind"},
+    {"EXT", 18, "tag-specific"},
+    {"VAL", 38, "value / ptr"}}]
 ```
 
 | Field | Bits | Purpose |
@@ -47,6 +64,16 @@ Tags defined by the runtime (codes match `TAG_*` in [tinyhvm.h](../../src/tinyhv
 | 14 | ANN | Annotation — `{term : type}` |
 
 The remainder (DSU/DDU, USP/UDP, MAT, ANY, SEQ, ALO, INC, EQL/AND/OR) appear in later chapters.
+
+### Shape legend
+
+`TINetGraph` uses a small alphabet of shapes — triangles for binders, hexagons for supers, ovals for references, rectangles for everything else. Memorize these so the interaction-net pictures later in the chapter are legible at a glance:
+
+```wolfram
+TShapeLegend[]
+```
+
+Treat the *shape family* (triangle vs hexagon vs rectangle) and *fill color* as the primary cues; each `TINetGraph` node also carries its heap slot in an `@n` tail label.
 
 ---
 
@@ -95,11 +122,7 @@ heap:  [ ERA ][ word₁ ][ word₂ ][ word₃ ] ...
 ## Hands-on: the fresh heap
 
 ```wolfram
-Needs["TinyHVM`"]
-TInit[]
-```
-
-```wolfram
+TInit[];
 THeapSnapshot[]
 ```
 
@@ -112,9 +135,22 @@ After `TInit[]`, the snapshot reports `HeapSize = 0` — the sentinel at slot 0 
 `TNum[42]` builds a handle whose word has `TAG=NUM, VAL=42`. No heap slot is used:
 
 ```wolfram
+TInit[];
 n = TNum[42];
 <|"Tag" -> TTermTag[n], "Ext" -> TTermExt[n], "Val" -> TTermVal[n]|>
 ```
+
+Decomposed into the four fields, the word looks like this:
+
+```wolfram
+TBitField[{
+    {"SUB", 1, 0},
+    {"TAG", 7, TTermTag[n] <> " (7)"},
+    {"EXT", 18, TTermExt[n]},
+    {"VAL", 38, TTermVal[n]}}]
+```
+
+The heap didn't grow:
 
 ```wolfram
 THeapSnapshot[]["HeapSize"]
@@ -140,37 +176,54 @@ lam = TLam[x |-> x];
   "HeapSize" -> THeapSnapshot[]["HeapSize"]|>
 ```
 
-The LAM owns two slots:
+Compare the two words side by side — the leaf versus the heap-owner. `NUM`'s `VAL` *is* the data; `LAM`'s `VAL` is a **pointer** (heap slot index):
 
 ```wolfram
-Grid[Prepend[
-  Table[THeapRead[i] /@ {"Loc", "Tag", "Val"}, {i, 1, 2}],
-  {"loc", "tag", "val"}],
-  Frame -> All]
+Column[{
+    Style["NUM 42  (leaf — VAL carries the value)", Bold],
+    TBitField[{{"SUB", 1, 0}, {"TAG", 7, "NUM"},
+               {"EXT", 18, 0}, {"VAL", 38, 42}}, ImageSize -> 560],
+    Spacer[{0, 10}],
+    Style["LAM  (owner — VAL is a heap pointer)", Bold],
+    TBitField[{{"SUB", 1, 0}, {"TAG", 7, "LAM"},
+               {"EXT", 18, 0},
+               {"VAL", 38, "\[RightArrow] heap[" <> ToString[TTermVal[lam]] <> "]"}},
+              ImageSize -> 560]
+}, Alignment -> Left]
 ```
 
-Slot 1 is the **binder** — owned by the LAM, initialized as a self-referring `Var` placeholder ("no value yet"). Slot 2 is the **body** — for `λx. x` the body is a `Var` reference pointing back to slot 1, which is why `Val -> 1`.
+The LAM owns two slots. A compact strip view of the heap:
+
+```wolfram
+THeapStrip[]
+```
+
+Slot 1 is the **binder** — owned by the LAM, initialized as a self-referring `Var` placeholder ("no value yet"). Slot 2 is the **body** — for `λx. x` the body is a `Var` reference pointing back to slot 1, which is why `val=1`.
 
 A richer body grows the heap further. `x + 1` needs an OP2 cell plus slots for its two arguments:
 
 ```wolfram
 TInit[];
 TLam[x |-> TOp2["Add", x, TNum[1]]];
-h = THeapSnapshot[];
-Grid[Prepend[
-  Table[THeapRead[i] /@ {"Loc", "Tag", "Val"}, {i, 1, h["HeapSize"]}],
-  {"loc", "tag", "val"}],
-  Frame -> All]
+THeapStrip[]
 ```
 
-Reading the grid:
+Reading left to right:
 
-- slot 1 — LAM's binder (holds a `Var` placeholder, overwritten on beta)
-- slot 2 — LAM's body: an `Op2`, `Val=3` means its args start at slot 3
-- slot 3 — OP2's arg0: a `Var` reference back to slot 1 (the `x` occurrence)
-- slot 4 — OP2's arg1: a `Num 1` (the constant, sitting inline)
+- **slot 1** — LAM's binder (holds a `Var` placeholder, overwritten on beta)
+- **slot 2** — LAM's body: an `OP2`, `val=3` means its args start at slot 3
+- **slot 3** — OP2's arg0: a `Var` reference back to slot 1 (the `x` occurrence)
+- **slot 4** — OP2's arg1: a `Num 1` (the constant, sitting inline)
 
-No slot here was allocated *for* a VAR or a NUM — the LAM allocated 2, the OP2 allocated 2, and their contents include VAR/NUM words inline.
+No slot here was allocated *for* a VAR or a NUM — the LAM allocated 2, the OP2 allocated 2, and their contents include VAR/NUM words inline. The same thing in the interaction-net view:
+
+```wolfram
+TInit[];
+lamBody = TLam[x |-> TOp2["Add", x, TNum[1]]];
+TINetGraph[lamBody, ImageSize -> 500]
+```
+
+The triangle is the LAM; its `body` edge lands on the rectangular OP2; the OP2's two ports (`a`, `b`) point at a VAR oval (back to the binder) and the NUM rectangle (the constant). The `@n` tail on each compound matches the `slot` labels in the heap strip one-for-one.
 
 ---
 
@@ -201,27 +254,27 @@ Properties are indexed like an association:
 
 ```wolfram
 TInit[];
-TINetGraph[TNum[42]]
+TINetGraph[TNum[42], ImageSize -> 260]
 ```
 
-A standalone `NUM` is one leaf node with no edges — it owns no heap slots.
+A standalone `NUM` is one leaf node with no edges — it owns no heap slots. Applying the lambda to an argument wires the pieces together:
 
 ```wolfram
 TInit[];
 app = TApp[TLam[x |-> TOp2["Add", x, TNum[1]]], TNum[41]];
-TINetGraph[app]
+TINetGraph[app, ImageSize -> 560]
 ```
 
-APP sits at the root (`out` pins to the free port above it). Its two slots (`fun`, `arg`) feed the LAM and the constant `41`. The LAM's `body` edge goes to the OP2, whose `a`/`b` slots hold the VAR reference and the constant `1`. Each compound carries its heap location in the `@n` tail label, so the graph lines up 1-to-1 with the `THeapRead` grid.
+APP sits at the root (`out` pins to the free port above it). Its two slots (`fun`, `arg`) feed the LAM and the constant `41`. The LAM's `body` edge goes to the OP2, whose `a`/`b` slots hold the VAR reference and the constant `1`. Each compound carries its heap location in the `@n` tail label, so the graph lines up 1-to-1 with the `THeapStrip[]` view above.
 
 ---
 
 ## Summary
 
-- A term is a 64-bit word — `[SUB][TAG][EXT][VAL]`.
+- A term is a 64-bit word — `[SUB][TAG][EXT][VAL]` — `TBitField` renders any field decomposition for teaching.
 - **Non-owning** words (NUM, ERA, VAR, REF) don't allocate: NUM/ERA are self-contained; VAR/REF are references whose `VAL` points to an existing slot.
 - **Heap-owning** compound nodes (LAM, APP, SUP, OP2) allocate 2 consecutive slots and stash the base in `VAL`.
 - The contents of a compound's slots are themselves 64-bit words — they may be leaves inline or references into the heap.
 - `THeapSnapshot[]` returns a `THeap` with heap size, interaction count, tensor count, next label, and definition count.
-- `THeapRead[loc]` reads one slot; `THeapReadRange[lo, count]` bulk-reads a run.
-- `TINetGraph[t]` — the canonical interaction-net view (dump.c-matched styling).
+- `THeapRead[loc]` reads one slot; `THeapReadRange[lo, count]` bulk-reads a run; `THeapStrip[]` / `THeapStrip[lo, hi]` draws the slots as a horizontal strip.
+- `TINetGraph[t]` — the canonical interaction-net view; `TShapeLegend[]` is the companion that names its shape alphabet.

@@ -1,0 +1,41 @@
+// GRAD ⊳ SUM just fired.  Tinygrad's rule for REDUCE_AXIS(ADD) is
+// just `to_inp_shape(ctx)` — a single EXPAND, no chain-rule MUL.
+// GRAD reparented ABOVE SUM: v_pass now feeds SUM (forward continues
+// through), ∂v feeds EXPAND (which adjusts shape and forwards to
+// FUSE_b).  GRAD stays 1-in/2-out.
+// Redex: MUL → GRAD (new principal y-edge).
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1     [label="t1\n[3] f32",   fillcolor="#ffe0e0"];
+  axes   [label="axes\n[1] i32", fillcolor="#e0e0e0"];
+  shape3 [label="[3]\nshape",    fillcolor="#e0e0e0"];
+
+  MUL    [label="MUL\n[3]",            fillcolor="#cce5ff"];
+  SUM    [label="SUM\n[1]",            fillcolor="#ffcccc"];
+  GRAD   [label="GRAD\nd/d(t1)",       fillcolor="#e8d0ff"];
+  EXPAND [label="EXPAND\n(SUM bwd)",   fillcolor="#fff3cd"];
+
+  FUSE_f [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+  FUSE_b [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+
+  y_out [label="y",      shape=circle, width=0.20, fixedsize=true, fillcolor="#ffffff"];
+  g_out [label="∂y/∂t1", shape=circle, width=0.30, fixedsize=true, fillcolor="#ffffff"];
+
+  // Forward: t1 → MUL → GRAD.y; v_pass → SUM → FUSE_f → y
+  t1     -> MUL    [label="a"];
+  t1     -> MUL    [label="b"];
+  MUL    -> GRAD   [label="y", color="#cc0000", penwidth=2];
+  GRAD   -> SUM    [label="v_pass"];
+  axes   -> SUM    [label="axes"];
+  SUM    -> FUSE_f;
+  FUSE_f -> y_out;
+
+  // Backward: GRAD.∂v → EXPAND → FUSE_b
+  GRAD   -> EXPAND [label="∂v"];
+  shape3 -> EXPAND [label="shape"];
+  EXPAND -> FUSE_b;
+  FUSE_b -> g_out;
+}

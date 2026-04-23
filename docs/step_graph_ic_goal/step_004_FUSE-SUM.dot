@@ -1,0 +1,51 @@
+// GRAD_b ⊳ TEN(t1) just fired — target match.  GRAD_b annihilates;
+// ones_b materialises into MUL_cb (∂b port).  No GRAD agents remain.
+// The graph is now pure forward + backward compute tree, ready for
+// FUSE to start kernelising TOPs.
+// Redex: SUM → FUSE_f (first forward TOP absorbed).
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1     [label="t1\n[3] f32",   fillcolor="#ffe0e0"];
+  axes   [label="axes\n[1] i32", fillcolor="#e0e0e0"];
+  shape3 [label="[3]\nshape",    fillcolor="#e0e0e0"];
+  ones_a [label="ones_a\n[3]",   fillcolor="#e0e0e0"];
+  ones_b [label="ones_b\n[3]",   fillcolor="#e0e0e0"];
+
+  MUL      [label="MUL\n[3]",            fillcolor="#cce5ff"];
+  SUM      [label="SUM\n[1]",            fillcolor="#ffcccc"];
+  MUL_ca   [label="MUL\n(b·∂a)",         fillcolor="#cce5ff"];
+  MUL_cb   [label="MUL\n(a·∂b)",         fillcolor="#cce5ff"];
+  ADD_leib [label="ADD\n(Leibniz)",      fillcolor="#cce5ff"];
+  EXPAND   [label="EXPAND\n(SUM bwd)",   fillcolor="#fff3cd"];
+
+  FUSE_f [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+  FUSE_b [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+
+  y_out [label="y",      shape=circle, width=0.20, fixedsize=true, fillcolor="#ffffff"];
+  g_out [label="∂y/∂t1", shape=circle, width=0.30, fixedsize=true, fillcolor="#ffffff"];
+
+  // Forward (redex at SUM → FUSE_f)
+  t1     -> MUL    [label="a"];
+  t1     -> MUL    [label="b"];
+  MUL    -> SUM    [label="in"];
+  axes   -> SUM    [label="axes"];
+  SUM    -> FUSE_f [color="#cc0000", penwidth=2];
+  FUSE_f -> y_out;
+
+  // Backward: both arms fully resolved
+  t1     -> MUL_ca [label="b"];
+  ones_a -> MUL_ca [label="∂a"];
+  t1     -> MUL_cb [label="a"];
+  ones_b -> MUL_cb [label="∂b"];
+
+  MUL_ca -> ADD_leib [label="a"];
+  MUL_cb -> ADD_leib [label="b"];
+
+  ADD_leib -> EXPAND [label="∂v"];
+  shape3   -> EXPAND [label="shape"];
+  EXPAND   -> FUSE_b;
+  FUSE_b   -> g_out;
+}

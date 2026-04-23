@@ -30,7 +30,8 @@ ClearAll[
     dotNodeAttrs,
     dotEdgeAttrs,
     walkDOTString,
-    withDOTImport
+    withDOTImport,
+    THeapStripColor
 ];
 
 $visualizationSourceDirectory = DirectoryName[$InputFileName];
@@ -380,21 +381,31 @@ nodeHalfSize[tag_String, lines_List] := Block[{
 nodeGraphic[tag_String, lines_List, fill_, textColor_] := Block[{
     shape = shapeForTag[tag],
     half = nodeHalfSize[tag, lines],
-    pad = 0.16
+    pad = 0.16,
+    n, fs, lineH, ys
 },
+    (* First line (primary label) is slightly larger & bold, the rest are smaller.
+       Text primitives are positioned directly so Rasterize renders without
+       stray Inset bounding boxes. *)
+    n = Length[lines];
+    fs = If[n == 0, {}, Prepend[ConstantArray[9, n - 1], 11]];
+    lineH = 2 half[[2]] / (n + 1);
+    ys = Table[half[[2]] - i lineH, {i, 1, n}];
     Graphics[
         {
             EdgeForm[Directive[GrayLevel[0.15], AbsoluteThickness[1.0]]],
             FaceForm[fill],
             shapePrim[shape, {0, 0}, half],
-            Inset[
-                Column[
-                    Style[#, 10, FontFamily -> "Helvetica", FontColor -> textColor] & /@ lines,
-                    Alignment -> Center,
-                    Spacings -> 0.03
-                ],
-                {0, 0}
-            ]
+            MapThread[
+                Function[{line, y, size, bold},
+                    Text[
+                        Style[line,
+                            FontFamily -> "Helvetica",
+                            FontColor -> textColor,
+                            FontSize -> size,
+                            FontWeight -> If[bold, Bold, Plain]],
+                        {0, y}]],
+                {lines, ys, fs, Prepend[ConstantArray[False, Max[n - 1, 0]], True]}]
         },
         PlotRange -> {
             {-half[[1]] - pad, half[[1]] + pad},
@@ -765,25 +776,23 @@ TINetGraph[
     ];
     fillFor[k_] := With[{n = nodes[k]}, dotFill[n["Tag"], Lookup[n, "UOp", ""]]];
 
+    (* Eagerly evaluate the node Graphics *before* capturing it in the VSF closure.
+       Leaving `nodeGraphic[...]` unevaluated inside `Function[{pos,...}, Inset[...]]`
+       causes the FE to emit stray pink bounding boxes during Rasterize, because
+       the inner Graphics re-resolves every draw. Baking the result into `ng`
+       keeps the closure a pure Inset of a fully-formed Graphics. *)
     vsf[k_] := If[
         nodes[k]["Tag"] === "Free",
-        Function[{pos, name, sz},
-            Inset[
-                Graphics[
-                    {GrayLevel[0.55], AbsoluteThickness[1.0], Circle[{0, 0}, 1]},
-                    ImageSize -> 14,
-                    PlotRange -> {{-1.2, 1.2}, {-1.2, 1.2}},
-                    ImagePadding -> 0,
-                    PlotRangePadding -> 0
-                ],
-                pos,
-                Center
-            ]
+        With[{ng = Graphics[
+                {GrayLevel[0.55], AbsoluteThickness[1.0], Circle[{0, 0}, 1]},
+                ImageSize -> 14,
+                PlotRange -> {{-1.2, 1.2}, {-1.2, 1.2}},
+                ImagePadding -> 0,
+                PlotRangePadding -> 0]},
+            Function[{pos, name, sz}, Inset[ng, pos, Center]]
         ],
-        With[{tag = nodes[k]["Tag"], ls = lineFor[k], fill = fillFor[k]},
-            Function[{pos, name, sz},
-                Inset[nodeGraphic[tag, ls, fill, textColor], pos, Center]
-            ]
+        With[{ng = nodeGraphic[nodes[k]["Tag"], lineFor[k], fillFor[k], textColor]},
+            Function[{pos, name, sz}, Inset[ng, pos, Center]]
         ]
     ];
 
@@ -889,6 +898,126 @@ TINetGraph[
         Sequence @@ FilterRules[passedOpts, Except["TermId"]]
     ]
 ]
+
+(* ── Pedagogical helpers (TBitField / TShapeLegend / THeapStrip) ────────── *)
+
+Options[TBitField] = {ImageSize -> 640};
+
+TBitField[fields : {{_, _Integer, _} ..}, opts : OptionsPattern[]] := Block[{
+    bits = fields[[All, 2]],
+    labels = fields[[All, 1]],
+    values = fields[[All, 3]],
+    total, w, xs, colors, minW = 0.08
+},
+    total = Total[bits];
+    (* Proportional widths with a minimum so narrow fields still hold their label. *)
+    w = Max[#, minW] & /@ (bits / total);
+    w = w / Total[w];
+    xs = Accumulate[Prepend[Most[w], 0]];
+    colors = {
+        RGBColor["#fde2e2"], RGBColor["#d1e7dd"],
+        RGBColor["#fff3cd"], RGBColor["#cfe2ff"],
+        RGBColor["#e2d4f7"], RGBColor["#f8d7da"]
+    }[[1 ;; Length[fields]]];
+    Graphics[
+        MapThread[
+            Function[{name, nbits, val, x, width, col},
+                {FaceForm[col],
+                 EdgeForm[Directive[GrayLevel[0.2], AbsoluteThickness[1.1]]],
+                 Rectangle[{x, 0}, {x + width, 1}],
+                 Text[Style[ToString[name], Bold, 13, FontColor -> Black],
+                      {x + width/2, 0.78}],
+                 Text[Style[ToString[nbits] <> " bits", 9, FontColor -> GrayLevel[0.35]],
+                      {x + width/2, 0.52}],
+                 Text[Style[ToString[val], 11, FontColor -> RGBColor[0.15, 0.15, 0.55]],
+                      {x + width/2, 0.22}]}],
+            {labels, bits, values, xs, w, colors}],
+        PlotRange -> {{-0.01, 1.01}, {-0.1, 1.1}},
+        ImageSize -> OptionValue[ImageSize],
+        AspectRatio -> 1/6,
+        Background -> White]
+]
+
+(* Shapes/colors mirror the gallery you see in TINetGraph, hand-drawn so they
+   render predictably at small sizes. *)
+TShapeLegend[] := Block[{items, cell},
+    items = {
+        {"LAM", "binder",      "Triangle",    RGBColor[Lookup[$heapTagFill, "Lam", "#f2e8ff"]]},
+        {"APP", "application", "InvTriangle", RGBColor[Lookup[$heapTagFill, "App", "#f3f3f3"]]},
+        {"SUP", "super",       "Hexagon",     RGBColor[Lookup[$heapTagFill, "Sup", "#e4d6fc"]]},
+        {"VAR", "reference",   "Oval",        RGBColor[Lookup[$heapTagFill, "Var", "#eeeeee"]]},
+        {"NUM", "leaf (u32)",  "Rectangle",   RGBColor["#fde2e2"]},
+        {"OP2", "primop",      "Rectangle",   RGBColor["#cfe2ff"]},
+        {"ERA", "eraser",      "Dot",         RGBColor["#ffffff"]}
+    };
+    cell[{name_, role_, shape_, col_}] := Column[{
+        Graphics[{
+            FaceForm[col],
+            EdgeForm[Directive[GrayLevel[0.15], AbsoluteThickness[1.2]]],
+            Switch[shape,
+                "Triangle",    Polygon[{{0, 0.9}, {-1, -0.7}, {1, -0.7}}],
+                "InvTriangle", Polygon[{{0, -0.9}, {-1, 0.7}, {1, 0.7}}],
+                "Hexagon",     Polygon[Table[{Cos[Pi/6 + k Pi/3], Sin[Pi/6 + k Pi/3]}, {k, 0, 5}]],
+                "Oval",        Disk[{0, 0}, {1.1, 0.65}],
+                "Rectangle",   Rectangle[{-1, -0.6}, {1, 0.6}],
+                "Dot",         Disk[{0, 0}, 0.25]],
+            Text[Style[name, Bold, 14, FontColor -> Black], {0, 0.05}]},
+            ImageSize -> 90,
+            PlotRange -> {{-1.2, 1.2}, {-1.1, 1.1}},
+            Background -> White],
+        Style[role, 10, FontColor -> GrayLevel[0.4]]},
+        Alignment -> Center, Spacings -> 0.2];
+    Grid[{cell /@ items},
+        Spacings -> {1, 1}, Alignment -> Center,
+        Frame -> All, FrameStyle -> GrayLevel[0.85]]
+]
+
+(* Colors picked up from $heapTagFill so THeapStrip and TINetGraph agree. *)
+THeapStripColor[tag_String] := Switch[tag,
+    "Lam" | "Bri",  RGBColor[Lookup[$heapTagFill, "Lam", "#f2e8ff"]],
+    "App",          RGBColor[Lookup[$heapTagFill, "App", "#f3f3f3"]],
+    "Sup" | "Usp",  RGBColor[Lookup[$heapTagFill, "Sup", "#e4d6fc"]],
+    "Var" | "Ref",  RGBColor[Lookup[$heapTagFill, "Var", "#eeeeee"]],
+    "Num",          RGBColor["#fde2e2"],
+    "Op2",          RGBColor["#cfe2ff"],
+    "Era",          RGBColor["#ffffff"],
+    "Ten",          RGBColor[Lookup[$heapTagFill, "Ten", "#e0e0e0"]],
+    "Top",          RGBColor[Lookup[$heapTagFill, "Top", "#cce5ff"]],
+    _,              RGBColor["#f3f3f3"]]
+
+THeapStrip[] := THeapStrip[1, THeapSnapshot[]["HeapSize"]]
+
+THeapStrip[lo_Integer, hi_Integer] /; hi >= lo := Block[{rows, size = hi - lo + 1},
+    rows = Table[
+        With[{h = THeapRead[i]},
+            {i, h["Tag"], h["Val"], THeapStripColor[h["Tag"]]}],
+        {i, lo, hi}];
+    Graphics[
+        MapIndexed[
+            Function[{row, idx},
+                With[{
+                    x = idx[[1]] - 1,
+                    loc = row[[1]], tag = row[[2]], val = row[[3]], col = row[[4]]
+                },
+                    {FaceForm[col],
+                     EdgeForm[Directive[GrayLevel[0.15], AbsoluteThickness[1.1]]],
+                     Rectangle[{x, 0}, {x + 1, 1.2}],
+                     Text[Style["slot " <> ToString[loc], 9, FontColor -> GrayLevel[0.4]],
+                          {x + 0.5, 1.05}],
+                     Text[Style[ToUpperCase[ToString[tag]], Bold, 12, FontColor -> Black],
+                          {x + 0.5, 0.72}],
+                     Text[Style["val=" <> ToString[val], 10,
+                                FontColor -> RGBColor[0.15, 0.15, 0.55]],
+                          {x + 0.5, 0.35}]}]],
+            rows],
+        PlotRange -> {{-0.05, size + 0.05}, {-0.1, 1.3}},
+        ImageSize -> 120 * size,
+        AspectRatio -> 1.3 / size,
+        Background -> White]
+]
+
+THeapStrip[lo_Integer, hi_Integer] /; hi < lo := Graphics[{},
+    ImageSize -> 40, Background -> White]
 
 TProfileEnable[] := (loadLibrary[]; thvmProfileEnableFn[])
 

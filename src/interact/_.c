@@ -71,8 +71,8 @@ static u32 thvm_uop_storage_arity(u32 ext) {
     if (ext == UOP_EXEC) return 3;   // [NUM(kid), deps, NUM(flags)]
     if (ext == UOP_FUSE) return 1;
     if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
-    if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) return 4;  // [y_bw, gy, target, y_fw]
-    if (ext == UOP_GRAD_PIN) return 4;  // shares cell with UOP_GRAD; PIN reads slot 3 (y_fw)
+    if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) return 2;  // [body, target] — DUP+target analog
+    if (ext == UOP_GRAD_PIN) return 2;  // shares cell with UOP_GRAD; two tag views of slot 0
     if (ext == UOP_LOG_PRINT || ext == UOP_DETACH) return 1;
     if (!is_binary(ext) && is_elementwise(ext)) return 1;
     return 2;

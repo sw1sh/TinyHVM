@@ -1,0 +1,59 @@
+// GRAD ⊳ MUL just fired (tinygrad's MUL rule: lgrads = (src[1]·ctx,
+// src[0]·ctx)).  Two sub-GRADs on t1; each sub-GRAD is 1-in/2-out
+// (v_pass → forward MUL, ∂v → chain MUL that multiplies by the OTHER
+// operand).  ADD sums the per-operand contributions into ∂v for the
+// MUL level, which feeds EXPAND above.  t1 is TEN — aliased without
+// DUP.
+// Redex: t1 → GRAD_a (left sub-GRAD's principal y-edge).
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1     [label="t1\n[3] f32",   fillcolor="#ffe0e0"];
+  axes   [label="axes\n[1] i32", fillcolor="#e0e0e0"];
+  shape3 [label="[3]\nshape",    fillcolor="#e0e0e0"];
+
+  MUL      [label="MUL\n[3]",            fillcolor="#cce5ff"];
+  SUM      [label="SUM\n[1]",            fillcolor="#ffcccc"];
+  GRAD_a   [label="GRAD_a\nd/d(t1)",     fillcolor="#e8d0ff"];
+  GRAD_b   [label="GRAD_b\nd/d(t1)",     fillcolor="#e8d0ff"];
+  MUL_ca   [label="MUL\n(b·∂a)",         fillcolor="#cce5ff"];
+  MUL_cb   [label="MUL\n(a·∂b)",         fillcolor="#cce5ff"];
+  ADD_leib [label="ADD\n(Leibniz)",      fillcolor="#cce5ff"];
+  EXPAND   [label="EXPAND\n(SUM bwd)",   fillcolor="#fff3cd"];
+
+  FUSE_f [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+  FUSE_b [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+
+  y_out [label="y",      shape=circle, width=0.20, fixedsize=true, fillcolor="#ffffff"];
+  g_out [label="∂y/∂t1", shape=circle, width=0.30, fixedsize=true, fillcolor="#ffffff"];
+
+  // Sub-GRADs (each 1-in/2-out): v_pass feeds forward MUL, ∂v feeds chain MUL
+  t1     -> GRAD_a [label="y", color="#cc0000", penwidth=2];
+  t1     -> GRAD_b [label="y"];
+  GRAD_a -> MUL    [label="a (v_pass)"];
+  GRAD_b -> MUL    [label="b (v_pass)"];
+
+  // Forward: MUL → SUM → FUSE_f → y
+  MUL    -> SUM    [label="in"];
+  axes   -> SUM    [label="axes"];
+  SUM    -> FUSE_f;
+  FUSE_f -> y_out;
+
+  // Chain MULs: each multiplies the OTHER operand (= t1) by the sub-GRAD's ∂
+  t1     -> MUL_ca [label="b"];     // src[1] of forward MUL
+  GRAD_a -> MUL_ca [label="∂a"];
+  t1     -> MUL_cb [label="a"];     // src[0] of forward MUL
+  GRAD_b -> MUL_cb [label="∂b"];
+
+  // Leibniz sum of per-operand contributions = ∂v at MUL level
+  MUL_ca -> ADD_leib [label="a"];
+  MUL_cb -> ADD_leib [label="b"];
+
+  // ADD's output is ∂v feeding the outer EXPAND (SUM's bwd)
+  ADD_leib -> EXPAND [label="∂v"];
+  shape3   -> EXPAND [label="shape"];
+  EXPAND   -> FUSE_b;
+  FUSE_b   -> g_out;
+}

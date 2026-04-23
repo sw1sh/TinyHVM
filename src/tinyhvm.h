@@ -160,16 +160,27 @@ typedef u64 Term;
                            // installed by global compiler passes; fires JIT/dispatch on reduce
 
 // UOP_GRAD: reverse-mode gradient (VJP with implicit ones cotangent on y).
-// heap[loc+0]=y, heap[loc+1]=target.  Reduces to tensor of target.shape.
+// heap[loc+0]=y, heap[loc+1]=gy(=ERA seed), heap[loc+2]=target.  Reduces
+// to tensor of target.shape.  Also called VJP_BW.
 #define UOP_GRAD      34
+#define UOP_VJP_BW    UOP_GRAD  // clearer alias paired with UOP_GRAD_PIN
 // UOP_GRAD_FWD: forward-mode tangent (JVP with implicit ones seed on target).
-// heap[loc+0]=y, heap[loc+1]=target.  Reduces to tensor of y.shape.
-// Shares the rule body with UOP_GRAD; branches on polarity for MM/SUM/EXPAND/
-// RESHAPE/PERMUTE/SHRINK/PAD and the leaf shape.  Elementwise rules are
-// polarity-agnostic (diagonal Jacobian ⇒ same rewrite in both modes).
+// heap[loc+0]=y, heap[loc+1]=tangent(=ERA seed), heap[loc+2]=target.
+// Reduces to tensor of y.shape.  Shares the rule body with UOP_GRAD;
+// branches on polarity for MM/SUM/EXPAND/RESHAPE/PERMUTE/SHRINK/PAD and
+// the leaf shape.  Elementwise rules are polarity-agnostic (diagonal
+// Jacobian ⇒ same rewrite in both modes).
 #define UOP_GRAD_FWD  35
+// UOP_GRAD_PIN: forward-pass "pin" view, mode-neutral.  Shares a 3-slot
+// cell [y, gy_or_tangent, target] with a sibling BW tag — either
+// UOP_GRAD (reverse mode) or UOP_GRAD_FWD (forward mode).  Allocated
+// together by thvm_grad_split / thvm_grad_fwd_split — one heap cell,
+// two term tags (like DP0/DP1 on a DUP cell).  When reduced it emits
+// y (forward passthrough); until reduced it pins the cell so y stays
+// reachable from root even after the BW sibling slides its y pointer.
+#define UOP_GRAD_PIN  36
 
-#define UOP_COUNT     36
+#define UOP_COUNT     37
 
 // (LAYER_OP_POOL_GATHER and LAYER_OP_BATCHNORM removed — both are now
 // composed from standard UOps with standard backward rules.)
@@ -180,7 +191,7 @@ static const char *uop_names[] = {
     "ADD","MUL","DIV","MAX","CMP","SUB","SUM","RMAX","MM",
     "RESHAPE","PERMUTE","EXPAND","SHRINK","PAD","KERNEL","ASSIGN","WHERE",
     "IFZ","LOG_PRINT","RESERVED28","TODEVICE","DETACH","FUSE","LEGACY32","EXEC",
-    "GRAD","GRAD_FWD"
+    "GRAD","GRAD_FWD","GRAD_PIN"
 };
 
 // ============================================================
@@ -1442,6 +1453,19 @@ f32      thvm_eval_accuracy(TinyHVM *ctx, Term logits, const u8 *labels,
 // Gradient.  Builds a UOP_GRAD(y, target) node that reduces to a tensor of
 // target.shape holding ∂(sum y)/∂target (reverse-mode, ones-seed cotangent).
 Term     thvm_grad(TinyHVM *ctx, Term y, Term target);
+
+// thvm_grad_split: split into (forward-pin, reverse-mode backward) view
+// terms sharing one heap cell.  Like thvm_dup but for GRAD: out_pin
+// reduces to y (forward passthrough, keeps y alive in the graph),
+// out_bw reduces to ∂y/∂target (reverse mode / VJP).
+void     thvm_grad_split(TinyHVM *ctx, Term y, Term target,
+                          Term *out_pin, Term *out_bw);
+
+// thvm_grad_fwd_split: JVP companion — same cell-sharing scheme, but
+// the BW sibling is UOP_GRAD_FWD (forward-mode tangent / JVP).  The
+// pin is mode-neutral and identical to thvm_grad_split's.
+void     thvm_grad_fwd_split(TinyHVM *ctx, Term y, Term target,
+                              Term *out_pin, Term *out_bw);
 // Forward-mode tangent (JVP).  Reduces to a tensor of y.shape holding
 // ∂y/∂target · ones(target.shape).  Same rule skeleton as thvm_grad with
 // a polarity bit; shape-propagation runs in the opposite direction.

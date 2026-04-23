@@ -1,0 +1,33 @@
+// KERNEL/KERNEL cascade merged all four backward singletons (MUL_ca,
+// MUL_cb, ADD, EXPAND) into KERNEL_bwd.  Final state: exactly two
+// kernels — KERNEL_fwd (MUL+SUM) producing y, and KERNEL_bwd
+// (MUL_ca, MUL_cb, ADD, EXPAND) producing ∂y/∂t1.  Both share t1 as
+// a TEN leaf.  No more redexes — WHNF.
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1     [label="t1\n[3] f32",   fillcolor="#ffe0e0"];
+  axes   [label="axes\n[1] i32", fillcolor="#e0e0e0"];
+  shape3 [label="[3]\nshape",    fillcolor="#e0e0e0"];
+  ones_a [label="ones_a\n[3]",   fillcolor="#e0e0e0"];
+  ones_b [label="ones_b\n[3]",   fillcolor="#e0e0e0"];
+
+  K_FWD [label="KERNEL_fwd\n{MUL, SUM}",                    fillcolor="#8fdd8f"];
+  K_BWD [label="KERNEL_bwd\n{MUL_ca, MUL_cb, ADD, EXPAND}", fillcolor="#8fdd8f"];
+
+  y_out [label="y",      shape=circle, width=0.20, fixedsize=true, fillcolor="#ffffff"];
+  g_out [label="∂y/∂t1", shape=circle, width=0.30, fixedsize=true, fillcolor="#ffffff"];
+
+  t1    -> K_FWD [label="a"];
+  t1    -> K_FWD [label="b"];
+  axes  -> K_FWD [label="axes"];
+  K_FWD -> y_out;
+
+  t1     -> K_BWD [label="t1×2"];
+  ones_a -> K_BWD [label="∂a"];
+  ones_b -> K_BWD [label="∂b"];
+  shape3 -> K_BWD [label="shape"];
+  K_BWD  -> g_out;
+}

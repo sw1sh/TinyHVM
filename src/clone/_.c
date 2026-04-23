@@ -22,7 +22,8 @@ static u32 clone_uop_storage_arity(u32 ext) {
     if (ext == UOP_EXEC) return 3;
     if (ext == UOP_FUSE) return 1;
     if (ext == UOP_WHERE || ext == UOP_IFZ) return 3;
-    if (ext == UOP_GRAD) return 2;
+    if (ext == UOP_GRAD || ext == UOP_GRAD_FWD) return 2;  // [body, target]
+    if (ext == UOP_GRAD_PIN) return 2;  // shares cell with UOP_GRAD
     if (ext == UOP_LOG_PRINT || ext == UOP_DETACH) return 1;
     if (!is_binary(ext) && is_elementwise(ext)) return 1;
     return 2;

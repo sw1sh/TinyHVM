@@ -1246,27 +1246,17 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // step graph's pre-reduce state matches the spec topology: GRAD is
     // a 1-in/2-out T-junction whose v_pass feeds a forward-output FUSE
     // and whose ∂v feeds a backward-output FUSE.  Both FUSEs are stored
-    // on heap so the dumper (include_all=1) walks them.  Reduction is
-    // driven through fuse_b (BW); fuse_f stays reachable for viz.
-    if (term_tag(traced) == TAG_TOP &&
-        (term_ext(traced) == UOP_GRAD || term_ext(traced) == UOP_GRAD_FWD)) {
-        u64 grad_loc = term_val(traced);
-        // PIN view of same cell (shares slot 3 = y_fw).
-        Term pin  = term_new(TAG_TOP, UOP_GRAD_PIN, grad_loc);
-        u64  fslt = heap_alloc(ctx, 1);
-        heap_set(ctx, fslt, pin);
-        Term fuse_f = term_new(TAG_TOP, UOP_FUSE, fslt);
-        u64  fsltb = heap_alloc(ctx, 1);
-        heap_set(ctx, fsltb, traced);
-        Term fuse_b = term_new(TAG_TOP, UOP_FUSE, fsltb);
-        // Stash fuse_f on a heap slot so it stays reachable for the
-        // dumper through the whole session.
-        u64 fuse_f_anchor = heap_alloc(ctx, 1);
-        heap_set(ctx, fuse_f_anchor, fuse_f);
-        (void)fuse_f_anchor;
-        traced = fuse_b;
-    }
-
+    // on heap so the dumper (include_all=1) walks them.
+    //
+    // Slide semantics:
+    //  - FUSE_f wraps the v_pass chain head.  Set its slot to y_fw
+    //    (heap[grad_loc+3]) so it directly points at the preserved
+    //    forward term (SUM in test_e2e_vjp_sum_of_square).  y_fw never
+    //    mutates, so FUSE_f's slot stays correct across slides.
+    //  - FUSE_b wraps the ∂v chain head.  Set its slot to GRAD
+    //    initially (ERA gy has no useful render).  Register the slot
+    //    with wnf so VJP_RECURSE_INTO mirrors each new gy into it,
+    //    keeping FUSE_b → (current gy) at every step.
     // Frame 0: initial state.  Highlight the initial redex edge —
     // for a GRAD root term, that's the y→GRAD principal-port edge
     // (slot grad_loc+0).
@@ -1277,18 +1267,20 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     thvm_step_seed_root_grad(ctx, traced);
     char p0[640];
     snprintf(p0, sizeof(p0), "%s/step_%03u.dot", dir, g_step_session_frame);
+    // Scan heap for the first outermost GRAD cell and highlight its
+    // slot 0 (principal y edge) as the initial redex.  Works whether
+    // the root is a direct GRAD term, or a compound (CTR / FUSE / ...)
+    // with GRAD nested inside.
     u64 init_hl = 0;
-    {
-        Term probe = traced;
-        // Unwrap FUSE(GRAD) to find the initial redex slot inside.
-        if (term_tag(probe) == TAG_TOP && term_ext(probe) == UOP_FUSE) {
-            u64 ploc = term_val(probe);
-            if (ploc != 0 && ploc < ctx->heap_pos)
-                probe = heap_read(ctx, ploc);
-        }
-        if (term_tag(probe) == TAG_TOP &&
-            (term_ext(probe) == UOP_GRAD || term_ext(probe) == UOP_GRAD_FWD)) {
-            init_hl = term_val(probe);  // y slot of the GRAD (redex edge endpoint)
+    for (u64 h = 1; h < ctx->heap_pos; h++) {
+        Term hh = ctx->heap[h];
+        if (term_tag(hh) == TAG_TOP &&
+            (term_ext(hh) == UOP_GRAD || term_ext(hh) == UOP_GRAD_FWD)) {
+            u64 gl = term_val(hh);
+            if (gl != 0 && gl + 1 < ctx->heap_pos) {
+                init_hl = gl + 0;  // slot 0 = body = y
+                break;
+            }
         }
     }
     thvm_heap_dot_set_highlight(init_hl, 0);
@@ -2300,6 +2292,19 @@ void thvm_register_pass(TinyHVM *ctx, ThvmCompilerPass pass, const char *name) {
 static Term thvm_eval_internal(TinyHVM *ctx, Term t, int pre_reduce_phase) {
     int outermost = (ctx->eval_depth++ == 0);
     u64 eval_itrs_start = ctx->itrs;
+    // Outermost thvm_eval auto-wraps a compute-TOP argument in UOP_FUSE
+    // so the kernelisation marker is on heap from step_000.  Nested
+    // eval calls don't re-wrap.  Already-FUSE/KERNEL/EXEC skipped
+    // (idempotent).  CTR/SEQ roots are structural — the test is
+    // expected to have already wrapped each compute arm in FUSE if
+    // kernelisation is desired.
+    if (outermost && term_tag(t) == TAG_TOP && term_ext(t) != UOP_FUSE &&
+        term_ext(t) != UOP_KERNEL && term_ext(t) != UOP_EXEC &&
+        term_ext(t) != UOP_ASSIGN) {
+        u64 fuse_slot = heap_alloc(ctx, 1);
+        heap_set(ctx, fuse_slot, t);
+        t = term_new(TAG_TOP, UOP_FUSE, fuse_slot);
+    }
     // Mark current-max buf_id as persistent floor so decref during reduction
     // can't free weight/bias buffers (keep-mode training aliases them).
     if (outermost) {

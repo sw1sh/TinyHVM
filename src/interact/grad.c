@@ -14,7 +14,7 @@
 if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) {
     const int is_fwd = (uop == UOP_GRAD_FWD);
     Term y   = heap_read(ctx, loc + 0);
-    Term tgt = heap_read(ctx, loc + 1);
+    Term tgt = heap_read(ctx, loc + 2);
     if (term_is_sub(y))   y   = term_strip_sub(y);
     if (term_is_sub(tgt)) tgt = term_strip_sub(tgt);
 

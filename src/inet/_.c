@@ -83,11 +83,9 @@ void thvm_dup(TinyHVM *ctx, u32 label, Term z, Term *out0, Term *out1) {
 // want to reference y or target outside GRAD must thvm_dup them
 // explicitly beforehand.
 Term thvm_grad(TinyHVM *ctx, Term y, Term target) {
-    u64 loc = heap_alloc(ctx, 4);
-    heap_set(ctx, loc + 0, y);             // y_bw — slides via VJP_RECURSE_INTO
-    heap_set(ctx, loc + 1, term_era());    // gy — seeded on first entry
-    heap_set(ctx, loc + 2, target);
-    heap_set(ctx, loc + 3, y);             // y_fw — PIN view; never mutated
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc + 0, y);             // body — shared by PIN and BW tag views
+    heap_set(ctx, loc + 1, target);        // target (constant)
     const View *tv = term_view(ctx, target);
     if (tv) { View v = *tv; st_set(loc, &v); }
     return term_new(TAG_TOP, UOP_GRAD, loc);
@@ -102,11 +100,9 @@ Term thvm_grad(TinyHVM *ctx, Term y, Term target) {
 static void thvm_grad_split_with_bw(TinyHVM *ctx, Term y, Term target,
                                      u32 bw_uop,
                                      Term *out_pin, Term *out_bw) {
-    u64 loc = heap_alloc(ctx, 4);
-    heap_set(ctx, loc + 0, y);             // y_bw — slides during BW descent
-    heap_set(ctx, loc + 1, term_era());    // gy / tangent — seeded on first BW entry
-    heap_set(ctx, loc + 2, target);
-    heap_set(ctx, loc + 3, y);             // y_fw — PIN reads here; preserves forward
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc + 0, y);             // body — shared by PIN and BW tag views
+    heap_set(ctx, loc + 1, target);
     const View *tv = term_view(ctx, target);
     if (tv) { View v = *tv; st_set(loc, &v); }
     *out_pin = term_new(TAG_TOP, UOP_GRAD_PIN, loc);
@@ -130,11 +126,9 @@ void thvm_grad_fwd_split(TinyHVM *ctx, Term y, Term target,
 // Forward-mode JVP.  heap[loc+0] = y, heap[loc+1] = tangent (ERA
 // until seeded), heap[loc+2] = target.
 Term thvm_grad_fwd(TinyHVM *ctx, Term y, Term target) {
-    u64 loc = heap_alloc(ctx, 4);
-    heap_set(ctx, loc + 0, y);             // y_bw — slides
-    heap_set(ctx, loc + 1, term_era());    // tangent
-    heap_set(ctx, loc + 2, target);
-    heap_set(ctx, loc + 3, y);             // y_fw — PIN reads here
+    u64 loc = heap_alloc(ctx, 2);
+    heap_set(ctx, loc + 0, y);
+    heap_set(ctx, loc + 1, target);
     const View *yv = term_view(ctx, y);
     if (yv) { View v = *yv; st_set(loc, &v); }
     return term_new(TAG_TOP, UOP_GRAD_FWD, loc);

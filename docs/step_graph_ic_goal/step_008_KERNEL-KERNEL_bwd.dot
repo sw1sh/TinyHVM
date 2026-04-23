@@ -1,0 +1,45 @@
+// FUSE_b has swept the backward subtree: every backward TOP (EXPAND,
+// ADD, MUL_ca, MUL_cb) is now a singleton KERNEL.  No outer MULchain
+// node — tinygrad's SUM rule is just EXPAND, no extra MUL.  The four
+// kernels are still wired along their original principal edges and
+// adjacent kernels are ready to merge.
+// Redex: KERNEL_MUL_ca → KERNEL_ADD (one of several K⊳K redexes).
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1     [label="t1\n[3] f32",   fillcolor="#ffe0e0"];
+  axes   [label="axes\n[1] i32", fillcolor="#e0e0e0"];
+  shape3 [label="[3]\nshape",    fillcolor="#e0e0e0"];
+  ones_a [label="ones_a\n[3]",   fillcolor="#e0e0e0"];
+  ones_b [label="ones_b\n[3]",   fillcolor="#e0e0e0"];
+
+  K_MUL_ca [label="KERNEL\nMUL (b·∂a)",    fillcolor="#ccffcc"];
+  K_MUL_cb [label="KERNEL\nMUL (a·∂b)",    fillcolor="#ccffcc"];
+  K_ADD    [label="KERNEL\nADD (Leibniz)", fillcolor="#ccffcc"];
+  K_EXPAND [label="KERNEL\nEXPAND",        fillcolor="#ccffcc"];
+
+  K_FWD [label="KERNEL_fwd\n{MUL, SUM}", fillcolor="#8fdd8f"];
+
+  y_out [label="y",      shape=circle, width=0.20, fixedsize=true, fillcolor="#ffffff"];
+  g_out [label="∂y/∂t1", shape=circle, width=0.30, fixedsize=true, fillcolor="#ffffff"];
+
+  // Forward kernel (unchanged)
+  t1    -> K_FWD [label="a"];
+  t1    -> K_FWD [label="b"];
+  axes  -> K_FWD [label="axes"];
+  K_FWD -> y_out;
+
+  // Backward: four singleton kernels along the Leibniz + EXPAND chain
+  t1     -> K_MUL_ca [label="b"];
+  ones_a -> K_MUL_ca [label="∂a"];
+  t1     -> K_MUL_cb [label="a"];
+  ones_b -> K_MUL_cb [label="∂b"];
+
+  K_MUL_ca -> K_ADD    [label="a", color="#cc0000", penwidth=2];
+  K_MUL_cb -> K_ADD    [label="b"];
+  K_ADD    -> K_EXPAND [label="∂v"];
+  shape3   -> K_EXPAND [label="shape"];
+  K_EXPAND -> g_out;
+}

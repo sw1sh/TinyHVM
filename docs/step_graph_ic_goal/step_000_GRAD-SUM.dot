@@ -1,0 +1,37 @@
+// Initial state.  GRAD is a 1-in/2-out T-junction: takes y on its
+// principal edge, emits v_pass (→ forward output via FUSE_f) and ∂v
+// (→ backward output via FUSE_b).  SUM has just one output going to
+// GRAD.y.  No concrete seed is drawn — ones/zeros only materialise
+// at GRAD ⊳ TEN.
+// Redex: SUM → GRAD (y-port principal edge).
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1   [label="t1\n[3] f32", fillcolor="#ffe0e0"];
+  axes [label="axes\n[1] i32", fillcolor="#e0e0e0"];
+
+  MUL  [label="MUL\n[3]", fillcolor="#cce5ff"];
+  SUM  [label="SUM\n[1]", fillcolor="#ffcccc"];
+  GRAD [label="GRAD\nd/d(t1)", fillcolor="#e8d0ff"];
+
+  FUSE_f [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+  FUSE_b [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+
+  y_out [label="y",      shape=circle, width=0.20, fixedsize=true, fillcolor="#ffffff"];
+  g_out [label="∂y/∂t1", shape=circle, width=0.30, fixedsize=true, fillcolor="#ffffff"];
+
+  // Forward: t1 → MUL → SUM → GRAD (v_pass) → FUSE_f → y
+  t1     -> MUL    [label="a"];
+  t1     -> MUL    [label="b"];
+  MUL    -> SUM    [label="in"];
+  axes   -> SUM    [label="axes"];
+  SUM    -> GRAD   [label="y", color="#cc0000", penwidth=2];
+  GRAD   -> FUSE_f [label="v_pass"];
+  FUSE_f -> y_out;
+
+  // Backward: GRAD.∂v → FUSE_b → ∂y/∂t1
+  GRAD   -> FUSE_b [label="∂v"];
+  FUSE_b -> g_out;
+}

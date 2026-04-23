@@ -1,0 +1,49 @@
+// FUSE_f ⊳ SUM just fired.  SUM became KERNEL_SUM; a fresh FUSE was
+// spawned at SUM's compute input (axes is metadata, passes through).
+// Forward MUL is next to kernelise.
+// Redex: MUL → FUSE_f (forward).
+digraph G {
+  rankdir=BT;
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box, margin="0.1,0.05"];
+  edge [fontsize=8, fontname="Helvetica"];
+
+  t1     [label="t1\n[3] f32",   fillcolor="#ffe0e0"];
+  axes   [label="axes\n[1] i32", fillcolor="#e0e0e0"];
+  shape3 [label="[3]\nshape",    fillcolor="#e0e0e0"];
+  ones_a [label="ones_a\n[3]",   fillcolor="#e0e0e0"];
+  ones_b [label="ones_b\n[3]",   fillcolor="#e0e0e0"];
+
+  MUL      [label="MUL\n[3]",          fillcolor="#cce5ff"];
+  MUL_ca   [label="MUL\n(b·∂a)",       fillcolor="#cce5ff"];
+  MUL_cb   [label="MUL\n(a·∂b)",       fillcolor="#cce5ff"];
+  ADD_leib [label="ADD\n(Leibniz)",    fillcolor="#cce5ff"];
+  EXPAND   [label="EXPAND\n(SUM bwd)", fillcolor="#fff3cd"];
+
+  K_SUM  [label="KERNEL\nSUM", fillcolor="#ccffcc"];
+  FUSE_f [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+  FUSE_b [label="FUSE", fillcolor="#b3e6ff", shape=invhouse];
+
+  y_out [label="y",      shape=circle, width=0.20, fixedsize=true, fillcolor="#ffffff"];
+  g_out [label="∂y/∂t1", shape=circle, width=0.30, fixedsize=true, fillcolor="#ffffff"];
+
+  // Forward: MUL → FUSE_f (new, redex) → KERNEL_SUM
+  t1     -> MUL    [label="a"];
+  t1     -> MUL    [label="b"];
+  MUL    -> FUSE_f [color="#cc0000", penwidth=2];
+  FUSE_f -> K_SUM  [label="in"];
+  axes   -> K_SUM  [label="axes"];
+  K_SUM  -> y_out;
+
+  // Backward (unchanged)
+  t1     -> MUL_ca [label="b"];
+  ones_a -> MUL_ca [label="∂a"];
+  t1     -> MUL_cb [label="a"];
+  ones_b -> MUL_cb [label="∂b"];
+  MUL_ca -> ADD_leib [label="a"];
+  MUL_cb -> ADD_leib [label="b"];
+
+  ADD_leib -> EXPAND [label="∂v"];
+  shape3   -> EXPAND [label="shape"];
+  EXPAND   -> FUSE_b;
+  FUSE_b   -> g_out;
+}

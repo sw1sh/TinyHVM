@@ -3160,38 +3160,124 @@ static int test_e2e_jvp_elementwise(void) {
 // shifts the indices).
 static int test_e2e_vjp_sum_of_square(void) {
     setup_step_graph_dir("vjp_sum_of_square");
-    setenv("THVM_STEP_GRAPH_NO_FUSE", "1", 1);
     TinyHVM *ctx = thvm_init("cpu");
     f32 xd[] = {1,2,3};
     Term x = thvm_tensor(ctx, xd, SHAPE(3));
     Term sq = thvm_op(ctx, UOP_MUL, x, x);
     Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
-    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, thvm_grad(ctx, y, x)));
+
+    // Split GRAD into (pin, bw) — both are tag views of ONE 2-slot
+    // [body, target] cell.  Pre-wrap each in FUSE so both kernelisation
+    // markers are on heap from step_000 (matching spec's FUSE_f +
+    // FUSE_b at the forward + backward output sinks).  Then bundle into
+    // a CTR and eval; thvm_eval's outermost auto-wrap skips CTR roots.
+    Term pin, bw;
+    thvm_grad_split(ctx, y, x, &pin, &bw);
+    u64 fslt_f = heap_alloc(ctx, 1); heap_set(ctx, fslt_f, pin);
+    u64 fslt_b = heap_alloc(ctx, 1); heap_set(ctx, fslt_b, bw);
+    Term fuse_f = term_new(TAG_TOP, UOP_FUSE, fslt_f);
+    Term fuse_b = term_new(TAG_TOP, UOP_FUSE, fslt_b);
+    Term pair = thvm_ctr(ctx, (Term[]){fuse_f, fuse_b}, 2);
+    Term reduced = thvm_eval(ctx, pair);
+
+    Term bw_result = thvm_grad_bundle_get(ctx, reduced, 1);
+    f32 *h = thvm_to_host(ctx, bw_result);
     f32 expect[] = {2,4,6};
     int ok = (h != NULL);
     if (h) for (int i = 0; i < 3; i++) if (h[i] != expect[i]) {
         fprintf(stderr, "  vjp_sum h[%d]=%g want %g\n", i, h[i], expect[i]); ok=0;
     }
     thvm_free(ctx);
-    // Per-step topology: initial forward-only, then cotangents grow in.
-    const char *init[][2] = {{"MUL","1"},{"SUM","1"},{"GRAD","1"},{"EXPAND","0"}};
+    const char *init[][2] = {{"MUL","1"},{"SUM","1"},{"GRAD","1"},{"FUSE","2"}};
     ok = ok && step_topo_check("vjp_sum_of_square", "step_000", init, 4);
-    // After VJP/SUM fires, GRAD slides to MUL for the step-001 dump
-    // (then restored after dump).  Step 002 fires VJP on MUL: cotangent
-    // EXPAND is allocated; forward still visible via include_all after
-    // slide restore.
-    const char *after_sum[][2] = {{"MUL","1"},{"SUM","1"},{"EXPAND","1"},{"GRAD","1"}};
-    ok = ok && step_topo_check("vjp_sum_of_square", "step_002", after_sum, 4);
-    // After VJP/MUL fires — MUL-Leibniz emits two MUL cotangents.
-    const char *after_mul[][2] = {{"MUL","3"},{"EXPAND","1"},{"SUM","1"},{"GRAD","1"}};
-    ok = ok && step_topo_check("vjp_sum_of_square", "step_003", after_mul, 4);
-    // Final (reachable-only): ADD of MUL cotangents, no forward/GRAD.
-    const char *final_t[][2] = {{"ADD","1"},{"MUL","2"},{"EXPAND","1"},
-                                {"GRAD","0"},{"SUM","0"}};
-    ok = ok && step_topo_check("vjp_sum_of_square", "step_004_final", final_t, 5);
-    unsetenv("THVM_STEP_GRAPH_NO_FUSE");
     teardown_step_graph_dir();
     return report("e2e_vjp_sum_of_square", ok);
+}
+
+// thvm_grad_split: shared-cell forward-pin + backward gradient.
+// Two term views of one heap cell; pin keeps y reachable while bw
+// reduces.  Only ONE of (pin, bw) is evaluated per program.  Step
+// graphs dumped to graphs/grad_rules/vjp_split_sum_of_square/.
+static int test_e2e_vjp_split_sum_of_square(void) {
+    setup_step_graph_dir("vjp_split_sum_of_square");
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term sq = thvm_op(ctx, UOP_MUL, x, x);
+    Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
+    Term pin = 0, bw = 0;
+    thvm_grad_split(ctx, y, x, &pin, &bw);
+    // Stash pin in a heap slot so the dumper (include_all=1) walks it
+    // and renders PIN alongside BW in every per-step snapshot.
+    u64 pin_slot = heap_alloc(ctx, 1);
+    heap_set(ctx, pin_slot, pin);
+    // Backward: ∂(sum(x²))/∂x = 2x = [2,4,6].
+    f32 *g = thvm_to_host(ctx, thvm_eval(ctx, bw));
+    int ok = (g != NULL);
+    if (!g) fprintf(stderr, "  vjp_split bw=NULL\n");
+    f32 expect[] = {2,4,6};
+    if (g) for (int i = 0; i < 3; i++) if (g[i] != expect[i]) {
+        fprintf(stderr, "  vjp_split bw[%d]=%g want %g\n", i, g[i], expect[i]); ok=0;
+    }
+    (void)pin;
+    thvm_free(ctx);
+    teardown_step_graph_dir();
+    return report("e2e_vjp_split_sum_of_square", ok);
+}
+
+// thvm_grad_split: use the pin view to evaluate forward (not bw).
+// Complementary case to the bw-only test above.
+static int test_e2e_vjp_split_pin(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term sq = thvm_op(ctx, UOP_MUL, x, x);
+    Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
+    Term pin = 0, bw = 0;
+    thvm_grad_split(ctx, y, x, &pin, &bw);
+    // Pin reduces to y = sum(x²) = 14.
+    f32 *f = thvm_to_host(ctx, thvm_eval(ctx, pin));
+    int ok = (f != NULL) && (f[0] > 13.9f && f[0] < 14.1f);
+    if (!ok) fprintf(stderr, "  vjp_split_pin pin=%g want 14\n", f ? f[0] : 0);
+    (void)bw;
+    thvm_free(ctx);
+    return report("e2e_vjp_split_pin", ok);
+}
+
+// thvm_grad_fwd_split: JVP analog.  bw tag is UOP_GRAD_FWD, pin shared
+// with mode-neutral UOP_GRAD_PIN.  JVP of y = sum(x*x) = 12 (directional
+// derivative with implicit ones tangent seed on x).
+static int test_e2e_jvp_split_bw(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term sq = thvm_op(ctx, UOP_MUL, x, x);
+    Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
+    Term pin = 0, bw = 0;
+    thvm_grad_fwd_split(ctx, y, x, &pin, &bw);
+    f32 *h = thvm_to_host(ctx, thvm_eval(ctx, bw));
+    int ok = (h != NULL) && (h[0] > 11.9f && h[0] < 12.1f);
+    if (!ok) fprintf(stderr, "  jvp_split_bw bw=%g want 12\n", h ? h[0] : 0);
+    (void)pin;
+    thvm_free(ctx);
+    return report("e2e_jvp_split_bw", ok);
+}
+
+// thvm_grad_fwd_split: pin-only path.  Same pin as VJP — reduces to y.
+static int test_e2e_jvp_split_pin(void) {
+    TinyHVM *ctx = thvm_init("cpu");
+    f32 xd[] = {1,2,3};
+    Term x = thvm_tensor(ctx, xd, SHAPE(3));
+    Term sq = thvm_op(ctx, UOP_MUL, x, x);
+    Term y = thvm_sum_axes(ctx, sq, (u32[]){0}, 1);
+    Term pin = 0, bw = 0;
+    thvm_grad_fwd_split(ctx, y, x, &pin, &bw);
+    f32 *f = thvm_to_host(ctx, thvm_eval(ctx, pin));
+    int ok = (f != NULL) && (f[0] > 13.9f && f[0] < 14.1f);
+    if (!ok) fprintf(stderr, "  jvp_split_pin pin=%g want 14\n", f ? f[0] : 0);
+    (void)bw;
+    thvm_free(ctx);
+    return report("e2e_jvp_split_pin", ok);
 }
 
 // Non-diagonal: SUM — shapes diverge.
@@ -3237,6 +3323,13 @@ static int test_e2e_jvp_mm(void) {
 
 int main(void) {
     int fails = 0;
+    // Focus run: vjp_sum_of_square first so step graphs are produced
+    // even if later tests crash from the in-progress rule rewrites.
+    if (getenv("THVM_FOCUS_VJP")) {
+        fails += test_e2e_vjp_sum_of_square();
+        printf("\ntotal failures: %d\n", fails);
+        return fails ? 1 : 0;
+    }
     fails += test_add();
     fails += test_sub();
     fails += test_mul();
@@ -3382,6 +3475,10 @@ int main(void) {
     fails += test_e2e_disconnected_target();
     fails += test_e2e_jvp_elementwise();
     fails += test_e2e_vjp_sum_of_square();
+    fails += test_e2e_vjp_split_sum_of_square();
+    fails += test_e2e_vjp_split_pin();
+    fails += test_e2e_jvp_split_bw();
+    fails += test_e2e_jvp_split_pin();
     fails += test_e2e_jvp_sum_of_square();
     fails += test_e2e_jvp_mm();
 

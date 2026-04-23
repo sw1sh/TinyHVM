@@ -49,6 +49,10 @@ thvm_steps/
 # Logs
 *.log
 
+# Example outputs
+examples/**/*.ppm
+examples/**/*.png
+
 # AI agents
 .codex/
 .gemini/

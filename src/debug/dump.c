@@ -144,8 +144,8 @@ static int dot_shape_broadcast(Shape a, Shape b, Shape *out) {
 
 static const char *dot_uop_port_name(u32 uop, u32 argi) {
     if (uop == UOP_SUM || uop == UOP_RMAX) return argi == 0 ? "in" : "axes";
-    if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) return argi == 0 ? "y" : argi == 1 ? "gy" : argi == 2 ? "tgt" : "y_fw";
-    if (uop == UOP_GRAD_PIN) return argi == 0 ? "y" : argi == 1 ? "gy" : argi == 2 ? "tgt" : "y_fw";
+    if (uop == UOP_GRAD || uop == UOP_GRAD_FWD) return argi == 0 ? "y" : "tgt";
+    if (uop == UOP_GRAD_PIN) return argi == 0 ? "y" : "tgt";
     if (is_view_op(uop)) return argi == 0 ? "in" : "shape";
     if (is_binary(uop) || uop == UOP_CMP || uop == UOP_MM) return argi == 0 ? "a" : "b";
     if (uop == UOP_LOG_PRINT) return "in";
@@ -1767,14 +1767,12 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                          kid, (unsigned long long)val);
                 color = "#ccccff";  // light blue for exec triggers
             } else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) {
-                // All three share a 3-slot cell [y, gy, target] — like
-                // DP0/DP1 tag views of a DUP cell, they render as ONE
-                // GRAD node.  Tag difference surfaces only in edge
-                // labels: UOP_GRAD → "∂v" edge, UOP_GRAD_PIN → "v_pass"
-                // edge, UOP_GRAD_FWD → "tangent" edge.
+                // 2-slot cell [body, target] shared by PIN and BW tag views
+                // (like DP0/DP1 of a DUP cell).  All three tags render as
+                // ONE GRAD node.
                 char tgt_desc[64] = "?";
-                if (val + 2 < ctx->heap_pos) {
-                    Term tgt = heap_read(ctx, val + 2);
+                if (val + 1 < ctx->heap_pos) {
+                    Term tgt = heap_read(ctx, val + 1);
                     if (term_tag(tgt) == TAG_TEN)
                         snprintf(tgt_desc, sizeof(tgt_desc), "t%u", (u32)term_val(tgt));
                     else if (term_tag(tgt) == TAG_DP0 || term_tag(tgt) == TAG_DP1)
@@ -1823,20 +1821,12 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             // as d/d(tN).  The GRAD's own outgoing edge carries fw/bw
             // semantics and is drawn by EMIT_FREE_OUT below.
             if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) {
-                // Render y_bw (slot 0) always; gy (slot 1) if non-ERA so the
-                // cotangent chain (EXPAND, chain MULs, ADD) appears connected
-                // to GRAD.∂v during the slide viz; y_fw (slot 3) always so the
-                // forward history stays visible as GRAD.v_pass → original y.
-                // Target (slot 2) stays in the label only.  Slots 0,1,3 are
-                // rendered via a hand-rolled sequence below; the 2-based
-                // contiguous loop path is bypassed.
-                arity = 0;
-                // y_bw (slot 0) — incoming forward redex (drawn by generic path below when arity>0 fallback)
-                // For simplicity keep the arity-loop rendering for slot 0:
+                // 2-slot cell.  Before commute: slot 0 = body (y), slot 1 = target.
+                //   Render only slot 0 as incoming y edge.
+                // After commute: slot 0 = SUB(body_with_reparent), slot 1 = bwd_wrapper.
+                //   v_pass edge (GRAD → slot-0-SUB-target) + ∂v edge (GRAD → slot-1) rendered
+                //   outside the arity loop.  Arity stays 1 so the loop renders slot 0.
                 arity = 1;
-                // gy (slot 1) — include if non-ERA so ∂v chain shows
-                Term gy_t = (val + 1 < ctx->heap_pos) ? heap_read(ctx, val + 1) : term_era();
-                if (!(term_tag(gy_t) == TAG_ERA && term_val(gy_t) == 0)) arity = 2;
             }
             else if (ext == UOP_WHERE || ext == UOP_IFZ) arity = 3;
             else if (ext == UOP_KERNEL) arity = monolithic_kernel ? 0 : 2;
@@ -1872,15 +1862,6 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                 else if (ext == UOP_DETACH) elbl = "in";
                 else if (is_binary(ext)) elbl = ai==0 ? "a" : "b";
                 int rev = 0;
-                // Spec-direction rendering: for GRAD cells, slot 1 (gy)
-                // holds the cotangent chain root (EXPAND, MUL, ADD).
-                // In the spec that chain is DOWNSTREAM of GRAD's ∂v
-                // output — reverse the edge and relabel.
-                if ((ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN)
-                        && ai == 1 && ctag == TAG_TOP) {
-                    rev = 1;
-                    elbl = "∂v";
-                }
 
                 if (ctag == TAG_DP0 || ctag == TAG_DP1) {
                     // Always show full DUP triangle with both ports
@@ -2048,52 +2029,40 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             }
             {
                 Term _self = term_new(TAG_TOP, ext, val);
-                if (!TERM_HAS_PARENT_REF(_self) && !TERM_IS_DEF_ROOT(_self) && !REF_TARGETS_LOC(val)) {
-                    // GRAD cells (whether rendered under VJP_BW, JVP_BW or
-                    // the PIN view) have TWO outputs in the target spec:
-                    // v_pass (forward passthrough) + ∂v (gradient).
-                    // Emit both free-port edges so the node renders as
-                    // the 1-in/2-out T-junction the step-graph spec uses.
-                    if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) {
-                        // v_pass: point at y_fw (slot 3) if it's a visible
-                        // forward TOP different from the current BW
-                        // descent (slot 0).  When y_fw == y_bw (fresh
-                        // GRAD cell, no slide yet), omit to avoid
-                        // drawing both incoming "y" and outgoing
-                        // "v_pass" edges against the same node.  Fall
-                        // back to free port otherwise.
-                        Term y_bw = (val + 0 < ctx->heap_pos) ? heap_read(ctx, val + 0) : term_era();
-                        Term y_fw = (val + 3 < ctx->heap_pos) ? heap_read(ctx, val + 3) : term_era();
-                        u8 fwtag = term_tag(y_fw);
-                        u64 fwval = term_val(y_fw);
-                        int slid  = (y_bw != y_fw);
-                        int emitted_vpass = 0;
-                        if (slid && fwtag == TAG_TOP && fwval != 0 && fwval < ctx->heap_pos && fwval != val) {
+                int has_parent = TERM_HAS_PARENT_REF(_self) || TERM_IS_DEF_ROOT(_self) || REF_TARGETS_LOC(val);
+                if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) {
+                    // Post-commute: slot 0 SUB-bit, slot 1 = bwd_wrapper.
+                    //   v_pass edge → stripped slot-0 target (reparented forward)
+                    //   ∂v edge     → slot-1 bwd_wrapper
+                    Term body = (val + 0 < ctx->heap_pos) ? heap_read(ctx, val + 0) : term_era();
+                    if (term_is_sub(body)) {
+                        Term stripped = term_strip_sub(body);
+                        u8 st = term_tag(stripped);
+                        u64 sv = term_val(stripped);
+                        if (st == TAG_TOP && sv != 0 && sv < ctx->heap_pos && sv != val) {
                             fprintf(f, "  n%llu -> n%llu [label=\"v_pass\"];\n",
-                                    (unsigned long long)val, (unsigned long long)fwval);
-                            emitted_vpass = 1;
-                        } else if (slid && fwtag == TAG_TEN && fwval > 0) {
-                            EMIT_TEN((u32)fwval);
+                                    (unsigned long long)val, (unsigned long long)sv);
+                        } else if (st == TAG_TEN && sv > 0) {
+                            EMIT_TEN((u32)sv);
                             fprintf(f, "  n%llu -> t%u [label=\"v_pass\"];\n",
-                                    (unsigned long long)val, (u32)fwval);
-                            emitted_vpass = 1;
+                                    (unsigned long long)val, (u32)sv);
                         }
-                        if (!emitted_vpass) {
-                            EMIT_FREE_PORT(val, 1000u);
-                            fprintf(f, "  n%llu -> free%llu_%u [label=\"v_pass\"];\n",
-                                    (unsigned long long)val, (unsigned long long)val, 1000u);
+                        Term bwd = (val + 1 < ctx->heap_pos) ? heap_read(ctx, val + 1) : term_era();
+                        u8 bt = term_tag(bwd);
+                        u64 bv = term_val(bwd);
+                        if (bt == TAG_TOP && bv != 0 && bv < ctx->heap_pos && bv != val) {
+                            fprintf(f, "  n%llu -> n%llu [label=\"\u2202v\"];\n",
+                                    (unsigned long long)val, (unsigned long long)bv);
+                        } else if (bt == TAG_TEN && bv > 0) {
+                            EMIT_TEN((u32)bv);
+                            fprintf(f, "  n%llu -> t%u [label=\"\u2202v\"];\n",
+                                    (unsigned long long)val, (u32)bv);
                         }
-                        Term gy_t = (val + 1 < ctx->heap_pos) ? heap_read(ctx, val + 1) : term_era();
-                        if (term_tag(gy_t) == TAG_ERA && term_val(gy_t) == 0) {
-                            EMIT_FREE_PORT(val, 1001u);
-                            fprintf(f, "  n%llu -> free%llu_%u [label=\"\u2202v\"];\n",
-                                    (unsigned long long)val, (unsigned long long)val, 1001u);
-                        }
-                    } else {
-                        EMIT_FREE_PORT(val, 1000u);
-                        fprintf(f, "  n%llu -> free%llu_%u [label=\"out\"];\n",
-                                (unsigned long long)val, (unsigned long long)val, 1000u);
                     }
+                } else if (!has_parent) {
+                    EMIT_FREE_PORT(val, 1000u);
+                    fprintf(f, "  n%llu -> free%llu_%u [label=\"out\"];\n",
+                            (unsigned long long)val, (unsigned long long)val, 1000u);
                 }
             }
             nn++;

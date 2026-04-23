@@ -1215,15 +1215,34 @@ static char     g_step_session_dir[512] = {0};
 
 static u64 g_step_session_last_render_sig = 0;
 
-// A step-graph frame renders the ENTIRE heap state — all live cells,
-// including any left behind as clutter by rule firings.  There is no
-// "session root" filtering: the net is a set of cells + free ports,
-// and the renderer enumerates them without traversing from a privileged
-// root.  (Called at the wnf interact wrapper's "term replaced" hook —
-// kept as a no-op for source compatibility; may be removed.)
+// The step-graph renderer enumerates the entire heap (no root-based
+// reach filtering).  But the INITIAL top-of-reduction term — e.g. an
+// empty KERNEL wrapping CTR — needs a live heap reference, otherwise
+// it only exists as a C-variable and isn't visible in the dump.  We
+// stash it in a dedicated anchor slot via `thvm_step_seed_root_grad`
+// at session start.
+//
+// When a rule REPLACES the anchored term (e.g. KERNEL-CTR slide
+// consumes the outer KERNEL and returns CTR), we update the anchor
+// slot so the now-orphan outer cell isn't kept artificially alive by
+// the anchor alone.  It's still on heap — if anything else references
+// it, the reference will keep it visible — but we no longer pin it.
+extern u64 step_root_slot;  // forward-decl from earlier in file
 void thvm_step_session_root_replaced(Term old_term, Term new_term) {
-    (void)old_term;
-    (void)new_term;
+    if (step_root_slot == 0) return;
+    TinyHVM *ctx = g_step_session_ctx;
+    if (!ctx || step_root_slot >= ctx->heap_pos) return;
+    Term anchor = ctx->heap[step_root_slot];
+    if (getenv("THVM_ANCHOR_TRACE"))
+        fprintf(stderr, "anchor_replace: slot=%llu anchor_tag=%u anchor_ext=%u anchor_val=%llu old_tag=%u old_ext=%u old_val=%llu new_tag=%u new_ext=%u new_val=%llu match=%d\n",
+                (unsigned long long)step_root_slot,
+                (u32)term_tag(anchor), (u32)term_ext(anchor), (unsigned long long)term_val(anchor),
+                (u32)term_tag(old_term), (u32)term_ext(old_term), (unsigned long long)term_val(old_term),
+                (u32)term_tag(new_term), (u32)term_ext(new_term), (unsigned long long)term_val(new_term),
+                anchor == old_term);
+    if (anchor == old_term) {
+        ctx->heap[step_root_slot] = new_term;
+    }
 }
 
 // Spec naming convention: step_N's filename names the redex that fires

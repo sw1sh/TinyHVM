@@ -1774,6 +1774,29 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (heap_dot_root_only) {
                 if (top_live && (val >= _dot_live_cap || !top_live[val])) continue;
             }
+            // Dead-cell skip: IC-consumed cells are marked by the rule
+            // that consumed them.  Two conventions used here:
+            //   (a) All slots ERA(0) — pure ERA wipe.
+            //   (b) Slot 0 is SUB(X) — redirect to the cell that took
+            //       this cell's structural role (e.g. KERNEL-CTR slide:
+            //       outer empty KERNEL's slot 0 = SUB(CTR)).  Anything
+            //       still referencing this cell dereferences through SUB
+            //       to the live replacement.
+            // In either case, we skip rendering the dead cell.
+            if (val + 0 < ctx->heap_pos) {
+                u32 ar = thvm_uop_storage_arity(ext);
+                int all_era = 1;
+                for (u32 _i = 0; _i < ar; _i++) {
+                    if (val + _i >= ctx->heap_pos) { all_era = 0; break; }
+                    Term _s = heap_read(ctx, val + _i);
+                    if (!(term_tag(_s) == TAG_ERA && term_val(_s) == 0)) {
+                        all_era = 0; break;
+                    }
+                }
+                if (ar > 0 && all_era) continue;
+                Term s0 = heap_read(ctx, val + 0);
+                if (term_is_sub(s0)) continue;
+            }
             // Commuted GRAD cell (slot 0 has SUB-bit) is "dead"; its edges
             // are dereferenced through dot_dereference_commuted_grad below.
             // Don't emit a node for it — spec's "single GRAD" view.

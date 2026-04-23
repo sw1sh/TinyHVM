@@ -248,6 +248,16 @@
                                 heap_set(ctx, cloc + i,
                                          thvm_make_empty_kernel(ctx, c));
                             }
+                            // IC-style commute: the outer KERNEL cell is
+                            // CONSUMED by the slide.  Mark slot 0 with a
+                            // SUB redirect to the CTR that took its
+                            // structural role, so any stale heap
+                            // reference to TAG_TOP(UOP_KERNEL, loc)
+                            // follows the SUB → CTR.  Dumper detects
+                            // this as "dead kernel" and skips rendering.
+                            // Slots 1, 2 kept intact so the cell
+                            // self-identifies as the former empty-KERNEL.
+                            heap_set(ctx, loc + 0, term_set_sub(left));
                             return left;
                         }
                         return left;  // default: pass payload through.

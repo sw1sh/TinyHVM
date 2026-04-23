@@ -1865,19 +1865,7 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
                     else if (is_binary(kop)) elbl = ai==0 ? "a" : "b";
                     else elbl = ai==0 ? "in" : "";
                 }
-                else if (ext == UOP_FUSE) {
-                    // Distinguish FUSE_f (wrapping a GRAD_PIN — forward
-                    // fuse) from FUSE_b (wrapping a GRAD/GRAD_FWD — bw
-                    // fuse) from generic compute-FUSE.  The child term
-                    // in slot 0 tells us which.
-                    u8 ct = term_tag(child);
-                    if (ct == TAG_TOP) {
-                        u32 cu = term_ext(child);
-                        if (cu == UOP_GRAD_PIN) elbl = "v_pass";
-                        else if (cu == UOP_GRAD || cu == UOP_GRAD_FWD) elbl = "\u2202v";
-                        else elbl = "in";
-                    } else elbl = "in";
-                }
+                else if (ext == UOP_FUSE) elbl = "in";
                 else if (ext >= UOP_RESHAPE && ext <= UOP_PAD) elbl = ai==0 ? "in" : "shape";
                 else if (ext == UOP_SUM || ext == UOP_RMAX) elbl = ai==0 ? "in" : "axes";
                 else if (ext == UOP_GRAD || ext == UOP_GRAD_FWD || ext == UOP_GRAD_PIN) elbl = ai==0 ? "y" : "gy";

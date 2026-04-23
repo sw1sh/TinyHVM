@@ -1142,6 +1142,36 @@ static Term thvm_eval_collect_fixed_point(TinyHVM *ctx, Term t, int dispatch_ena
 }
 
 static Term thvm_eval_fuse_fixed_point(TinyHVM *ctx, Term t, int mixed_dispatch) {
+    // Skip redundant wrap: if root is already a FUSE, or a CTR whose arms
+    // are all FUSE/KERNEL/leaf, adding another FUSE creates an empty
+    // FUSE-CTR interaction that doesn't correspond to any structural
+    // change in the graph.  Just drive the existing redex set.
+    int skip_wrap = 0;
+    if (term_tag(t) == TAG_TOP && term_ext(t) == UOP_FUSE) skip_wrap = 1;
+    // Empty KERNEL is the unified-FUSE pending-kernelisation marker —
+    // wrapping it in another FUSE would create a redundant FUSE-KERNEL
+    // no-op step that adds noise without changing structure.
+    if (term_tag(t) == TAG_TOP && term_ext(t) == UOP_KERNEL) skip_wrap = 1;
+    if (term_tag(t) == TAG_CTR) {
+        u64 cloc = term_val(t);
+        u32 ar = term_ext(t);
+        if (cloc && cloc + ar <= ctx->heap_pos) {
+            int all_ok = 1;
+            for (u32 i = 0; i < ar; i++) {
+                Term c = heap_read(ctx, cloc + i);
+                u8 ctag = term_tag(c);
+                if (ctag == TAG_TEN || ctag == TAG_ERA || ctag == TAG_NUM) continue;
+                if (ctag == TAG_TOP) {
+                    u32 ce = term_ext(c);
+                    if (ce == UOP_FUSE || ce == UOP_KERNEL) continue;
+                }
+                all_ok = 0; break;
+            }
+            if (all_ok) skip_wrap = 1;
+        }
+    }
+    if (skip_wrap)
+        return thvm_eval_collect_fixed_point(ctx, t, mixed_dispatch);
     u64 fuse_loc = heap_alloc(ctx, 1);
     heap_set(ctx, fuse_loc, t);
     return thvm_eval_collect_fixed_point(ctx, term_new(TAG_TOP, UOP_FUSE, fuse_loc),
@@ -1186,6 +1216,34 @@ static char     g_step_session_dir[512] = {0};
 
 static u64 g_step_session_last_render_sig = 0;
 
+// Called by the wnf interact wrapper when a rule replaces a term.  With
+// the dumper now rendering the entire heap state (no root-based reach
+// filtering), we still track the session root term as a rendering
+// hint — the dumper highlights the root node with a blue border so
+// viewers can see which cell is the top of the live reduction.  This
+// is a hint, NOT a reach boundary: orphan cells elsewhere in the heap
+// still render normally.
+void thvm_step_session_root_replaced(Term old_term, Term new_term) {
+    if (g_step_session_root == 0) return;
+    if (old_term == g_step_session_root) {
+        g_step_session_root = new_term;
+    }
+}
+
+// Spec naming convention: step_N's filename names the redex that fires
+// FROM state N to state N+1, i.e. the rule ABOUT TO FIRE at that frame.
+// To do this with a post-fire hook, we write each frame with a plain
+// pending name ("step_NNN_pending.dot") and, on the NEXT hook
+// invocation, rename the pending file to embed the just-fired rule name
+// (which IS the redex that was about to fire in the pending frame).
+static char g_step_session_pending_path[640] = {0};
+static u32  g_step_session_pending_frame = 0;
+
+extern const char *thvm_wnf_last_interact_pair(void);
+extern u64         thvm_wnf_last_interact_outer(void);
+extern u64         thvm_wnf_last_interact_inner(void);
+extern u64         thvm_wnf_last_grad_loc_at_fire(void);
+
 static void wnf_step_session_hook(TinyHVM *ctx) {
     if (ctx != g_step_session_ctx) return;
     if (g_step_session_dir[0] == 0) return;
@@ -1194,25 +1252,196 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
     // (which is heap-driven) picks up root-shaped TOPs like GRAD even
     // when the root itself isn't held in any other heap cell.
     thvm_step_seed_root_grad(ctx, g_step_session_root);
-    char path[640];
-    snprintf(path, sizeof(path), "%s/step_%03u.dot",
-             g_step_session_dir, g_step_session_frame);
+
     u64 cursor_loc = thvm_wnf_last_cursor();
     const char *rule_name = thvm_wnf_last_rule();
     u64 grad_slot = thvm_wnf_current_grad_slot();
+    u64 grad_loc_fire = thvm_wnf_last_grad_loc_at_fire();
+    const char *pair = thvm_wnf_last_interact_pair();
+    u64 ipair_outer = thvm_wnf_last_interact_outer();
+    u64 ipair_inner = thvm_wnf_last_interact_inner();
 
-    // Redex edge = the principal-port y→GRAD edge.  Always at
-    // grad_slot+0 when a GRAD is active — even if cursor_loc is 0
-    // (e.g. operand is a TEN leaf about to annihilate).  Falls back
-    // to cursor_loc when no GRAD is active (non-GRAD rule firings).
-    u64 hl_slot = (grad_slot != 0 && grad_slot + 1 < ctx->heap_pos)
-                  ? (grad_slot + 0)
-                  : (cursor_loc != 0 && cursor_loc < ctx->heap_pos ? cursor_loc : 0);
+    // Build rule suffix for the just-fired rule.  This describes the
+    // redex that was about to fire in the PENDING frame — so we rename
+    // the pending file with this suffix before writing a new pending.
+    const char *disp_rule = "";
+    u64 disp_outer = 0, disp_inner = 0;
+    if (pair && pair[0]) {
+        disp_rule = pair;
+        disp_outer = ipair_outer;
+        disp_inner = ipair_inner;
+    } else if (rule_name && rule_name[0]) {
+        disp_rule = rule_name;            // e.g. "SUM" → label as GRAD-SUM
+        disp_outer = grad_loc_fire ? grad_loc_fire : grad_slot;
+        disp_inner = cursor_loc;
+    }
+
+    // Compute the "about-to-fire" hl_slot for the PENDING frame (which
+    // is the pre-fire state of this very rule).  For interact rules, the
+    // outer cell's slot 0 holds the edge being consumed.  For GRAD rules,
+    // it's the pre-slide GRAD cell's principal edge.
+    u64 pre_fire_hl = 0;
+    if (ipair_outer != 0 && ipair_outer < ctx->heap_pos) {
+        pre_fire_hl = ipair_outer;
+    } else if (grad_loc_fire != 0 && grad_loc_fire + 1 < ctx->heap_pos) {
+        pre_fire_hl = grad_loc_fire + 0;
+    }
+
+    // Rename the pending frame (state BEFORE this rule fired) to embed
+    // this rule's name — that's the redex it was about to fire.  ALSO
+    // update the highlight in the pending file's content: the file was
+    // written with the PREVIOUS rule's hl (which is stale by now); edit
+    // it so the red edge points at THIS rule's principal redex edge.
+    if (g_step_session_pending_path[0] && disp_rule[0]) {
+        char renamed[640];
+        const char *fmt_prefix = (pair && pair[0]) ? "" : "GRAD-";
+        if (disp_outer && disp_inner)
+            snprintf(renamed, sizeof(renamed), "%s/step_%03u_%s%s@%llu-%llu.dot",
+                     g_step_session_dir, g_step_session_pending_frame,
+                     fmt_prefix, disp_rule,
+                     (unsigned long long)disp_outer,
+                     (unsigned long long)disp_inner);
+        else if (disp_outer)
+            snprintf(renamed, sizeof(renamed), "%s/step_%03u_%s%s@%llu.dot",
+                     g_step_session_dir, g_step_session_pending_frame,
+                     fmt_prefix, disp_rule,
+                     (unsigned long long)disp_outer);
+        else
+            snprintf(renamed, sizeof(renamed), "%s/step_%03u_%s%s.dot",
+                     g_step_session_dir, g_step_session_pending_frame,
+                     fmt_prefix, disp_rule);
+
+        // Edit highlight in pending content to reflect the about-to-fire
+        // redex.  Strip existing red-edge attrs, then add them to the
+        // edge(s) whose HEAD is `n<pre_fire_hl>`.
+        if (pre_fire_hl != 0) {
+            FILE *fp = fopen(g_step_session_pending_path, "r");
+            if (fp) {
+                fseek(fp, 0, SEEK_END);
+                long sz = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+                char *buf = (char *)malloc((size_t)sz + 1);
+                fread(buf, 1, (size_t)sz, fp);
+                buf[sz] = 0;
+                fclose(fp);
+                // Strip any existing ',color="#cc0000",penwidth=2.0' attrs.
+                const char *old_hl = ",color=\"#cc0000\",penwidth=2.0";
+                size_t old_len = strlen(old_hl);
+                char *w = buf, *r = buf;
+                while (*r) {
+                    if (strncmp(r, old_hl, old_len) == 0) { r += old_len; continue; }
+                    *w++ = *r++;
+                }
+                *w = 0;
+                // Find edges with HEAD `n<pre_fire_hl>` and add highlight
+                // before the closing ']' on that line.
+                char head_tok[64];
+                snprintf(head_tok, sizeof(head_tok), "-> n%llu ",
+                         (unsigned long long)pre_fire_hl);
+                FILE *fo = fopen(renamed, "w");
+                if (fo) {
+                    // Principal edge = the slot-0 in-edge of the owner at
+                    // pre_fire_hl.  Slot 0 lives at heap[owner_loc], so
+                    // its edge either has no taillabel or has
+                    // taillabel="@<owner_loc>".
+                    //
+                    // KERNEL-KERNEL absorbs BOTH children simultaneously
+                    // (the in-place settle needs both operands locally
+                    // ready).  For this rule, highlight ALL in-edges to
+                    // the outer — both edges are part of the redex.
+                    int is_kk = (strcmp(disp_rule, "KERNEL-KERNEL") == 0);
+                    char self_taillabel[64];
+                    snprintf(self_taillabel, sizeof(self_taillabel),
+                             "taillabel=\"@%llu\"",
+                             (unsigned long long)pre_fire_hl);
+                    char *line = buf;
+                    int highlighted_any = 0;
+                    while (*line) {
+                        char *nl = strchr(line, '\n');
+                        size_t llen = nl ? (size_t)(nl - line) : strlen(line);
+                        char saved = line[llen];
+                        line[llen] = 0;
+                        int has_head = strstr(line, head_tok) != NULL;
+                        int ends_semi = (llen > 0 && line[llen - 1] == ';');
+                        int has_any_taillabel = strstr(line, "taillabel=") != NULL;
+                        int is_slot0 = !has_any_taillabel ||
+                                       strstr(line, self_taillabel) != NULL;
+                        // K-K: any in-edge of the outer is part of the
+                        // redex; other rules: only the principal (slot 0).
+                        int match = has_head && ends_semi &&
+                                    (is_kk || is_slot0) &&
+                                    (is_kk || !highlighted_any);
+                        if (match) {
+                            char *close = strrchr(line, ']');
+                            if (close) {
+                                *close = 0;
+                                fprintf(fo, "%s,color=\"#cc0000\",penwidth=2.0];",
+                                        line);
+                                highlighted_any = 1;
+                            } else {
+                                fprintf(fo, "%s", line);
+                            }
+                        } else {
+                            fprintf(fo, "%s", line);
+                        }
+                        line[llen] = saved;
+                        if (nl) { fputc('\n', fo); line = nl + 1; }
+                        else break;
+                    }
+                    fclose(fo);
+                    remove(g_step_session_pending_path);
+                } else {
+                    rename(g_step_session_pending_path, renamed);
+                }
+                free(buf);
+            } else {
+                rename(g_step_session_pending_path, renamed);
+            }
+        } else {
+            rename(g_step_session_pending_path, renamed);
+        }
+        g_step_session_pending_path[0] = 0;
+    }
+
+    // Write the NEW pending frame (state after current rule fired; its
+    // filename will be fixed up by the NEXT hook invocation).
+    char path[640];
+    snprintf(path, sizeof(path), "%s/step_%03u_pending.dot",
+             g_step_session_dir, g_step_session_frame);
+
+    // Each pending frame is the state BEFORE its named rule fires.  So
+    // the highlight here reflects the PRE-fire redex of the rule whose
+    // name will be embedded in the (just-renamed) PREVIOUS frame.  For
+    // the current new pending, we have no rule name yet (will be set by
+    // next fire) so we can only fall back to the post-state principal
+    // edge.  But for the RENAMED previous pending, we've already committed
+    // the file to disk.
+    //
+    // Since writing a per-rule highlight into the previous pending
+    // requires re-rendering at rename time (expensive), we instead pick
+    // an hl_slot that reflects the redex JUST fired (whose effects we
+    // can see in the current heap state).  For:
+    //   - Interact rules (FUSE-X, KERNEL-KERNEL): ipair_outer was the
+    //     outer loc pre-fire; its slot 0 now holds the post-fire payload,
+    //     but the edge rendering still uses that slot.
+    //   - GRAD rules: grad_loc_fire is the pre-slide GRAD cell; slot 0
+    //     was the body that just commuted in.
+    u64 hl_slot = 0;
+    if (ipair_outer != 0 && ipair_outer < ctx->heap_pos) {
+        hl_slot = ipair_outer;
+    } else if (grad_loc_fire != 0 && grad_loc_fire + 1 < ctx->heap_pos) {
+        // Pre-slide GRAD cell's principal edge — matches the redex edge
+        // for the rule that just fired.
+        hl_slot = grad_loc_fire + 0;
+    } else if (grad_slot != 0 && grad_slot + 1 < ctx->heap_pos) {
+        hl_slot = grad_slot + 0;
+    }
+    // Note: cursor_loc intentionally NOT used as fallback.  For GRAD-TEN
+    // firings, cursor_loc holds the tensor id (for filename), not a heap
+    // slot — interpreting it as a slot would point at an arbitrary edge.
     thvm_heap_dot_set_highlight(hl_slot, 0);
-    if (rule_name && rule_name[0]) {
-        char meta[96];
-        snprintf(meta, sizeof(meta), "%s", rule_name);
-        thvm_heap_dot_set_step_meta(meta, "");
+    if (disp_rule[0]) {
+        thvm_heap_dot_set_step_meta(disp_rule, "");
     } else {
         thvm_heap_dot_set_step_meta("", "");
     }
@@ -1235,6 +1464,9 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
         return;
     }
     g_step_session_last_render_sig = render_sig;
+    snprintf(g_step_session_pending_path, sizeof(g_step_session_pending_path),
+             "%s", path);
+    g_step_session_pending_frame = g_step_session_frame;
     g_step_session_frame++;
 }
 
@@ -1268,9 +1500,11 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     g_step_session_ctx               = ctx;
     g_step_session_frame             = 0;
     g_step_session_last_render_sig   = 0;
+    g_step_session_pending_path[0]   = 0;
+    g_step_session_pending_frame     = 0;
     thvm_step_seed_root_grad(ctx, traced);
     char p0[640];
-    snprintf(p0, sizeof(p0), "%s/step_%03u.dot", dir, g_step_session_frame);
+    snprintf(p0, sizeof(p0), "%s/step_%03u_pending.dot", dir, g_step_session_frame);
     // Scan heap for the first outermost GRAD cell and highlight its
     // slot 0 (principal y edge) as the initial redex.  Works whether
     // the root is a direct GRAD term, or a compound (CTR / FUSE / ...)
@@ -1294,6 +1528,9 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     thvm_heap_dot_set_include_all(0);
     thvm_heap_dot_set_highlight(0, 0);
     g_step_session_last_render_sig = thvm_file_sig(p0);
+    snprintf(g_step_session_pending_path, sizeof(g_step_session_pending_path),
+             "%s", p0);
+    g_step_session_pending_frame = g_step_session_frame;
     g_step_session_frame++;
 
     // Drive reduction; hook emits one dot per wnf interaction.  We run
@@ -1306,6 +1543,13 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // kernel-building FUSE interactions that turn lazy compute TOPs
     // into KERNEL terms.
     thvm_wnf_set_step_hook(wnf_step_session_hook);
+    // Step-graph renders the entire heap state per frame — no root-based
+    // reach filtering.  Orphan cells left behind by rule firings remain
+    // visible until either ERA interactions garbage-collect them, or
+    // they get overwritten by new allocations.  A net in interaction-net
+    // terms is a SET of cells plus free ports; the "root" is just a
+    // rendering hint (blue border on the top-of-reduction node), not a
+    // visibility boundary.
     // Phase 1: VJP reduce + normalize (FUSE rule deferred — GRAD
     // commutes fire first, matching spec's steps 0..4).
     extern int g_thvm_defer_fuse_kernelize;
@@ -1319,23 +1563,24 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
         traced = thvm_eval_fuse_fixed_point(ctx, traced, thvm_eval_mixed_dispatch_enabled());
     thvm_wnf_clear_step_hook();
 
-    // Final-state frame (skipped if identical to last).
+    // The last pending frame is the state AFTER all hook-visible rules
+    // have fired.  Any additional changes from the post-hook thvm_normalize
+    // aren't part of the captured sequence, so we overwrite the pending
+    // frame with the truly-final reduced state and name it "_final".
     g_step_session_root = traced;
     thvm_step_seed_root_grad(ctx, traced);
     char pF[640];
-    snprintf(pF, sizeof(pF), "%s/step_%03u_final.dot", dir, g_step_session_frame);
+    snprintf(pF, sizeof(pF), "%s/step_%03u_final.dot",
+             dir, g_step_session_pending_frame);
     thvm_heap_dot_set_highlight(0, 0);
     thvm_heap_dot_set_step_meta("", "");
-    // Final uses reachable-only (include_all=0) — the accumulated scratch
-    // from the VJP and FUSE phases is not semantically part of the final
-    // reduced form.
     thvm_heap_dot_root(ctx, pF, traced);
-    u64 final_sig = thvm_file_sig(pF);
-    if (final_sig != g_step_session_last_render_sig) {
-        g_step_session_frame++;
-    } else {
-        remove(pF);
+    // Remove the stale pending snapshot now that the final is written.
+    if (g_step_session_pending_path[0] &&
+        strcmp(g_step_session_pending_path, pF) != 0) {
+        remove(g_step_session_pending_path);
     }
+    g_step_session_pending_path[0] = 0;
 
     // Render PNGs.
     if (!getenv("THVM_STEP_GRAPH_NO_PNG")) {
@@ -1347,6 +1592,8 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     fprintf(stderr, "Step graphs (%u frames) → %s/\n",
             g_step_session_frame, dir);
 
+    // (Session no longer toggles heap_dot_root_only; dumper always shows
+    // the entire heap.)
     g_step_session_ctx  = NULL;
     g_step_session_root = 0;
     g_step_session_frame = 0;

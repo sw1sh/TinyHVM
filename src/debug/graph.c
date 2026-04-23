@@ -1,6 +1,8 @@
 // graph.c — BFS heap walker for inet graph visualization
 // Returns node/edge arrays suitable for WL Graph construction.
 static int heap_dot_root_only = 0; // skip global ERA/ASSIGN seeding in step graphs
+void thvm_heap_dot_set_root_only(int v) { heap_dot_root_only = v ? 1 : 0; }
+int thvm_heap_dot_get_root_only(void) { return heap_dot_root_only; }
 static u64 heap_dot_node_hl = 0;  // node highlight (red border when edge hl fails)
 static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root);
 static void thvm_heap_dot_set_highlight(u64 slot, Term term);

@@ -174,6 +174,85 @@
                 Term right = heap_read(ctx, loc + 1);
                 u32 kernel_uop = thvm_kernel_root_uop(ctx, t);
                 if (kernel_uop == UOP_COUNT) {
+                    // Empty KERNEL (UOP_COUNT in slot 2).  If slot 1 is
+                    // ERA, this is a "pending kernelisation" marker (the
+                    // unified-FUSE role): slot 0 holds a payload to
+                    // kernelise.  Apply kernelisation IN PLACE so
+                    // external references stay valid.
+                    //
+                    // Otherwise (slot 1 != ERA), it's a legacy SEQ-style
+                    // KERNEL with no root op — keep the SEQ semantics.
+                    //
+                    // Defer during phase 1 (VJP commutes) so gradient
+                    // rules fire on the still-lazy compute graph before
+                    // any kernelisation happens.  Phase 2 clears the
+                    // flag and kernels absorb payloads normally.
+                    extern int g_thvm_defer_fuse_kernelize;
+                    if (g_thvm_defer_fuse_kernelize && term_tag(right) == TAG_ERA)
+                        return t;
+                    if (term_tag(right) == TAG_ERA) {
+                        u8 ptag = term_tag(left);
+                        // Atoms/already-fused: no-op, just unwrap.
+                        if (ptag == TAG_TEN || ptag == TAG_NUM ||
+                            (ptag == TAG_ERA && term_val(left) == 0))
+                            return left;
+                        if (ptag == TAG_TOP) {
+                            u32 puop = term_ext(left);
+                            if (puop == UOP_KERNEL) return left;  // already kernel
+                            if (is_elementwise(puop) || puop == UOP_SUM ||
+                                puop == UOP_RMAX ||
+                                (puop >= UOP_RESHAPE && puop <= UOP_PAD)) {
+                                // Kernelise the payload: allocate inner
+                                // payload + wrap children in empty kernels.
+                                Term public_term = thvm_fuse_public_term(ctx, left, 0);
+                                if (term_tag(public_term) == TAG_TOP &&
+                                    term_ext(public_term) == UOP_KERNEL) {
+                                    u64 pub_loc = term_val(public_term);
+                                    // Rewrite THIS kernel's slots in place
+                                    // with the resolved kernel's contents.
+                                    heap_set(ctx, loc + 0,
+                                             heap_read(ctx, pub_loc + 0));
+                                    heap_set(ctx, loc + 1,
+                                             heap_read(ctx, pub_loc + 1));
+                                    heap_set(ctx, loc + 2,
+                                             heap_read(ctx, pub_loc + 2));
+                                    thvm_fuse_copy_public_shape(ctx, t, loc);
+                                    return t;  // same outer ref, now populated
+                                }
+                                return left;
+                            }
+                            if (puop == UOP_ASSIGN) {
+                                u64 aloc = term_val(left);
+                                Term src = heap_read(ctx, aloc + 1);
+                                u8 st = term_tag(src);
+                                int already_wrapped = (st == TAG_TOP &&
+                                                       term_ext(src) == UOP_KERNEL);
+                                if (st != TAG_TEN && st != TAG_ERA && !already_wrapped) {
+                                    Term wrapped = thvm_make_empty_kernel(ctx, src);
+                                    heap_set(ctx, aloc + 1, wrapped);
+                                }
+                                return left;
+                            }
+                            // Other TOPs (GRAD / GRAD_PIN / ...): pending.
+                            return t;
+                        }
+                        if (ptag == TAG_CTR) {
+                            u64 cloc = term_val(left);
+                            u32 ar = term_ext(left);
+                            for (u32 i = 0; i < ar; i++) {
+                                Term c = heap_read(ctx, cloc + i);
+                                u8 ct = term_tag(c);
+                                if (ct == TAG_TEN || ct == TAG_ERA) continue;
+                                if (ct == TAG_TOP &&
+                                    term_ext(c) == UOP_KERNEL) continue;
+                                heap_set(ctx, cloc + i,
+                                         thvm_make_empty_kernel(ctx, c));
+                            }
+                            return left;
+                        }
+                        return left;  // default: pass payload through.
+                    }
+                    // Legacy SEQ-style (both operands present, no ERA).
                     if ((term_tag(left) == TAG_TOP && term_ext(left) == UOP_FUSE) ||
                         (term_tag(right) == TAG_TOP && term_ext(right) == UOP_FUSE))
                         return t;
@@ -183,13 +262,34 @@
                     if (!thvm_kernel_local_child_ready(ctx, left) ||
                         !thvm_kernel_local_child_ready(ctx, right))
                         return t;
-                    Term settled = thvm_make_public_kernel_from_uop(ctx, kernel_uop, left, right, t);
-                    if (!settled) return t;
+                    // In-place settle: extract children's payloads and
+                    // rewrite THIS kernel's slots to become monolithic.
+                    // External references to `t` stay valid — same heap
+                    // loc, same tag — but the internal structure is now
+                    // a fully fused kernel.  This avoids the "mid-fire
+                    // stale reference" problem where a new kernel at a
+                    // new loc would render as separate until normalize
+                    // propagates the update to parent slots.
+                    Term raw_left = left;
+                    Term raw_right = right;
+                    if (!thvm_public_kernel_absorb_child(ctx, left, &raw_left, 0))
+                        return t;
+                    if (!thvm_public_kernel_absorb_child(ctx, right, &raw_right, 0))
+                        return t;
+                    u64 ploc = heap_alloc(ctx, 2);
+                    heap_set(ctx, ploc + 0, raw_left);
+                    heap_set(ctx, ploc + 1, raw_right);
+                    Term inner = term_new(TAG_TOP, kernel_uop, ploc);
+                    thvm_fuse_copy_public_shape(ctx, t, ploc);
+                    heap_set(ctx, loc + 0, inner);
+                    heap_set(ctx, loc + 1, thvm_any());
+                    // slot 2 already NUM(kernel_uop).  shape stays on @loc.
                     if (getenv("THVM_SCHED_DIAG"))
-                        fprintf(stderr, "KERNEL_SETTLE: op=%s tag=%u ext=%u val=%llu\n",
-                                uop_names[kernel_uop], term_tag(settled), term_ext(settled),
-                                (unsigned long long)term_val(settled));
-                    return settled;
+                        fprintf(stderr, "KERNEL_SETTLE (in-place): op=%s @%llu\n",
+                                uop_names[kernel_uop], (unsigned long long)loc);
+                    // Return same term (t).  My interact wrapper detects
+                    // the slot_mutated condition and fires WNF_FIRED.
+                    return t;
                 }
                 // KERNEL stays a DAG node in phase-1 — only phase-2 (which sets
                 // dispatch_enabled) is allowed to lower (register) and dispatch it.
@@ -392,27 +492,28 @@
                     // Leaf ops can be monolithic immediately; parents with
                     // still-fused children keep the growing shell.
                     //
-                    // Persistence: the FUSE wrapper *stays* — we write the
-                    // resolved kernel back into its slot 0 (memoisation)
-                    // and return the FUSE term unchanged.  Callers'
-                    // references to this FUSE remain valid; the FUSE node
-                    // itself stays visible in the step graph as the
-                    // kernelisation marker on the bwd / fwd output edge.
+                    // FUSE ⊳ compute-TOP: build a KERNEL of the payload
+                    // and replace the FUSE.  Also writes the KERNEL back
+                    // into the FUSE's payload slot so that any caller
+                    // still holding `TAG_TOP(UOP_FUSE, loc)` transparently
+                    // sees the kernel through FUSE.slot0.  The dumper
+                    // treats a FUSE wrapping a KERNEL as transparent
+                    // (renders only the KERNEL), so the FUSE node is
+                    // effectively gone from the graph once kernelised.
                     if (is_elementwise(puop) || puop == UOP_SUM || puop == UOP_RMAX ||
                         (puop >= UOP_RESHAPE && puop <= UOP_PAD)) {
                         Term public_term = thvm_fuse_public_term(ctx, payload, 0);
                         if (term_tag(public_term) == TAG_TOP &&
                             term_ext(public_term) == UOP_KERNEL) {
                             heap_set(ctx, loc, public_term);
+                            if (getenv("THVM_SCHED_DIAG")) {
+                                fprintf(stderr, "FUSE→KERNEL: op=%s tag=%u ext=%u val=%llu\n",
+                                        uop_names[puop], term_tag(public_term), term_ext(public_term),
+                                        (unsigned long long)term_val(public_term));
+                            }
+                            return public_term;  // replace FUSE with KERNEL
                         }
-                        if (getenv("THVM_SCHED_DIAG") &&
-                            term_tag(public_term) == TAG_TOP &&
-                            term_ext(public_term) == UOP_KERNEL) {
-                            fprintf(stderr, "FUSE→KERNEL: op=%s tag=%u ext=%u val=%llu\n",
-                                    uop_names[puop], term_tag(public_term), term_ext(public_term),
-                                    (unsigned long long)term_val(public_term));
-                        }
-                        return t;  // return FUSE term itself, keeping it visible
+                        return payload;
                     }
 
                     // Other TAG_TOP (e.g. UOP_GRAD/GRAD_PIN/GRAD_FWD):

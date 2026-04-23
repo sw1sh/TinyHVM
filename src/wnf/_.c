@@ -163,6 +163,19 @@ static Term        g_wnf_last_tgt      = 0;
 // descent operand before dumping, restoring it afterward.
 static u64 g_wnf_current_grad_slot = 0;
 
+// Meta set just before the interact-path WNF_FIRED fires, so the session
+// hook can render the (outer UOP × inner UOP) pair as "FUSE-SUM" etc.
+// For GRAD rules, g_wnf_last_rule / g_wnf_last_cursor / g_wnf_current_grad_slot
+// already carry the redex info.
+static char g_wnf_last_interact_pair[64] = "";
+static u64  g_wnf_last_interact_outer    = 0;
+static u64  g_wnf_last_interact_inner    = 0;
+
+// GRAD cell location AT the moment of fire — set before a commute slide
+// updates g_wnf_current_grad_slot to the new inner cell.  Used for rich
+// filename output: "step_001_GRAD-SUM@<preFireGradLoc>-<sumLoc>.dot".
+static u64  g_wnf_last_grad_loc_at_fire  = 0;
+
 void thvm_grad_target_remember(u64 loc, Term target);
 
 
@@ -175,6 +188,10 @@ const char *thvm_wnf_last_rule(void)          { return g_wnf_last_rule; }
 u64         thvm_wnf_last_cursor(void)        { return g_wnf_last_cursor; }
 Term        thvm_wnf_last_tgt(void)           { return g_wnf_last_tgt; }
 u64         thvm_wnf_current_grad_slot(void)  { return g_wnf_current_grad_slot; }
+const char *thvm_wnf_last_interact_pair(void) { return g_wnf_last_interact_pair; }
+u64         thvm_wnf_last_interact_outer(void){ return g_wnf_last_interact_outer; }
+u64         thvm_wnf_last_interact_inner(void){ return g_wnf_last_interact_inner; }
+u64         thvm_wnf_last_grad_loc_at_fire(void){ return g_wnf_last_grad_loc_at_fire; }
 
 // Peek the current VJP frame's cotangent (gy) term, if any.  Returns 0
 // when no VJP frame is active.  Used by the step-graph hook to mirror
@@ -925,11 +942,77 @@ enter: {
                 // IFZ needs its counter (arg 0) as a TEN — already covered
                 // by the a0 reduction above.
             }
+            // Capture (outer × inner) uop pair before firing so the step
+            // hook can label/highlight the interaction edge.  Outer = the
+            // TOP term being reduced (FUSE/KERNEL/ASSIGN/...).  Inner =
+            // the payload at outer.slot0 (the compute TOP being absorbed,
+            // or the TEN/ERA it resolves to).
+            u32 _outer_uop_snap = term_ext(next);
+            u64 _outer_loc_snap = term_val(next);
+            Term _inner_snap = (_outer_loc_snap && _outer_loc_snap < ctx->heap_pos)
+                ? heap_read(ctx, _outer_loc_snap) : term_era();
+            Term _pre_fire_next = next;
             Term r = thvm_interact(ctx, next);
-            if (r != next) {
+            // Mutation-style fire: e.g. FUSE on a compute-TOP payload
+            // writes a fresh KERNEL back into its own slot 0 and returns
+            // the FUSE unchanged.  Detect by comparing the pre-fire slot
+            // snapshot against the post-fire slot value.
+            Term _inner_post = (_outer_loc_snap && _outer_loc_snap < ctx->heap_pos)
+                ? heap_read(ctx, _outer_loc_snap) : term_era();
+            int _slot_mutated = (_inner_post != _inner_snap);
+            // If this rule replaced a term and that term was the session
+            // root (e.g. empty KERNEL sliding through CTR), update the
+            // tracked root so later renders walk from the new structural
+            // root — otherwise the discarded outer node lingers in frames.
+            if (r != _pre_fire_next) {
+                extern void thvm_step_session_root_replaced(Term old_term, Term new_term);
+                thvm_step_session_root_replaced(_pre_fire_next, r);
+            }
+            if (r != next || _slot_mutated) {
+                // Record the interact pair only when the rule actually
+                // fired (changed term).  Keep short: "FUSE-SUM", etc.
+                const char *_oname = wnf_uop_name_safe(_outer_uop_snap);
+                u8 _itag = term_tag(_inner_snap);
+                const char *_iname = (_itag == TAG_TOP)
+                    ? wnf_uop_name_safe(term_ext(_inner_snap))
+                    : (_itag == TAG_TEN ? "TEN"
+                       : _itag == TAG_ERA ? "ERA"
+                       : _itag == TAG_NUM ? "NUM"
+                       : _itag == TAG_CTR ? "CTR"
+                       : _itag == TAG_SEQ ? "SEQ"
+                       : _itag == TAG_DP0 ? "DP0"
+                       : _itag == TAG_DP1 ? "DP1"
+                       : _itag == TAG_VAR ? "VAR"
+                       : _itag == TAG_LAM ? "LAM"
+                       : _itag == TAG_APP ? "APP"
+                       : _itag == TAG_SUP ? "SUP"
+                       : _itag == TAG_ANY ? "ANY"
+                       : "?");
+                snprintf(g_wnf_last_interact_pair,
+                         sizeof(g_wnf_last_interact_pair),
+                         "%s-%s", _oname, _iname);
+                g_wnf_last_interact_outer = _outer_loc_snap;
+                g_wnf_last_interact_inner = (term_tag(_inner_snap) == TAG_TOP ||
+                                             term_tag(_inner_snap) == TAG_TEN)
+                    ? term_val(_inner_snap) : 0;
+                if (getenv("THVM_INTERACT_TRACE")) {
+                    fprintf(stderr, "interact: %s@%llu-%llu\n",
+                            g_wnf_last_interact_pair,
+                            (unsigned long long)g_wnf_last_interact_outer,
+                            (unsigned long long)g_wnf_last_interact_inner);
+                }
                 WNF_FIRED();
-                next = r;
-                goto enter;
+                // Clear after fire so next hook emit doesn't re-use stale
+                // pair; filename path reads it inside hook, already consumed.
+                g_wnf_last_interact_pair[0] = 0;
+                g_wnf_last_interact_outer = 0;
+                g_wnf_last_interact_inner = 0;
+                if (r != next) {
+                    next = r;
+                    goto enter;
+                }
+                // Slot mutated but rule returned same term (e.g. FUSE kept
+                // as visible marker).  Treat as WHNF completion.
             }
         }
         whnf = next;
@@ -1682,14 +1765,16 @@ apply: {
 
         case WNF_F_VJP: {
             // Reverse-mode (VJP) apply.  Cotangent g is carried in t1;
-            // seed at outermost entry if t1 == 0.
+            // a zero value is a SENTINEL meaning "not seeded yet — use
+            // ones(y.shape) lazily if any rule actually consumes it".
+            // Deferring the seed keeps the commute phase fully symbolic:
+            // SUM/MUL/ADD rules only use the structural inner-GRAD tags
+            // (`(void)g;`), so the concrete ones scalar need not exist
+            // unless a TEN-match rule fires.
             Term tgt = f.t0;
             Term g   = f.t1;
-            if (g == 0) {
-                // Outermost: seed g = ones(y.shape).
-                Shape ys = wnf_shape_of(ctx, whnf);
-                g = wnf_ones_of_shape(ctx, ys);
-            }
+            // (No outermost eager seed here.  TEN-match below will
+            // materialize ones(target.shape) on demand when g == 0.)
 
             // Leaf rules.  GRAD ⊳ TEN target-match: produce the cotangent
             // seed `g` and store it in the cell's slot 1 so later BW
@@ -1700,6 +1785,14 @@ apply: {
                 if (term_tag(tgt) == TAG_TEN) {
                     u32 wtid = (u32)term_val(whnf);
                     u32 ttid = (u32)term_val(tgt);
+                    // Lazy-seed: ones(target.shape) materialises HERE,
+                    // not at outer VJP entry.  Only the matching arm
+                    // needs it; mismatched (wtid != ttid) annihilates
+                    // to ERA without ever constructing the ones tensor.
+                    if (wtid == ttid && g == 0) {
+                        Shape ts = wnf_shape_of(ctx, tgt);
+                        g = wnf_ones_of_shape(ctx, ts);
+                    }
                     Term result = (wtid == ttid) ? g : term_era();
                     u64 fired_slot = g_wnf_current_grad_slot;
                     if (fired_slot != 0 && fired_slot + 1 < ctx->heap_pos) {
@@ -1723,7 +1816,12 @@ apply: {
                             break;
                         }
                     }
-                    WNF_FIRED();
+                    // Rule name "TEN" → file becomes GRAD-TEN@<gradLoc>-t<tenId>.
+                    // WNF_FIRED_AT cursor_loc is the tensor id so the hook
+                    // filename shows which TEN leaf annihilated.
+                    g_wnf_last_grad_loc_at_fire = fired_slot;
+                    WNF_FIRED_AT("TEN", (u64)wtid, whnf);
+                    g_wnf_last_grad_loc_at_fire = 0;
                     whnf = result;
                     continue;
                 }
@@ -1887,9 +1985,11 @@ apply: {
                 }
                 // Slide grad-slot to sub_a so next step's redex lands
                 // on t1→sub_GRAD_a[y] per spec step_002.
+                g_wnf_last_grad_loc_at_fire = g_wnf_current_grad_slot;
                 g_wnf_current_grad_slot = sa_loc;
                 whnf = add_combined;
-                WNF_FIRED();
+                WNF_FIRED_AT("MUL", wloc, tgt);
+                g_wnf_last_grad_loc_at_fire = 0;
                 continue;
             }
             // DIV: grad_a = g / b, grad_b = -g * a / (b*b).
@@ -1992,9 +2092,11 @@ apply: {
                 // inner cell — the hook's per-step redex highlight then
                 // lands on the NEW principal edge (MUL→inner_GRAD[y]),
                 // matching spec step_001 redex annotation.
+                g_wnf_last_grad_loc_at_fire = g_wnf_current_grad_slot;
                 g_wnf_current_grad_slot = inner_loc;
                 whnf = bwd_wrapper;
-                WNF_FIRED();
+                WNF_FIRED_AT("SUM", wloc, tgt);
+                g_wnf_last_grad_loc_at_fire = 0;
                 continue;
             }
             // EXPAND: grad_a = sum_to_shape(g, a.shape).  Sum over broadcast

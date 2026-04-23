@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 
 #define GRAPH_ROOT "graphs/grad_rules"
 
@@ -87,10 +88,28 @@ static int count_op_nodes(const char *buf, const char *op) {
 // .dot file (e.g. "step_000", "step_004_final").
 static int step_topo_check(const char *rule, const char *step,
                            const char *const (*expect)[2], int n_expect) {
-    char path[512];
-    snprintf(path, sizeof(path), "%s/%s/steps/%s.dot", GRAPH_ROOT, rule, step);
-    char *buf = slurp(path);
-    if (!buf) { printf("  STEP miss: %s not written\n", path); return 0; }
+    // Step-graph files now embed the redex-about-to-fire in the name
+    // (e.g. step_000_GRAD-SUM@5-3.dot).  Match on step_NNN prefix.
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/%s/steps", GRAPH_ROOT, rule);
+    DIR *d = opendir(dir);
+    char *buf = NULL;
+    if (d) {
+        struct dirent *de;
+        size_t sl = strlen(step);
+        while ((de = readdir(d))) {
+            if (strncmp(de->d_name, step, sl) != 0) continue;
+            if (de->d_name[sl] != '.' && de->d_name[sl] != '_') continue;
+            const char *ext_ptr = strrchr(de->d_name, '.');
+            if (!ext_ptr || strcmp(ext_ptr, ".dot") != 0) continue;
+            char fullpath[1024];
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, de->d_name);
+            buf = slurp(fullpath);
+            break;
+        }
+        closedir(d);
+    }
+    if (!buf) { printf("  STEP miss: %s/%s.dot not written\n", dir, step); return 0; }
     int ok = 1;
     for (int i = 0; i < n_expect; i++) {
         const char *op = expect[i][0];
@@ -3173,12 +3192,17 @@ static int test_e2e_vjp_sum_of_square(void) {
     // a CTR and eval; thvm_eval's outermost auto-wrap skips CTR roots.
     Term pin, bw;
     thvm_grad_split(ctx, y, x, &pin, &bw);
-    u64 fslt_f = heap_alloc(ctx, 1); heap_set(ctx, fslt_f, pin);
-    u64 fslt_b = heap_alloc(ctx, 1); heap_set(ctx, fslt_b, bw);
-    Term fuse_f = term_new(TAG_TOP, UOP_FUSE, fslt_f);
-    Term fuse_b = term_new(TAG_TOP, UOP_FUSE, fslt_b);
-    Term pair = thvm_ctr(ctx, (Term[]){fuse_f, fuse_b}, 2);
-    Term reduced = thvm_eval(ctx, pair);
+    // Bundle pin + bw inside a single CTR, then wrap the bundle in one
+    // empty KERNEL (pending-kernelisation marker, unified with legacy
+    // UOP_FUSE).  The very first reduction step will be a KERNEL-CTR
+    // interaction that SLIDES the empty marker through the CTR,
+    // replacing each arm with its own empty KERNEL — producing the
+    // familiar CTR(empty_kernel(pin), empty_kernel(bw)) state from
+    // which the VJP commutes proceed.
+    extern Term thvm_make_empty_kernel(TinyHVM *ctx, Term payload);
+    Term pair = thvm_ctr(ctx, (Term[]){pin, bw}, 2);
+    Term root = thvm_make_empty_kernel(ctx, pair);
+    Term reduced = thvm_eval(ctx, root);
 
     Term bw_result = thvm_grad_bundle_get(ctx, reduced, 1);
     f32 *h = thvm_to_host(ctx, bw_result);
@@ -3188,7 +3212,10 @@ static int test_e2e_vjp_sum_of_square(void) {
         fprintf(stderr, "  vjp_sum h[%d]=%g want %g\n", i, h[i], expect[i]); ok=0;
     }
     thvm_free(ctx);
-    const char *init[][2] = {{"MUL","1"},{"SUM","1"},{"GRAD","1"},{"FUSE","2"}};
+    // Initial topology: MUL + SUM + GRAD + CTR + 1 empty KERNEL on top.
+    // The first interaction (KERNEL-CTR) slides the empty kernel into
+    // each CTR arm, producing the 2-KERNEL state at step_001.
+    const char *init[][2] = {{"MUL","1"},{"SUM","1"},{"GRAD","1"},{"KERNEL","1"}};
     ok = ok && step_topo_check("vjp_sum_of_square", "step_000", init, 4);
     teardown_step_graph_dir();
     return report("e2e_vjp_sum_of_square", ok);

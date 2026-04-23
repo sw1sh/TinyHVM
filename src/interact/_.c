@@ -155,11 +155,47 @@ static int thvm_fuse_child_is_compute_like(Term child) {
 
 static void fuse_wrap_memo_reset(void) { (void)0; }
 
+// An "empty KERNEL" (pending kernelisation): 3-slot layout, same as
+// populated KERNEL but with NUM(UOP_COUNT) in slot 2 — that signals
+// "no op yet, waiting to absorb the compute-TOP in slot 0".  The
+// KERNEL rule in tensor_ops.c handles this case by kernelising the
+// payload in place.  Externally, the term is TAG_TOP(UOP_KERNEL,loc),
+// rendered as a green invhouse node (FUSE shape) until populated.
+static Term thvm_make_empty_kernel(TinyHVM *ctx, Term payload) {
+    u64 kloc = heap_alloc(ctx, 3);
+    heap_set(ctx, kloc + 0, payload);
+    heap_set(ctx, kloc + 1, term_era());                  // sentinel: empty
+    heap_set(ctx, kloc + 2, term_num_u32(UOP_COUNT));     // no op yet
+    thvm_fuse_copy_public_shape(ctx, payload, kloc);
+    return term_new(TAG_TOP, UOP_KERNEL, kloc);
+}
+
 static Term thvm_fuse_wrap_child(TinyHVM *ctx, Term child) {
-    if (!ctx || !thvm_fuse_child_is_compute_like(child)) return child;
-    u64 floc = heap_alloc(ctx, 1);
-    heap_set(ctx, floc, child);
-    return term_new(TAG_TOP, UOP_FUSE, floc);
+    if (!ctx) return child;
+    // Follow GRAD_PIN / GRAD SUB redirects so we wrap the RESOLVED
+    // compute term, not the tag view.
+    for (u32 hop = 0; hop < 16 && term_tag(child) == TAG_TOP; hop++) {
+        u32 e = term_ext(child);
+        u64 l = term_val(child);
+        if (l == 0 || l + 1 >= ctx->heap_pos) break;
+        if (e == UOP_GRAD_PIN) {
+            Term s0 = heap_read(ctx, l + 0);
+            if (!term_is_sub(s0)) break;
+            child = term_strip_sub(s0);
+            continue;
+        }
+        if (e == UOP_GRAD || e == UOP_GRAD_FWD) {
+            Term s0 = heap_read(ctx, l + 0);
+            if (!term_is_sub(s0)) break;
+            child = heap_read(ctx, l + 1);
+            continue;
+        }
+        break;
+    }
+    if (!thvm_fuse_child_is_compute_like(child)) return child;
+    // Unified fusion marker: an "empty" KERNEL waiting to absorb the
+    // compute-TOP payload.  Replaces the legacy UOP_FUSE wrapper.
+    return thvm_make_empty_kernel(ctx, child);
 }
 
 static int thvm_kernel_local_child_ready(TinyHVM *ctx, Term child) {

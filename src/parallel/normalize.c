@@ -70,13 +70,27 @@ Term thvm_normalize(TinyHVM *ctx, Term root) {
         // DP0/DP1/VAR/UDP point to a single body slot, not arg slots
         // owned by this term — but enqueuing the target is still correct
         // (reduce at that slot is a no-op if it's already WHNF).
+        // Push order: default LIFO (right-to-left, preserves original
+        // lazy evaluation order).  Under step-graph tracing, push reverse
+        // so slot 0 pops first (left-to-right — matches IC spec
+        // convention where the principal port is the leftmost operand,
+        // e.g. Leibniz chain-MUL sub_a annihilates before sub_b).
+        int left_first = (getenv("THVM_STEP_GRAPH") != NULL);
         u32 ar = reduce_net_term_arity(w);
         u64 cloc = term_val(w);
         if (cloc == 0) continue;
-        for (u32 i = 0; i < ar; i++) {
-            u64 child = cloc + i;
-            if (child >= ctx->heap_pos) break;
-            ws_push(&dq, child);
+        if (left_first) {
+            for (u32 i = ar; i > 0; i--) {
+                u64 child = cloc + (i - 1);
+                if (child >= ctx->heap_pos) continue;
+                ws_push(&dq, child);
+            }
+        } else {
+            for (u32 i = 0; i < ar; i++) {
+                u64 child = cloc + i;
+                if (child >= ctx->heap_pos) break;
+                ws_push(&dq, child);
+            }
         }
     }
 

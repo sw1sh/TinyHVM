@@ -1210,24 +1210,20 @@ Term thvm_eval(TinyHVM *ctx, Term t);
 // — no sig dedup, no highlight prediction, no next-redex forecasting.
 // Just: after each wnf rule fires, snapshot the whole heap.
 static TinyHVM *g_step_session_ctx   = NULL;
-static Term     g_step_session_root  = 0;
 static u32      g_step_session_frame = 0;
 static char     g_step_session_dir[512] = {0};
 
 static u64 g_step_session_last_render_sig = 0;
 
-// Called by the wnf interact wrapper when a rule replaces a term.  With
-// the dumper now rendering the entire heap state (no root-based reach
-// filtering), we still track the session root term as a rendering
-// hint — the dumper highlights the root node with a blue border so
-// viewers can see which cell is the top of the live reduction.  This
-// is a hint, NOT a reach boundary: orphan cells elsewhere in the heap
-// still render normally.
+// A step-graph frame renders the ENTIRE heap state — all live cells,
+// including any left behind as clutter by rule firings.  There is no
+// "session root" filtering: the net is a set of cells + free ports,
+// and the renderer enumerates them without traversing from a privileged
+// root.  (Called at the wnf interact wrapper's "term replaced" hook —
+// kept as a no-op for source compatibility; may be removed.)
 void thvm_step_session_root_replaced(Term old_term, Term new_term) {
-    if (g_step_session_root == 0) return;
-    if (old_term == g_step_session_root) {
-        g_step_session_root = new_term;
-    }
+    (void)old_term;
+    (void)new_term;
 }
 
 // Spec naming convention: step_N's filename names the redex that fires
@@ -1248,10 +1244,6 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
     if (ctx != g_step_session_ctx) return;
     if (g_step_session_dir[0] == 0) return;
     if (g_step_session_frame >= thvm_step_graph_max_steps()) return;
-    // Mirror the current root Term into step_root_slot so the dumper
-    // (which is heap-driven) picks up root-shaped TOPs like GRAD even
-    // when the root itself isn't held in any other heap cell.
-    thvm_step_seed_root_grad(ctx, g_step_session_root);
 
     u64 cursor_loc = thvm_wnf_last_cursor();
     const char *rule_name = thvm_wnf_last_rule();
@@ -1447,13 +1439,12 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
     }
     thvm_heap_dot_set_grad_cursor(0, 0);  // disable overlay; slide + hl does the job
 
-    // Reachable-only rendering: walks only what's reachable from the
-    // session root term.  include_all=1 previously picked up every
-    // non-ERA heap slot, which during the fuse phase surfaces lots of
-    // scaffolding MUL/SUM cells that have been absorbed into kernels
-    // but still sit on heap.  Reachable-only prunes them, matching
-    // spec's cleaner kernel topology in steps 5-9.
-    thvm_heap_dot_root(ctx, path, g_step_session_root);
+    // Whole-heap rendering: no root-based filtering.  The dumper
+    // enumerates every live heap cell; free ports (unconsumed outputs)
+    // surface as the net's visible roots.  `term_era()` as the root
+    // argument disables the blue-border "root hint" since there is no
+    // privileged root — all cells are on equal footing.
+    thvm_heap_dot_root(ctx, path, term_era());
 
     // Dedup on rendered content — collapses enter-phase administrative
     // firings (VAR resolve, INC unwrap, ...) that don't change what the
@@ -1496,12 +1487,17 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // Frame 0: initial state.  Highlight the initial redex edge —
     // for a GRAD root term, that's the y→GRAD principal-port edge
     // (slot grad_loc+0).
-    g_step_session_root              = traced;
     g_step_session_ctx               = ctx;
     g_step_session_frame             = 0;
     g_step_session_last_render_sig   = 0;
     g_step_session_pending_path[0]   = 0;
     g_step_session_pending_frame     = 0;
+    // Anchor the initial term in a dedicated heap slot so the outer
+    // wrapper (e.g. empty KERNEL@9 above CTR) is a live heap reference,
+    // not a floating C variable.  This is purely about making every
+    // allocated cell reachable via heap_read — the dumper does not
+    // filter by "root", it enumerates all live heap cells.  The anchor
+    // slot is freed at session end.
     thvm_step_seed_root_grad(ctx, traced);
     char p0[640];
     snprintf(p0, sizeof(p0), "%s/step_%03u_pending.dot", dir, g_step_session_frame);
@@ -1567,14 +1563,12 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // have fired.  Any additional changes from the post-hook thvm_normalize
     // aren't part of the captured sequence, so we overwrite the pending
     // frame with the truly-final reduced state and name it "_final".
-    g_step_session_root = traced;
-    thvm_step_seed_root_grad(ctx, traced);
     char pF[640];
     snprintf(pF, sizeof(pF), "%s/step_%03u_final.dot",
              dir, g_step_session_pending_frame);
     thvm_heap_dot_set_highlight(0, 0);
     thvm_heap_dot_set_step_meta("", "");
-    thvm_heap_dot_root(ctx, pF, traced);
+    thvm_heap_dot_root(ctx, pF, term_era());
     // Remove the stale pending snapshot now that the final is written.
     if (g_step_session_pending_path[0] &&
         strcmp(g_step_session_pending_path, pF) != 0) {
@@ -1595,7 +1589,6 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     // (Session no longer toggles heap_dot_root_only; dumper always shows
     // the entire heap.)
     g_step_session_ctx  = NULL;
-    g_step_session_root = 0;
     g_step_session_frame = 0;
     g_step_session_dir[0] = 0;
     step_root_slot = 0;

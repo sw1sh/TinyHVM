@@ -1104,7 +1104,13 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
         (void)(is_sub); \
     } while(0)
     #define SLOT_LIVE(pos) (((pos) < ctx->heap_pos) ? slot_live[(pos)] : 0)
-    #define LOC_LIVE(pos)  (((pos) < ctx->heap_pos) ? loc_live[(pos)] : 0)
+    // In whole-heap mode (root_only=0), there's no privileged root to
+    // traverse from — every cell in the heap is treated as live.
+    // root_only=1 (coarse-phase dumps) keeps the reach-walk-based
+    // filtering to trim noise from the entire history of allocations.
+    #define LOC_LIVE(pos)  (heap_dot_root_only ? \
+        (((pos) < ctx->heap_pos) ? loc_live[(pos)] : 0) : \
+        ((pos) > 0 && (pos) < ctx->heap_pos))
     // Node highlight: red border when edge highlight failed
     #define NODE_HL_ATTRS(loc) ((heap_dot_node_hl > 0 && (u64)(loc) == heap_dot_node_hl) ? \
         ",color=\"#cc0000\",penwidth=2.0" : "")
@@ -1751,10 +1757,15 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
 
         // --- TAG_TOP: op nodes (dedup by val) ---
         if (tag == TAG_TOP) {
-            // Bounds-check against _dot_live_cap, not current heap_pos:
-            // kernel-label rendering may have grown heap_pos mid-loop,
-            // and top_live is only sized to the original heap_pos.
-            if (top_live && (val >= _dot_live_cap || !top_live[val])) continue;
+            // In root-only mode (coarse phase dumps), the reach walk
+            // populates top_live from a privileged root.  Without a
+            // root — or in explicit whole-heap mode (root_only=0) — we
+            // render EVERY live TAG_TOP we encounter; the net's visible
+            // structure comes from the heap state itself, not from a
+            // root-anchored walk.
+            if (heap_dot_root_only) {
+                if (top_live && (val >= _dot_live_cap || !top_live[val])) continue;
+            }
             // Commuted GRAD cell (slot 0 has SUB-bit) is "dead"; its edges
             // are dereferenced through dot_dereference_commuted_grad below.
             // Don't emit a node for it — spec's "single GRAD" view.
@@ -2382,7 +2393,16 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             if (val < ctx->heap_pos && (!ctr_children_emitted || !ctr_children_emitted[val])) {
                 if (ctr_children_emitted) ctr_children_emitted[val] = 1;
                 for (u32 gi = 0; gi < ext; gi++) {
-                    Term cterm = heap_read(ctx, val + gi);
+                    Term cterm_raw = heap_read(ctx, val + gi);
+                    // Deref commuted GRAD tag views: after a GRAD-X
+                    // commute, the old outer GRAD cell carries SUB on
+                    // slot 0 and the real bwd/fwd target on slot 1.
+                    // Rendering the raw GRAD tag here would produce a
+                    // gray-box ghost with no shape.  Follow the SUB
+                    // redirect to the reparented target so the edge
+                    // lands on the correct live node (EXPAND / SUM /
+                    // the Leibniz ADD / etc.).
+                    Term cterm = dot_deref_commuted_grad(ctx, cterm_raw);
                     char clbl[16];
                     snprintf(clbl, sizeof(clbl), "c%u", gi);
                     u8 ctag = term_tag(cterm);

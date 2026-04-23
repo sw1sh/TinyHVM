@@ -1201,29 +1201,6 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
     const char *rule_name = thvm_wnf_last_rule();
     u64 grad_slot = thvm_wnf_current_grad_slot();
 
-    // Slide GRAD visually: point heap[grad_slot+0] at the current
-    // descent operand TOP (the thing that's about to be differentiated
-    // next).  Before the dump we overwrite, after the dump we restore
-    // — the GRAD cell is semantically consumed into a frame at this
-    // point, so the mutation only affects what the dumper sees.
-    Term cursor_top = 0;
-    Term saved_grad_y = 0;
-    int sliding = 0;
-    if (grad_slot != 0 && cursor_loc != 0 && rule_name && rule_name[0] &&
-        grad_slot + 1 < ctx->heap_pos && cursor_loc < ctx->heap_pos) {
-        u32 cursor_uop = UOP_COUNT;
-        for (u32 u = 0; u < UOP_COUNT; u++)
-            if (strcmp(rule_name, uop_names[u]) == 0) { cursor_uop = u; break; }
-        if (cursor_uop < UOP_COUNT) {
-            cursor_top = term_new(TAG_TOP, cursor_uop, cursor_loc);
-            saved_grad_y = heap_read(ctx, grad_slot + 0);
-            if (cursor_top != saved_grad_y) {
-                heap_set(ctx, grad_slot + 0, cursor_top);
-                sliding = 1;
-            }
-        }
-    }
-
     // Redex edge = the principal-port y→GRAD edge.  Always at
     // grad_slot+0 when a GRAD is active — even if cursor_loc is 0
     // (e.g. operand is a TEN leaf about to annihilate).  Falls back
@@ -1245,7 +1222,6 @@ static void wnf_step_session_hook(TinyHVM *ctx) {
     thvm_heap_dot_root(ctx, path, g_step_session_root);
     thvm_heap_dot_set_include_all(0);
 
-    if (sliding) heap_set(ctx, grad_slot + 0, saved_grad_y);
     // Dedup on rendered content — collapses enter-phase administrative
     // firings (VAR resolve, INC unwrap, ...) that don't change what the
     // step graph actually shows.
@@ -1266,6 +1242,31 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
              dir, dir, dir);
     system(cmd);
 
+    // Wrap GRAD root in FUSE_f (forward) + FUSE_b (backward) so the
+    // step graph's pre-reduce state matches the spec topology: GRAD is
+    // a 1-in/2-out T-junction whose v_pass feeds a forward-output FUSE
+    // and whose ∂v feeds a backward-output FUSE.  Both FUSEs are stored
+    // on heap so the dumper (include_all=1) walks them.  Reduction is
+    // driven through fuse_b (BW); fuse_f stays reachable for viz.
+    if (term_tag(traced) == TAG_TOP &&
+        (term_ext(traced) == UOP_GRAD || term_ext(traced) == UOP_GRAD_FWD)) {
+        u64 grad_loc = term_val(traced);
+        // PIN view of same cell (shares slot 3 = y_fw).
+        Term pin  = term_new(TAG_TOP, UOP_GRAD_PIN, grad_loc);
+        u64  fslt = heap_alloc(ctx, 1);
+        heap_set(ctx, fslt, pin);
+        Term fuse_f = term_new(TAG_TOP, UOP_FUSE, fslt);
+        u64  fsltb = heap_alloc(ctx, 1);
+        heap_set(ctx, fsltb, traced);
+        Term fuse_b = term_new(TAG_TOP, UOP_FUSE, fsltb);
+        // Stash fuse_f on a heap slot so it stays reachable for the
+        // dumper through the whole session.
+        u64 fuse_f_anchor = heap_alloc(ctx, 1);
+        heap_set(ctx, fuse_f_anchor, fuse_f);
+        (void)fuse_f_anchor;
+        traced = fuse_b;
+    }
+
     // Frame 0: initial state.  Highlight the initial redex edge —
     // for a GRAD root term, that's the y→GRAD principal-port edge
     // (slot grad_loc+0).
@@ -1277,9 +1278,18 @@ static Term thvm_trace_step_graph_session(TinyHVM *ctx, Term traced) {
     char p0[640];
     snprintf(p0, sizeof(p0), "%s/step_%03u.dot", dir, g_step_session_frame);
     u64 init_hl = 0;
-    if (term_tag(traced) == TAG_TOP &&
-        (term_ext(traced) == UOP_GRAD || term_ext(traced) == UOP_GRAD_FWD)) {
-        init_hl = term_val(traced);  // y slot of the GRAD (redex edge endpoint)
+    {
+        Term probe = traced;
+        // Unwrap FUSE(GRAD) to find the initial redex slot inside.
+        if (term_tag(probe) == TAG_TOP && term_ext(probe) == UOP_FUSE) {
+            u64 ploc = term_val(probe);
+            if (ploc != 0 && ploc < ctx->heap_pos)
+                probe = heap_read(ctx, ploc);
+        }
+        if (term_tag(probe) == TAG_TOP &&
+            (term_ext(probe) == UOP_GRAD || term_ext(probe) == UOP_GRAD_FWD)) {
+            init_hl = term_val(probe);  // y slot of the GRAD (redex edge endpoint)
+        }
     }
     thvm_heap_dot_set_highlight(init_hl, 0);
     thvm_heap_dot_set_step_meta("", "");

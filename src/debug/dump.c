@@ -1477,8 +1477,16 @@ static void thvm_heap_dot_root(TinyHVM *ctx, const char *path, Term root) {
             Term _pp = ctx->heap[_hh]; \
             u8 _pt = term_tag(_pp); \
             u64 _pv = term_val(_pp); \
+            /* Whole-heap mode (root_only=0): treat every in-bounds slot \
+               as live — there's no reach-walk seed to populate liveness \
+               arrays.  Otherwise require top_live/loc_live from the \
+               root-anchored walk. */ \
             if (_pt == TAG_TOP) { \
-                if (!top_live || _pv == 0 || _pv >= ctx->heap_pos || !top_live[_pv]) continue; \
+                if (heap_dot_root_only) { \
+                    if (!top_live || _pv == 0 || _pv >= ctx->heap_pos || !top_live[_pv]) continue; \
+                } else { \
+                    if (_pv == 0 || _pv >= ctx->heap_pos) continue; \
+                } \
             } else if (dot_visible_heap_loc_tag(_pt)) { \
                 if (_pv == 0 || _pv >= ctx->heap_pos || !LOC_LIVE(_pv)) continue; \
             } \
